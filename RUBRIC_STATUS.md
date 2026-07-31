@@ -65,6 +65,38 @@ DuckDB file, so they never disturb `make pipeline` or the pytest suite.
 
 ---
 
+## Changes since the baseline scoring
+
+The scores below are the **Phase-0 baseline** and are deliberately left
+unchanged until each item is re-measured. Two things have moved underneath them:
+
+* **TODO 1.0(b) — engine failures no longer exit 0.** `SupervisedDebeziumEngine`
+  (`src/cdc_flight/engine.py`) registers a Debezium `CompletionCallback`, so a
+  connector that fails to start now raises `EngineFailure`, exits non-zero and
+  writes `last_run.json` with `ok: false` and the Debezium message. A hang
+  detected by the watchdog is also a non-zero exit now. This does **not** change
+  any score by itself — 4.1/4.3 still have no recovery, and 6.2 still has no
+  alerts — but it is the precondition for measuring 1.8, 4.1, 4.2, 4.3 and 6.2 at
+  all. Pinned by `tests/1.0_engine_error_propagation/`.
+* **Deterministic fault injection exists** (`src/cdc_flight/faults.py`,
+  `CDC_FAULT_INJECT`). 1.7's "robust injection of failures in testing" now has
+  machinery behind it; the score stays at 1 until the applier makes duplication
+  impossible, which is what `tests/1.1_*` and `tests/1.2_*` measure.
+* **The architecture that closes §1 is decided** in
+  [`docs/adr/0001-transactional-applier.md`](docs/adr/0001-transactional-applier.md).
+
+Two measurements made while writing those tests are worth recording because they
+correct assumptions in the notes below:
+
+1. Rolling `offsets.dat` back does **not** reliably force a replay: Postgres will
+   not stream from before the slot's `restart_lsn`. In a two-transaction test
+   only the tail replayed. `probes/p13` case A worked only because its rollback
+   happened to stay inside the retained window.
+2. `snapshot.mode=never` does not exist in Debezium 3.6 (the valid values are
+   `always, initial_only, configuration_based, when_needed, initial, custom,
+   no_data`). The old CLI help text advertised `never`; before 1.0(b) that
+   misconfiguration exited **0** with `records: 0`.
+
 ## Summary
 
 | # | Item | Score | One-line gap |

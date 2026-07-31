@@ -135,25 +135,62 @@ Collapsing it into current state is Phase 1/8 work.
 ## Testing
 
 ```bash
-make test        # default suite, local only (Postgres + DuckDB), no cloud
-make test-md     # MotherDuck smoke test only  (marker: motherduck)
+make test        # default suite, local only (Postgres + DuckDB), no cloud, no slow tests
+make test-md     # MotherDuck smoke test only        (marker: motherduck)
+make test-slow   # slow fault injection only         (marker: slow)
 make test-all    # everything
 ```
 
 `pytest` is configured with `--durations=20`, so every run prints a timing report.
-MotherDuck tests carry the `motherduck` marker and are deselected by `make test`.
+MotherDuck tests carry the `motherduck` marker and long fault-injection tests carry
+`slow`; both are deselected by `make test`.
 
 Measured on an M-series Mac (2026-07-30):
 
 | suite | tests | wall clock |
 |---|---|---|
-| `make test` (local only) | 8 | **142 s** |
+| `make test` (local only) | 22 passed + 6 xfail | **281 s** |
 | `make test-md` | 2 | **35 s** |
-| `make test-all` | 10 | **177 s** |
 
-Budget is 10 minutes for the whole suite, so there is plenty of headroom. The dominant
-cost is JVM startup (~10 s) plus the Debezium idle tail per pipeline invocation; each e2e
-test runs the pipeline twice.
+Budget is 10 minutes for the whole suite. The dominant cost is JVM startup (~17 s
+including the destination connect) plus the Debezium idle tail per pipeline invocation,
+so the suite is optimised by *sharing scenarios*, not by running fewer assertions: the
+rubric gap suites build their scenario once per module (or, for `crash_replay`, once per
+session) and then interrogate it with many cheap tests.
+
+### Test layout and conventions
+
+Rubric work lives in `tests/<item>_<slug>/`, each with a README explaining the gap:
+
+| directory | rubric item |
+|---|---|
+| `tests/1.0_engine_error_propagation/` | TODO 1.0(b) — engine failures must not exit 0 |
+| `tests/1.1_exactly_once_pk/` | 1.1 delivery guarantees, tables with a PK |
+| `tests/1.2_exactly_once_nopk/` | 1.2 delivery guarantees, tables without a PK |
+| `tests/1.3_atomic_batches/` | 1.3 multi-table transactional atomicity |
+
+Three naming conventions carry meaning:
+
+* `test_gap_*` — pins **today's broken behaviour**. It passes now; when the fix lands it
+  starts failing, which is the signal to delete it.
+* `test_target_*` — the **desired behaviour**, marked
+  `@pytest.mark.xfail(..., strict=True)`. Strict means an unexpected pass fails the
+  suite, so implementing the feature forces the marker (and its paired gap pin) to be
+  removed. Nothing drifts silently.
+* `@pytest.mark.slow` — real `kill -9` / large-workload fault injection, deselected by
+  `make test`. Every slow test has a fast deterministic counterpart in the default suite.
+
+### Fault injection
+
+`src/cdc_flight/faults.py` makes crash points exact instead of racing a `kill -9`
+(`probes/p07` lost that race outright). It is inert unless `CDC_FAULT_INJECT` is set:
+
+```bash
+CDC_FAULT_INJECT=after_load:1 uv run cdc-flight --destination duckdb
+```
+
+`after_load:1` commits the first batch to the destination and then `os._exit`s the
+process *before* Debezium's offset is flushed — the exact at-least-once window.
 
 The tests start the Postgres cluster themselves if it is not already up (session fixture
 `postgres_cluster`), reseed the schema, and give every test its own replication slot,
@@ -171,11 +208,15 @@ cdc_flight/
 ├── src/cdc_flight/
 │   ├── config.py                 # env-driven config dataclasses
 │   ├── debezium_props.py         # Debezium engine properties
+│   ├── engine.py                 # Debezium engine that cannot fail silently
+│   ├── errors.py                 # EngineFailure
+│   ├── faults.py                 # deterministic crash injection (test-only)
 │   ├── handler.py                # Debezium batch → dlt resources
 │   ├── pipeline.py               # bounded runner + CLI entrypoint
 │   ├── datagen.py                # deterministic change generator
 │   └── inspect.py                # `make query`
-├── tests/                        # pytest e2e harness
+├── docs/adr/                     # architecture decision records
+├── tests/                        # pytest e2e harness + rubric gap suites
 ├── probes/                       # rubric evidence experiments (see RUBRIC_STATUS.md)
 ├── RUBRIC_STATUS.md              # all 40 rubric items scored, with evidence
 └── research/                     # blog capture + deviation notes
@@ -192,10 +233,17 @@ The evidence comes from [`probes/`](probes/) — small, reproducible experiments
 are *not* tests: several deliberately break the source schema, and each reseeds
 it first and uses its own replication slot, offset file and DuckDB file.
 
-The single most important finding is a bug rather than a rubric item:
-`run_engine_bounded` reports **exit 0** when the Debezium engine fails to start
-(dropped slot, unusable offset), so several catastrophic failure modes currently
-look like successful no-op runs.
+The single most important finding was a bug rather than a rubric item:
+`run_engine_bounded` reported **exit 0** when the Debezium engine failed to start
+(dropped slot, unusable offset), so several catastrophic failure modes looked like
+successful no-op runs. **Fixed** — see `src/cdc_flight/engine.py` and
+`tests/1.0_engine_error_propagation/`. Debezium reports such failures through a
+`CompletionCallback` and then returns normally from `run()`; the engine now
+registers one, and the CLI exits non-zero with the Debezium message and writes a
+`last_run.json` carrying `ok: false` and `error`.
+
+The architecture that closes §1 of the rubric is decided in
+[`docs/adr/0001-transactional-applier.md`](docs/adr/0001-transactional-applier.md).
 
 ## Known baseline weaknesses
 
