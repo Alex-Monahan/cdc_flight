@@ -643,11 +643,14 @@ makes detection survive a restart, and persistence is never allowed to run ahead
 destructive action it implies.
 
 **The fence.** A drop is discovered after the fact, so applying it immediately could
-delete rows an in-flight event would then re-add - a zombie table. Each change
-carries the `pg_current_wal_lsn()` of its poll and the applier holds it until the
+delete rows an in-flight event would then re-add - a zombie table. Each *destructive*
+change carries the `pg_current_wal_lsn()` of its poll and the applier holds it until the
 resume point it is about to make durable reaches that LSN. On a quiet source nothing
 would ever advance it, so the watcher emits a **transactional**
-`pg_logical_emit_message` past the change (ADR D9's mechanism, one poll early).
+`pg_logical_emit_message` past the change (ADR D9's mechanism, one poll early) and keeps
+emitting one per poll while a destructive change is pending, which makes the fence
+self-healing. A `new` / `unpublished` / `republished` change removes nothing, so it is
+never fenced and never causes a write to the source.
 
 That the marker is transactional is measured, not stylistic. A non-transactional one
 looks better (it stays out of every `END.event_count`) but does not end Debezium's

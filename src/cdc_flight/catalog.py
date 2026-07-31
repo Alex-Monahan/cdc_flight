@@ -256,12 +256,14 @@ class CatalogWatcher:
                 for r in rows
             }
             added = self._compare(observed, lsn)
-            # Emitted while ANYTHING is pending, not only when a change is new. One
-            # tiny WAL record per poll interval, and it makes the fence self-healing:
-            # a marker that was written but not delivered (see `_emit_marker`) is
-            # simply followed by another one.
-            if self.emit_marker and self._pending:
-                self._emit_marker(conn, added or self.pending())
+            # Emitted while a **destructive** change is pending, not only when one is
+            # new: one tiny WAL record per poll interval, which makes the fence
+            # self-healing (a marker that was written but not delivered - see
+            # `_emit_marker` - is simply followed by another one). Nothing is written to
+            # the source when there is nothing to fence.
+            unfenced = [c for c in self.pending() if c.kind in DESTRUCTIVE]
+            if self.emit_marker and unfenced:
+                self._emit_marker(conn, [c for c in added if c.kind in DESTRUCTIVE] or unfenced)
         self.last_error = None
         return added
 
@@ -400,6 +402,14 @@ class CatalogWatcher:
         out: list[CatalogChange] = []
         with self._lock:
             for change in self._pending:
+                if change.kind not in DESTRUCTIVE:
+                    # Nothing is removed for a `new`, `unpublished` or `republished`
+                    # change - it is a marker row and an operator decision - so there is
+                    # nothing for the fence to protect. Fencing them anyway kept them
+                    # pending on an idle stream, which in turn kept the watcher writing
+                    # marker records to the source for no reason.
+                    out.append(change)
+                    continue
                 if durable_lsn >= change.detected_lsn:
                     out.append(change)
                     continue

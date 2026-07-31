@@ -167,6 +167,19 @@ def test_a_change_is_not_due_until_the_destination_reaches_its_lsn():
     assert len(w.due(durable_lsn=5000)) == 1
 
 
+def test_a_non_destructive_change_needs_no_fence():
+    """A `new` / `unpublished` / `republished` change removes nothing, so there is
+    nothing for the fence to protect. Fencing them anyway left them pending on an idle
+    stream, which kept the watcher writing marker records to the source for no reason.
+    """
+    w = watcher()
+    for kind in (CHANGE_NEW, CHANGE_UNPUBLISHED, CHANGE_REPUBLISHED):
+        w._pending.append(
+            CatalogChange(kind=kind, schema="app", table="t", detected_lsn=10**9)
+        )
+    assert len(w.due(durable_lsn=0)) == 3
+
+
 def test_grace_zero_never_forces_an_unfenced_change():
     """The default. Forcing a drop the fence has not cleared can leave a zombie: an
     in-flight event for the table re-creates it with pre-drop rows."""
