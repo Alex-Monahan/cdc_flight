@@ -40,11 +40,17 @@ scenario both ways.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import offset_file
-from .destination import CONTROL_SCHEMA, ResumePoint, raise_alert, read_offset_blobs
+from .destination import (
+    CONTROL_SCHEMA,
+    ResumePoint,
+    raise_alert,
+    read_offset_blobs,
+    request_snapshot,
+)
 from .errors import (
     NoDurableDestinationRow,
     ReconciliationRefused,
@@ -229,6 +235,368 @@ def slot_position(dsn: str, slot_name: str) -> int | None:
     if not rows or rows[0][0] is None:
         return None
     return int(rows[0][0])
+
+
+# --------------------------------------------------------------------------- #
+# rubric 1.8 — the slot, and the cluster it lives in, on every acquisition
+# --------------------------------------------------------------------------- #
+#: `pg_current_wal_lsn()` **errors** on a standby ("recovery is in progress"), and
+#: rubric 7.2 wants CDC to be able to read from a replica, so the write position has to
+#: be asked for in a way that answers on both. `pg_last_wal_receive_lsn()` is the
+#: standby's equivalent and, like the primary's write position, is never behind
+#: anything the slot has already decoded - which is all the regression check needs.
+_SLOT_OBSERVATION_SQL = """
+SELECT (s.restart_lsn - '0/0')::bigint,
+       (s.confirmed_flush_lsn - '0/0')::bigint,
+       s.active,
+       ((CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn()
+              ELSE pg_current_wal_lsn() END) - '0/0')::bigint,
+       (SELECT system_identifier::text FROM pg_control_system()),
+       (SELECT timeline_id FROM pg_control_checkpoint())
+FROM (SELECT 1) one
+LEFT JOIN pg_replication_slots s ON s.slot_name = %s
+"""
+
+
+@dataclass
+class SlotObservation:
+    """One look at the slot *and at the cluster it belongs to*.
+
+    `system_identifier` and `timeline_id` are the two facts that separate "my source,
+    quiet" from "a different source wearing the same DSN": a base-backup restore, a
+    promoted standby, a DSN repointed at a clone. Neither is visible in the slot alone,
+    and both are one cheap catalog function away.
+    """
+
+    slot_exists: bool = False
+    active: bool = False
+    restart_lsn: int | None = None
+    confirmed_flush_lsn: int | None = None
+    current_wal_lsn: int | None = None
+    system_identifier: str | None = None
+    timeline_id: int | None = None
+    error: str | None = None
+
+    @property
+    def observable(self) -> bool:
+        return self.error is None
+
+    def as_dict(self) -> dict:
+        return {
+            "slot_exists": self.slot_exists,
+            "slot_active": self.active,
+            "restart_lsn": self.restart_lsn,
+            "confirmed_flush_lsn": self.confirmed_flush_lsn,
+            "current_wal_lsn": self.current_wal_lsn,
+            "system_identifier": self.system_identifier,
+            "timeline_id": self.timeline_id,
+            "error": self.error,
+        }
+
+
+def observe_slot(dsn: str, slot_name: str, *, connect_timeout: int = 10) -> SlotObservation:
+    """Everything rubric 1.8 needs, in one round trip on its own connection."""
+    try:
+        import psycopg
+
+        with psycopg.connect(dsn, autocommit=True, connect_timeout=connect_timeout) as conn:
+            row = conn.execute(_SLOT_OBSERVATION_SQL, (slot_name,)).fetchone()
+    except Exception as exc:  # pragma: no cover - the source may be down
+        return SlotObservation(error=f"{type(exc).__name__}: {exc}")
+    if row is None:  # pragma: no cover - the LEFT JOIN always returns one row
+        return SlotObservation(error="no row from pg_replication_slots")
+    restart, confirmed, active, current, system_id, timeline = row
+    return SlotObservation(
+        slot_exists=restart is not None or confirmed is not None or bool(active),
+        active=bool(active),
+        restart_lsn=int(restart) if restart is not None else None,
+        confirmed_flush_lsn=int(confirmed) if confirmed is not None else None,
+        current_wal_lsn=int(current) if current is not None else None,
+        system_identifier=str(system_id) if system_id is not None else None,
+        timeline_id=int(timeline) if timeline is not None else None,
+    )
+
+
+#: Decisions that mean "WAL we needed is unreachable, so the destination has to be
+#: rebuilt from the source". Every one of them triggers an automatic re-snapshot
+#: (rubric 1.8's 5) rather than the hard error that was worth a 4.
+RESNAPSHOT_DECISIONS = (
+    "slot_ahead_of_destination",
+    "slot_missing",
+    "slot_recreated",
+    "source_identity_changed",
+    "source_lsn_regressed",
+    "no_durable_destination_row",
+)
+
+
+@dataclass
+class SlotVerdict:
+    """What the slot check concluded, and what the run must do about it."""
+
+    decision: str
+    ok: bool
+    resnapshot: bool = False
+    refuse: bool = False
+    message: str = ""
+    context: dict = field(default_factory=dict)
+
+    def as_dict(self) -> dict:
+        return {
+            "decision": self.decision,
+            "ok": self.ok,
+            "resnapshot": self.resnapshot,
+            "refuse": self.refuse,
+            "message": self.message,
+            **self.context,
+        }
+
+
+def check_slot(
+    *,
+    durable_lsn: int | None,
+    observation: SlotObservation,
+    previous: dict | None,
+) -> SlotVerdict:
+    """The rubric-1.8 decision table, as a pure function (ADR 0001 §19/A45).
+
+    Pure so that every cell is a unit test rather than a Postgres it would take a
+    base-backup restore to produce. The caller supplies the durable resume point, one
+    observation, and the previous observation; nothing here connects to anything.
+
+    | condition | decision | action |
+    |---|---|---|
+    | source unobservable | `source_unobservable` | proceed; the engine will fail on its own |
+    | no durable row, no slot | `fresh_start` | nothing to reconcile |
+    | no durable row, slot has a position | `no_durable_destination_row` | re-snapshot |
+    | durable row, slot gone | `slot_missing` | re-snapshot |
+    | `system_identifier` changed | `source_identity_changed` | re-snapshot |
+    | `pg_current_wal_lsn() < durable` | `source_lsn_regressed` | re-snapshot |
+    | `restart_lsn` regressed vs the last observation | `slot_recreated` | re-snapshot |
+    | `confirmed_flush_lsn > durable` | `slot_ahead_of_destination` | re-snapshot |
+    | otherwise | `ok` | stream |
+
+    Order matters: the *cause* is reported, not the symptom. A restored cluster also
+    shows a regressed LSN and often a recreated slot, and "your source is a different
+    cluster" is the sentence an operator needs.
+    """
+    context = observation.as_dict() | {"durable_lsn": durable_lsn}
+    if not observation.observable:
+        return SlotVerdict(
+            "source_unobservable", ok=False, message=str(observation.error), context=context
+        )
+
+    if durable_lsn is None:
+        if not observation.slot_exists or observation.confirmed_flush_lsn is None:
+            return SlotVerdict("fresh_start", ok=True, context=context)
+        return SlotVerdict(
+            "no_durable_destination_row",
+            ok=False,
+            resnapshot=True,
+            message=(
+                f"the slot exists with confirmed_flush_lsn="
+                f"{observation.confirmed_flush_lsn} but the destination has no resume "
+                "point: nothing before that position is durable here, so the WAL that "
+                "would have carried it is already discarded"
+            ),
+            context=context,
+        )
+
+    previous = previous or {}
+    prev_system = previous.get("system_identifier")
+    if (
+        prev_system
+        and observation.system_identifier
+        and str(prev_system) != str(observation.system_identifier)
+    ):
+        return SlotVerdict(
+            "source_identity_changed",
+            ok=False,
+            resnapshot=True,
+            message=(
+                f"the source cluster's system_identifier changed from {prev_system} to "
+                f"{observation.system_identifier}: this is not the database the "
+                "destination was built from (a restore, a clone, or a repointed DSN)"
+            ),
+            context=context | {"previous_system_identifier": str(prev_system)},
+        )
+
+    if (
+        observation.current_wal_lsn is not None
+        and observation.current_wal_lsn < durable_lsn
+    ):
+        return SlotVerdict(
+            "source_lsn_regressed",
+            ok=False,
+            resnapshot=True,
+            message=(
+                f"pg_current_wal_lsn()={observation.current_wal_lsn} is BEHIND the "
+                f"durable destination offset {durable_lsn}: the source has been rewound "
+                "(a base-backup restore or a timeline change), so the events the "
+                "destination already holds are no longer the source's history"
+            ),
+            context=context,
+        )
+
+    if not observation.slot_exists:
+        return SlotVerdict(
+            "slot_missing",
+            ok=False,
+            resnapshot=True,
+            message=(
+                "the replication slot is gone. A new slot starts at the *current* WAL "
+                f"position, so every change since the durable offset {durable_lsn} "
+                "would be silently missing"
+            ),
+            context=context,
+        )
+
+    prev_restart = previous.get("restart_lsn")
+    if (
+        prev_restart is not None
+        and observation.restart_lsn is not None
+        and observation.restart_lsn < int(prev_restart)
+    ):
+        return SlotVerdict(
+            "slot_recreated",
+            ok=False,
+            resnapshot=True,
+            message=(
+                f"the slot's restart_lsn went BACKWARDS, from {prev_restart} to "
+                f"{observation.restart_lsn}: a slot only ever advances, so this slot is "
+                "not the slot we were streaming from"
+            ),
+            context=context | {"previous_restart_lsn": int(prev_restart)},
+        )
+
+    confirmed = observation.confirmed_flush_lsn
+    if confirmed is not None and confirmed > durable_lsn:
+        return SlotVerdict(
+            "slot_ahead_of_destination",
+            ok=False,
+            resnapshot=True,
+            message=(
+                f"the slot's confirmed_flush_lsn={confirmed} is AHEAD of the durable "
+                f"destination offset {durable_lsn}: something else advanced the slot, "
+                "and the WAL in between can no longer be replayed"
+            ),
+            context=context,
+        )
+
+    return SlotVerdict("ok", ok=True, context=context)
+
+
+def drop_slot(dsn: str, slot_name: str) -> str:
+    """Drop the slot so the next start creates a fresh one. Returns what happened.
+
+    The re-snapshot **needs** a slot Debezium creates itself, and this is why. Debezium
+    only uses Postgres's exported snapshot - `CREATE_REPLICATION_SLOT` returning a
+    `consistent_point` plus a `snapshot_name`, then `SET TRANSACTION SNAPSHOT` - when it
+    creates the slot as part of the same start-up (`PostgresSnapshotChangeEventSource.
+    getTransactionStartLsn`: "if any SQL operations occur mid-snapshot ... otherwise
+    they'll be lost"). With a pre-existing slot it falls back to an ordinary snapshot
+    plus `pg_current_wal_lsn()`, and the snapshot/stream boundary is then only as exact
+    as that pairing happens to be. VERIFIED in the engine log: a fresh slot gets
+    `SET TRANSACTION SNAPSHOT '…'`, a pre-existing one does not.
+
+    Keeping the stale slot would also be wrong for a different reason: its
+    `confirmed_flush_lsn` is by definition *ahead* of what we can account for, so a
+    stream resumed from it starts past the snapshot's consistent point and the window
+    in between is lost twice over.
+    """
+    import psycopg
+
+    with psycopg.connect(dsn, autocommit=True, connect_timeout=10) as conn:
+        rows = conn.execute(
+            "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
+            "WHERE slot_name = %s",
+            (slot_name,),
+        ).fetchall()
+    return "dropped" if rows else "absent"
+
+
+def recover_by_full_resnapshot(
+    con,
+    *,
+    pipeline: str,
+    namespace: str,
+    dsn: str,
+    slot_name: str,
+    offset_path: Path,
+    verdict: SlotVerdict,
+    captured_tables: list[tuple[str, str, str]],
+    forget_catalog: bool = False,
+) -> dict:
+    """Rubric 1.8's automatic recovery: rebuild every captured table from the source.
+
+    "Affected tables = all captured tables, unless provable otherwise", and it is not
+    provable otherwise: a slot advanced past our position discarded WAL for *every*
+    relation in the publication, and nothing in the destination records which relations
+    the discarded WAL touched. So the whole capture set is re-snapshotted.
+
+    Nothing is destroyed here. The destination tables stay exactly as they are, still
+    queryable, and each one is replaced only when its shadow is complete, in one
+    transaction (D7). If this run dies half way, the tables it did not reach are still
+    `awaiting_snapshot` and the next run finishes the job - which is why the marking
+    happens *before* anything else.
+
+    The steps, in the order they have to happen:
+
+    1. mark every captured table `awaiting_snapshot` - the durable to-do list;
+    2. delete the destination resume point, so reconciliation sees a fresh start;
+    3. delete `offsets.dat`, so Debezium does not resume from a position we have just
+       declared unusable;
+    4. drop the replication slot, so Debezium creates one and the snapshot is
+       coordinated by Postgres's exported snapshot rather than by a race (see
+       `drop_slot`).
+
+    Order 2-before-3 matters: with the row gone and the file present, reconciliation
+    REFUSES to start (`orphan_offset_file`), which is the correct refusal for an
+    operator pointing at the wrong database and the wrong outcome for us. Doing both,
+    in this order, in one function is how that stays true.
+    """
+    detail = f"{verdict.decision}: {verdict.message}"
+    raise_alert(
+        con, pipeline=pipeline, severity="critical", code=verdict.decision,
+        message=(
+            f"{verdict.message}. Rebuilding every captured table from the source "
+            f"({len(captured_tables)} tables); the destination stays queryable until "
+            "each table's snapshot is complete and swapped in one transaction."
+        ),
+        context=verdict.as_dict(),
+    )
+    marked = request_snapshot(con, pipeline=pipeline, tables=captured_tables, detail=detail)
+    con.execute(
+        f"DELETE FROM {CONTROL_SCHEMA}.debezium_offsets WHERE pipeline = ? AND namespace = ?",
+        [pipeline, namespace],
+    )
+    if forget_catalog:
+        # A different cluster's oids are not our relations' oids, and comparing them
+        # would make the catalog watcher conclude that every table was dropped and
+        # recreated - which the mass-drop circuit breaker then refuses, correctly and
+        # unhelpfully. Forget what we knew about a catalog that no longer exists.
+        con.execute(
+            f"DELETE FROM {CONTROL_SCHEMA}.source_relations WHERE pipeline = ?", [pipeline]
+        )
+    file_removed = Path(offset_path).exists()
+    Path(offset_path).unlink(missing_ok=True)
+    try:
+        slot_action = drop_slot(dsn, slot_name)
+    except Exception as exc:  # pragma: no cover - a slot held by another backend
+        log.error("could not drop the replication slot %r: %s", slot_name, exc)
+        slot_action = f"drop_failed: {exc}"
+    log.warning(
+        "rubric 1.8 recovery armed (%s): %s tables awaiting a snapshot, resume point "
+        "deleted, offsets file %s, slot %s",
+        verdict.decision, marked, "removed" if file_removed else "absent", slot_action,
+    )
+    return {
+        "decision": verdict.decision,
+        "tables_marked": marked,
+        "offset_file": "removed" if file_removed else "absent",
+        "slot": slot_action,
+        "message": verdict.message,
+    }
 
 
 #: `snapshot.mode` values that re-read every captured table's data in full, so an

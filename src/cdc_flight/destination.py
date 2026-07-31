@@ -27,6 +27,14 @@ log = logging.getLogger("cdc_flight.destination")
 
 CONTROL_SCHEMA = "_cdc_flight"
 
+#: `table_state.snapshot_state` for a table whose destination data cannot be trusted
+#: and which CDC alone cannot rebuild: a source relation that was dropped and
+#: recreated (rubric 1.5), or a table caught by rubric 1.8's slot-mismatch recovery.
+#: It is the queue `cdc_flight.resnapshot` works from. Defined here rather than in
+#: `catalog_apply` because three modules now write it and this is the one they all
+#: already depend on.
+AWAITING_SNAPSHOT = "awaiting_snapshot"
+
 #: How long a lease write may keep retrying a write-write conflict, and how long it
 #: waits between attempts. See `Lease._write` - this exists because a hard crash
 #: leaves an abandoned MotherDuck transaction holding the lease row.
@@ -228,6 +236,31 @@ CONTROL_DDL = [
             first_seen_at     TIMESTAMPTZ NOT NULL,
             last_seen_at      TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (pipeline, source_schema, source_table)
+        )""",
+    # rubric 1.8. What the *slot and the source cluster* looked like the last time we
+    # acquired them. Three of the four cases 1.8 has to detect are invisible from a
+    # single observation: a slot that was dropped and recreated at the same name has a
+    # perfectly ordinary `confirmed_flush_lsn`, a source restored from a base backup
+    # has a perfectly ordinary slot, and a rewound timeline looks like a quiet source.
+    # What gives them away is a comparison against the *previous* observation, so the
+    # previous observation has to be durable.
+    #
+    # Written outside the commit group's transaction on purpose: it is an observation
+    # about the source, not a fact about the data, and recording it must not be able to
+    # fail a commit. Correctness never depends on it - every check degrades to
+    # "cannot compare, so assume nothing changed" when the row is missing - it only
+    # makes the *detectable* set larger.
+    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.slot_state (
+            pipeline           VARCHAR     NOT NULL,
+            slot_name          VARCHAR     NOT NULL,
+            system_identifier  VARCHAR,
+            timeline_id        BIGINT,
+            restart_lsn        BIGINT,
+            confirmed_flush_lsn BIGINT,
+            current_wal_lsn    BIGINT,
+            durable_lsn        BIGINT,
+            observed_at        TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (pipeline, slot_name)
         )""",
     f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.alerts (
             pipeline        VARCHAR     NOT NULL,
@@ -600,6 +633,98 @@ def raise_alert(con, *, pipeline: str, severity: str, code: str, message: str, c
         )
     except Exception:  # pragma: no cover - alerting must never mask the cause
         log.warning("could not write alert %s", code, exc_info=True)
+
+
+def read_slot_state(con, pipeline: str, slot_name: str) -> dict | None:
+    """The last recorded observation of this pipeline's slot, or None (rubric 1.8)."""
+    rows = con.execute(
+        f"SELECT system_identifier, timeline_id, restart_lsn, confirmed_flush_lsn, "
+        f"       current_wal_lsn, durable_lsn, observed_at "
+        f"FROM {CONTROL_SCHEMA}.slot_state WHERE pipeline = ? AND slot_name = ?",
+        [pipeline, slot_name],
+    ).fetchall()
+    if not rows:
+        return None
+    keys = (
+        "system_identifier", "timeline_id", "restart_lsn", "confirmed_flush_lsn",
+        "current_wal_lsn", "durable_lsn", "observed_at",
+    )
+    return dict(zip(keys, rows[0], strict=True))
+
+
+def write_slot_state(con, *, pipeline: str, slot_name: str, observation: dict) -> None:
+    """Record what the slot and the source cluster look like now (rubric 1.8).
+
+    DELETE + INSERT, the control schema's one idiom for "replace this row". Called on
+    its own, never inside a commit group: see the DDL comment.
+    """
+    con.execute(
+        f"DELETE FROM {CONTROL_SCHEMA}.slot_state WHERE pipeline = ? AND slot_name = ?",
+        [pipeline, slot_name],
+    )
+    con.execute(
+        f"INSERT INTO {CONTROL_SCHEMA}.slot_state "
+        "(pipeline, slot_name, system_identifier, timeline_id, restart_lsn, "
+        " confirmed_flush_lsn, current_wal_lsn, durable_lsn, observed_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        [
+            pipeline,
+            slot_name,
+            observation.get("system_identifier"),
+            observation.get("timeline_id"),
+            observation.get("restart_lsn"),
+            observation.get("confirmed_flush_lsn"),
+            observation.get("current_wal_lsn"),
+            observation.get("durable_lsn"),
+            now(),
+        ],
+    )
+
+
+def tables_awaiting_snapshot(con, pipeline: str) -> list[tuple[str, str, str]]:
+    """`(source_schema, source_table, target_table)` for every table owed a snapshot.
+
+    The queue rubric 1.6's re-snapshot works from and rubric 1.5's `recreated` action
+    and rubric 1.8's recovery both write into. Ordered so a re-snapshot is
+    deterministic and its logs are diffable.
+    """
+    rows = con.execute(
+        f"SELECT source_schema, source_table, target_table FROM {CONTROL_SCHEMA}.table_state "
+        "WHERE pipeline = ? AND snapshot_state = ? ORDER BY source_schema, source_table",
+        [pipeline, AWAITING_SNAPSHOT],
+    ).fetchall()
+    return [(str(a), str(b), str(c)) for a, b, c in rows]
+
+
+def request_snapshot(
+    con, *, pipeline: str, tables: list[tuple[str, str, str]], detail: str
+) -> int:
+    """Mark tables as owing a snapshot. Returns how many rows were marked.
+
+    Idempotent: a table already `awaiting_snapshot` stays so. It deliberately does
+    NOT touch the destination table - the data stays queryable, stale and flagged,
+    until the re-snapshot swaps a complete image over it in one transaction.
+    """
+    marked = 0
+    for schema, table, target in tables:
+        con.execute(
+            f"UPDATE {CONTROL_SCHEMA}.table_state SET snapshot_state = ? "
+            "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+            [AWAITING_SNAPSHOT, pipeline, schema, table],
+        )
+        existing = con.execute(
+            f"SELECT 1 FROM {CONTROL_SCHEMA}.table_state "
+            "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+            [pipeline, schema, table],
+        ).fetchall()
+        if not existing:
+            mark_awaiting_snapshot(
+                con, pipeline=pipeline, source_schema=schema, source_table=table,
+                target_table=target, state=AWAITING_SNAPSHOT,
+            )
+        marked += 1
+    log.warning("marked %s table(s) as awaiting a snapshot: %s", marked, detail)
+    return marked
 
 
 def mark_awaiting_snapshot(

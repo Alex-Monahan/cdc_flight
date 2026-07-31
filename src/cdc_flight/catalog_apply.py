@@ -47,7 +47,9 @@ log = logging.getLogger("cdc_flight.catalog_apply")
 #: `table_state.snapshot_state` for a relation whose destination table was removed
 #: because the source relation was replaced. The rows are gone and CDC alone cannot
 #: rebuild them, so anything that reads this table must know it is incomplete.
-AWAITING_SNAPSHOT = "awaiting_snapshot"
+#: Canonical definition now lives in `destination`, which rubric 1.6's re-snapshot and
+#: rubric 1.8's recovery also write; re-exported so the name still reads locally.
+AWAITING_SNAPSHOT = destination.AWAITING_SNAPSHOT
 
 
 class _Sentinel:

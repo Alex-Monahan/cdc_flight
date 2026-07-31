@@ -116,6 +116,12 @@ class ApplierConfig:
     #: How long `COMMIT` may take before the process aborts (rubric 1.7 / 4.5).
     #: 0 disables the watchdog.
     commit_timeout: float = 300.0
+    #: rubric 1.6: this applier is serving a **re-snapshot** engine, not the pipeline's
+    #: own stream. It applies snapshot chunks and DISCARDS streaming units: the
+    #: re-snapshot's slot is a throwaway whose offsets nobody reads, so a streaming
+    #: event applied here would be delivered a second time by the real slot. See
+    #: `cdc_flight.resnapshot`.
+    resnapshot: bool = False
 
     def __post_init__(self) -> None:
         # A typo must not silently restore Debezium's "truncates are skipped" default.
@@ -146,6 +152,7 @@ class Applier:
         verifier=None,
         transactional_ddl: bool = True,
         catalog=None,
+        watermarks: dict[str, int] | None = None,
     ):
         self.con = con
         self.pipeline = pipeline
@@ -162,6 +169,17 @@ class Applier:
         #: `catalog.CatalogWatcher` or None. The only source of DROP TABLE knowledge
         #: (rubric 1.5): logical decoding does not carry DDL at all.
         self.catalog = catalog
+        #: rubric 1.6: `"<schema>.<table>" -> snapshot_lsn`. A source transaction whose
+        #: **commit** LSN is below a table's watermark is already inside that table's
+        #: snapshot image, so its events for that table are dropped. Per table, because
+        #: only the re-snapshotted tables have a new image; per *commit* LSN, because a
+        #: transaction that straddles the consistent point is in no image at all and
+        #: must be applied in full (`cdc_flight.resnapshot`).
+        self.watermarks: dict[str, int] = dict(watermarks or {})
+        #: the consistent point of the snapshot this run applied, if any
+        self.last_snapshot_lsn: int | None = None
+        #: True once every table that entered the snapshot phase has been swapped in
+        self.snapshot_completed = False
 
         self.registry = apply_sql.SchemaRegistry(
             con, dataset, constraints=config.destination_constraints
@@ -233,6 +251,9 @@ class Applier:
         self.deferred_events = 0
         self.truncates_applied = 0
         self.truncates_logged = 0
+        self.resnapshot_discarded_events = 0
+        #: events dropped because their transaction is already inside a table's image
+        self.watermark_fenced_events = 0
         #: `_cdc_flight.table_events` rows collected while applying THIS group, all
         #: written inside its transaction.
         self._table_events: list[dict] = []
@@ -298,6 +319,12 @@ class Applier:
             # rubric 1.5
             "truncates_applied": self.truncates_applied,
             "truncates_logged": self.truncates_logged,
+            # rubric 1.6: events that belonged to a transaction already inside a
+            # table's snapshot image, and (for a re-snapshot applier) streaming events
+            # that belong to the real slot rather than to the throwaway one.
+            "watermark_fenced_events": self.watermark_fenced_events,
+            "resnapshot_discarded_events": self.resnapshot_discarded_events,
+            "snapshot_consistent_lsn": self.last_snapshot_lsn,
             **self.catalog_coordinator.summary(),
             **(self.catalog.summary() if self.catalog is not None else {}),
         }
@@ -416,6 +443,15 @@ class Applier:
         if not self._group:
             self._group_is_snapshot = is_snapshot
             self._group_opened_at = time.monotonic()
+
+        if self.cfg.resnapshot and unit.kind == UNIT_TXN:
+            # A re-snapshot engine streams for as long as it takes us to notice the
+            # snapshot finished. Those events belong to the real slot, which has not
+            # consumed them, so applying them here would be a duplicate delivery.
+            unit.fenced = True
+            self.fenced_units += 1
+            self.fenced_events += unit.event_count
+            self.resnapshot_discarded_events += unit.event_count
 
         if unit.kind == UNIT_TXN and unit.last_lsn and unit.last_lsn <= self.resume_point.last_lsn:
             # ADR §4.4 idempotency fence. Correctness does not depend on it - the
@@ -560,6 +596,11 @@ class Applier:
 
         self._settle_catalog()
         self._flush_alerts()
+        if self.snapshots.swaps and not self.snapshots.active:
+            # Every table that entered the snapshot phase has been swapped in and the
+            # swap is durable. `cdc_flight.resnapshot` stops its engine on this rather
+            # than waiting out an idle window it does not need.
+            self.snapshot_completed = True
         self.commit_groups += 1
         if has_data:
             self.data_commit_groups += 1
@@ -650,6 +691,7 @@ class Applier:
             spill=self.spill,
             truncate_mode=self.cfg.truncate_mode,
             created_in_txn=self._created_in_txn,
+            watermarks=self.watermarks,
         )
         for unit in group:
             if unit.fenced:
@@ -690,6 +732,11 @@ class Applier:
                 self.table_counts[target] = self.table_counts.get(target, 0) + count
         self.truncates_applied += plan.truncates_applied
         self.truncates_logged += plan.truncates_logged
+        self.watermark_fenced_events += plan.watermark_fenced_events
+        if self._group_is_snapshot and stats.get("last_lsn"):
+            # Every snapshot record of one snapshot carries the exported snapshot's
+            # consistent point, so this is `C` (rubric 1.6, `cdc_flight.resnapshot`).
+            self.last_snapshot_lsn = stats["last_lsn"]
         self._group_source_tables |= plan.source_tables
         self._table_events.extend(plan.markers())
         self._flush_table_events(commit_id)

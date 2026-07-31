@@ -468,6 +468,19 @@ class Sandbox:
         finally:
             con.close()
 
+    def duck_write(self, stmt: str, params: list | None = None) -> None:
+        """Mutate the destination directly, between runs.
+
+        Used to put the destination into a state a *cause* would have produced - a table
+        marked `awaiting_snapshot`, a rewritten `slot_state` row - without also having to
+        reproduce the cause. Only ever called with no pipeline running.
+        """
+        con = duckdb.connect(str(self.duckdb_path))
+        try:
+            con.execute(stmt, params or [])
+        finally:
+            con.close()
+
     def scalar(self, stmt: str, params: list | None = None):
         return self.duck_query(stmt, params)[0][0]
 
