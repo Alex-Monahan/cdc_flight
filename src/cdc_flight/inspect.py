@@ -50,11 +50,20 @@ def main(argv: list[str] | None = None) -> int:
     for (name,) in tables:
         qualified = f'"{dest.dataset_name}"."{name}"'
         total = con.execute(f"SELECT count(*) FROM {qualified}").fetchone()[0]
-        ops = con.execute(
-            f"SELECT __op, count(*) FROM {qualified} GROUP BY 1 ORDER BY 1"
-        ).fetchall()
-        ops_txt = " ".join(f"{op}={n}" for op, n in ops)
-        print(f"{name:42s} rows={total:<6d} ops[{ops_txt}]")
+        # dlt child tables (arrays) carry no CDC metadata of their own.
+        has_op = con.execute(
+            "SELECT count(*) FROM information_schema.columns "
+            "WHERE table_schema = ? AND table_name = ? AND column_name = 'dbz_op'",
+            [dest.dataset_name, name],
+        ).fetchone()[0]
+        if has_op:
+            ops = con.execute(
+                f"SELECT dbz_op, count(*) FROM {qualified} GROUP BY 1 ORDER BY 1"
+            ).fetchall()
+            ops_txt = " ".join(f"{op}={n}" for op, n in ops)
+        else:
+            ops_txt = "child table"
+        print(f"{name:44s} rows={total:<6d} ops[{ops_txt}]")
 
     print("-" * 72)
     for (name,) in tables:
