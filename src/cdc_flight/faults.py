@@ -156,7 +156,36 @@ DESTINATION_POINTS = (
     "destination_close",
 )
 
-ALL_POINTS = POINTS + DESTINATION_POINTS
+#: **Recovery anchors** (rubric 1.7's route from 4 to 5, added with rubric 1.9's state
+#: machines). The acquisition recovery is the one durable sequence in the tree that
+#: cannot be made atomic — it mutates the to-do list, `offsets.dat`, the durable resume
+#: point and the replication slot, in that order, and a crash between any two of them
+#: used to leave a state the Flight diagnosed as an operator error and refused to start
+#: on, for ever (Codex B3 / Opus MAJOR-1). The 1.6—1.8 round proved those cuts through a
+#: **test seam** (`recovery.resume(on_phase=...)`), which proves the *logic* resumes and
+#: not that a hard-killed process does: `os._exit` skips every `except`, every `finally`
+#: and every atexit hook, and the seam runs on none of those paths. These anchors put a
+#: real `os._exit` at each boundary, so the crash-cut table in A53 is measured rather
+#: than modelled — which is the difference the 1.7 hold was about.
+#:
+#: * `recovery_requested`             - the journal row and the to-do list are durable
+#:   and NOTHING has been destroyed. The next run must resume, not re-diagnose.
+#: * `recovery_offsets_file_deleted`  - `offsets.dat` is gone, the journal still says
+#:   `requested`. A53's benign cut: `file absent / row present` -> rebuilt.
+#: * `recovery_resume_point_deleted`  - the durable resume point is gone, the slot is
+#:   not. The next run re-runs the drop from `offsets_file_deleted`.
+#: * `recovery_armed`                 - the slot is dropped and the journal has not
+#:   recorded it. The dangerous one: the forced `snapshot.mode` lives only in the row.
+#: * `table_rebuild_queued`           - the durable to-do list is mid-write.
+RECOVERY_POINTS = (
+    "recovery_requested",
+    "recovery_offsets_file_deleted",
+    "recovery_resume_point_deleted",
+    "recovery_armed",
+    "table_rebuild_queued",
+)
+
+ALL_POINTS = POINTS + DESTINATION_POINTS + RECOVERY_POINTS
 
 #: Names kept working from the first fault-injection cut.
 ALIASES = {"before_load": "pre_commit", "after_load": "post_commit_pre_ack"}
@@ -259,6 +288,25 @@ def _spec() -> tuple[str, int, int | str] | None:
 #: connection wrapper to *infer* the group index from the SQL it sees, and an
 #: inferred index is exactly how a fault test goes vacuously green (Opus M7).
 _current_group = 0
+
+
+#: How many times this process has reached each NON-group anchor, 1-based. The
+#: protocol anchors index by commit group, which is the right `<nth>` for them; a
+#: recovery phase boundary is not a commit group, and an index that is a function of the
+#: workload is one that silently stops firing (Opus M7). `arrival()` is the counter for
+#: anchors that happen once (or twice) per RUN rather than once per group.
+_arrivals: dict[str, int] = {}
+
+
+def arrival(point: str) -> int:
+    """The 1-based count of times this process has reached `point`."""
+    _arrivals[point] = _arrivals.get(point, 0) + 1
+    return _arrivals[point]
+
+
+def reset_arrivals() -> None:
+    """Test seam: forget how many times each non-group anchor has been reached."""
+    _arrivals.clear()
 
 
 def arm_group(nth: int) -> None:

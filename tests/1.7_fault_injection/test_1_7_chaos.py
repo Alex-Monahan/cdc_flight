@@ -49,14 +49,57 @@ from cdc_flight import faults
 
 ROWS = 12
 
-#: `swap` needs a re-snapshot in flight to have a shadow to tear, so it is excluded here
-#: and covered by `tests/1.6_snapshot_consistency/test_1_6_interrupted_snapshot.py`.
-#: `destination_hang` is excluded because it is a *timeout* anchor: composing it adds
-#: `CDC_COMMIT_TIMEOUT` to every iteration it lands in and proves nothing the bounded
-#: test does not.
-CHAOS_POINTS = tuple(
-    p for p in faults.ALL_POINTS if p not in ("swap", "destination_hang")
-)
+#: Anchors this harness cannot reach, each with the reason and the module that does.
+#:
+#: The harness's scenario is an *ordinary healthy run over a changing workload*, which
+#: is what makes composition meaningful; an anchor that needs a different scenario
+#: cannot be drawn from the plan, and an anchor that is drawn and does not fire is a
+#: silently missing case rather than a data point (Codex M3). So the exclusions are
+#: named here rather than discovered at run time — and `test_the_excluded_anchors_are_
+#: covered_somewhere_else` checks that each named module exists.
+#:
+#: The five `recovery_*` anchors are the ones this list gained with rubric 1.9. They sit
+#: inside the **acquisition recovery**, which only runs when the slot check declares the
+#: destination unusable; a healthy run never reaches them, so the seeded plan would arm
+#: one, watch nothing fire, and (correctly) fail. Their composition question — "does a
+#: fault during a recovery leave a resumable journal" — is exactly what the recovery's
+#: own anchors test, one per boundary, and it is answered from durable state rather than
+#: from the previous iteration's residue.
+EXCLUDED = {
+    "swap": (
+        "needs a re-snapshot in flight to have a shadow to tear",
+        "tests/1.6_snapshot_consistency/test_1_6_interrupted_snapshot.py",
+    ),
+    "destination_hang": (
+        "a *timeout* anchor: composing it adds CDC_COMMIT_TIMEOUT to every iteration it "
+        "lands in and proves nothing the bounded test does not",
+        "tests/1.7_fault_injection/test_1_7_anchor_guards.py",
+    ),
+    **{
+        point: (
+            "inside the acquisition recovery, which a healthy run never enters",
+            "tests/1.7_fault_injection/test_1_7_recovery_anchors.py",
+        )
+        for point in faults.RECOVERY_POINTS
+    },
+}
+
+CHAOS_POINTS = tuple(p for p in faults.ALL_POINTS if p not in EXCLUDED)
+
+
+def test_the_excluded_anchors_are_covered_somewhere_else():
+    """An exclusion with no owner is an anchor nothing proves.
+
+    `swap` was excluded with a prose comment. A comment does not fail when the module it
+    names is renamed or deleted, which is the same shape as every other vacuously-green
+    assertion this item has had to close.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    assert set(EXCLUDED) | set(CHAOS_POINTS) == set(faults.ALL_POINTS)
+    for point, (_why, where) in EXCLUDED.items():
+        assert (root / where).exists(), f"{point} points at {where}, which does not exist"
 
 #: `(seed, iterations, must_cover)`. The first run is a **cover**: every eligible anchor
 #: fires at least once, which is what makes "the anchors compose" a checked claim rather

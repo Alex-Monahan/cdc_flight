@@ -35,6 +35,7 @@ from . import faults as faults_mod
 from . import reconcile as reconcile_mod
 from . import recovery as recovery_mod
 from . import resnapshot as resnapshot_mod
+from . import table_lifecycle
 from .applier import Applier, ApplierConfig
 from .config import (
     CatalogConfig,
@@ -49,6 +50,14 @@ from .debezium_props import assert_no_internal_topic_collision, build_properties
 from .destination import CONTROL_SCHEMA, Lease
 from .errors import EngineFailure
 from .faults import validate_env as validate_fault_env
+from .machines import (
+    PHASE_RECONCILING,
+    PHASE_RECOVERING,
+    PHASE_SNAPSHOTTING,
+    PHASE_STOPPING,
+    PHASE_STREAMING,
+)
+from .run_state import RunPhaseWriter
 from .source_health import SourceHealth
 from .supervisor import run_engine_bounded
 
@@ -103,7 +112,7 @@ def _captured_tables(con, pipeline: str, source, replication) -> list[tuple[str,
 
 
 def _resume_any_journalled_recovery(
-    con, *, source, replication, dest, namespace: str
+    con, *, source, replication, dest, namespace: str, phases=None
 ) -> tuple:
     """Finish a recovery an earlier process left half-done, BEFORE anything else looks.
 
@@ -118,6 +127,8 @@ def _resume_any_journalled_recovery(
     record = recovery_mod.read(con, pipeline=dest.pipeline_name, namespace=namespace)
     if record is None:
         return None, None
+    if phases is not None:
+        phases.ensure(PHASE_RECOVERING, detail=f"journal {record.recovery_id} at {record.phase}")
     if record.phase == recovery_mod.PHASE_ARMED:
         log.warning(
             "resuming rubric 1.8 recovery %s (%s): the destructive phase is complete "
@@ -320,9 +331,20 @@ def run(
     summary_extra: dict = {}
     lease: Lease | None = None
     lease_held = False
+    phases: RunPhaseWriter | None = None
+    run_ok = False
+    #: What the run concluded, handed to the terminal `RUN_PHASE` transition so
+    #: `heartbeat.terminal_reason` says something. `RunOutcome` refuses a downgrade, so
+    #: a later, less severe reason cannot overwrite an earlier diagnosis here either.
+    terminal_reason: str | None = None
     try:
         dest_mod.ensure_control_schema(con)
         dest_mod.ensure_dataset(con, dest.dataset_name)
+        # rubric 1.9 / ADR §4.8: one `_cdc_flight.heartbeat` row per run, moved through
+        # the `RUN_PHASE` machine on its OWN connection. "Where is this run" stops being
+        # a source-line position in a 470-line function and becomes a query. The
+        # periodic liveness/lag writer is still 4.4/6.1's.
+        phases = RunPhaseWriter(con, pipeline=dest.pipeline_name, runner_id=runner_id)
 
         if reset_state:
             # WHY THIS ONE IS NOT JOURNALLED (architecture review, finding 4). It is the
@@ -367,12 +389,10 @@ def run(
             # `_compare` skips a name it has no oid for and does not believe is
             # replicated - so its stale destination table survives for ever and
             # detection is disabled for it (Opus MAJOR-4, measured). What "start over"
-            # has to reset is the *snapshot* bookkeeping, which is what this does.
-            con.execute(
-                f"UPDATE {CONTROL_SCHEMA}.table_state SET snapshot_state = 'none', "
-                "snapshot_epoch = 0, snapshot_lsn = NULL, last_commit_id = NULL "
-                "WHERE pipeline = ?",
-                [dest.pipeline_name],
+            # has to reset is the *snapshot* bookkeeping, which is what this does -
+            # through `TableLifecycle`, so even the operator tool takes declared edges.
+            table_lifecycle.reset_all(
+                con, pipeline=dest.pipeline_name, reason="--reset-state"
             )
             con.execute(
                 f"DELETE FROM {CONTROL_SCHEMA}.lease WHERE pipeline = ?",
@@ -423,11 +443,13 @@ def run(
         # able from a fresh problem, and the Flight used to diagnose its own half-done
         # work as an operator error and refuse for ever (Codex B3 / Opus MAJOR-1).
         journal, resumed = _resume_any_journalled_recovery(
-            con, source=source, replication=replication, dest=dest, namespace=namespace
+            con, source=source, replication=replication, dest=dest, namespace=namespace,
+            phases=phases,
         )
         if resumed is not None:
             summary_extra["recovery_resumed"] = resumed
 
+        phases.ensure(PHASE_RECONCILING)
         captured_tables = _captured_tables(con, dest.pipeline_name, source, replication)
         verdict, recovery = _check_the_slot(
             con,
@@ -446,6 +468,7 @@ def run(
         )
         summary_extra["slot_check"] = verdict.as_dict()
         if recovery is not None:
+            phases.to(PHASE_RECOVERING, detail=verdict.decision)
             summary_extra["slot_recovery"] = recovery
             journal = recovery_mod.read(
                 con, pipeline=dest.pipeline_name, namespace=namespace
@@ -471,6 +494,7 @@ def run(
                 )
             summary_extra["recovery_journal"] = journal.as_dict()
 
+        phases.ensure(PHASE_RECONCILING)
         outcome = reconcile_mod.reconcile(
             con,
             pipeline=dest.pipeline_name,
@@ -610,6 +634,7 @@ def run(
                 dict(summary_extra),
             )
         if owed and not will_snapshot_everything and resnapshot_enabled():
+            phases.to(PHASE_SNAPSHOTTING, detail=f"{len(owed)} table(s) owed")
             resnap = resnapshot_mod.run(
                 con,
                 source=source,
@@ -744,11 +769,13 @@ def run(
 
         terminating_modes = {"initial_only", "recovery_only"}
         try:
+            phases.to(PHASE_STREAMING)
             result = run_engine_bounded(
                 engine, applier, run_cfg, health,
                 engine_terminates_normally=props["snapshot.mode"] in terminating_modes,
                 catalog=watcher,
                 catalog_drain_seconds=catalog_cfg.drain_seconds,
+                phases=phases,
             )
             summary_extra["invariant_o_end"] = reconcile_mod.check_invariant_o(
                 con, pipeline=dest.pipeline_name, namespace=namespace,
@@ -788,8 +815,13 @@ def run(
                     )
                 else:
                     summary_extra["recovery_still_armed"] = journal.recovery_id
+            run_ok = bool(result.get("ok"))
+            terminal_reason = result.get("stop_reason") or terminal_reason
+            summary_extra.update(phases.summary())
             return _decorate(result)
         except EngineFailure as failure:
+            terminal_reason = failure.summary.get("stop_reason") or "engine_error"
+            summary_extra.update(phases.summary())
             _decorate(failure.summary)
             raise
         finally:
@@ -802,8 +834,22 @@ def run(
         # destination state and must not race a second runner - so releasing it has to
         # move out here with it. `lease_held` rather than `lease is not None`: a run that
         # failed to acquire must not delete the incumbent's row.
+        # Guarded, all of it: this is the outermost `finally`, and an observability
+        # write that raises here would replace the run's real failure with a
+        # bookkeeping one.
+        if phases is not None:
+            try:
+                phases.ensure(PHASE_STOPPING)
+            except Exception:  # pragma: no cover - every phase declares `-> stopping`
+                log.error("could not record the stopping phase", exc_info=True)
         if lease_held and lease is not None:
             lease.release(con)
+        if phases is not None:
+            try:
+                phases.finish(ok=run_ok, reason=terminal_reason)
+            except Exception:  # pragma: no cover
+                log.error("could not record the terminal run phase", exc_info=True)
+            phases.close()
         try:
             con.close()
         except Exception:  # pragma: no cover

@@ -357,13 +357,22 @@ def test_a_table_left_mid_snapshot_is_owed_work_after_ANY_crash(world):
     The consequence was concrete: the recovery journal's "no table owes a snapshot any
     more" test could pass, and the run could log "recovery COMPLETE: every captured
     table has a fresh image", over a table that was half built.
+
+    Rubric 1.9 closed the *class* as well as the case: `tables_awaiting_snapshot()` now
+    selects every NON-TERMINAL `TableLifecycle` state rather than the one literal value,
+    so the queue is complete even for a run that never called the promotion. The
+    promotion still runs at start-up, because "owed and mid-snapshot" and "owed" should
+    not be two different durable answers to the same question.
     """
     world.con.execute(
         "UPDATE _cdc_flight.table_state SET snapshot_state = 'in_progress' "
         "WHERE pipeline = ? AND source_table = 'orders'",
         [PIPELINE],
     )
-    assert world.owed == [], "this is the gap: no durable queue selected it"
+    assert world.owed == ["app.orders"], (
+        "the queue selects every non-terminal lifecycle state; it used to select only "
+        "`awaiting_snapshot`, which is how a half-snapshotted table belonged to no queue"
+    )
 
     promoted = dest_mod.promote_interrupted_snapshots(world.con, PIPELINE)
     assert promoted == ["app.orders"]

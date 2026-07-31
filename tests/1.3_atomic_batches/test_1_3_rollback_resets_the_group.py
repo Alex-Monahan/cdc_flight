@@ -24,6 +24,12 @@ destination probe answer "no row here" unconditionally.
 
 The ADR's own rule is that a rolled-back group replays *from the source*. These tests
 pin that this is true of the process as well as of the offset store.
+
+**Rubric 1.9 made the defect unrepresentable rather than merely fixed.** The sixteen
+fields are now one `applier.OpenGroup`, created at BEGIN and *replaced* at COMMIT and at
+ROLLBACK, so "reset five of them and forget the other nine" is not something anybody can
+write. These assertions therefore read against `applier.group` — and the strongest of
+them is that the object itself is a different one.
 """
 
 from __future__ import annotations
@@ -102,9 +108,10 @@ def test_a_rolled_back_group_is_not_folded_a_second_time(lab, monkeypatch, point
     faults.refresh()
 
     assert state(box) == [(1, "a"), (2, "b")], "the rollback left the old state"
-    assert box.applier._group == [], "the failed group must not stay buffered"
-    assert box.applier._created_in_txn == set()
-    assert box.applier._spill_commit_id is None
+    assert box.applier.group.units == [], "the failed group must not stay buffered"
+    assert box.applier.group.created_in_txn == set()
+    assert box.applier.group.spill_commit_id is None
+    assert box.applier.group.txn_open is False
 
     # Debezium replays the transaction from the durable resume point.
     box.run(permutation("2", 200))
@@ -134,6 +141,34 @@ def test_a_rolled_back_group_does_not_contaminate_a_different_transaction(lab, m
     # would resume from still precedes transaction 2 - which is why the *first*
     # assertion is the one that matters: the fold of transaction 3 was clean.
     assert box.applier.fenced_units == 0
+
+
+def test_the_rolled_back_group_object_is_replaced_not_edited(lab, monkeypatch):
+    """The 1.9 claim: a partially-reset group has no representation.
+
+    Not "every field was reset" — that is the assertion that was true of the success
+    path and false of the failure path for a whole review round. The object identity is
+    the thing: whatever the discarded group held, nothing holds it now.
+    """
+    box = lab()
+    preload(box)
+    before = box.applier.group
+    nth = box.applier.data_commit_groups + 1
+    monkeypatch.setenv("CDC_FAULT_INJECT", f"pre_commit:{nth}:raise")
+    faults.refresh()
+    with pytest.raises(faults.InjectedFault):
+        box.run(permutation("2", 200))
+    monkeypatch.delenv("CDC_FAULT_INJECT")
+    faults.refresh()
+    assert box.applier.group is not before
+    # And a fresh one, field for field, without anybody having enumerated the fields.
+    from cdc_flight.applier import OpenGroup
+
+    fresh = OpenGroup()
+    for name in fresh.__dataclass_fields__:
+        if name == "opened_at":
+            continue  # a timestamp; "is a fresh one" is the assertion above
+        assert getattr(box.applier.group, name) == getattr(fresh, name), name
 
 
 def test_the_deferral_of_a_failed_group_is_counted(lab, monkeypatch):
@@ -166,7 +201,7 @@ def test_a_rolled_back_group_that_created_a_table_does_not_skip_the_merge(lab, m
         box.run(txn("1", [insert("1", 1, 10, 1, "a")]))
     monkeypatch.delenv("CDC_FAULT_INJECT")
     faults.refresh()
-    assert box.applier._created_in_txn == set()
+    assert box.applier.group.created_in_txn == set()
     assert not box.exists(TABLE)
 
     box.run(txn("1", [insert("1", 1, 10, 1, "a")]))

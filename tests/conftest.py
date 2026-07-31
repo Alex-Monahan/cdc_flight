@@ -74,8 +74,10 @@ def _reset_fault_spec():
     from cdc_flight import faults
 
     faults.refresh()
+    faults.reset_arrivals()
     yield
     faults.refresh()
+    faults.reset_arrivals()
 
 
 # --------------------------------------------------------------------------- #

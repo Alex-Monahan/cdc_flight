@@ -20,8 +20,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from . import faults, table_lifecycle
 from .control_schema import CONTROL_DDL, ensure_control_schema
 from .errors import LeaseLost
+from .machines import LIFECYCLE_DURABLE_VALUES
 from .naming import quote
 
 __all__ = ["CONTROL_DDL", "ensure_control_schema"]
@@ -42,28 +44,35 @@ AWAITING_SNAPSHOT = "awaiting_snapshot"
 #: failed` and the value the whole re-snapshot machinery runs on - `awaiting_snapshot` -
 #: was not in the declared domain, while `failed` was declared and never written by
 #: anything. Nothing validated a read, so a typo anywhere would have produced a state
-#: that silently belongs to no queue (architecture review, finding 2). The set is now
-#: here, `failed` is gone because nothing writes it, and reads are validated.
-SNAPSHOT_NONE = "none"
-SNAPSHOT_IN_PROGRESS = "in_progress"
-SNAPSHOT_COMPLETE = "complete"
-SNAPSHOT_STATES = frozenset(
-    {SNAPSHOT_NONE, SNAPSHOT_IN_PROGRESS, SNAPSHOT_COMPLETE, AWAITING_SNAPSHOT}
-)
+#: that silently belongs to no queue (architecture review, finding 2).
+#:
+#: The domain, the legal edges and the writers now live in `cdc_flight.table_lifecycle`
+#: (rubric 1.9, ADR §20/A55); these names are re-exported so the existing call sites and
+#: test literals keep reading as they did.
+SNAPSHOT_NONE = table_lifecycle.NONE
+SNAPSHOT_IN_PROGRESS = table_lifecycle.IN_PROGRESS
+SNAPSHOT_COMPLETE = table_lifecycle.COMPLETE
+SNAPSHOT_STATES = LIFECYCLE_DURABLE_VALUES
 
 #: States that mean "this table does not hold a trustworthy image of the source".
 #: `in_progress` is in here and that is the whole point: it is durable, it is NOT
 #: terminal, and until now no durable query selected it, so a table whose snapshot was
 #: interrupted by anything the `except BaseException` handler cannot catch - `os._exit`,
 #: `SIGKILL`, the commit watchdog - was invisible to every queue and to the recovery
-#: journal's "is the rebuild finished?" test (architecture review, finding 1).
-SNAPSHOT_STATES_OWING_WORK = frozenset({AWAITING_SNAPSHOT, SNAPSHOT_IN_PROGRESS})
+#: journal's "is the rebuild finished?" test (architecture review, finding 1). It is now
+#: DERIVED from the machine's terminal set rather than restated as a second literal.
+SNAPSHOT_STATES_OWING_WORK = table_lifecycle.OWING_WORK
 
 #: How long a lease write may keep retrying a write-write conflict, and how long it
 #: waits between attempts. See `Lease._write` - this exists because a hard crash
 #: leaves an abandoned MotherDuck transaction holding the lease row.
 LEASE_CONFLICT_BUDGET_SEC = 30.0
 LEASE_CONFLICT_RETRY_SEC = 1.0
+
+#: How many times this process has queued a table rebuild - rubric 1.7's `<nth>` for
+#: the `table_rebuild_queued` anchor.
+def _queueing() -> int:
+    return faults.arrival("table_rebuild_queued")
 
 
 # --------------------------------------------------------------------------- #
@@ -347,11 +356,17 @@ def forget_source_relation(con, *, pipeline: str, source_schema: str, source_tab
     )
 
 
-def forget_table_state(con, *, pipeline: str, source_schema: str, source_table: str) -> None:
-    con.execute(
-        f"DELETE FROM {CONTROL_SCHEMA}.table_state "
-        "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
-        [pipeline, source_schema, source_table],
+def forget_table_state(
+    con, *, pipeline: str, source_schema: str, source_table: str, alerts=None
+) -> None:
+    """The source relation is gone: `TableLifecycle -> absent` (rubric 1.9)."""
+    table_lifecycle.forget(
+        con,
+        pipeline=pipeline,
+        source_schema=source_schema,
+        source_table=source_table,
+        reason="the source relation was dropped (rubric 1.5)",
+        alerts=alerts,
     )
 
 
@@ -534,13 +549,19 @@ def tables_awaiting_snapshot(con, pipeline: str) -> list[tuple[str, str, str]]:
     and rubric 1.8's recovery both write into. Ordered so a re-snapshot is
     deterministic and its logs are diffable.
 
-    `promote_interrupted_snapshots()` is what makes this queue complete: run it once at
-    start-up and every durable non-terminal state is in here.
+    **The queue selects every NON-TERMINAL lifecycle state**, not only
+    `awaiting_snapshot` (rubric 1.9). `in_progress` is durable and non-terminal, and
+    selecting only the one value meant a table a hard crash left half-snapshotted was in
+    no queue at all. `promote_interrupted_snapshots()` still runs at start-up and is
+    still the right thing to do — it makes the state honest rather than merely
+    selected — but the queue no longer *depends* on somebody having called it.
     """
+    placeholders = ", ".join("?" for _ in SNAPSHOT_STATES_OWING_WORK)
     rows = con.execute(
         f"SELECT source_schema, source_table, target_table FROM {CONTROL_SCHEMA}.table_state "
-        "WHERE pipeline = ? AND snapshot_state = ? ORDER BY source_schema, source_table",
-        [pipeline, AWAITING_SNAPSHOT],
+        f"WHERE pipeline = ? AND snapshot_state IN ({placeholders}) "
+        "ORDER BY source_schema, source_table",
+        [pipeline, *sorted(SNAPSHOT_STATES_OWING_WORK)],
     ).fetchall()
     return [(str(a), str(b), str(c)) for a, b, c in rows]
 
@@ -548,25 +569,10 @@ def tables_awaiting_snapshot(con, pipeline: str) -> list[tuple[str, str, str]]:
 def read_snapshot_states(con, pipeline: str) -> dict[str, str]:
     """`"<schema>.<table>" -> snapshot_state`, VALIDATED against the frozen domain.
 
-    A state outside `SNAPSHOT_STATES` is a bug in whatever wrote it, and the honest
-    response is a loud failure rather than a table that quietly belongs to no queue.
+    A state outside the domain is a bug in whatever wrote it, and the honest response is
+    a loud failure rather than a table that quietly belongs to no queue.
     """
-    out: dict[str, str] = {}
-    for schema, table, state in con.execute(
-        f"SELECT source_schema, source_table, snapshot_state FROM "
-        f"{CONTROL_SCHEMA}.table_state WHERE pipeline = ?",
-        [pipeline],
-    ).fetchall():
-        value = str(state)
-        if value not in SNAPSHOT_STATES:
-            raise ValueError(
-                f"{CONTROL_SCHEMA}.table_state for {schema}.{table} carries "
-                f"snapshot_state={value!r}, which is not one of {sorted(SNAPSHOT_STATES)}. "
-                "A state outside the frozen domain belongs to no queue and no recovery "
-                "path, so it is refused rather than skipped (ADR 0001 §4.8)."
-            )
-        out[f"{schema}.{table}"] = value
-    return out
+    return table_lifecycle.read_all(con, pipeline)
 
 
 def promote_interrupted_snapshots(con, pipeline: str) -> list[str]:
@@ -585,23 +591,18 @@ def promote_interrupted_snapshots(con, pipeline: str) -> list[str]:
     previous process died inside one. Promoting it to `awaiting_snapshot` is what makes
     that discoverable from durable state alone, after ANY crash.
     """
-    rows = con.execute(
-        f"SELECT source_schema, source_table FROM {CONTROL_SCHEMA}.table_state "
-        "WHERE pipeline = ? AND snapshot_state = ? ORDER BY source_schema, source_table",
-        [pipeline, SNAPSHOT_IN_PROGRESS],
-    ).fetchall()
-    if not rows:
-        return []
-    con.execute(
-        f"UPDATE {CONTROL_SCHEMA}.table_state SET snapshot_state = ? "
-        "WHERE pipeline = ? AND snapshot_state = ?",
-        [AWAITING_SNAPSHOT, pipeline, SNAPSHOT_IN_PROGRESS],
+    names = table_lifecycle.transition_all(
+        con,
+        pipeline=pipeline,
+        frm=SNAPSHOT_IN_PROGRESS,
+        to=AWAITING_SNAPSHOT,
+        reason="a previous process died inside this table's snapshot",
     )
-    names = [f"{a}.{b}" for a, b in rows]
-    log.warning(
-        "%s table(s) were left mid-snapshot by an earlier process and are now marked "
-        "awaiting_snapshot: %s", len(names), ", ".join(names),
-    )
+    if names:
+        log.warning(
+            "%s table(s) were left mid-snapshot by an earlier process and are now marked "
+            "awaiting_snapshot: %s", len(names), ", ".join(names),
+        )
     return names
 
 
@@ -619,22 +620,23 @@ def request_snapshot(
     `len(tables)` unconditionally and the test asserting on it restated its own
     configuration (Opus MINOR-1).
     """
+    # rubric 1.7: the durable to-do list is being written. A crash here must leave
+    # either "nothing is owed" or "these tables are owed" and never a half-written
+    # queue that a journal claims to explain - which is why `recovery.begin` wraps this
+    # and the journal INSERT in one transaction.
+    faults.maybe_crash("table_rebuild_queued", _queueing())
     for schema, table, target in tables:
-        con.execute(
-            f"UPDATE {CONTROL_SCHEMA}.table_state SET snapshot_state = ? "
-            "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
-            [AWAITING_SNAPSHOT, pipeline, schema, table],
+        # One call: `absent -> awaiting_snapshot` (INSERT) and `x -> awaiting_snapshot`
+        # (UPDATE) are the same declared edge set, and the machine picks the statement.
+        table_lifecycle.transition(
+            con,
+            pipeline=pipeline,
+            source_schema=schema,
+            source_table=table,
+            to=AWAITING_SNAPSHOT,
+            reason=detail,
+            target_table=target,
         )
-        existing = con.execute(
-            f"SELECT 1 FROM {CONTROL_SCHEMA}.table_state "
-            "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
-            [pipeline, schema, table],
-        ).fetchall()
-        if not existing:
-            mark_awaiting_snapshot(
-                con, pipeline=pipeline, source_schema=schema, source_table=table,
-                target_table=target, state=AWAITING_SNAPSHOT,
-            )
     marked = 0
     for schema, table, _target in tables:
         rows = con.execute(
@@ -700,16 +702,17 @@ def mark_awaiting_snapshot(
     incomplete. So the row survives the drop carrying `snapshot_state` — the run
     summary and `inspect` surface it, and rubric 2.3/3.4's re-snapshot clears it.
     """
-    con.execute(
-        f"DELETE FROM {CONTROL_SCHEMA}.table_state "
-        "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
-        [pipeline, source_schema, source_table],
-    )
-    con.execute(
-        f"INSERT INTO {CONTROL_SCHEMA}.table_state "
-        "(pipeline, source_schema, source_table, target_table, snapshot_state) "
-        "VALUES (?,?,?,?,?)",
-        [pipeline, source_schema, source_table, target_table, state],
+    table_lifecycle.transition(
+        con,
+        pipeline=pipeline,
+        source_schema=source_schema,
+        source_table=source_table,
+        to=state,
+        reason="the source relation was replaced; the destination rows are a different relation's",
+        target_table=target_table,
+        # The row's identity is being re-established against a relation that is not the
+        # one it described, so the snapshot bookkeeping goes with it.
+        replace=True,
     )
 
 
@@ -729,18 +732,23 @@ def register_table(
     while the pipeline was down left an orphan destination table that no later poll
     could ever report — `_compare` skips a name it has no oid for and does not believe
     is ours. Written by whoever creates the table, whatever the origin.
+
+    `absent -> none` and nothing else: a table that already has a row is already
+    registered, and re-registering it would overwrite whatever lifecycle state it is
+    genuinely in (a re-snapshot in flight, a rebuild owed) with "never snapshotted".
     """
-    existing = con.execute(
-        f"SELECT 1 FROM {CONTROL_SCHEMA}.table_state "
-        "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
-        [pipeline, source_schema, source_table],
-    ).fetchall()
-    if existing:
+    if table_lifecycle.read(
+        con, pipeline=pipeline, source_schema=source_schema, source_table=source_table
+    ) != table_lifecycle.ABSENT:
         return
-    con.execute(
-        f"INSERT INTO {CONTROL_SCHEMA}.table_state "
-        "(pipeline, source_schema, source_table, target_table) VALUES (?,?,?,?)",
-        [pipeline, source_schema, source_table, target_table],
+    table_lifecycle.transition(
+        con,
+        pipeline=pipeline,
+        source_schema=source_schema,
+        source_table=source_table,
+        to=table_lifecycle.NONE,
+        reason="a destination table was materialised for this relation",
+        target_table=target_table,
     )
 
 

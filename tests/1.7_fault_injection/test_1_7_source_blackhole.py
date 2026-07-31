@@ -165,7 +165,10 @@ def test_unknown_after_a_working_sampler_forbids_idle():
         "an unreachable source that was reachable a moment ago is a source outage, "
         "not a reason to declare the stream idle (TODO 4.6(b))"
     )
+    # A source that WAS answering and stopped: still `unknown`, and distinct from the
+    # never-sampled case below — which is the whole point of the declared domain.
     assert health.summary()["slot_health"] == "unknown"
+    assert health.state() == "unknown"
 
 
 def test_a_sampler_that_never_worked_stays_fail_soft():
@@ -180,7 +183,14 @@ def test_a_sampler_that_never_worked_stays_fail_soft():
         "a source that could never be consulted must degrade to timer-only idle "
         "detection rather than turning every run into a --max-seconds wait"
     )
-    assert health.summary()["slot_health"] == "unknown"
+    # rubric 1.9: the summary now carries the DECLARED classification, and this is the
+    # state that never had a name — A51 row 50's fail-open. It used to read `unknown`,
+    # which is the same word for "the source stopped answering" (a failure) and "we
+    # could never ask" (a degradation), and an operator had to read `slot_ever_sampled`
+    # in the next key to tell them apart.
+    assert health.summary()["slot_health"] == "unknown_never_sampled"
+    assert health.summary()["slot_ever_sampled"] is False
+    assert health.state() == "unknown_never_sampled"
 
 
 def test_unknown_is_reported_as_time_not_streaming():

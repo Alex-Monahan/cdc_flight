@@ -197,16 +197,24 @@ CONTROL_DDL = [
         )""",
     # ADR §4.8 / D9.1 declared this table and nothing ever created it, so the
     # observability surface rubrics 4.5/4.6/6.1/6.2 are scored against did not exist
-    # (architecture review, finding 5). The run-phase writer belongs to 4.4/6.1 and is
-    # not here; creating the table now means that task lands a writer rather than a
-    # migration, and an operator querying for it gets an empty table rather than an
-    # error. Written on a SEPARATE connection when it is written, deliberately outside
-    # the commit group: an observability signal must survive a rolled-back apply.
+    # (architecture review, finding 5). Rubric 1.9 adds the **run-phase** writer
+    # (`cdc_flight.run_state`), which moves one row per run through the `RUN_PHASE`
+    # machine; the periodic liveness/lag writer and the source-side WAL heartbeat are
+    # still 4.4/6.1's, with their own cadence. Written on a SEPARATE connection,
+    # deliberately outside the commit group: an observability signal must survive a
+    # rolled-back apply, and it must never lengthen the commit->ack window.
+    #
+    # `phase` is validated against `machines.RUN_PHASE`; `terminal_reason` against
+    # `machines.RUN_OUTCOME`, whose precedence is why a symptom cannot overwrite a
+    # diagnosis (A49).
     f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.heartbeat (
             pipeline                 VARCHAR     NOT NULL,
             runner_id                VARCHAR     NOT NULL,
             beat_at                  TIMESTAMPTZ NOT NULL,
             phase                    VARCHAR     NOT NULL,
+            phase_since              TIMESTAMPTZ,
+            terminal_reason          VARCHAR,
+            phase_history            VARCHAR,
             last_event_at            TIMESTAMPTZ,
             last_commit_id           BIGINT,
             last_commit_at           TIMESTAMPTZ,
@@ -241,10 +249,50 @@ _COMMIT_LOG_COLUMNS = (
 )
 
 
+#: Columns added to `heartbeat` after it first shipped. `CREATE TABLE IF NOT EXISTS`
+#: cannot add a column, and the table was created (empty, writer-less) one round ago, so
+#: a destination that already has it - including the shared MotherDuck development
+#: database - would otherwise reject every run-phase write with "column not found".
+_HEARTBEAT_ADDED_COLUMNS = (
+    ("phase_since", "TIMESTAMPTZ"),
+    ("terminal_reason", "VARCHAR"),
+    ("phase_history", "VARCHAR"),
+)
+
+
 def ensure_control_schema(con) -> None:
     _migrate_commit_log_key(con)
     for statement in CONTROL_DDL:
         con.execute(statement)
+    _migrate_heartbeat_columns(con)
+
+
+def _migrate_heartbeat_columns(con) -> None:
+    """Add the run-phase columns to an already-created `heartbeat`. Idempotent."""
+    try:
+        existing = {
+            str(row[0])
+            for row in con.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = ? AND table_name = 'heartbeat'",
+                [CONTROL_SCHEMA],
+            ).fetchall()
+        }
+    except Exception:  # pragma: no cover - a destination without information_schema
+        log.debug("could not read heartbeat columns", exc_info=True)
+        return
+    if not existing:
+        return
+    for column, sql_type in _HEARTBEAT_ADDED_COLUMNS:
+        if column in existing:
+            continue
+        log.warning("adding %s.heartbeat.%s", CONTROL_SCHEMA, column)
+        try:
+            con.execute(
+                f"ALTER TABLE {CONTROL_SCHEMA}.heartbeat ADD COLUMN {column} {sql_type}"
+            )
+        except Exception:  # pragma: no cover - a concurrent runner won the race
+            log.debug("could not add heartbeat.%s", column, exc_info=True)
 
 
 def _commit_log_primary_key(con) -> tuple[str, ...] | None:

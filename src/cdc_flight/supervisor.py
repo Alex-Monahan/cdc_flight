@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING
 from .applier import Applier
 from .config import RunConfig
 from .errors import EngineFailure
+from .machines import PHASE_DRAINING
+from .run_state import RunOutcome
 from .source_health import SourceHealth
 
 if TYPE_CHECKING:  # `engine` imports pydbzengine, which boots a JVM on import.
@@ -38,6 +40,7 @@ def run_engine_bounded(
     catalog=None,
     catalog_drain_seconds: float = 30.0,
     stop_when=None,
+    phases=None,
 ) -> dict:
     """Run the Debezium engine until the *source* agrees it is idle, or the deadline hits.
 
@@ -61,6 +64,19 @@ def run_engine_bounded(
     seconds" misleading. A change that is still unresolved when the barrier expires
     makes the run **non-successful**: the destination is knowingly out of step with the
     source, and reporting `ok: true` on that is not honest.
+
+    **The outcome is a `RunOutcome`, not a string** (rubric 1.9). It used to be assigned
+    by plain `=` in eight places including inside the `finally` below, with the
+    cause-before-symptom rule written out as `if stop_reason not in ("source_dark",
+    "engine_error")` — twice. A49 measured what that costs: a dark source makes
+    `engine.close()` hang almost by definition, so the `finally` replaced the diagnosis
+    with the consequence and a blackholed Postgres was reported as `hung`. The
+    precedence is now declared once, in `machines.RUN_OUTCOME`, and a downgrade is an
+    edge that does not exist rather than a tuple somebody has to remember to extend.
+
+    `phases` is an optional `run_state.RunPhaseWriter`: the supervisor owns exactly one
+    phase transition, `streaming -> draining`, because this is the only place that knows
+    when the engine stopped producing and started shutting down.
     """
     started = time.monotonic()
     error_box: list[BaseException] = []
@@ -77,7 +93,9 @@ def run_engine_bounded(
     thread = threading.Thread(target=_run, name="debezium-engine", daemon=True)
     thread.start()
 
-    stop_reason = "max_seconds"
+    # rubric 1.9: a precedence, not a string. `record()` keeps the most severe value it
+    # has been given, so no later assignment can overwrite an earlier diagnosis.
+    outcome = RunOutcome("max_seconds")
     idle_blocked_by_source = 0
     source_dark_after: float | None = None
     close_hung = False
@@ -85,10 +103,10 @@ def run_engine_bounded(
         while thread.is_alive():
             elapsed = time.monotonic() - started
             if elapsed >= run.max_seconds:
-                stop_reason = "max_seconds"
+                outcome.record("max_seconds")
                 break
             if error_box or engine.failure is not None:
-                stop_reason = "engine_error"
+                outcome.record("engine_error")
                 break
             # TODO 4.6(b): a source that was answering and has gone completely dark
             # is a failure with a bounded detection time, not something to discover
@@ -101,7 +119,7 @@ def run_engine_bounded(
                 and health.ever_sampled
                 and health.unknown_for >= run.source_dark_seconds
             ):
-                stop_reason = "source_dark"
+                outcome.record("source_dark")
                 source_dark_after = round(elapsed, 2)
                 break
             # An explicit "the work this engine was started for is done" signal. Only
@@ -110,7 +128,7 @@ def run_engine_bounded(
             # would add `--idle-seconds` to every recovery for nothing. Checked with the
             # applier NOT busy so a group in flight is never abandoned.
             if stop_when is not None and not handler.busy and stop_when():
-                stop_reason = "work_done"
+                outcome.record("work_done")
                 break
             enough = handler.record_count >= run.min_records
             quiet = handler.seconds_since_last_batch >= run.idle_seconds
@@ -145,7 +163,7 @@ def run_engine_bounded(
                         time.sleep(0.25)
                         continue
                     catalog_unresolved = unresolved
-                    stop_reason = "idle"
+                    outcome.record("idle")
                     break
                 idle_blocked_by_source += 1
                 if idle_blocked_by_source % 20 == 1:
@@ -156,10 +174,27 @@ def run_engine_bounded(
                     )
             time.sleep(0.25)
         else:
-            stop_reason = "engine_finished"
+            outcome.record("engine_finished")
     finally:
-        intentional = stop_reason != "engine_error" and handler.error is None and not error_box
-        log.info("closing debezium engine (reason=%s, intentional=%s)", stop_reason, intentional)
+        intentional = (
+            outcome.value != "engine_error" and handler.error is None and not error_box
+        )
+        log.info(
+            "closing debezium engine (reason=%s, intentional=%s)", outcome.value, intentional
+        )
+        if phases is not None:
+            # The one phase transition the supervisor owns: the engine has stopped
+            # producing and is being shut down. Written on the heartbeat's own
+            # connection, never inside a commit group.
+            #
+            # Guarded because this is a `finally`: an exception raised here would
+            # REPLACE whatever failure is already in flight, and an observability write
+            # must never be able to do that. The machine still records the illegal edge
+            # in the log, where a test can find it.
+            try:
+                phases.to(PHASE_DRAINING, detail=f"stop_reason={outcome.value}")
+            except Exception:  # pragma: no cover - the edge is declared
+                log.error("could not record the draining phase", exc_info=True)
 
         closer = threading.Thread(
             target=engine.close,
@@ -177,14 +212,12 @@ def run_engine_bounded(
             # socket that will never answer - and overwriting `source_dark` with `hung`
             # reported the consequence and lost the diagnosis. The same principle the
             # error path already applies to `EngineFailure`'s cause ordering.
-            if stop_reason not in ("source_dark", "engine_error"):
-                stop_reason = "hung"
+            outcome.record("hung")
         thread.join(timeout=60)
         if thread.is_alive():
             log.error("debezium engine thread did not stop within 60s")
             close_hung = True
-            if stop_reason not in ("source_dark", "engine_error"):
-                stop_reason = "hung"
+            outcome.record("hung")
         # ADR 0001 §3.2: the un-ENDed tail is DISCARDED, never guessed at. It is
         # safe to discard precisely because Invariant O means the offset store
         # still points before it, so it replays on the next run.
@@ -193,7 +226,7 @@ def run_engine_bounded(
             log.info("discarded %s un-committed tail events at shutdown", discarded)
 
     summary = {
-        "stop_reason": stop_reason,
+        "stop_reason": outcome.value,
         "elapsed_sec": round(time.monotonic() - started, 2),
         "records": handler.record_count,
         "batches": handler.batch_count,
@@ -235,13 +268,14 @@ def run_engine_bounded(
         if failure is not None:
             parts.append(f"debezium engine: {failure}")
         message = " | ".join(parts) or "the engine failed without a message"
-        summary["stop_reason"] = "engine_error"
+        outcome.record("engine_error")
+        summary["stop_reason"] = outcome.value
         raise EngineFailure(message, summary) from cause
 
-    if stop_reason == "hung":
+    if outcome.value == "hung":
         raise EngineFailure("debezium engine thread did not stop within 60s", summary)
 
-    if stop_reason == "source_dark":
+    if outcome.value == "source_dark":
         raise EngineFailure(
             f"the source has been unreachable for {health.unknown_for:.1f}s "
             f"({health.summary()}); the delivery cannot be shown to be complete, so "
@@ -249,7 +283,7 @@ def run_engine_bounded(
             summary,
         )
 
-    if stop_reason == "engine_finished" and not engine_terminates_normally:
+    if outcome.value == "engine_finished" and not engine_terminates_normally:
         raise EngineFailure(
             "the Debezium engine terminated before the supervisor requested a stop "
             f"(completion success={engine.completed_success}); in streaming mode "
@@ -257,7 +291,7 @@ def run_engine_bounded(
             summary,
         )
 
-    if health is not None and stop_reason == "max_seconds":
+    if health is not None and outcome.value == "max_seconds":
         not_streaming_for = health.not_streaming_for
         if not_streaming_for >= run.idle_seconds:
             raise EngineFailure(
@@ -280,7 +314,8 @@ def run_engine_bounded(
         still_pending = [c.qualified for c in catalog.pending_destructive()]
         if still_pending or catalog_unresolved:
             names = sorted(set(still_pending) | set(catalog_unresolved))
-            summary["stop_reason"] = "catalog_unresolved"
+            outcome.record("catalog_unresolved")
+            summary["stop_reason"] = outcome.value
             summary["catalog_unresolved_tables"] = names
             # Codex 6: deferring is the correct *safety* choice - a destructive action
             # whose fence has not opened must not be guessed past - but it is not

@@ -115,6 +115,7 @@ from dataclasses import dataclass, field
 
 from . import destination as dest_mod
 from . import reconcile as reconcile_mod
+from . import table_lifecycle
 from .applier import Applier, ApplierConfig
 from .config import ReplicationConfig, RunConfig, SourceConfig
 from .debezium_props import build_properties
@@ -660,12 +661,10 @@ def _completed_tables(
     """
     done: list[str] = []
     for schema, table, target in tables:
-        rows = con.execute(
-            f"SELECT snapshot_state FROM {CONTROL_SCHEMA}.table_state "
-            "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
-            [pipeline, schema, table],
-        ).fetchall()
-        if rows and str(rows[0][0]) == "complete":
+        state = table_lifecycle.read(
+            con, pipeline=pipeline, source_schema=schema, source_table=table
+        )
+        if state == table_lifecycle.COMPLETE:
             con.execute(
                 f"UPDATE {CONTROL_SCHEMA}.table_state SET snapshot_lsn = ? "
                 "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
@@ -751,11 +750,18 @@ def finish_verified_empty_tables(
                     f"SELECT count(*) FROM {quote(dataset)}.{quote(target)}"
                 ).fetchone()[0]
                 con.execute(f"DELETE FROM {quote(dataset)}.{quote(target)}")
-            con.execute(
-                f"UPDATE {CONTROL_SCHEMA}.table_state SET snapshot_state = 'complete', "
-                "snapshot_lsn = ? WHERE pipeline = ? AND source_schema = ? "
-                "AND source_table = ?",
-                [consistent_lsn, pipeline, schema, table],
+            # rubric 1.9: `awaiting_snapshot -> complete` with no shadow to swap. It is
+            # a declared edge precisely because a table can be proven empty at the
+            # source; `none -> complete` is NOT declared, which is what keeps this path
+            # reachable only from the owed queue.
+            table_lifecycle.transition(
+                con,
+                pipeline=pipeline,
+                source_schema=schema,
+                source_table=table,
+                to=table_lifecycle.COMPLETE,
+                reason="verified empty at the source; the destination table was emptied",
+                snapshot_lsn=consistent_lsn,
             )
             dest_mod.write_table_event(
                 con,

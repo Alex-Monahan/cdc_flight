@@ -202,9 +202,12 @@ Measured on an M-series Mac. Only executed runs are reported here; see
 
 | suite | result | wall clock | measured |
 |---|---|---|---|
-| `make test` (local only) | **441 passed, 0 xfail** | **526 s** (8:46) | 2026-07-31, after the 1.6-1.8 review round |
-| `make test-slow` | **78 passed** | **1 066 s** (17:45) | 2026-07-31, after the 1.6-1.8 review round |
-| `make test-md` | **22 passed** | **291 s** (4:50) | 2026-07-31, after the 1.6-1.8 review round |
+| `make test` (local only) | **529 passed, 0 xfail** | **528 s** (8:47) | 2026-07-31, after rubric 1.9 + 1.7's closure |
+| `make test-slow` | **83 passed** | **1 098 s** (18:18) | 2026-07-31, after rubric 1.9 + 1.7's closure |
+| `make test-md` | **22 passed** | **301 s** (5:01) | 2026-07-31, after rubric 1.9 + 1.7's closure |
+| `make test` (local only) | 441 passed, 0 xfail | 526 s (8:46) | 2026-07-31, after the 1.6-1.8 review round |
+| `make test-slow` | 78 passed | 1 066 s (17:45) | 2026-07-31, after the 1.6-1.8 review round |
+| `make test-md` | 22 passed | 291 s (4:50) | 2026-07-31, after the 1.6-1.8 review round |
 | `make test` (local only) | 384 passed, 0 xfail | 502 s (8:21) | 2026-07-31, after 1.6 + 1.7 + 1.8 + 4.7 |
 | `make test-slow` | **54 passed** | **851 s** (14:10) | 2026-07-31, after 1.6 + 1.7 + 1.8 + 4.7 |
 | `make test-md` | **22 passed** | **284 s** (4:44) | 2026-07-31, after 1.6 + 1.7 + 1.8 + 4.7 |
@@ -218,16 +221,41 @@ Measured on an M-series Mac. Only executed runs are reported here; see
 | `make test-slow` | 9 passed | 179 s (2:58) | 2026-07-31, after the 1.1-1.3 review round |
 | `make test-md` | 12 passed | 155 s (2:34) | 2026-07-31, after the 1.1-1.3 review round |
 
-The default suite is at **8:46 of a 10-minute budget** with 57 more tests than the
-previous measurement, and the partition was rebalanced rather than the ceiling raised.
-The 1.6-1.8 review found that 10 of 12 fault anchors and 57 of 91 new tests ran only
-under `-m slow` — a guard outside the gate that runs on every change is not a guard.
+The default suite is at **8:47 of a 10-minute budget** with **88 more tests than the
+previous measurement and the same wall clock** (526 s then, 528 s now). That is not luck: the
+1.9 round added 79 tests that cost **0.8 s in total**, because every one of them drives
+the shipped code in-process — the state machines against a DuckDB file in a tmp dir, the
+recovery anchors against an injectable slot drop — rather than through a `cdc-flight`
+subprocess. The expensive end-to-end pairing for each of them is in `-m slow`.
+
+`make test-slow` is 18:18 for 83 tests (was 17:45 for 78): the five new ones are the
+end-to-end pairing for the recovery anchors — a real `cdc-flight` process killed at
+`recovery_armed` against a real Postgres slot, then two more runs to prove the
+destination equals the source exactly. It belongs in a review round rather than a tight
+edit loop, which is what the partition is for.
+
+**One observed flake, recorded rather than smoothed over.**
+`test_1_7_source_blackhole.py::test_a_blackholed_source_never_reports_ok` asserts
+`close_hung is True` — the claim that Debezium's `close()` cannot complete against a dead
+socket. It failed once in two `-m slow` runs of this round and passed on the re-run, with
+no change to that path in between: the JVM sometimes does tear down inside the 30 s
+`close_timeout`. Every *correctness* assertion in that test (non-zero exit,
+`stop_reason == "source_dark"`, detection within 60 s of going dark) passed both times;
+the flaky one is about the shutdown path. It is left as-is and written down here so the
+next reviewer does not have to rediscover it.
+
+The previous measurement's context: the 1.6-1.8 review found that 10 of 12 fault anchors
+and 57 of 91 new tests ran only under `-m slow` — a guard outside the gate that runs on
+every change is not a guard — and the partition was rebalanced rather than the ceiling
+raised.
 
 What that cost, and what paid for it, is enumerated in `RUBRIC_STATUS.md` under "Suite
 partition". The short version: every anchor and every `check_slot` decision cell now has
 a default-suite guard, most of them **in-process** and costing milliseconds
-(`tests/1.7_fault_injection/test_1_7_anchor_guards.py` covers all thirteen anchors in
-0.8 s), while the expensive end-to-end matrices stay `slow`. Two modules whose claims are
+(`tests/1.7_fault_injection/test_1_7_anchor_guards.py` covers the thirteen protocol and
+destination anchors in 0.8 s and
+`tests/1.7_fault_injection/test_1_7_recovery_anchors.py` the five recovery anchors in
+0.3 s), while the expensive end-to-end matrices stay `slow`. Two modules whose claims are
 now covered more cheaply elsewhere moved out (`test_1_6_resnapshot.py`,
 `test_1_5_truncate_drop_e2e.py`). Nothing was deleted.
 
@@ -331,12 +359,23 @@ implementation, so they survive the ADR 0001 refactor:
 | `destination_commit` | `COMMIT` raises — the ambiguous case (ADR §4.6 F5) |
 | `destination_hang` | `COMMIT` never returns; bounded by `CDC_COMMIT_TIMEOUT` |
 | `destination_close` | the destination connection is severed mid-transaction |
+| `recovery_requested` | the acquisition recovery's journal and to-do list are durable; nothing destroyed |
+| `recovery_offsets_file_deleted` | `offsets.dat` unlinked, the journal still says `requested` |
+| `recovery_resume_point_deleted` | the durable resume point deleted, the slot still there |
+| `recovery_armed` | the slot dropped, the journal not yet recording it |
+| `table_rebuild_queued` | mid-write of the durable "these tables owe a snapshot" list |
 
-The four `destination_*` points are injected by wrapping the single connection the
+The five `destination_*` points are injected by wrapping the single connection the
 applier writes through (`faults.wrap_destination`), and they fire at the data group the
 applier *declares* rather than one inferred from the SQL. The fault the process cannot
 inject at all — a source whose packets stop arriving with the sockets left open — is
 injected from outside by `tests/tcp_relay.py`.
+
+The five `recovery_*` points (rubric 1.9's round, which closed 1.7 at 5) sit at the
+boundaries of the one durable sequence nothing can make atomic — the to-do list,
+`offsets.dat`, the resume point and the replication slot. Their `<nth>` counts
+**boundary arrivals**, not commit groups: a recovery boundary is not a commit group, and
+an index that is a function of the workload is one that silently stops firing.
 
 `<nth>` counts **data** batches only: batches containing nothing but Debezium heartbeats
 or transaction-metadata markers are not counted, because otherwise enabling
@@ -364,6 +403,10 @@ cdc_flight/
 │   ├── debezium_props.py         # Debezium engine properties
 │   ├── engine.py                 # Debezium engine that cannot fail silently
 │   ├── errors.py                 # EngineFailure
+│   ├── states.py                 # Machine/Domain: declared states + legal edges (1.9)
+│   ├── machines.py               # EVERY consistency-affecting state, in one file (1.9)
+│   ├── table_lifecycle.py        # the ONE writer of table_state.snapshot_state (1.9)
+│   ├── run_state.py              # RunPhase -> _cdc_flight.heartbeat + RunOutcome (1.9)
 │   ├── faults.py                 # deterministic crash injection (test-only)
 │   ├── envelope.py               # decode the full Debezium envelope
 │   ├── assembler.py              # TransactionAssembler: whole units only

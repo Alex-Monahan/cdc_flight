@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from . import destination, naming
 from .catalog import CHANGE_DROPPED, CHANGE_RECREATED, DESTRUCTIVE, CatalogChange
 from .config import DROP_IGNORE, DROP_REPLICATE
+from .machines import CHANGE_APPLIED, CHANGE_REFUSED
 
 log = logging.getLogger("cdc_flight.catalog_apply")
 
@@ -190,6 +191,7 @@ class CatalogCoordinator:
             )
             for change in destructive_changes:
                 blocked.add(id(change))
+                change.to(CHANGE_REFUSED)  # rubric 1.9 (SM-D)
                 refused.append((change, reason))
             alerts.append(
                 {
@@ -230,6 +232,7 @@ class CatalogCoordinator:
                     # separated by the fence, and the fence can be arbitrarily wide on
                     # a quiet source; a fact that is no longer true must not destroy a
                     # live relation's destination table (Codex 4).
+                    change.to(CHANGE_REFUSED)  # rubric 1.9 (SM-D)
                     refused.append((change, reason))
                     log.warning(
                         "not dropping %s: %s (the change stays pending)",
@@ -406,6 +409,12 @@ class CatalogCoordinator:
             return
         changes = [action.change for action in plan.actions]
         if changes:
+            # rubric 1.9 (SM-D): `due -> applied` is terminal, and it is recorded only
+            # AFTER the COMMIT for the same reason `resolve()` is - a change marked
+            # applied over a rolled-back DDL is a destructive action nothing will
+            # re-detect.
+            for change in changes:
+                change.to(CHANGE_APPLIED)
             self.catalog.resolve(changes)
             for action in plan.actions:
                 if action.change.kind == CHANGE_DROPPED and action.destructive:

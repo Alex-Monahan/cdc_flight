@@ -56,6 +56,16 @@ from dataclasses import dataclass, field
 
 from . import source_marker as marker_mod
 from .destination import CONTROL_SCHEMA
+from .machines import (
+    CATALOG_CHANGE,
+    CHANGE_DEFERRED,
+    CHANGE_DUE,
+    CHANGE_MARKED,
+    CHANGE_OBSERVED,
+    CHANGE_PENDING,
+    CHANGE_SUPERSEDED,
+    CHANGE_UNCONFIRMED,
+)
 
 log = logging.getLogger("cdc_flight.catalog")
 
@@ -142,10 +152,30 @@ class CatalogChange:
     deferrals: int = 0
     #: consecutive polls that agreed with this observation before it was queued
     confirmations: int = 1
+    #: rubric 1.9 (SM-D). Where this change is in the observe -> confirm -> fence ->
+    #: apply pipeline, as ONE named value. It used to be spread over four containers and
+    #: three counters (`_unconfirmed`, `_pending`, `refused`, `awaiting_snapshot`,
+    #: `fenced`, `deferrals`, `confirmations`), which is how `fenced` came to be
+    #: documented as gating an action it never gated (Opus MINOR-2). Memory only: a
+    #: lost pending change is re-detected on the next poll, which is correct, so
+    #: persisting it would buy nothing and would need a new durable domain.
+    state: str = CHANGE_OBSERVED
 
     @property
     def qualified(self) -> str:
         return f"{self.schema}.{self.table}"
+
+    def to(self, state: str) -> None:
+        """Move through `machines.CATALOG_CHANGE`, asserting the edge. Idempotent.
+
+        Loud on an undeclared edge, like every other machine here: this one carries no
+        durable consequence, but a change that reached `applied` from somewhere nobody
+        declared is a destructive DDL nobody reasoned about.
+        """
+        if state == self.state:
+            return
+        CATALOG_CHANGE.check(self.state, state)
+        self.state = state
 
     def context(self) -> dict:
         return {
@@ -155,8 +185,27 @@ class CatalogChange:
             "old_oid": self.old_oid,
             "new_oid": self.new_oid,
             "fenced": self.fenced,
+            "state": self.state,
             "confirmations": self.confirmations,
         }
+
+
+def _queued(change: CatalogChange) -> CatalogChange:
+    """Membership of `_pending` IS the `pending` state (rubric 1.9, SM-D).
+
+    `_compare()` sets it when it extends the list, but a change can also be put there
+    directly - the 1.5 suite constructs one and queues it so a destructive action can be
+    tested without a live source DDL - and "it is in the pending list but its state says
+    `observed`" would be a distinction with no meaning. Normalising here keeps the
+    declared edges honest instead of adding `observed -> everything`.
+
+    Only from `observed`: a change that is already `due` or `deferred` is still in the
+    list and must not be walked backwards to `pending`, which would make "how far did
+    this change get" a function of how many commit groups have looked at it.
+    """
+    if change.state == CHANGE_OBSERVED:
+        change.to(CHANGE_PENDING)
+    return change
 
 
 def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
@@ -478,6 +527,8 @@ class CatalogWatcher:
                 if current != previous:
                     self.known[name] = current
                     self._dirty[name] = current
+            for change in added:
+                change.to(CHANGE_PENDING)
             self._pending.extend(added)
         for change in added:
             log.warning(
@@ -508,6 +559,7 @@ class CatalogWatcher:
             seen = None
         count = (seen[1] if seen else 0) + 1
         if count < self.confirm_polls:
+            change.to(CHANGE_UNCONFIRMED)
             self._unconfirmed[name] = (shape, count)
             log.info(
                 "%s observed for %s (%s/%s confirming polls); not queued yet",
@@ -525,6 +577,10 @@ class CatalogWatcher:
         ]
         if len(keep) == len(self._pending):
             return []
+        kept = set(map(id, keep))
+        for change in self._pending:
+            if id(change) not in kept:
+                change.to(CHANGE_SUPERSEDED)
         self.superseded += len(self._pending) - len(keep)
         self._pending = keep
         return [name]
@@ -545,6 +601,7 @@ class CatalogWatcher:
         with self._lock:
             for change in self._pending:
                 change.fenced = True
+                _queued(change).to(CHANGE_MARKED)
 
     # -- what the applier asks ---------------------------------------------- #
     def due(self, durable_lsn: int) -> list[CatalogChange]:
@@ -557,7 +614,9 @@ class CatalogWatcher:
         out: list[CatalogChange] = []
         with self._lock:
             for change in self._pending:
+                _queued(change)
                 if change.kind not in DESTRUCTIVE:
+                    change.to(CHANGE_DUE)
                     # Nothing is removed for a `new`, `unpublished` or `republished`
                     # change - it is a marker row and an operator decision - so there is
                     # nothing for the fence to protect. Fencing them anyway kept them
@@ -566,9 +625,11 @@ class CatalogWatcher:
                     out.append(change)
                     continue
                 if durable_lsn >= change.detected_lsn:
+                    change.to(CHANGE_DUE)
                     out.append(change)
                     continue
                 change.deferrals += 1
+                change.to(CHANGE_DEFERRED)
                 if self.grace_seconds and (
                     time.monotonic() - change.detected_at >= self.grace_seconds
                 ):
@@ -580,6 +641,7 @@ class CatalogWatcher:
                         change.kind, change.qualified, self.grace_seconds,
                         durable_lsn, change.detected_lsn,
                     )
+                    change.to(CHANGE_DUE)
                     out.append(change)
         return out
 

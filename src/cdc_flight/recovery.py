@@ -72,21 +72,41 @@ from pathlib import Path
 
 from .destination import CONTROL_SCHEMA, now, raise_alert, request_snapshot
 from .errors import RecoveryFailed
+from .faults import arrival, maybe_crash
+from .machines import (
+    ACQUISITION_RECOVERY,
+    RECOVERY_ABSENT,
+    RECOVERY_ARMED,
+    RECOVERY_FILE_DELETED,
+    RECOVERY_REQUESTED,
+    RECOVERY_ROW_DELETED,
+)
 
 log = logging.getLogger("cdc_flight.recovery")
 
 #: In the order they happen. `armed` is terminal for the *mutation* sequence and is
 #: cleared only once the snapshot the recovery asked for has actually been taken.
-PHASE_REQUESTED = "requested"
-PHASE_FILE_DELETED = "offsets_file_deleted"
-PHASE_ROW_DELETED = "resume_point_deleted"
-PHASE_ARMED = "armed"
+#: The names and the legal edges are `machines.ACQUISITION_RECOVERY`; re-exported here
+#: because this module is where they are read and written (rubric 1.9).
+PHASE_REQUESTED = RECOVERY_REQUESTED
+PHASE_FILE_DELETED = RECOVERY_FILE_DELETED
+PHASE_ROW_DELETED = RECOVERY_ROW_DELETED
+PHASE_ARMED = RECOVERY_ARMED
+#: `absent` is the pseudo-state for "no journal row"; it is not a column value.
+PHASE_ABSENT = RECOVERY_ABSENT
 
 PHASES = (PHASE_REQUESTED, PHASE_FILE_DELETED, PHASE_ROW_DELETED, PHASE_ARMED)
 
 #: The `snapshot.mode` a recovery forces. Persisted, because the whole point of the
 #: journal is that this intent outlives the process that formed it.
 FORCED_SNAPSHOT_MODE = "initial"
+
+
+#: Rubric 1.7's `<nth>` for the recovery anchors: a recovery normally happens once per
+#: run, so `<nth>` is 1, but a run that arms a *second* recovery after resuming a first
+#: one reaches the same boundary twice and a test must be able to name which.
+def _reached(phase: str) -> int:
+    return arrival(f"recovery:{phase}")
 
 
 @dataclass
@@ -151,7 +171,16 @@ def read(con, *, pipeline: str, namespace: str) -> RecoveryRecord | None:
     )
 
 
-def _write_phase(con, *, pipeline: str, namespace: str, phase: str) -> None:
+def _write_phase(con, *, pipeline: str, namespace: str, phase: str, frm: str) -> None:
+    """The ONE writer of `recovery_state.phase`, and it asserts the edge first.
+
+    `PHASES` used to be declared and never consumed: `read()` accepted any string and
+    `resume()` then matched none of its branches, fell through every `if`, and logged
+    "recovery is ARMED" having done nothing at all. The domain check landed in the
+    1.6-1.8 fix round; rubric 1.9 adds the *edges*, so a future caller cannot jump from
+    `requested` straight to `armed` and claim a slot was dropped that never was.
+    """
+    ACQUISITION_RECOVERY.check(frm, phase)
     con.execute(
         f"UPDATE {CONTROL_SCHEMA}.recovery_state SET phase = ?, updated_at = ? "
         "WHERE pipeline = ? AND namespace = ?",
@@ -160,7 +189,16 @@ def _write_phase(con, *, pipeline: str, namespace: str, phase: str) -> None:
 
 
 def clear(con, *, pipeline: str, namespace: str) -> None:
-    """The recovery is done: the tables it owed have been snapshotted."""
+    """The recovery is done: the tables it owed have been snapshotted.
+
+    `armed -> absent` is the ONLY declared edge into `absent`. Clearing from an earlier
+    phase would discard the record of a destructive sequence that is still half-done -
+    exactly the state the journal exists to name - so a caller that tries is refused.
+    """
+    record = read(con, pipeline=pipeline, namespace=namespace)
+    if record is None:
+        return
+    ACQUISITION_RECOVERY.check(record.phase, RECOVERY_ABSENT)
     con.execute(
         f"DELETE FROM {CONTROL_SCHEMA}.recovery_state WHERE pipeline = ? AND namespace = ?",
         [pipeline, namespace],
@@ -190,6 +228,10 @@ def begin(
     Idempotent: an existing journal row for this pipeline is replaced, because a second
     detection of the same unsafe state is the same recovery, not a new one.
     """
+    existing = read(con, pipeline=pipeline, namespace=namespace)
+    ACQUISITION_RECOVERY.check(
+        existing.phase if existing is not None else RECOVERY_ABSENT, RECOVERY_REQUESTED
+    )
     record = RecoveryRecord(
         recovery_id=uuid.uuid4().hex,
         decision=decision,
@@ -248,6 +290,9 @@ def begin(
             ],
         )
         con.execute("COMMIT")
+        # rubric 1.7: the journal row and the to-do list are now durable and NOTHING
+        # has been destroyed. A crash here must leave a resumable `requested` journal.
+        maybe_crash("recovery_requested", _reached(PHASE_REQUESTED))
     except BaseException:
         try:
             con.execute("ROLLBACK")
@@ -306,7 +351,14 @@ def resume(
         result["offset_file"] = "removed" if removed else "absent"
         if on_phase is not None:
             on_phase(PHASE_FILE_DELETED)
-        _write_phase(con, pipeline=pipeline, namespace=namespace, phase=PHASE_FILE_DELETED)
+        # rubric 1.7: the file is gone and the journal still says `requested`. This is
+        # the cut A53's crash table calls benign (`file absent / row present` ->
+        # `file_missing_rebuilt`), and it is now an INJECTED fault rather than a claim.
+        maybe_crash("recovery_offsets_file_deleted", _reached(PHASE_FILE_DELETED))
+        _write_phase(
+            con, pipeline=pipeline, namespace=namespace,
+            phase=PHASE_FILE_DELETED, frm=PHASE_REQUESTED,
+        )
         record.phase = PHASE_FILE_DELETED
 
     if record.phase == PHASE_FILE_DELETED:
@@ -317,7 +369,13 @@ def resume(
         )
         if on_phase is not None:
             on_phase(PHASE_ROW_DELETED)
-        _write_phase(con, pipeline=pipeline, namespace=namespace, phase=PHASE_ROW_DELETED)
+        # rubric 1.7: the durable resume point is gone and the slot is not. The next
+        # acquisition must resume from `offsets_file_deleted` and re-run this step.
+        maybe_crash("recovery_resume_point_deleted", _reached(PHASE_ROW_DELETED))
+        _write_phase(
+            con, pipeline=pipeline, namespace=namespace,
+            phase=PHASE_ROW_DELETED, frm=PHASE_FILE_DELETED,
+        )
         record.phase = PHASE_ROW_DELETED
 
     if record.phase == PHASE_ROW_DELETED:
@@ -327,7 +385,14 @@ def resume(
         result["slot"] = slot_action
         if on_phase is not None:
             on_phase(PHASE_ARMED)
-        _write_phase(con, pipeline=pipeline, namespace=namespace, phase=PHASE_ARMED)
+        # rubric 1.7: the slot is dropped and the journal has not recorded it. The
+        # dangerous one: a next run that could not tell would re-snapshot against a
+        # surviving slot, or lose the forced snapshot mode entirely (Codex B3).
+        maybe_crash("recovery_armed", _reached(PHASE_ARMED))
+        _write_phase(
+            con, pipeline=pipeline, namespace=namespace,
+            phase=PHASE_ARMED, frm=PHASE_ROW_DELETED,
+        )
         record.phase = PHASE_ARMED
 
     if record.phase != PHASE_ARMED:  # pragma: no cover - the ladder above is total

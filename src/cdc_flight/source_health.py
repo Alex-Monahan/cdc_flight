@@ -37,6 +37,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+from .machines import SOURCE_HEALTH_STATES
+
 log = logging.getLogger("cdc_flight.source_health")
 
 #: How far `confirmed_flush_lsn` may trail `pg_current_wal_lsn()` and still count
@@ -248,6 +250,35 @@ class SourceHealth:
                 return 0.0
             return time.monotonic() - self._lag_decreased_at
 
+    def state(self, *, dark_after: float = 0.0) -> str:
+        """The fold's classification, as ONE declared value (rubric 1.9).
+
+        `SourceHealth` is a **fold over observations**, not a state machine, and it
+        should stay one: there is no durable state and no transition anybody can cut. But
+        the *classification* of the fold was written out three separate times — in
+        `may_declare_idle()`, in `summary()`, and again in the supervisor's
+        `ever_sampled and unknown_for >= ...` test — and the value that mattered most had
+        no name at all. `unknown_never_sampled` is A51 row 50: the documented fail-open
+        where a source that was dark before we ever looked degrades the run to the
+        timer-only path and can report success on a delivery that never started.
+
+        The domain is `machines.SOURCE_HEALTH_STATES`. `dark_after` (the run's
+        `CDC_SOURCE_DARK_SECONDS`) separates `unknown` from `dark`; passing 0 means "do
+        not make that distinction", which is what a caller with no threshold wants.
+        """
+        sample = self.last
+        if sample is None:
+            return SOURCE_HEALTH_STATES.parse("unsampled")
+        if sample.unknown:
+            if not self.ever_sampled:
+                return SOURCE_HEALTH_STATES.parse("unknown_never_sampled")
+            if dark_after > 0 and self.unknown_for >= dark_after:
+                return SOURCE_HEALTH_STATES.parse("dark")
+            return SOURCE_HEALTH_STATES.parse("unknown")
+        return SOURCE_HEALTH_STATES.parse(
+            "streaming" if sample.streaming else "not_streaming"
+        )
+
     def may_declare_idle(self, *, min_seconds: float) -> bool:
         """Corroborate a quiet timer against the source.
 
@@ -291,17 +322,20 @@ class SourceHealth:
     def summary(self) -> dict:
         sample = self.last
         if sample is None:
-            return {"slot_health": "unsampled"}
+            return {"slot_health": self.state()}
         if sample.unknown:
             return {
-                "slot_health": "unknown",
+                # The declared classification, so `unknown_never_sampled` - the
+                # fail-open A51 row 50 is about - finally appears in the run summary
+                # instead of being inferred from `slot_ever_sampled` next to it.
+                "slot_health": self.state(),
                 "slot_error": sample.error,
                 "slot_unknown_for_sec": round(self.unknown_for, 1),
                 "slot_ever_sampled": self.ever_sampled,
                 "slot_not_streaming_for_sec": round(self.not_streaming_for, 1),
             }
         return {
-            "slot_health": "streaming" if sample.streaming else "not_streaming",
+            "slot_health": self.state(),
             "slot_exists": sample.exists,
             "slot_active": sample.active,
             "slot_lag_bytes": sample.lag_bytes,
