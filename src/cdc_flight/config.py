@@ -140,6 +140,12 @@ def applier_settings() -> dict:
         "repair_offset_file": _flag("CDC_OFFSET_FILE_REPAIR", True),
         "verify_offset_file": _flag("CDC_VERIFY_OFFSET_FILE", True),
         "ack_every_record": _flag("CDC_ACK_EVERY_RECORD", False),
+        #: Destination-side PRIMARY KEY on every replicated table's identity
+        #: columns (Opus M-2). On by default: it is what makes "duplication is
+        #: impossible" a property of the destination rather than of the applier.
+        #: `CDC_DESTINATION_CONSTRAINTS=0` falls back to the post-apply uniqueness
+        #: assertion inside the commit group.
+        "destination_constraints": _flag("CDC_DESTINATION_CONSTRAINTS", True),
     }
 
 

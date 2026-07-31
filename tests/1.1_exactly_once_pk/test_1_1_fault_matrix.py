@@ -10,7 +10,8 @@ there.
 | anchor | destination transaction | Debezium offset store | expected |
 |---|---|---|---|
 | `begin` | open, empty | untouched | rolled back, replay, no dup |
-| `mid_apply` | open, partially written | untouched | rolled back, replay, no dup |
+| `spill` | open, a unit's prefix staged in `spill_events` | untouched | rolled back with the staging rows, replay, no dup |
+| `mid_apply` | open, **table A written, table B not** | untouched | rolled back, replay, no dup |
 | `pre_commit` | fully written, uncommitted | untouched | rolled back, replay, no dup |
 | `post_commit_pre_ack` | **committed** | untouched (stale) | already durable, resume point rebuilds the file, NO replay |
 | `post_ack` | committed | flushed, slot not confirmed | nothing to redo |
@@ -32,14 +33,22 @@ import pytest
 CUSTOMERS = '"cdc_raw"."cdcflight_app_customers"'
 READINGS = '"cdc_raw"."cdcflight_app_sensor_readings"'
 
-#: (anchor, tag, rows). Kept small on purpose: the point is the *anchor*, not the
-#: volume, and the suite has a 10-minute budget.
+#: (anchor, tag, rows, extra env). Kept small on purpose: the point is the
+#: *anchor*, not the volume, and the suite has a 10-minute budget.
+#:
+#: `spill` was a declared anchor that the matrix never used, and the two blockers
+#: that lived on the spill path (Opus B-1, Codex 5) were exactly what that gap hid
+#: — so it is exercised here with the spill threshold forced below the workload.
+#: `decode` and the `raise` action live in `test_1_1_fault_interleavings.py`
+#: (slow): rubric 1.7 owns the wider failure surface, and the 10-minute default
+#: budget does not stretch to two more crash/recovery cycles.
 ANCHORS = [
-    ("begin", "fb", 12),
-    ("mid_apply", "fm", 12),
-    ("pre_commit", "fp", 12),
-    ("post_commit_pre_ack", "fa", 12),
-    ("post_ack", "fk", 12),
+    ("begin", "fb", 12, {}),
+    ("mid_apply", "fm", 12, {}),
+    ("spill", "fs", 12, {"CDC_UNIT_SPILL_EVENTS": "4"}),
+    ("pre_commit", "fp", 12, {}),
+    ("post_commit_pre_ack", "fa", 12, {}),
+    ("post_ack", "fk", 12, {}),
 ]
 
 
@@ -50,7 +59,7 @@ def crashed_at(sandbox) -> dict:
     sandbox.run(reset_state=True, max_seconds=150)
 
     results: dict[str, dict] = {}
-    for anchor, tag, rows in ANCHORS:
+    for anchor, tag, rows, extra in ANCHORS:
         sandbox.sql(
             [
                 "INSERT INTO app.customers (name, email) SELECT "
@@ -64,14 +73,17 @@ def crashed_at(sandbox) -> dict:
         crashed = sandbox.run(
             max_seconds=150,
             expect_success=False,
-            extra_env={"CDC_FAULT_INJECT": f"{anchor}:1"},
+            extra_env={"CDC_FAULT_INJECT": f"{anchor}:1", **extra},
         )
-        recovered = sandbox.run(max_seconds=150)
+        # The recovery run keeps the same spill setting, so the *replay* of a
+        # spilled transaction is exercised too (and the fence has to suppress its
+        # staged prefix - Codex 5).
+        recovered = sandbox.run(max_seconds=150, extra_env=extra)
         results[anchor] = {"crashed": crashed, "recovered": recovered, "rows": rows, "tag": tag}
     return {"box": sandbox, "results": results}
 
 
-@pytest.mark.parametrize("anchor", [a for a, _, _ in ANCHORS])
+@pytest.mark.parametrize("anchor", [a for a, *_ in ANCHORS])
 def test_fault_actually_fired(crashed_at, anchor):
     """Guard: a fault that did not fire makes every assertion below vacuous."""
     outcome = crashed_at["results"][anchor]
@@ -82,7 +94,7 @@ def test_fault_actually_fired(crashed_at, anchor):
     assert outcome["recovered"]["returncode"] == 0, outcome["recovered"]
 
 
-@pytest.mark.parametrize("anchor", [a for a, _, _ in ANCHORS])
+@pytest.mark.parametrize("anchor", [a for a, *_ in ANCHORS])
 def test_no_loss_at_anchor(crashed_at, anchor):
     """NO LOSS - every source row reached the destination after the restart."""
     box = crashed_at["box"]
@@ -99,7 +111,7 @@ def test_no_loss_at_anchor(crashed_at, anchor):
     assert readings == rows, f"crash at {anchor} lost {rows - readings} keyless rows"
 
 
-@pytest.mark.parametrize("anchor", [a for a, _, _ in ANCHORS])
+@pytest.mark.parametrize("anchor", [a for a, *_ in ANCHORS])
 def test_no_duplicates_at_anchor(crashed_at, anchor):
     """NO DUPLICATES - and measured on the table where a merge cannot hide one.
 
@@ -128,7 +140,7 @@ def test_no_duplicates_at_anchor(crashed_at, anchor):
     assert dupe_events == 0, f"crash at {anchor} applied {dupe_events} events twice"
 
 
-@pytest.mark.parametrize("anchor", [a for a, _, _ in ANCHORS])
+@pytest.mark.parametrize("anchor", [a for a, *_ in ANCHORS])
 def test_slot_never_outruns_the_destination_at_anchor(crashed_at, anchor):
     """ADR 0001 §4.7 - Invariant O, sampled after every crash/recovery cycle."""
     box = crashed_at["box"]
@@ -155,7 +167,7 @@ def test_uncommitted_anchors_leave_nothing_behind(crashed_at):
     transaction may never straddle two commit groups, whatever the crash did.
     """
     box = crashed_at["box"]
-    for anchor, tag, _rows in ANCHORS:
+    for anchor, tag, _rows, _extra in ANCHORS:
         commits = box.duck_query(
             f"SELECT DISTINCT cdcf_commit_id FROM {CUSTOMERS} WHERE name LIKE '{tag}-c-%' "
             f"UNION SELECT DISTINCT cdcf_commit_id FROM {READINGS} "

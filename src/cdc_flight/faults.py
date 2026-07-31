@@ -72,7 +72,10 @@ ENV_VAR = "CDC_FAULT_INJECT"
 #: * `decode`      - records decoded and assembled, no transaction open yet
 #: * `begin`       - `BEGIN TRANSACTION` issued, nothing applied
 #: * `spill`       - a unit's events staged into `_cdc_flight.spill_events`
-#: * `mid_apply`   - some tables written, others not, transaction still open
+#: * `mid_apply`   - the FIRST destination table of the group has been written and
+#:                   the next has not; the transaction is still open. (It used to
+#:                   fire *before* the table-write loop, so it could not detect a
+#:                   transaction torn between table A and table B - Codex 6.)
 #: * `pre_commit`  - everything (data + commit_log + resume point) written, not committed
 #: * `post_commit_pre_ack` - committed, Debezium NOT acknowledged
 #: * `post_ack`    - acknowledged, slot not confirmed (that is the next poll())
@@ -139,13 +142,36 @@ def parse_spec(raw: str | None) -> tuple[str, int, int | str] | None:
     return point, nth, action
 
 
+#: Sentinel distinguishing "not parsed yet" from "parsed, and there is no fault".
+_UNPARSED = object()
+_spec_cache: object = _UNPARSED
+
+
 def validate_env() -> tuple[str, int, int | str] | None:
     """Parse the environment once, at start-up, so a bad spec fails loudly."""
-    return parse_spec(os.environ.get(ENV_VAR))
+    return refresh()
+
+
+def refresh() -> tuple[str, int, int | str] | None:
+    """Re-read `CDC_FAULT_INJECT` and cache the result. Tests call this after
+    changing the environment."""
+    global _spec_cache
+    _spec_cache = parse_spec(os.environ.get(ENV_VAR))
+    return _spec_cache  # type: ignore[return-value]
 
 
 def _spec() -> tuple[str, int, int | str] | None:
-    return parse_spec(os.environ.get(ENV_VAR))
+    """The parsed spec, cached.
+
+    Cached because `maybe_crash` is called from inside the commit->ack window, and
+    the binding principle says that window contains nothing but the
+    acknowledgement (Codex 7). Re-reading and re-parsing an environment variable
+    there is exactly the kind of unrelated work the principle excludes; after the
+    first call this is a tuple comparison.
+    """
+    if _spec_cache is _UNPARSED:
+        return refresh()
+    return _spec_cache  # type: ignore[return-value]
 
 
 def maybe_crash(point: str, nth: int) -> None:

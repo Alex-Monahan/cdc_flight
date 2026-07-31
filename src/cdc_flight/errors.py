@@ -40,9 +40,33 @@ class SourceNotStreaming(RuntimeError):
     """
 
 
+class UnsafeDebeziumProperty(RuntimeError):
+    """A Debezium property that Invariant O depends on was given an unsafe value.
+
+    ADR 0001 §4.10. `lsn.flush.mode=connector_and_driver` makes pgjdbc advance the
+    flushed LSN from server keepalives without ever consulting the offset store,
+    which confirms WAL to Postgres outside the invariant (Opus B-2); a false
+    `provide.transaction.metadata` removes the END marker the boundary rule needs;
+    a non-zero `offset.flush.interval.ms` makes a missing flush unobservable.
+    Also raised when a captured table's topic would collide with one of Debezium's
+    own internal topics.
+    """
+
+
 # --------------------------------------------------------------------------- #
 # transactional applier (ADR 0001 §3, §4)
 # --------------------------------------------------------------------------- #
+class EnvelopeDecodeError(RuntimeError):
+    """A Debezium payload cannot be decoded into a record we are willing to act on.
+
+    ADR 0001 §3.2. The load-bearing case is the transaction topic: a payload whose
+    `status` is neither `BEGIN` nor `END` used to become an `END` with no
+    `event_count`, which terminated the open transaction with no completeness
+    check at all (Opus M-1). Failing loud is the only safe reading of "unknown
+    control message".
+    """
+
+
 class TransactionAssemblyError(RuntimeError):
     """Debezium's transaction metadata is not self-consistent.
 
@@ -68,6 +92,27 @@ class ReconciliationRefused(RuntimeError):
     ADR 0001 §4.5. The load-bearing case is *file present / table row missing*:
     the file may be arbitrarily ahead of anything durable in the destination, so
     trusting it is silent data loss.
+    """
+
+
+class DestinationIdentityCollision(RuntimeError):
+    """Two destination rows share one identity (ADR 0001 §15/A21, Opus M-2).
+
+    Raised inside the commit group's transaction, so the group rolls back and the
+    events replay. Only reachable on a destination that cannot express the
+    `PRIMARY KEY` the identity columns normally carry; where it can, the destination
+    itself rejects the INSERT.
+    """
+
+
+class NoDurableDestinationRow(RuntimeError):
+    """The replication slot exists and has advanced, but nothing is durable here.
+
+    ADR 0001 §4.5's "absent/absent but slot exists" cell (Codex 3). The slot's
+    `confirmed_flush_lsn` may be arbitrarily far ahead of the empty destination, so
+    a start-up mode that streams from it without re-reading the tables silently
+    skips all the history in between. Refused unless the configured
+    `snapshot.mode` is one that re-reads every captured table in full.
     """
 
 

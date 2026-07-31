@@ -34,6 +34,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from .errors import EnvelopeDecodeError
+
 #: `source.snapshot` values that mean "this record came out of a snapshot".
 #: Debezium serialises `SnapshotRecord` lowercased.
 SNAPSHOT_VALUES = frozenset(
@@ -50,6 +52,10 @@ SNAPSHOT_VALUES = frozenset(
 SNAPSHOT_TABLE_LAST = frozenset({"last_in_data_collection", "last"})
 #: `source.snapshot` value that closes the whole snapshot.
 SNAPSHOT_LAST = "last"
+#: `source.snapshot` value of an *incremental* snapshot chunk. Refused until
+#: rubric 3.3 owns it: those records interleave with streaming events, never carry
+#: a `last` marker and carry no `txId`/`lsn` (Opus M-7).
+SNAPSHOT_INCREMENTAL = "incremental"
 
 KIND_DATA = "data"
 KIND_SNAPSHOT = "snapshot"
@@ -86,6 +92,13 @@ class PendingRecord:
     txn_data_collections: dict[str, int] = field(default_factory=dict)
     source_partition: dict[str, Any] | None = None
     source_offset: dict[str, Any] | None = None
+    #: 1-based arrival ordinal within the current snapshot of this table, assigned
+    #: by `TransactionAssembler`. A snapshot record has no transaction and
+    #: therefore no `total_order`, so this is what gives it a stable identity
+    #: (`snap:<epoch>:<schema>.<table>:<ordinal>`) in **both** storage modes. It is
+    #: assigned where the records arrive, so the ordinal is arrival order whether
+    #: the record is later spilled or kept in memory (Codex 1).
+    snapshot_ordinal: int | None = None
 
     @property
     def is_data(self) -> bool:
@@ -180,7 +193,15 @@ def offsets_of(raw: Any) -> tuple[dict | None, dict | None]:
 
 
 def decode(raw: Any, *, topic_prefix: str, want_offsets: bool = False) -> PendingRecord:
-    """Decode one `ChangeEvent`. Never raises for an unexpected payload shape.
+    """Decode one `ChangeEvent`.
+
+    **Raises `EnvelopeDecodeError` rather than guessing.** The earlier docstring
+    said this function "never raises for an unexpected payload shape", which was
+    both untrue (`json.loads` raises on malformed JSON) and the wrong goal: the
+    one place it did fail open — any non-`BEGIN` payload on the transaction topic
+    became an `END` with no `event_count` — bypassed the completeness rule the
+    whole of rubric 1.3 rests on (Opus M-1, MINOR-5). A payload we cannot classify
+    is a consistency error, not a record.
 
     `want_offsets` is **off** by default and that is a measured decision, not a
     micro-optimisation. Reading the Connect offset maps costs ~20 JPype calls per
@@ -195,6 +216,11 @@ def decode(raw: Any, *, topic_prefix: str, want_offsets: bool = False) -> Pendin
     topic = str(raw.destination())
     value = raw.value()
     text = "" if value is None else str(value)
+    # The JSON *text* length, not the retained Python size of the `PendingRecord`
+    # plus its decoded dicts, which is several times larger. The spill and chunk
+    # thresholds are therefore looser in real memory than the constants read
+    # (Opus MINOR-12); they are calibrated by measurement (ADR §15/A16), so the
+    # numbers are right and the units are a proxy.
     nbytes = len(text)
 
     rec = PendingRecord(raw=raw, kind=KIND_UNKNOWN, topic=topic, nbytes=nbytes)
@@ -214,10 +240,17 @@ def decode(raw: Any, *, topic_prefix: str, want_offsets: bool = False) -> Pendin
         rec.lsn = _offset_lsn(rec.source_offset)
         return rec
 
-    payload = json.loads(text)
-    if not isinstance(payload, dict):  # pragma: no cover - defensive
-        rec.kind = KIND_UNKNOWN
-        return rec
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise EnvelopeDecodeError(
+            f"payload on {topic} is not JSON ({exc}); a record we cannot decode "
+            "must not become a data event or a boundary (ADR 0001 §3.2)"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise EnvelopeDecodeError(
+            f"payload on {topic} decoded to {type(payload).__name__}, not an object"
+        )
 
     if topic == f"{topic_prefix}.transaction":
         # The only records whose LSN is NOT in the payload: the transaction value
@@ -226,7 +259,19 @@ def decode(raw: Any, *, topic_prefix: str, want_offsets: bool = False) -> Pendin
         if rec.source_offset is None:
             rec.source_partition, rec.source_offset = offsets_of(raw)
         status = str(payload.get("status") or "").upper()
-        rec.kind = KIND_TXN_BEGIN if status == "BEGIN" else KIND_TXN_END
+        # NOT `BEGIN if status == "BEGIN" else END`. That made every unrecognised
+        # control payload an END with `event_count = None`, which then closed the
+        # open transaction without any completeness check (Opus M-1).
+        if status == "BEGIN":
+            rec.kind = KIND_TXN_BEGIN
+        elif status == "END":
+            rec.kind = KIND_TXN_END
+        else:
+            raise EnvelopeDecodeError(
+                f"transaction marker on {topic} has status {status!r}, expected "
+                "'BEGIN' or 'END'. Treating it as an END would terminate the open "
+                "transaction without proving it whole (ADR 0001 §3.2)."
+            )
         rec.txn_status = status
         rec.txn_id = _txn_id(payload.get("id"))
         rec.txn_event_count = payload.get("event_count")

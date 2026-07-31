@@ -90,6 +90,8 @@ class ApplierConfig:
     max_batch_size: int = 2048
     repair_offset_file: bool = True
     verify_offset_file: bool = True
+    #: PRIMARY KEY on every generated table's identity columns (Opus M-2).
+    destination_constraints: bool = True
     #: ADR 0001 §14.6, answered. `markProcessed(record)` is
     #: `offsetWriter.offset(record.sourcePartition(), record.sourceOffset())`
     #: (`AsyncEmbeddedEngine.java:1361-1366`) - a last-write-wins map put - so
@@ -163,7 +165,9 @@ class Applier:
         self.verifier = verifier
         self.transactional_ddl = transactional_ddl
 
-        self.registry = apply_sql.SchemaRegistry(con, dataset)
+        self.registry = apply_sql.SchemaRegistry(
+            con, dataset, constraints=config.destination_constraints
+        )
         self.assembler = TransactionAssembler(
             snapshot_chunk_events=config.snapshot_chunk_events,
             snapshot_chunk_bytes=config.snapshot_chunk_bytes,
@@ -181,8 +185,8 @@ class Applier:
         self._close_requested = False
         self._txn_open = False
         self._spill_commit_id: int | None = None
-        self._spill_unit_seq = 0
         self._spill_rows = 0
+        self._pending_verification: tuple | None = None
 
         self._snapshot: dict[str, _SnapshotTable] = {}
         self._snapshot_epoch = resume_point.snapshot_epoch
@@ -205,11 +209,14 @@ class Applier:
         self.fenced_units = 0
         self.fenced_events = 0
         self.spilled_events = 0
+        self.fenced_spilled_events = 0
+        self.deferred_units = 0
+        self.deferred_events = 0
         self.swaps = 0
         self.table_counts: dict[str, int] = {}
         self.last_commit_id = resume_point.commit_id
         self.error: BaseException | None = None
-        self._next_commit_id = destination.next_commit_id(con)
+        self._next_commit_id = destination.next_commit_id(con, pipeline)
         self._pending_offset_blob: bytes | None = None
         self._pending_offset_key_blob: bytes | None = None
 
@@ -244,6 +251,12 @@ class Applier:
             "fenced_units": self.fenced_units,
             "fenced_events": self.fenced_events,
             "spilled_events": self.spilled_events,
+            "fenced_spilled_events": self.fenced_spilled_events,
+            # Whole units that were buffered but never committed at shutdown. Safe -
+            # Invariant O means they replay - but a run that reports `ok: true` while
+            # silently deferring transactions should say so (Opus MINOR-9).
+            "deferred_units": self.deferred_units,
+            "deferred_events": self.deferred_events,
             "snapshot_swaps": self.swaps,
             "discarded_tail_events": self.assembler.discarded_tail_events,
             "orphan_end_markers": self.assembler.orphan_end_markers,
@@ -288,6 +301,10 @@ class Applier:
 
     def _handle(self, records, committer) -> None:
         self._committer = committer
+        # The previous group's offset flush is verified here, outside the
+        # commit->ack window, now that Debezium has polled at least once since it
+        # (Codex 7).
+        self._run_pending_verification()
         n = len(records)
         data_in_batch = 0
         for raw in records:
@@ -402,7 +419,13 @@ class Applier:
             return
         commit_id = self._spill_commit_id or self._next_commit_id
         opened_at = destination.now()
-        has_data = any(not u.fenced and u.events for u in group) or self._spill_rows > 0
+        # NOT `or self._spill_rows > 0`: staged rows belonging only to *fenced*
+        # units are about to be discarded, and counting them made a group with no
+        # applicable content a "data group", which shifts every `<nth>`-indexed
+        # fault anchor by one (Codex 5).
+        has_data = any(
+            not u.fenced and (u.events or u.spilled_events) for u in group
+        )
 
         if not self._txn_open:
             self.con.execute("BEGIN TRANSACTION")
@@ -411,8 +434,8 @@ class Applier:
             if has_data:
                 maybe_crash("begin", self.data_commit_groups + 1)
             self.lease.renew(self.con)
-            stats = self._apply_units(group, commit_id)
-            new_point = self._resume_point_for(group)
+            stats = self._apply_units(group, commit_id, has_data=has_data)
+            new_point = self._resume_point_for(group, commit_id)
             destination.write_commit_log(
                 self.con,
                 commit_id=commit_id,
@@ -443,6 +466,10 @@ class Applier:
             )
             if has_data:
                 maybe_crash("pre_commit", self.data_commit_groups + 1)
+            # Principle (3): the pre-flush fingerprint of `offsets.dat` is taken
+            # HERE, before the commit, because it is only a *forensic* baseline -
+            # it does not need to lengthen the commit->ack path (Codex 7).
+            offset_fingerprint = self.verifier.before() if self.verifier else None
             self.con.execute("COMMIT")
             self._txn_open = False
             if has_data:
@@ -459,13 +486,16 @@ class Applier:
                     continue
                 self._committer.markProcessed(rec.raw)
                 marked += 1
-        before = self.verifier.before() if self.verifier else None
         self._committer.markBatchFinished()
-        if self.verifier is not None:
-            self.verifier.after(before, marked=marked)
         if has_data:
             maybe_crash("post_ack", self.data_commit_groups + 1)
         # next poll() -> performCommit() -> flushLsn(new)  ── nothing between ──
+        # No filesystem work, no hashing: the "did the flush happen" check is a
+        # liveness canary, not a prerequisite under Invariant O, so it runs on the
+        # next batch (or at shutdown) once the connector has had its poll/commit
+        # opportunity (Codex 7).
+        if self.verifier is not None and marked:
+            self._pending_verification = (offset_fingerprint, marked)
 
         self.commit_groups += 1
         if has_data:
@@ -489,11 +519,13 @@ class Applier:
             # Every CREATE / ALTER we issued is gone with the transaction, so the
             # cached destination shape is now a lie. Rebuilding it is cheap and
             # not doing it is how a rolled-back run corrupts the next one.
-            self.registry = apply_sql.SchemaRegistry(self.con, self.dataset)
+            self.registry = apply_sql.SchemaRegistry(
+                self.con, self.dataset, constraints=self.cfg.destination_constraints
+            )
             self._created_in_txn = set()
 
     # -- resume point ------------------------------------------------------- #
-    def _resume_point_for(self, group: list[CompleteUnit]) -> ResumePoint:
+    def _resume_point_for(self, group: list[CompleteUnit], commit_id: int) -> ResumePoint:
         terminal: PendingRecord | None = None
         for unit in reversed(group):
             if unit.records:
@@ -507,6 +539,20 @@ class Applier:
         last_lsn = max(
             [self.resume_point.last_lsn] + [u.last_lsn or 0 for u in group]
         )
+        if last_lsn > self.resume_point.last_lsn and (
+            terminal is None or not terminal.source_offset
+        ):
+            # `envelope.offsets_of()` returns `(None, None)` for every bridge
+            # failure, and the old code then paired a NEWER `last_lsn` with the
+            # PREVIOUS (or an empty) offset map. Debezium would resume from the
+            # older offset while our fence claimed the newer LSN was durable, so a
+            # replay would be fenced away: silent loss (Codex 3). Refuse the commit
+            # instead - a rollback replays, which is free.
+            raise ResumePointDrift(
+                f"commit group would advance last_lsn to {last_lsn} but the terminal "
+                "record's Connect offset could not be read, so the resume point would "
+                "pair a newer LSN with an older offset map (ADR 0001 §4.3)"
+            )
         total_order = None
         for unit in reversed(group):
             if unit.events:
@@ -518,9 +564,28 @@ class Applier:
             last_lsn=last_lsn,
             last_txn_id=last_unit.txn_id or self.resume_point.last_txn_id,
             last_total_order=total_order,
-            commit_id=self.last_commit_id,
+            # The group being written, not the previous one. `ResumePoint.to_json`
+            # omits it and `read_resume_point` takes it from its own column, so this
+            # was dead but looked live (Opus MINOR-16).
+            commit_id=commit_id,
             snapshot_epoch=self._snapshot_epoch,
         )
+
+    def _run_pending_verification(self) -> None:
+        """Check a deferred offset flush, now that the connector has polled again.
+
+        Deliberately outside the commit->ack window (Codex 7). It is still
+        meaningful there: `markBatchFinished()` on an *empty* poll comes from an
+        independent committer that never marked a record, so `beginFlush()` finds
+        nothing to flush and does not rewrite the file - only our own
+        acknowledgement can have moved it.
+        """
+        pending = self._pending_verification
+        if pending is None or self.verifier is None:
+            return
+        self._pending_verification = None
+        before, marked = pending
+        self.verifier.after(before, marked=marked)
 
     def _capture_offset_file(self, point: ResumePoint) -> None:
         """Snapshot `offsets.dat` after the acknowledgement (ADR §4.3).
@@ -557,7 +622,25 @@ class Applier:
     # ------------------------------------------------------------------ #
     # applying units
     # ------------------------------------------------------------------ #
-    def _apply_units(self, group: list[CompleteUnit], commit_id: int) -> dict:
+    def _apply_units(self, group: list[CompleteUnit], commit_id: int, *, has_data: bool) -> dict:
+        """One ordered pass over the group, whatever each unit's storage mode is.
+
+        This used to be two passes - "write every in-memory `_TableWork`, then
+        drain `spill_events`" - and that split cannot be correct in either order
+        (Opus B-1). A unit that spills keeps accumulating an in-memory **tail**
+        after the spill, so its staged rows are *earlier* in source order than its
+        own tail; and a group can hold `unit1 (spilled + tail), unit2 (wholly in
+        memory)`, whose correct order interleaves the two representations. The
+        measured consequences were a destination left holding the **earlier** value
+        with the later change event gone (existing table), and the **same primary
+        key twice** (table created inside the group, so both passes skipped the
+        DELETE half of the merge).
+
+        So: walk the units in group order, and for each one load its staged prefix
+        into the *shared* `work` map before collecting its in-memory tail. One
+        `_write_table` per destination table, source order preserved end to end,
+        and the merge sees the whole group at once.
+        """
         work: dict[str, _TableWork] = {}
         stats = {
             "events": 0,
@@ -570,15 +653,26 @@ class Applier:
         }
         swaps: list[_SnapshotTable] = []
         swap_all = False
+        staged_units = any(u.spill_unit_seq is not None for u in group)
 
         for unit in group:
             if unit.fenced:
+                # ADR §4.4 / Codex 5: the fence is set at `_add_unit`, which is the
+                # unit's END - long after its prefix was staged. Skipping only the
+                # in-memory half re-applied the prefix of a transaction the
+                # destination already holds, which made A9's "the fence alone
+                # prevents duplication" false for every spilled unit. The staged
+                # rows are deleted with the rest below, inside this transaction.
+                if unit.spill_unit_seq is not None:
+                    self.fenced_spilled_events += unit.spilled_events
                 continue
             if unit.kind == UNIT_CONTROL:
                 continue
             if unit.kind == UNIT_SNAPSHOT_CHUNK:
                 self._group_is_snapshot = True
                 state = self._snapshot_state(unit.schema, unit.table)
+                if unit.spill_unit_seq is not None:
+                    self._load_staged(unit, work, commit_id, stats)
                 for event in unit.events:
                     self._collect(work, event, commit_id, snapshot=state, stats=stats)
                 if unit.snapshot_last_for_table and state is not None:
@@ -587,16 +681,24 @@ class Applier:
                     swap_all = True
                 continue
 
+            if unit.spill_unit_seq is not None:
+                self._load_staged(unit, work, commit_id, stats)
             for event in unit.events:
                 self._collect(work, event, commit_id, snapshot=None, stats=stats)
             if unit.txn_id:
                 stats["first_txn_id"] = stats["first_txn_id"] or unit.txn_id
                 stats["last_txn_id"] = unit.txn_id
 
-        maybe_crash("mid_apply", self.data_commit_groups + 1)
-
-        for table_work in work.values():
+        for index, table_work in enumerate(work.values()):
             self._write_table(table_work)
+            if index == 0 and has_data:
+                # The anchor documented as "some tables written, others not". It
+                # used to fire BEFORE this loop, so it could not detect a
+                # transaction torn between table A and table B - the one
+                # interleaving rubric 1.3 is about (Codex 6). It is also gated on
+                # `has_data` now, like every other anchor, because `<nth>` counts
+                # data-carrying groups (Opus MINOR-2).
+                maybe_crash("mid_apply", self.data_commit_groups + 1)
             if table_work.events:
                 stats["tables"].add(table_work.target)
                 with self._lock:
@@ -604,14 +706,28 @@ class Applier:
                         self.table_counts.get(table_work.target, 0) + table_work.events
                     )
 
-        if self._spill_rows:
-            stats["events"] += self._drain_spill(commit_id, stats)
+        if staged_units:
+            self._clear_staged(commit_id)
 
         if swap_all:
             swaps = list(self._snapshot.values())
         for state in swaps:
             self._swap(state, commit_id, stats)
         return stats
+
+    def _work_for(
+        self, work: dict[str, _TableWork], target: str, event: PendingRecord, snapshot: bool
+    ) -> _TableWork:
+        item = work.get(target)
+        if item is None:
+            item = _TableWork(target=target, keyless=event.key is None, snapshot=snapshot)
+            item.key_columns = (
+                tuple(naming.normalize(k) for k in event.key)
+                if event.key
+                else (CDCF_EVENT_ID,)
+            )
+            work[target] = item
+        return item
 
     def _collect(
         self,
@@ -626,53 +742,31 @@ class Applier:
             return
         if snapshot is not None:
             target = snapshot.shadow
-            snapshot.ordinal += 1
-            event_id = (
-                f"snap:{self._snapshot_epoch}:{event.schema}.{event.table}:"
-                f"{snapshot.ordinal}"
-            )
+            event_id = self._snapshot_event_id(event)
         else:
             target = self._target_table(event.schema, event.table)
             event_id = _stream_event_id(event)
+        item = self._work_for(work, target, event, snapshot is not None)
+        self._collect_prepared(item, event, commit_id, event_id, stats)
 
-        item = work.get(target)
-        if item is None:
-            item = _TableWork(target=target, keyless=event.key is None, snapshot=snapshot is not None)
-            if event.key:
-                item.key_columns = tuple(naming.normalize(k) for k in event.key)
-            else:
-                item.key_columns = (CDCF_EVENT_ID,)
-            work[target] = item
+    def _snapshot_event_id(self, event: PendingRecord) -> str:
+        """`snap:<epoch>:<schema>.<table>:<arrival ordinal>` (ADR §6, §15/A18).
 
-        row = self._row_for(event, commit_id, event_id, snapshot=snapshot is not None)
-        for column, value in row.items():
-            item.columns[column] = apply_sql.widen(
-                item.columns.get(column), apply_sql.sql_type(value)
+        The ordinal is assigned by the assembler when the record arrives, so it is
+        arrival order whether the record was later spilled or kept in memory. It
+        used to be assigned at apply time from a counter on `_SnapshotTable`, which
+        the spill path incremented separately and the *first* spilled chunk of a
+        snapshot could not reach at all (Codex 1).
+        """
+        if event.snapshot_ordinal is None:  # pragma: no cover - assembler guarantees it
+            raise ResumePointDrift(
+                f"snapshot record for {event.schema}.{event.table} has no arrival "
+                "ordinal, so it has no stable identity (ADR 0001 §6)"
             )
-        item.events += 1
-        stats["events"] += 1
-        if event.lsn:
-            stats["first_lsn"] = stats["first_lsn"] or event.lsn
-            stats["last_lsn"] = event.lsn
-        if event.source_ts_ms:
-            stats["max_source_ts"] = max(stats["max_source_ts"] or 0, event.source_ts_ms)
-
-        if item.keyless:
-            key = (event_id,)
-            item.touched[key] = None
-            item.final[key] = row
-            return
-
-        raw_key = tuple(event.key[k] for k in event.key)
-        item.touched.setdefault(raw_key, None)
-        # A primary-key UPDATE under REPLICA IDENTITY FULL arrives as one event
-        # whose `before` carries the OLD key. Touching both keys is what makes
-        # "delete old, insert new" fall out of the normal path (rubric 1.4).
-        if event.before and all(k in event.before for k in event.key):
-            old_key = tuple(event.before[k] for k in event.key)
-            if old_key != raw_key:
-                item.touched.setdefault(old_key, None)
-        item.final[raw_key] = None if event.op == "d" else row
+        return (
+            f"snap:{self._snapshot_epoch}:{event.schema}.{event.table}:"
+            f"{event.snapshot_ordinal}"
+        )
 
     def _row_for(
         self, event: PendingRecord, commit_id: int, event_id: str, *, snapshot: bool
@@ -744,6 +838,11 @@ class Applier:
                 ]
             )
         apply_sql.insert_rows(self.con, table, column_order, rows)
+        # A no-op when the destination accepted the PRIMARY KEY on the identity
+        # columns (it then rejects a duplicate on the INSERT itself). Where it could
+        # not, this is what keeps "duplication is impossible" enforced by the
+        # destination rather than asserted by us (Opus M-2).
+        apply_sql.assert_identity_is_unique(self.con, table)
 
     # ------------------------------------------------------------------ #
     # snapshot phase (ADR §3.5 + D7)
@@ -838,13 +937,28 @@ class Applier:
     # ------------------------------------------------------------------ #
     # spill (ADR §3.4)
     # ------------------------------------------------------------------ #
-    def _spill_events(self, events: list[PendingRecord]) -> int:
-        """Stage a unit's events inside the group's own transaction.
+    def _spill_events(
+        self,
+        events: list[PendingRecord],
+        *,
+        unit_seq: int,
+        snapshot: tuple[str | None, str | None] | None = None,
+    ) -> int:
+        """Stage one unit's events inside the group's own transaction.
 
         Because staging and drain are in the *same* transaction, nothing is ever
         visible early, so rubric 1.3 is not weakened; and a crash rolls the
         staging rows back with everything else, so there is no orphan cleanup
         problem (ADR §3.4).
+
+        `unit_seq` and `snapshot` are **inputs**, not inferences. This function used
+        to look the phase up in `self._snapshot`, a mapping that `_apply_units`
+        populates only later, so on the first spilled chunk of every snapshot it
+        concluded "streaming" and staged the rows into the **live** table with a
+        `<lsn>:None:None` identity; a consumer could then see a partial snapshot,
+        and the swap dropped those rows (Codex 1). Establishing the shadow before
+        anything can be staged is the fix, and `unit_seq` is what lets the drain
+        order and fence per unit (Opus B-1, Codex 5).
         """
         if not events:
             return 0
@@ -853,25 +967,29 @@ class Applier:
             self._txn_open = True
             self._spill_commit_id = self._next_commit_id
         commit_id = self._spill_commit_id or self._next_commit_id
-        self._spill_unit_seq += 1
+        state: _SnapshotTable | None = None
+        if snapshot is not None:
+            # Creates the shadow table, its `table_state` row and the snapshot epoch
+            # BEFORE any record of this table can be staged.
+            state = self._snapshot_state(*snapshot)
         rows = []
-        for seq, event in enumerate(events, start=1):
+        for event in events:
             if not event.schema or not event.table:
                 continue
-            snapshot_state = self._snapshot.get(f"{event.schema}.{event.table}")
-            if snapshot_state is not None:
-                snapshot_state.ordinal += 1
-                event_id = (
-                    f"snap:{self._snapshot_epoch}:{event.schema}.{event.table}:"
-                    f"{snapshot_state.ordinal}"
-                )
-                target = snapshot_state.shadow
+            if state is not None:
+                event_id = self._snapshot_event_id(event)
+                target = state.shadow
+                event_seq = event.snapshot_ordinal
             else:
                 event_id = _stream_event_id(event)
                 target = self._target_table(event.schema, event.table)
+                # Mandatory and validated by the assembler, so there is nothing to
+                # substitute a local sequence for: doing that gave a replay a
+                # different identity (Codex 4).
+                event_seq = event.total_order
             rows.append(
                 [
-                    commit_id, self._spill_unit_seq, event.total_order or seq, target,
+                    commit_id, unit_seq, event_seq, target,
                     event.schema, event.table, event.lsn, event.txn_id,
                     event.total_order, event_id, event.op, event.source_ts_ms,
                     json.dumps(event.before, default=str) if event.before else None,
@@ -896,21 +1014,22 @@ class Applier:
         maybe_crash("spill", self.data_commit_groups + 1)
         return len(events)
 
-    def _drain_spill(self, commit_id: int, stats: dict) -> int:
-        """Project the staged rows into their target tables, then clear them.
+    def _load_staged(
+        self, unit: CompleteUnit, work: dict[str, _TableWork], commit_id: int, stats: dict
+    ) -> None:
+        """Load one unit's staged prefix into the group's shared `work` map.
 
-        Reads `ORDER BY unit_seq, event_seq`, which is exactly source order, so
-        the merge semantics are identical to the in-memory path.
+        `ORDER BY event_seq` inside one unit is source order, and the caller calls
+        this immediately before collecting that unit's in-memory tail, so the whole
+        group is applied in one totally ordered pass.
         """
         staged = self.con.execute(
             f"SELECT target_table, source_schema, source_table, lsn, txn_id, total_order, "
             "       cdcf_event_id, op, source_ts_ms, before_json, after_json, key_json "
-            f"FROM {CONTROL_SCHEMA}.spill_events WHERE commit_id = ? "
-            "ORDER BY unit_seq, event_seq",
-            [commit_id],
+            f"FROM {CONTROL_SCHEMA}.spill_events WHERE commit_id = ? AND unit_seq = ? "
+            "ORDER BY event_seq",
+            [commit_id, unit.spill_unit_seq],
         ).fetchall()
-        work: dict[str, _TableWork] = {}
-        applied = 0
         for row in staged:
             (
                 target, schema, table, lsn, txn_id, total_order, event_id, op,
@@ -924,46 +1043,46 @@ class Applier:
                 before=json.loads(before_json) if before_json else None,
                 after=json.loads(after_json) if after_json else None,
             )
-            item = work.get(target)
-            if item is None:
-                item = _TableWork(
-                    target=target,
-                    keyless=event.key is None,
-                    snapshot=target.endswith(naming.SHADOW_SUFFIX),
-                )
-                item.key_columns = (
-                    tuple(naming.normalize(k) for k in event.key)
-                    if event.key
-                    else (CDCF_EVENT_ID,)
-                )
-                work[target] = item
+            item = self._work_for(
+                work, target, event, target.endswith(naming.SHADOW_SUFFIX)
+            )
             self._collect_prepared(item, event, commit_id, event_id, stats)
-            applied += 1
-        for item in work.values():
-            self._write_table(item)
-            stats["tables"].add(item.target)
+
+    def _clear_staged(self, commit_id: int) -> None:
         self.con.execute(
             f"DELETE FROM {CONTROL_SCHEMA}.spill_events WHERE commit_id = ?", [commit_id]
         )
         self._spill_rows = 0
-        return applied
 
     def _collect_prepared(
         self, item: _TableWork, event: PendingRecord, commit_id: int, event_id: str, stats: dict
     ) -> None:
+        """The one place an event becomes destination work, in either storage mode.
+
+        In-memory collection and staged-row projection used to be two functions
+        that drifted: the drain updated neither `table_counts` nor
+        `stats["max_source_ts"]`, so a spilled group under-reported in
+        `last_run.json` and in `commit_log.max_source_ts` (Opus MINOR-1).
+        """
         row = self._row_for(event, commit_id, event_id, snapshot=item.snapshot)
         for column, value in row.items():
             item.columns[column] = apply_sql.widen(
                 item.columns.get(column), apply_sql.sql_type(value)
             )
         item.events += 1
+        stats["events"] += 1
         if event.lsn:
             stats["first_lsn"] = stats["first_lsn"] or event.lsn
             stats["last_lsn"] = event.lsn
+        if event.source_ts_ms:
+            stats["max_source_ts"] = max(stats["max_source_ts"] or 0, event.source_ts_ms)
         if item.keyless:
             key = (event_id,)
         else:
             key = tuple(event.key[k] for k in event.key)
+            # A primary-key UPDATE under REPLICA IDENTITY FULL arrives as one event
+            # whose `before` carries the OLD key. Touching both keys is what makes
+            # "delete old, insert new" fall out of the normal path (rubric 1.4).
             if event.before and all(k in event.before for k in event.key):
                 old = tuple(event.before[k] for k in event.key)
                 if old != key:
@@ -979,21 +1098,58 @@ class Applier:
 
         Deliberately does NOT try to commit: the tail cannot be proven whole, and
         Invariant O guarantees nothing about it was acknowledged, so replaying it
-        is free.
+        is free. Whole units still buffered in the group are equally safe to drop,
+        but they used to vanish without being counted anywhere, so a run could
+        report `ok: true` having silently deferred entire transactions
+        (Opus MINOR-9). They are counted into the summary now.
         """
         self.shutdown()
+        if self._group:
+            self.deferred_units += len(self._group)
+            self.deferred_events += sum(u.event_count for u in self._group)
+            log.info(
+                "deferring %s whole unit(s) / %s events buffered at shutdown; they "
+                "replay on the next run (Invariant O)",
+                len(self._group), self.deferred_events,
+            )
+            self._group = []
+        # A staging transaction may still be open (a large unit was spilling when the
+        # engine stopped). Roll it back explicitly, or the lease DELETE that follows
+        # in `pipeline.run`'s `finally` joins that transaction and is discarded by
+        # `con.close()`, leaving the lease alive until its TTL (Opus MINOR-8).
+        self._rollback_quietly()
+        try:
+            self._run_pending_verification()
+        except BaseException as exc:
+            # Recorded rather than raised: this runs in a `finally`, and raising
+            # here would replace whatever exception is already in flight. The
+            # supervisor checks `handler.error` after that block, so it still fails
+            # the run.
+            log.error("the last commit group's offset flush could not be verified: %s", exc)
+            if self.error is None:
+                self.error = exc
         return self.assembler.discard_open_unit()
 
 
 def _stream_event_id(event: PendingRecord) -> str:
-    """`"<commit lsn>:<txId>:<transaction.total_order>"` (ADR §6).
+    """`"<event lsn>:<source.txId>:<transaction.total_order>"` (ADR §6, §15/A3).
 
-    `total_order` is the connector's own 1-based ordinal within the transaction,
-    restored from the offset on restart, so it is stable across a replay of the
-    same WAL. `source.sequence` is NOT an ordinal (it is
-    `[lastCommitLsn, currentLsn]`, `SourceInfo.java:180-196`) and several events
-    can share one LSN, which is why the LSN alone cannot be the identity
-    (Codex 3).
+    The **event's own** LSN, not the transaction's commit LSN (ADR §15/A3 records
+    the change; this docstring and `apply_sql`'s used to say "commit lsn" —
+    Opus MINOR-14).
+
+    `total_order` is the connector's own 1-based ordinal within the transaction, so
+    it is stable across a replay of the same WAL: a resume point can only ever sit
+    on a transaction boundary, so a replayed transaction renumbers from 1 and
+    recomputes identical identities. `source.sequence` is NOT an ordinal (it is
+    `[lastCommitLsn, currentLsn]`, `SourceInfo.java:180-196`) and several events can
+    share one LSN, which is why the LSN alone cannot be the identity (Codex 3).
+
+    Uniqueness is **structural, not conventional**, and only because
+    `TransactionAssembler` refuses a unit whose ordinals are absent, non-positive,
+    repeated, or not exactly `1..event_count` (Codex 4; ADR §15/A18). Without that
+    validation two accepted events could reach this function with the same triple
+    and the keyless collection would silently keep one of them.
     """
     return f"{event.lsn}:{event.txn_id}:{event.total_order}"
 

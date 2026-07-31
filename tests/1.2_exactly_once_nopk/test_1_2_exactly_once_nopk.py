@@ -138,14 +138,36 @@ def test_target_event_identity_is_derived_not_random(crash_replay):
     recomputed - and therefore matched - on a replay.
     """
     box = crash_replay["box"]
+    # `dbz_tx_id` and `cdcf_total_order` are NULL by design for SNAPSHOT rows, so
+    # the predicate below evaluates to NULL for them and `WHERE NOT ...` silently
+    # exempted every snapshot row from the assertion (Opus MINOR-13). Streaming
+    # rows and snapshot rows now get their own explicit assertion.
+    streaming = box.scalar(f"SELECT count(*) FROM {READINGS} WHERE dbz_tx_id IS NOT NULL")
+    assert streaming > 0, "no streaming rows to assert on; the test would be vacuous"
     mismatched = box.scalar(
         f"SELECT count(*) FROM {READINGS} "
-        "WHERE cdcf_event_id IS NULL "
-        "   OR NOT ends_with(cdcf_event_id, "
-        "        dbz_tx_id::VARCHAR || ':' || cdcf_total_order::VARCHAR)"
+        "WHERE dbz_tx_id IS NOT NULL "
+        "  AND (cdcf_event_id IS NULL "
+        "       OR cdcf_total_order IS NULL "
+        "       OR cdcf_event_id <> dbz_lsn::VARCHAR || ':' || dbz_tx_id::VARCHAR "
+        "                          || ':' || cdcf_total_order::VARCHAR)"
     )
     assert mismatched == 0, (
-        f"{mismatched} rows have a cdcf_event_id that does not end in "
-        "(txId, transaction.total_order), so it is not recomputable from the "
-        "envelope and cannot be matched on a replay (ADR 0001 §6)"
+        f"{mismatched} streaming rows have a cdcf_event_id that is not exactly "
+        "(event lsn, txId, transaction.total_order), so it is not recomputable from "
+        "the envelope and cannot be matched on a replay (ADR 0001 §6)"
+    )
+
+    snapshot_rows = box.scalar(f"SELECT count(*) FROM {READINGS} WHERE dbz_tx_id IS NULL")
+    assert snapshot_rows > 0, "no snapshot rows to assert on; the test would be vacuous"
+    bad_snapshot = box.scalar(
+        f"SELECT count(*) FROM {READINGS} WHERE dbz_tx_id IS NULL AND ("
+        "  cdcf_total_order IS NOT NULL"
+        "  OR cdcf_event_id IS NULL"
+        "  OR NOT regexp_matches(cdcf_event_id, '^snap:[0-9]+:app\\.sensor_readings:[0-9]+$')"
+        ")"
+    )
+    assert bad_snapshot == 0, (
+        f"{bad_snapshot} snapshot rows do not carry the snapshot identity form "
+        "`snap:<epoch>:<schema>.<table>:<ordinal>` (ADR 0001 §6)"
     )

@@ -16,10 +16,16 @@ the `after` image, so the row is deleted under the old key and inserted under th
 new one inside the same commit group. No consumer can ever see it under both.
 
 The keyless rule is what makes rubric 1.2 reachable. `cdcf_event_id` is
-`"<commit_lsn>:<txId>:<transaction.total_order>"` - the connector's own
+`"<event lsn>:<source.txId>:<transaction.total_order>"` - the connector's own
 bookkeeping, not ours, so a replayed event recomputes the *same* id, while two
 genuinely identical source rows are two different events and keep two different
-ids. Nothing that deduplicates by row *content* can do both.
+ids. Nothing that deduplicates by row *content* can do both. (It is the **event's
+own** LSN, not the transaction's commit LSN - ADR §15/A3; this docstring said
+`commit_lsn` long after the code changed, Opus MINOR-14.)
+
+Every table created here also carries a destination-side `PRIMARY KEY` on those
+identity columns, so a duplicate identity is a failed transaction rather than a
+silently corrupted table (Opus M-2).
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ import logging
 import math
 from typing import Any
 
+from .errors import DestinationIdentityCollision
 from .naming import (
     CDCF_COMMIT_ID,
     CDCF_EVENT_ID,
@@ -129,8 +136,16 @@ class TableSchema:
         self.name = name
         self.dataset = dataset
         self.columns: dict[str, str] = {}
+        #: the destination's own type string, before `_normalise_type` collapses it.
+        #: Kept so we never ALTER a column whose real type we did not recognise
+        #: (Opus MINOR-15): TIMESTAMP normalises to VARCHAR, and "widening" a
+        #: TIMESTAMP column to VARCHAR is destructive-by-accident.
+        self.raw_types: dict[str, str] = {}
         self.key_columns: tuple[str, ...] = ()
         self.exists = False
+        #: True when the table carries a destination-side PRIMARY KEY on its
+        #: identity columns (Opus M-2).
+        self.constrained = False
 
     @property
     def qualified(self) -> str:
@@ -138,11 +153,23 @@ class TableSchema:
 
 
 class SchemaRegistry:
-    """Creates and evolves destination tables. All DDL runs in the caller's txn."""
+    """Creates and evolves destination tables. All DDL runs in the caller's txn.
 
-    def __init__(self, con, dataset: str):
+    Every table it creates carries a `PRIMARY KEY` on its identity columns - the
+    source key columns for a keyed table, `cdcf_event_id` for a keyless one - so
+    that "duplication is impossible" is *enforced by the destination* rather than
+    asserted by the applier (Opus M-2). That is what turns the whole B-1 class of
+    apply-path defect from silent corruption into a failed transaction, and a failed
+    transaction is safe: it rolls back and replays. MEASURED on DuckDB 1.5.4:
+    200 000 rows x 2 columns through Arrow into a table with a PRIMARY KEY takes
+    0.03 s, and DELETE-then-INSERT of the same key inside one transaction is
+    accepted, so the merge path is unaffected.
+    """
+
+    def __init__(self, con, dataset: str, *, constraints: bool = True):
         self.con = con
         self.dataset = dataset
+        self.constraints = constraints
         self._tables: dict[str, TableSchema] = {}
 
     def get(self, name: str) -> TableSchema:
@@ -165,6 +192,7 @@ class SchemaRegistry:
         if rows:
             table.exists = True
             table.columns = {name: _normalise_type(dtype) for name, dtype in rows}
+            table.raw_types = {name: str(dtype).upper() for name, dtype in rows}
 
     # -- DDL ---------------------------------------------------------------- #
     def ensure(
@@ -179,14 +207,7 @@ class SchemaRegistry:
         table = self.get(name)
         table.key_columns = key_columns
         if not table.exists:
-            defs = ", ".join(
-                f"{quote(col)} {ctype}" for col, ctype in columns.items()
-            )
-            self.con.execute(
-                f"CREATE TABLE IF NOT EXISTS {table.qualified} ({defs})"
-            )
-            table.columns = dict(columns)
-            table.exists = True
+            self._create(table, columns, key_columns)
             return table, True
 
         for col, ctype in columns.items():
@@ -197,26 +218,103 @@ class SchemaRegistry:
                     f"ALTER TABLE {table.qualified} ADD COLUMN {quote(col)} {ctype}"
                 )
                 table.columns[col] = ctype
+                table.raw_types[col] = ctype
                 continue
             widened = widen(existing, ctype)
-            if widened != existing:
-                try:
-                    self.con.execute(
-                        f"ALTER TABLE {table.qualified} ALTER COLUMN {quote(col)} "
-                        f"SET DATA TYPE {widened}"
-                    )
-                    table.columns[col] = widened
-                except Exception as exc:  # rubric 2.5 owns the real answer
-                    log.warning(
-                        "could not widen %s.%s from %s to %s: %s",
-                        name, col, existing, widened, exc,
-                    )
+            if widened == existing:
+                continue
+            raw = table.raw_types.get(col, existing)
+            if raw not in _RECOGNISED_TYPES:
+                # `_normalise_type` collapses TIMESTAMP / DECIMAL / DATE / BLOB / LIST
+                # to VARCHAR, so an "upgrade" computed from that lattice can narrow a
+                # real TIMESTAMP column to text. Refuse explicitly instead of doing it
+                # by accident; rubric 2.4/2.5 own the real answer (Opus MINOR-15).
+                log.warning(
+                    "not altering %s.%s: the destination type %s is outside the type "
+                    "lattice, so widening it to %s could narrow it (rubric 2.4/2.5)",
+                    name, col, raw, widened,
+                )
+                continue
+            try:
+                self.con.execute(
+                    f"ALTER TABLE {table.qualified} ALTER COLUMN {quote(col)} "
+                    f"SET DATA TYPE {widened}"
+                )
+                table.columns[col] = widened
+                table.raw_types[col] = widened
+            except Exception as exc:  # rubric 2.5 owns the real answer
+                log.warning(
+                    "could not widen %s.%s from %s to %s: %s",
+                    name, col, existing, widened, exc,
+                )
         return table, False
+
+    def _create(
+        self, table: TableSchema, columns: dict[str, str], key_columns: tuple[str, ...]
+    ) -> None:
+        defs = ", ".join(f"{quote(col)} {ctype}" for col, ctype in columns.items())
+        constraint = ""
+        if self.constraints and key_columns and all(c in columns for c in key_columns):
+            constraint = ", PRIMARY KEY (" + ", ".join(quote(c) for c in key_columns) + ")"
+        try:
+            self.con.execute(
+                f"CREATE TABLE IF NOT EXISTS {table.qualified} ({defs}{constraint})"
+            )
+            table.constrained = bool(constraint)
+        except Exception as exc:
+            if not constraint:
+                raise
+            # A destination that cannot express the constraint must not block the
+            # load; `_assert_identity_is_unique` becomes the enforcement instead.
+            log.warning(
+                "could not create %s with a PRIMARY KEY on %s (%s); falling back to a "
+                "post-apply uniqueness assertion inside the commit group",
+                table.name, key_columns, exc,
+            )
+            self.con.execute(f"CREATE TABLE IF NOT EXISTS {table.qualified} ({defs})")
+            table.constrained = False
+        table.columns = dict(columns)
+        table.raw_types = dict(columns)
+        table.exists = True
 
     def drop(self, name: str) -> None:
         table = self.get(name)
         self.con.execute(f"DROP TABLE IF EXISTS {table.qualified}")
         self.forget(name)
+
+
+#: Destination types the widening lattice actually understands. Anything else is
+#: reported as VARCHAR by `_normalise_type` and must never be ALTERed on that basis.
+_RECOGNISED_TYPES = frozenset(
+    {
+        BOOLEAN, BIGINT, DOUBLE, JSON_T, VARCHAR,
+        "TEXT", "STRING", "INT64", "HUGEINT", "INTEGER", "INT", "INT32", "SMALLINT",
+        "FLOAT", "REAL", "FLOAT8",
+    }
+)
+
+
+def assert_identity_is_unique(con, table: TableSchema) -> None:
+    """Fallback for a destination that cannot express the PRIMARY KEY (Opus M-2).
+
+    Runs **inside** the commit group's transaction, so a violation rolls the whole
+    group back and the events replay. Only used when `_create` could not attach the
+    constraint; with the constraint in place the destination raises on the INSERT
+    itself and this is never called.
+    """
+    if table.constrained or not table.key_columns:
+        return
+    cols = ", ".join(quote(c) for c in table.key_columns)
+    duplicates = con.execute(
+        f"SELECT count(*) FROM (SELECT {cols} FROM {table.qualified} "
+        f"GROUP BY {cols} HAVING count(*) > 1)"
+    ).fetchone()[0]
+    if duplicates:
+        raise DestinationIdentityCollision(
+            f"{table.qualified} holds {duplicates} identity value(s) more than once on "
+            f"({cols}). Exactly-once delivery means one row per identity, so this commit "
+            "group is rolled back (ADR 0001 §15/A21)."
+        )
 
 
 def _normalise_type(duckdb_type: str) -> str:

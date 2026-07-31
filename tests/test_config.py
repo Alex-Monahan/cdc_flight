@@ -3,8 +3,14 @@ pieces that are pure logic."""
 
 from __future__ import annotations
 
+import pytest
+
 from cdc_flight.config import ReplicationConfig, SourceConfig, applier_settings
-from cdc_flight.debezium_props import build_properties
+from cdc_flight.debezium_props import (
+    assert_no_internal_topic_collision,
+    build_properties,
+)
+from cdc_flight.errors import UnsafeDebeziumProperty
 from cdc_flight.naming import destination_table, normalize, shadow_table
 
 
@@ -43,6 +49,51 @@ def test_properties_configure_the_full_envelope(tmp_path):
     assert props["replace.null.with.default"] == "false"
     # ADR 0001 §4.2 / Opus B2: a flush that did not happen must be observable.
     assert props["offset.flush.interval.ms"] == "0"
+
+
+def test_the_lsn_flush_mode_is_pinned_to_connector(tmp_path):
+    """Invariant O depends on it, and the safe value is only a Debezium *default*.
+
+    With `lsn.flush.mode=connector_and_driver`,
+    `PostgresReplicationConnection.java:1114-1123` sets `.withAutomaticFlush(true)`
+    and the shipped pgjdbc then advances the flushed LSN to the server-supplied
+    `lastServerLSN` on keepalives, **never consulting the offset store**. That
+    confirms WAL to Postgres outside the invariant, i.e. it is the withdrawn P2's
+    shape: an argument that holds because a default happens to be safe. Pin it
+    (Opus B-2).
+    """
+    props = build_properties(SourceConfig(), ReplicationConfig(state_dir=tmp_path))
+    assert props["lsn.flush.mode"] == "connector"
+
+
+def test_an_unsafe_lsn_flush_mode_is_refused(tmp_path):
+    with pytest.raises(UnsafeDebeziumProperty, match=r"lsn\.flush\.mode"):
+        build_properties(
+            SourceConfig(),
+            ReplicationConfig(state_dir=tmp_path),
+            overrides={"lsn.flush.mode": "connector_and_driver"},
+        )
+
+
+def test_an_override_that_would_break_invariant_o_is_refused(tmp_path):
+    """The other two properties the whole design rests on."""
+    for key, value in (
+        ("provide.transaction.metadata", "false"),
+        ("offset.flush.interval.ms", "60000"),
+    ):
+        with pytest.raises(UnsafeDebeziumProperty, match=key.replace(".", r"\.")):
+            build_properties(
+                SourceConfig(), ReplicationConfig(state_dir=tmp_path), overrides={key: value}
+            )
+
+
+def test_no_captured_table_can_collide_with_an_internal_topic():
+    """`internal_topic_prefixes()` was dead code left behind by the deleted
+    handler, which reads as protection that is not there (Opus MINOR-6). It is now
+    an assertion the run makes at start-up."""
+    assert_no_internal_topic_collision("cdcflight", ["app.customers", "app.orders"])
+    with pytest.raises(UnsafeDebeziumProperty, match="transaction"):
+        assert_no_internal_topic_collision("cdcflight", ["app.customers", "cdcflight.transaction"])
 
 
 def test_snapshot_mode_override(tmp_path):

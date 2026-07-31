@@ -84,8 +84,13 @@ def write(path: Path | str, entries: dict[bytes, bytes]) -> None:
     """Write `entries` in `FileOffsetBackingStore`'s format, atomically.
 
     Kafka's own writer is *not* atomic, which is why ADR §4.5 has a
-    "corrupt/truncated" row. Ours writes to a sibling temp file and renames, so
-    the failure mode it repairs cannot be reintroduced by the repair itself.
+    "corrupt/truncated" row. Ours writes to a sibling temp file, `fsync`s it and
+    the directory, then renames - so the failure mode it repairs cannot be
+    reintroduced by the repair itself, and the guarantee holds against machine
+    death and not only against process death (Opus MINOR-4).
+
+    The file is still never a source of truth (ADR §4.5): if the rename is lost
+    entirely, start-up reconciliation rebuilds it from the destination.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -106,7 +111,35 @@ def write(path: Path | str, entries: dict[bytes, bytes]) -> None:
         stream.flush()
     finally:
         stream.close()
+    _fsync(tmp)
     os.replace(tmp, path)
+    _fsync_dir(path.parent)
+
+
+def _fsync(target: Path) -> None:
+    try:
+        fd = os.open(str(target), os.O_RDONLY)
+    except OSError:  # pragma: no cover
+        return
+    try:
+        os.fsync(fd)
+    except OSError:  # pragma: no cover - not every filesystem supports it
+        log.debug("fsync of %s failed", target, exc_info=True)
+    finally:
+        os.close(fd)
+
+
+def _fsync_dir(directory: Path) -> None:
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:  # pragma: no cover
+        return
+    try:
+        os.fsync(fd)
+    except OSError:  # pragma: no cover - macOS/Linux differ on directory fsync
+        log.debug("fsync of directory %s failed", directory, exc_info=True)
+    finally:
+        os.close(fd)
 
 
 def _signed(data: bytes) -> list[int]:

@@ -9,6 +9,7 @@ in `research/NOTES.md`.
 from __future__ import annotations
 
 from .config import ReplicationConfig, SourceConfig
+from .errors import UnsafeDebeziumProperty
 
 # Debezium's marker for a TOASTed column whose value was not present in the WAL.
 UNAVAILABLE_VALUE_PLACEHOLDER = "__debezium_unavailable_value"
@@ -28,18 +29,72 @@ METADATA_PREFIX = "dbz_"
 # true (`repos/debezium/debezium-api/.../spi/OffsetCommitPolicy.java:36-53`).
 OFFSET_FLUSH_INTERVAL_MS_ALWAYS = "0"
 
+#: ADR 0001 §4.10 / Opus B-2. Invariant O holds because
+#: `PostgresConnectorTask.performCommit()` re-reads the offset *backing store*
+#: rather than the task's in-memory offset context. `lsn.flush.mode` is the one
+#: documented bypass: with `connector_and_driver`,
+#: `PostgresReplicationConnection.java:1114-1123` sets `.withAutomaticFlush(true)`
+#: and the shipped pgjdbc (`V3PGReplicationStream.processKeepAliveMessage`) then
+#: advances the flushed LSN to the **server-supplied** `lastServerLSN` on
+#: keepalives, never consulting the offset store - confirming WAL to Postgres
+#: outside the invariant. Debezium's default is already `connector`, and that is
+#: precisely the problem: "the default happens to be safe" is a conditional
+#: argument, which is the shape of the withdrawn P2. So it is pinned.
+LSN_FLUSH_MODE_SAFE = "connector"
+
+#: Properties whose value the exactly-once argument depends on. An override that
+#: changes any of them is refused rather than logged.
+INVARIANT_O_PINS = {
+    "lsn.flush.mode": LSN_FLUSH_MODE_SAFE,
+    "provide.transaction.metadata": "true",
+    "offset.flush.interval.ms": OFFSET_FLUSH_INTERVAL_MS_ALWAYS,
+}
+
+INVARIANT_O_REASONS = {
+    "lsn.flush.mode": (
+        "any value but 'connector' lets pgjdbc flush the LSN from server keepalives "
+        "without consulting the offset store, which advances the slot past data the "
+        "destination never committed (ADR 0001 §4.10, Opus B-2)"
+    ),
+    "provide.transaction.metadata": (
+        "without the transaction END marker there is no way to prove a Postgres "
+        "transaction whole, so no commit group can be formed (ADR 0001 §3.2)"
+    ),
+    "offset.flush.interval.ms": (
+        "a non-zero interval makes `markBatchFinished()` a no-op most of the time, so "
+        "'the offset did not flush' becomes unobservable (ADR 0001 §4.2)"
+    ),
+}
+
 
 def internal_topic_prefixes(topic_prefix: str) -> tuple[str, ...]:
     """Topics that must never become destination tables.
 
-    Debezium's own topics are `__debezium-heartbeat.<prefix>` and, once
-    `provide.transaction.metadata=true` lands, `<prefix>.transaction`. The
-    previous literal `("__debezium", "__cdcflight")` could never match the second
-    one - `topic.prefix` is `cdcflight`, so the transaction topic is
-    `cdcflight.transaction`, and it would have been materialised as a data table
-    (Opus m1). Derive it from the configured prefix instead.
+    Debezium's own topics are `__debezium-heartbeat.<prefix>` and, with
+    `provide.transaction.metadata=true`, `<prefix>.transaction`.
     """
     return ("__debezium", f"{topic_prefix}.transaction", f"{topic_prefix}.heartbeat")
+
+
+def assert_no_internal_topic_collision(topic_prefix: str, tables: list[str]) -> None:
+    """A captured table whose topic equals an internal topic would be silently lossy.
+
+    With the pinned `DefaultTopicNamingStrategy` a Postgres table named
+    `transaction` lands on `<prefix>.<schema>.transaction`, so it does not collide
+    with `<prefix>.transaction` today. This is asserted rather than reasoned about,
+    because `internal_topic_prefixes()` had become dead code after the old handler
+    was deleted, which reads as protection that is not there (Opus MINOR-6).
+    """
+    internal = set(internal_topic_prefixes(topic_prefix))
+    for table in tables:
+        topic = f"{topic_prefix}.{table}"
+        if topic in internal or table in internal:
+            raise UnsafeDebeziumProperty(
+                f"captured table {table!r} would publish to {topic!r}, which is one of "
+                f"Debezium's internal topics ({sorted(internal)}). Its records would be "
+                "decoded as transaction metadata or heartbeats and never applied "
+                "(ADR 0001 §3.2)."
+            )
 
 # Metadata columns as they appear in the destination (after dlt normalisation).
 METADATA_COLUMNS = (
@@ -61,14 +116,26 @@ def build_properties(
     snapshot_mode: str | None = None,
     max_batch_size: int = 2048,
     poll_interval_ms: int = 500,
+    overrides: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Return Debezium engine properties as a plain dict.
 
     `DebeziumJsonEngine` converts a dict into `java.util.Properties` for us, so we
     keep the Python side dict-shaped and unit-testable.
+
+    `overrides` exists so the pins that Invariant O depends on have something to
+    refuse: an operator (or a future config surface) that tries to change one of
+    `INVARIANT_O_PINS` gets `UnsafeDebeziumProperty`, not a warning.
     """
     replication.state_dir.mkdir(parents=True, exist_ok=True)
     snapshot = snapshot_mode or replication.snapshot_mode
+    for key, value in (overrides or {}).items():
+        pinned = INVARIANT_O_PINS.get(key)
+        if pinned is not None and str(value) != pinned:
+            raise UnsafeDebeziumProperty(
+                f"refusing to set {key}={value!r}: it is pinned to {pinned!r} because "
+                f"{INVARIANT_O_REASONS[key]}"
+            )
 
     props: dict[str, str] = {
         "name": "cdc-flight-engine",
@@ -104,6 +171,11 @@ def build_properties(
         # `cdc_flight.consumer.OffsetFlushVerifier` cannot tell a policy no-op
         # from Debezium swallowing a flush failure (Opus B2).
         "offset.flush.interval.ms": OFFSET_FLUSH_INTERVAL_MS_ALWAYS,
+        # PINNED, not left to the default. See LSN_FLUSH_MODE_SAFE above: this is
+        # the one path that can confirm WAL to Postgres without ever reading the
+        # offset store, i.e. the one thing that could break Invariant O from
+        # outside our code (Opus B-2).
+        "lsn.flush.mode": LSN_FLUSH_MODE_SAFE,
         # ADR 0001 §4.10 / Opus m10: `stopSourceTasks()` waits only
         # `task.management.timeout.ms` before `taskService.shutdownNow()`
         # (`AsyncEngineConfig.java:25,76-80`), so a flush timeout larger than it

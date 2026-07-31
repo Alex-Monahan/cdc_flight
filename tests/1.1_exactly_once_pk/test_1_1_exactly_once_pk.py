@@ -22,6 +22,7 @@ import time
 import pytest
 
 CUSTOMERS = '"cdc_raw"."cdcflight_app_customers"'
+READINGS = '"cdc_raw"."cdcflight_app_sensor_readings"'
 REPLAY_FILTER = "name LIKE 'replay-c-%'"
 
 
@@ -169,17 +170,34 @@ def test_slow_real_sigkill_is_exactly_once(sandbox):
     sleep: the applier now streams 200 000 rows in ~30 s, and the old 35 s sleep
     let the run finish before the signal arrived (which is how this rewrite
     started).
+
+    **3. It can now actually see a duplicate.** `app.customers` is keyed, so it is
+    under merge semantics: a re-delivered event is `delete_keys` + insert and
+    `count(*)` stays at `rows` *whether or not the batch was applied twice*. The
+    old assertions were therefore vacuous as duplication detectors, on exactly the
+    test `RUBRIC_STATUS.md` cited as the evidence for "0 duplicates across a real
+    kill -9" (Opus M-3). Each transaction now also writes to the keyless
+    `app.sensor_readings`, whose identity is `cdcf_event_id`, so every delivery of
+    a change event is a row and a second delivery cannot hide.
     """
     sandbox.reseed()
     sandbox.run(reset_state=True, max_seconds=200, idle_seconds=8, timeout=400)
 
     txns, per_txn = 40, 5_000
     rows = txns * per_txn
+    readings_per_txn = 25
+    readings = txns * readings_per_txn
     for t in range(txns):
         sandbox.sql(
-            "INSERT INTO app.customers (name, email) SELECT "
-            "'kill9-' || i, 'kill9-' || i || '@example.com' "
-            f"FROM generate_series({t * per_txn + 1}, {(t + 1) * per_txn}) i",
+            [
+                "INSERT INTO app.customers (name, email) SELECT "
+                "'kill9-' || i, 'kill9-' || i || '@example.com' "
+                f"FROM generate_series({t * per_txn + 1}, {(t + 1) * per_txn}) i",
+                # The changelog table: this is where duplication is measurable.
+                "INSERT INTO app.sensor_readings (sensor_id, value, unit) SELECT "
+                f"'KILL9', {t} * 1000 + i, 'C' "
+                f"FROM generate_series(1, {readings_per_txn}) i",
+            ],
             one_transaction=True,
         )
 
@@ -210,9 +228,34 @@ def test_slow_real_sigkill_is_exactly_once(sandbox):
         f"{total - rows} DUPLICATE rows survived a SIGKILL; under Invariant O a crash "
         "can only replay what the destination never committed"
     )
+
+    # THE duplication assertion (Opus M-3): the keyless changelog, where a merge on
+    # a primary key cannot absorb a second delivery.
+    landed, unique_events = sandbox.duck_query(
+        f"SELECT count(*), count(DISTINCT cdcf_event_id) FROM {READINGS} "
+        "WHERE sensor_id = 'KILL9'"
+    )[0]
+    assert landed == readings, (
+        f"the keyless changelog holds {landed} change events, the source produced "
+        f"{readings}: a real SIGKILL {'duplicated' if landed > readings else 'lost'} "
+        f"{abs(landed - readings)}"
+    )
+    assert unique_events == readings, (
+        f"{readings - unique_events} change events were applied more than once "
+        "(duplicate cdcf_event_id in the changelog)"
+    )
+    # And the audit trail agrees: one commit group per event, no event stamped twice.
+    ledger_dupes = sandbox.scalar(
+        f"SELECT count(*) FROM (SELECT cdcf_event_id FROM {READINGS} "
+        "WHERE sensor_id = 'KILL9' GROUP BY 1 HAVING count(DISTINCT cdcf_commit_id) > 1)"
+    )
+    assert ledger_dupes == 0, (
+        f"{ledger_dupes} change events are attributed to more than one commit group"
+    )
     print(
-        f"\nSIGKILL mid-stream over {txns} transactions: {total} rows / {distinct} "
-        f"distinct => 0 duplicates, 0 lost (recovery re-applied "
+        f"\nSIGKILL mid-stream over {txns} transactions: {total} keyed rows / {distinct} "
+        f"distinct ids, {landed} keyless change events / {unique_events} distinct "
+        f"cdcf_event_id => 0 duplicates, 0 lost (recovery re-applied "
         f"{recovered['applied_events']} events)"
     )
 

@@ -40,6 +40,9 @@ CAPTURED_TABLES = (
 )
 
 sys.path.insert(0, str(PROJECT_DIR / "src"))
+# `tests/applier_lab.py` is shared by the per-rubric suites in subdirectories,
+# which pytest imports with only their own directory on `sys.path`.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from cdc_flight.config import DestinationConfig, ReplicationConfig, SourceConfig
 
@@ -61,6 +64,18 @@ def _executable(name: str) -> str:
     """Prefer the project venv's console scripts, fall back to PATH."""
     candidate = VENV_BIN / name
     return str(candidate) if candidate.exists() else name
+
+
+@pytest.fixture(autouse=True)
+def _reset_fault_spec():
+    """`faults` caches the parsed `CDC_FAULT_INJECT` (it is read from inside the
+    commit->ack window, which must contain nothing else - Codex 7). Re-read it
+    around every test so an in-process fault cannot leak into the next one."""
+    from cdc_flight import faults
+
+    faults.refresh()
+    yield
+    faults.refresh()
 
 
 # --------------------------------------------------------------------------- #

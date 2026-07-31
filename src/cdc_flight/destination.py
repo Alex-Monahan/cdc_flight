@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import socket
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -25,6 +26,12 @@ from .naming import quote
 log = logging.getLogger("cdc_flight.destination")
 
 CONTROL_SCHEMA = "_cdc_flight"
+
+#: How long a lease write may keep retrying a write-write conflict, and how long it
+#: waits between attempts. See `Lease._write` - this exists because a hard crash
+#: leaves an abandoned MotherDuck transaction holding the lease row.
+LEASE_CONFLICT_BUDGET_SEC = 30.0
+LEASE_CONFLICT_RETRY_SEC = 1.0
 
 
 # --------------------------------------------------------------------------- #
@@ -116,8 +123,16 @@ CONTROL_DDL = [
             updated_at        TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (pipeline, namespace)
         )""",
+    # `PRIMARY KEY (pipeline, commit_id)`, not `PRIMARY KEY (commit_id)`. The id is
+    # allocated as `max(commit_id) + 1` and that cannot be atomic on this
+    # destination, so a globally unique key made two *different, valid* pipelines
+    # race into a primary-key failure: the loser rolled back safely, but a
+    # destination with more than one pipeline could not operate, and "global
+    # commit_id" was acting as a coordination mechanism with no global lease
+    # (Codex 9). Scoped per pipeline it matches the lease's scope, and the
+    # allocation below is monotone within a pipeline.
     f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.commit_log (
-            commit_id       BIGINT      PRIMARY KEY,
+            commit_id       BIGINT      NOT NULL,
             pipeline        VARCHAR     NOT NULL,
             runner_id       VARCHAR     NOT NULL,
             opened_at       TIMESTAMPTZ NOT NULL,
@@ -132,7 +147,8 @@ CONTROL_DDL = [
             first_lsn       BIGINT,
             last_lsn        BIGINT,
             max_source_ts   TIMESTAMPTZ,
-            tables_touched  VARCHAR[]
+            tables_touched  VARCHAR[],
+            PRIMARY KEY (pipeline, commit_id)
         )""",
     f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.lease (
             pipeline        VARCHAR     PRIMARY KEY,
@@ -187,9 +203,66 @@ CONTROL_DDL = [
 ]
 
 
+#: Columns of `commit_log`, in DDL order, used by the key migration below.
+_COMMIT_LOG_COLUMNS = (
+    "commit_id", "pipeline", "runner_id", "opened_at", "committed_at", "trigger",
+    "unit_count", "event_count", "fenced_units", "spilled", "first_txn_id",
+    "last_txn_id", "first_lsn", "last_lsn", "max_source_ts", "tables_touched",
+)
+
+
 def ensure_control_schema(con) -> None:
+    _migrate_commit_log_key(con)
     for statement in CONTROL_DDL:
         con.execute(statement)
+
+
+def _commit_log_primary_key(con) -> tuple[str, ...] | None:
+    """The column list of `commit_log`'s PRIMARY KEY, or None if unknowable."""
+    try:
+        rows = con.execute(
+            "SELECT constraint_column_names FROM duckdb_constraints() "
+            "WHERE schema_name = ? AND table_name = 'commit_log' "
+            "AND constraint_type = 'PRIMARY KEY'",
+            [CONTROL_SCHEMA],
+        ).fetchall()
+    except Exception:  # pragma: no cover - a destination without duckdb_constraints()
+        log.debug("could not read commit_log constraints", exc_info=True)
+        return None
+    if not rows:
+        return ()
+    return tuple(str(c) for c in rows[0][0])
+
+
+def _migrate_commit_log_key(con) -> None:
+    """Move `commit_log` from `PRIMARY KEY (commit_id)` to `(pipeline, commit_id)`.
+
+    Needed because `CREATE TABLE IF NOT EXISTS` cannot change a key, and a
+    destination that already hosts a pipeline would otherwise reject the *first*
+    commit of a second pipeline: ids are now allocated per pipeline, so a new
+    pipeline starts again at 1 (Codex 9). MEASURED against the shared MotherDuck
+    development database, which already had the global key.
+
+    Runs before any commit group opens a transaction, and is a no-op once done.
+    """
+    existing = _commit_log_primary_key(con)
+    if existing is None or existing == () or set(existing) == {"pipeline", "commit_id"}:
+        return
+    log.warning(
+        "migrating %s.commit_log from PRIMARY KEY %s to (pipeline, commit_id)",
+        CONTROL_SCHEMA, existing,
+    )
+    columns = ", ".join(_COMMIT_LOG_COLUMNS)
+    old = f"{CONTROL_SCHEMA}.commit_log__cdcf_oldkey"
+    con.execute(f"DROP TABLE IF EXISTS {old}")
+    con.execute(f"ALTER TABLE {CONTROL_SCHEMA}.commit_log RENAME TO commit_log__cdcf_oldkey")
+    for statement in CONTROL_DDL:
+        if ".commit_log (" in statement:
+            con.execute(statement)
+    con.execute(
+        f"INSERT INTO {CONTROL_SCHEMA}.commit_log ({columns}) SELECT {columns} FROM {old}"
+    )
+    con.execute(f"DROP TABLE {old}")
 
 
 def ensure_dataset(con, dataset: str) -> None:
@@ -281,9 +354,18 @@ def write_resume_point(
     )
 
 
-def next_commit_id(con) -> int:
+def next_commit_id(con, pipeline: str) -> int:
+    """The next commit id **for this pipeline** (Codex 9).
+
+    Scoped, because `max(...) + 1` cannot be made atomic here and the lease is
+    per-pipeline: two different pipelines writing to one destination used to
+    contend for the same global id. Within a pipeline the lease guarantees a single
+    writer, so monotone-per-pipeline is exactly as strong as the lease is.
+    """
     row = con.execute(
-        f"SELECT coalesce(max(commit_id), 0) FROM {CONTROL_SCHEMA}.commit_log"
+        f"SELECT coalesce(max(commit_id), 0) FROM {CONTROL_SCHEMA}.commit_log "
+        "WHERE pipeline = ?",
+        [pipeline],
     ).fetchone()
     return int(row[0] or 0) + 1
 
@@ -335,10 +417,14 @@ def raise_alert(con, *, pipeline: str, severity: str, code: str, message: str, c
 # single-writer lease (rubric 4.2)
 # --------------------------------------------------------------------------- #
 def _is_dead(host: str | None, pid: int | None) -> bool:
-    """True only when we can *prove* the recorded owner is gone.
+    """True when the recorded owner is gone *as far as this process can tell*.
 
-    Provable means: it claimed this host, and the pid does not exist. A lease from
-    another host is never assumed dead - there the TTL is the only safe answer.
+    "As far as this process can tell" means: it recorded this hostname, and no such
+    pid exists in **our** PID namespace. That is a proof only when the recorded
+    owner shared that namespace - inside containers that share a hostname across
+    PID namespaces it can reclaim a live lease (Opus MINOR-10), which is why the
+    guarantee is stated this way rather than as "provable". A lease from another
+    host is never assumed dead: there the TTL is the only safe answer.
     """
     if not host or not pid or host != socket.gethostname():
         return False
@@ -404,16 +490,52 @@ class Lease:
         from datetime import timedelta
 
         expires = current + timedelta(seconds=self.ttl_seconds)
-        con.execute(
-            f"DELETE FROM {CONTROL_SCHEMA}.lease WHERE pipeline = ?", [self.pipeline]
-        )
-        con.execute(
-            f"INSERT INTO {CONTROL_SCHEMA}.lease "
-            "(pipeline, owner_id, host, pid, acquired_at, renewed_at, expires_at) "
-            "VALUES (?,?,?,?,?,?,?)",
-            [self.pipeline, self.owner_id, socket.gethostname(), os.getpid(),
-             current, current, expires],
-        )
+        self._write(con, current, expires)
+
+    def _write(self, con, current: datetime, expires: datetime) -> None:
+        """DELETE + INSERT the lease row, retrying a write-write conflict.
+
+        MEASURED against MotherDuck, 2026-07-31, while adding the MotherDuck fault
+        tests: after a hard crash (`os._exit`, the fault injector's SIGKILL
+        equivalent) the dead process leaves an **uncommitted server-side
+        transaction** that had already touched this row, so the next runner's
+        `DELETE` fails with `TransactionContext Error: Conflict on tuple deletion!`.
+        The lease logic is right - the dead pid is reclaimable - but the write has
+        to outlive the moment MotherDuck spends aborting the abandoned transaction.
+
+        Retrying is safe: the row is the lease's own bookkeeping, the statements are
+        idempotent, and this runs before any data is written. Failing after the
+        budget is also safe - the run exits non-zero and nothing was applied - but it
+        would make crash recovery depend on a timer, which is exactly what `_is_dead`
+        exists to avoid.
+        """
+        deadline = time.monotonic() + LEASE_CONFLICT_BUDGET_SEC
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                con.execute(
+                    f"DELETE FROM {CONTROL_SCHEMA}.lease WHERE pipeline = ?", [self.pipeline]
+                )
+                con.execute(
+                    f"INSERT INTO {CONTROL_SCHEMA}.lease "
+                    "(pipeline, owner_id, host, pid, acquired_at, renewed_at, expires_at) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    [self.pipeline, self.owner_id, socket.gethostname(), os.getpid(),
+                     current, current, expires],
+                )
+                return
+            except Exception as exc:
+                if "conflict" not in str(exc).lower() or time.monotonic() >= deadline:
+                    raise
+                log.warning(
+                    "lease row for %r is locked by an abandoned transaction (attempt %s): "
+                    "%s; retrying",
+                    self.pipeline, attempt, exc,
+                )
+                with contextlib.suppress(Exception):
+                    con.execute("ROLLBACK")
+                time.sleep(LEASE_CONFLICT_RETRY_SEC)
 
     def release(self, con) -> None:
         try:

@@ -42,7 +42,7 @@ from .config import (
     applier_settings,
     lease_ttl_seconds,
 )
-from .debezium_props import build_properties
+from .debezium_props import assert_no_internal_topic_collision, build_properties
 from .destination import CONTROL_SCHEMA, Lease
 from .errors import EngineFailure
 from .faults import validate_env as validate_fault_env
@@ -231,6 +231,11 @@ def run(
 
     replication.state_dir.mkdir(parents=True, exist_ok=True)
     props = build_properties(source, replication, snapshot_mode=snapshot_mode)
+    # A captured table whose topic collides with `<prefix>.transaction` would be
+    # decoded as transaction metadata and never applied. Not reachable with the
+    # pinned topic-naming strategy, and asserted rather than reasoned about
+    # (Opus MINOR-6).
+    assert_no_internal_topic_collision(replication.topic_prefix, source.tables)
     namespace = props["name"]
     runner_id = uuid.uuid4().hex
 
@@ -272,10 +277,6 @@ def run(
             **settings,
         )
 
-        # ADR §14.1's open question, answered by measurement rather than by guess.
-        transactional_ddl = dest_mod.probe_transactional_ddl(con)
-        summary_extra["transactional_ddl"] = transactional_ddl
-
         outcome = reconcile_mod.reconcile(
             con,
             pipeline=dest.pipeline_name,
@@ -288,14 +289,25 @@ def run(
         summary_extra["reconciliation_detail"] = outcome.message
         log.info("start-up reconciliation: %s (%s)", outcome.decision, outcome.message)
 
-        # ADR §4.7 - the Invariant-O guard, at start-up.
+        # ADR §4.7 - the Invariant-O guard, at start-up. `snapshot_mode` is what
+        # decides the "slot exists / no durable destination row" cell (Codex 3).
         summary_extra["invariant_o_start"] = reconcile_mod.check_invariant_o(
             con, pipeline=dest.pipeline_name, namespace=namespace,
             dsn=source.dsn, slot_name=replication.slot_name,
+            snapshot_mode=props["snapshot.mode"],
         )
 
         lease = Lease(dest.pipeline_name, owner_id=runner_id, ttl_seconds=lease_ttl_seconds())
         lease.acquire(con)
+
+        # ADR §14.1's open question, answered by measurement rather than by guess.
+        # AFTER the lease: the probe DROPs and CREATEs shared
+        # `_cdc_flight.__ddl_probe_*` tables, so a runner that is about to be
+        # rejected by the lease could otherwise drop the incumbent's probe tables
+        # mid-probe and make the incumbent conclude `transactional_ddl=False`
+        # (Opus MINOR-7).
+        transactional_ddl = dest_mod.probe_transactional_ddl(con)
+        summary_extra["transactional_ddl"] = transactional_ddl
 
         # Imported late: importing pydbzengine boots a JVM.
         from .engine import SupervisedDebeziumEngine
@@ -319,7 +331,18 @@ def run(
             offset_file=replication.offset_file,
             always_commit_offsets=props.get("offset.flush.interval.ms") == "0",
         )
-        applier.verifier = None  # attached below, once the consumer builds it
+        # Wired EXPLICITLY. It used to be attached as a side effect of
+        # `engine.consumer`'s `cached_property` being evaluated before `engine`'s,
+        # which is a third-party property-evaluation order (Opus B2 note): correct
+        # today, invisible if it ever changes. Touching `engine.consumer` here makes
+        # the dependency a statement, and the assertion makes it a checked one.
+        applier.verifier = None
+        engine.consumer  # noqa: B018 - builds the consumer and attaches the verifier
+        if applier.cfg.verify_offset_file:
+            assert applier.verifier is not None, (
+                "the offset-flush verifier was not attached to the applier; a silently "
+                "failed markBatchFinished() would be invisible (ADR 0001 §4.2)"
+            )
         health = SourceHealth(
             dsn=source.dsn,
             slot_name=replication.slot_name,
@@ -346,6 +369,7 @@ def run(
             summary_extra["invariant_o_end"] = reconcile_mod.check_invariant_o(
                 con, pipeline=dest.pipeline_name, namespace=namespace,
                 dsn=source.dsn, slot_name=replication.slot_name,
+                snapshot_mode=props["snapshot.mode"],
             )
             return _decorate(result)
         except EngineFailure as failure:

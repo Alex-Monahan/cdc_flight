@@ -73,7 +73,7 @@ def test_a_transaction_is_emitted_only_on_a_verified_end():
     assert feed_all(a, [begin("7"), data("7", 1, 101), data("7", 2, 102)]) == []
     assert a.buffered_events == 2
 
-    units = a.feed(end("7", 2, lsn=103))
+    units = a.feed(end("7", 2, lsn=103, per_table={"app.customers": 2}))
     assert len(units) == 1
     unit = units[0]
     assert unit.kind == UNIT_TXN
@@ -98,6 +98,78 @@ def test_a_per_table_count_mismatch_is_fatal():
     feed_all(a, [begin("7"), data("7", 1, 101, "customers"), data("7", 2, 102, "orders")])
     with pytest.raises(TransactionAssemblyError, match=r"events for app\.orders"):
         a.feed(end("7", 2, per_table={"app.customers": 1, "app.orders": 2}))
+
+
+def test_an_end_with_no_event_count_is_fatal():
+    """`declared is None` used to skip the check and emit the unit as WHOLE.
+
+    The boundary rule is the whole of 1.3 and it says the marker's `event_count`
+    must *equal* the number of events buffered. `None` equals nothing, so an END
+    without a count is not proof of anything (Codex 2 / Opus M-1).
+    """
+    a = TransactionAssembler()
+    feed_all(a, [begin("7"), data("7", 1, 101)])
+    with pytest.raises(TransactionAssemblyError, match="no event_count"):
+        a.feed(end("7", None))
+
+
+def test_an_end_with_a_non_integral_event_count_is_fatal():
+    a = TransactionAssembler()
+    feed_all(a, [begin("7"), data("7", 1, 101)])
+    with pytest.raises(TransactionAssemblyError, match="event_count"):
+        a.feed(end("7", "not-a-number"))
+
+
+def test_per_table_counts_are_still_checked_after_a_spill():
+    """Validation must not weaken when the storage representation changes.
+
+    The per-table check was disabled wholesale as soon as any event spilled, and
+    the claimed "the drain re-derives them" had no corresponding comparison
+    anywhere (Codex 2).
+    """
+    a = TransactionAssembler(spill_events=2, on_spill=lambda events, **kw: len(events))
+    feed_all(a, [begin("7"), data("7", 1, 101), data("7", 2, 102), data("7", 3, 103)])
+    with pytest.raises(TransactionAssemblyError, match=r"events for app\.customers"):
+        a.feed(end("7", 3, per_table={"app.customers": 4}))
+
+
+def test_a_table_the_marker_never_declared_is_fatal():
+    """The comparison has to run in both directions, or a misrouted event is silent."""
+    a = TransactionAssembler()
+    feed_all(a, [begin("7"), data("7", 1, 101, "customers"), data("7", 2, 102, "orders")])
+    with pytest.raises(TransactionAssemblyError, match="never declared"):
+        a.feed(end("7", 2, per_table={"app.customers": 1}))
+
+
+def test_a_streaming_event_without_a_total_order_is_fatal():
+    """Keyless identity is `<lsn>:<txId>:<total_order>`; a missing ordinal collapses
+    two accepted events onto one identity (Codex 4)."""
+    a = TransactionAssembler()
+    rec = data("7", 1, 101)
+    rec.total_order = None
+    with pytest.raises(TransactionAssemblyError, match="total_order"):
+        a.feed(rec)
+
+
+def test_a_duplicate_total_order_inside_one_transaction_is_fatal():
+    a = TransactionAssembler()
+    feed_all(a, [begin("7"), data("7", 1, 101)])
+    with pytest.raises(TransactionAssemblyError, match="total_order 1 twice"):
+        a.feed(data("7", 1, 101))
+
+
+def test_a_non_positive_total_order_is_fatal():
+    a = TransactionAssembler()
+    with pytest.raises(TransactionAssemblyError, match="total_order"):
+        a.feed(data("7", 0, 101))
+
+
+def test_the_ordinal_set_must_be_exactly_one_to_n():
+    """`event_count` implies the ordinals `1..N`; a gap means an event we never saw."""
+    a = TransactionAssembler()
+    feed_all(a, [begin("7"), data("7", 1, 101), data("7", 3, 102)])
+    with pytest.raises(TransactionAssemblyError, match="ordinal"):
+        a.feed(end("7", 2))
 
 
 def test_a_txid_change_without_an_end_is_fatal_not_a_fallback():
@@ -159,7 +231,7 @@ def test_a_heartbeat_inside_a_transaction_is_carried_by_it():
     hb = PendingRecord(raw=object(), kind=KIND_HEARTBEAT, topic="__debezium-heartbeat.p",
                        nbytes=5, lsn=150)
     assert a.feed(hb) == []
-    units = a.feed(end("7", 1, lsn=200))
+    units = a.feed(end("7", 1, lsn=200, per_table={"app.customers": 1}))
     assert len(units) == 1
     assert [r.kind for r in units[0].records] == [
         KIND_TXN_BEGIN, KIND_DATA, KIND_HEARTBEAT, KIND_TXN_END
@@ -186,7 +258,7 @@ def test_a_transaction_can_open_without_a_begin():
     a = TransactionAssembler()
     assert a.feed(data("7", 1, 101)) == []
     assert a.implicit_txn_opens == 1
-    units = a.feed(end("7", 1, lsn=102))
+    units = a.feed(end("7", 1, lsn=102, per_table={"app.customers": 1}))
     assert len(units) == 1 and units[0].kind == UNIT_TXN
 
 
@@ -221,13 +293,30 @@ def test_the_last_snapshot_marker_closes_the_chunk_and_the_snapshot():
 
 def test_the_first_streaming_record_closes_the_snapshot_phase():
     """The swap has to happen even for a table whose snapshot ended without a
-    `last` marker, or the live table never appears."""
+    `last` marker, or the live table never appears — but it is a **per-table**
+    swap, not a swap of every shadow that happens to exist.
+
+    `snapshot_last` (which swaps *every* shadow) is only ever set when Debezium
+    actually said `last` (Opus M-7). Setting it from any non-snapshot record is
+    live-table destruction the moment incremental snapshots interleave with
+    streaming events.
+    """
     a = TransactionAssembler()
     assert feed_all(a, [snapshot("customers"), snapshot("customers")]) == []
     units = a.feed(begin("7"))
     assert len(units) == 1
     assert units[0].kind == UNIT_SNAPSHOT_CHUNK
-    assert units[0].snapshot_last is True
+    assert units[0].snapshot_last_for_table is True
+    assert units[0].snapshot_last is False
+
+
+def test_an_incremental_snapshot_record_is_refused_until_rubric_3_3_owns_it():
+    """Incremental chunk records are interleaved with streaming events and never
+    carry a `last` marker, so the snapshot-phase machinery here cannot host them
+    safely (Opus M-7). Refusing is loud; guessing destroys a live table."""
+    a = TransactionAssembler()
+    with pytest.raises(TransactionAssemblyError, match="incremental"):
+        a.feed(snapshot("customers", marker="incremental"))
 
 
 # --------------------------------------------------------------------------- #
@@ -236,7 +325,7 @@ def test_the_first_streaming_record_closes_the_snapshot_phase():
 def test_spill_takes_events_out_of_memory_without_changing_the_boundary():
     staged: list[list] = []
 
-    def on_spill(events):
+    def on_spill(events, **_identity):
         staged.append(list(events))
         return len(events)
 
@@ -245,7 +334,7 @@ def test_spill_takes_events_out_of_memory_without_changing_the_boundary():
     assert sum(len(batch) for batch in staged) == 2
     assert a.buffered_events == 1
 
-    units = a.feed(end("7", 3, lsn=104))
+    units = a.feed(end("7", 3, lsn=104, per_table={"app.customers": 3}))
     assert len(units) == 1
     unit = units[0]
     # The boundary rule still holds against the FULL count, spilled or not.
@@ -266,7 +355,7 @@ def test_by_default_a_unit_retains_only_its_terminal_record():
     a = TransactionAssembler()
     records = [begin("7"), data("7", 1, 101), data("7", 2, 102)]
     feed_all(a, records)
-    units = a.feed(end("7", 2, lsn=103))
+    units = a.feed(end("7", 2, lsn=103, per_table={"app.customers": 2}))
     unit = units[0]
 
     assert len(unit.records) == 1
@@ -282,7 +371,7 @@ def test_ack_every_record_keeps_the_whole_chain():
     a = TransactionAssembler(keep_all_records=True)
     records = [begin("7"), data("7", 1, 101), data("7", 2, 102)]
     feed_all(a, records)
-    unit = a.feed(end("7", 2, lsn=103))[0]
+    unit = a.feed(end("7", 2, lsn=103, per_table={"app.customers": 2}))[0]
     assert len(unit.records) == 4
     assert all(r.raw is not None for r in records)
 
@@ -297,14 +386,14 @@ def test_spill_does_not_retrigger_on_every_subsequent_event():
     """
     calls: list[int] = []
 
-    def on_spill(events):
+    def on_spill(events, **_identity):
         calls.append(len(events))
         return len(events)
 
     # bytes threshold only: 100-byte events, spill at 250 bytes
     a = TransactionAssembler(spill_events=10**9, spill_bytes=250, on_spill=on_spill)
     feed_all(a, [begin("7")] + [data("7", i, 100 + i) for i in range(1, 13)])
-    a.feed(end("7", 12, lsn=200))
+    a.feed(end("7", 12, lsn=200, per_table={"app.customers": 12}))
 
     # 12 events x 100 bytes = 1200 bytes => 4 spills of 3, never 1-per-event.
     assert calls == [3, 3, 3, 3], calls
@@ -320,13 +409,13 @@ def test_an_open_unit_that_has_spilled_blocks_the_group_from_closing():
     Postgres transaction committed at the destination. The group itself cannot
     catch this, because it contains only whole units.
     """
-    a = TransactionAssembler(spill_events=2, on_spill=lambda events: len(events))
+    a = TransactionAssembler(spill_events=2, on_spill=lambda events, **_: len(events))
     assert a.open_unit_has_spilled is False
 
     feed_all(a, [begin("7"), data("7", 1, 101), data("7", 2, 102)])
     assert a.open_unit_has_spilled is True, "the spill did not register"
 
-    units = a.feed(end("7", 2, lsn=103))
+    units = a.feed(end("7", 2, lsn=103, per_table={"app.customers": 2}))
     assert len(units) == 1
     assert units[0].spilled_events == 2
     # Once the unit is whole, the group is free to close and drain.

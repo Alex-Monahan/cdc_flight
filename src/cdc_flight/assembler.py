@@ -8,14 +8,25 @@ at all (Codex 2's "code-judo" note, adopted by ADR rev 2).
 The one boundary rule:
 
 > A Postgres transaction is complete, and therefore eligible for a commit group,
-> **only** when its Debezium `END` marker has been received **and** the marker's
-> `event_count` equals the number of events buffered for that transaction id
-> (and each `data_collections[].event_count` equals the per-table count).
+> **only** when its Debezium `END` marker has been received **and** the marker
+> carries an `event_count` that equals the number of events counted for that
+> transaction id, **and** the declared per-table `data_collections` counts equal
+> the observed per-table counts *in both directions*, **and** the observed
+> `transaction.total_order` ordinals are exactly `1..event_count`.
 
-Consequences, enforced here and asserted by `tests/1.3_atomic_batches/`:
+Consequences, enforced here and asserted by `tests/1.3_atomic_batches/` and
+`tests/test_assembler.py`:
 
 * a `txId` change without an intervening `END` is fatal, not a fallback;
-* an `event_count` mismatch is fatal;
+* an `event_count` mismatch is fatal, and so is a **missing** `event_count`: the
+  rule says "equals", and `None` equals nothing (Codex 2 / Opus M-1);
+* the counters the rule is checked against (`count`, `per_table`, `orders`) are
+  maintained on arrival and are never touched by spilling, so a unit is proven
+  identically in memory and on disk. Nothing about the proof is conditional on
+  the storage representation;
+* a missing, non-positive or repeated `total_order` is fatal, because that value
+  is part of `cdcf_event_id` and a collision silently drops an accepted event
+  (Codex 4);
 * at shutdown the un-`END`ed tail is **discarded** (`discard_open_unit()`), which
   is safe precisely because Invariant O means nothing about it was acknowledged.
 
@@ -51,6 +62,7 @@ from .envelope import (
     KIND_SNAPSHOT,
     KIND_TXN_BEGIN,
     KIND_TXN_END,
+    SNAPSHOT_INCREMENTAL,
     SNAPSHOT_LAST,
     SNAPSHOT_TABLE_LAST,
     PendingRecord,
@@ -86,6 +98,11 @@ class CompleteUnit:
     #: set by the applier when the unit's events were staged to `spill_events`
     spilled: bool = False
     spilled_events: int = 0
+    #: `_cdc_flight.spill_events.unit_seq` of this unit's staged rows, or None.
+    #: The drain reads and fences per unit, which is what lets a group interleave
+    #: `spilled prefix -> in-memory tail -> next unit` in true source order
+    #: (Opus B-1) and lets a fenced unit suppress its own prefix (Codex 5).
+    spill_unit_seq: int | None = None
 
     @property
     def terminal(self) -> PendingRecord | None:
@@ -103,7 +120,8 @@ class CompleteUnit:
 
 class _OpenTxn:
     __slots__ = (
-        "begin_seen", "events", "mem_bytes", "nbytes", "per_table", "records", "txn_id",
+        "begin_seen", "count", "events", "mem_bytes", "message_count", "nbytes", "orders",
+        "per_table", "records", "spill_unit_seq", "spilled", "txn_id",
     )
 
     def __init__(self, txn_id: str, begin_seen: bool):
@@ -116,11 +134,28 @@ class _OpenTxn:
         #: size of what is still IN MEMORY. Reset on every spill - see
         #: `_maybe_spill_txn` for why conflating the two was a 30x throughput bug.
         self.mem_bytes = 0
+        #: Counters that are maintained INDEPENDENTLY of the retained payloads, so
+        #: spilling changes the storage representation and never the proof
+        #: (Codex 2). `len(events)` is not a count of the transaction.
+        self.count = 0
         self.per_table: dict[str, int] = {}
+        #: every `transaction.total_order` seen, so a duplicate or a gap is loud
+        self.orders: set[int] = set()
+        #: counted events that belong to no captured table (logical-decoding
+        #: messages); they occupy an ordinal and a `data_collections` entry.
+        self.message_count = 0
+        #: how many events were handed to the spill callback
+        self.spilled = 0
+        #: identity of this unit in `_cdc_flight.spill_events`, allocated on its
+        #: first spill so the drain can order and fence per unit.
+        self.spill_unit_seq: int | None = None
 
 
 class _OpenChunk:
-    __slots__ = ("events", "mem_bytes", "nbytes", "records", "schema", "table")
+    __slots__ = (
+        "count", "events", "mem_bytes", "nbytes", "records", "saw_last", "schema",
+        "spill_unit_seq", "spilled", "table",
+    )
 
     def __init__(self, schema: str | None, table: str | None):
         self.schema = schema
@@ -129,6 +164,12 @@ class _OpenChunk:
         self.records: list[PendingRecord] = []
         self.nbytes = 0
         self.mem_bytes = 0
+        self.count = 0
+        self.spilled = 0
+        self.spill_unit_seq: int | None = None
+        #: True once Debezium actually said `snapshot=last` for this chunk. Only
+        #: then may the chunk claim the whole snapshot ended (Opus M-7).
+        self.saw_last = False
 
 
 class TransactionAssembler:
@@ -163,8 +204,10 @@ class TransactionAssembler:
 
         self._txn: _OpenTxn | None = None
         self._chunk: _OpenChunk | None = None
-        self._txn_spilled = 0
-        self._chunk_spilled = 0
+        #: monotone identity for spilled units within this process
+        self._spill_unit_seq = 0
+        #: per-table arrival ordinal for the snapshot phase (ADR §6 / Codex 1)
+        self._snapshot_ordinals: dict[str, int] = {}
         #: counters exposed for the run summary / observability
         self.units_emitted = 0
         self.discarded_tail_events = 0
@@ -187,7 +230,9 @@ class TransactionAssembler:
         Nothing else in the design would catch it, because the group itself
         contains only whole units.
         """
-        return self._txn_spilled > 0 or self._chunk_spilled > 0
+        return (self._txn is not None and self._txn.spilled > 0) or (
+            self._chunk is not None and self._chunk.spilled > 0
+        )
 
     @property
     def buffered_events(self) -> int:
@@ -208,9 +253,10 @@ class TransactionAssembler:
             return self._feed_snapshot(rec)
 
         units: list[CompleteUnit] = []
-        # Any non-snapshot record ends the snapshot phase: the shadow tables can
-        # be swapped in (ADR §3.5 / §7).
-        units.extend(self._close_chunk(force=True, last_for_table=True, last=True))
+        # Any non-snapshot record ends the snapshot phase for the table whose chunk
+        # is open, so *that table's* shadow can be swapped in (ADR §3.5 / §7). It
+        # does NOT claim the whole snapshot ended - see `_close_chunk`.
+        units.extend(self._close_chunk(last_for_table=True))
 
         if kind == KIND_TXN_BEGIN:
             units.extend(self._feed_begin(rec))
@@ -242,12 +288,44 @@ class TransactionAssembler:
         self._txn.nbytes += rec.nbytes
         return []
 
+    def _validate_ordinal(self, rec: PendingRecord) -> int:
+        """`transaction.total_order` is part of the event identity, so it is a
+        contract, not a hint (Codex 4).
+
+        Keyless identity is `<event lsn>:<txId>:<total_order>` and the keyless
+        collection is a dict keyed on it, so an absent or repeated ordinal makes
+        two *accepted* events collide and one of them disappear. Validating here is
+        what makes the identity structurally unique rather than conventionally
+        unique: the assembler is the only producer of units, so nothing that
+        reaches the identity builder can collide.
+        """
+        order = rec.total_order
+        if order is None:
+            raise TransactionAssemblyError(
+                f"streaming event on {rec.topic} (txn {rec.txn_id}) carries no "
+                "transaction.total_order. It is part of `cdcf_event_id`, so without "
+                "it two events of one transaction share an identity and one is lost "
+                "(ADR 0001 §6)."
+            )
+        try:
+            order = int(order)
+        except (TypeError, ValueError) as exc:
+            raise TransactionAssemblyError(
+                f"transaction.total_order {rec.total_order!r} is not an integer"
+            ) from exc
+        if order < 1:
+            raise TransactionAssemblyError(
+                f"transaction.total_order must be a 1-based ordinal, got {order}"
+            )
+        return order
+
     def _feed_data(self, rec: PendingRecord) -> list[CompleteUnit]:
         if rec.txn_id is None:
             raise TransactionAssemblyError(
                 f"streaming data event on {rec.topic} carries no transaction id; "
                 "`provide.transaction.metadata=true` is mandatory (ADR 0001 §3.2)"
             )
+        order = self._validate_ordinal(rec)
         if self._txn is None:
             # Debezium suppresses a duplicate BEGIN when the transaction context
             # was restored from the offset (`TransactionMonitor.java:130-136`).
@@ -262,7 +340,16 @@ class TransactionAssembler:
                 f"without an END marker ({len(self._txn.events)} events buffered). "
                 "That is a fatal consistency error, not a boundary (ADR 0001 §3.2)."
             )
+        if order in self._txn.orders:
+            raise TransactionAssemblyError(
+                f"transaction {rec.txn_id} declared total_order {order} twice. Two "
+                "accepted events would then share one `cdcf_event_id` and one of "
+                "them would be silently dropped (ADR 0001 §6)."
+            )
+        self._txn.orders.add(order)
+        rec.total_order = order
         self._txn.events.append(rec)
+        self._txn.count += 1
         self._retain(self._txn, rec)
         self._txn.nbytes += rec.nbytes
         self._txn.mem_bytes += rec.nbytes
@@ -285,30 +372,11 @@ class TransactionAssembler:
             )
 
         txn = self._txn
-        spilled = self._txn_spilled
+        spilled = txn.spilled
         self._txn = None
-        self._txn_spilled = 0
         self._retain(txn, rec)
         txn.nbytes += rec.nbytes
-
-        buffered = len(txn.events) + spilled
-        declared = rec.txn_event_count
-        if declared is not None and int(declared) != buffered:
-            raise TransactionAssemblyError(
-                f"transaction {rec.txn_id}: END declares {declared} events, "
-                f"{buffered} were buffered. A commit group may only contain "
-                "transactions we can prove whole (ADR 0001 §3.2)."
-            )
-        if not spilled:
-            # Per-table counts are only checkable while every event is in memory;
-            # in spill mode the drain re-derives them from `spill_events`.
-            for table, declared_n in rec.txn_data_collections.items():
-                actual = txn.per_table.get(table, 0)
-                if actual != declared_n:
-                    raise TransactionAssemblyError(
-                        f"transaction {rec.txn_id}: END declares {declared_n} events "
-                        f"for {table}, {actual} were buffered (ADR 0001 §3.2)"
-                    )
+        self._verify_complete(txn, rec)
 
         commit_lsn = rec.lsn or max(
             (e.lsn or 0 for e in txn.events), default=0
@@ -323,8 +391,83 @@ class TransactionAssembler:
             nbytes=txn.nbytes,
             spilled=bool(spilled),
             spilled_events=spilled,
+            spill_unit_seq=txn.spill_unit_seq,
         )
         return [unit]
+
+    def _verify_complete(self, txn: _OpenTxn, rec: PendingRecord) -> None:
+        """The boundary rule, in one place and in **every** storage mode.
+
+        Three things used to weaken it (Codex 2 / Opus M-1):
+
+        * a missing `END.event_count` skipped the total check entirely, so a unit
+          with no proof at all was emitted as whole;
+        * the per-table check was disabled wholesale as soon as any event spilled,
+          and the claimed "the drain re-derives them" had no comparison anywhere;
+        * the comparison ran in one direction only, so an *observed* table the
+          marker never mentioned was accepted.
+
+        The counters compared here (`txn.count`, `txn.per_table`, `txn.orders`) are
+        maintained as records arrive and are never touched by spilling, so
+        "in memory" and "spilled" are proven identically.
+        """
+        declared = rec.txn_event_count
+        if declared is None:
+            raise TransactionAssemblyError(
+                f"transaction {rec.txn_id}: END marker carries no event_count, so the "
+                f"{txn.count} events buffered cannot be proven to be the whole "
+                "transaction. A commit group may only contain transactions we can "
+                "prove whole (ADR 0001 §3.2)."
+            )
+        try:
+            declared_total = int(declared)
+        except (TypeError, ValueError) as exc:
+            raise TransactionAssemblyError(
+                f"transaction {rec.txn_id}: END event_count {declared!r} is not an integer"
+            ) from exc
+        if declared_total != txn.count:
+            raise TransactionAssemblyError(
+                f"transaction {rec.txn_id}: END declares {declared_total} events, "
+                f"{txn.count} were buffered. A commit group may only contain "
+                "transactions we can prove whole (ADR 0001 §3.2)."
+            )
+
+        # `total_order` is 1..N over the counted events of the transaction, so the
+        # exact set is implied by the declared count. A gap means an event we never
+        # saw; a duplicate is already fatal in `_feed_data`.
+        expected = set(range(1, txn.count + 1))
+        if txn.orders != expected:
+            raise TransactionAssemblyError(
+                f"transaction {rec.txn_id}: END declares {declared_total} events but the "
+                f"observed transaction.total_order ordinals are {sorted(txn.orders)} "
+                f"(missing {sorted(expected - txn.orders)}, unexpected "
+                f"{sorted(txn.orders - expected)}). The ordinal set implied by "
+                "event_count is 1..N (ADR 0001 §6)."
+            )
+
+        # Per-table, in both directions. `allowance` covers counted events that
+        # belong to no captured table (logical-decoding messages get their own
+        # `data_collections` pseudo-entry, ADR §15/A19 / Opus M-5).
+        allowance = txn.message_count
+        for table, declared_n in rec.txn_data_collections.items():
+            actual = txn.per_table.get(table, 0)
+            if actual == declared_n:
+                continue
+            if actual == 0 and declared_n <= allowance:
+                allowance -= declared_n
+                continue
+            raise TransactionAssemblyError(
+                f"transaction {rec.txn_id}: END declares {declared_n} events "
+                f"for {table}, {actual} were buffered (ADR 0001 §3.2)"
+            )
+        for table, actual in txn.per_table.items():
+            if table not in rec.txn_data_collections:
+                raise TransactionAssemblyError(
+                    f"transaction {rec.txn_id}: {actual} events were buffered for "
+                    f"{table}, which the END marker never declared. The comparison "
+                    "runs in both directions, or a misrouted event is invisible "
+                    "(ADR 0001 §3.2)."
+                )
 
     def _feed_control(self, rec: PendingRecord) -> list[CompleteUnit]:
         if self._txn is not None:
@@ -333,6 +476,25 @@ class TransactionAssembler:
             # would advance the resume point past a half-buffered transaction.
             self._retain(self._txn, rec)
             self._txn.nbytes += rec.nbytes
+            if rec.kind == KIND_MESSAGE:
+                # VERIFIED against vendored Debezium 3.6:
+                # `LogicalDecodingMessageMonitor.java:106` calls
+                # `transactionMonitor.dataEvent(...)`, so a transactional logical
+                # message IS counted in `END.event_count`, occupies a
+                # `total_order` ordinal, and gets its own `data_collections`
+                # pseudo-entry. Not counting it made a transaction containing one
+                # fatal - which matters because ADR D9's source heartbeat is
+                # specified as exactly this mechanism (Opus M-5). It carries no
+                # row of ours, so it is counted and not applied.
+                order = self._validate_ordinal(rec)
+                if order in self._txn.orders:
+                    raise TransactionAssemblyError(
+                        f"transaction {rec.txn_id} declared total_order {order} twice "
+                        "(logical-decoding message)"
+                    )
+                self._txn.orders.add(order)
+                self._txn.count += 1
+                self._txn.message_count += 1
             return []
         return [self._control_unit(rec)]
 
@@ -353,14 +515,39 @@ class TransactionAssembler:
             raise TransactionAssemblyError(
                 "snapshot record arrived while a streaming transaction is open"
             )
+        if rec.snapshot == SNAPSHOT_INCREMENTAL:
+            # VERIFIED against vendored Debezium 3.6: incremental chunk records are
+            # interleaved with streaming events on the same queue
+            # (`AbstractIncrementalSnapshotChangeEventSource.java:170-178`), never
+            # carry `last`/`last_in_data_collection` (`EventDispatcher.java:693-695`
+            # is empty) and carry no `txId`/`lsn` at all. The shadow-table phase
+            # machinery here cannot host that safely; rubric 3.3 owns it (Opus M-7).
+            raise TransactionAssemblyError(
+                "record carries source.snapshot='incremental'. Incremental snapshots "
+                "interleave with streaming events and never emit a `last` marker, so "
+                "the snapshot-phase shadow/swap machinery cannot host them; refusing "
+                "rather than swapping a partial shadow over a live table "
+                "(rubric 3.3, ADR 0001 §15/A20)."
+            )
         units: list[CompleteUnit] = []
         if self._chunk is not None and (
             self._chunk.table != rec.table or self._chunk.schema != rec.schema
         ):
-            units.extend(self._close_chunk(force=True, last_for_table=True, last=False))
+            units.extend(self._close_chunk(last_for_table=True))
         if self._chunk is None:
             self._chunk = _OpenChunk(rec.schema, rec.table)
+        # Assigned HERE, on arrival, so the ordinal is arrival order whether the
+        # record is later spilled or kept in memory. Deriving it at apply time made
+        # a spilled snapshot chunk take a *streaming* identity (Codex 1).
+        key = rec.qualified_table or ""
+        ordinal = self._snapshot_ordinals.get(key, 0) + 1
+        self._snapshot_ordinals[key] = ordinal
+        rec.snapshot_ordinal = ordinal
+
         self._chunk.events.append(rec)
+        self._chunk.count += 1
+        if rec.snapshot == SNAPSHOT_LAST:
+            self._chunk.saw_last = True
         self._retain(self._chunk, rec)
         self._chunk.nbytes += rec.nbytes
         self._chunk.mem_bytes += rec.nbytes
@@ -368,28 +555,18 @@ class TransactionAssembler:
 
         table_last = rec.snapshot in SNAPSHOT_TABLE_LAST
         overflow = (
-            len(self._chunk.events) + self._chunk_spilled >= self.snapshot_chunk_events
+            self._chunk.count >= self.snapshot_chunk_events
             or self._chunk.nbytes >= self.snapshot_chunk_bytes
         )
         if table_last or overflow:
-            units.extend(
-                self._close_chunk(
-                    force=True,
-                    last_for_table=table_last,
-                    last=rec.snapshot == SNAPSHOT_LAST,
-                )
-            )
+            units.extend(self._close_chunk(last_for_table=table_last))
         return units
 
-    def _close_chunk(
-        self, *, force: bool, last_for_table: bool, last: bool
-    ) -> list[CompleteUnit]:
+    def _close_chunk(self, *, last_for_table: bool) -> list[CompleteUnit]:
         if self._chunk is None:
             return []
         chunk = self._chunk
-        spilled = self._chunk_spilled
         self._chunk = None
-        self._chunk_spilled = 0
         unit = CompleteUnit(
             kind=UNIT_SNAPSHOT_CHUNK,
             events=chunk.events,
@@ -399,9 +576,14 @@ class TransactionAssembler:
             last_lsn=max((e.lsn or 0 for e in chunk.events), default=0),
             nbytes=chunk.nbytes,
             snapshot_last_for_table=last_for_table,
-            snapshot_last=last,
-            spilled=bool(spilled),
-            spilled_events=spilled,
+            # ONLY when Debezium actually said so. Deriving "the whole snapshot
+            # ended" from "a non-snapshot record arrived" swaps EVERY shadow over
+            # its live table, which is live-table destruction the moment anything
+            # can interleave with a snapshot stream (Opus M-7).
+            snapshot_last=chunk.saw_last,
+            spilled=bool(chunk.spilled),
+            spilled_events=chunk.spilled,
+            spill_unit_seq=chunk.spill_unit_seq,
         )
         return [unit]
 
@@ -415,6 +597,22 @@ class TransactionAssembler:
         target.records = [rec]
 
     # -- spill (ADR 0001 §3.4) ---------------------------------------------- #
+    def _spill(self, target, events: list[PendingRecord], snapshot) -> int:
+        """Hand `events` to the applier's staging callback, with explicit identity.
+
+        The callback is told **which unit** the rows belong to and **whether they
+        are snapshot rows** (and of which table). It used to be told neither, so it
+        inferred the phase from mutable applier state that a different part of the
+        applier only initialised later - which is how the first spilled chunk of
+        every snapshot ended up staged into the live table with a streaming
+        identity (Codex 1), and how a fenced unit's staged prefix stayed
+        indistinguishable from everyone else's (Codex 5).
+        """
+        if target.spill_unit_seq is None:
+            self._spill_unit_seq += 1
+            target.spill_unit_seq = self._spill_unit_seq
+        return self.on_spill(events, unit_seq=target.spill_unit_seq, snapshot=snapshot)
+
     def _maybe_spill_txn(self) -> None:
         """Stage the in-memory tail when it exceeds the hard threshold.
 
@@ -432,9 +630,9 @@ class TransactionAssembler:
             and self._txn.mem_bytes < self.spill_bytes
         ):
             return
-        staged = self.on_spill(self._txn.events)
+        staged = self._spill(self._txn, self._txn.events, None)
         if staged:
-            self._txn_spilled += staged
+            self._txn.spilled += staged
             retained = set(map(id, self._txn.records))
             for event in self._txn.events:
                 if id(event) not in retained:
@@ -450,9 +648,11 @@ class TransactionAssembler:
             and self._chunk.mem_bytes < self.spill_bytes
         ):
             return
-        staged = self.on_spill(self._chunk.events)
+        staged = self._spill(
+            self._chunk, self._chunk.events, (self._chunk.schema, self._chunk.table)
+        )
         if staged:
-            self._chunk_spilled += staged
+            self._chunk.spilled += staged
             retained = set(map(id, self._chunk.records))
             for event in self._chunk.events:
                 if id(event) not in retained:
@@ -471,7 +671,7 @@ class TransactionAssembler:
         """
         discarded = 0
         if self._txn is not None:
-            discarded += len(self._txn.events) + self._txn_spilled
+            discarded += self._txn.count
             log.info(
                 "discarding un-ENDed tail of transaction %s (%s events); it replays "
                 "on the next run",
@@ -479,14 +679,12 @@ class TransactionAssembler:
                 discarded,
             )
             self._txn = None
-            self._txn_spilled = 0
         if self._chunk is not None:
-            discarded += len(self._chunk.events) + self._chunk_spilled
+            discarded += self._chunk.count
             self._chunk = None
-            self._chunk_spilled = 0
         self.discarded_tail_events += discarded
         return discarded
 
     def close_snapshot_chunk(self) -> list[CompleteUnit]:
         """Emit the buffered snapshot chunk without claiming the snapshot ended."""
-        return self._close_chunk(force=True, last_for_table=False, last=False)
+        return self._close_chunk(last_for_table=False)
