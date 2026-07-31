@@ -176,12 +176,31 @@ cdc_flight/
 │   ├── datagen.py                # deterministic change generator
 │   └── inspect.py                # `make query`
 ├── tests/                        # pytest e2e harness
+├── probes/                       # rubric evidence experiments (see RUBRIC_STATUS.md)
+├── RUBRIC_STATUS.md              # all 40 rubric items scored, with evidence
 └── research/                     # blog capture + deviation notes
 ```
 
+## Rubric status
+
+[`RUBRIC_STATUS.md`](RUBRIC_STATUS.md) scores this baseline against every item of
+the 40-item Postgres-CDC decision matrix, with the evidence for each score.
+**Baseline average: 1.65 / 5; one item (7.1, pgoutput) is already at 5.**
+
+The evidence comes from [`probes/`](probes/) — small, reproducible experiments
+(`uv run python probes/p01_dml_edge_cases.py`, output in `probes/.out/`). They
+are *not* tests: several deliberately break the source schema, and each reseeds
+it first and uses its own replication slot, offset file and DuckDB file.
+
+The single most important finding is a bug rather than a rubric item:
+`run_engine_bounded` reports **exit 0** when the Debezium engine fails to start
+(dropped slot, unusable offset), so several catastrophic failure modes currently
+look like successful no-op runs.
+
 ## Known baseline weaknesses
 
-Summarised in [`research/NOTES.md`](research/NOTES.md); the headline ones:
+Summarised in [`research/NOTES.md`](research/NOTES.md) and scored in
+[`RUBRIC_STATUS.md`](RUBRIC_STATUS.md); the headline ones:
 
 * **At-least-once at best.** Debezium offsets live in `offsets.dat`, committed independently
   of the dlt load. A crash between the two duplicates rows, and `append` means duplicates stay.

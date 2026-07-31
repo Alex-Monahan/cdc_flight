@@ -32,7 +32,11 @@ logs/
 
 # Project-local Postgres cluster (disposable; recreate with `make pg-init`)
 .pgdata/
+.pgdata_replica/
 .cdc_state_md/
+
+# Probe output (regenerate with `uv run python probes/pNN_*.py`)
+probes/.out/
 
 # JVM crash dumps
 hs_err_pid*.log
