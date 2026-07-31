@@ -860,6 +860,10 @@ class Applier:
              "source_table", "lsn", "txn_id", "total_order", "cdcf_event_id", "op",
              "source_ts_ms", "before_json", "after_json", "key_json"],
             rows,
+            [apply_sql.BIGINT, apply_sql.BIGINT, apply_sql.BIGINT, apply_sql.VARCHAR,
+             apply_sql.VARCHAR, apply_sql.VARCHAR, apply_sql.BIGINT, apply_sql.VARCHAR,
+             apply_sql.BIGINT, apply_sql.VARCHAR, apply_sql.VARCHAR, apply_sql.BIGINT,
+             apply_sql.VARCHAR, apply_sql.VARCHAR, apply_sql.VARCHAR],
         )
         self._spill_rows += len(rows)
         self.spilled_events += len(rows)

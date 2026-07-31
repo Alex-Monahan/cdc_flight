@@ -46,6 +46,9 @@ DELETE_CHUNK = 2000
 MAX_PARAMS_PER_STATEMENT = 40_000
 #: Never build a statement with more rows than this, whatever the column count.
 MAX_ROWS_PER_STATEMENT = 5_000
+#: Rows per registered Arrow batch. Bounds the peak Python->Arrow copy, not the
+#: transaction: the whole group is still one COMMIT.
+ARROW_CHUNK = 100_000
 
 BOOLEAN, BIGINT, DOUBLE, JSON_T, VARCHAR = "BOOLEAN", "BIGINT", "DOUBLE", "JSON", "VARCHAR"
 
@@ -249,7 +252,7 @@ def delete_keys(con, table: TableSchema, key_columns: tuple[str, ...], keys: lis
         types = [table.columns.get(c, VARCHAR) for c in key_columns]
         defs = ", ".join(f"{quote(c)} {t}" for c, t in zip(key_columns, types, strict=True))
         con.execute(f"CREATE OR REPLACE TEMP TABLE {staging} ({defs})")
-        bulk_insert(con, staging, list(key_columns), [list(k) for k in keys])
+        bulk_insert(con, staging, list(key_columns), [list(k) for k in keys], types)
         con.execute(
             f"DELETE FROM {table.qualified} AS t WHERE EXISTS "
             f"(SELECT 1 FROM {staging} AS v WHERE {predicate})"
@@ -277,32 +280,87 @@ def rows_per_statement(n_columns: int) -> int:
     return max(1, min(MAX_ROWS_PER_STATEMENT, MAX_PARAMS_PER_STATEMENT // n_columns))
 
 
-def bulk_insert(con, target: str, columns: list[str], rows: list[list]) -> None:
-    """`INSERT INTO … VALUES (…),(…),…` in chunks. One statement, many rows.
+def _arrow_type(sql_type: str):
+    import pyarrow as pa
 
-    MEASURED, 2026-07-30, against MotherDuck: `executemany` costs a network round
-    trip **per row** - 200 rows took 27.9 s (~140 ms/row), which turned a 3 000-row
-    Postgres transaction into a commit group that never finished inside the test's
-    deadline. The identical 1 500 rows as one multi-row `VALUES` statement took
-    **0.65 s**, and as a registered Arrow table 1.87 s. Local DuckDB does not care
-    (it is in-process), so this was invisible until the first MotherDuck run.
+    return {
+        BIGINT: pa.int64(),
+        DOUBLE: pa.float64(),
+        BOOLEAN: pa.bool_(),
+    }.get(sql_type, pa.string())
+
+
+def bulk_insert(
+    con, target: str, columns: list[str], rows: list[list], types: list[str] | None = None
+) -> None:
+    """Insert many rows through a registered Arrow table.
+
+    MEASURED, 2026-07-30, 200 000 rows x 19 columns into local DuckDB inside one
+    transaction:
+
+    | strategy | time |
+    |---|---|
+    | `con.executemany(INSERT … VALUES (?,…))` | **410 s** |
+    | chunked multi-row `INSERT … VALUES (…),(…),…` | **> 7 min**, abandoned |
+    | register an Arrow table + `INSERT … SELECT` | **1.37 s** |
+
+    and against MotherDuck, 1 500 rows: `executemany` 27.9 s (a network round trip
+    *per row*), multi-row `VALUES` 0.65 s, Arrow 1.87 s.
+
+    So Arrow is the only strategy that is fast at both ends, and `executemany` -
+    the obvious way to write this - is 300x slower than it looks even locally.
+    That is what turned one 200 000-row Postgres transaction into a commit group
+    that could not finish inside the slow test's 300 s deadline.
+
+    `pyarrow` is a hard dependency for this reason; if it is somehow missing the
+    code falls back to `executemany` and logs, because a slow apply is better
+    than a failed one.
     """
     if not rows:
         return
     collist = ", ".join(quote(c) for c in columns)
-    row_placeholder = "(" + ", ".join("?" for _ in columns) + ")"
-    chunk = rows_per_statement(len(columns))
-    for start in range(0, len(rows), chunk):
-        batch = rows[start : start + chunk]
-        values = ", ".join(row_placeholder for _ in batch)
-        params: list[Any] = []
-        for row in batch:
-            params.extend(row)
-        con.execute(f"INSERT INTO {target} ({collist}) VALUES {values}", params)
+    column_types = types or [VARCHAR] * len(columns)
+    try:
+        import pyarrow as pa
+    except ImportError:  # pragma: no cover - pyarrow is a declared dependency
+        log.warning("pyarrow is unavailable; falling back to a slow row-at-a-time insert")
+        placeholders = ", ".join("?" for _ in columns)
+        con.executemany(f"INSERT INTO {target} ({collist}) VALUES ({placeholders})", rows)
+        return
+
+    view = "cdcf_bulk_rows"
+    for start in range(0, len(rows), ARROW_CHUNK):
+        batch = rows[start : start + ARROW_CHUNK]
+        arrays = {}
+        for index, column in enumerate(columns):
+            values = [row[index] for row in batch]
+            try:
+                arrays[column] = pa.array(values, type=_arrow_type(column_types[index]))
+            except (pa.ArrowInvalid, pa.ArrowTypeError, OverflowError):
+                # A value the declared type cannot hold (a huge integer, a mixed
+                # column mid-evolution). Keeping the value as text is always
+                # possible and DuckDB casts it on the way in; losing it is not.
+                arrays[column] = pa.array(
+                    [None if v is None else str(v) for v in values], type=pa.string()
+                )
+        table = pa.table(arrays)
+        con.register(view, table)
+        try:
+            con.execute(f"INSERT INTO {target} ({collist}) SELECT * FROM {view}")
+        finally:
+            con.unregister(view)
 
 
-def insert_rows(con, table: TableSchema, columns: list[str], rows: list[list]) -> None:
-    bulk_insert(con, table.qualified, columns, rows)
+def insert_rows(
+    con, table: TableSchema, columns: list[str], rows: list[list]
+) -> None:
+    bulk_insert(
+        con,
+        table.qualified,
+        columns,
+        rows,
+        [table.columns.get(c, VARCHAR) for c in columns],
+    )
 
 
 __all__ = [

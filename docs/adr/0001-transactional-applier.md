@@ -17,7 +17,7 @@
 |---|---|---|
 | 1 | 2026-07-30 | original |
 | 2 | 2026-07-30 | **P2 withdrawn** and replaced by **Invariant O** (§4.1). Crash matrix rebuilt over all three engine lifecycle paths **and** the snapshot phase (§4.6). Transaction assembly made a state machine with one boundary rule (§3.2). Triggers restated as soft group-close requests plus a hard spill threshold (§3.3). Start-up reconciliation decision table added (§4.5). Keyless event identity moved off `source.sequence` (§6). D10 rewritten: dlt demoted to a **library**, not removed (§10). Throughput risk of D5 recorded as a measurement task (§5). |
-| 3 | 2026-07-30 | **Amendments from the implementation** (§15): `transaction.id` is not a transaction identifier (A1); the Connect schema stays off, so rubric 2.4 is untouched (A2); `verify_offset_file` becomes a rebuild plus a one-directional assertion (A4); a drained batch closes the group (A5); a provably-dead lease is reclaimed (A6); §14.1 answered for DuckDB (A8); §10's dlt exit criterion evaluated (A10). |
+| 3 | 2026-07-30 | **Amendments from the implementation** (§15): the apply path must insert through Arrow - `executemany` is 300x slower and makes a large commit group unfinishable (A14); `transaction.id` is not a transaction identifier (A1); the Connect schema stays off, so rubric 2.4 is untouched (A2); `verify_offset_file` becomes a rebuild plus a one-directional assertion (A4); a drained batch closes the group (A5); a provably-dead lease is reclaimed (A6); §14.1 answered for DuckDB (A8); §10's dlt exit criterion evaluated (A10). |
 
 ---
 
@@ -1599,3 +1599,40 @@ groups** rather than data batches, because the commit group is the unit the
 protocol is about. `tests/1.1_exactly_once_pk/test_1_1_fault_matrix.py` crashes
 at all five commit-group anchors and asserts no loss, no duplicates and
 Invariant O at each.
+
+### A14 — the apply path inserts through Arrow, and this is a correctness matter
+
+The ADR never says how rows reach the destination, and the obvious answer is
+wrong by two orders of magnitude. Measured, 200 000 rows x 19 columns into local
+DuckDB inside one transaction:
+
+| strategy | time |
+|---|---|
+| `con.executemany("INSERT … VALUES (?,…)", rows)` | **410 s** |
+| chunked multi-row `INSERT … VALUES (…),(…),…` | **> 7 min**, abandoned |
+| register a `pyarrow.Table` + `INSERT … SELECT` | **1.37 s** |
+
+and against MotherDuck, 1 500 rows: `executemany` **27.9 s** (a network round
+trip *per row*), multi-row `VALUES` 0.65 s, Arrow 1.87 s.
+
+This is not a performance footnote. A commit group holds an integral number of
+*whole* Postgres transactions (Invariant B), so a single 200 000-row transaction
+is a single group and a single `COMMIT`; at 410 s that group cannot finish inside
+any sane deadline, and the run is killed with the transaction open. The first
+symptom was `tests/1.1_exactly_once_pk::test_slow_real_sigkill_loses_nothing`
+timing out at 300 s, and the second was
+`tests/1.3_atomic_batches/test_1_3_motherduck_atomicity.py` reaching its deadline
+with **zero** commit groups. `pyarrow` is therefore a hard dependency, and
+§14.2's "measured MotherDuck commit latency for a 200 000-row group" is now
+partly answered: the write path, not the commit, was the cost.
+
+### A15 — MotherDuck's client caches the catalog per process (affects verification only)
+
+`duckdb.connect()` caches the database instance per DSN inside a process, and
+MotherDuck's catalog snapshot rides on that instance. A process that has already
+opened `md:<db>` — even on a connection it has since closed — can therefore not
+immediately see what another *process* committed. The applier is unaffected (each
+run is its own process), but a test that verifies a MotherDuck write from the
+parent process will read an empty schema and conclude nothing was written. It is
+recorded here because the same trap will catch anyone writing 6.1's observability
+queries. `tests/test_motherduck.py::wait_for_tables` handles it.
