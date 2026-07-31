@@ -35,14 +35,18 @@ import time
 import pytest
 
 CUSTOMERS = '"cdc_raw"."cdcflight_app_customers"'
-ROWS = 60_000
+#: Raised from 60 000 when the applier landed: the kill has to arrive while
+#: delivery is still in progress, and 60 000 rows are now streamed and applied in
+#: under the 12 s this test used to wait, which made it vacuous (it asserted
+#: `delivered == ROWS` against a run that had already finished).
+ROWS = 250_000
 SENTINEL = "wskill-"
 
 
 @pytest.mark.slow
 def test_walsender_kill_never_reports_ok_on_partial_delivery(sandbox):
     sandbox.reseed()
-    sandbox.run(reset_state=True, max_seconds=150)
+    sandbox.run(reset_state=True, max_seconds=200, idle_seconds=8, timeout=400)
 
     sandbox.sql(
         f"INSERT INTO app.customers (name, email) SELECT "
@@ -50,7 +54,7 @@ def test_walsender_kill_never_reports_ok_on_partial_delivery(sandbox):
         f"FROM generate_series(1, {ROWS}) i"
     )
 
-    proc = sandbox.spawn(max_seconds=420, idle_seconds=8)
+    proc = sandbox.spawn(max_seconds=600, idle_seconds=8)
     try:
         # Wait until the connector is genuinely streaming (the slot is held), then
         # give it long enough to be part-way through, and cut the connection.
@@ -62,7 +66,7 @@ def test_walsender_kill_never_reports_ok_on_partial_delivery(sandbox):
                 "SELECT active FROM pg_replication_slots WHERE slot_name = %s AND active",
                 (sandbox.slot,),
             ):
-                time.sleep(12)  # stream for a while so the kill lands mid-delivery
+                time.sleep(5)  # stream for a while so the kill lands mid-delivery
                 killed = sandbox.kill_walsender()
                 break
         assert killed == 1, (
@@ -88,9 +92,16 @@ def test_walsender_kill_never_reports_ok_on_partial_delivery(sandbox):
             "Debezium's retriable-restart backoff was mistaken for an idle one.\n"
             f"{detail}"
         )
-        # Having recovered, the supervisor must have been able to say why it was
-        # safe to stop.
-        assert summary.get("slot_health") in {"streaming", "unknown"}, detail
+        # Having recovered, the run must say *why* it was safe to stop, and the
+        # Invariant-O guard must still hold across the reconnect.
+        #
+        # This used to assert `slot_health in {streaming, unknown}`. That is not a
+        # property of a successful run: the health summary is taken after
+        # `engine.close()`, by which time the slot has legitimately been released,
+        # so it reads `not_streaming` whenever the shutdown wins the race. It
+        # passed by luck, not by construction.
+        assert summary.get("stop_reason") == "idle", detail
+        assert summary.get("invariant_o_end", {}).get("ok") is True, detail
     else:
         assert delivered < ROWS or returncode != 0, detail
         assert summary.get("ok") is not True, detail

@@ -144,51 +144,84 @@ def test_target_slot_never_outruns_the_destination(crash_replay):
 
 
 @pytest.mark.slow
-def test_slow_real_sigkill_loses_nothing(sandbox):
+def test_slow_real_sigkill_is_exactly_once(sandbox):
     """The un-simulated fault: a real `kill -9` mid-load, then a restart.
 
-    This test asserts **no loss**, not duplication. Whether a SIGKILL duplicates
-    depends entirely on where it lands relative to the offset flush, and that is
-    a race nobody wins reliably: `probes/p07` lost it at 60 k rows, this test
-    lost it at 200 k (200 000 rows / 200 000 distinct, i.e. the kill fell outside
-    the window), and `probes/p13` only won it at 400 k. Requiring duplication
-    here would make the suite flaky for no gain - the deterministic
-    `crash_replay` scenario in the default suite already proves duplication.
+    REWRITTEN when the applier landed, in two ways that both make it stronger.
 
-    What a real SIGKILL *can* guarantee, and what regresses catastrophically if
-    the applier gets its ordering wrong, is that nothing is lost. That is the
-    assertion. The observed duplication count is reported either way.
+    **1. It asserts exactly-once, not just no-loss.** The old version asserted only
+    "nothing was lost", because whether a SIGKILL duplicated depended on where it
+    landed relative to the offset flush, and that race is not winnable reliably
+    (`probes/p07` lost it at 60 k rows, `probes/p13` won it at 400 k). Under
+    Invariant O the outcome no longer depends on where the kill lands: whatever the
+    destination committed is durable *together with* the resume point, and whatever
+    it did not is replayed. So `total == distinct == rows` is a legitimate
+    assertion for an un-simulated kill, and it is the strongest statement this test
+    can make.
+
+    **2. The workload is many transactions, not one.** 200 000 rows in a single
+    Postgres transaction is a single commit group, so *any* kill before the end
+    replays everything and the interesting case - a kill after some groups have
+    committed and before others - never occurs. 40 transactions of 5 000 rows
+    produce many commit groups, so the kill genuinely lands between them.
+
+    The kill is timed off the replication slot becoming active rather than a fixed
+    sleep: the applier now streams 200 000 rows in ~30 s, and the old 35 s sleep
+    let the run finish before the signal arrived (which is how this rewrite
+    started).
     """
     sandbox.reseed()
-    sandbox.run(reset_state=True, max_seconds=150)
+    sandbox.run(reset_state=True, max_seconds=200, idle_seconds=8, timeout=400)
 
-    rows = 200_000
-    sandbox.sql(
-        "INSERT INTO app.customers (name, email) SELECT "
-        "'kill9-' || i, 'kill9-' || i || '@example.com' "
-        f"FROM generate_series(1, {rows}) i"
+    txns, per_txn = 40, 5_000
+    rows = txns * per_txn
+    for t in range(txns):
+        sandbox.sql(
+            "INSERT INTO app.customers (name, email) SELECT "
+            "'kill9-' || i, 'kill9-' || i || '@example.com' "
+            f"FROM generate_series({t * per_txn + 1}, {(t + 1) * per_txn}) i",
+            one_transaction=True,
+        )
+
+    proc = sandbox.spawn(max_seconds=400, idle_seconds=10)
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        time.sleep(1)
+        if sandbox.pg_query(
+            "SELECT active FROM pg_replication_slots WHERE slot_name = %s AND active",
+            (sandbox.slot,),
+        ):
+            break
+    time.sleep(8)  # long enough that several commit groups have gone through
+    assert proc.poll() is None, (
+        "the run finished before the SIGKILL could land, so the test would be "
+        "vacuous; raise the workload"
     )
-
-    proc = sandbox.spawn(max_seconds=300, idle_seconds=10)
-    time.sleep(35)  # JVM start plus enough loading to be mid-stream
     proc.send_signal(signal.SIGKILL)
     proc.wait(timeout=60)
     assert proc.returncode != 0, "process survived SIGKILL"
 
-    landed_before = sandbox.scalar(
-        f"SELECT count(*) FROM {CUSTOMERS} WHERE name LIKE 'kill9-%'"
-    )
-
-    sandbox.run(max_seconds=300, idle_seconds=10)
+    recovered = sandbox.run(max_seconds=400, idle_seconds=10, timeout=600)
     total, distinct = sandbox.duck_query(
         f"SELECT count(*), count(DISTINCT id) FROM {CUSTOMERS} WHERE name LIKE 'kill9-%'"
     )[0]
-    assert distinct == rows, (
-        f"rows LOST across a SIGKILL: {rows - distinct} of {rows} missing "
-        f"({landed_before} had landed before the kill)"
+    assert distinct == rows, f"rows LOST across a SIGKILL: {rows - distinct} of {rows}"
+    assert total == rows, (
+        f"{total - rows} DUPLICATE rows survived a SIGKILL; under Invariant O a crash "
+        "can only replay what the destination never committed"
     )
-    assert total >= rows
     print(
-        f"\nSIGKILL after {landed_before} rows: {total} rows / {distinct} distinct "
-        f"=> {total - distinct} duplicates"
+        f"\nSIGKILL mid-stream over {txns} transactions: {total} rows / {distinct} "
+        f"distinct => 0 duplicates, 0 lost (recovery re-applied "
+        f"{recovered['applied_events']} events)"
+    )
+
+    durable = sandbox.scalar("SELECT last_lsn FROM _cdc_flight.debezium_offsets LIMIT 1")
+    confirmed = sandbox.pg_query(
+        "SELECT confirmed_flush_lsn - '0/0' FROM pg_replication_slots WHERE slot_name = %s",
+        (sandbox.slot,),
+    )
+    assert confirmed[0][0] <= durable, (
+        f"after a real SIGKILL the slot confirmed {confirmed[0][0]}, ahead of the "
+        f"durable destination offset {durable}"
     )

@@ -94,6 +94,7 @@ Evidence:
 | multi-table atomicity in MotherDuck | `tests/1.3_atomic_batches/test_1_3_motherduck_atomicity.py` — a second MotherDuck connection polling both tables never observes a partial Postgres transaction, and is required to have seen both the before and after states |
 | start-up reconciliation, incl. the refuse-to-start case | `tests/1.1_exactly_once_pk/test_1_1_reconciliation.py` |
 | correctness without the offsets-file repair | same file, `CDC_OFFSET_FILE_REPAIR=0` |
+| exactly-once across a **real** `kill -9` | `tests/1.1_exactly_once_pk::test_slow_real_sigkill_is_exactly_once` (`slow`) - 40 transactions x 5 000 rows, SIGKILL mid-stream, restart: **200 000 rows / 200 000 distinct, 0 duplicates, 0 lost**, and the recovery run genuinely re-applied 95 000 events |
 
 Measurements made while implementing it, recorded because they contradict
 assumptions elsewhere in this document and in the ADR:
@@ -125,6 +126,28 @@ Two things this did **not** change, stated so they are not overclaimed:
 * **1.7 is not yet 5.** Fault injection is now genuinely robust at every commit
   anchor, but the rubric item also wants the wider failure surface (WAL errors,
   slot invalidation, network partitions) covered.
+
+### Throughput measured while implementing it (informs 5.1/5.3/5.4)
+
+One 200 000-row Postgres transaction, local DuckDB, one commit group, whole-run
+wall clock. Every row is a real measurement on the same machine:
+
+| state | wall clock |
+|---|---|
+| `executemany` insert | did not finish (410 s in the insert alone) |
+| Arrow insert; spill threshold on the unit's TOTAL size | 239 s |
+| Arrow insert; spill threshold on total size, spill disabled | 458 s |
+| Arrow insert; spill threshold on the in-memory tail; ordered-dict merge | **32 s** |
+
+and, isolated on the same workload: raw `ChangeEvent` field access ~40 000
+events/s, full-envelope `decode()` ~39 400 events/s, decode **and** buffer ~26 500
+events/s. So the full-envelope decode is **not** the bottleneck ADR §5.1 feared at
+this payload size; the apply path was. 5.3's work should start there.
+
+The baseline dlt path loaded 200 000 rows in ~35 s *at-least-once with no
+transactional boundaries*; the applier does it in ~32 s exactly-once, in one
+atomic multi-table transaction, with 168 885 of the events spilled to disk and
+drained inside that transaction.
 
 Two things had already moved underneath the baseline before that:
 
