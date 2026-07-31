@@ -7,12 +7,15 @@ No Docker, no Kafka, no testcontainers.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -24,6 +27,17 @@ import pytest
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 PG_SH = PROJECT_DIR / "scripts" / "pg.sh"
 VENV_BIN = PROJECT_DIR / ".venv" / "bin"
+
+#: Tables the pipeline replicates. Used to fingerprint the shared source so a
+#: concurrent writer produces a diagnostic instead of a mystery assertion.
+CAPTURED_TABLES = (
+    "customers",
+    "orders",
+    "sensor_readings",
+    "documents",
+    "wide_types",
+    "audit_log",
+)
 
 sys.path.insert(0, str(PROJECT_DIR / "src"))
 
@@ -53,7 +67,50 @@ def _executable(name: str) -> str:
 # session-scoped environment
 # --------------------------------------------------------------------------- #
 @pytest.fixture(scope="session")
-def postgres_cluster() -> Iterator[SourceConfig]:
+def exclusive_source() -> Iterator[Path]:
+    """Serialise whole test sessions against the shared Postgres cluster.
+
+    Every sandbox has a private slot, offset directory and DuckDB file, but they
+    all mutate the *same* `app` schema and publication, and `reseed()` drops and
+    recreates both (`sql/01_schema.sql:7-12`, `:142-150`). Two concurrent
+    sessions - two reviewers running `make test` at once against :15432, which is
+    exactly what happened during the 1.0 review - therefore corrupt each other:
+    one session's snapshot picks up another's rows, or its publication vanishes
+    mid-run. That produced the review's "1 failed, 21 passed" and Codex's
+    "healthy snapshot contained 40 rather than 20 records".
+
+    A whole-session exclusive `flock` is the cheapest fix that actually removes
+    the class of failure rather than papering over one symptom (Opus B4,
+    Codex 12). Per-worker databases would be better and are the follow-up if the
+    suite is ever parallelised.
+    """
+    lock_path = PROJECT_DIR / ".pytest-source.lock"
+    lock_path.touch(exist_ok=True)
+    handle = lock_path.open("r+")
+    waited = 0.0
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if waited == 0.0:
+                print(
+                    f"\nwaiting for another test session to release {lock_path} "
+                    "(the Postgres cluster on :15432 is shared)"
+                )
+            time.sleep(1.0)
+            waited += 1.0
+            if waited > 1800:
+                pytest.fail(f"timed out waiting 30 min for {lock_path}")
+    try:
+        yield lock_path
+    finally:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
+
+
+@pytest.fixture(scope="session")
+def postgres_cluster(exclusive_source: Path) -> Iterator[SourceConfig]:
     """Start (if needed) the project-local Postgres cluster and load the schema.
 
     The cluster is intentionally left running afterwards: `initdb` + start costs a
@@ -64,6 +121,35 @@ def postgres_cluster() -> Iterator[SourceConfig]:
     _pg("start")
     _pg("seed")
     yield SourceConfig()
+
+
+def source_fingerprint(source: SourceConfig) -> dict[str, int]:
+    """Row counts of every captured table.
+
+    Compared across a window in which the test itself makes no source changes;
+    a difference means *something else* wrote to the shared cluster, which is a
+    much more useful failure message than `assert 110 == 0`.
+    """
+    with psycopg.connect(source.dsn, autocommit=True) as conn:
+        return {
+            table: conn.execute(f"SELECT count(*) FROM app.{table}").fetchone()[0]
+            for table in CAPTURED_TABLES
+        }
+
+
+def kill_walsender(source: SourceConfig, slot: str) -> int:
+    """Terminate the walsender backend holding `slot`. Returns how many were killed.
+
+    Scoped to one slot on purpose: killing every walsender would also kill any
+    other suite's replication connection on this shared cluster.
+    """
+    with psycopg.connect(source.dsn, autocommit=True) as conn:
+        rows = conn.execute(
+            "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots "
+            "WHERE slot_name = %s AND active",
+            (slot,),
+        ).fetchall()
+    return len(rows)
 
 
 @pytest.fixture
@@ -318,23 +404,41 @@ class Sandbox:
         kwargs.setdefault("idle_seconds", 6)
         return _invoke_pipeline({**self.env, **(extra_env or {})}, **kwargs)
 
-    def spawn(self, *, max_seconds: float = 300, idle_seconds: float = 10) -> subprocess.Popen:
+    def spawn(
+        self,
+        *,
+        max_seconds: float = 300,
+        idle_seconds: float = 10,
+        destination: str = "duckdb",
+        extra_env: dict[str, str] | None = None,
+        capture: bool = False,
+    ) -> subprocess.Popen:
         """Start the pipeline as a killable child process (fault injection)."""
+        sink = subprocess.PIPE if capture else subprocess.DEVNULL
         return subprocess.Popen(
             [
                 _executable("cdc-flight"),
                 "--destination",
-                "duckdb",
+                destination,
                 "--max-seconds",
                 str(max_seconds),
                 "--idle-seconds",
                 str(idle_seconds),
             ],
-            env=self.env,
+            env={**self.env, **(extra_env or {})},
             cwd=PROJECT_DIR,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=sink,
+            stderr=sink,
+            text=capture,
         )
+
+    def last_summary(self) -> dict:
+        """The JSON summary the CLI wrote for its most recent run, if any."""
+        path = self.state_dir / "last_run.json"
+        return json.loads(path.read_text()) if path.exists() else {}
+
+    def kill_walsender(self) -> int:
+        return kill_walsender(self.source, self.slot)
 
     # -- destination -------------------------------------------------------- #
     def duck_query(self, stmt: str, params: list | None = None) -> list[tuple]:
@@ -353,6 +457,15 @@ class Sandbox:
 
 CRASH_REPLAY_CUSTOMERS = 50
 CRASH_REPLAY_READINGS = 60
+#: How many *byte-identical* keyless rows the scenario inserts on purpose.
+#: This is the case that separates exactly-once delivery from deduplication: a
+#: `SELECT DISTINCT` (or any dedupe by row content) collapses these two rows and
+#: is therefore WRONG, while a crash-replay copy of them must not survive
+#: (Opus M6 / Codex 8).
+CRASH_REPLAY_IDENTICAL = 2
+IDENTICAL_SENSOR = "REPLAY-IDENTICAL"
+IDENTICAL_READING_AT = "2026-07-30T12:00:00+00:00"
+IDENTICAL_VALUE = 42.5
 
 
 @pytest.fixture(scope="session")
@@ -363,17 +476,27 @@ def crash_replay(tmp_path_factory, postgres_cluster: SourceConfig) -> Iterator[d
     the ~75 s scenario is paid for once. It is safe as a session fixture because
     the whole scenario completes inside a single fixture setup - no other test
     can interleave a `seed` into it - and every later assertion only reads the
-    sandbox's private DuckDB file.
+    sandbox's private DuckDB file. It also **reseeds on teardown**, so the shared
+    cluster is left in its canonical state for whatever runs next.
 
-    The fault is injected at `after_load` (see `cdc_flight.faults`): the batch is
-    committed to the destination and then the process is `os._exit`-ed *before*
-    `markProcessed()` / `markBatchFinished()` run, so Debezium's offset file
-    still points before the batch and the replication slot was never confirmed
-    past it. That is precisely the window a `kill -9` hits, made exact.
+    The fault is injected at `post_commit_pre_ack` (see `cdc_flight.faults`): the
+    batch is committed to the destination and then the process is `os._exit`-ed
+    *before* `markProcessed()` / `markBatchFinished()` run, so Debezium's offset
+    file still points before the batch and the replication slot was never
+    confirmed past it. That is precisely the window a `kill -9` hits, made exact.
 
     (Rolling the offset *file* back instead does not work reliably: Postgres will
     not stream from before the slot's `restart_lsn`, which has already advanced,
     so only the tail of the batch replays. Measured, not assumed.)
+
+    The scenario writes three things in ONE Postgres transaction:
+
+    * `CRASH_REPLAY_CUSTOMERS` rows in a table WITH a primary key (1.1);
+    * `CRASH_REPLAY_READINGS` rows with distinct values in a table WITHOUT one (1.2);
+    * `CRASH_REPLAY_IDENTICAL` **byte-identical** rows in that same keyless table.
+
+    `source_events` is the ledger every "exactly once" assertion is measured
+    against: the number of change events Postgres actually produced.
     """
     box = Sandbox("crash_replay", tmp_path_factory.mktemp("sbx_crash_replay"), postgres_cluster)
     try:
@@ -388,6 +511,11 @@ def crash_replay(tmp_path_factory, postgres_cluster: SourceConfig) -> Iterator[d
                 "INSERT INTO app.sensor_readings (sensor_id, value, unit) SELECT "
                 "'REPLAY', i * 1.5, 'C' "
                 f"FROM generate_series(1, {CRASH_REPLAY_READINGS}) i",
+                # Two rows that are identical in every column, inserted on
+                # purpose. Nothing downstream may treat them as one.
+                "INSERT INTO app.sensor_readings (sensor_id, reading_at, value, unit) "
+                f"SELECT '{IDENTICAL_SENSOR}', TIMESTAMPTZ '{IDENTICAL_READING_AT}', "
+                f"{IDENTICAL_VALUE}, 'C' FROM generate_series(1, {CRASH_REPLAY_IDENTICAL}) i",
             ],
             one_transaction=True,
         )
@@ -395,9 +523,18 @@ def crash_replay(tmp_path_factory, postgres_cluster: SourceConfig) -> Iterator[d
         crashed = box.run(
             max_seconds=150,
             expect_success=False,
-            extra_env={"CDC_FAULT_INJECT": "after_load:1"},
+            extra_env={"CDC_FAULT_INJECT": "post_commit_pre_ack:1"},
         )
-        assert crashed["returncode"] == 137, f"fault injection did not fire: {crashed}"
+        if crashed["returncode"] != 137:
+            # A bare `assert` here errors every test in 1.1 and 1.2 with the same
+            # opaque message; say what actually went wrong instead (Opus M7).
+            raise RuntimeError(
+                "fault injection did not fire at post_commit_pre_ack:1. Expected the "
+                f"process to exit 137, got {crashed['returncode']}. This usually means "
+                "the fault point moved or the first DATA batch was consumed before the "
+                f"fault could arm. summary={ {k: v for k, v in crashed.items() if k != 'output'} }"
+                f"\n--- tail ---\n{crashed.get('output', '')[-3000:]}"
+            )
 
         replayed = box.run(max_seconds=150)
 
@@ -408,9 +545,18 @@ def crash_replay(tmp_path_factory, postgres_cluster: SourceConfig) -> Iterator[d
             "replayed": replayed,
             "customers": CRASH_REPLAY_CUSTOMERS,
             "readings": CRASH_REPLAY_READINGS,
+            "identical": CRASH_REPLAY_IDENTICAL,
+            "identical_sensor": IDENTICAL_SENSOR,
+            # The ledger: exactly how many change events the source produced in
+            # the replayed transaction. "Exactly once" means the destination
+            # holds this many change events, no more and no fewer.
+            "source_events": CRASH_REPLAY_CUSTOMERS + CRASH_REPLAY_READINGS + CRASH_REPLAY_IDENTICAL,
         }
     finally:
         box.cleanup()
+        # Leave the shared source in its canonical state (Opus B4 / Codex 12).
+        with contextlib.suppress(Exception):  # teardown must not mask a failure
+            _pg("seed")
 
 
 @pytest.fixture(scope="module")

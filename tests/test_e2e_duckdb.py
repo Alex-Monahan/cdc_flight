@@ -180,11 +180,30 @@ def test_documented_baseline_gaps(fresh_seed, run_pipeline, generate_changes, du
 
 
 def test_second_run_is_incremental(fresh_seed, run_pipeline, duck, dataset):
-    """Offsets persist: a second run with no source changes loads nothing new."""
+    """Offsets persist: a second run with no source changes loads nothing new.
+
+    This assertion is about *our* offsets, but its literal form ("the second run
+    saw zero change events") is a statement about the whole shared cluster, so
+    any other writer on :15432 breaks it with a baffling message - which is
+    exactly how the 1.0 review saw `assert 110 == 0` (Opus B4). Sessions are now
+    serialised by the `exclusive_source` lock; this fingerprint check catches
+    anything that still slips past and says so plainly.
+    """
+    from conftest import source_fingerprint
+
     first = run_pipeline(reset_state=True, max_seconds=120, idle_seconds=6)
     assert first["records"] == 20
 
+    before = source_fingerprint(fresh_seed)
     second = run_pipeline(max_seconds=40, idle_seconds=6)
+    after = source_fingerprint(fresh_seed)
+
+    if before != after:
+        pytest.fail(
+            "the shared Postgres source was modified by something other than this "
+            "test while it ran, so 'a second run loads nothing new' cannot be "
+            f"evaluated.\n  before: {before}\n  after:  {after}\n  run: {second}"
+        )
     assert second["records"] == 0, second
 
     con = duck()

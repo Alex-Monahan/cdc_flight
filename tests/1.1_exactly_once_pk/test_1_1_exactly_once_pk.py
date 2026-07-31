@@ -1,6 +1,17 @@
 """Rubric 1.1 - exactly-once delivery for tables WITH a primary key.
 
 See README.md for the failure mode and the test conventions.
+
+Review note (Opus M6 / Codex 8), and the reason the TARGET tests below look the
+way they do: for a primary-keyed table, `count(*) == 50 AND count(DISTINCT id)
+== 50` is satisfied by any implementation that merges on `id`, **even if the
+same change event was delivered and applied twice**. Row-shape assertions
+therefore cannot distinguish exactly-once *delivery* from idempotent
+*application*. The assertions here are consequently made against an **event
+ledger**: how many change events the source produced versus how many the
+destination holds. The baseline destination is an append-only changelog, so the
+row count *is* the event count today; once ADR 0001 D8 splits current-state from
+changelog, these tests point at the changelog and keep meaning the same thing.
 """
 
 from __future__ import annotations
@@ -43,13 +54,40 @@ def test_gap_replay_duplicates_pk_rows(crash_replay):
     )
 
 
-def test_gap_duplication_is_a_whole_batch(crash_replay):
-    """The duplicate is the *entire* replayed window, not a stray row."""
+def test_gap_some_ids_are_delivered_twice(crash_replay):
+    """PIN OF TODAY'S BROKEN BEHAVIOUR - delete once the applier lands.
+
+    Renamed from `test_gap_duplication_is_a_whole_batch`: the assertion only ever
+    established that *at least one* id was delivered twice, not that the whole
+    batch was (Codex 13). The batch-level claim now has its own assertion.
+    """
     box = crash_replay["box"]
     per_id = box.duck_query(
         f"SELECT count(*) AS c FROM {CUSTOMERS} WHERE {REPLAY_FILTER} GROUP BY id ORDER BY c DESC"
     )
     assert per_id[0][0] >= 2, per_id[:5]
+
+
+def test_gap_duplicates_span_a_contiguous_prefix(crash_replay):
+    """The duplicated events are a *prefix of the batch*, not scattered rows.
+
+    That is what makes the failure an offset-window problem rather than random
+    double-application: everything up to the crash point is delivered twice and
+    nothing after it is.
+    """
+    box = crash_replay["box"]
+    counts = box.duck_query(
+        f"SELECT id, count(*) FROM {CUSTOMERS} WHERE {REPLAY_FILTER} GROUP BY id ORDER BY id"
+    )
+    seen_single = False
+    for _id, c in counts:
+        if c == 1:
+            seen_single = True
+        elif seen_single:
+            pytest.fail(
+                "duplicated ids are interleaved with non-duplicated ones, which is "
+                f"not an offset-window replay: {counts}"
+            )
 
 
 def test_no_rows_are_lost(crash_replay):
@@ -62,6 +100,28 @@ def test_no_rows_are_lost(crash_replay):
         "WHERE c.name = 'replay-c-' || g.i)"
     )[0][0]
     assert missing == 0, f"{missing} source rows never reached the destination"
+
+
+@pytest.mark.xfail(reason=TARGET, strict=True)
+def test_target_change_event_ledger_balances(crash_replay):
+    """TARGET BEHAVIOUR - the destination holds exactly the events the source produced.
+
+    THE assertion for 1.1, and the one a PK merge cannot fake: the source
+    produced `customers` INSERT events in the replayed transaction, so the
+    destination must hold exactly that many change events for them. A merge on
+    `id` collapses a duplicate delivery into one row and would silently pass a
+    row-count test; it cannot pass an event-count test against an append-only
+    changelog.
+    """
+    box = crash_replay["box"]
+    expected = crash_replay["customers"]
+    events = box.scalar(
+        f"SELECT count(*) FROM {CUSTOMERS} WHERE {REPLAY_FILTER} AND dbz_op = 'c'"
+    )
+    assert events == expected, (
+        f"source produced {expected} INSERT events, destination holds {events} "
+        "change events for them"
+    )
 
 
 @pytest.mark.xfail(reason=TARGET, strict=True)
@@ -85,6 +145,35 @@ def test_target_no_duplicate_change_events(crash_replay):
         f"WHERE {REPLAY_FILTER} GROUP BY 1, 2 HAVING count(*) > 1)"
     )[0][0]
     assert dupes == 0, f"{dupes} change events delivered more than once"
+
+
+@pytest.mark.xfail(reason=TARGET, strict=True)
+def test_target_slot_never_outruns_the_destination(crash_replay):
+    """TARGET BEHAVIOUR - ADR 0001 §4.7's Invariant-O guard.
+
+    `slot.confirmed_flush_lsn <= debezium_offsets.last_lsn` is the ONLY detector
+    for the class of bug that produced ADR revision 2 (a lifecycle path
+    confirming an LSN the destination never committed). It must be sampled at
+    every observed moment, and it is asserted here - after a crash and a restart,
+    which is when it would first be violated.
+
+    xfail until `_cdc_flight.debezium_offsets` exists (ADR implementation step 3).
+    """
+    box = crash_replay["box"]
+    rows = box.duck_query(
+        "SELECT last_lsn FROM _cdc_flight.debezium_offsets LIMIT 1"
+    )
+    assert rows, "_cdc_flight.debezium_offsets has no row for this pipeline"
+    durable_lsn = rows[0][0]
+    confirmed = box.pg_query(
+        "SELECT confirmed_flush_lsn - '0/0' FROM pg_replication_slots WHERE slot_name = %s",
+        (box.slot,),
+    )
+    assert confirmed, f"slot {box.slot} is gone"
+    assert confirmed[0][0] <= durable_lsn, (
+        f"slot confirmed_flush_lsn={confirmed[0][0]} is AHEAD of the durable "
+        f"destination offset {durable_lsn}: data in between is unrecoverable"
+    )
 
 
 @pytest.mark.slow
@@ -114,7 +203,7 @@ def test_slow_real_sigkill_loses_nothing(sandbox):
     )
 
     proc = sandbox.spawn(max_seconds=300, idle_seconds=10)
-    time.sleep(35)  # JVM start (~17 s) plus enough loading to be mid-stream
+    time.sleep(35)  # JVM start plus enough loading to be mid-stream
     proc.send_signal(signal.SIGKILL)
     proc.wait(timeout=60)
     assert proc.returncode != 0, "process survived SIGKILL"

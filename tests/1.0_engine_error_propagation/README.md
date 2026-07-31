@@ -32,12 +32,28 @@ while the pipeline reports `{"records": 0, "stop_reason": "engine_finished",
 
 | test | asserts |
 |---|---|
-| `test_healthy_run_reports_success` | a healthy run still exits 0 with a summary — guards against an over-eager failure detector |
+| `test_healthy_run_reports_success` | a healthy run still exits 0 with a summary — guards against an over-eager failure detector. Asserts a *scenario-specific* row count, not the seed's global total, so an unrelated seed change or another writer cannot break it. |
 | `test_dropped_slot_surfaces_as_a_failure` | slot dropped externally ⇒ non-zero exit, `stop_reason: "engine_error"`, and the Debezium message ("no longer available on the server") in the run summary and on stderr |
 | `test_corrupt_offset_surfaces_as_a_failure` (`slow`) | a corrupted offset file ⇒ non-zero exit and a Debezium error message |
 
 These are **target-behaviour** tests for a defect that is fixed in the same
 commit range, so they are expected to *pass*. They are not xfail-marked.
+
+## 1.0(feedback) — the two failure paths 1.0(b) did **not** cover
+
+`test_1_0_supervisor_liveness.py` (`slow`) and `test_1_0_supervisor_unit.py`
+(fast, no JVM, no Postgres) were added after the dual review of TODO 1.0.
+
+`1.0(b)` fixed *startup* failures. Two other ways to exit 0 on a broken run
+survived it:
+
+| test | defect |
+|---|---|
+| `test_walsender_kill_never_reports_ok_on_partial_delivery` (`slow`) | a **streaming** failure. Killing the walsender puts Debezium into a 10 s retriable-restart backoff; the 8 s idle timer fires first and the run reports `ok: true` with `57 344 / 60 000` rows and `EXIT=0` (measured on the pre-fix code). Idle is now corroborated against `pg_replication_slots`: the slot must have been continuously held for the whole quiet window. |
+| `test_engine_that_returns_on_its_own_is_a_failure_in_streaming_mode` | the engine thread returning on its own (`stop_reason: engine_finished`) used to be `ok: true`, even when Debezium had swallowed a `StopEngineException`. Only a snapshot mode that is designed to terminate may end that way. |
+| `test_noise_filter_*` | the shutdown-noise filter was armed on **every** close (`close()` runs in a `finally`), so it degenerated into "discard any failure whose text contains `interrupted`" — which is exactly how a handler error propagates. It is now armed only by an *intentional* close, and a suppressed message still reaches the run summary. |
+| `test_verifier_*` | `markBatchFinished()` can return normally without flushing, because Debezium discards `commitOffsets()`'s boolean. `OffsetFlushVerifier` makes that fatal. |
+| `test_fault_spec_*` / `test_malformed_fault_spec_is_rejected` | a malformed `CDC_FAULT_INJECT` used to leave the process running normally, so a fault test could pass vacuously. It is parsed and validated once at start-up. |
 
 ## Conventions used by all `tests/<rubric item>_*/` suites
 

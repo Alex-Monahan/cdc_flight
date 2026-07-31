@@ -29,6 +29,15 @@ One Postgres `BEGIN … COMMIT` inserting 1 500 `app.customers` **and** 1 500
 must cut it into at least two batches, and the cut necessarily falls inside the
 transaction and between the two tables.
 
+## ⚠ These gap tests key off `_dlt_load_id`
+
+`test_gap_pg_transaction_is_split_across_commits` and
+`test_gap_torn_transaction_is_observable` read `_dlt_load_id`. ADR 0001 D10
+removes dlt from the apply path, so that column **disappears** and both tests
+will fail with a DuckDB `CatalogException` rather than a clean assertion failure.
+That is expected: they are gap pins and must be **deleted** at that point, not
+debugged.
+
 ## Observing atomicity without a concurrent reader
 
 DuckDB is single-writer: while the pipeline holds the write lock on the file, a
@@ -50,6 +59,24 @@ intermediate state explicitly.
 | `test_gap_torn_transaction_is_observable` | **passes** — all customers visible, only part of the orders | starts failing; delete it |
 | `test_target_pg_transaction_lands_in_one_commit` | **xfail(strict)** | must pass, then drop the marker |
 | `test_target_commit_group_metadata_is_present` | **xfail(strict)** | must pass, then drop the marker |
+| `test_target_commit_log_accounts_for_every_row` | **xfail(strict)** | must pass, then drop the marker |
+
+### The MotherDuck variant is where the real proof lives
+
+`test_1_3_motherduck_atomicity.py` (marker `motherduck`, deselected by
+`make test`, run with `make test-md`) is the answer to the review's central
+objection: *metadata equality is not proof*. An implementation could stamp the
+same `cdcf_commit_id` in two separate commits and pass every assertion in this
+file. Only a **visibility** assertion is proof, and it needs a concurrent reader,
+which DuckDB's single-writer file lock makes impossible locally but MotherDuck
+makes trivial.
+
+That module streams one multi-table Postgres transaction into MotherDuck while a
+second MotherDuck connection samples both tables. Every observation must be
+either `(0, 0)` or `(N, N)`; anything else is a torn transaction that a consumer
+could have seen. Rubric 1.3 asks for atomicity *in MotherDuck*, so 1.3 is not
+scored 5 until that test passes. It is kept deliberately small (one 3 000-event
+transaction, no large loads) to keep MotherDuck usage light.
 
 Conventions are described in `tests/1.0_engine_error_propagation/README.md`.
 

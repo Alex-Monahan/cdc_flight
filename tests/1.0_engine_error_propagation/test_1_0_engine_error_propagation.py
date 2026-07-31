@@ -16,6 +16,7 @@ def dropped_slot_scenario(sandbox) -> dict:
     """Snapshot, make one change, drop the slot underneath us, run again."""
     sandbox.reseed()
     healthy = sandbox.run(reset_state=True, max_seconds=150)
+    seeded_customers = sandbox.pg_query("SELECT count(*) FROM app.customers")[0][0]
 
     sandbox.sql(
         "INSERT INTO app.customers (name, email) VALUES "
@@ -24,16 +25,28 @@ def dropped_slot_scenario(sandbox) -> dict:
     sandbox.drop_slot()
 
     broken = sandbox.run(max_seconds=90, expect_success=False)
-    return {"healthy": healthy, "broken": broken}
+    return {"healthy": healthy, "broken": broken, "seeded_customers": seeded_customers}
 
 
-def test_healthy_run_reports_success(dropped_slot_scenario):
-    """Guard rail: the failure detector must not fire on a clean shutdown."""
+def test_healthy_run_reports_success(dropped_slot_scenario, sandbox):
+    """Guard rail: the failure detector must not fire on a clean shutdown.
+
+    Asserts a *scenario-specific* fact rather than the seed's global total: the
+    previous `records == 20` coupled an engine-supervision test to the seed file
+    and to every other writer on the shared cluster (Opus m2 / Codex 12).
+    """
     healthy = dropped_slot_scenario["healthy"]
     assert healthy["returncode"] == 0, healthy
-    assert healthy["records"] == 20, healthy
     assert healthy["stop_reason"] in {"idle", "engine_finished"}, healthy
     assert "error" not in healthy, healthy
+    landed = sandbox.scalar(
+        'SELECT count(*) FROM "cdc_raw"."cdcflight_app_customers"'
+    )
+    assert landed == dropped_slot_scenario["seeded_customers"], (
+        "the healthy snapshot must contain exactly the customers that were in the "
+        f"source when it ran: {healthy}"
+    )
+    assert healthy["records"] >= landed, healthy
 
 
 def test_dropped_slot_surfaces_as_a_failure(dropped_slot_scenario):

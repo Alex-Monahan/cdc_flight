@@ -130,3 +130,39 @@ def test_target_commit_group_metadata_is_present(multi_table_txn):
     for table in (CUSTOMERS, ORDERS):
         nulls = box.scalar(f"SELECT count(*) FROM {table} WHERE cdcf_commit_id IS NULL")
         assert nulls == 0, f"{table} has {nulls} rows with no commit group"
+
+
+@pytest.mark.xfail(reason=TARGET, strict=True)
+def test_target_commit_log_accounts_for_every_row(multi_table_txn):
+    """TARGET BEHAVIOUR - the commit group's own record agrees with the rows.
+
+    Shared metadata alone proves nothing: an implementation could stamp the same
+    `cdcf_commit_id` in two separate commits and pass
+    `test_target_pg_transaction_lands_in_one_commit` (Codex 7). Joining to
+    `_cdc_flight.commit_log` and checking its counters is audit evidence that the
+    stamp was not invented after the fact - and the *visibility* proof lives in
+    `test_1_3_motherduck_atomicity.py`, which is the actual proof.
+    """
+    box = multi_table_txn["box"]
+    tx_id = multi_table_txn["tx_ids"][0]
+    commit_ids = [
+        c
+        for (c,) in box.duck_query(
+            f"SELECT DISTINCT cdcf_commit_id FROM {CUSTOMERS} WHERE dbz_tx_id = {tx_id}"
+        )
+    ]
+    assert len(commit_ids) == 1, commit_ids
+    logged = box.duck_query(
+        "SELECT event_count, unit_count, tables_touched FROM _cdc_flight.commit_log "
+        f"WHERE commit_id = {commit_ids[0]}"
+    )
+    assert logged, f"no commit_log row for commit {commit_ids[0]}"
+    event_count, unit_count, tables_touched = logged[0]
+    applied = box.scalar(
+        f"SELECT count(*) FROM {CUSTOMERS} WHERE cdcf_commit_id = {commit_ids[0]}"
+    ) + box.scalar(f"SELECT count(*) FROM {ORDERS} WHERE cdcf_commit_id = {commit_ids[0]}")
+    assert event_count == applied, (
+        f"commit_log says {event_count} events, {applied} rows carry that commit id"
+    )
+    assert unit_count >= 1
+    assert set(tables_touched) >= {"cdcflight_app_customers", "cdcflight_app_orders"}
