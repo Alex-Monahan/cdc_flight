@@ -35,6 +35,15 @@ from cdc_flight.config import motherduck_token
 
 pytestmark = [pytest.mark.motherduck, pytest.mark.e2e]
 
+#: MEASURED, 2026-07-30: `duckdb.connect()` caches the database instance per DSN
+#: within a process and MotherDuck's catalog snapshot rides on it, so a reader in
+#: THIS process can go stale against writes made by the pipeline SUBPROCESS.
+#: `FORCE CHECKPOINT` re-syncs it. Without this the observer below would sample a
+#: frozen `(0, 0)` forever and `test_target_no_observer_ever_sees_a_partial_transaction`
+#: would pass vacuously - which is why that test now also requires the observer to
+#: have seen the transition.
+REFRESH = "FORCE CHECKPOINT"
+
 MD_DATABASE = "cdc_flight_dev"
 N = 1500  # per table; 2 * N = 3000 events > max.batch.size (2048)
 
@@ -94,6 +103,7 @@ def md_observed_txn(sandbox, md_token) -> dict:
         try:
             while not stop.is_set():
                 try:
+                    con.execute(REFRESH)
                     row = con.execute(
                         f'SELECT (SELECT count(*) FROM "{dataset}"."cdcflight_app_customers" '
                         "        WHERE name LIKE 'mdatomic-c-%'), "
@@ -122,6 +132,7 @@ def md_observed_txn(sandbox, md_token) -> dict:
         watcher.join(timeout=15)
 
     con = duckdb.connect(dsn)
+    con.execute(REFRESH)
     try:
         yield {
             "box": sandbox,
@@ -137,14 +148,30 @@ def md_observed_txn(sandbox, md_token) -> dict:
 
 
 def test_scenario_reached_motherduck(md_observed_txn):
-    """Guard: without this, every assertion below is vacuous."""
+    """Guard: without this, every assertion below is vacuous.
+
+    "The observer never saw a partial transaction" is trivially true of an
+    observer that never saw anything, so the guard has to establish that it was
+    genuinely watching **across** the commit: it must have sampled the state
+    before the transaction landed AND the state after it landed.
+    """
     con, dataset, n = md_observed_txn["con"], md_observed_txn["dataset"], md_observed_txn["n"]
     landed = con.execute(
         f'SELECT count(*) FROM "{dataset}"."cdcflight_app_customers" '
         "WHERE name LIKE 'mdatomic-c-%'"
     ).fetchone()[0]
     assert landed == n, md_observed_txn["streamed"]
-    assert md_observed_txn["observations"], "the observer never sampled MotherDuck"
+    observations = md_observed_txn["observations"]
+    assert observations, "the observer never sampled MotherDuck"
+    assert (0, 0) in observations, (
+        "the observer never saw the pre-transaction state, so it started too late "
+        f"to prove anything: {observations[:20]}"
+    )
+    assert (n, n) in observations, (
+        "the observer never saw the committed transaction, so it was reading a "
+        f"stale catalog and every atomicity assertion would pass vacuously: "
+        f"{observations[:20]}"
+    )
 
 
 

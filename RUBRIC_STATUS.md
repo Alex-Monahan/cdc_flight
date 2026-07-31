@@ -68,7 +68,65 @@ DuckDB file, so they never disturb `make pipeline` or the pytest suite.
 ## Changes since the baseline scoring
 
 The scores below are the **Phase-0 baseline** and are deliberately left
-unchanged until each item is re-measured. Two things have moved underneath them:
+unchanged until each item is re-measured. **1.1, 1.2 and 1.3 have now been
+re-measured and are listed at the top of the summary table**; everything else
+below is still the baseline.
+
+### TODO 1.1 / 1.2 / 1.3 — the transactional applier (implemented 2026-07-30)
+
+One mechanism, three items. `src/cdc_flight/applier.py` owns the destination
+transaction: a **commit group** is one `BEGIN … COMMIT` containing an integral
+number of *whole* Postgres transactions, the Debezium resume point is written
+**inside** that transaction (`_cdc_flight.debezium_offsets`), and the connector
+is acknowledged **only after** it commits. That is ADR 0001's **Invariant O**:
+Debezium's offset store can never contain an offset the destination has not
+already committed, so no lifecycle path — poll loop, graceful close, or error
+teardown — can confirm an LSN to Postgres that is not durable.
+
+Evidence:
+
+| claim | test |
+|---|---|
+| exactly-once, keyed tables | `tests/1.1_exactly_once_pk/test_1_1_exactly_once_pk.py` (4 target tests, xfail markers removed) |
+| exactly-once, keyless tables | `tests/1.2_exactly_once_nopk/` (5 target tests, markers removed) — including two byte-identical source rows that both survive while crash-replay copies do not |
+| no loss / no duplicates at **every** protocol anchor | `tests/1.1_exactly_once_pk/test_1_1_fault_matrix.py` — crashes at `begin`, `mid_apply`, `pre_commit`, `post_commit_pre_ack`, `post_ack` |
+| Invariant O (`slot.confirmed_flush_lsn <= debezium_offsets.last_lsn`) | asserted at start-up and shutdown of every run, and after every crash in the matrix |
+| multi-table atomicity in MotherDuck | `tests/1.3_atomic_batches/test_1_3_motherduck_atomicity.py` — a second MotherDuck connection polling both tables never observes a partial Postgres transaction, and is required to have seen both the before and after states |
+| start-up reconciliation, incl. the refuse-to-start case | `tests/1.1_exactly_once_pk/test_1_1_reconciliation.py` |
+| correctness without the offsets-file repair | same file, `CDC_OFFSET_FILE_REPAIR=0` |
+
+Measurements made while implementing it, recorded because they contradict
+assumptions elsewhere in this document and in the ADR:
+
+1. **Debezium 3.6's envelope `transaction.id` is not a transaction identifier.**
+   It is `"<txId>:<lsn at struct-build time>"`, so it differs for every event of
+   one transaction and between `BEGIN` and `END`. `source.txId` is the stable
+   identifier. (ADR §15/A1.)
+2. **`executemany` against MotherDuck costs a network round trip per row** —
+   200 rows took 27.9 s (~140 ms/row). The same 1 500 rows as one chunked
+   multi-row `VALUES` statement took 0.65 s. Local DuckDB is in-process and does
+   not show this at all.
+3. **DuckDB caches the database instance per DSN within a process**, and
+   MotherDuck's catalog snapshot rides on it, so a reader that has already opened
+   `md:<db>` cannot immediately see what another *process* committed. This is a
+   test-harness hazard (each pipeline run is its own process) but it can make a
+   MotherDuck assertion pass vacuously; `tests/test_motherduck.py::wait_for_tables`
+   documents and handles it.
+4. **MotherDuck honours `DROP TABLE` + `ALTER TABLE … RENAME` inside a
+   transaction** — the shadow-table swap works as ADR §7 specifies, and the run
+   probes it rather than assuming (`transactional_ddl` in `last_run.json`). This
+   answers the ADR's single biggest open question (§14.1) for both destinations.
+
+Two things this did **not** change, stated so they are not overclaimed:
+
+* **Type mapping is untouched** (rubric 2.4 is still 1). The applier consumes the
+  full Debezium *envelope* but not the Connect *schema*; that lands with 2.4/2.6
+  after the decode-throughput measurement ADR §5.1 asks for.
+* **1.7 is not yet 5.** Fault injection is now genuinely robust at every commit
+  anchor, but the rubric item also wants the wider failure surface (WAL errors,
+  slot invalidation, network partitions) covered.
+
+Two things had already moved underneath the baseline before that:
 
 * **TODO 1.0(b) — engine failures no longer exit 0.** `SupervisedDebeziumEngine`
   (`src/cdc_flight/engine.py`) registers a Debezium `CompletionCallback`, so a
@@ -140,9 +198,9 @@ correct assumptions in the notes below:
 
 | # | Item | Score | One-line gap |
 |---|---|---|---|
-| 1.1 | Delivery guarantees, tables WITH a primary key | 3 | At-least-once, **proven**: SIGKILL mid-load left 2 048 duplicate rows on restart; `append` makes them permanent. |
-| 1.2 | Delivery guarantees, tables WITHOUT a primary key | 3 | Same machinery, and with no key there is nothing to dedupe on afterwards. |
-| 1.3 | CDC changes atomic in MotherDuck | 1 | Batches are 2048-record windows, not Postgres transactions; each table is its own dlt transaction. |
+| 1.1 | Delivery guarantees, tables WITH a primary key | ~~3~~ → **5** | Exactly-once by construction (Invariant O). Crash at all five commit-group anchors: no loss, no duplicates. |
+| 1.2 | Delivery guarantees, tables WITHOUT a primary key | ~~3~~ → **5** | Keyless rows are keyed on a connector-derived `cdcf_event_id`, so two identical source rows survive and a replay does not. |
+| 1.3 | CDC changes atomic in MotherDuck | ~~1~~ → **5** | A commit group is an integral number of whole multi-table Postgres transactions; a concurrent MotherDuck observer never sees a partial one. |
 | 1.4 | Primary-key update handled correctly | 2 | Debezium emits delete+insert correctly, but the append-only destination keeps both rows and the delete image is fabricated zeros/empty strings. |
 | 1.5 | TRUNCATE / DROP propagate | 1 | `skipped.operations` defaults to `t`, so truncate never reaches us; DROP TABLE is silently ignored. |
 | 1.6 | Snapshot/backfill consistent with CDC | 3 | Consistent on the healthy path (proven); an interrupted snapshot restarts from scratch and the partial snapshot is already appended. |
