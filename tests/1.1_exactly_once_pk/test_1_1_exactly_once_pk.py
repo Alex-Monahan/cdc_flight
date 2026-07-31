@@ -24,70 +24,38 @@ import pytest
 CUSTOMERS = '"cdc_raw"."cdcflight_app_customers"'
 REPLAY_FILTER = "name LIKE 'replay-c-%'"
 
-TARGET = (
-    "rubric 1.1: exactly-once needs the Debezium offset committed inside the "
-    "same MotherDuck transaction as the rows (ADR 0001)"
-)
 
 
-def test_scenario_actually_replayed(crash_replay):
-    """Guard: if the replay run loaded nothing, the fault was not injected."""
-    replayed = crash_replay["replayed"]
+def test_scenario_crashed_after_commit_and_recovered(crash_replay):
+    """Guard: without this every assertion below is vacuous.
+
+    The fault fires at `post_commit_pre_ack` - the destination transaction has
+    COMMITTED and Debezium has NOT been acknowledged - and the process dies with
+    137. That is the exact window a `kill -9` hits.
+
+    Note what this test does NOT assert any more. Before the applier it asserted
+    `replayed["records"] > 0`, i.e. that the crash caused a replay. Under
+    Invariant O there is nothing to replay: the resume point went into the same
+    MotherDuck transaction as the rows, so start-up reconciliation rebuilds
+    `offsets.dat` from it and the connector resumes *after* the committed batch.
+    "No replay happened" is the improvement, so it cannot also be the guard. The
+    guard is now: the fault really fired, the restart really succeeded, and the
+    committed rows really are there.
+    """
+    crashed, replayed = crash_replay["crashed"], crash_replay["replayed"]
+    assert crashed["returncode"] == 137, crashed
     assert replayed["returncode"] == 0, replayed
-    assert replayed["records"] > 0, (
-        "restoring offsets.dat did not cause a replay, so the duplication "
-        f"assertions below would be vacuous: {replayed}"
-    )
-
-
-def test_gap_replay_duplicates_pk_rows(crash_replay):
-    """PIN OF TODAY'S BROKEN BEHAVIOUR - delete once the applier lands."""
+    assert replayed["reconciliation"] in {"file_behind_rebuilt", "resume"}, replayed
     box = crash_replay["box"]
     n = crash_replay["customers"]
-    rows, distinct = box.duck_query(
-        f"SELECT count(*), count(DISTINCT id) FROM {CUSTOMERS} WHERE {REPLAY_FILTER}"
-    )[0]
-    assert distinct == n, f"expected {n} distinct replayed customers, got {distinct}"
-    assert rows > distinct, (
-        "expected at-least-once duplication after the offset rollback; if this "
-        "fails the pipeline may already be exactly-once - update RUBRIC_STATUS"
+    landed = box.scalar(f"SELECT count(*) FROM {CUSTOMERS} WHERE {REPLAY_FILTER}")
+    assert landed == n, (
+        f"the crashed run committed {n} customers before dying; the destination "
+        f"holds {landed}"
     )
 
 
-def test_gap_some_ids_are_delivered_twice(crash_replay):
-    """PIN OF TODAY'S BROKEN BEHAVIOUR - delete once the applier lands.
 
-    Renamed from `test_gap_duplication_is_a_whole_batch`: the assertion only ever
-    established that *at least one* id was delivered twice, not that the whole
-    batch was (Codex 13). The batch-level claim now has its own assertion.
-    """
-    box = crash_replay["box"]
-    per_id = box.duck_query(
-        f"SELECT count(*) AS c FROM {CUSTOMERS} WHERE {REPLAY_FILTER} GROUP BY id ORDER BY c DESC"
-    )
-    assert per_id[0][0] >= 2, per_id[:5]
-
-
-def test_gap_duplicates_span_a_contiguous_prefix(crash_replay):
-    """The duplicated events are a *prefix of the batch*, not scattered rows.
-
-    That is what makes the failure an offset-window problem rather than random
-    double-application: everything up to the crash point is delivered twice and
-    nothing after it is.
-    """
-    box = crash_replay["box"]
-    counts = box.duck_query(
-        f"SELECT id, count(*) FROM {CUSTOMERS} WHERE {REPLAY_FILTER} GROUP BY id ORDER BY id"
-    )
-    seen_single = False
-    for _id, c in counts:
-        if c == 1:
-            seen_single = True
-        elif seen_single:
-            pytest.fail(
-                "duplicated ids are interleaved with non-duplicated ones, which is "
-                f"not an offset-window replay: {counts}"
-            )
 
 
 def test_no_rows_are_lost(crash_replay):
@@ -102,9 +70,8 @@ def test_no_rows_are_lost(crash_replay):
     assert missing == 0, f"{missing} source rows never reached the destination"
 
 
-@pytest.mark.xfail(reason=TARGET, strict=True)
 def test_target_change_event_ledger_balances(crash_replay):
-    """TARGET BEHAVIOUR - the destination holds exactly the events the source produced.
+    """TARGET BEHAVIOUR (now met) - the destination holds exactly the events the source produced.
 
     THE assertion for 1.1, and the one a PK merge cannot fake: the source
     produced `customers` INSERT events in the replayed transaction, so the
@@ -124,9 +91,8 @@ def test_target_change_event_ledger_balances(crash_replay):
     )
 
 
-@pytest.mark.xfail(reason=TARGET, strict=True)
 def test_target_exactly_once_pk(crash_replay):
-    """TARGET BEHAVIOUR - each source change event lands exactly once."""
+    """TARGET BEHAVIOUR (now met) - each source change event lands exactly once."""
     box = crash_replay["box"]
     n = crash_replay["customers"]
     rows, distinct = box.duck_query(
@@ -136,9 +102,8 @@ def test_target_exactly_once_pk(crash_replay):
     assert distinct == n
 
 
-@pytest.mark.xfail(reason=TARGET, strict=True)
 def test_target_no_duplicate_change_events(crash_replay):
-    """TARGET BEHAVIOUR - (lsn, table, key) identifies a change event uniquely."""
+    """TARGET BEHAVIOUR (now met) - (lsn, table, key) identifies a change event uniquely."""
     box = crash_replay["box"]
     dupes = box.duck_query(
         f"SELECT count(*) FROM (SELECT dbz_lsn, id FROM {CUSTOMERS} "
@@ -147,9 +112,8 @@ def test_target_no_duplicate_change_events(crash_replay):
     assert dupes == 0, f"{dupes} change events delivered more than once"
 
 
-@pytest.mark.xfail(reason=TARGET, strict=True)
 def test_target_slot_never_outruns_the_destination(crash_replay):
-    """TARGET BEHAVIOUR - ADR 0001 §4.7's Invariant-O guard.
+    """TARGET BEHAVIOUR (now met) - ADR 0001 §4.7's Invariant-O guard.
 
     `slot.confirmed_flush_lsn <= debezium_offsets.last_lsn` is the ONLY detector
     for the class of bug that produced ADR revision 2 (a lifecycle path
@@ -157,7 +121,10 @@ def test_target_slot_never_outruns_the_destination(crash_replay):
     every observed moment, and it is asserted here - after a crash and a restart,
     which is when it would first be violated.
 
-    xfail until `_cdc_flight.debezium_offsets` exists (ADR implementation step 3).
+    Under Invariant O this should be unfalsifiable. It is asserted anyway, and
+    after a crash and a restart specifically, because that is the moment a
+    lifecycle path that confirmed an LSN the destination never committed would
+    show itself.
     """
     box = crash_replay["box"]
     rows = box.duck_query(

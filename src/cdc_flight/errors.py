@@ -38,3 +38,47 @@ class SourceNotStreaming(RuntimeError):
     retriable-restart backoff looks exactly like an idle stream from the Python
     side (ADR 0001 §9.1; review finding Opus B5).
     """
+
+
+# --------------------------------------------------------------------------- #
+# transactional applier (ADR 0001 §3, §4)
+# --------------------------------------------------------------------------- #
+class TransactionAssemblyError(RuntimeError):
+    """Debezium's transaction metadata is not self-consistent.
+
+    ADR 0001 §3.2: a `txId` change without an intervening `END`, a `BEGIN` while
+    another transaction is open, or an `END` whose `event_count` disagrees with
+    what we buffered. Every one of these means a commit group could contain part
+    of a Postgres transaction, so the applier refuses rather than guessing.
+    """
+
+
+class ResumePointDrift(RuntimeError):
+    """`offsets.dat` does not agree with the resume point we just committed.
+
+    ADR 0001 §4.3. Raised *after* the destination COMMIT, so the data is already
+    durable; the process exits non-zero and start-up reconciliation (§4.5)
+    repairs the file from `_cdc_flight.debezium_offsets`.
+    """
+
+
+class ReconciliationRefused(RuntimeError):
+    """Start-up reconciliation cannot establish a safe resume point.
+
+    ADR 0001 §4.5. The load-bearing case is *file present / table row missing*:
+    the file may be arbitrarily ahead of anything durable in the destination, so
+    trusting it is silent data loss.
+    """
+
+
+class SlotAheadOfDestination(RuntimeError):
+    """`slot.confirmed_flush_lsn > debezium_offsets.last_lsn` (ADR 0001 §4.7).
+
+    The Invariant-O guard. Under Invariant O this should be unfalsifiable; if it
+    ever fires, WAL that the destination never committed has already been
+    discarded by Postgres, and the only recovery is a re-snapshot (rubric 1.8).
+    """
+
+
+class LeaseLost(RuntimeError):
+    """Another runner owns `_cdc_flight.lease` for this pipeline (rubric 4.2)."""

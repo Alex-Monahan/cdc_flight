@@ -112,6 +112,40 @@ class RunConfig:
     )
 
 
+def _flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def applier_settings() -> dict:
+    """Trigger policy and containment switches for the transactional applier.
+
+    Defaults follow ADR 0001 §3.3. `CDC_OFFSET_FILE_REPAIR=0` is the one switch
+    an operator would not normally touch: it disables the `offsets.dat` rebuild
+    so the applier's idempotency fence carries correctness on its own. The suite
+    runs the crash scenario both ways on purpose - if correctness ever came to
+    depend on the repair, that would be an ordering argument, and ADR 0001 exists
+    because ordering arguments are not good enough.
+    """
+    return {
+        "commit_max_age": float(_env("CDC_COMMIT_MAX_AGE", "5")),
+        "commit_max_events": int(_env("CDC_COMMIT_MAX_EVENTS", "200000")),
+        "commit_max_bytes": int(_env("CDC_COMMIT_MAX_BYTES", str(256 * 1024 * 1024))),
+        "unit_spill_events": int(_env("CDC_UNIT_SPILL_EVENTS", "500000")),
+        "unit_spill_bytes": int(_env("CDC_UNIT_SPILL_BYTES", str(64 * 1024 * 1024))),
+        "snapshot_chunk_events": int(_env("CDC_SNAPSHOT_CHUNK_EVENTS", "50000")),
+        "snapshot_chunk_bytes": int(_env("CDC_SNAPSHOT_CHUNK_BYTES", str(64 * 1024 * 1024))),
+        "repair_offset_file": _flag("CDC_OFFSET_FILE_REPAIR", True),
+        "verify_offset_file": _flag("CDC_VERIFY_OFFSET_FILE", True),
+    }
+
+
+def lease_ttl_seconds() -> float:
+    return float(_env("CDC_LEASE_TTL", "60"))
+
+
 def motherduck_token() -> str | None:
     """MotherDuck accepts either spelling of the env var; prefer the lowercase one."""
     return os.environ.get("motherduck_token") or os.environ.get("MOTHERDUCK_TOKEN")

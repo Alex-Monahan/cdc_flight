@@ -38,10 +38,6 @@ pytestmark = [pytest.mark.motherduck, pytest.mark.e2e]
 MD_DATABASE = "cdc_flight_dev"
 N = 1500  # per table; 2 * N = 3000 events > max.batch.size (2048)
 
-TARGET = (
-    "rubric 1.3: whole-transaction commit groups need the custom MotherDuck "
-    "applier with BEGIN/COMMIT (ADR 0001 D1/D2)"
-)
 
 
 @pytest.fixture(scope="module")
@@ -151,24 +147,9 @@ def test_scenario_reached_motherduck(md_observed_txn):
     assert md_observed_txn["observations"], "the observer never sampled MotherDuck"
 
 
-def test_gap_a_torn_transaction_is_observable_in_motherduck(md_observed_txn):
-    """PIN OF TODAY'S BROKEN BEHAVIOUR - delete once the applier lands.
 
-    A reader on another MotherDuck connection saw a state in which part of one
-    Postgres transaction was visible and the rest was not.
-    """
-    n = md_observed_txn["n"]
-    torn = [pair for pair in md_observed_txn["observations"] if pair not in {(0, 0), (n, n)}]
-    assert torn, (
-        "no torn intermediate state was observed; either the observer was too slow "
-        "or atomicity has been fixed - update RUBRIC_STATUS. observations="
-        f"{md_observed_txn['observations'][:20]}"
-    )
-
-
-@pytest.mark.xfail(reason=TARGET, strict=True)
 def test_target_no_observer_ever_sees_a_partial_transaction(md_observed_txn):
-    """TARGET BEHAVIOUR - the actual proof of rubric 1.3.
+    """TARGET BEHAVIOUR (now met) - the actual proof of rubric 1.3.
 
     Every observation from an independent MotherDuck connection must be either
     "the transaction is not there yet" or "the whole transaction is there".
@@ -182,9 +163,8 @@ def test_target_no_observer_ever_sees_a_partial_transaction(md_observed_txn):
     )
 
 
-@pytest.mark.xfail(reason=TARGET, strict=True)
 def test_target_one_commit_group_per_pg_transaction_in_motherduck(md_observed_txn):
-    """TARGET BEHAVIOUR - and the metadata agrees with what the observer saw."""
+    """TARGET BEHAVIOUR (now met) - and the metadata agrees with what the observer saw."""
     con, dataset = md_observed_txn["con"], md_observed_txn["dataset"]
     commits = con.execute(
         f'SELECT DISTINCT cdcf_commit_id FROM "{dataset}"."cdcflight_app_customers" '

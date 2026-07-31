@@ -1,0 +1,303 @@
+"""Decode one Debezium `ChangeEvent` into a `PendingRecord` (ADR 0001 D5, §3.2).
+
+The baseline flattened every event with `ExtractNewRecordState` before it ever
+reached Python. ADR 0001 D5 drops that transform, so what arrives here is the
+**full Debezium envelope**:
+
+```json
+{"before": null,
+ "after":  {"id": 1, "name": "Ada", ...},
+ "source": {"schema": "app", "table": "customers", "lsn": 26289304,
+            "txId": 771, "ts_ms": 1..., "snapshot": "false", ...},
+ "transaction": {"id": "771", "total_order": 3, "data_collection_order": 3},
+ "op": "c", "ts_ms": 1...}
+```
+
+plus two *control* topics that the baseline deliberately threw away and the
+applier depends on:
+
+* `<prefix>.transaction` — `{"status": "BEGIN"|"END", "id": ..., "event_count":
+  ..., "data_collections": [...]}`. This is the only authoritative statement of
+  where a Postgres transaction ends (ADR 0001 §3.2).
+* `__debezium-heartbeat.<prefix>` — offset-bearing, data-free.
+
+Deviation from ADR 0001 §5, recorded in the ADR's amendment section: the
+envelope is consumed with `value.converter.schemas.enable=false`. The
+*envelope* (before/after/source/transaction/op) is what rubric 1.1/1.2/1.3
+need; the *Connect schema* is what rubric 2.4/2.6 need, and it lands with them,
+after §5.1's decode-throughput measurement.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from typing import Any
+
+#: `source.snapshot` values that mean "this record came out of a snapshot".
+#: Debezium serialises `SnapshotRecord` lowercased.
+SNAPSHOT_VALUES = frozenset(
+    {
+        "true",
+        "first",
+        "first_in_data_collection",
+        "last_in_data_collection",
+        "last",
+        "incremental",
+    }
+)
+#: `source.snapshot` values that close a table's snapshot.
+SNAPSHOT_TABLE_LAST = frozenset({"last_in_data_collection", "last"})
+#: `source.snapshot` value that closes the whole snapshot.
+SNAPSHOT_LAST = "last"
+
+KIND_DATA = "data"
+KIND_SNAPSHOT = "snapshot"
+KIND_TXN_BEGIN = "txn_begin"
+KIND_TXN_END = "txn_end"
+KIND_HEARTBEAT = "heartbeat"
+KIND_MESSAGE = "logical_message"
+KIND_SCHEMA_CHANGE = "schema_change"
+KIND_UNKNOWN = "unknown"
+
+
+@dataclass
+class PendingRecord:
+    """One decoded Debezium record, plus the Java object needed to acknowledge it."""
+
+    raw: Any
+    kind: str
+    topic: str
+    nbytes: int
+    op: str | None = None
+    schema: str | None = None
+    table: str | None = None
+    lsn: int | None = None
+    txn_id: str | None = None
+    total_order: int | None = None
+    data_collection_order: int | None = None
+    source_ts_ms: int | None = None
+    snapshot: str | None = None
+    key: dict[str, Any] | None = None
+    before: dict[str, Any] | None = None
+    after: dict[str, Any] | None = None
+    txn_status: str | None = None
+    txn_event_count: int | None = None
+    txn_data_collections: dict[str, int] = field(default_factory=dict)
+    source_partition: dict[str, Any] | None = None
+    source_offset: dict[str, Any] | None = None
+
+    @property
+    def is_data(self) -> bool:
+        return self.kind in (KIND_DATA, KIND_SNAPSHOT)
+
+    @property
+    def qualified_table(self) -> str | None:
+        if self.schema and self.table:
+            return f"{self.schema}.{self.table}"
+        return self.table
+
+
+def _java_map_to_dict(m: Any) -> dict[str, Any] | None:
+    """Convert a `java.util.Map` (source partition / offset) into plain Python.
+
+    Values are Long / Integer / String / Boolean; JPype hands them over as the
+    matching Python types already, but they are still Java objects, so they are
+    coerced explicitly - a `java.lang.Long` survives `json.dumps` only by
+    accident.
+    """
+    if m is None:
+        return None
+    out: dict[str, Any] = {}
+    try:
+        for entry in m.entrySet():
+            key = str(entry.getKey())
+            value = entry.getValue()
+            out[key] = _coerce(value)
+    except Exception:  # pragma: no cover - defensive around the JVM bridge
+        return None
+    return out
+
+
+#: Java classes we round-trip through JSON into Debezium's offset store.
+_JAVA_LONGS = frozenset({"java.lang.Long", "java.lang.Integer", "java.lang.Short"})
+_JAVA_FLOATS = frozenset({"java.lang.Double", "java.lang.Float"})
+
+
+def _coerce(value: Any) -> Any:
+    """Convert one Connect offset value, PRESERVING its Java type.
+
+    This is not cosmetic. The offset map is re-serialised into `offsets.dat` by
+    start-up reconciliation, and Debezium casts several fields by type:
+    `transaction_id` and `messageType` are `String`, `lsn`/`txId`/`ts_usec` are
+    `Long`, `snapshot_completed` is `Boolean`. Guessing "looks like a number ⇒
+    int" turns `transaction_id` into a Long and the connector dies on start-up
+    with `ClassCastException: java.lang.Long cannot be cast to java.lang.String`
+    (measured, 2026-07-30).
+    """
+    if value is None:
+        return None
+    try:
+        java_class = str(value.getClass().getName())
+    except (AttributeError, TypeError):
+        java_class = None
+    if java_class in _JAVA_LONGS:
+        return int(value)
+    if java_class in _JAVA_FLOATS:
+        return float(value)
+    if java_class == "java.lang.Boolean":
+        return bool(value)
+    if java_class == "java.lang.String":
+        return str(value)
+    # Plain Python values (unit tests) or an unfamiliar Java type: keep bools and
+    # numbers as they are, everything else as text.
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    return str(value)
+
+
+def offsets_of(raw: Any) -> tuple[dict | None, dict | None]:
+    """`(sourcePartition, sourceOffset)` of a Debezium `ChangeEvent`.
+
+    `EmbeddedEngineChangeEvent.sourceRecord()` is public and is retained by the
+    JSON-converting engine path
+    (`debezium-embedded/.../ConverterBuilder.java:133`), so the Connect offset
+    maps are reachable without a fork. They are what ADR 0001 §4.3 persists as
+    the resume point.
+    """
+    try:
+        record = raw.sourceRecord()
+    except Exception:  # pragma: no cover - a non-embedded event shape
+        return None, None
+    try:
+        return _java_map_to_dict(record.sourcePartition()), _java_map_to_dict(
+            record.sourceOffset()
+        )
+    except Exception:  # pragma: no cover
+        return None, None
+
+
+def decode(raw: Any, *, topic_prefix: str, want_offsets: bool = True) -> PendingRecord:
+    """Decode one `ChangeEvent`. Never raises for an unexpected payload shape."""
+    topic = str(raw.destination())
+    value = raw.value()
+    text = "" if value is None else str(value)
+    nbytes = len(text)
+
+    rec = PendingRecord(raw=raw, kind=KIND_UNKNOWN, topic=topic, nbytes=nbytes)
+    if want_offsets:
+        rec.source_partition, rec.source_offset = offsets_of(raw)
+
+    if topic.startswith("__debezium-heartbeat"):
+        rec.kind = KIND_HEARTBEAT
+        rec.lsn = _offset_lsn(rec.source_offset)
+        return rec
+
+    if not text.strip():
+        # A tombstone (key, null value). `tombstones.on.delete=false` should stop
+        # these, but a null payload must never become a data event.
+        rec.kind = KIND_UNKNOWN
+        rec.lsn = _offset_lsn(rec.source_offset)
+        return rec
+
+    payload = json.loads(text)
+    if not isinstance(payload, dict):  # pragma: no cover - defensive
+        rec.kind = KIND_UNKNOWN
+        return rec
+
+    if topic == f"{topic_prefix}.transaction":
+        status = str(payload.get("status") or "").upper()
+        rec.kind = KIND_TXN_BEGIN if status == "BEGIN" else KIND_TXN_END
+        rec.txn_status = status
+        rec.txn_id = _txn_id(payload.get("id"))
+        rec.txn_event_count = payload.get("event_count")
+        rec.source_ts_ms = payload.get("ts_ms")
+        for entry in payload.get("data_collections") or []:
+            if isinstance(entry, dict):
+                rec.txn_data_collections[str(entry.get("data_collection"))] = int(
+                    entry.get("event_count") or 0
+                )
+        rec.lsn = _offset_lsn(rec.source_offset)
+        return rec
+
+    source = payload.get("source") or {}
+    rec.op = payload.get("op")
+    rec.schema = source.get("schema")
+    rec.table = source.get("table")
+    rec.lsn = source.get("lsn") or _offset_lsn(rec.source_offset)
+    rec.source_ts_ms = source.get("ts_ms")
+    rec.snapshot = _as_str(source.get("snapshot"))
+    rec.before = payload.get("before")
+    rec.after = payload.get("after")
+
+    txn = payload.get("transaction")
+    if isinstance(txn, dict):
+        # MEASURED, 2026-07-30, Debezium 3.6.0.Final + pgoutput: the envelope's
+        # `transaction.id` is NOT a transaction identifier. It is
+        # `"<txId>:<lsn at the moment this struct was built>"`, so every event of
+        # one transaction carries a DIFFERENT id, and BEGIN's differs from END's:
+        #
+        #   BEGIN  {"id":"11115:937926432"}
+        #   data   {"id":"11115:937926432","total_order":1}
+        #   data   {"id":"11115:937926736","total_order":2}
+        #   END    {"id":"11115:937927152","event_count":3}
+        #
+        # ADR 0001 §3.2/§6 assumed it was stable. Taking it literally makes every
+        # multi-event transaction look like a `txId` change without an END - which
+        # is exactly the fatal error the assembler raises. The stable identifier is
+        # the prefix, which equals `source.txId`, and that is what is used.
+        rec.txn_id = _txn_id(txn.get("id"))
+        rec.total_order = txn.get("total_order")
+        rec.data_collection_order = txn.get("data_collection_order")
+    if source.get("txId") is not None:
+        rec.txn_id = _as_str(source.get("txId"))
+
+    key_text = raw.key()
+    if key_text is not None:
+        key_str = str(key_text).strip()
+        if key_str:
+            try:
+                parsed = json.loads(key_str)
+                rec.key = parsed if isinstance(parsed, dict) else None
+            except json.JSONDecodeError:  # pragma: no cover
+                rec.key = None
+
+    if rec.op == "m":
+        rec.kind = KIND_MESSAGE
+    elif rec.op is None and "ddl" in payload:
+        rec.kind = KIND_SCHEMA_CHANGE
+    elif rec.snapshot in SNAPSHOT_VALUES:
+        rec.kind = KIND_SNAPSHOT
+        # A snapshot record has no transaction metadata (its dispatch path never
+        # reaches `TransactionMonitor.dataEvent`, verified in
+        # `EventDispatcher.java:324` vs `dispatchSnapshotEvent`). Anything the
+        # `source` block happens to carry must not be mistaken for one, or the
+        # assembler would try to close a transaction that has no END.
+        rec.txn_id = None
+        rec.total_order = None
+    else:
+        rec.kind = KIND_DATA
+    return rec
+
+
+def _as_str(value: Any) -> str | None:
+    return None if value is None else str(value)
+
+
+def _txn_id(value: Any) -> str | None:
+    """The stable part of Debezium 3.6's `"<txId>:<lsn>"` transaction id."""
+    if value is None:
+        return None
+    return str(value).split(":", 1)[0]
+
+
+def _offset_lsn(offset: dict[str, Any] | None) -> int | None:
+    if not offset:
+        return None
+    for key in ("lsn", "lsn_proc", "lsn_commit"):
+        value = offset.get(key)
+        if isinstance(value, int):
+            return value
+    return None

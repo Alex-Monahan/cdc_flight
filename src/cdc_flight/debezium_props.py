@@ -115,24 +115,33 @@ def build_properties(
         "max.batch.size": str(max_batch_size),
         "max.queue.size": str(max_batch_size * 4),
         "poll.interval.ms": str(poll_interval_ms),
-        # --- payload shape ----------------------------------------------------
+        # --- payload shape (ADR 0001 D5) --------------------------------------
+        # `ExtractNewRecordState` is GONE. The applier consumes the full Debezium
+        # envelope, because the SMT discards - before Python ever sees it - the
+        # `before` image (1.2, 1.4, 2.6), the truncate/message operations (1.5,
+        # 7.4) and, decisively, the `transaction` block that ADR 0001 §3.2 and §6
+        # both depend on. Nothing downstream of here can recover those.
         "key.converter.schemas.enable": "false",
+        # DEVIATION from ADR 0001 §5, recorded in the ADR amendment: the Connect
+        # *schema* stays off for now. The applier needs the *envelope*; the schema
+        # is what rubric 2.4/2.6 need, and turning it on inflates every payload
+        # 3-5x, which §5.1 flags as an unmeasured throughput risk owned by 5.3.
         "value.converter.schemas.enable": "false",
         "topic.naming.strategy": "io.debezium.schema.DefaultTopicNamingStrategy",
-        # Flatten the Debezium envelope to the "after" image and carry the
-        # operation metadata as `__`-prefixed fields.
-        "transforms": "unwrap",
-        "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
-        "transforms.unwrap.add.fields": "op,table,schema,lsn,txId,source.ts_ms,ts_ms",
-        # DEVIATION: the blog keeps Debezium's default `__` prefix. dlt's snake_case
-        # naming convention strips leading underscores, which would land the
-        # metadata as bare `op` / `table` / `schema` - names that can collide with
-        # real source columns and are reserved words in SQL. An explicit `dbz_`
-        # prefix survives normalisation untouched.
-        "transforms.unwrap.add.fields.prefix": METADATA_PREFIX,
-        # DEVIATION: the blog uses `delete.handling.mode`, removed in Debezium 3.x.
-        # `rewrite` keeps deletes as rows carrying `__deleted=true`.
-        "transforms.unwrap.delete.tombstone.handling.mode": "rewrite",
+        # ADR 0001 §3.2: MANDATORY, not optional. Without it there is no `END`
+        # marker and therefore no way to prove a Postgres transaction whole, so
+        # the applier cannot form a commit group at all.
+        "provide.transaction.metadata": "true",
+        # A tombstone is a (key, null value) record; with the envelope there is
+        # nothing to gain from one and a null payload must never be mistaken for
+        # a data event.
+        "tombstones.on.delete": "false",
+        # p01 finding: with the default, a delete's `before` image is fabricated
+        # zeros and empty strings rather than the real NULLs.
+        "replace.null.with.default": "false",
+        # Postgres DDL events would arrive on the bare `<prefix>` topic and are
+        # rubric 2.x work; keep them off until there is code that handles them.
+        "include.schema.changes": "false",
         # --- resilience -------------------------------------------------------
         "errors.max.retries": "3",
         "errors.retry.delay.initial.ms": "300",

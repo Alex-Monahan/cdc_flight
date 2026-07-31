@@ -32,7 +32,8 @@ today keeps working after D5/D9/D1 land:
 Legacy aliases `before_load` / `after_load` map onto `pre_commit` /
 `post_commit_pre_ack` so existing scenarios keep working.
 
-`<nth>` is 1-based over the **data** batches this process handles. Batches that
+`<nth>` is 1-based over the **data-carrying commit groups** this process
+performs (for `decode`, over data-carrying Debezium batches). Batches that
 contain only internal/skipped records (Debezium heartbeats, transaction-metadata
 markers) are deliberately not counted: once `provide.transaction.metadata=true`
 and `heartbeat.interval.ms` land (ADR 0001 D5/D9), the first batch of a run is
@@ -62,7 +63,28 @@ log = logging.getLogger("cdc_flight.faults")
 ENV_VAR = "CDC_FAULT_INJECT"
 
 #: Protocol anchor points, in the order the applier reaches them.
-POINTS = ("pre_commit", "post_commit_pre_ack", "post_ack")
+#:
+#: `decode`, `begin`, `mid_apply` and `spill` were added with the transactional
+#: applier (Codex 9 carry-forward): before it, those code paths did not exist, so
+#: the three original anchors were the whole protocol. They now bracket every
+#: state the commit group passes through:
+#:
+#: * `decode`      - records decoded and assembled, no transaction open yet
+#: * `begin`       - `BEGIN TRANSACTION` issued, nothing applied
+#: * `spill`       - a unit's events staged into `_cdc_flight.spill_events`
+#: * `mid_apply`   - some tables written, others not, transaction still open
+#: * `pre_commit`  - everything (data + commit_log + resume point) written, not committed
+#: * `post_commit_pre_ack` - committed, Debezium NOT acknowledged
+#: * `post_ack`    - acknowledged, slot not confirmed (that is the next poll())
+POINTS = (
+    "decode",
+    "begin",
+    "spill",
+    "mid_apply",
+    "pre_commit",
+    "post_commit_pre_ack",
+    "post_ack",
+)
 
 #: Names kept working from the first fault-injection cut.
 ALIASES = {"before_load": "pre_commit", "after_load": "post_commit_pre_ack"}

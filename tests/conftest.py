@@ -222,6 +222,7 @@ def run_pipeline(cdc_env: dict[str, str]):
         extra_env: dict[str, str] | None = None,
         timeout: float = 300,
         expect_success: bool = True,
+        accept_orphan_offsets: bool = False,
     ) -> dict:
         return _invoke_pipeline(
             {**cdc_env, **(extra_env or {})},
@@ -233,6 +234,7 @@ def run_pipeline(cdc_env: dict[str, str]):
             snapshot_mode=snapshot_mode,
             timeout=timeout,
             expect_success=expect_success,
+            accept_orphan_offsets=accept_orphan_offsets,
         )
 
     return _run
@@ -249,6 +251,7 @@ def _invoke_pipeline(
     snapshot_mode: str | None = None,
     timeout: float = 300,
     expect_success: bool = True,
+    accept_orphan_offsets: bool = False,
 ) -> dict:
     """Run the `cdc-flight` CLI once and return its summary plus process outcome.
 
@@ -269,6 +272,8 @@ def _invoke_pipeline(
     ]
     if reset_state:
         cmd.append("--reset-state")
+    if accept_orphan_offsets:
+        cmd.append("--accept-orphan-offsets")
     if snapshot_mode:
         cmd += ["--snapshot-mode", snapshot_mode]
 
