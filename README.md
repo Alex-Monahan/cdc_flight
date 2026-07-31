@@ -184,7 +184,7 @@ Measured on an M-series Mac. Only executed runs are reported here; see
 
 | suite | result | wall clock | measured |
 |---|---|---|---|
-| `make test` (local only) | **245 passed, 0 xfail** | **338 s** (5:38) | 2026-07-31, after 1.4 + 1.5 |
+| `make test` (local only) | **246 passed, 0 xfail** | **337 s** (5:37) | 2026-07-31, after 1.4 + 1.5 |
 | `make test-slow` | **20 passed** | **268 s** (4:28) | 2026-07-31, after 1.4 + 1.5 |
 | `make test-md` | **17 passed** | **221 s** (3:41) | 2026-07-31, after 1.4 + 1.5 |
 | `make test` (local only) | 168 passed | 283 s (4:43) | 2026-07-31, after the 1.1-1.3 review round |
@@ -192,8 +192,8 @@ Measured on an M-series Mac. Only executed runs are reported here; see
 | `make test-md` | 12 passed | 155 s (2:34) | 2026-07-31, after the 1.1-1.3 review round |
 
 The xfail count is zero because every target test passes; the gap pins they superseded
-were deleted, as each suite's README said they should be. 1.4 and 1.5 added 77 default
-tests for +55 s, because all but two of their modules are in-process (`applier_lab`) or
+were deleted, as each suite's README said they should be. 1.4 and 1.5 added 78 default
+tests for +54 s, because all but two of their modules are in-process (`applier_lab`) or
 share one scenario per module.
 
 The default suite grew from 110 tests to 168 and got *faster*, which is worth
