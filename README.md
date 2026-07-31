@@ -150,9 +150,9 @@ Measured on an M-series Mac. Only executed runs are reported here; see
 
 | suite | result | wall clock | measured |
 |---|---|---|---|
-| `make test` (local only) | see `RUBRIC_STATUS.md` for the current run | | |
-| `make test-md` | 2 passed | ~35 s | 2026-07-30 |
-| `make test-slow` | see `RUBRIC_STATUS.md` | | |
+| `make test` (local only) | 49 passed + 12 xfail | **290 s** | 2026-07-30 |
+| `make test-md` | 2 passed (+ 4 xfail after 1.3 landed) | ~35 s | 2026-07-30 (2 passed); the 1.3 MotherDuck variant is newer |
+| `make test-slow` | 3 passed | **219 s** | 2026-07-30 |
 
 Budget is 10 minutes for the default suite. The dominant cost is JVM startup plus the
 Debezium idle tail per pipeline invocation, so the suite is optimised by *sharing
