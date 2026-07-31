@@ -173,8 +173,8 @@ Measured on an M-series Mac. Only executed runs are reported here; see
 
 | suite | result | wall clock | measured |
 |---|---|---|---|
-| `make test` (local only) | **106 passed, 0 xfail** | **422 s** (7:01) | 2026-07-30, after the applier |
-| `make test-md` | **5 passed** | **97 s** | 2026-07-30, after the applier |
+| `make test` (local only) | **109 passed, 0 xfail** | **416 s** (6:55) | 2026-07-31, after the applier |
+| `make test-md` | **5 passed** | **94 s** | 2026-07-31, after the applier |
 | `make test-slow` | **3 passed** | **136 s** | 2026-07-31, after the applier |
 
 The xfail count is now zero because the 1.1/1.2/1.3 target tests pass; the gap pins they
