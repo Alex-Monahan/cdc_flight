@@ -16,6 +16,31 @@ UNAVAILABLE_VALUE_PLACEHOLDER = "__debezium_unavailable_value"
 # Prefix applied to the CDC metadata fields injected by ExtractNewRecordState.
 METADATA_PREFIX = "dbz_"
 
+# Flush on every `markBatchFinished()` rather than on a timer, so that a flush
+# that did not happen is a detectable event (see `cdc_flight.consumer`).
+#
+# MEASURED: `offset.commit.policy=…$AlwaysCommitOffsetPolicy` does NOT work -
+# Debezium instantiates the policy reflectively and requires a
+# `<init>(java.util.Properties)` constructor, which that class does not have
+# (`NoSuchMethodException`, reproduced 2026-07-30). The default
+# `PeriodicCommitOffsetPolicy` with a **zero** interval is equivalent:
+# `performCommit()` is `timeSinceLastCommit >= Duration.ZERO`, which is always
+# true (`repos/debezium/debezium-api/.../spi/OffsetCommitPolicy.java:36-53`).
+OFFSET_FLUSH_INTERVAL_MS_ALWAYS = "0"
+
+
+def internal_topic_prefixes(topic_prefix: str) -> tuple[str, ...]:
+    """Topics that must never become destination tables.
+
+    Debezium's own topics are `__debezium-heartbeat.<prefix>` and, once
+    `provide.transaction.metadata=true` lands, `<prefix>.transaction`. The
+    previous literal `("__debezium", "__cdcflight")` could never match the second
+    one - `topic.prefix` is `cdcflight`, so the transaction topic is
+    `cdcflight.transaction`, and it would have been materialised as a data table
+    (Opus m1). Derive it from the configured prefix instead.
+    """
+    return ("__debezium", f"{topic_prefix}.transaction", f"{topic_prefix}.heartbeat")
+
 # Metadata columns as they appear in the destination (after dlt normalisation).
 METADATA_COLUMNS = (
     "dbz_op",
@@ -74,7 +99,18 @@ def build_properties(
         # which is what breaks exactly-once - see research/NOTES.md).
         "offset.storage": "org.apache.kafka.connect.storage.FileOffsetBackingStore",
         "offset.storage.file.filename": replication.offset_file.as_posix(),
-        "offset.flush.interval.ms": "1000",
+        # ADR 0001 §4.10: every `markBatchFinished()` must actually attempt a
+        # flush, otherwise "the offset advanced" is unobservable and
+        # `cdc_flight.consumer.OffsetFlushVerifier` cannot tell a policy no-op
+        # from Debezium swallowing a flush failure (Opus B2).
+        "offset.flush.interval.ms": OFFSET_FLUSH_INTERVAL_MS_ALWAYS,
+        # ADR 0001 §4.10 / Opus m10: `stopSourceTasks()` waits only
+        # `task.management.timeout.ms` before `taskService.shutdownNow()`
+        # (`AsyncEngineConfig.java:25,76-80`), so a flush timeout larger than it
+        # would be hard-killed mid-write during shutdown. Keep the pair aligned,
+        # with task management the larger of the two.
+        "offset.flush.timeout.ms": "5000",
+        "task.management.timeout.ms": "30000",
         # --- batching / latency ----------------------------------------------
         "max.batch.size": str(max_batch_size),
         "max.queue.size": str(max_batch_size * 4),

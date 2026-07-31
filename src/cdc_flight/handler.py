@@ -73,6 +73,12 @@ class DltChangeHandler(BasePythonChangeHandler):
         self._in_flight = 0
         self.record_count = 0
         self.batch_count = 0
+        # Fault points are indexed on batches that carry DATA, not on every
+        # callback. Once `provide.transaction.metadata=true` and
+        # `heartbeat.interval.ms` land (ADR 0001 D5/D9) the first batch of a run
+        # is frequently metadata-only; counting it would move every fault point
+        # by one and silently disarm the whole 1.1/1.2 suite (Opus M7).
+        self.data_batch_count = 0
         self.skipped_count = 0
         self.table_counts: dict[str, int] = {}
         self.last_batch_at: float = time.monotonic()
@@ -106,24 +112,27 @@ class DltChangeHandler(BasePythonChangeHandler):
             grouped.setdefault(resolve_table_name(topic, payload), []).append(payload)
 
         n = sum(len(v) for v in grouped.values())
-        nth = self.batch_count + 1
         if grouped:
+            with self._lock:
+                self.data_batch_count += 1
+                nth = self.data_batch_count
             log.info(
                 "loading batch: %s records across %s tables (%s)",
                 n,
                 len(grouped),
                 ", ".join(f"{k}={len(v)}" for k, v in sorted(grouped.items())),
             )
-            maybe_crash("before_load", nth)
+            # `pre_commit`: decoded, destination transaction not yet committed.
+            maybe_crash("pre_commit", nth)
             try:
                 self.dlt_pipeline.run(debezium_source_events(grouped))
             except BaseException as exc:  # surfaced to the caller by the engine
                 self.error = exc
                 raise
-            # The at-least-once window: rows are committed at the destination,
-            # the Debezium offset is not yet flushed. Inert unless a test asks
-            # for it (see cdc_flight.faults).
-            maybe_crash("after_load", nth)
+            # `post_commit_pre_ack`: rows are committed at the destination, the
+            # Debezium offset is not yet flushed. This is the at-least-once
+            # window. Inert unless a test asks for it (see cdc_flight.faults).
+            maybe_crash("post_commit_pre_ack", nth)
 
         with self._lock:
             self.record_count += n

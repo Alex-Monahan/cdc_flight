@@ -96,6 +96,14 @@ class RunConfig:
     max_seconds: float = field(default_factory=lambda: float(_env("CDC_MAX_SECONDS", "90")))
     idle_seconds: float = field(default_factory=lambda: float(_env("CDC_IDLE_SECONDS", "8")))
     min_records: int = field(default_factory=lambda: int(_env("CDC_MIN_RECORDS", "0")))
+    #: How far the slot's `confirmed_flush_lsn` may trail `pg_current_wal_lsn()`
+    #: and still allow the supervisor to call a quiet stream "idle". A quiet
+    #: stream with a large backlog means the connector is not streaming - most
+    #: often Debezium's 10 s retriable-restart backoff, which is longer than the
+    #: 8 s idle window (ADR 0001 §9.1, review finding Opus B5).
+    idle_max_lag_bytes: int = field(
+        default_factory=lambda: int(_env("CDC_IDLE_MAX_LAG_BYTES", str(64 * 1024)))
+    )
 
 
 def motherduck_token() -> str | None:

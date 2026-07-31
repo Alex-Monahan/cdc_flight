@@ -35,16 +35,16 @@ from .config import (
     SourceConfig,
     motherduck_token,
 )
-from .debezium_props import build_properties
+from .debezium_props import build_properties, internal_topic_prefixes
 from .errors import EngineFailure
+from .faults import validate_env as validate_fault_env
 from .handler import DltChangeHandler
+from .source_health import SourceHealth
 
 if TYPE_CHECKING:  # `engine` imports pydbzengine, which boots a JVM on import.
     from .engine import SupervisedDebeziumEngine
 
 log = logging.getLogger("cdc_flight.pipeline")
-
-INTERNAL_TOPIC_PREFIXES = ("__debezium", "__cdcflight")
 
 
 # --------------------------------------------------------------------------- #
@@ -95,18 +95,27 @@ def build_dlt_pipeline(dest: DestinationConfig) -> dlt.Pipeline:
 # bounded engine runner
 # --------------------------------------------------------------------------- #
 def run_engine_bounded(
-    engine: SupervisedDebeziumEngine, handler: DltChangeHandler, run: RunConfig
+    engine: SupervisedDebeziumEngine,
+    handler: DltChangeHandler,
+    run: RunConfig,
+    health: SourceHealth | None = None,
+    *,
+    engine_terminates_normally: bool = False,
 ) -> dict:
-    """Run the Debezium engine until it goes idle, or the deadline is hit.
+    """Run the Debezium engine until the *source* agrees it is idle, or the deadline hits.
 
-    Three independent things can go wrong, and all three must reach the caller:
+    Four independent things can go wrong, and all four must reach the caller:
 
     * `engine.run()` raises on this process's engine thread (rare);
     * the handler's dlt load raises (captured by `handler.error`);
     * the *engine itself* fails - a connector that cannot start, or a streaming
       error. Debezium reports that through its `CompletionCallback` and returns
       normally, so it is only visible via `SupervisedDebeziumEngine.failure`.
-      Missing this third case is what made every §4 failure mode exit 0.
+      Missing this case is what made every rubric-§4 failure mode exit 0;
+    * the connector stops streaming *without failing* - a retriable exception
+      puts it into a restart backoff that is longer than our idle window, so an
+      idle timer alone reports success on a partial delivery (Opus B5). `health`
+      corroborates "quiet" against `pg_replication_slots`.
     """
     started = time.monotonic()
     error_box: list[BaseException] = []
@@ -121,6 +130,7 @@ def run_engine_bounded(
     thread.start()
 
     stop_reason = "max_seconds"
+    idle_blocked_by_source = 0
     try:
         while thread.is_alive():
             elapsed = time.monotonic() - started
@@ -137,14 +147,28 @@ def run_engine_bounded(
             # engine mid-batch interrupts the record committer).
             warmed_up = elapsed >= min(run.idle_seconds, 5.0)
             if enough and quiet and warmed_up and not handler.busy:
-                stop_reason = "idle"
-                break
+                if health is None or health.may_declare_idle(min_seconds=run.idle_seconds):
+                    stop_reason = "idle"
+                    break
+                # The stream is quiet but the source says the connector is not
+                # streaming (or is far behind): keep waiting rather than
+                # reporting a partial delivery as a success.
+                idle_blocked_by_source += 1
+                if idle_blocked_by_source % 20 == 1:
+                    log.warning(
+                        "stream quiet for %.1fs but the source disagrees it is idle: %s",
+                        handler.seconds_since_last_batch,
+                        health.summary(),
+                    )
             time.sleep(0.25)
         else:
             stop_reason = "engine_finished"
     finally:
-        log.info("closing debezium engine (reason=%s)", stop_reason)
-        engine.close()
+        # Only an *intentional* stop may arm the shutdown-noise filter, or a real
+        # failure racing the close gets discarded as noise (Opus M1).
+        intentional = stop_reason != "engine_error" and handler.error is None and not error_box
+        log.info("closing debezium engine (reason=%s, intentional=%s)", stop_reason, intentional)
+        engine.close(intentional=intentional)
         thread.join(timeout=60)
         if thread.is_alive():
             log.error("debezium engine thread did not stop within 60s")
@@ -155,9 +179,16 @@ def run_engine_bounded(
         "elapsed_sec": round(time.monotonic() - started, 2),
         "records": handler.record_count,
         "batches": handler.batch_count,
+        "data_batches": handler.data_batch_count,
         "skipped": handler.skipped_count,
         "tables": handler.snapshot_counts(),
+        "offset_flushes_verified": engine.offset_flushes_verified,
     }
+    if health is not None:
+        summary.update(health.summary())
+    if engine.suppressed_message:
+        # Never let a suppressed failure be invisible to an operator (Opus M1).
+        summary["suppressed_engine_message"] = engine.suppressed_message
 
     failure = engine.failure
     if error_box or handler.error is not None or failure is not None:
@@ -170,6 +201,31 @@ def run_engine_bounded(
     # (rubric 4.5 - a hang that exits 0 is invisible to any scheduler).
     if stop_reason == "hung":
         raise EngineFailure("debezium engine thread did not stop within 60s", summary)
+
+    # The engine thread returned on its own, before the supervisor asked for a
+    # stop. For a *streaming* mode that is engine death, even when Debezium
+    # invoked its completion callback with success=true (a swallowed
+    # StopEngineException looks exactly like this). Only a snapshot mode that is
+    # designed to terminate may end this way (Codex 10).
+    if stop_reason == "engine_finished" and not engine_terminates_normally:
+        raise EngineFailure(
+            "the Debezium engine terminated before the supervisor requested a stop "
+            f"(completion success={engine.completed_success}); in streaming mode "
+            "that is engine death, not a clean finish",
+            summary,
+        )
+
+    # Stopping on the deadline while the connector is not attached to its slot is
+    # engine death wearing a bounded-run costume: report it, do not claim ok.
+    if health is not None and stop_reason == "max_seconds":
+        not_streaming_for = health.not_streaming_for
+        if not_streaming_for >= run.idle_seconds:
+            raise EngineFailure(
+                "reached --max-seconds while the connector was not streaming for "
+                f"{not_streaming_for:.1f}s ({health.summary()}); the delivery is "
+                "incomplete, so this run is not a success",
+                summary,
+            )
 
     summary["ok"] = True
     return summary
@@ -187,6 +243,12 @@ def run(
     snapshot_mode: str | None = None,
     reset_state: bool = False,
 ) -> dict:
+    # Parse CDC_FAULT_INJECT once, here, so a typo fails the run instead of
+    # leaving a fault test vacuously green (Codex 9).
+    fault_spec = validate_fault_env()
+    if fault_spec:
+        log.warning("fault injection armed: point=%s data_batch=%s action=%s", *fault_spec)
+
     source = SourceConfig()
     replication = ReplicationConfig()
     dest = DestinationConfig(**({"kind": destination} if destination else {}))
@@ -223,8 +285,21 @@ def run(
     from .engine import SupervisedDebeziumEngine
 
     dlt_pipeline = build_dlt_pipeline(dest)
-    handler = DltChangeHandler(dlt_pipeline, internal_topic_prefixes=INTERNAL_TOPIC_PREFIXES)
-    engine = SupervisedDebeziumEngine(properties=props, handler=handler)
+    handler = DltChangeHandler(
+        dlt_pipeline,
+        internal_topic_prefixes=internal_topic_prefixes(replication.topic_prefix),
+    )
+    engine = SupervisedDebeziumEngine(
+        properties=props,
+        handler=handler,
+        offset_file=replication.offset_file,
+        always_commit_offsets=props.get("offset.flush.interval.ms") == "0",
+    )
+    health = SourceHealth(
+        dsn=source.dsn,
+        slot_name=replication.slot_name,
+        max_lag_bytes=run_cfg.idle_max_lag_bytes,
+    ).start()
 
     def _decorate(result: dict) -> dict:
         result["destination"] = dest.kind
@@ -235,11 +310,24 @@ def run(
             result["motherduck_database"] = dest.motherduck_database
         return result
 
+    # The only snapshot modes that are *supposed* to end the engine on their own.
+    terminating_modes = {"initial_only", "recovery_only"}
+
     try:
-        return _decorate(run_engine_bounded(engine, handler, run_cfg))
+        return _decorate(
+            run_engine_bounded(
+                engine,
+                handler,
+                run_cfg,
+                health,
+                engine_terminates_normally=props["snapshot.mode"] in terminating_modes,
+            )
+        )
     except EngineFailure as failure:
         _decorate(failure.summary)
         raise
+    finally:
+        health.stop()
 
 
 def shutdown_and_exit(code: int = 0, timeout: float = 15.0) -> None:
@@ -298,7 +386,11 @@ def main(argv: list[str] | None = None) -> int:
             snapshot_mode=args.snapshot_mode,
             reset_state=args.reset_state,
         )
-    except Exception as exc:
+    # `BaseException`, not `Exception`: Ctrl-C must still reach
+    # `shutdown_and_exit()`, because Debezium leaves non-daemon JVM threads
+    # behind and a bare `raise` would hang the interpreter forever - a rubric-4.5
+    # regression hiding in the error path (Opus m3).
+    except BaseException as exc:
         log.exception("pipeline run failed")
         # A failed run still owes the operator (and rubric 6.1/6.2) a
         # machine-readable summary saying *why* it failed.

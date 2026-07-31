@@ -22,10 +22,13 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from functools import cached_property
+from pathlib import Path
 
 from pydbzengine import BasePythonChangeHandler, DebeziumJsonEngine
 
+from .consumer import OffsetFlushVerifier, verifying_consumer_class
 from .errors import EngineFailure
 
 __all__ = ["EngineFailure", "SupervisedDebeziumEngine"]
@@ -34,7 +37,9 @@ log = logging.getLogger("cdc_flight.engine")
 
 # Debezium reports a graceful stop as a *failure* in some shutdown races (the
 # polling thread is interrupted while we are closing the engine). Those are not
-# real failures, so they are filtered out when we asked for the stop ourselves.
+# real failures - but ONLY when the stop was ours *and* deliberate. See
+# `close(intentional=...)` below for why the previous, always-armed version of
+# this filter was unsafe (review finding Opus M1).
 _SHUTDOWN_NOISE = (
     "interrupted",
     "interruptedexception",
@@ -42,6 +47,11 @@ _SHUTDOWN_NOISE = (
     "engine has been already shut down",
     "connector has been stopped",
 )
+
+#: How long after an intentional `close()` a shutdown-noise failure is still
+#: attributable to that close. Debezium's teardown is bounded by
+#: `task.management.timeout.ms`, so anything later is a real failure.
+SHUTDOWN_NOISE_WINDOW_SEC = 60.0
 
 
 def _describe(message: str | None, error) -> str:
@@ -91,26 +101,55 @@ def _completion_callback_class():
 class SupervisedDebeziumEngine(DebeziumJsonEngine):
     """`DebeziumJsonEngine` whose completion status is visible to Python."""
 
-    def __init__(self, properties, handler: BasePythonChangeHandler):
+    def __init__(
+        self,
+        properties,
+        handler: BasePythonChangeHandler,
+        *,
+        offset_file: Path | str | None = None,
+        always_commit_offsets: bool = False,
+    ):
         super().__init__(properties, handler)
         self._lock = threading.Lock()
         self._completed = False
+        self._completed_success: bool | None = None
         self._failure: str | None = None
-        self._stop_requested = False
+        self._suppressed: str | None = None
+        # The shutdown-noise filter is DISARMED until an intentional close asks
+        # for it. Previously `_stop_requested` was set by every `close()`, and
+        # `close()` runs in a `finally` on every run - so the filter was always
+        # armed and degenerated into "drop any failure whose text contains
+        # 'interrupted'". That is exactly how a handler error propagates
+        # (`pydbzengine/_jvm.py` interrupts the engine thread), so real failures
+        # could be discarded (Opus M1).
+        self._noise_filter_armed_at: float | None = None
+        self._offset_file = Path(offset_file) if offset_file else None
+        self._always_commit_offsets = always_commit_offsets
+        self._verifier: OffsetFlushVerifier | None = None
 
     # -- completion bookkeeping --------------------------------------------- #
     def _on_completion(self, success: bool, message, error) -> None:
         detail = _describe(message, error)
         with self._lock:
             self._completed = True
+            self._completed_success = bool(success)
             if success:
                 log.info("debezium engine completed: %s", detail)
                 return
-            if self._stop_requested and self._is_shutdown_noise(detail):
-                log.info("debezium engine stopped during shutdown: %s", detail)
+            if self._noise_armed_locked() and self._is_shutdown_noise(detail):
+                # Never silently: an operator with a wedged pipeline needs to see
+                # what we decided to ignore, so it also lands in the run summary.
+                self._suppressed = detail
+                log.info("debezium engine stopped during intentional shutdown: %s", detail)
                 return
             self._failure = detail
         log.error("debezium engine failed: %s", detail)
+
+    def _noise_armed_locked(self) -> bool:
+        armed_at = self._noise_filter_armed_at
+        if armed_at is None:
+            return False
+        return (time.monotonic() - armed_at) <= SHUTDOWN_NOISE_WINDOW_SEC
 
     @staticmethod
     def _is_shutdown_noise(detail: str) -> bool:
@@ -124,11 +163,44 @@ class SupervisedDebeziumEngine(DebeziumJsonEngine):
             return self._failure
 
     @property
+    def suppressed_message(self) -> str | None:
+        """A failure that was attributed to an intentional shutdown."""
+        with self._lock:
+            return self._suppressed
+
+    @property
     def completed(self) -> bool:
         with self._lock:
             return self._completed
 
+    @property
+    def completed_success(self) -> bool | None:
+        """Debezium's own verdict, or None if the engine never completed."""
+        with self._lock:
+            return self._completed_success
+
+    @property
+    def offset_flushes_verified(self) -> int:
+        return self._verifier.flushes_verified if self._verifier else 0
+
     # -- engine construction ------------------------------------------------ #
+    @cached_property
+    def consumer(self):
+        """Our own `ChangeConsumer`, so a silently-failed offset flush is fatal.
+
+        pydbzengine's consumer calls `markProcessed`/`markBatchFinished` for us
+        and drops the outcome on the floor; ADR 0001 §3.7 replaces it. Doing it
+        here (rather than inside the applier task) means the check is already in
+        place when the applier starts relying on it.
+        """
+        consumer = verifying_consumer_class()()
+        if self._offset_file is not None:
+            self._verifier = OffsetFlushVerifier(
+                self._offset_file, always_commit=self._always_commit_offsets
+            )
+            consumer.verifier = self._verifier
+        return consumer
+
     @cached_property
     def engine(self):
         from pydbzengine._jvm import DebeziumEngine, EngineFormat, Properties
@@ -153,7 +225,20 @@ class SupervisedDebeziumEngine(DebeziumJsonEngine):
             .build()
         )
 
-    def close(self) -> None:
-        with self._lock:
-            self._stop_requested = True
+    def close(self, *, intentional: bool = True) -> None:
+        """Stop the engine.
+
+        `intentional=False` says "we are closing *because* something already went
+        wrong". The shutdown-noise filter stays disarmed in that case, so the
+        interrupt Debezium reports cannot swallow the real cause.
+        """
+        if intentional:
+            with self._lock:
+                self._noise_filter_armed_at = time.monotonic()
+        # `DebeziumJsonEngine.close()` does `if self.engine:`, which *constructs*
+        # an engine through the cached_property when one was never started (Opus
+        # m4). Guard it: closing something that does not exist should be free.
+        if "engine" not in self.__dict__:
+            log.debug("close() called on an engine that was never built; nothing to do")
+            return
         super().close()
