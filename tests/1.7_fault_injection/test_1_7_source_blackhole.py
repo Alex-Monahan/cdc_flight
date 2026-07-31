@@ -129,9 +129,19 @@ def test_a_blackholed_source_never_reports_ok(tmp_path, postgres_cluster, relay)
         "CDC_SOURCE_DARK_SECONDS is 45 s; anything near --max-seconds=70 would mean the "
         "deadline ended this run rather than the detector"
     )
-    # The engine cannot be closed cleanly against a dead socket, and that is expected -
-    # what must not happen is the shutdown symptom replacing the diagnosis.
-    assert summary.get("close_hung") is True, summary
+    # The engine usually cannot be closed cleanly against a dead socket, and that is
+    # expected — but whether the JVM happens to finish `close()` inside
+    # `--close-timeout` is a race, not a correctness property, and this assertion was
+    # recorded flaking while every correctness assertion passed (Codex r1 MINOR-4).
+    #
+    # The contract is: a non-zero exit, `source_dark` by name, a bounded detection time,
+    # and NO downgrade of the diagnosis to the shutdown symptom. That last part is what
+    # A49 is about, and it is the only thing `close_hung` is evidence for here.
+    if summary.get("close_hung"):
+        assert summary.get("stop_reason") == "source_dark", (
+            "engine.close() hung AND the run reported the hang: the symptom replaced "
+            f"the diagnosis, which is exactly A49 ({summary})"
+        )
 
 
 def _drop(dsn: str, slot: str) -> None:

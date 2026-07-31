@@ -2673,7 +2673,8 @@ var" with "the slot was externally advanced", and the rubric's band is a *count*
 
 #### A51.1 — the transition tables (generated from `cdc_flight.machines`)
 
-**`table_lifecycle`** — Does this destination table hold a trustworthy image of its source relation, and if not, who owes the work?  
+**`table_lifecycle`** — Does this destination table hold a trustworthy image of its source relation, and if not, who owes the work?
+
 persistence: `_cdc_flight.table_state.snapshot_state` · initial: `absent` · terminal: `absent`, `complete`
 
 | from | to | terminal |
@@ -2700,7 +2701,8 @@ persistence: `_cdc_flight.table_state.snapshot_state` · initial: `absent` · te
 | `none` | `in_progress` | no |
 | `none` | `none` | no |
 
-**`run_phase`** — Where is this run right now, readable from the destination while it runs?  
+**`run_phase`** — Where is this run right now, readable from the destination while it runs?
+
 persistence: `_cdc_flight.heartbeat.phase` · initial: `starting` · terminal: `failed`, `stopped`
 
 | from | to | terminal |
@@ -2729,29 +2731,34 @@ persistence: `_cdc_flight.heartbeat.phase` · initial: `starting` · terminal: `
 | `streaming` | `failed` | yes |
 | `streaming` | `stopping` | no |
 
-**`run_outcome`** — Why did this run stop? Cause before symptom, by construction.  
+**`run_outcome`** — Why did this run stop? Cause before symptom, by construction.
+
 persistence: `_cdc_flight.heartbeat.terminal_reason (also last_run.json stop_reason)` · initial: `max_seconds` · terminal: (none)
 
 | from | to | terminal |
 |---|---|---|
 | `catalog_unresolved` | `engine_error` | no |
 | `catalog_unresolved` | `error` | no |
+| `catalog_unresolved` | `recovery_uncleared` | no |
 | `catalog_unresolved` | `source_dark` | no |
 | `engine_error` | `error` | no |
 | `engine_finished` | `catalog_unresolved` | no |
 | `engine_finished` | `engine_error` | no |
 | `engine_finished` | `error` | no |
 | `engine_finished` | `hung` | no |
+| `engine_finished` | `recovery_uncleared` | no |
 | `engine_finished` | `source_dark` | no |
 | `hung` | `catalog_unresolved` | no |
 | `hung` | `engine_error` | no |
 | `hung` | `error` | no |
+| `hung` | `recovery_uncleared` | no |
 | `hung` | `source_dark` | no |
 | `idle` | `catalog_unresolved` | no |
 | `idle` | `engine_error` | no |
 | `idle` | `engine_finished` | no |
 | `idle` | `error` | no |
 | `idle` | `hung` | no |
+| `idle` | `recovery_uncleared` | no |
 | `idle` | `source_dark` | no |
 | `idle` | `work_done` | no |
 | `max_seconds` | `catalog_unresolved` | no |
@@ -2760,8 +2767,12 @@ persistence: `_cdc_flight.heartbeat.terminal_reason (also last_run.json stop_rea
 | `max_seconds` | `error` | no |
 | `max_seconds` | `hung` | no |
 | `max_seconds` | `idle` | no |
+| `max_seconds` | `recovery_uncleared` | no |
 | `max_seconds` | `source_dark` | no |
 | `max_seconds` | `work_done` | no |
+| `recovery_uncleared` | `engine_error` | no |
+| `recovery_uncleared` | `error` | no |
+| `recovery_uncleared` | `source_dark` | no |
 | `source_dark` | `engine_error` | no |
 | `source_dark` | `error` | no |
 | `work_done` | `catalog_unresolved` | no |
@@ -2769,9 +2780,11 @@ persistence: `_cdc_flight.heartbeat.terminal_reason (also last_run.json stop_rea
 | `work_done` | `engine_finished` | no |
 | `work_done` | `error` | no |
 | `work_done` | `hung` | no |
+| `work_done` | `recovery_uncleared` | no |
 | `work_done` | `source_dark` | no |
 
-**`acquisition_recovery`** — What has this destructive recovery already done, if the process died mid-way?  
+**`acquisition_recovery`** — What has this destructive recovery already done, if the process died mid-way?
+
 persistence: `_cdc_flight.recovery_state.phase` · initial: `absent` · terminal: `absent`
 
 | from | to | terminal |
@@ -2786,7 +2799,8 @@ persistence: `_cdc_flight.recovery_state.phase` · initial: `absent` · terminal
 | `resume_point_deleted` | `armed` | no |
 | `resume_point_deleted` | `requested` | no |
 
-**`catalog_change`** — Where in the observe -> confirm -> fence -> apply pipeline is one DDL fact about one relation? Memory only: a lost pending change is re-detected, which is correct, so persisting it would buy nothing.  
+**`catalog_change`** — Where in the observe -> confirm -> fence -> apply pipeline is one DDL fact about one relation? Memory only: a lost pending change is re-detected, which is correct, so persisting it would buy nothing.
+
 persistence: **memory only** · initial: `observed` · terminal: `applied`, `superseded`
 
 | from | to | terminal |
@@ -2880,17 +2894,18 @@ persistence: **memory only** · initial: `observed` · terminal: `applied`, `sup
 | 48 | — | `source.snapshot='incremental'` record reaches the assembler | `TransactionAssemblyError` | run fails and repeats; rubric 3.3 owns the mechanism | nothing partial swapped | **UNDEFINED** |
 | 49 | — | a captured table's topic collides with a Debezium internal topic | `assert_no_internal_topic_collision` at start-up | refuses | n/a — a human chose the names | **MANUAL** (correctly) |
 | 50 | source_health (domain) | the source is dark from the FIRST sample and never answers | `SourceHealth.ever_sampled` is false | the run falls back to timer-only idle and can report success on a partial delivery | n/a (memory) | **UNDEFINED** — **fail-open**, see the note below |
-| 51 | — | an **undeclared state transition** is attempted in any machine | `Machine.check(from, to)` at the one writer of that state | refused; the previous (more conservative) state is kept and a `critical` alert is raised on the independent connection; the run fails loudly | nothing wrong is written, so there is no cut | **MANUAL** (new at rev 9 — it means a defect in the Flight, and only a code change fixes it. It replaces a SILENT wrong state, which is strictly safer and strictly worse for this count.) |
+| 51 | — | an **undeclared state transition** is attempted in a DURABLE machine (`table_lifecycle`, `run_phase`, `acquisition_recovery`) | `Machine.check(from, to)` at the one writer of that state | refused; the previous (more conservative) state is kept, a `critical` alert is raised on the independent connection, and the exception propagates: the run fails | nothing wrong is written, so there is no cut | **MANUAL** (rev 9 — it means a defect in the Flight, and only a code change fixes it. It replaces a SILENT wrong state, which is strictly safer and strictly worse for this count.) |
+| 51a | — | an undeclared transition in the MEMORY-ONLY catalog machine, on the polling thread | `CatalogChange.to()` raises; `CatalogWatcher.poll_quietly` records it in `machine_error` rather than in the transient `last_error` | the poll returns nothing, the destructive action is not applied, and `run_engine_bounded` raises `EngineFailure` at shutdown: **the run is not successful** | the polling thread owns no destination state, so nothing is half-written | **MANUAL** (rev 10 — corrected. Rev 9's row 51 promised a loud failure for *any* machine; the polling thread caught the exception, wrote it to `last_error` and let the run report success, and a live `due -> marked` event reached it. Codex r1 MAJOR-1.) |
 | 52 | — | a durable state value **outside its frozen domain** is read (`table_state.snapshot_state`, `recovery_state.phase`) | `Machine.parse()` on every read | refused; the run does not start. A value in no domain belongs to no queue and no recovery path | n/a — reading is not a mutation | **MANUAL** (new at rev 9 — same trade as 51: it was silent before) |
 | 53 | run_phase: starting -> reconciling | the run-phase heartbeat row cannot be written (the table is missing, the independent connection is refused) | the write raises and is caught | the phase is tracked in memory, the machine still checks every edge, and the run is unaffected: observability must never fail a run that is otherwise correct | the row is not load-bearing for any decision | AUTO (new at rev 9) |
 
-**The counts, parsed from the rows above rather than recalled.** 57 rows, one
+**The counts, parsed from the rows above rather than recalled.** 58 rows, one
 failure and one terminal class each.
 
 | class | count | rows |
 |---|---:|---|
 | `AUTO` | **35** | 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 24b, 32, 35, 36, 40, 43, 44, 45, 46, 47, 53 |
-| `MANUAL` | **14** | 17b, 25, 26, 27, 28, 29, 33, 38, 41, 42, 44b, 49, 51, 52 |
+| `MANUAL` | **15** | 17b, 25, 26, 27, 28, 29, 33, 38, 41, 42, 44b, 49, 51, 51a, 52 |
 | `UNDEFINED` | **8** | 30, 31, 32b, 35b, 37, 39, 48, 50 |
 
 **What rev 9 changed, and it is not flattering.** Three rows are new and two of them are
@@ -2898,8 +2913,16 @@ failure and one terminal class each.
 into loud refusals *created* two manual-intervention cases where there had previously
 been two silent-corruption paths. That is the right trade for correctness and the wrong
 direction for a rubric whose band is a count, and both facts are stated rather than one
-of them. 4.7 stays at **1** either way — its 1-band is "more than 2 cases that cause
-manual intervention" and 14 is more than 2.
+of them.
+
+**What rev 10 changed, and it is worse.** Row 51 claimed that policy for *any* machine
+and the memory-only catalog machine did not implement it: `poll_quietly` caught the
+`IllegalTransition`, wrote it to the same `last_error` a network failure uses, and let
+the run report success — and a real, reachable `due -> marked` event was hitting it
+(Codex r1 MAJOR-1). Row 51a is that case, split out with the policy the code now has: the
+run fails. A fourteenth manual case, created by admitting one that was being under-counted
+as automatic. 4.7 stays at **1** either way — its 1-band is "more than 2 cases that cause
+manual intervention" and 15 is more than 2.
 
 **The manual cases, and why each one is manual.** Six protect a destination from an
 automatic action that could destroy it (17b, 25, 26, 27, 38, and 44's terminal form);
@@ -2929,11 +2952,11 @@ as machines. They exist so the inventory, the run summary and the tests share on
 vocabulary; `RESNAPSHOT_DECISIONS` and `RECONCILE_DECISIONS` were previously declared and
 consumed only by a test.
 
-* **`slot_verdict`** (11 values) — What did the last acquisition conclude about the slot?  
+* **`slot_verdict`** (11 values) — What did the last acquisition conclude about the slot?
   `ok`, `fresh_start`, `source_unobservable`, `slot_ahead_of_destination`, `slot_missing`, `slot_recreated`, `source_identity_changed`, `source_timeline_changed`, `source_lsn_regressed`, `no_durable_destination_row`, `no_durable_row_full_snapshot`
-* **`reconcile_decision`** (10 values) — What did `offsets.dat` versus the durable resume point turn out to be?  
+* **`reconcile_decision`** (10 values) — What did `offsets.dat` versus the durable resume point turn out to be?
   `fresh_start`, `resume`, `file_missing_rebuilt`, `file_missing_no_durable_offset`, `file_missing_repair_disabled`, `file_corrupt_rebuilt`, `file_ahead_rebuilt`, `file_behind_rebuilt`, `file_offset_mismatch_rebuilt`, `orphan_accepted_resnapshot`
-* **`source_health`** (6 values) — What is the source connector doing, as one named value rather than six timers?  
+* **`source_health`** (6 values) — What is the source connector doing, as one named value rather than six timers?
   `unsampled`, `streaming`, `not_streaming`, `unknown`, `unknown_never_sampled`, `dark`
 
 
@@ -3314,3 +3337,166 @@ from `ALL_POINTS` and requires a declared outcome for each; the default-suite gu
 **real** `cdc-flight` process at `recovery_armed` against a real Postgres slot and then
 compares the whole destination against the whole source
 (`test_1_8_recovery_crash_e2e.py`).
+
+### A58 — rev 10: the operator routes are journalled too, and one owner per fact
+
+The first Codex review of rev 9 scored 1.9 a **3**, not a 5, and it was right for a
+reason that is easy to state: the machines were real but the **word "any" was not
+satisfied**. Three consistency-affecting sequences still lived outside them, two facts
+still had two owners, and one machine was a shadow of the containers it was supposed to
+replace. Rev 10 is the answer, and every item below is a behaviour change.
+
+#### A58.1 — `--accept-orphan-offsets` journals before it destroys (BLOCKER)
+
+`offset_reconcile.reconcile()` dropped the replication slot and unlinked `offsets.dat`,
+and `pipeline.run()` wrote the recovery journal **after** it returned. The comment saying
+so called the placement deliberate. It is the B3/A53 shape recreated on the one route an
+operator reaches for when something has already gone wrong:
+
+1. the operator authorises a rebuild;
+2. the slot is dropped and `offsets.dat` is unlinked;
+3. the process dies before `recovery.begin()` commits;
+4. the next run sees no resume row, no offsets file, no slot and **no journal**, and
+   classifies that as an ordinary `fresh_start`;
+5. under a configured non-data `snapshot.mode` it streams onto the old destination
+   without rebuilding the baseline the operator explicitly asked to rebuild.
+
+A crash between the drop and the unlink instead strands the operation behind the orphan
+refusal. Both outcomes contradict the journal's purpose.
+
+`reconcile()` now **classifies and mutates nothing**; `dsn` and `slot_name` are accepted
+and ignored so a caller that passes them is not silently mis-wired. `recovery.begin()`
+writes the intent and the whole captured obligation in one transaction, and the one
+idempotent `resume()` ladder performs the file, the row and the slot. The route is
+therefore anchored at every boundary it already had, and the evidence is a real `os._exit`
+at `recovery_requested` followed by a restart that does **not** repeat the flag, under
+`--snapshot-mode no_data`, ending in exact source/destination equality
+(`test_1_8_operator_route_crash_e2e.py`).
+
+#### A58.2 — `--reset-state` is a journalled recovery (MAJOR)
+
+Rev 9 argued reset needed no journal because every intermediate state converges. Two
+steps of that argument are false:
+
+* after the resume row is deleted, `check_slot()` runs **before**
+  `will_snapshot_everything` is computed. With a positioned slot over a populated
+  destination it returns the deliberate `no_durable_destination_row` refusal — and
+  repeating `--reset-state` does not drop that slot, so it does not necessarily finish
+  the reset either;
+* the forced `props['snapshot.mode'] = 'initial'` was a local variable, so a crash after
+  the file and the row were gone let the next ordinary run start fresh under a configured
+  `no_data` mode.
+
+Reset is now `recovery.begin(decision='operator_reset', ...)`: the table bookkeeping goes
+back to `none` **inside the journal's transaction** (through `TableLifecycle`, as before),
+`source_relations` is discarded through the existing `forget_catalog` flag, and the ladder
+clears the state directory, deletes the resume row and **drops the slot**. Dropping the
+slot is not incidental — it is what makes the sequence converge, and it is required for
+correctness anyway, because Debezium only pairs a snapshot with an exact WAL position when
+it creates the slot itself (A45). The lease row is still deleted outside the journal,
+before the lease is acquired: it destroys no data and records no obligation.
+
+#### A58.3 — one `RunOutcome` per run, and terminalise before reporting (MAJOR)
+
+`run_engine_bounded()` built one `RunOutcome` and `RunPhaseWriter` built another. The
+supervisor returned the first as `stop_reason`; the phase writer published the second as
+`run_outcome`. Successful end-to-end runs therefore shipped
+
+```text
+ok=true, stop_reason="idle", run_outcome="max_seconds", run_phase="draining"
+```
+
+while the destination heartbeat correctly held `phase='stopped', terminal_reason='idle'`.
+A severe result could be represented by the untouched mild default, which is A49's class
+arriving through duplicate ownership instead of last-writer-wins.
+
+There is now one `RunOutcome`, constructed in `pipeline.run()` and passed to both. The
+returned summary dict is the very dict `main()` prints, and the outer `finally` updates it
+**after** `stopping`/`stopped`/`failed` — so `last_run.json` and the heartbeat are two
+projections of one state. A failure that unwinds outside the engine records `error` on the
+same object, but only when nothing more specific has been diagnosed, because `error` is
+the most severe value in the precedence and would otherwise bury `engine_error`.
+`OUTCOME_FAILURES` no longer contains `engine_finished`: that is a success for a
+terminating snapshot mode and a failure otherwise, and severity alone cannot decide it.
+
+#### A58.4 — the commit→ack window is a wall-clock exclusion (MAJOR)
+
+The callback's synchronous instruction sequence was clean, and that is not the claim the
+ADR made. On `max_seconds`, engine error or source-dark the supervisor breaks the loop
+without checking `handler.busy` and writes `draining` on its own thread — while the engine
+thread can be between `COMMIT` and `markBatchFinished()`. "Never in the window" was false.
+
+`run_state.COMMIT_ACK` is a flag the applier enters immediately before `COMMIT` and leaves
+immediately after the acknowledgement. Two plain attribute assignments, no lock and no
+allocation: taking a mutex inside the one sequence that must contain nothing else would be
+exactly the unrelated work the principle excludes. A phase write that arrives while it is
+set is **dropped** — never deferred behind a lock, never blocking — and counted into the
+run summary, because every write states the whole row and the next transition restores it.
+
+Separately, `con.cursor()` failing used to set `_sink = con`, which put observability
+statements on the applier's own connection, inside its open transaction, from another
+thread. It is `None` now: no independent connection means no row.
+
+#### A58.5 — the catalog machine owns the catalog (MAJOR)
+
+`CatalogChange.state` was added *beside* `_unconfirmed`, `_pending`, `fenced`,
+`deferrals` and `confirmations` rather than replacing them, and it showed:
+
+* the first observation's object went `observed -> unconfirmed` and was **discarded**;
+  the confirming poll constructed a new one that went `observed -> pending`. The declared
+  `unconfirmed -> pending` edge described no object production ever advanced;
+* `fenced` was a second representation of `marked` that a caller had to remember to set;
+* there was a **live, reachable undeclared edge**. `due()` leaves a change in the list
+  until the COMMIT resolves it; a poll that overlaps the applier then called
+  `_queued(change).to(marked)` over every live change, and `due -> marked` is not
+  declared. `poll_quietly()` caught the `IllegalTransition`, wrote it to the same
+  `last_error` a network failure uses, and let the run report success — so A51 row 51's
+  promise of a loud failure was not kept for this machine.
+
+Now: `_unconfirmed` holds the object whose state *says* `unconfirmed` and carries the
+streak on it; `fenced` is derived from the state history; `pending()` filters on state;
+`queue()` is the `observed -> pending` edge and the only way in; `_emit_marker` marks only
+changes from which `-> marked` is declared. An undeclared edge on the polling thread sets
+`machine_error`, and `run_engine_bounded` raises `EngineFailure` on it. A51 row 51 is
+split, with 51a stating the policy this machine actually has.
+
+#### A58.6 — ownership: domains, the completion predicate, the slot verdict (MAJOR)
+
+* `SLOT_VERDICTS` and `RECONCILE_DECISIONS` were referenced only by tests, so they froze
+  nothing. `SlotVerdict` and `Reconciliation` parse them in `__post_init__`.
+* The recovery-clear predicate lived in `pipeline.py`, re-derived the obligation from
+  *all* current lifecycle rows, called `clear()` directly, and — when false — only added a
+  summary key while the run still reported `ok: true`. It is `recovery.complete_if_ready()`
+  now: it validates the **journalled** captured set, performs `armed -> absent` itself, and
+  returns a typed `Completion`. An uncleared recovery raises `EngineFailure`, so the run
+  exits non-zero. `run_outcome` gains `recovery_uncleared` for it.
+* `recovery_state` persists `captured_json` (the obligation) and `state_dir` (reset only).
+* `slot_state` persists `verdict`, `verdict_message` and `verdict_at` in the observation's
+  own transaction, so the destination can explain why a rebuild started. A typed
+  classification, not a new machine.
+
+#### A58.7 — the 1.7 evidence, made non-vacuous (MAJOR)
+
+* All four recovery boundaries are now cut by a **real `os._exit`** in a child process
+  (`tests/recovery_crash_driver.py`), not by exception unwinding; the `:raise` variants
+  stay as the *error-teardown* path, which is a different lifecycle (§1.2).
+* `table_rebuild_queued` fires after the **first** captured table has taken its
+  `-> awaiting_snapshot` edge, so it proves a torn queue rather than a pre-write rollback.
+* The chaos harness's composed fault is still armed at `<nth>=2` and still allowed not to
+  fire, which is right for a terminating random walk and wrong as evidence. A bounded
+  scenario now *requires* one: a hard death at `post_commit_pre_ack`, then `pre_commit:1`
+  during the replay run, which the replay necessarily reaches.
+* The two operator routes have end-to-end crash coverage of their own (A58.1, A58.2).
+* `close_hung is True` is gone from the blackhole test: whether the JVM finishes `close()`
+  inside 30 s is a race, not a correctness property, and it was recorded flaking. What is
+  asserted is that a reported hang did **not** replace the diagnosis, which is all A49
+  needs.
+
+#### A58.8 — decomposition, again
+
+`applier.py` (996), `pipeline.py` (992) and `destination.py` (952) were back at the
+1,000-line threshold. `OpenGroup` moves to `cdc_flight/commit_group.py` and the four
+pre-engine decisions move to `cdc_flight/acquisition.py`, taking `applier.py` to 917 and
+`pipeline.py` to 730. Both seams are argued rather than arbitrary: `OpenGroup` has no
+dependency on the applier, and the acquisition decisions are testable against a DuckDB
+file with no JVM.

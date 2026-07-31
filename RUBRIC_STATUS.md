@@ -1487,7 +1487,7 @@ run-time error instead of a review finding.
 | `acquisition_recovery` | what has this destructive recovery already done | 5 | 9 | `_cdc_flight.recovery_state.phase` |
 | `catalog_change` | where is one DDL fact in observe → confirm → fence → apply | 9 | 30 | **memory only** |
 
-Style, deliberately minimal: `cdc_flight/states.py` is ~230 lines with **no dependencies**
+Style, deliberately minimal: `cdc_flight/states.py` is 293 lines with **no dependencies**
 — plain-`str` states (they are already durable strings in `VARCHAR` columns, in
 `last_run.json` and in a hundred test literals, so an `enum.Enum` would need a migration
 and would break every existing SQL comparison for no gain), `machine.check(from, to)`
@@ -1582,28 +1582,37 @@ owning exactly one state, no two sharing a durable location (asserted), and seve
 candidates each with a written argument. The 3-band ("only 1 big state machine") is
 clearly not this, and the 1-band is clearly not this.
 
-Held-open items a reviewer should treat as the honest edges of the claim:
+#### What the first Codex review rejected, and what round 2 changed
 
-1. **`catalog_change` is informational.** No behaviour depends on the state yet — the
-   fence is still `durable_lsn >= detected_lsn` in `due()` — so it buys interpretability
-   and an illegal-edge check, not a behaviour change. The review classed it "cheap,
-   memory-only" and that is what it is.
-2. **The recovery-clear predicate still lives in `pipeline.py`.** It now uses the
-   machine's own non-terminal definition, so it cannot be satisfied by a table stuck
-   mid-snapshot, but the *ownership* split the review flagged (pure decision here, side
-   effects there) is unchanged. Owner: a later round.
-3. **`slot_state` still does not persist the verdict.** The eleven decisions are a frozen
-   domain and land in `last_run.json`; an operator still cannot ask the destination what
-   the last acquisition concluded. The review classed this "persistence, not an SM";
-   carry-forward to 1.8-minor.
-4. **`--reset-state` remains unjournalled.** Argued (in `pipeline.py`, at the code) rather
-   than journalled: every intermediate state converges on the same outcome rather than on
-   a refusal, and the one hole — a non-data `snapshot.mode` — is closed two lines below.
-   It now goes through the machine's declared edges, which it did not before.
-5. **Two new MANUAL rows.** Making an undeclared transition and an out-of-domain durable
-   value into loud refusals *created* two manual-intervention cases (A51 rows 51, 52)
-   where there had been two silent-corruption paths. Right for correctness, wrong for
-   4.7's count, and both facts are recorded rather than one.
+The first submission of this item was scored **3, not 5**, and the rejection was
+specific: several good machines with material gaps, so the rubric's word **any** was not
+satisfied. Every gap it named is closed here, and each one is a behaviour change rather
+than a documentation change.
+
+| finding | what it was | what it is now |
+|---|---|---|
+| **BLOCKER-1** — `--accept-orphan-offsets` journalled AFTER destroying its evidence | `offset_reconcile` dropped the slot and unlinked `offsets.dat`, then `pipeline.run()` wrote the journal. A hard exit in that gap left no row, no file, no slot and no journal, which the next run reads as an ordinary `fresh_start`: under a configured non-data `snapshot.mode` it streams onto a destination nobody rebuilt (B3/A53, recreated) | `reconcile()` **classifies and mutates nothing**. `recovery.begin()` makes the intent and the whole table obligation durable first; the one idempotent `resume()` ladder removes the file, deletes the row and drops the slot, anchored at every boundary. Proved by a real `os._exit` at `recovery_requested` and a restart that does **not** repeat the flag, under `--snapshot-mode no_data`, ending in exact source/destination equality |
+| **MAJOR-1** — `catalog_change` was a shadow model with a real missing edge | `CatalogChange.state` sat *beside* `_unconfirmed`, `_pending` and a `fenced` flag; the confirming poll built a second object, so `unconfirmed -> pending` described nothing; and a live `due -> marked` event (poll overlapping `due()`) raised `IllegalTransition`, which `poll_quietly` wrote to `last_error` and stepped over | The machine **owns** the representation: `_unconfirmed` holds the object whose state says `unconfirmed`, `fenced` is derived from the state history, `pending()` filters on state, `queue()` is the `observed -> pending` edge, and `_emit_marker` never walks a `due` change backwards. An undeclared edge on the polling thread sets `machine_error` and **fails the run** (A51 row 51a) |
+| **MAJOR-2** — two `RunOutcome`s, contradictory summaries | `run_engine_bounded` built one and `RunPhaseWriter` another, so successful runs shipped `stop_reason="idle"` beside `run_outcome="max_seconds"`, and the summary was sampled while the run was still `draining` | **One** `RunOutcome` per run, constructed in `pipeline.run()` and handed to both. The returned dict is updated in the outer `finally` **after** the terminal transitions, so `last_run.json` and the destination heartbeat are two projections of one state. Outer failures record on the same object |
+| **MAJOR-3** — the heartbeat could overlap commit→ack and could borrow the primary connection | true in program order, false in wall clock: the supervisor writes `draining` on its own thread the moment `max_seconds`/engine error/source-dark breaks the loop, and `con.cursor()` failing set `_sink = con` | `run_state.COMMIT_ACK` is entered by the applier immediately before `COMMIT` and left immediately after `markBatchFinished()`; a phase write inside it is **dropped** (never deferred behind a lock, never blocking), counted, and reported. No independent connection now means **no row**, not the applier's connection |
+| **MAJOR-4** — `--reset-state` neither atomic nor convergent | five independent durable mutations plus a process-local `snapshot.mode='initial'`. The convergence argument was false: a positioned slot over a populated destination makes the next run refuse with `no_durable_destination_row` before `will_snapshot_everything` is computed, and repeating the flag does not drop that slot | a journalled recovery (`decision='operator_reset'`) like any other: intent and table reset in one transaction, then state directory, resume row and **slot**, each idempotent. Proved by an `os._exit` mid-sequence and a restart **without the flag** under `no_data` |
+| **MAJOR-5** — ownership gaps | `SLOT_VERDICTS` / `RECONCILE_DECISIONS` were referenced only by tests; the recovery-clear predicate lived in `pipeline.py` and a false predicate still reported `ok: true`; the captured obligation was not persisted | both domains are parsed in `__post_init__` on the production types; `recovery.complete_if_ready()` owns the predicate, validates the **journalled** captured set, performs `armed -> absent` itself and returns a typed `Completion`; an uncleared recovery raises `EngineFailure` and the run exits non-zero. `slot_state` persists `verdict`, `verdict_message`, `verdict_at` in the observation's own transaction |
+| **MINOR-1/2/3** | migration failures silently accepted; the `OpenGroup` claim overstated; `in_progress -> in_progress` checked after a side effect | a failed `ALTER` is **re-read** and raises `ControlSchemaFailed` unless the column is now present; the `OpenGroup` claim is narrowed to what is true and the one legitimate partial mutation is `discard_units()`; `SnapshotCoordinator.state_for` calls `table_lifecycle.check_transition()` **before** it drops the shadow |
+
+Held-open items a reviewer should still treat as the honest edges of the claim:
+
+1. **`catalog_change` is memory-only and still does not gate the fence.** The behavioural
+   fence is `durable_lsn >= detected_lsn`, as it must be — it is a fact about the
+   destination, not about this object. What the state now owns is the *queue*: which
+   changes are live, which are fenced, and whether a poll may touch one the applier is
+   holding. That is a behaviour change; gating the LSN comparison would not be.
+2. **Two new MANUAL rows, and a third.** Making an undeclared transition and an
+   out-of-domain durable value into loud refusals *created* two manual-intervention cases
+   (A51 rows 51, 52) where there had been two silent-corruption paths; splitting the
+   catalog machine's policy out honestly (51a) adds a third. Right for correctness, wrong
+   for 4.7's count, and all of it recorded rather than half of it.
+3. **`states.py` is 293 lines, not "~230".** The number above is corrected; the module
+   still has no dependencies.
 
 
 ## 2. Schema Evolution & Type Handling

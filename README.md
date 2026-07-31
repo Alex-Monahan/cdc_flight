@@ -234,15 +234,16 @@ end-to-end pairing for the recovery anchors — a real `cdc-flight` process kill
 destination equals the source exactly. It belongs in a review round rather than a tight
 edit loop, which is what the partition is for.
 
-**One observed flake, recorded rather than smoothed over.**
-`test_1_7_source_blackhole.py::test_a_blackholed_source_never_reports_ok` asserts
+**One observed flake, fixed rather than documented around.**
+`test_1_7_source_blackhole.py::test_a_blackholed_source_never_reports_ok` used to assert
 `close_hung is True` — the claim that Debezium's `close()` cannot complete against a dead
-socket. It failed once in two `-m slow` runs of this round and passed on the re-run, with
-no change to that path in between: the JVM sometimes does tear down inside the 30 s
-`close_timeout`. Every *correctness* assertion in that test (non-zero exit,
-`stop_reason == "source_dark"`, detection within 60 s of going dark) passed both times;
-the flaky one is about the shutdown path. It is left as-is and written down here so the
-next reviewer does not have to rediscover it.
+socket. It failed once in two `-m slow` runs and passed on the re-run with no change to
+that path: the JVM sometimes *does* tear down inside the 30 s `close_timeout`, so the
+assertion was never a correctness property, only a race the test happened to win most of
+the time. It is gone. The contract the test carries is a non-zero exit,
+`stop_reason == "source_dark"` by name, detection within 60 s of going dark, and — where
+`close_hung` *is* reported — that the shutdown symptom did not replace the diagnosis,
+which is the only thing A49 needs from it.
 
 The previous measurement's context: the 1.6-1.8 review found that 10 of 12 fault anchors
 and 57 of 91 new tests ran only under `-m slow` — a guard outside the gate that runs on

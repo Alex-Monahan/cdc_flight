@@ -29,6 +29,10 @@ the next run, the destination equals the source exactly.
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import duckdb
@@ -67,11 +71,17 @@ ANCHOR_PHASE = {
 }
 
 
+DRIVER = Path(__file__).resolve().parents[1] / "recovery_crash_driver.py"
+
+
 class _World:
     """A destination, an offsets file and a source slot: all fake, all real state."""
 
     def __init__(self, tmp_path: Path):
-        self.con = duckdb.connect(str(tmp_path / "dest.duckdb"))
+        self.root = tmp_path
+        self.duckdb_path = tmp_path / "dest.duckdb"
+        self.slots_path = tmp_path / "slots.json"
+        self.con = duckdb.connect(str(self.duckdb_path))
         dest_mod.ensure_control_schema(self.con)
         dest_mod.ensure_dataset(self.con, DATASET)
         self.offset_path = tmp_path / "offsets.dat"
@@ -93,8 +103,47 @@ class _World:
     def drop_slot(self, dsn: str, slot_name: str) -> str:
         if slot_name in self.slots:
             self.slots.discard(slot_name)
+            self._save_slots()
             return "dropped"
         return "absent"
+
+    # -- the hard-death seam ------------------------------------------------ #
+    def _save_slots(self) -> None:
+        self.slots_path.write_text(json.dumps(sorted(self.slots)))
+
+    def crash_at(self, point: str, step: str, *, nth: int = 1, exit_code: int = 137):
+        """Run one recovery step in a CHILD process that really dies at `point`.
+
+        `os._exit` skips every `except`, `finally` and `atexit` hook, which is the
+        difference between "the resume logic is re-entrant" and "a hard-killed process
+        leaves resumable durable state" (Codex r1 MAJOR-6). The parent's DuckDB handle
+        is closed first — one writer per file — and reopened afterwards.
+        """
+        self._save_slots()
+        self.con.close()
+        try:
+            env = dict(os.environ)
+            env["CDC_FAULT_INJECT"] = f"{point}:{nth}"
+            env["CDC_STATE_DIR"] = str(self.root / "state")
+            env["PYTHONPATH"] = os.pathsep.join(
+                [str(Path(__file__).resolve().parents[2] / "src"), env.get("PYTHONPATH", "")]
+            )
+            proc = subprocess.run(
+                [
+                    sys.executable, str(DRIVER), str(self.duckdb_path),
+                    str(self.offset_path), str(self.slots_path), step,
+                ],
+                env=env, capture_output=True, text=True, timeout=120, check=False,
+            )
+        finally:
+            self.con = duckdb.connect(str(self.duckdb_path))
+        self.slots = set(json.loads(self.slots_path.read_text()))
+        assert proc.returncode == exit_code, (
+            f"{point} at step {step!r} did not hard-exit {exit_code}: "
+            f"rc={proc.returncode}\nstdout={proc.stdout[-2000:]}\n"
+            f"stderr={proc.stderr[-2000:]}"
+        )
+        return proc
 
     def journal(self):
         return recovery_mod.read(self.con, pipeline=PIPELINE, namespace=NAMESPACE)
@@ -178,22 +227,23 @@ def test_every_recovery_anchor_parses(point, monkeypatch):
 # each anchor fires where it says it fires, and the next attempt finishes the job
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("point", sorted(ANCHOR_PHASE))
-def test_a_crash_at_a_recovery_anchor_leaves_a_resumable_journal(world, monkeypatch, point):
-    world.begin() if point != "recovery_requested" else None
-    if point == "recovery_requested":
-        _arm(monkeypatch, point)
-        with pytest.raises(faults.InjectedFault):
-            world.begin()
-        _disarm(monkeypatch)
-    else:
-        _arm(monkeypatch, point)
-        with pytest.raises(faults.InjectedFault):
-            world.resume()
-        _disarm(monkeypatch)
+def test_a_hard_death_at_a_recovery_anchor_leaves_a_resumable_journal(world, point):
+    """A REAL `os._exit` at every recovery boundary, in a child process.
+
+    All four cuts used to be taken with `:raise`, which is Python exception unwinding:
+    the caller's `try` runs, the destination connection closes cleanly, the interpreter
+    tidies up. Only `recovery_armed` had a hard-death pairing, and it was in the slow
+    lane. The claim under test is that DURABLE STATE ALONE is enough after a crash, and
+    a raised exception does not test it (Codex r1 MAJOR-6).
+    """
+    if point != "recovery_requested":
+        world.begin()
+    world.crash_at(point, "begin" if point == "recovery_requested" else "resume")
 
     # The anchor recorded itself, fsynced, where a test can read it even after os._exit.
-    fired = faults.read_fired_record(Path(world.offset_path).parent / "state")
+    fired = faults.read_fired_record(world.root / "state")
     assert fired is not None and fired["point"] == point, fired
+    assert fired["pid"] != os.getpid(), "the cut has to happen in the process that dies"
 
     surviving = world.journal()
     assert surviving is not None, "the journal is the whole point"
@@ -201,6 +251,8 @@ def test_a_crash_at_a_recovery_anchor_leaves_a_resumable_journal(world, monkeypa
     # The forced snapshot mode survived the cut: it used to live only in a local
     # variable, so a crash after the slot was dropped lost it (Codex B3).
     assert surviving.snapshot_mode == recovery_mod.FORCED_SNAPSHOT_MODE
+    # And the obligation itself, which is what the completion predicate is about.
+    assert sorted(surviving.captured) == ["app.customers", "app.orders"]
 
     # ... and the next attempt finishes the job, from durable state alone.
     result = world.resume()
@@ -211,17 +263,36 @@ def test_a_crash_at_a_recovery_anchor_leaves_a_resumable_journal(world, monkeypa
     assert world.owed == ["app.customers", "app.orders"]
 
 
-def test_the_journal_and_the_to_do_list_survive_or_die_together(world, monkeypatch):
-    """`table_rebuild_queued` fires INSIDE `begin()`'s transaction.
+@pytest.mark.parametrize("point", sorted(ANCHOR_PHASE))
+def test_the_same_anchor_also_unwinds_cleanly_as_an_exception(world, monkeypatch, point):
+    """The `:raise` action, kept as the *error teardown* path rather than as the crash.
 
-    The to-do list and the journal that explains it are written in one destination
-    transaction on purpose. A crash while the queue is being written must leave neither,
-    or the next run finds tables marked owed with nothing recording why.
+    ADR 0001 §1.2: an exception drives Debezium's error-teardown lifecycle, which is a
+    different (and differently dangerous) path from hard death. Both are covered; the
+    test above is the one that carries the rubric claim.
     """
-    _arm(monkeypatch, "table_rebuild_queued")
-    with pytest.raises(faults.InjectedFault):
+    if point != "recovery_requested":
         world.begin()
+    _arm(monkeypatch, point)
+    with pytest.raises(faults.InjectedFault):
+        world.begin() if point == "recovery_requested" else world.resume()
     _disarm(monkeypatch)
+    surviving = world.journal()
+    assert surviving is not None and surviving.phase == ANCHOR_PHASE[point]
+    assert world.resume()["phase"] == PHASE_ARMED
+
+
+def test_the_journal_and_the_to_do_list_survive_or_die_together(world):
+    """`table_rebuild_queued` fires INSIDE `begin()`'s transaction, MID-WRITE.
+
+    The anchor is now placed after the FIRST captured table has taken its
+    `-> awaiting_snapshot` edge and before the second has (Codex r1 MAJOR-6); it used to
+    fire before the loop, so it proved a pre-write rollback rather than a torn queue.
+    The to-do list and the journal that explains it are written in one destination
+    transaction on purpose: a hard death while the queue is half-written must leave
+    neither, or the next run finds tables marked owed with nothing recording why.
+    """
+    world.crash_at("table_rebuild_queued", "begin")
 
     assert world.journal() is None
     assert world.owed == [], "the to-do list must not outlive the journal"

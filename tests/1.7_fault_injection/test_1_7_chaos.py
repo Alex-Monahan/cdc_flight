@@ -234,7 +234,9 @@ def test_random_faults_at_random_anchors_never_break_the_ledger(
             # module claims: the second fault lands on a destination whose most recent
             # event is the first fault's rollback, and on an offset store that is
             # mid-replay. `<nth>` is deliberately high enough that it usually does not
-            # fire, so the sequence still terminates.
+            # fire, so the sequence still terminates — and because it usually does not
+            # fire, this loop alone is NOT evidence that a composed fault ever lands.
+            # `test_a_fault_during_a_recovery_really_fires` is (Codex r1 MAJOR-6).
             during_recovery = rng.choice(CHAOS_POINTS)
             recovery_env = {
                 "CDC_FAULT_INJECT": f"{during_recovery}:2",
@@ -273,5 +275,59 @@ def test_random_faults_at_random_anchors_never_break_the_ledger(
         raise
     finally:
         print(f"\nchaos seed {seed} executed: {executed}")
+        box.cleanup()
+        box.reseed()
+
+
+@pytest.mark.slow
+def test_a_fault_during_a_recovery_really_fires(tmp_path_factory, postgres_cluster):
+    """The composition claim, as a BOUNDED scenario that must fire (Codex r1 MAJOR-6).
+
+    The seeded harness above arms a fault during recovery at `<nth>=2` so the sequence
+    still terminates, and explicitly allows it not to fire — which means its
+    shuffled-cover assertion can be satisfied entirely by the first faults, and "the
+    anchors compose" rests on nothing that has to happen. This test makes exactly one
+    composed fault mandatory:
+
+    1. a healthy baseline, so the counts afterwards mean something;
+    2. two transactions and a hard death at `post_commit_pre_ack:1` — the at-least-once
+       window, the shape Invariant O exists for;
+    3. the recovery run, with `pre_commit:1` armed. The recovery *replays* the
+       un-acknowledged group, so it necessarily builds a data-carrying commit group,
+       so this anchor necessarily arrives. It is asserted to have fired;
+    4. an unhindered run, and then exact source/destination equality.
+
+    The second fault therefore lands on a destination whose most recent durable event is
+    the first fault's commit, and on an offset store that is mid-replay.
+    """
+    box = Sandbox("chaos_compose", tmp_path_factory.mktemp("sbx_compose"), postgres_cluster)
+    try:
+        box.reseed()
+        box.run(reset_state=True, max_seconds=150)
+        _assert_equal_to_source(box, "baseline")
+
+        _shape(box, random.Random(1), "compose1")
+        box.clear_fired_fault()
+        box.run(
+            max_seconds=120, timeout=200, expect_success=False,
+            extra_env={"CDC_FAULT_INJECT": "post_commit_pre_ack:1"},
+        )
+        first = box.fired_fault()
+        assert first is not None and first["point"] == "post_commit_pre_ack", first
+
+        box.clear_fired_fault()
+        box.run(
+            max_seconds=120, timeout=200, expect_success=False,
+            extra_env={"CDC_FAULT_INJECT": "pre_commit:1"},
+        )
+        during = box.fired_fault()
+        assert during is not None and during["point"] == "pre_commit", (
+            "the composed fault did not fire: the recovery run must build at least one "
+            f"data-carrying commit group to replay the un-acknowledged batch ({during!r})"
+        )
+
+        assert box.run(max_seconds=200, timeout=280)["ok"] is True
+        _assert_equal_to_source(box, "after a fault inside a recovery")
+    finally:
         box.cleanup()
         box.reseed()
