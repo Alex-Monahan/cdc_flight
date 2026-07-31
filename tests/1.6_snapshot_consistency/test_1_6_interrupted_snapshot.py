@@ -24,14 +24,32 @@ from __future__ import annotations
 import pytest
 from conftest import Sandbox
 
-#: Whole module `slow`: the fixture is two pipeline runs over 400 preloaded rows with
-#: 60-row snapshot chunks, and the default suite already carries a guard for the same
+#: Whole module `slow`: the fixture is two pipeline runs over 3 000 preloaded rows, and the default suite already carries a guard for the same
 #: mechanism (`tests/1.1_exactly_once_pk/test_1_1_fault_interleavings.py::
 #: test_a_crash_during_the_snapshot_phase_leaves_no_partial_table`). What is *only* here
 #: is the full content comparison and the torn swap, and both are worth their minute.
 pytestmark = pytest.mark.slow
 
-PRELOAD = 400
+#: Getting a fault to land *inside* the snapshot phase took three measurements, and they
+#: are worth recording because each one is a real property of the applier:
+#:
+#: 1. 405 rows in 60-row chunks: **one** data group. A commit group is closed once per
+#:    Debezium batch (`_handle` evaluates the triggers after feeding a whole batch), and
+#:    405 records arrive in one batch. `applied_events: 420, batches: 1, returncode: 0`.
+#: 2. Same, plus `CDC_COMMIT_MAX_EVENTS=60`: still one group, for the same reason - the
+#:    trigger is *checked* once per batch, so a smaller threshold changes nothing.
+#: 3. 3 000 rows, `CDC_COMMIT_MAX_EVENTS=1000`: STILL one group, and this is the
+#:    interesting one. A group only holds *complete units*, and a snapshot chunk only
+#:    closes at `snapshot.chunk.events`, a change of source table, or the end of the
+#:    snapshot. At the default 50 000 the customers chunk is still open when the first
+#:    batch is exhausted, so `self._group` is empty and there is nothing to trigger on.
+#:
+#: So all three have to be true at once: enough rows to fill more than one batch, chunks
+#: small enough to *close* inside the first one, and a group trigger that fires on them.
+#: Verified state at the crash: one shadow table, `table_state.snapshot_state='in_progress'`,
+#: no live table at all.
+PRELOAD = 3000
+CHUNKED = {"CDC_COMMIT_MAX_EVENTS": "1000", "CDC_SNAPSHOT_CHUNK_EVENTS": "500"}
 
 
 def _source(box: Sandbox) -> set[str]:
@@ -68,20 +86,20 @@ def interrupted(tmp_path_factory, postgres_cluster):
             f"'bulk-' || i || '@example.com' FROM generate_series(1, {PRELOAD}) i",
             one_transaction=True,
         )
-        # Small chunks so the snapshot spans several commit groups and the fault lands
-        # with at least one chunk already durable in a shadow table.
+        # The FIRST data group, not the second: with more than one batch of snapshot
+        # records the first group commits ~2048 rows into shadow tables and the swap does
+        # not happen until the batch carrying `snapshot_last` arrives. Crashing here is
+        # therefore the state the item is about - a partial image, durably committed,
+        # invisible.
         crashed = box.run(
             reset_state=True,
-            max_seconds=150,
+            max_seconds=200,
             expect_success=False,
-            extra_env={
-                "CDC_SNAPSHOT_CHUNK_EVENTS": "60",
-                "CDC_FAULT_INJECT": "post_commit_pre_ack:2",
-            },
+            extra_env={**CHUNKED, "CDC_FAULT_INJECT": "post_commit_pre_ack:1"},
         )
         mid_crash_tables = _dest(box) if _dest_exists(box) else set()
         mid_crash_shadows = _shadows(box)
-        recovered = box.run(max_seconds=200, extra_env={"CDC_SNAPSHOT_CHUNK_EVENTS": "60"})
+        recovered = box.run(max_seconds=240, extra_env=CHUNKED)
         yield {
             "box": box,
             "crashed": crashed,
@@ -109,8 +127,16 @@ def test_the_crash_landed_inside_the_snapshot_phase(interrupted):
     assert interrupted["crashed"].get("snapshot_swaps", 0) == 0, interrupted["crashed"]
 
 
-def test_the_partial_snapshot_was_never_visible(interrupted):
-    """Committed chunks live in a shadow, so the live table shows nothing partial."""
+def test_the_partial_snapshot_was_durable_and_invisible(interrupted):
+    """Both halves. A shadow held rows; the live table did not exist.
+
+    The first half is what makes the second one mean something: if nothing had been
+    committed there would be no partial state to hide.
+    """
+    assert interrupted["mid_crash_shadows"], (
+        "no shadow table survived the crash, so no partial image was ever durable and "
+        "this scenario proves nothing"
+    )
     assert interrupted["mid_crash_tables"] == set(), interrupted["mid_crash_tables"]
 
 

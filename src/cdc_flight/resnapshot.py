@@ -72,7 +72,6 @@ import dataclasses
 import logging
 import shutil
 import threading
-import time
 from dataclasses import dataclass, field
 
 from . import destination as dest_mod
@@ -497,13 +496,3 @@ def read_watermarks(con, pipeline: str) -> dict[str, int]:
         [pipeline],
     ).fetchall()
     return {f"{schema}.{table}": int(lsn) for schema, table, lsn in rows}
-
-
-def wait_for_slot_gone(dsn: str, slot: str, timeout: float = 10.0) -> bool:
-    """Best-effort: don't leave a throwaway slot holding WAL if we can help it."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not reconcile_mod.observe_slot(dsn, slot, connect_timeout=3).slot_exists:
-            return True
-        time.sleep(0.25)
-    return False

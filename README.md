@@ -202,15 +202,31 @@ Measured on an M-series Mac. Only executed runs are reported here; see
 
 | suite | result | wall clock | measured |
 |---|---|---|---|
-| `make test` (local only) | **326 passed, 0 xfail** | **344 s** (5:44) | 2026-07-31, after the 1.4/1.5 review round |
-| `make test-slow` | **20 passed** | **268 s** (4:28) | 2026-07-31, after the 1.4/1.5 review round |
-| `make test-md` | **22 passed** | **265 s** (4:25) | 2026-07-31, after the 1.4/1.5 review round |
+| `make test` (local only) | **384 passed, 0 xfail** | **502 s** (8:21) | 2026-07-31, after 1.6 + 1.7 + 1.8 + 4.7 |
+| `make test-slow` | **54 passed** | **851 s** (14:10) | 2026-07-31, after 1.6 + 1.7 + 1.8 + 4.7 |
+| `make test-md` | **22 passed** | **284 s** (4:44) | 2026-07-31, after 1.6 + 1.7 + 1.8 + 4.7 |
+| `make test` (local only) | 326 passed, 0 xfail | 344 s (5:44) | 2026-07-31, after the 1.4/1.5 review round |
+| `make test-slow` | 20 passed | 268 s (4:28) | 2026-07-31, after the 1.4/1.5 review round |
+| `make test-md` | 22 passed | 265 s (4:25) | 2026-07-31, after the 1.4/1.5 review round |
 | `make test` (local only) | 246 passed | 337 s (5:37) | 2026-07-31, after 1.4 + 1.5 |
 | `make test-slow` | 20 passed | 268 s (4:28) | 2026-07-31, after 1.4 + 1.5 |
 | `make test-md` | 17 passed | 221 s (3:41) | 2026-07-31, after 1.4 + 1.5 |
 | `make test` (local only) | 168 passed | 283 s (4:43) | 2026-07-31, after the 1.1-1.3 review round |
 | `make test-slow` | 9 passed | 179 s (2:58) | 2026-07-31, after the 1.1-1.3 review round |
 | `make test-md` | 12 passed | 155 s (2:34) | 2026-07-31, after the 1.1-1.3 review round |
+
+The default suite is at **8:21 of a 10-minute budget**, so 1.6/1.7/1.8 spent their
+budget deliberately rather than by accident: one representative per *mechanism* stays in
+the default suite and the exhaustive matrices are `slow`. What moved out, and why it is
+safe to have moved: the full 12-anchor fault matrix (the default suite runs one
+`maybe_crash` and one `FaultyConnection` representative, which share all the machinery),
+the dropped-slot and restored-cluster recoveries (the advanced-slot recovery, which is
+1.8's own headline, stays in), the interrupted snapshot (the default suite keeps
+`tests/1.1_exactly_once_pk/test_1_1_fault_interleavings.py`'s guard for the same
+mechanism), the recreated-relation rebuild, the TCP blackhole and the chaos harness.
+
+`make test-slow` grew from 4:28 to 14:10. It is not on a budget, but it is now long
+enough that it belongs in a review round rather than in a tight edit loop.
 
 The xfail count is zero because every target test passes; the gap pins they superseded
 were deleted, as each suite's README said they should be. 1.4 and 1.5 added 78 default
@@ -291,9 +307,24 @@ implementation, so they survive the ADR 0001 refactor:
 
 | point | meaning |
 |---|---|
+| `decode` | records decoded and assembled, no transaction open yet |
+| `begin` | `BEGIN TRANSACTION` issued, nothing applied |
+| `spill` | a unit's events staged into `_cdc_flight.spill_events` |
+| `mid_apply` | the first destination table of the group written, the next not |
+| `swap` | between the `DROP` and the `RENAME` of a backfill swap (`<nth>` counts **swaps**) |
 | `pre_commit` | applied to the destination inside an open transaction, not committed |
 | `post_commit_pre_ack` | destination committed, Debezium **not** acknowledged — the at-least-once window |
 | `post_ack` | `offsets.dat` flushed, the replication slot not yet confirmed |
+| `destination_write` | the destination **rejects** a data write, transaction open |
+| `destination_commit` | `COMMIT` raises — the ambiguous case (ADR §4.6 F5) |
+| `destination_hang` | `COMMIT` never returns; bounded by `CDC_COMMIT_TIMEOUT` |
+| `destination_close` | the destination connection is severed mid-transaction |
+
+The four `destination_*` points are injected by wrapping the single connection the
+applier writes through (`faults.wrap_destination`), and they fire at the data group the
+applier *declares* rather than one inferred from the SQL. The fault the process cannot
+inject at all — a source whose packets stop arriving with the sockets left open — is
+injected from outside by `tests/tcp_relay.py`.
 
 `<nth>` counts **data** batches only: batches containing nothing but Debezium heartbeats
 or transaction-metadata markers are not counted, because otherwise enabling
