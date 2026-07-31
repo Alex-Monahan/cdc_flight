@@ -95,6 +95,19 @@ class ReconciliationRefused(RuntimeError):
     """
 
 
+class AmbiguousDelete(RuntimeError):
+    """The fold cannot say which physical row a delete removed (ADR 0001 §18/A35).
+
+    Rubric 1.4's hard case. Inside one Postgres transaction a deferred unique
+    constraint lets several rows wear one key, and only the delete's before-image
+    says which of them the event describes. A deferrable key is not a valid replica
+    identity, so that image is always a full row where the shape is reachable - but
+    if it ever is not, the honest outcome is a refused commit group, not a guess:
+    the rubric's own scale puts an error (=1) above silent loss, the group rolls
+    back, and the transaction replays for free under Invariant O.
+    """
+
+
 class DestinationIdentityCollision(RuntimeError):
     """Two destination rows share one identity (ADR 0001 §15/A21, Opus M-2).
 
