@@ -104,6 +104,12 @@ class RunConfig:
     idle_max_lag_bytes: int = field(
         default_factory=lambda: int(_env("CDC_IDLE_MAX_LAG_BYTES", str(64 * 1024)))
     )
+    #: How long `engine.close()` may take before the run is declared hung. It runs
+    #: on its own supervised thread, because a hang *inside* close would otherwise
+    #: never reach the join-based watchdog (rubric 4.5).
+    close_timeout: float = field(
+        default_factory=lambda: float(_env("CDC_CLOSE_TIMEOUT", "30"))
+    )
 
 
 def motherduck_token() -> str | None:

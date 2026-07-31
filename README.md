@@ -150,7 +150,7 @@ Measured on an M-series Mac. Only executed runs are reported here; see
 
 | suite | result | wall clock | measured |
 |---|---|---|---|
-| `make test` (local only) | 49 passed + 12 xfail | **290 s** | 2026-07-30 |
+| `make test` (local only) | 50 passed + 12 xfail | **294 s** | 2026-07-30 |
 | `make test-md` | 2 passed (+ 4 xfail after 1.3 landed) | ~35 s | 2026-07-30 (2 passed); the 1.3 MotherDuck variant is newer |
 | `make test-slow` | 3 passed | **219 s** | 2026-07-30 |
 

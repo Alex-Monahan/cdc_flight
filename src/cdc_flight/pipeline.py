@@ -168,7 +168,24 @@ def run_engine_bounded(
         # failure racing the close gets discarded as noise (Opus M1).
         intentional = stop_reason != "engine_error" and handler.error is None and not error_box
         log.info("closing debezium engine (reason=%s, intentional=%s)", stop_reason, intentional)
-        engine.close(intentional=intentional)
+
+        # `close()` gets the same bounded supervision as the engine thread.
+        # Previously it was called synchronously *before* the join, so a hang
+        # inside close() never reached the join-based "hung" verdict and the
+        # advertised 60 s hang detector did not actually guard this path
+        # (Codex 11). The process-level hard stop is `shutdown_and_exit()`'s
+        # watchdog timer, which fires even if the interpreter is wedged.
+        closer = threading.Thread(
+            target=engine.close,
+            kwargs={"intentional": intentional},
+            name="debezium-close",
+            daemon=True,
+        )
+        closer.start()
+        closer.join(timeout=run.close_timeout)
+        if closer.is_alive():
+            log.error("engine.close() did not return within %ss", run.close_timeout)
+            stop_reason = "hung"
         thread.join(timeout=60)
         if thread.is_alive():
             log.error("debezium engine thread did not stop within 60s")

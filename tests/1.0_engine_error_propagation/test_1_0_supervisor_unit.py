@@ -49,6 +49,14 @@ class FakeEngine:
         self.closed_intentional = intentional
 
 
+class HangingCloseEngine(FakeEngine):
+    """An engine whose `close()` never returns."""
+
+    def close(self, *, intentional: bool = True):
+        self.closed_intentional = intentional
+        time.sleep(600)
+
+
 class FakeHandler:
     def __init__(self):
         self.record_count = 0
@@ -96,6 +104,22 @@ def test_close_is_marked_unintentional_when_the_run_already_failed():
     with pytest.raises(EngineFailure):
         run_engine_bounded(engine, FakeHandler(), _run_cfg())
     assert engine.closed_intentional is False
+
+
+def test_a_hanging_close_is_a_hang_not_a_success():
+    """Codex 11: `close()` used to run synchronously *before* the join.
+
+    So a hang inside `close()` never reached the join-based "hung" verdict, and
+    the advertised hang detector did not guard this path at all - the run would
+    simply never return. It now gets its own bounded supervision.
+    """
+    engine = HangingCloseEngine(run_seconds=1)
+    handler = FakeHandler()
+    handler.seconds_since_last_batch = 99
+    with pytest.raises(EngineFailure) as excinfo:
+        run_engine_bounded(engine, handler, _run_cfg(close_timeout=1))
+    assert "did not stop within" in str(excinfo.value)
+    assert excinfo.value.summary["stop_reason"] == "hung"
 
 
 def test_close_is_marked_intentional_on_a_clean_stop():
