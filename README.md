@@ -1,30 +1,44 @@
 # cdc_flight
 
 Change Data Capture from **PostgreSQL** to **MotherDuck** (and local DuckDB), built on the
-**Debezium embedded engine** driven from Python plus **dlt** for loading.
+**Debezium embedded engine** driven from Python plus a **transactional applier** that owns
+the destination transaction.
 
-The starting point is the dlthub post
+The starting point was the dlthub post
 [*Real-time Data Replication with Debezium and Python*](https://dlthub.com/blog/debezium-and-dlt),
-but this repo is meant to go a long way past it: the target is 5/5 on every item of a
-42-item Postgres-CDC decision matrix (delivery guarantees, schema evolution, backfills,
-failure recovery, latency, observability, PII controls). **This commit is the *baseline***
-— faithful to the blog, cleaned up and made testable, with the gaps documented rather
-than fixed. See [`research/NOTES.md`](research/NOTES.md) for the honest list.
+but this repo goes a long way past it: the target is 5/5 on every item of a Postgres-CDC
+decision matrix (delivery guarantees, schema evolution, backfills, failure recovery,
+latency, observability, PII controls).
+
+**Where it is now.** Rubric §1.1 (exactly-once, keyed tables), §1.2 (exactly-once, keyless
+tables) and §1.3 (multi-table atomic batches) are implemented and their target tests pass.
+The mechanism is one commit group = one destination `BEGIN … COMMIT` containing an integral
+number of *whole* Postgres transactions, with the Debezium resume point written **inside**
+that transaction and the connector acknowledged **only after** it commits. See
+[`docs/adr/0001-transactional-applier.md`](docs/adr/0001-transactional-applier.md).
+`dlt.pipeline.run()` is no longer in the apply path — it structurally cannot host the
+resume point in the destination transaction — but dlt remains as a *library*
+(`cdc_flight/naming.py`).
 
 ## Architecture
 
 ```
                   ┌──────────────────────────────────────────── one Python process ──┐
  PostgreSQL 18    │                                                                  │
- (local cluster,  │  JVM (JPype)                        Python                        │
-  :15432,         │  ┌────────────────────┐   batch of  ┌───────────────────┐         │
-  wal_level=      │  │ Debezium 3.6       │   JSON      │ DltChangeHandler  │         │
-  logical)        │  │ PostgresConnector  ├────────────▶│  → dlt.pipeline   │         │
-    │  WAL        │  │ plugin=pgoutput    │   events    └─────────┬─────────┘         │
-    └────────────▶│  │ ExtractNewRecord   │                       │                   │
+ (local cluster,  │  JVM (JPype)                       Python                         │
+  :15432,         │  ┌────────────────────┐  full      ┌──────────────────────┐       │
+  wal_level=      │  │ Debezium 3.6       │  envelope  │ TransactionAssembler │       │
+  logical)        │  │ PostgresConnector  ├───────────▶│   -> whole units     │       │
+    │  WAL        │  │ plugin=pgoutput    │  + BEGIN/  └──────────┬───────────┘       │
+    └────────────▶│  │ txn metadata ON    │    END                │ commit group      │
    replication    │  └────────────────────┘                       ▼                   │
-   slot +         │        ▲                              DuckDB file  /  MotherDuck  │
-   publication    │        └── offsets.dat (file-backed)                              │
+   slot +         │        ▲   ▲                        ┌──────────────────────┐      │
+   publication    │        │   └── offsets.dat          │ Applier: BEGIN .. .. │      │
+                  │        │       (scratch, rebuilt    │  apply, commit_log,  │      │
+                  │        │        from the table)     │  resume point COMMIT │      │
+                  │        │                            └──────────┬───────────┘      │
+                  │        └── markProcessed() AFTER the COMMIT    ▼                   │
+                  │            (Invariant O)             DuckDB file / MotherDuck     │
                   └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -113,24 +127,33 @@ One destination table per source table, named `<topic_prefix>_<schema>_<table>`:
 | `cdc_raw.cdcflight_app_wide_types` | `app.wide_types` |
 | `cdc_raw.cdcflight_app_audit_log` | `app.audit_log` (all partitions, via `publish_via_partition_root`) |
 
-Every row is the **flattened `after` image** plus Debezium metadata columns added by
-`ExtractNewRecordState`:
+Every row is the event's `after` image (or, for a delete, its `before` image) plus:
 
-| column | meaning |
-|---|---|
-| `dbz_op` | `r` snapshot read, `c` insert, `u` update, `d` delete |
-| `deleted` | `'true'` on delete rows (`delete.tombstone.handling.mode=rewrite`) |
-| `dbz_table`, `dbz_schema` | source identifiers |
-| `dbz_lsn`, `dbz_tx_id` | WAL position / Postgres transaction id |
-| `dbz_source_ts_ms`, `dbz_ts_ms` | commit time / Debezium processing time |
+| column | source | meaning |
+|---|---|---|
+| `cdcf_commit_id` | applier | which destination transaction made this row visible |
+| `cdcf_event_id` | applier | stable event identity, `"<lsn>:<txId>:<total_order>"` (or `"snap:<epoch>:<schema>.<table>:<n>"`) |
+| `cdcf_total_order` | envelope | ordinal within the Postgres transaction; NULL for snapshot rows |
+| `dbz_op` | envelope | `r` snapshot read, `c` insert, `u` update, `d` delete |
+| `dbz_table`, `dbz_schema` | envelope | source identifiers |
+| `dbz_lsn`, `dbz_tx_id` | envelope | WAL position / Postgres transaction id |
+| `dbz_source_ts_ms` | envelope | commit time |
 
-(Debezium's own default prefix is `__`, but dlt strips leading underscores, which would
-land the metadata as bare `op` / `table` / `schema`. We set
-`transforms.unwrap.add.fields.prefix=dbz_` instead. `deleted` is the one field Debezium
-does not apply that prefix to.)
+**Two write shapes, chosen per table by whether Debezium emits a message key:**
 
-Write disposition is **append** — the destination is a raw changelog, not a mirror.
-Collapsing it into current state is Phase 1/8 work.
+* **keyed tables** (a primary key or unique index exists) are **current state**. Within a
+  commit group every touched key is deleted and the group's final row per key is inserted,
+  which makes a primary-key update fall out as delete-old + insert-new with no special
+  case, and a delete a real delete.
+* **keyless tables** are an **append-only changelog keyed on `cdcf_event_id`**. Two
+  genuinely identical source rows are two different *events*, so both survive; a replayed
+  event recomputes the same id and is dropped. Nothing that deduplicates by row *content*
+  can do both, which is exactly what rubric 1.2 asks for.
+
+Alongside the data, the applier owns a `_cdc_flight` schema: `debezium_offsets` (the
+resume point, written inside the data transaction), `commit_log` (one row per destination
+transaction), `lease` (single-writer, rubric 4.2), `table_state`, `spill_events` and
+`alerts`.
 
 ## Testing
 
@@ -150,9 +173,12 @@ Measured on an M-series Mac. Only executed runs are reported here; see
 
 | suite | result | wall clock | measured |
 |---|---|---|---|
-| `make test` (local only) | 50 passed + 12 xfail | **294 s** | 2026-07-30 |
-| `make test-md` | 2 passed (+ 4 xfail after 1.3 landed) | ~35 s | 2026-07-30 (2 passed); the 1.3 MotherDuck variant is newer |
-| `make test-slow` | 3 passed | **219 s** | 2026-07-30 |
+| `make test` (local only) | **106 passed, 0 xfail** | **422 s** (7:01) | 2026-07-30, after the applier |
+| `make test-md` | see below | see below | 2026-07-30, after the applier |
+| `make test-slow` | see below | see below | 2026-07-30, after the applier |
+
+The xfail count is now zero because the 1.1/1.2/1.3 target tests pass; the gap pins they
+superseded were deleted, as each suite's README said they should be.
 
 Budget is 10 minutes for the default suite. The dominant cost is JVM startup plus the
 Debezium idle tail per pipeline invocation, so the suite is optimised by *sharing
@@ -233,7 +259,14 @@ cdc_flight/
 │   ├── engine.py                 # Debezium engine that cannot fail silently
 │   ├── errors.py                 # EngineFailure
 │   ├── faults.py                 # deterministic crash injection (test-only)
-│   ├── handler.py                # Debezium batch → dlt resources
+│   ├── envelope.py               # decode the full Debezium envelope
+│   ├── assembler.py              # TransactionAssembler: whole units only
+│   ├── applier.py                # commit groups, fence, snapshot swap, spill
+│   ├── apply_sql.py              # merge/DDL SQL inside the caller's transaction
+│   ├── destination.py            # _cdc_flight control schema + lease
+│   ├── offset_file.py            # read/write Debezium's offsets.dat
+│   ├── reconcile.py              # start-up decision table + Invariant-O guard
+│   ├── naming.py                 # dlt-as-a-library identifier normalisation
 │   ├── pipeline.py               # bounded runner + CLI entrypoint
 │   ├── datagen.py                # deterministic change generator
 │   └── inspect.py                # `make query`
@@ -272,10 +305,9 @@ The architecture that closes §1 of the rubric is decided in
 Summarised in [`research/NOTES.md`](research/NOTES.md) and scored in
 [`RUBRIC_STATUS.md`](RUBRIC_STATUS.md); the headline ones:
 
-* **At-least-once at best.** Debezium offsets live in `offsets.dat`, committed independently
-  of the dlt load. A crash between the two duplicates rows, and `append` means duplicates stay.
-* **No transactional boundaries.** Each Debezium batch becomes one or more dlt loads;
-  Postgres transactions are split arbitrarily.
+* ~~**At-least-once at best.**~~ **FIXED** by the transactional applier (rubric 1.1/1.2).
+* ~~**No transactional boundaries.**~~ **FIXED** — a commit group is an integral number of
+  whole Postgres transactions (rubric 1.3).
 * **`numeric` arrives base64-encoded** (Debezium `decimal.handling.mode=precise`) and
   temporal types arrive as integers (`time.precision.mode=adaptive`) — left at Debezium
   defaults on purpose so the type-mapping gap is measurable.

@@ -69,7 +69,10 @@ def test_snapshot_loads_into_motherduck(fresh_seed, run_pipeline, md_token, md_d
                 [md_dataset],
             ).fetchall()
         }
-        assert "cdcflight_app_customers" in tables, sorted(tables)
+        assert "cdcflight_app_customers" in tables, (
+            f"dataset {md_dataset!r} holds {sorted(tables)}; run summary="
+            f"{ {k: v for k, v in result.items() if k != 'output'} }"
+        )
 
         n, ops = con.execute(
             f'SELECT count(*), count(DISTINCT dbz_op) FROM "{MD_DATABASE}"."{md_dataset}".'

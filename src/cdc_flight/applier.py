@@ -853,11 +853,12 @@ class Applier:
                     json.dumps(event.key, default=str) if event.key else None,
                 ]
             )
-        self.con.executemany(
-            f"INSERT INTO {CONTROL_SCHEMA}.spill_events "
-            "(commit_id, unit_seq, event_seq, target_table, source_schema, source_table, "
-            " lsn, txn_id, total_order, cdcf_event_id, op, source_ts_ms, before_json, "
-            " after_json, key_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        apply_sql.bulk_insert(
+            self.con,
+            f"{CONTROL_SCHEMA}.spill_events",
+            ["commit_id", "unit_seq", "event_seq", "target_table", "source_schema",
+             "source_table", "lsn", "txn_id", "total_order", "cdcf_event_id", "op",
+             "source_ts_ms", "before_json", "after_json", "key_json"],
             rows,
         )
         self._spill_rows += len(rows)
