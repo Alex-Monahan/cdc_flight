@@ -155,6 +155,19 @@ def applier_settings() -> dict:
         #: rubric 1.5. `replicate` drops the destination table when the source table
         #: is gone; `log` records the marker only; `ignore` disables detection.
         "drop_mode": _env("CDC_DROP_MODE", DROP_REPLICATE).strip().lower(),
+        #: rubric 1.5 circuit breaker (Opus MAJOR-3 / Q2). A genuine single
+        #: `DROP TABLE` is the overwhelmingly common real case and stays fully
+        #: automatic; every plural case is either a schema-level migration
+        #: (`DROP SCHEMA … CASCADE`, `DROP SCHEMA; CREATE SCHEMA`) or a
+        #: misconfiguration (a DSN repointed at an empty database, a failover target,
+        #: a source mid-`pg_restore`), and both want a human. The whole set is
+        #: refused, never half of it.
+        "drop_max_per_group": int(_env("CDC_DROP_MAX_PER_POLL", "1")),
+        "drop_allow_mass": _flag("CDC_DROP_ALLOW_MASS", False),
+        #: Re-read the relation immediately before destroying its destination table,
+        #: and fail closed if the source cannot be asked (Codex 4). Off only for tests
+        #: that drive the coordinator without a real source.
+        "drop_revalidate": _flag("CDC_DROP_REVALIDATE", True),
     }
 
 
@@ -184,19 +197,42 @@ class CatalogConfig:
     poll_seconds: float = field(
         default_factory=lambda: float(_env("CDC_CATALOG_POLL_SECONDS", "10"))
     )
-    #: Emit `pg_logical_emit_message(false, …)` on the source after a change is
-    #: detected, so an LSN past the DDL is guaranteed to flow and the fence can open
-    #: (ADR 0001 D9). Writes go to the PRIMARY; with 7.2's replica reads this is the
-    #: same separate primary connection D9 already requires.
+    #: Emit a **transactional** `pg_logical_emit_message(true, …)` on the source after
+    #: a change is detected, so an LSN past the DDL is guaranteed to flow and the fence
+    #: can open (ADR 0001 D9; `cdc_flight.source_marker` records the measurement that
+    #: makes `true` load-bearing). Writes go to the PRIMARY; with 7.2's replica reads
+    #: this is the same separate primary connection D9 already requires.
     emit_marker: bool = field(default_factory=lambda: _flag("CDC_CATALOG_MARKER", True))
     marker_prefix: str = field(
-        default_factory=lambda: _env("CDC_CATALOG_MARKER_PREFIX", "cdcf_catalog")
+        default_factory=lambda: _env("CDC_CATALOG_MARKER_PREFIX", "cdcf")
     )
     #: 0 = never apply a DDL action the fence has not cleared. Anything else trades
     #: "the destination table might be re-created by an in-flight event" for
-    #: "the drop is applied even though the source cannot be written to".
+    #: "the drop is applied even though the source cannot be written to", and a
+    #: non-zero value is EXCLUDED from the structural correctness claim
+    #: (ADR 0001 §18/A38).
     grace_seconds: float = field(
         default_factory=lambda: float(_env("CDC_CATALOG_GRACE", "0"))
+    )
+    #: How many consecutive polls must agree before a DESTRUCTIVE change is queued at
+    #: all (Opus Q5). Costs at most one poll interval of latency on a real drop and
+    #: removes a whole class of transient-catalog and mid-DDL false positive.
+    confirm_polls: int = field(
+        default_factory=lambda: int(_env("CDC_DROP_CONFIRM_POLLS", "2"))
+    )
+    #: Cap on how many fence markers one run writes to the source while a destructive
+    #: change stays unresolved (Opus MINOR-1): a fence that never opens would
+    #: otherwise write one WAL record per poll for ever against a source cdc_flight
+    #: otherwise only reads. 0 = uncapped.
+    marker_max_writes: int = field(
+        default_factory=lambda: int(_env("CDC_CATALOG_MARKER_MAX", "60"))
+    )
+    #: How long a quiet run holds the engine open after its final catalog poll, so a
+    #: destructive change it just queued can be fenced and applied by THIS run rather
+    #: than the next one (Codex 6). A change still unresolved after this makes the run
+    #: non-successful.
+    drain_seconds: float = field(
+        default_factory=lambda: float(_env("CDC_CATALOG_DRAIN_SECONDS", "30"))
     )
 
 

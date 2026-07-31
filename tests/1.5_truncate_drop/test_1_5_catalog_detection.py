@@ -53,16 +53,36 @@ def kinds(changes) -> list[tuple[str, str]]:
     return [(c.kind, c.qualified) for c in changes]
 
 
+def confirmed(w: CatalogWatcher, observed: dict, lsn: int) -> list:
+    """Poll until a destructive observation is confirmed (`CDC_DROP_CONFIRM_POLLS`).
+
+    Returns the changes the *confirming* poll added, and asserts every poll before it
+    added nothing - a destructive action must not be queued on a single observation
+    (Opus Q5). The lsn advances between polls, exactly as a real source's would.
+    """
+    for attempt in range(w.confirm_polls - 1):
+        assert w._compare(observed, lsn=lsn + attempt) == [], (
+            f"poll {attempt + 1} of {w.confirm_polls} must not queue anything yet"
+        )
+    return w._compare(observed, lsn=lsn + w.confirm_polls - 1)
+
+
 # --------------------------------------------------------------------------- #
 # comparison
 # --------------------------------------------------------------------------- #
 def test_a_table_that_disappeared_is_a_drop():
     w = watcher(known=[relation("customers", 16384)], replicated=["app.customers"])
-    changes = w._compare({}, lsn=500)
+    changes = confirmed(w, {}, lsn=500)
     assert kinds(changes) == [(CHANGE_DROPPED, "app.customers")]
-    assert changes[0].detected_lsn == 500
+    assert changes[0].detected_lsn == 501
     assert changes[0].old_oid == 16384
-    assert "app.customers" not in w.known, "a dropped table is no longer known"
+    # The oid and the membership are deliberately KEPT while the action is pending: a
+    # queued drop can still be refused (guard 3) or cancelled (guard 2), and forgetting
+    # them made a cancelled drop indistinguishable from a table we never had. They are
+    # forgotten by `forget()`, which the applier calls only after the DROP has COMMITTED.
+    assert "app.customers" in w.known
+    w.forget("app.customers")
+    assert "app.customers" not in w.known
 
 
 def test_a_replicated_table_with_no_persisted_oid_that_is_gone_is_still_a_drop():
@@ -74,10 +94,11 @@ def test_a_replicated_table_with_no_persisted_oid_that_is_gone_is_still_a_drop()
     was never noticed at all.
     """
     w = watcher(replicated=["app.customers"])
-    changes = w._compare({}, lsn=900)
+    changes = confirmed(w, {}, lsn=900)
     assert kinds(changes) == [(CHANGE_DROPPED, "app.customers")]
     assert changes[0].old_oid is None
-    assert w._compare({}, lsn=901) == [], "and it is reported once, not every poll"
+    assert w._compare({}, lsn=910) == [], "and it is reported once, not every poll"
+    assert w._compare({}, lsn=911) == []
 
 
 def test_a_table_we_never_replicated_and_that_does_not_exist_is_not_a_drop():
@@ -87,7 +108,7 @@ def test_a_table_we_never_replicated_and_that_does_not_exist_is_not_a_drop():
 
 def test_the_same_name_with_a_new_oid_is_a_recreate():
     w = watcher(known=[relation("customers", 16384)], replicated=["app.customers"])
-    changes = w._compare({"app.customers": relation("customers", 99999)}, lsn=600)
+    changes = confirmed(w, {"app.customers": relation("customers", 99999)}, lsn=600)
     assert kinds(changes) == [(CHANGE_RECREATED, "app.customers")]
     assert (changes[0].old_oid, changes[0].new_oid) == (16384, 99999)
 
@@ -221,7 +242,7 @@ def test_a_relation_with_an_unapplied_change_is_excluded_from_persistence():
     oid before the recreate is applied would make the next run agree with the source
     and never notice the drop."""
     w = watcher(known=[relation("customers", 1)], replicated=["app.customers"])
-    w._compare({"app.customers": relation("customers", 2)}, lsn=1)
+    confirmed(w, {"app.customers": relation("customers", 2)}, lsn=1)
     assert [r.qualified for r in w.dirty()] == ["app.customers"]
     assert w.dirty(exclude={"app.customers"}) == []
 
@@ -261,7 +282,7 @@ def test_a_successful_marker_fences_every_pending_change():
     assert w.markers_emitted == 1
     sql, params = conn.calls[0]
     assert "pg_logical_emit_message(true" in sql
-    assert params[0] == "cdcf_catalog"
+    assert params[0] == "cdcf_catalog_fence", "the reason is in the prefix (Opus Q3)"
 
 
 def test_polling_can_be_switched_off():

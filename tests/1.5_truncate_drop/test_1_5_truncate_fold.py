@@ -52,11 +52,23 @@ def lab(tmp_path):
         box.close()
 
 
-def _watcher(**kw) -> CatalogWatcher:
-    """A watcher with polling disabled: the tests hand it changes directly."""
-    return CatalogWatcher(
+def _watcher(*, present: dict[str, int] | None = None, **kw) -> CatalogWatcher:
+    """A watcher with polling disabled: the tests hand it changes directly.
+
+    `present` is what guard 3's revalidation should see (`{"app.customers": 4711}`),
+    defaulting to "the relation really is gone". A watcher with no DSN cannot re-read
+    the source, and failing closed then refuses every drop - which is correct
+    behaviour and useless for testing the apply path, so the query is stubbed here and
+    exercised for real in `test_1_5_catalog_guards.py` and the e2e suite.
+    """
+    watcher = CatalogWatcher(
         dsn="", publication="pub", schema="app", include=set(), poll_seconds=0, **kw
     )
+    oids = dict(present or {})
+    watcher.relation_oids = lambda names: {  # type: ignore[method-assign]
+        f"{s}.{t}": oids.get(f"{s}.{t}") for s, t in names
+    }
+    return watcher
 
 
 def txn(number: str, events: list, per_table: dict[str, int] | None = None) -> list:
@@ -285,7 +297,7 @@ def test_a_recreated_table_drops_the_destination_and_says_why(lab):
     """Same name, new relation oid: the destination table holds the OLD table's rows
     and nothing about them is recoverable, so it goes. The marker records the oid
     change and that a re-snapshot is required (rubric 2.3/3.4)."""
-    watcher = _watcher()
+    watcher = _watcher(present={"app.customers": 99999})
     box = lab(catalog=watcher)
     preload(box)
     _queue(
@@ -301,6 +313,12 @@ def test_a_recreated_table_drops_the_destination_and_says_why(lab):
         "SELECT detail FROM _cdc_flight.table_events WHERE event = 'recreated'"
     )[0][0]
     assert "re-snapshot" in detail and "99999" in detail
+    # Opus Q1: the table is not silently re-accumulated by ordinary CDC. Its
+    # `table_state` row survives the drop carrying "this is incomplete".
+    assert box.q(
+        "SELECT snapshot_state FROM _cdc_flight.table_state WHERE source_table = 'customers'"
+    ) == [("awaiting_snapshot",)]
+    assert box.applier.stats()["tables_awaiting_snapshot"] == ["app.customers"]
 
 
 def test_a_dropped_table_raises_an_alert(lab):
@@ -326,11 +344,12 @@ def test_a_dropped_table_forgets_its_table_state_row(lab):
     watcher = _watcher()
     box = lab(catalog=watcher)
     preload(box)
-    box.con.execute(
-        "INSERT INTO _cdc_flight.table_state (pipeline, source_schema, source_table, "
-        "target_table) VALUES ('lab', 'app', 'customers', ?)",
-        [CUSTOMERS],
-    )
+    # No manual INSERT: streaming DML that creates a destination table now registers
+    # the ownership itself, inside the same transaction (Codex 5). That row is what
+    # makes a drop detectable after a restart, and it is what the drop removes.
+    assert box.q(
+        "SELECT target_table FROM _cdc_flight.table_state WHERE source_table = 'customers'"
+    ) == [(CUSTOMERS,)]
     _queue(
         watcher,
         CatalogChange(

@@ -518,10 +518,79 @@ def forget_table_state(con, *, pipeline: str, source_schema: str, source_table: 
     )
 
 
+class AlertSink:
+    """`_cdc_flight.alerts` on its **own** connection (ADR §9.1, Codex 7 / Opus M-2).
+
+    The comment at the call site used to say "deliberately NOT in this transaction"
+    while handing `raise_alert` the applier's own connection, with `BEGIN TRANSACTION`
+    open. It was therefore fully transactional and a rolled-back apply discarded it —
+    measured: inject `pre_commit:raise` after a detected drop and the DDL correctly
+    rolls back while `alerts` is empty. That is precisely the case §9.1 introduces the
+    alert for: a destructive change that keeps *failing* to apply (lease loss,
+    destination error, repeated crash) produced no signal at all.
+
+    `con.cursor()` is a separate connection to the same database, with its own
+    transaction context. VERIFIED on DuckDB 1.5.4: an INSERT on the cursor while the
+    parent connection holds an open write transaction succeeds, and survives the
+    parent's `ROLLBACK`. `alerts` is only ever written through this sink, so there is
+    no writer to conflict with.
+
+    If a destination cannot give us an independent connection, the sink degrades to
+    the caller's connection and says so in the row itself (`context.transactional`),
+    rather than silently labelling a same-connection insert non-transactional.
+    """
+
+    def __init__(self, con, *, pipeline: str):
+        self.pipeline = pipeline
+        self._main = con
+        self._sink = None
+        self.independent = False
+        try:
+            self._sink = con.cursor()
+            self.independent = True
+        except Exception:  # pragma: no cover - a destination without cursors
+            log.warning(
+                "could not open an independent connection for alerts; they will be "
+                "written inside the commit group's transaction and a rolled-back "
+                "apply will discard them",
+                exc_info=True,
+            )
+
+    def raise_alert(
+        self, *, severity: str, code: str, message: str, context=None
+    ) -> bool:
+        """Write one alert. Returns True if it went to the independent connection."""
+        payload = dict(context or {})
+        if not self.independent:
+            payload["transactional"] = True
+        con = self._sink if self.independent else self._main
+        try:
+            con.execute(
+                f"INSERT INTO {CONTROL_SCHEMA}.alerts "
+                "(pipeline, raised_at, severity, code, message, context) VALUES (?,?,?,?,?,?)",
+                [self.pipeline, now(), severity, code, message,
+                 json.dumps(payload, default=str) if payload else None],
+            )
+        except Exception:  # pragma: no cover - alerting must never mask the cause
+            log.warning("could not write alert %s", code, exc_info=True)
+            return False
+        log.warning("ALERT %s/%s: %s", severity, code, message)
+        return self.independent
+
+    def close(self) -> None:
+        if self._sink is not None:
+            with contextlib.suppress(Exception):
+                self._sink.close()
+            self._sink = None
+
+
 def raise_alert(con, *, pipeline: str, severity: str, code: str, message: str, context=None):
-    """Alerts are written on whatever connection is handy - deliberately not
-    transactional with the data (ADR §9.1: a signal that disappears when the
-    apply rolls back is the signal you need most)."""
+    """One-shot alert on a connection the caller owns.
+
+    Kept for callers outside a commit group (start-up, shutdown), where the
+    connection has no open transaction and a separate one buys nothing. Anything
+    inside a commit group must use `AlertSink`.
+    """
     try:
         con.execute(
             f"INSERT INTO {CONTROL_SCHEMA}.alerts "
@@ -531,6 +600,68 @@ def raise_alert(con, *, pipeline: str, severity: str, code: str, message: str, c
         )
     except Exception:  # pragma: no cover - alerting must never mask the cause
         log.warning("could not write alert %s", code, exc_info=True)
+
+
+def mark_awaiting_snapshot(
+    con,
+    *,
+    pipeline: str,
+    source_schema: str,
+    source_table: str,
+    target_table: str,
+    state: str,
+) -> None:
+    """Record that a table's destination data is gone and CDC cannot rebuild it.
+
+    Rubric 1.5 / Opus Q1. A `recreated` source relation means the destination table
+    held a *different* relation's rows: keeping them presents pre-drop data as
+    current, and dropping them and letting ordinary CDC re-create a partial table is
+    worse still, because the destination then looks healthy while being silently
+    incomplete. So the row survives the drop carrying `snapshot_state` — the run
+    summary and `inspect` surface it, and rubric 2.3/3.4's re-snapshot clears it.
+    """
+    con.execute(
+        f"DELETE FROM {CONTROL_SCHEMA}.table_state "
+        "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+        [pipeline, source_schema, source_table],
+    )
+    con.execute(
+        f"INSERT INTO {CONTROL_SCHEMA}.table_state "
+        "(pipeline, source_schema, source_table, target_table, snapshot_state) "
+        "VALUES (?,?,?,?,?)",
+        [pipeline, source_schema, source_table, target_table, state],
+    )
+
+
+def register_table(
+    con,
+    *,
+    pipeline: str,
+    source_schema: str,
+    source_table: str,
+    target_table: str,
+) -> None:
+    """Persist source-to-destination ownership, inside the transaction that creates it.
+
+    Codex 5: `table_state` is the canonical registry the catalog watcher seeds itself
+    from, and it used to be written only by the snapshot coordinator. A table first
+    materialised by streaming DML therefore had no durable row, so a `DROP TABLE`
+    while the pipeline was down left an orphan destination table that no later poll
+    could ever report — `_compare` skips a name it has no oid for and does not believe
+    is ours. Written by whoever creates the table, whatever the origin.
+    """
+    existing = con.execute(
+        f"SELECT 1 FROM {CONTROL_SCHEMA}.table_state "
+        "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+        [pipeline, source_schema, source_table],
+    ).fetchall()
+    if existing:
+        return
+    con.execute(
+        f"INSERT INTO {CONTROL_SCHEMA}.table_state "
+        "(pipeline, source_schema, source_table, target_table) VALUES (?,?,?,?)",
+        [pipeline, source_schema, source_table, target_table],
+    )
 
 
 # --------------------------------------------------------------------------- #
