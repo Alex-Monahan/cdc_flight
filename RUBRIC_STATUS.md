@@ -90,6 +90,39 @@ unchanged until each item is re-measured. Two things have moved underneath them:
   the deterministic crash point rather than the race.
 * **The architecture that closes §1 is decided** in
   [`docs/adr/0001-transactional-applier.md`](docs/adr/0001-transactional-applier.md).
+  **Revision 2** (after the dual review of TODO 1.0) withdrew the ordering
+  argument that the first revision's exactly-once proof rested on and replaced it
+  with **Invariant O** — Debezium's offset store must never contain an offset
+  that is not already durable in MotherDuck. See the ADR's revision history.
+* **TODO 1.0(feedback) — three correctness defects found by review were fixed in
+  code**, all of which change what a *measurement* of §4/§6 means:
+  1. `markBatchFinished()` can return normally without flushing (Debezium
+     discards `commitOffsets()`'s boolean). `src/cdc_flight/consumer.py` now
+     replaces pydbzengine's `ChangeConsumer` and raises `OffsetFlushFailed` if
+     `offsets.dat` did not move. `offset.flush.interval.ms` is 0 so a flush is
+     always expected. (`offset.commit.policy=…$AlwaysCommitOffsetPolicy` does
+     **not** work — Debezium requires a `(Properties)` constructor that class
+     does not have; measured.)
+  2. **Engine death still exited 0** on the retriable-restart path. Reproduced
+     under fault injection: walsender killed mid-stream ⇒ `ok: true`,
+     `records: 57 344 / 60 000`, `stop_reason: idle`, `EXIT=0`. The 8 s idle
+     timer is shorter than Debezium's 10 s restart backoff, so a reconnect looks
+     exactly like an idle stream. `src/cdc_flight/source_health.py` now requires
+     the slot to have been *continuously* held for the whole quiet window before
+     a run may be called idle. Pinned by
+     `tests/1.0_engine_error_propagation/test_1_0_supervisor_liveness.py`
+     (`slow`), which fails on the pre-fix code and passes on the fixed code.
+  3. An engine thread that returns on its own in streaming mode is now a
+     non-zero exit rather than `stop_reason: engine_finished, ok: true`.
+* **Measured slot signals** (60 000-row stream, 2026-07-30), recorded because the
+  idle detector and 6.1's lag metric both depend on them:
+  `pg_current_wal_lsn() - confirmed_flush_lsn` settles at **328–384 bytes** on a
+  healthy run, but **freezes ~1.8 MB behind and never recovers** after a
+  connector reconnect, even once every row has been delivered. So slot lag is a
+  usable *health* signal and a poor *completion* signal.
+  `pg_stat_replication.sent_lsn` is useless for progress here: it read 0–48 bytes
+  behind current WAL while `confirmed_flush_lsn` was 19 MB behind, because the
+  walsender had already pushed everything into Debezium's in-memory queue.
 
 Two measurements made while writing those tests are worth recording because they
 correct assumptions in the notes below:

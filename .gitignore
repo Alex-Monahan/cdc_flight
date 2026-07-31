@@ -41,3 +41,6 @@ probes/.out/
 # JVM crash dumps
 hs_err_pid*.log
 replay_pid*.log
+
+# Test-session mutex for the shared :15432 cluster (see tests/conftest.py)
+.pytest-source.lock

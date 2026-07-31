@@ -145,19 +145,26 @@ make test-all    # everything
 MotherDuck tests carry the `motherduck` marker and long fault-injection tests carry
 `slow`; both are deselected by `make test`.
 
-Measured on an M-series Mac (2026-07-30):
+Measured on an M-series Mac. Only executed runs are reported here; see
+`RUBRIC_STATUS.md` for the per-item evidence.
 
-| suite | tests | wall clock |
-|---|---|---|
-| `make test` (local only) | 22 passed + 6 xfail | **281 s** |
-| `make test-md` | 2 | **35 s** |
-| `make test-slow` | 2 | **142 s** |
+| suite | result | wall clock | measured |
+|---|---|---|---|
+| `make test` (local only) | see `RUBRIC_STATUS.md` for the current run | | |
+| `make test-md` | 2 passed | ~35 s | 2026-07-30 |
+| `make test-slow` | see `RUBRIC_STATUS.md` | | |
 
-Budget is 10 minutes for the whole suite. The dominant cost is JVM startup (~17 s
-including the destination connect) plus the Debezium idle tail per pipeline invocation,
-so the suite is optimised by *sharing scenarios*, not by running fewer assertions: the
-rubric gap suites build their scenario once per module (or, for `crash_replay`, once per
-session) and then interrogate it with many cheap tests.
+Budget is 10 minutes for the default suite. The dominant cost is JVM startup plus the
+Debezium idle tail per pipeline invocation, so the suite is optimised by *sharing
+scenarios*, not by running fewer assertions: the rubric gap suites build their scenario
+once per module (or, for `crash_replay`, once per session) and then interrogate it with
+many cheap tests.
+
+**One session at a time.** Every sandbox has its own slot, offsets and DuckDB file, but
+they all share the `app` schema and publication on :15432, and reseeding drops and
+recreates both. Two concurrent `make test` runs used to corrupt each other - that is what
+produced the 1.0 review's `assert 110 == 0`. A session-wide `flock` on
+`.pytest-source.lock` now serialises whole sessions; a second run waits and says so.
 
 ### Test layout and conventions
 
@@ -187,11 +194,25 @@ Three naming conventions carry meaning:
 (`probes/p07` lost that race outright). It is inert unless `CDC_FAULT_INJECT` is set:
 
 ```bash
-CDC_FAULT_INJECT=after_load:1 uv run cdc-flight --destination duckdb
+CDC_FAULT_INJECT=post_commit_pre_ack:1 uv run cdc-flight --destination duckdb
 ```
 
-`after_load:1` commits the first batch to the destination and then `os._exit`s the
-process *before* Debezium's offset is flushed — the exact at-least-once window.
+Fault points are named after the **transactional protocol**, not the current
+implementation, so they survive the ADR 0001 refactor:
+
+| point | meaning |
+|---|---|
+| `pre_commit` | applied to the destination inside an open transaction, not committed |
+| `post_commit_pre_ack` | destination committed, Debezium **not** acknowledged — the at-least-once window |
+| `post_ack` | `offsets.dat` flushed, the replication slot not yet confirmed |
+
+`<nth>` counts **data** batches only: batches containing nothing but Debezium heartbeats
+or transaction-metadata markers are not counted, because otherwise enabling
+`provide.transaction.metadata` would silently move every fault point by one and disarm
+the whole 1.1/1.2 suite. The action defaults to `os._exit(137)`; `:raise` instead raises,
+which exercises Debezium's error-teardown path. The spec is parsed and validated once at
+start-up, so a typo fails the run rather than leaving a fault test vacuously green.
+Legacy names `before_load` / `after_load` still work.
 
 The tests start the Postgres cluster themselves if it is not already up (session fixture
 `postgres_cluster`), reseed the schema, and give every test its own replication slot,
