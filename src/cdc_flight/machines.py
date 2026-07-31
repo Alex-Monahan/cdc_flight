@@ -200,6 +200,7 @@ OUTCOME_ORDER = (
     "engine_finished",     # the engine terminated on its own
     "hung",                # close() or the engine thread would not stop  <- symptom
     "catalog_unresolved",  # destructive DDL still unresolved at shutdown
+    "recovery_uncleared",  # a journalled rebuild is still armed at shutdown
     "source_dark",         # the source stopped answering                 <- cause
     "engine_error",        # the applier or the connector raised
     "error",               # anything that unwound through main()
@@ -212,9 +213,15 @@ RUN_OUTCOME = ranked(
     purpose="Why did this run stop? Cause before symptom, by construction.",
 )
 
-#: The outcomes that mean the run did not succeed. Everything from `engine_finished`
-#: up raises `EngineFailure` somewhere in `supervisor.run_engine_bounded`.
-OUTCOME_FAILURES = frozenset(OUTCOME_ORDER[OUTCOME_ORDER.index("engine_finished"):])
+#: The outcomes that mean the run did not succeed.
+#:
+#: `engine_finished` is deliberately NOT here (Codex r1 MAJOR-2). The engine
+#: terminating on its own is a *success* for a terminating snapshot mode
+#: (`initial_only`, `recovery_only`) and a failure otherwise, so severity alone cannot
+#: decide it: `supervisor.run_engine_bounded` knows which run it is and raises
+#: `EngineFailure` in the case that is one. Calling every `engine_finished` a failure
+#: made `RunOutcome.failed` disagree with the run's own verdict.
+OUTCOME_FAILURES = frozenset(OUTCOME_ORDER[OUTCOME_ORDER.index("hung"):])
 
 
 # --------------------------------------------------------------------------- #
@@ -269,6 +276,12 @@ CHANGE_DEFERRED = "deferred"
 CHANGE_REFUSED = "refused"
 
 _LIVE_CHANGE_STATES = (CHANGE_PENDING, CHANGE_MARKED, CHANGE_DEFERRED, CHANGE_REFUSED)
+
+#: The states in which a change is still the watcher's business: it has been queued,
+#: it has not reached a terminal state, and `CatalogWatcher.pending()` must return it.
+#: Exported because membership of the pending list IS this predicate (rubric 1.9) —
+#: the list is an ordering, the state is the meaning.
+LIVE_CHANGE_STATES = frozenset((*_LIVE_CHANGE_STATES, CHANGE_DUE))
 
 CATALOG_CHANGE = Machine(
     "catalog_change",

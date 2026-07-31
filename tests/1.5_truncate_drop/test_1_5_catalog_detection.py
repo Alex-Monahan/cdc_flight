@@ -176,7 +176,7 @@ def _pending(w: CatalogWatcher, lsn: int, **kw) -> CatalogChange:
     change = CatalogChange(
         kind=CHANGE_DROPPED, schema="app", table="customers", detected_lsn=lsn, **kw
     )
-    w._pending.append(change)
+    w.queue(change)
     return change
 
 
@@ -195,7 +195,7 @@ def test_a_non_destructive_change_needs_no_fence():
     """
     w = watcher()
     for kind in (CHANGE_NEW, CHANGE_UNPUBLISHED, CHANGE_REPUBLISHED):
-        w._pending.append(
+        w.queue(
             CatalogChange(kind=kind, schema="app", table="t", detected_lsn=10**9)
         )
     assert len(w.due(durable_lsn=0)) == 3

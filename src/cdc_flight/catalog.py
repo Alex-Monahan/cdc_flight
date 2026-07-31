@@ -65,7 +65,9 @@ from .machines import (
     CHANGE_PENDING,
     CHANGE_SUPERSEDED,
     CHANGE_UNCONFIRMED,
+    LIVE_CHANGE_STATES,
 )
+from .states import IllegalTransition, UnknownState
 
 log = logging.getLogger("cdc_flight.catalog")
 
@@ -141,41 +143,60 @@ class CatalogChange:
     detected_at: float = field(default_factory=time.monotonic)
     old_oid: int | None = None
     new_oid: int | None = None
-    #: True once a WAL marker has been emitted past `detected_lsn`, so the fence is
-    #: guaranteed to open. False means the source could not be written to.
-    #: Informational: the *behavioural* fence is `durable_lsn >= detected_lsn` in
-    #: `due()`, and the marker only guarantees that comparison will eventually be
-    #: satisfiable (Opus MINOR-2 - the old docstring claimed `fenced` gated the
-    #: action, which it never did).
-    fenced: bool = False
     #: how many times the applier has looked at this change and declined
     deferrals: int = 0
     #: consecutive polls that agreed with this observation before it was queued
     confirmations: int = 1
     #: rubric 1.9 (SM-D). Where this change is in the observe -> confirm -> fence ->
-    #: apply pipeline, as ONE named value. It used to be spread over four containers and
-    #: three counters (`_unconfirmed`, `_pending`, `refused`, `awaiting_snapshot`,
-    #: `fenced`, `deferrals`, `confirmations`), which is how `fenced` came to be
-    #: documented as gating an action it never gated (Opus MINOR-2). Memory only: a
-    #: lost pending change is re-detected on the next poll, which is correct, so
-    #: persisting it would buy nothing and would need a new durable domain.
+    #: apply pipeline, as ONE named value, and the value the rest of the module now
+    #: *asks* rather than re-derives: `CatalogWatcher.pending()` filters on it,
+    #: `fenced` is computed from it, and `_unconfirmed` holds the very object whose
+    #: state says `unconfirmed`. It used to be spread over four containers and three
+    #: counters, which is how `fenced` came to be documented as gating an action it
+    #: never gated (Opus MINOR-2) and how a live `due -> marked` event went undeclared
+    #: (Codex r1 MAJOR-1). Memory only: a lost pending change is re-detected on the
+    #: next poll, which is correct, so persisting it would buy nothing.
     state: str = CHANGE_OBSERVED
+
+    def __post_init__(self) -> None:
+        #: every state this change has actually been in, in order. `fenced` is read off
+        #: it rather than kept as a second flag that a caller has to remember to set.
+        self.history: list[str] = [self.state]
 
     @property
     def qualified(self) -> str:
         return f"{self.schema}.{self.table}"
+
+    @property
+    def fenced(self) -> bool:
+        """True once a WAL marker was emitted past `detected_lsn` for this change.
+
+        DERIVED from the state history, not a field anybody assigns (Codex r1 MAJOR-1):
+        `marked` is the state that means "a marker was written", so a second
+        representation of the same fact could only ever disagree with it. Informational
+        either way - the *behavioural* fence is `durable_lsn >= detected_lsn` in `due()`,
+        and the marker only guarantees that comparison will eventually be satisfiable
+        (Opus MINOR-2).
+        """
+        return CHANGE_MARKED in self.history
 
     def to(self, state: str) -> None:
         """Move through `machines.CATALOG_CHANGE`, asserting the edge. Idempotent.
 
         Loud on an undeclared edge, like every other machine here: this one carries no
         durable consequence, but a change that reached `applied` from somewhere nobody
-        declared is a destructive DDL nobody reasoned about.
+        declared is a destructive DDL nobody reasoned about. `CatalogWatcher.poll_quietly`
+        no longer swallows that failure into `last_error` - see `machine_error`.
         """
         if state == self.state:
             return
         CATALOG_CHANGE.check(self.state, state)
         self.state = state
+        self.history.append(state)
+
+    def can(self, state: str) -> bool:
+        """True if `-> state` is declared from where this change is now."""
+        return self.state == state or CATALOG_CHANGE.allows(self.state, state)
 
     def context(self) -> dict:
         return {
@@ -191,7 +212,7 @@ class CatalogChange:
 
 
 def _queued(change: CatalogChange) -> CatalogChange:
-    """Membership of `_pending` IS the `pending` state (rubric 1.9, SM-D).
+    """Normalise a directly-queued change to `pending` (rubric 1.9, SM-D).
 
     `_compare()` sets it when it extends the list, but a change can also be put there
     directly - the 1.5 suite constructs one and queues it so a destructive action can be
@@ -293,15 +314,29 @@ class CatalogWatcher:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._pending: list[CatalogChange] = []
+        #: Every change this run is still carrying, whatever state it is in. The
+        #: *state* decides what it is, not which container it sits in (rubric 1.9):
+        #: `pending()` filters on `_LIVE_CHANGE_STATES | {due}`, and a change that
+        #: reaches a terminal state is removed by `resolve()` / `_supersede()`.
+        self._changes: list[CatalogChange] = []
         #: relations whose `source_relations` row needs (re)writing
         self._dirty: dict[str, SourceRelation] = {}
-        #: `name -> ((kind, new_oid), consecutive polls that agreed)`
-        self._unconfirmed: dict[str, tuple[tuple[str, int | None], int]] = {}
+        #: `name -> the CatalogChange object that is in state `unconfirmed``.
+        #: It used to be `name -> ((kind, new_oid), count)` while the observation's own
+        #: object was thrown away and a *new* one constructed for the confirming poll -
+        #: so the declared `unconfirmed -> pending` edge described no object production
+        #: ever advanced (Codex r1 MAJOR-1). The same object now carries the streak.
+        self._unconfirmed: dict[str, CatalogChange] = {}
         self.polls = 0
         self.empty_polls = 0
         self.superseded = 0
         self.last_error: str | None = None
+        #: An undeclared state-machine transition or a state outside the domain. Kept
+        #: separate from `last_error` because the policy is different: a poll that could
+        #: not reach the source is transient and fails soft, while a catalog change that
+        #: moved along an edge nobody declared is a destructive DDL nobody reasoned
+        #: about. `supervisor.run_engine_bounded` fails the run on this one (A51 row 51).
+        self.machine_error: str | None = None
         self.last_lsn: int = 0
 
     @property
@@ -335,9 +370,23 @@ class CatalogWatcher:
                 return
 
     def poll_quietly(self) -> list[CatalogChange]:
-        """One poll that never raises. Fail soft, like `SourceHealth`."""
+        """One poll that never raises. Fail soft on the source, LOUD on the machine.
+
+        A source that cannot be reached is transient and the next poll fixes it. A
+        transition `machines.CATALOG_CHANGE` does not declare is not transient and is
+        not a poll failure: it means a DDL fact moved through this pipeline along a path
+        nobody designed, and the run must not report success on it (Codex r1 MAJOR-1).
+        It used to be caught here, written to `last_error`, and stepped over.
+        """
         try:
             return self.poll()
+        except (IllegalTransition, UnknownState) as illegal:
+            self.machine_error = f"{type(illegal).__name__}: {illegal}"
+            log.critical(
+                "catalog state machine violated during a poll; this run cannot be "
+                "reported successful: %s", self.machine_error,
+            )
+            return []
         except Exception as exc:  # pragma: no cover - exercised through the thread
             self.last_error = f"{type(exc).__name__}: {exc}"
             log.warning("catalog poll failed: %s", self.last_error)
@@ -424,7 +473,7 @@ class CatalogWatcher:
                 self.include
                 | self.replicated
                 | set(self.known)
-                | {c.qualified for c in self._pending if c.kind in DESTRUCTIVE}
+                | {c.qualified for c in self._live() if c.kind in DESTRUCTIVE}
             )
             for name in sorted(interesting):
                 if not name.startswith(f"{self.schema}."):
@@ -443,7 +492,14 @@ class CatalogWatcher:
                     # recreate looks like.
                     superseded.extend(self._supersede(name, CHANGE_DROPPED))
                     if previous is not None and current.oid == previous.oid:
-                        self._unconfirmed.pop(name, None)
+                        stale = self._unconfirmed.pop(name, None)
+                        if stale is not None:
+                            # The relation is unchanged, so whatever streak was building
+                            # describes a world that no longer exists. Cancelled through
+                            # the machine rather than dropped on the floor, so nothing is
+                            # left in a state nothing will ever advance.
+                            stale.to(CHANGE_SUPERSEDED)
+                            self.superseded += 1
                 else:
                     # And symmetrically: a relation that has since gone away makes a
                     # pending `recreated` stale. Its own drop is confirmed below.
@@ -451,7 +507,7 @@ class CatalogWatcher:
                 # AFTER supersession: a change this poll has just cancelled must not
                 # then suppress the change this poll should queue instead.
                 queued = any(
-                    c.qualified == name and c.kind in DESTRUCTIVE for c in self._pending
+                    c.qualified == name and c.kind in DESTRUCTIVE for c in self._live()
                 )
                 if previous is None:
                     if current is None:
@@ -529,7 +585,7 @@ class CatalogWatcher:
                     self._dirty[name] = current
             for change in added:
                 change.to(CHANGE_PENDING)
-            self._pending.extend(added)
+            self._changes.extend(added)
         for change in added:
             log.warning(
                 "source catalog change: %s %s (oid %s -> %s) detected at lsn %s after "
@@ -552,37 +608,60 @@ class CatalogWatcher:
         mid-DDL false positive at essentially no cost (Opus Q5). Returns the change once
         the streak is complete, `None` while it is still building; the streak resets
         whenever the *shape* of the observation changes. Held under `self._lock`.
+
+        **The object that ends up queued is the object the first poll observed**
+        (Codex r1 MAJOR-1). It used to build the streak in a side table of tuples and
+        throw the observation away, so the confirming poll constructed a *second* object
+        that went `observed -> pending` directly and the declared `unconfirmed ->
+        pending` edge described nothing production ever did. Carrying the same object
+        forward is what makes the confirmation half of SM-D a real machine: `detected_lsn`
+        is refreshed to the latest agreeing poll, because that is the LSN the fence has
+        to clear.
         """
         shape = (change.kind, change.new_oid)
         seen = self._unconfirmed.get(name)
-        if seen is not None and seen[0] != shape:
+        if seen is not None and (seen.kind, seen.new_oid) != shape:
+            # A different observation: the streak restarts, and the old object is
+            # cancelled rather than left dangling in a state nothing will advance.
+            seen.to(CHANGE_SUPERSEDED)
+            self.superseded += 1
             seen = None
-        count = (seen[1] if seen else 0) + 1
-        if count < self.confirm_polls:
+        if seen is None:
             change.to(CHANGE_UNCONFIRMED)
-            self._unconfirmed[name] = (shape, count)
+            tracked = change
+        else:
+            tracked = seen
+            tracked.confirmations += 1
+            tracked.detected_lsn = change.detected_lsn
+            tracked.to(CHANGE_UNCONFIRMED)  # `unconfirmed -> unconfirmed`, declared
+        if tracked.confirmations < self.confirm_polls:
+            self._unconfirmed[name] = tracked
             log.info(
                 "%s observed for %s (%s/%s confirming polls); not queued yet",
-                change.kind, name, count, self.confirm_polls,
+                tracked.kind, name, tracked.confirmations, self.confirm_polls,
             )
             return None
         self._unconfirmed.pop(name, None)
-        change.confirmations = count
-        return change
+        # `unconfirmed -> pending`: the edge an object now really takes. `_compare`
+        # moves it the rest of the way when it extends `_changes`.
+        return tracked
 
     def _supersede(self, name: str, *kinds: str) -> list[str]:
-        """Cancel pending changes of `kinds` for `name`. Caller holds the lock."""
-        keep = [
-            c for c in self._pending if not (c.qualified == name and c.kind in kinds)
+        """Cancel live changes of `kinds` for `name`. Caller holds the lock."""
+        cancelled = [
+            c for c in self._live() if c.qualified == name and c.kind in kinds
         ]
-        if len(keep) == len(self._pending):
+        unconfirmed = self._unconfirmed.get(name)
+        if unconfirmed is not None and unconfirmed.kind in kinds:
+            unconfirmed.to(CHANGE_SUPERSEDED)
+            self._unconfirmed.pop(name, None)
+            self.superseded += 1
+        if not cancelled:
             return []
-        kept = set(map(id, keep))
-        for change in self._pending:
-            if id(change) not in kept:
-                change.to(CHANGE_SUPERSEDED)
-        self.superseded += len(self._pending) - len(keep)
-        self._pending = keep
+        for change in cancelled:
+            change.to(CHANGE_SUPERSEDED)
+        self.superseded += len(cancelled)
+        self._changes = [c for c in self._changes if c.state in LIVE_CHANGE_STATES]
         return [name]
 
     def _change(self, kind, relation: SourceRelation, lsn: int, **oids) -> CatalogChange:
@@ -591,7 +670,17 @@ class CatalogWatcher:
         )
 
     def _emit_marker(self, conn, changes: list[CatalogChange]) -> None:
-        """Write a WAL record past the detected change, so the fence can open."""
+        """Write a WAL record past the detected change, so the fence can open.
+
+        **Only changes that are still waiting for their fence are moved to `marked`**
+        (Codex r1 MAJOR-1). A change the applier has already taken through `due()` is
+        still in the live list - `resolve()` removes it only after the COMMIT - and this
+        loop used to walk it back to `marked`, which `machines.CATALOG_CHANGE` does not
+        declare and which is meaningless anyway: its fence is already open. The real
+        polling thread reached that edge whenever a poll overlapped an applier that had
+        just asked what was due, and `poll_quietly` wrote the `IllegalTransition` to
+        `last_error` and carried on.
+        """
         payload = {"changes": [c.kind + ":" + c.qualified for c in changes]}
         if not self.marker.emit(conn, marker_mod.CATALOG_FENCE, payload):
             self.last_error = self.marker.last_error or (
@@ -599,9 +688,10 @@ class CatalogWatcher:
             )
             return
         with self._lock:
-            for change in self._pending:
-                change.fenced = True
-                _queued(change).to(CHANGE_MARKED)
+            for change in self._live():
+                queued = _queued(change)
+                if queued.can(CHANGE_MARKED):
+                    queued.to(CHANGE_MARKED)
 
     # -- what the applier asks ---------------------------------------------- #
     def due(self, durable_lsn: int) -> list[CatalogChange]:
@@ -613,7 +703,7 @@ class CatalogWatcher:
         """
         out: list[CatalogChange] = []
         with self._lock:
-            for change in self._pending:
+            for change in self._live():
                 _queued(change)
                 if change.kind not in DESTRUCTIVE:
                     change.to(CHANGE_DUE)
@@ -646,17 +736,41 @@ class CatalogWatcher:
         return out
 
     def resolve(self, changes: list[CatalogChange]) -> None:
+        """Drop changes that have reached a terminal state. Caller has COMMITted."""
         with self._lock:
             done = set(map(id, changes))
-            self._pending = [c for c in self._pending if id(c) not in done]
+            self._changes = [c for c in self._changes if id(c) not in done]
+
+    def queue(self, change: CatalogChange) -> CatalogChange:
+        """Put a change into the queue by taking the `observed -> pending` EDGE.
+
+        The one way in, for `_compare` and for the 1.5 suite alike. Appending to the
+        list without moving the state was how "it is in the pending list but its state
+        says `observed`" became representable, and a distinction with no meaning is
+        exactly what rubric 1.9 is about (Codex r1 MAJOR-1).
+        """
+        with self._lock:
+            if change.state in (CHANGE_OBSERVED, CHANGE_UNCONFIRMED):
+                change.to(CHANGE_PENDING)
+            self._changes.append(change)
+        return change
+
+    def _live(self) -> list[CatalogChange]:
+        """The changes whose STATE says they are still this watcher's business.
+
+        The list is an ordering; the state is the meaning (rubric 1.9). Filtering here
+        rather than trusting membership is what stops a change that was superseded or
+        applied from being re-queued by a poll that happens to still see it.
+        """
+        return [c for c in self._changes if c.state in LIVE_CHANGE_STATES]
 
     def pending(self) -> list[CatalogChange]:
         with self._lock:
-            return list(self._pending)
+            return self._live()
 
     def pending_destructive(self) -> list[CatalogChange]:
         with self._lock:
-            return [c for c in self._pending if c.kind in DESTRUCTIVE]
+            return [c for c in self._live() if c.kind in DESTRUCTIVE]
 
     def dirty(self, *, exclude: set[str] | None = None) -> list[SourceRelation]:
         """Relations whose persisted row is stale, minus `exclude`. Non-destructive.
@@ -680,7 +794,10 @@ class CatalogWatcher:
         with self._lock:
             self.known.pop(name, None)
             self._dirty.pop(name, None)
-            self._unconfirmed.pop(name, None)
+            stale = self._unconfirmed.pop(name, None)
+            if stale is not None:
+                stale.to(CHANGE_SUPERSEDED)
+                self.superseded += 1
             self.replicated.discard(name)
 
     def observe_replicated(self, names: set[str]) -> None:
@@ -690,9 +807,12 @@ class CatalogWatcher:
 
     def summary(self) -> dict:
         with self._lock:
-            pending = list(self._pending)
+            pending = self._live()
         return {
             "catalog_polls": self.polls,
+            # An undeclared SM-D edge. `None` on every healthy run; when it is set the
+            # supervisor refuses to call the run successful (A51 row 51).
+            "catalog_machine_error": self.machine_error,
             "catalog_empty_polls": self.empty_polls,
             "catalog_markers": self.marker.writes,
             "catalog_pending": len(pending),

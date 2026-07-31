@@ -33,6 +33,7 @@ from cdc_flight.catalog import (
     CatalogChange,
     CatalogWatcher,
 )
+from cdc_flight.machines import CHANGE_MARKED
 
 CUSTOMERS = "cdcflight_app_customers"
 ORDERS = "cdcflight_app_orders"
@@ -246,7 +247,7 @@ def test_an_unknown_truncate_mode_is_refused(tmp_path):
 # applying a detected drop
 # --------------------------------------------------------------------------- #
 def _queue(watcher: CatalogWatcher, change: CatalogChange) -> None:
-    watcher._pending.append(change)
+    watcher.queue(change)
 
 
 def test_a_dropped_table_is_dropped_at_the_destination(lab):
@@ -257,7 +258,7 @@ def test_a_dropped_table_is_dropped_at_the_destination(lab):
         watcher,
         CatalogChange(
             kind=CHANGE_DROPPED, schema="app", table="customers",
-            detected_lsn=100, old_oid=16384, fenced=True,
+            detected_lsn=100, old_oid=16384, state=CHANGE_MARKED,
         ),
     )
     box.run(txn("2", [keyed("2", 1, 300, 9, "unrelated", table="orders")]))
@@ -278,7 +279,7 @@ def test_a_drop_is_not_applied_before_the_destination_reaches_the_detected_lsn(l
         watcher,
         CatalogChange(
             kind=CHANGE_DROPPED, schema="app", table="customers",
-            detected_lsn=10_000, old_oid=16384, fenced=True,
+            detected_lsn=10_000, old_oid=16384, state=CHANGE_MARKED,
         ),
     )
     box.run(txn("2", [keyed("2", 1, 300, 9, "unrelated", table="orders")]))
@@ -304,7 +305,7 @@ def test_a_recreated_table_drops_the_destination_and_says_why(lab):
         watcher,
         CatalogChange(
             kind=CHANGE_RECREATED, schema="app", table="customers",
-            detected_lsn=50, old_oid=16384, new_oid=99999, fenced=True,
+            detected_lsn=50, old_oid=16384, new_oid=99999, state=CHANGE_MARKED,
         ),
     )
     box.run(txn("2", [keyed("2", 1, 300, 9, "unrelated", table="orders")]))
@@ -332,7 +333,7 @@ def test_a_dropped_table_raises_an_alert(lab):
         watcher,
         CatalogChange(
             kind=CHANGE_DROPPED, schema="app", table="customers",
-            detected_lsn=100, old_oid=1, fenced=True,
+            detected_lsn=100, old_oid=1, state=CHANGE_MARKED,
         ),
     )
     box.run(txn("2", [keyed("2", 1, 300, 9, "unrelated", table="orders")]))
@@ -354,7 +355,7 @@ def test_a_dropped_table_forgets_its_table_state_row(lab):
         watcher,
         CatalogChange(
             kind=CHANGE_DROPPED, schema="app", table="customers",
-            detected_lsn=100, old_oid=1, fenced=True,
+            detected_lsn=100, old_oid=1, state=CHANGE_MARKED,
         ),
     )
     box.run(txn("2", [keyed("2", 1, 300, 9, "unrelated", table="orders")]))
@@ -371,7 +372,7 @@ def test_drop_mode_log_keeps_the_destination_table(lab):
         watcher,
         CatalogChange(
             kind=CHANGE_DROPPED, schema="app", table="customers",
-            detected_lsn=100, old_oid=1, fenced=True,
+            detected_lsn=100, old_oid=1, state=CHANGE_MARKED,
         ),
     )
     box.run(txn("2", [keyed("2", 1, 300, 9, "unrelated", table="orders")]))
@@ -392,7 +393,7 @@ def test_an_unpublished_table_is_never_dropped(lab):
         watcher,
         CatalogChange(
             kind=CHANGE_UNPUBLISHED, schema="app", table="customers",
-            detected_lsn=100, old_oid=1, new_oid=1, fenced=True,
+            detected_lsn=100, old_oid=1, new_oid=1, state=CHANGE_MARKED,
         ),
     )
     box.run(txn("2", [keyed("2", 1, 300, 9, "unrelated", table="orders")]))
@@ -411,7 +412,7 @@ def test_a_rolled_back_drop_stays_pending(lab, monkeypatch):
         watcher,
         CatalogChange(
             kind=CHANGE_DROPPED, schema="app", table="customers",
-            detected_lsn=100, old_oid=1, fenced=True,
+            detected_lsn=100, old_oid=1, state=CHANGE_MARKED,
         ),
     )
     nth = box.applier.data_commit_groups + 1

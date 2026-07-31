@@ -41,6 +41,7 @@ def run_engine_bounded(
     catalog_drain_seconds: float = 30.0,
     stop_when=None,
     phases=None,
+    outcome: RunOutcome | None = None,
 ) -> dict:
     """Run the Debezium engine until the *source* agrees it is idle, or the deadline hits.
 
@@ -77,6 +78,12 @@ def run_engine_bounded(
     `phases` is an optional `run_state.RunPhaseWriter`: the supervisor owns exactly one
     phase transition, `streaming -> draining`, because this is the only place that knows
     when the engine stopped producing and started shutting down.
+
+    `outcome` is the run's **one** `RunOutcome`. It used to be constructed here while
+    `RunPhaseWriter` constructed a second, unrelated one, so `last_run.json` shipped
+    `stop_reason="idle"` next to `run_outcome="max_seconds"` on ordinary successful runs
+    and the two owners could disagree about how badly a run had gone (Codex r1 MAJOR-2).
+    The caller passes `phases.outcome`; the default keeps this function usable alone.
     """
     started = time.monotonic()
     error_box: list[BaseException] = []
@@ -94,8 +101,9 @@ def run_engine_bounded(
     thread.start()
 
     # rubric 1.9: a precedence, not a string. `record()` keeps the most severe value it
-    # has been given, so no later assignment can overwrite an earlier diagnosis.
-    outcome = RunOutcome("max_seconds")
+    # has been given, so no later assignment can overwrite an earlier diagnosis. ONE
+    # per run, shared with the phase writer that publishes it (Codex r1 MAJOR-2).
+    outcome = outcome if outcome is not None else RunOutcome("max_seconds")
     idle_blocked_by_source = 0
     source_dark_after: float | None = None
     close_hung = False
@@ -309,6 +317,22 @@ def run_engine_bounded(
                 f"{health.unknown_for:.1f}s ({health.summary()})",
                 summary,
             )
+
+    if catalog is not None and getattr(catalog, "machine_error", None):
+        # A51 row 51, as a policy rather than a promise. A catalog change that moved
+        # along an edge `machines.CATALOG_CHANGE` does not declare is a destructive DDL
+        # nobody reasoned about; `poll_quietly` used to write it to `last_error` and let
+        # the run report success (Codex r1 MAJOR-1).
+        outcome.record("engine_error")
+        summary["stop_reason"] = outcome.value
+        summary["catalog_machine_error"] = catalog.machine_error
+        raise EngineFailure(
+            "the source-catalog state machine took an undeclared transition during "
+            f"this run ({catalog.machine_error}); a DDL fact moved through the "
+            "observe -> confirm -> fence -> apply pipeline along a path nobody "
+            "declared, so this run is not a success (ADR 0001 §19/A51 row 51)",
+            summary,
+        )
 
     if catalog is not None:
         still_pending = [c.qualified for c in catalog.pending_destructive()]

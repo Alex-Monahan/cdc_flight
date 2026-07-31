@@ -199,7 +199,7 @@ def _watcher_with_pending(polls: list) -> CatalogWatcher:
     w = CatalogWatcher(
         dsn="", publication="pub", schema="app", include=set(), poll_seconds=0
     )
-    w._pending.append(
+    w.queue(
         CatalogChange(kind=CHANGE_DROPPED, schema="app", table="gone", detected_lsn=10**9)
     )
     w.poll_quietly = lambda: polls.append(1) or []  # type: ignore[method-assign]
@@ -254,7 +254,7 @@ def test_a_marker_failure_is_preserved_in_the_summary():
     w = CatalogWatcher(
         dsn="", publication="pub", schema="app", include=set(), poll_seconds=0
     )
-    w._pending.append(
+    w.queue(
         CatalogChange(kind=CHANGE_DROPPED, schema="app", table="gone", detected_lsn=1)
     )
 
@@ -262,7 +262,7 @@ def test_a_marker_failure_is_preserved_in_the_summary():
         def execute(self, *_args):
             raise RuntimeError("cannot write to a read-only source")
 
-    w._emit_marker(Broken(), w._pending)
+    w._emit_marker(Broken(), w.pending())
     summary = w.summary()
     assert summary["catalog_marker_error"]
     assert summary["catalog_marker_capable"] is False
