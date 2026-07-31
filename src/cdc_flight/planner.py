@@ -1,0 +1,375 @@
+"""One commit group's table mutations: fold every unit, then write every table.
+
+This module exists because the truncate defect Codex found was **structural**, not a
+missing branch. There used to be two dispatchers: in-memory events entered through
+the applier's `_collect()`, which applied `CDC_TRUNCATE_MODE`, appended the audit
+marker and moved the counters, while staged (spilled) events were loaded straight
+into the level *below* that and unconditionally emptied the table. Storage mode
+therefore changed semantics: `truncate_mode=log` under spill emptied the table,
+and no storage-mode-crossing test existed to notice.
+
+So there is exactly one entry point now — `GroupPlan.add_unit()` — and it does not
+know or care whether a unit's events arrived in memory or came back out of
+`_cdc_flight.spill_events`. `SpillBuffer` decides where bytes live. Nothing else.
+
+The plan is also where rubric 1.4's attribution question is *answered* rather than
+asked: `table_work` folds physical rows and asks this module two things about the
+destination (`start_exists`, `start_matches`), both only where two rows compete for
+one key. They run during the fold, before the group has issued any DELETE or INSERT
+for the table, so what they read is genuinely the pre-group state.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from . import apply_sql, naming, table_work
+from .assembler import UNIT_CONTROL, UNIT_SNAPSHOT_CHUNK, CompleteUnit
+from .config import TRUNCATE_REPLICATE
+from .envelope import KIND_TRUNCATE, PendingRecord
+from .snapshot import SnapshotTable
+from .table_work import TableWork
+
+log = logging.getLogger("cdc_flight.planner")
+
+
+class GroupPlan:
+    """Everything one commit group does to the data tables.
+
+    Built empty, fed whole units in group order, then written. It owns the shared
+    `work` map (one `TableWork` per destination table), the truncate policy and the
+    truncate audit; it owns no transaction and no acknowledgement.
+    """
+
+    def __init__(
+        self,
+        con,
+        *,
+        commit_id: int,
+        registry_of,
+        snapshots,
+        spill,
+        truncate_mode: str,
+        created_in_txn: set[str],
+    ):
+        self.con = con
+        self.commit_id = commit_id
+        #: a callable: `_rollback_quietly` rebuilds the registry, so a captured
+        #: reference would be a stale cache of a rolled-back CREATE.
+        self._registry_of = registry_of
+        self.snapshots = snapshots
+        self.spill = spill
+        self.truncate_mode = truncate_mode
+        self.created_in_txn = created_in_txn
+
+        self.work: dict[str, TableWork] = {}
+        self.stats: dict = {
+            "events": 0,
+            "tables": set(),
+            "first_txn_id": None,
+            "last_txn_id": None,
+            "first_lsn": None,
+            "last_lsn": None,
+            "max_source_ts": None,
+        }
+        #: `_cdc_flight.table_events` rows this plan produced, in source order
+        self.table_events: list[dict] = []
+        #: source tables this plan actually wrote, for the catalog watcher
+        self.source_tables: set[str] = set()
+        #: `target -> (source_schema, source_table)` for tables created by this plan
+        self.created_tables: dict[str, tuple[str, str]] = {}
+        self.truncates_applied = 0
+        self.truncates_logged = 0
+        self.staged_units = False
+        self.table_counts: dict[str, int] = {}
+        self._swaps: list[SnapshotTable] = []
+        self._swap_all = False
+
+    @property
+    def registry(self):
+        return self._registry_of()
+
+    # ------------------------------------------------------------------ #
+    # folding
+    # ------------------------------------------------------------------ #
+    def add_unit(self, unit: CompleteUnit) -> None:
+        """Fold one whole unit — staged prefix first, then its in-memory tail.
+
+        A unit that spills keeps accumulating an in-memory tail after the spill, so
+        its staged rows are *earlier* in source order than its own tail, and a group
+        can hold `unit1 (spilled + tail), unit2 (wholly in memory)` whose correct
+        order interleaves the two representations (Opus B-1). One ordered pass is the
+        only arrangement that is right in every case.
+        """
+        if unit.kind == UNIT_CONTROL:
+            return
+        snapshot_state = None
+        if unit.kind == UNIT_SNAPSHOT_CHUNK:
+            snapshot_state = self.snapshots.state_for(unit.schema, unit.table)
+
+        if unit.spill_unit_seq is not None:
+            self.staged_units = True
+            for staged in self.spill.load(
+                commit_id=self.commit_id, unit_seq=unit.spill_unit_seq
+            ):
+                self._collect(
+                    staged.event,
+                    snapshot=snapshot_state,
+                    target=staged.target,
+                    event_id=staged.event_id,
+                )
+        for event in unit.events:
+            self._collect(event, snapshot=snapshot_state)
+
+        if unit.kind == UNIT_SNAPSHOT_CHUNK:
+            if unit.snapshot_last_for_table and snapshot_state is not None:
+                self._swaps.append(snapshot_state)
+            if unit.snapshot_last:
+                self._swap_all = True
+            return
+
+        # The source transaction has ended. Every key must be back to at most one row
+        # (a deferred constraint relaxes uniqueness only *inside* a transaction), and
+        # that assertion is what makes the fold source-transaction-preserving rather
+        # than merely group-wide (Codex 1).
+        for item in self.work.values():
+            table_work.end_transaction(item)
+        if unit.txn_id:
+            self.stats["first_txn_id"] = self.stats["first_txn_id"] or unit.txn_id
+            self.stats["last_txn_id"] = unit.txn_id
+
+    def _collect(
+        self,
+        event: PendingRecord,
+        *,
+        snapshot: SnapshotTable | None,
+        target: str | None = None,
+        event_id: str | None = None,
+    ) -> None:
+        """The one canonical dispatcher for one event, in either storage mode.
+
+        `target`/`event_id` are supplied for a staged event (they were decided when it
+        was staged and must not be recomputed — that is what gave a replay a different
+        identity, Codex 4) and derived here otherwise.
+        """
+        if not event.schema or not event.table:
+            return
+        if target is None:
+            target = (
+                snapshot.shadow
+                if snapshot is not None
+                else self.snapshots.target_table(event.schema, event.table)
+            )
+        self._count_event(event)
+        if event.kind == KIND_TRUNCATE:
+            self._truncate(event, target, snapshot=snapshot)
+            return
+        if event_id is None:
+            event_id = (
+                self.snapshots.event_id(event)
+                if snapshot is not None
+                else stream_event_id(event)
+            )
+        item = table_work.work_for(self.work, target, event, snapshot is not None)
+        row = table_work.row_for(event, self.commit_id, event_id, snapshot=item.snapshot)
+        table_work.collect(item, event, row, event_id, probe=self)
+        self.source_tables.add(f"{event.schema}.{event.table}")
+
+    def _count_event(self, event: PendingRecord) -> None:
+        """Group-level bookkeeping every event contributes to, whatever it is.
+
+        Truncates included: the event happened whatever policy does with it, so it
+        counts towards the group's event total and its LSN window either way. Doing
+        this in one place is what stopped the staged path from under-reporting
+        `table_counts` and `commit_log.max_source_ts` (Opus MINOR-1).
+        """
+        self.stats["events"] += 1
+        if event.lsn:
+            self.stats["first_lsn"] = self.stats["first_lsn"] or event.lsn
+            self.stats["last_lsn"] = event.lsn
+        if event.source_ts_ms:
+            self.stats["max_source_ts"] = max(
+                self.stats["max_source_ts"] or 0, event.source_ts_ms
+            )
+
+    def _truncate(
+        self, event: PendingRecord, target: str, *, snapshot: SnapshotTable | None
+    ) -> None:
+        """Fold one `op="t"` event (rubric 1.5).
+
+        A truncate is a table-level fact, so it always produces a `table_events`
+        marker; whether it also empties the destination table is `truncate_mode`.
+        `log` keeps the rows on purpose - that is the rubric's "handled with
+        tombstones / soft delete" behaviour, and it is the only sane setting for a
+        destination whose consumers treat the table as an append-only log.
+        """
+        replicate = self.truncate_mode == TRUNCATE_REPLICATE
+        marker = {
+            "event": "truncate",
+            "source_schema": event.schema,
+            "source_table": event.table,
+            "target_table": target,
+            "applied": replicate,
+            "lsn": event.lsn,
+            "txn_id": event.txn_id,
+            "detail": None if replicate else f"truncate_mode={self.truncate_mode}",
+        }
+        self.table_events.append(marker)
+        if not replicate:
+            self.truncates_logged += 1
+            return
+        item = table_work.work_for(self.work, target, event, snapshot is not None)
+        table_work.truncate(item)
+        self.stats["tables"].add(target)
+        self.truncates_applied += 1
+        # Positional, resolved in `write()`: the marker records what *this* truncate
+        # removed, not what the table plan ended up looking like (Codex 2).
+        marker["item"] = item
+        marker["truncate_ordinal"] = item.truncates - 1
+
+    # ------------------------------------------------------------------ #
+    # the destination probe (rubric 1.4)
+    # ------------------------------------------------------------------ #
+    def start_exists(self, item: TableWork, key: tuple) -> bool:
+        """Does the destination hold a row under `key`, from before this group?"""
+        table = self._probe_table(item)
+        if table is None:
+            return False
+        predicate, params = self._key_predicate(table, item, key)
+        found = self.con.execute(
+            f"SELECT 1 FROM {table.qualified} WHERE {predicate} LIMIT 1", params
+        ).fetchone()
+        return found is not None
+
+    def start_matches(self, item: TableWork, key: tuple, image: dict) -> bool | None:
+        """Is the destination's row under `key` the one `image` describes?
+
+        Compared **at the destination**, with every value bound to the destination
+        column's own type: a Python comparison of a Debezium JSON value against a
+        value that has been through DuckDB's type system is not a comparison. `None`
+        means "no column of the image can be compared", which is not an answer and
+        must not be read as one.
+        """
+        table = self._probe_table(item)
+        if table is None:
+            return None
+        predicate, params = self._key_predicate(table, item, key)
+        comparable = 0
+        for column, value in image.items():
+            column_type = table.columns.get(column)
+            if column_type is None:
+                continue
+            comparable += 1
+            predicate += f" AND {naming.quote(column)} IS NOT DISTINCT FROM ?"
+            params.append(apply_sql.bind(value, column_type))
+        if not comparable:
+            return None
+        found = self.con.execute(
+            f"SELECT 1 FROM {table.qualified} WHERE {predicate} LIMIT 1", params
+        ).fetchone()
+        return found is not None
+
+    def _probe_table(self, item: TableWork):
+        """The destination table to probe, or None when there is nothing to read.
+
+        A snapshot writes into a shadow this transaction created and carries no
+        deletes; a table created inside this transaction is empty by construction.
+        """
+        if item.snapshot or item.target in self.created_in_txn or not item.key_columns:
+            return None
+        table = self.registry.get(item.target)
+        return table if table.exists else None
+
+    def _key_predicate(self, table, item: TableWork, key: tuple) -> tuple[str, list]:
+        predicate = " AND ".join(
+            f"{naming.quote(column)} IS NOT DISTINCT FROM ?" for column in item.key_columns
+        )
+        params = [
+            apply_sql.bind(value, table.columns.get(column, apply_sql.VARCHAR))
+            for column, value in zip(item.key_columns, key, strict=False)
+        ]
+        return predicate, params
+
+    # ------------------------------------------------------------------ #
+    # writing
+    # ------------------------------------------------------------------ #
+    def write(self, *, after_first_table=None) -> dict:
+        """Apply every table's plan, then the snapshot swaps. Returns the stats.
+
+        `after_first_table` is the `mid_apply` fault anchor: "some tables written,
+        others not", which is the one interleaving rubric 1.3 is about, so it has to
+        fire *between* two `table_work.write()` calls (Codex 6).
+        """
+        for index, item in enumerate(self.work.values()):
+            table_work.write(self.con, self.registry, item, self.created_in_txn)
+            if (
+                not item.snapshot
+                and item.source_schema
+                and item.target in self.created_in_txn
+            ):
+                # Codex 5: destination ownership has to be persisted by whoever first
+                # materialises the table, snapshot or streaming, or a table that only
+                # ever existed through streaming DML has no durable `table_state` row
+                # and a DROP while the pipeline is down is never detected.
+                self.created_tables[item.target] = (item.source_schema, item.source_table)
+            if index == 0 and after_first_table is not None:
+                after_first_table()
+            if item.events:
+                self.stats["tables"].add(item.target)
+                self.table_counts[item.target] = (
+                    self.table_counts.get(item.target, 0) + item.events
+                )
+
+        if self.staged_units:
+            self.spill.clear(self.commit_id)
+
+        swaps = self.snapshots.states() if self._swap_all else self._swaps
+        for state in swaps:
+            if self.snapshots.swap(
+                state, commit_id=self.commit_id, snapshot_lsn=self.stats.get("last_lsn")
+            ):
+                self.stats["tables"].add(state.target)
+        return self.stats
+
+    def markers(self) -> list[dict]:
+        """The `table_events` rows, with `rows_removed` frozen per truncate.
+
+        Called after `write()`, and it resolves each truncate marker positionally
+        against its own plan rather than reading one mutable field: two truncates in
+        one transaction used to report the same number (Codex 2).
+        """
+        out: list[dict] = []
+        for marker in self.table_events:
+            row = dict(marker)
+            item = row.pop("item", None)
+            ordinal = row.pop("truncate_ordinal", None)
+            removed = None
+            if item is not None and ordinal is not None:
+                counts = item.truncate_rows_removed
+                removed = counts[ordinal] if ordinal < len(counts) else None
+            row["rows_removed"] = removed
+            out.append(row)
+        return out
+
+
+def stream_event_id(event: PendingRecord) -> str:
+    """`"<event lsn>:<source.txId>:<transaction.total_order>"` (ADR §6, §15/A3).
+
+    The **event's own** LSN, not the transaction's commit LSN (ADR §15/A3 records
+    the change; this docstring and `apply_sql`'s used to say "commit lsn" —
+    Opus MINOR-14).
+
+    `total_order` is the connector's own 1-based ordinal within the transaction, so
+    it is stable across a replay of the same WAL: a resume point can only ever sit
+    on a transaction boundary, so a replayed transaction renumbers from 1 and
+    recomputes identical identities. `source.sequence` is NOT an ordinal (it is
+    `[lastCommitLsn, currentLsn]`, `SourceInfo.java:180-196`) and several events can
+    share one LSN, which is why the LSN alone cannot be the identity (Codex 3).
+
+    Uniqueness is **structural, not conventional**, and only because
+    `TransactionAssembler` refuses a unit whose ordinals are absent, non-positive,
+    repeated, or not exactly `1..event_count` (Codex 4; ADR §15/A18). Without that
+    validation two accepted events could reach this function with the same triple
+    and the keyless collection would silently keep one of them.
+    """
+    return f"{event.lsn}:{event.txn_id}:{event.total_order}"

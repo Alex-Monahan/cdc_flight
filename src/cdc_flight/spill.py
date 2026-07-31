@@ -25,7 +25,7 @@ from dataclasses import dataclass
 
 from . import apply_sql
 from .destination import CONTROL_SCHEMA
-from .envelope import KIND_DATA, PendingRecord
+from .envelope import KIND_DATA, KIND_TRUNCATE, OP_TRUNCATE, PendingRecord
 
 log = logging.getLogger("cdc_flight.spill")
 
@@ -111,7 +111,13 @@ class SpillBuffer:
             out.append(
                 StagedEvent(
                     event=PendingRecord(
-                        raw=None, kind=KIND_DATA, topic="", nbytes=0, op=op, schema=schema,
+                        # A truncate must come back OUT of the buffer as a truncate:
+                        # the fold dispatches on `kind`, and a staged `op="t"` restored
+                        # as `KIND_DATA` would be folded as a keyless row instead of
+                        # emptying the table (rubric 1.5).
+                        raw=None,
+                        kind=KIND_TRUNCATE if op == OP_TRUNCATE else KIND_DATA,
+                        topic="", nbytes=0, op=op, schema=schema,
                         table=table, lsn=lsn, txn_id=txn_id, total_order=total_order,
                         source_ts_ms=source_ts_ms,
                         key=json.loads(key_json) if key_json else None,

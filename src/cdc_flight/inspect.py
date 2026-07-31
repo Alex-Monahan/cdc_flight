@@ -21,6 +21,30 @@ def connect(dest: DestinationConfig) -> duckdb.DuckDBPyConnection:
     return duckdb.connect(f"md:{dest.motherduck_database}?motherduck_token={token}")
 
 
+def _report_incomplete_tables(con, dest: DestinationConfig) -> None:
+    """Say loudly which tables are known to be incomplete (rubric 1.5 / Opus Q1).
+
+    A source relation that was dropped and recreated has a destination table that CDC
+    alone cannot rebuild, and the worst outcome is one that *looks* healthy. So the
+    `awaiting_snapshot` flag `catalog_apply` persists is surfaced here rather than only
+    in one `table_events.detail` string.
+    """
+    try:
+        rows = con.execute(
+            "SELECT pipeline, source_schema, source_table, target_table "
+            "FROM _cdc_flight.table_state WHERE snapshot_state = 'awaiting_snapshot' "
+            "ORDER BY 1, 2, 3"
+        ).fetchall()
+    except Exception:  # pragma: no cover - a destination with no control schema yet
+        return
+    if not rows:
+        return
+    print("-" * 72)
+    print(f"!! {len(rows)} table(s) are INCOMPLETE and need a re-snapshot (rubric 2.3/3.4):")
+    for pipeline, schema, table, target in rows:
+        print(f"   {schema}.{table} -> {target or '(dropped)'}   [pipeline {pipeline}]")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="cdc-inspect", description=__doc__)
     parser.add_argument("--destination", choices=["duckdb", "motherduck"], default="duckdb")
@@ -64,6 +88,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             ops_txt = "child table"
         print(f"{name:44s} rows={total:<6d} ops[{ops_txt}]")
+
+    _report_incomplete_tables(con, dest)
 
     print("-" * 72)
     for (name,) in tables:

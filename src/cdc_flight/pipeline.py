@@ -31,10 +31,12 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from . import catalog as catalog_mod
 from . import destination as dest_mod
 from . import reconcile as reconcile_mod
 from .applier import Applier, ApplierConfig
 from .config import (
+    CatalogConfig,
     DestinationConfig,
     ReplicationConfig,
     RunConfig,
@@ -64,6 +66,8 @@ def run_engine_bounded(
     health: SourceHealth | None = None,
     *,
     engine_terminates_normally: bool = False,
+    catalog=None,
+    catalog_drain_seconds: float = 30.0,
 ) -> dict:
     """Run the Debezium engine until the *source* agrees it is idle, or the deadline hits.
 
@@ -78,9 +82,21 @@ def run_engine_bounded(
       puts it into a restart backoff that is longer than our idle window, so an
       idle timer alone reports success on a partial delivery (Opus B5). `health`
       corroborates "quiet" against `pg_replication_slots`.
+
+    Before a quiet run is allowed to shut down there is one more barrier (Codex 6):
+    a **synchronous final catalog poll**, and then a bounded wait for any destructive
+    change it queued to be fenced and applied. Without it a `DROP TABLE` on a quiet
+    source normally could not be seen until the *next* scheduled run - the watcher
+    polls every 10 s while the idle window is 8 s - which makes "detected in 10
+    seconds" misleading. A change that is still unresolved when the barrier expires
+    makes the run **non-successful**: the destination is knowingly out of step with the
+    source, and reporting `ok: true` on that is not honest.
     """
     started = time.monotonic()
     error_box: list[BaseException] = []
+    final_poll_done = False
+    drain_until = 0.0
+    catalog_unresolved: list[str] = []
 
     def _run():
         try:
@@ -109,6 +125,32 @@ def run_engine_bounded(
             warmed_up = elapsed >= min(run.idle_seconds, 5.0)
             if enough and quiet and warmed_up and not handler.busy:
                 if health is None or health.may_declare_idle(min_seconds=run.idle_seconds):
+                    if catalog is not None and not final_poll_done:
+                        # The synchronous final poll. A DROP that happened after the
+                        # last scheduled poll is seen by THIS run, and it is also the
+                        # poll that completes `CDC_DROP_CONFIRM_POLLS` on a short run.
+                        final_poll_done = True
+                        catalog.poll_quietly()
+                        drain_until = time.monotonic() + catalog_drain_seconds
+                    unresolved = (
+                        [c.qualified for c in catalog.pending_destructive()]
+                        if catalog is not None
+                        else []
+                    )
+                    if unresolved and time.monotonic() < drain_until:
+                        # The drain barrier: the fence marker has been emitted, so a
+                        # WAL record past the detection point is on its way and the
+                        # applier will apply the change on the group that carries it.
+                        if idle_blocked_by_source % 40 == 0:
+                            log.info(
+                                "holding the engine open for %s unresolved destructive "
+                                "catalog change(s): %s",
+                                len(unresolved), ", ".join(sorted(unresolved)),
+                            )
+                        idle_blocked_by_source += 1
+                        time.sleep(0.25)
+                        continue
+                    catalog_unresolved = unresolved
                     stop_reason = "idle"
                     break
                 idle_blocked_by_source += 1
@@ -191,6 +233,27 @@ def run_engine_bounded(
                 summary,
             )
 
+    if catalog is not None:
+        still_pending = [c.qualified for c in catalog.pending_destructive()]
+        if still_pending or catalog_unresolved:
+            names = sorted(set(still_pending) | set(catalog_unresolved))
+            summary["stop_reason"] = "catalog_unresolved"
+            summary["catalog_unresolved_tables"] = names
+            # Codex 6: deferring is the correct *safety* choice - a destructive action
+            # whose fence has not opened must not be guessed past - but it is not
+            # faithful propagation and it is not honest to call the run successful.
+            # The most common cause is a source that cannot be written to (a read-only
+            # replica, a missing privilege), which `catalog_marker_error` names.
+            raise EngineFailure(
+                f"{len(names)} destructive source-catalog change(s) are still "
+                f"unresolved at shutdown ({', '.join(names)}): the destination is "
+                "knowingly out of step with the source. Most often the WAL fence "
+                "marker could not be written to the source (see "
+                f"catalog_marker_error={summary.get('catalog_marker_error')!r}), so no "
+                "LSN past the detection point can be proven to have flowed",
+                summary,
+            )
+
     summary["ok"] = True
     return summary
 
@@ -230,7 +293,16 @@ def run(
     )
 
     replication.state_dir.mkdir(parents=True, exist_ok=True)
-    props = build_properties(source, replication, snapshot_mode=snapshot_mode)
+    settings = applier_settings()
+    # `skipped.operations` is what decides whether a TRUNCATE is decoded at all, so
+    # the truncate policy has to be known before the engine properties are built
+    # (rubric 1.5).
+    props = build_properties(
+        source,
+        replication,
+        snapshot_mode=snapshot_mode,
+        truncate_mode=settings["truncate_mode"],
+    )
     # A captured table whose topic collides with `<prefix>.transaction` would be
     # decoded as transaction metadata and never applied. Not reachable with the
     # pinned topic-naming strategy, and asserted rather than reasoned about
@@ -262,16 +334,39 @@ def run(
                 f"DELETE FROM {CONTROL_SCHEMA}.debezium_offsets WHERE pipeline = ?",
                 [dest.pipeline_name],
             )
+            # NOT a DELETE. `table_state` is the canonical source-to-destination
+            # ownership registry (Codex 5), and it is the only thing that tells the
+            # catalog watcher a destination table is ours. Deleting it made
+            # `--reset-state` produce a PERMANENT zombie: a table dropped at the source
+            # produces no events, so `observe_replicated` never re-learns it, and
+            # `_compare` skips a name it has no oid for and does not believe is
+            # replicated - so its stale destination table survives for ever and
+            # detection is disabled for it (Opus MAJOR-4, measured). What "start over"
+            # has to reset is the *snapshot* bookkeeping, which is what this does.
             con.execute(
-                f"DELETE FROM {CONTROL_SCHEMA}.table_state WHERE pipeline = ?",
+                f"UPDATE {CONTROL_SCHEMA}.table_state SET snapshot_state = 'none', "
+                "snapshot_epoch = 0, snapshot_lsn = NULL, last_commit_id = NULL "
+                "WHERE pipeline = ?",
                 [dest.pipeline_name],
             )
             con.execute(
                 f"DELETE FROM {CONTROL_SCHEMA}.lease WHERE pipeline = ?",
                 [dest.pipeline_name],
             )
+            # And what we last saw of the source catalog (rubric 1.5). MEASURED: a
+            # stale `source_relations` row makes the next run compare the *new*
+            # relation oids against the old ones and correctly conclude that every
+            # table was dropped and recreated - which is exactly right for a rebuilt
+            # source and exactly wrong for "start over", where the re-snapshot is
+            # about to rebuild the destination anyway. Without this,
+            # `tests/1.1_exactly_once_pk/test_1_1_fault_interleavings.py::
+            # test_a_crash_during_the_snapshot_phase_leaves_no_partial_table` lost its
+            # tables to a `recreated` action mid-run.
+            con.execute(
+                f"DELETE FROM {CONTROL_SCHEMA}.source_relations WHERE pipeline = ?",
+                [dest.pipeline_name],
+            )
 
-        settings = applier_settings()
         applier_cfg = ApplierConfig(
             max_batch_size=int(props["max.batch.size"]),
             **settings,
@@ -309,6 +404,38 @@ def run(
         transactional_ddl = dest_mod.probe_transactional_ddl(con)
         summary_extra["transactional_ddl"] = transactional_ddl
 
+        # rubric 1.5: `DROP TABLE` is not in the replication stream, so the source
+        # catalog is polled on its own connection. Started BEFORE the engine, so a
+        # table dropped while this pipeline was down is detected on this run rather
+        # than one poll interval into it.
+        catalog_cfg = CatalogConfig()
+        watcher = None
+        if applier_cfg.drop_mode != "ignore" and catalog_cfg.poll_seconds > 0:
+            watcher = catalog_mod.CatalogWatcher(
+                dsn=source.dsn,
+                publication=replication.publication_name,
+                schema=source.schema,
+                include={t if "." in t else f"{source.schema}.{t}" for t in source.tables},
+                known=catalog_mod.read_known_relations(con, dest.pipeline_name),
+                replicated=catalog_mod.seed_from_table_state(con, dest.pipeline_name),
+                poll_seconds=catalog_cfg.poll_seconds,
+                emit_marker=catalog_cfg.emit_marker,
+                marker_prefix=catalog_cfg.marker_prefix,
+                grace_seconds=catalog_cfg.grace_seconds,
+                confirm_polls=catalog_cfg.confirm_polls,
+                marker_max_writes=catalog_cfg.marker_max_writes or None,
+            ).start()
+            if catalog_cfg.grace_seconds:
+                log.warning(
+                    "CDC_CATALOG_GRACE=%.0fs: a destructive catalog action will be "
+                    "applied after that long even though the destination has not "
+                    "reached the LSN at which it was detected. In-flight events for "
+                    "the table can then re-create it as a zombie holding pre-drop "
+                    "rows, so this mode is EXPLICITLY EXCLUDED from the structural "
+                    "correctness guarantee (ADR 0001 §18/A38).",
+                    catalog_cfg.grace_seconds,
+                )
+
         # Imported late: importing pydbzengine boots a JVM.
         from .engine import SupervisedDebeziumEngine
 
@@ -324,6 +451,7 @@ def run(
             lease=lease,
             runner_id=runner_id,
             transactional_ddl=transactional_ddl,
+            catalog=watcher,
         )
         engine = SupervisedDebeziumEngine(
             properties=props,
@@ -365,6 +493,8 @@ def run(
             result = run_engine_bounded(
                 engine, applier, run_cfg, health,
                 engine_terminates_normally=props["snapshot.mode"] in terminating_modes,
+                catalog=watcher,
+                catalog_drain_seconds=catalog_cfg.drain_seconds,
             )
             summary_extra["invariant_o_end"] = reconcile_mod.check_invariant_o(
                 con, pipeline=dest.pipeline_name, namespace=namespace,
@@ -377,6 +507,8 @@ def run(
             raise
         finally:
             health.stop()
+            if watcher is not None:
+                watcher.stop()
             applier.shutdown()
             lease.release(con)
     finally:

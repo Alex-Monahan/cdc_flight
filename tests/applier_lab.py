@@ -36,6 +36,7 @@ from cdc_flight.envelope import (
     KIND_DATA,
     KIND_HEARTBEAT,
     KIND_SNAPSHOT,
+    KIND_TRUNCATE,
     KIND_TXN_BEGIN,
     KIND_TXN_END,
     PendingRecord,
@@ -147,6 +148,30 @@ def data(
     )
 
 
+def truncate(txn: str, order: int, lsn: int, *, table: str = "customers") -> PendingRecord:
+    """One `op="t"` event, exactly as `envelope.decode` produces it.
+
+    No key (Debezium sends truncates to the table topic with a null key schema) and
+    no before/after image, but a full transaction ordinal: Debezium counts truncates
+    in `END.event_count`, so the assembler must too.
+    """
+    return PendingRecord(
+        raw=_Raw(f"{TOPIC_PREFIX}.app.{table}"),
+        kind=KIND_TRUNCATE,
+        topic=f"{TOPIC_PREFIX}.app.{table}",
+        nbytes=60,
+        op="t",
+        schema="app",
+        table=table,
+        lsn=lsn,
+        txn_id=txn,
+        total_order=order,
+        source_ts_ms=1_760_000_000_000 + order,
+        source_partition=dict(PARTITION),
+        source_offset=_offset(lsn, txn),
+    )
+
+
 def keyed(txn: str, order: int, lsn: int, ident: int, value: str, **kw) -> PendingRecord:
     """One keyed UPDATE/INSERT of `id = ident`."""
     return data(
@@ -205,7 +230,7 @@ def heartbeat(lsn: int) -> PendingRecord:
 class Lab:
     """One `Applier` over one DuckDB file, driven record by record."""
 
-    def __init__(self, path: Path, *, resume_lsn: int = 0, **cfg: Any) -> None:
+    def __init__(self, path: Path, *, resume_lsn: int = 0, catalog=None, **cfg: Any) -> None:
         self.path = Path(path)
         self.con = duckdb.connect(str(self.path))
         dest_mod.ensure_control_schema(self.con)
@@ -226,6 +251,7 @@ class Lab:
             config=self.config,
             lease=self.lease,
             runner_id="lab-runner",
+            catalog=catalog,
         )
         self.applier._committer = self.committer
 

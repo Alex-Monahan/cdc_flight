@@ -205,7 +205,12 @@ class SchemaRegistry:
         """`(schema, created_now)`. `created_now` lets the caller skip the DELETE
         half of a merge against a table it just created."""
         table = self.get(name)
-        table.key_columns = key_columns
+        if key_columns:
+            # NOT unconditionally: a group whose only event for this table is a
+            # TRUNCATE carries no message key, so it would erase the cached identity
+            # and silently disarm `assert_identity_is_unique` for the rest of the run
+            # (Opus MINOR-3).
+            table.key_columns = key_columns
         if not table.exists:
             self._create(table, columns, key_columns)
             return table, True

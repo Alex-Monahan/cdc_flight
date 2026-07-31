@@ -9,6 +9,7 @@ acknowledged **after** it commits.
 BEGIN TRANSACTION
     renew lease                       # 4.2 - the loser fails before it writes
     apply whole units, all tables     # 1.3 - multi-table atomicity
+    apply due catalog DDL             # 1.5 - fenced on this group's resume point
     write _cdc_flight.commit_log      # 1.7 / 6.1 audit trail
     write _cdc_flight.debezium_offsets# (4) data ∧ state atomic
 COMMIT                                # <- the only durability event
@@ -25,33 +26,45 @@ committed. Loss therefore requires the slot to advance past durable data, which
 is impossible by construction; duplication requires the engine to resume before
 the durable resume point, which is impossible because that point is what we hand
 it.
+
+Invariant O bounds *ordering*, and that is not the whole of exactly-once: it also
+has to be true that what the group commits is the semantically right answer. A
+durably committed **wrong fold** advances the slot just as happily as a right one.
+That is why this file owns the commit protocol *and only that* (ADR §15/A29,
+§18/A37): the fold lives in `planner.py` + `table_work.py`, the destructive-DDL
+policy in `catalog_apply.py`, and the two never share a dispatcher with anything
+else — the last two review rounds both found defects that existed only because a
+second path had grown alongside the first.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any
 
-from . import apply_sql, destination, naming, offset_file, table_work
+from . import apply_sql, destination, resume, table_work
 from .assembler import (
-    UNIT_CONTROL,
     UNIT_SNAPSHOT_CHUNK,
     UNIT_TXN,
     CompleteUnit,
     TransactionAssembler,
 )
-from .destination import Lease, ResumePoint
+from .catalog_apply import CatalogCoordinator
+from .config import (
+    DROP_MODES,
+    DROP_REPLICATE,
+    TRUNCATE_MODES,
+    TRUNCATE_REPLICATE,
+)
+from .destination import AlertSink, Lease, ResumePoint
 from .envelope import PendingRecord, decode
-from .envelope import offsets_of as envelope_offsets
-from .errors import ResumePointDrift
 from .faults import maybe_crash
-from .snapshot import SnapshotCoordinator, SnapshotTable
+from .planner import GroupPlan, stream_event_id
+from .snapshot import SnapshotCoordinator
 from .spill import SpillBuffer, StagedEvent
-from .table_work import TableWork
 
 log = logging.getLogger("cdc_flight.applier")
 
@@ -83,6 +96,29 @@ class ApplierConfig:
     #: and holds 200 000 Java references alive. Terminal-only is the default;
     #: `CDC_ACK_EVERY_RECORD=1` restores the conservative behaviour.
     ack_every_record: bool = False
+    #: rubric 1.5, `CDC_TRUNCATE_MODE` / `CDC_DROP_MODE`. `replicate` is what the
+    #: rubric's 5 asks for ("replicated just like Postgres handles them"); the other
+    #: modes exist because "faithful" destroys destination data, and an operator who
+    #: wants the audit trail without the destruction should not have to fork.
+    truncate_mode: str = TRUNCATE_REPLICATE
+    drop_mode: str = DROP_REPLICATE
+    #: rubric 1.5 circuit breaker (Opus MAJOR-3 / Q2). At most this many destination
+    #: tables may be destroyed by one commit group; the whole set is refused when the
+    #: limit is exceeded, never half of it.
+    drop_max_per_group: int = 1
+    drop_allow_mass: bool = False
+    #: Re-read the source relation immediately before destroying its destination
+    #: table, and fail closed if the source cannot be asked (Codex 4).
+    drop_revalidate: bool = True
+
+    def __post_init__(self) -> None:
+        # A typo must not silently restore Debezium's "truncates are skipped" default.
+        if self.truncate_mode not in TRUNCATE_MODES:
+            raise ValueError(
+                f"CDC_TRUNCATE_MODE={self.truncate_mode!r} is not one of {TRUNCATE_MODES}"
+            )
+        if self.drop_mode not in DROP_MODES:
+            raise ValueError(f"CDC_DROP_MODE={self.drop_mode!r} is not one of {DROP_MODES}")
 
 
 class Applier:
@@ -103,6 +139,7 @@ class Applier:
         runner_id: str,
         verifier=None,
         transactional_ddl: bool = True,
+        catalog=None,
     ):
         self.con = con
         self.pipeline = pipeline
@@ -116,6 +153,9 @@ class Applier:
         self.runner_id = runner_id
         self.verifier = verifier
         self.transactional_ddl = transactional_ddl
+        #: `catalog.CatalogWatcher` or None. The only source of DROP TABLE knowledge
+        #: (rubric 1.5): logical decoding does not carry DDL at all.
+        self.catalog = catalog
 
         self.registry = apply_sql.SchemaRegistry(
             con, dataset, constraints=config.destination_constraints
@@ -140,9 +180,9 @@ class Applier:
         self._pending_verification: tuple | None = None
 
         self._created_in_txn: set[str] = set()
-        # ADR §3.5 / D7 and §3.4 live in their own modules now (Codex 8): the
-        # snapshot-spill blocker was a direct consequence of spill routing reaching
-        # into snapshot state that a different part of this file initialised later.
+        # ADR §3.5 / D7, §3.4, the fold and the catalog policy all live in their own
+        # modules (ADR §15/A29, §18/A37): every blocker of the last two review rounds
+        # was a consequence of two paths doing one job inside one file.
         self.snapshots = SnapshotCoordinator(
             con,
             dataset=dataset,
@@ -154,6 +194,17 @@ class Applier:
             transactional_ddl=transactional_ddl,
         )
         self.spill = SpillBuffer(con)
+        self.alerts = AlertSink(con, pipeline=pipeline)
+        self.catalog_coordinator = CatalogCoordinator(
+            catalog=catalog,
+            pipeline=pipeline,
+            topic_prefix=topic_prefix,
+            drop_mode=config.drop_mode,
+            registry_of=lambda: self.registry,
+            max_destructive_per_group=config.drop_max_per_group,
+            allow_mass_drop=config.drop_allow_mass,
+            revalidate=config.drop_revalidate,
+        )
 
         self._committer = None
         self._lock = threading.Lock()
@@ -174,6 +225,18 @@ class Applier:
         self.fenced_spilled_events = 0
         self.deferred_units = 0
         self.deferred_events = 0
+        self.truncates_applied = 0
+        self.truncates_logged = 0
+        #: `_cdc_flight.table_events` rows collected while applying THIS group, all
+        #: written inside its transaction.
+        self._table_events: list[dict] = []
+        self._table_event_seq = 0
+        #: the catalog plan this group is committing, settled only after COMMIT
+        self._catalog_plan = None
+        #: alerts raised only once the transaction has settled (Codex 7)
+        self._pending_alerts: list[dict] = []
+        #: source tables this group actually wrote, handed to the watcher after COMMIT
+        self._group_source_tables: set[str] = set()
         self.table_counts: dict[str, int] = {}
         self.last_commit_id = resume_point.commit_id
         self.error: BaseException | None = None
@@ -225,7 +288,21 @@ class Applier:
             "last_commit_id": self.last_commit_id,
             "durable_lsn": self.resume_point.last_lsn,
             "transactional_ddl": self.transactional_ddl,
+            "alerts_out_of_transaction": self.alerts.independent,
+            # rubric 1.5
+            "truncates_applied": self.truncates_applied,
+            "truncates_logged": self.truncates_logged,
+            **self.catalog_coordinator.summary(),
+            **(self.catalog.summary() if self.catalog is not None else {}),
         }
+
+    @property
+    def tables_dropped(self) -> int:
+        return self.catalog_coordinator.tables_dropped
+
+    @property
+    def catalog_changes_applied(self) -> int:
+        return self.catalog_coordinator.changes_applied
 
     def _age_timer(self) -> None:
         """Ask for a group close on age. It can only ever *request*: the commit
@@ -369,6 +446,11 @@ class Applier:
         # `.clear()`, not a fresh set: `SnapshotCoordinator` holds the same object.
         self._created_in_txn.clear()
         self._spill_commit_id = None
+        self._table_events = []
+        self._table_event_seq = 0
+        self._catalog_plan = None
+        self._pending_alerts = []
+        self._group_source_tables = set()
 
     # ------------------------------------------------------------------ #
     # the transaction
@@ -395,7 +477,15 @@ class Applier:
                 maybe_crash("begin", self.data_commit_groups + 1)
             self.lease.renew(self.con)
             stats = self._apply_units(group, commit_id, has_data=has_data)
-            new_point = self._resume_point_for(group, commit_id)
+            new_point = resume.point_for(
+                group,
+                previous=self.resume_point,
+                commit_id=commit_id,
+                snapshot_epoch=self.snapshots.epoch,
+            )
+            # rubric 1.5: DDL the stream cannot carry, fenced on the resume point this
+            # group is about to make durable.
+            self._apply_catalog_changes(commit_id, new_point.last_lsn, stats)
             destination.write_commit_log(
                 self.con,
                 commit_id=commit_id,
@@ -457,6 +547,8 @@ class Applier:
         if self.verifier is not None and marked:
             self._pending_verification = (offset_fingerprint, marked)
 
+        self._settle_catalog()
+        self._flush_alerts()
         self.commit_groups += 1
         if has_data:
             self.data_commit_groups += 1
@@ -464,11 +556,15 @@ class Applier:
         self.last_commit_id = commit_id
         self.resume_point = new_point
         self._next_commit_id = commit_id + 1
-        self._capture_offset_file(new_point)
+        if self.cfg.verify_offset_file:
+            self._pending_offset_key_blob, self._pending_offset_blob = (
+                resume.capture_offset_file(self.offset_path, new_point)
+            )
         self._reset_group()
 
     def _rollback_quietly(self) -> None:
         if not self._txn_open:
+            self._reset_after_rollback()
             return
         try:
             self.con.execute("ROLLBACK")
@@ -476,61 +572,45 @@ class Applier:
             log.debug("rollback failed", exc_info=True)
         finally:
             self._txn_open = False
-            # Every CREATE / ALTER we issued is gone with the transaction, so the
-            # cached destination shape is now a lie. Rebuilding it is cheap and
-            # not doing it is how a rolled-back run corrupts the next one.
-            self.registry = apply_sql.SchemaRegistry(
-                self.con, self.dataset, constraints=self.cfg.destination_constraints
-            )
-            self._created_in_txn.clear()
+            self._reset_after_rollback()
 
-    # -- resume point ------------------------------------------------------- #
-    def _resume_point_for(self, group: list[CompleteUnit], commit_id: int) -> ResumePoint:
-        terminal: PendingRecord | None = None
-        for unit in reversed(group):
-            if unit.records:
-                terminal = unit.records[-1]
-                break
-        if terminal is not None and terminal.source_offset is None and terminal.raw is not None:
-            # Decoded lazily: only this one record's Connect offset is needed, and
-            # reading it for all 200 000 of them is what made decode the bottleneck.
-            terminal.source_partition, terminal.source_offset = envelope_offsets(terminal.raw)
-        last_unit = group[-1]
-        last_lsn = max(
-            [self.resume_point.last_lsn] + [u.last_lsn or 0 for u in group]
-        )
-        if last_lsn > self.resume_point.last_lsn and (
-            terminal is None or not terminal.source_offset
-        ):
-            # `envelope.offsets_of()` returns `(None, None)` for every bridge
-            # failure, and the old code then paired a NEWER `last_lsn` with the
-            # PREVIOUS (or an empty) offset map. Debezium would resume from the
-            # older offset while our fence claimed the newer LSN was durable, so a
-            # replay would be fenced away: silent loss (Codex 3). Refuse the commit
-            # instead - a rollback replays, which is free.
-            raise ResumePointDrift(
-                f"commit group would advance last_lsn to {last_lsn} but the terminal "
-                "record's Connect offset could not be read, so the resume point would "
-                "pair a newer LSN with an older offset map (ADR 0001 §4.3)"
-            )
-        total_order = None
-        for unit in reversed(group):
-            if unit.events:
-                total_order = unit.events[-1].total_order
-                break
-        return ResumePoint(
-            partition=(terminal.source_partition if terminal else self.resume_point.partition) or {},
-            offset=(terminal.source_offset if terminal else self.resume_point.offset) or {},
-            last_lsn=last_lsn,
-            last_txn_id=last_unit.txn_id or self.resume_point.last_txn_id,
-            last_total_order=total_order,
-            # The group being written, not the previous one. `ResumePoint.to_json`
-            # omits it and `read_resume_point` takes it from its own column, so this
-            # was dead but looked live (Opus MINOR-16).
-            commit_id=commit_id,
-            snapshot_epoch=self.snapshots.epoch,
-        )
+    def _reset_after_rollback(self) -> None:
+        """Everything the discarded transaction touched, in memory as well.
 
+        `_reset_group()` used to be called **only** on the success path, so a group
+        whose COMMIT failed stayed buffered and was folded a second time by the next
+        `commit_group` — alongside whatever had arrived since. For an idempotent shape
+        that is harmless, which is why the fault tests passed; for a key-reuse shape it
+        is not, and it was measured to lose a row (Opus MAJOR-1). The ADR's own rule is
+        that a rolled-back group replays *from the source*, and this is what makes that
+        true of the process as well as of the offset store.
+        """
+        # Markers describe an apply that did not happen, and the catalog work of a
+        # rolled-back group must stay pending so it is applied (or re-detected)
+        # rather than silently forgotten.
+        alerts = [a for a in self._pending_alerts if a.get("on_rollback")]  # Codex 7
+        # Every CREATE / ALTER we issued is gone with the transaction, so the
+        # cached destination shape is now a lie. Rebuilding it is cheap and
+        # not doing it is how a rolled-back run corrupts the next one.
+        self.registry = apply_sql.SchemaRegistry(
+            self.con, self.dataset, constraints=self.cfg.destination_constraints
+        )
+        failed = list(self._group)
+        self._reset_group()
+        if failed:
+            self.deferred_units += len(failed)
+            self.deferred_events += sum(u.event_count for u in failed)
+            log.warning(
+                "discarding %s buffered unit(s) after a failed commit group; they "
+                "replay from the source (Invariant O)", len(failed),
+            )
+        # Raised AFTER the group state is clean, on the independent connection, so
+        # "the destructive change could not be applied" reaches an operator even
+        # though everything else about the attempt was rolled back.
+        for alert in alerts:
+            self._raise_alert(alert)
+
+    # -- resume point (ADR §4.3, `resume.py`) ------------------------------- #
     def _run_pending_verification(self) -> None:
         """Check a deferred offset flush, now that the connector has polled again.
 
@@ -547,74 +627,19 @@ class Applier:
         before, marked = pending
         self.verifier.after(before, marked=marked)
 
-    def _capture_offset_file(self, point: ResumePoint) -> None:
-        """Snapshot `offsets.dat` after the acknowledgement (ADR §4.3).
-
-        The bytes belong to the group that has *just* been acknowledged, so they
-        can only ride on the *next* group's transaction. They are redundant -
-        `resume_json` is the source of truth - but they let start-up rebuild a
-        byte-exact file, and they make format drift visible immediately.
-        """
-        if not self.cfg.verify_offset_file:
-            return
-        try:
-            entries = offset_file.read(self.offset_path)
-        except Exception:  # pragma: no cover
-            return
-        if not entries:
-            return
-        key = next(iter(entries))
-        self._pending_offset_key_blob = key
-        self._pending_offset_blob = _serialise_entries(entries)
-        file_offsets = offset_file.parse_offsets(entries)
-        if not file_offsets:
-            return
-        _partition, offset = file_offsets[0]
-        file_lsn = offset_file.lsn_of(offset)
-        if file_lsn is not None and point.last_lsn and file_lsn > point.last_lsn:
-            # Invariant O says this cannot happen: nothing enters the offset store
-            # before COMMIT. If it ever does, it is the ADR-rev-2 bug class.
-            raise ResumePointDrift(
-                f"offsets.dat claims lsn {file_lsn}, ahead of the durable resume "
-                f"point {point.last_lsn}. Invariant O is violated (ADR 0001 §4.3)."
-            )
-
     # ------------------------------------------------------------------ #
-    # applying units
+    # applying units — one ordered pass, delegated to the planner
     # ------------------------------------------------------------------ #
     def _apply_units(self, group: list[CompleteUnit], commit_id: int, *, has_data: bool) -> dict:
-        """One ordered pass over the group, whatever each unit's storage mode is.
-
-        This used to be two passes - "write every in-memory `TableWork`, then
-        drain `spill_events`" - and that split cannot be correct in either order
-        (Opus B-1). A unit that spills keeps accumulating an in-memory **tail**
-        after the spill, so its staged rows are *earlier* in source order than its
-        own tail; and a group can hold `unit1 (spilled + tail), unit2 (wholly in
-        memory)`, whose correct order interleaves the two representations. The
-        measured consequences were a destination left holding the **earlier** value
-        with the later change event gone (existing table), and the **same primary
-        key twice** (table created inside the group, so both passes skipped the
-        DELETE half of the merge).
-
-        So: walk the units in group order, and for each one load its staged prefix
-        into the *shared* `work` map before collecting its in-memory tail. One
-        `table_work.write()` per destination table, source order preserved end to
-        end, and the merge sees the whole group at once.
-        """
-        work: dict[str, TableWork] = {}
-        stats = {
-            "events": 0,
-            "tables": set(),
-            "first_txn_id": None,
-            "last_txn_id": None,
-            "first_lsn": None,
-            "last_lsn": None,
-            "max_source_ts": None,
-        }
-        swaps: list[SnapshotTable] = []
-        swap_all = False
-        staged_units = any(u.spill_unit_seq is not None for u in group)
-
+        plan = GroupPlan(
+            self.con,
+            commit_id=commit_id,
+            registry_of=lambda: self.registry,
+            snapshots=self.snapshots,
+            spill=self.spill,
+            truncate_mode=self.cfg.truncate_mode,
+            created_in_txn=self._created_in_txn,
+        )
         for unit in group:
             if unit.fenced:
                 # ADR §4.4 / Codex 5: the fence is set at `_add_unit`, which is the
@@ -625,80 +650,112 @@ class Applier:
                 # rows are deleted with the rest below, inside this transaction.
                 if unit.spill_unit_seq is not None:
                     self.fenced_spilled_events += unit.spilled_events
-                continue
-            if unit.kind == UNIT_CONTROL:
+                    plan.staged_units = True
                 continue
             if unit.kind == UNIT_SNAPSHOT_CHUNK:
                 self._group_is_snapshot = True
-                state = self.snapshots.state_for(unit.schema, unit.table)
-                if unit.spill_unit_seq is not None:
-                    self._load_staged(unit, work, commit_id, stats)
-                for event in unit.events:
-                    self._collect(work, event, commit_id, snapshot=state, stats=stats)
-                if unit.snapshot_last_for_table and state is not None:
-                    swaps.append(state)
-                if unit.snapshot_last:
-                    swap_all = True
-                continue
+            plan.add_unit(unit)
 
-            if unit.spill_unit_seq is not None:
-                self._load_staged(unit, work, commit_id, stats)
-            for event in unit.events:
-                self._collect(work, event, commit_id, snapshot=None, stats=stats)
-            if unit.txn_id:
-                stats["first_txn_id"] = stats["first_txn_id"] or unit.txn_id
-                stats["last_txn_id"] = unit.txn_id
-
-        for index, item in enumerate(work.values()):
-            table_work.write(
-                self.con, self.registry, item, self._created_in_txn
-            )
-            if index == 0 and has_data:
-                # The anchor documented as "some tables written, others not". It
-                # used to fire BEFORE this loop, so it could not detect a
-                # transaction torn between table A and table B - the one
-                # interleaving rubric 1.3 is about (Codex 6). It is also gated on
-                # `has_data` now, like every other anchor, because `<nth>` counts
-                # data-carrying groups (Opus MINOR-2).
+        # The `mid_apply` anchor is documented as "some tables written, others not".
+        # It has to fire BETWEEN two table writes, or it cannot detect a transaction
+        # torn between table A and table B - the one interleaving rubric 1.3 is about
+        # (Codex 6) - and it is gated on `has_data` like every other anchor, because
+        # `<nth>` counts data-carrying groups (Opus MINOR-2).
+        anchor = None
+        if has_data:
+            def anchor() -> None:
                 maybe_crash("mid_apply", self.data_commit_groups + 1)
-            if item.events:
-                stats["tables"].add(item.target)
-                with self._lock:
-                    self.table_counts[item.target] = (
-                        self.table_counts.get(item.target, 0) + item.events
-                    )
-
-        if staged_units:
-            self.spill.clear(commit_id)
-
-        if swap_all:
-            swaps = self.snapshots.states()
-        for state in swaps:
-            if self.snapshots.swap(
-                state, commit_id=commit_id, snapshot_lsn=stats.get("last_lsn")
-            ):
-                stats["tables"].add(state.target)
+        stats = plan.write(after_first_table=anchor)
+        for target, (schema, table) in plan.created_tables.items():
+            destination.register_table(
+                self.con,
+                pipeline=self.pipeline,
+                source_schema=schema,
+                source_table=table,
+                target_table=target,
+            )
+        with self._lock:
+            for target, count in plan.table_counts.items():
+                self.table_counts[target] = self.table_counts.get(target, 0) + count
+        self.truncates_applied += plan.truncates_applied
+        self.truncates_logged += plan.truncates_logged
+        self._group_source_tables |= plan.source_tables
+        self._table_events.extend(plan.markers())
+        self._flush_table_events(commit_id)
         return stats
 
-    def _collect(
-        self,
-        work: dict[str, TableWork],
-        event: PendingRecord,
-        commit_id: int,
-        *,
-        snapshot: SnapshotTable | None,
-        stats: dict,
-    ) -> None:
-        if not event.schema or not event.table:
+    # ------------------------------------------------------------------ #
+    # table-level events and catalog DDL (rubric 1.5)
+    # ------------------------------------------------------------------ #
+    def _flush_table_events(self, commit_id: int) -> None:
+        """Write this group's `table_events` rows, inside its transaction.
+
+        Deliberately transactional with the data: "the destination table was emptied"
+        and "here is the source event that emptied it" must become true together, or
+        the audit trail can outlive a rolled-back apply and describe something that
+        never happened.
+        """
+        for marker in self._table_events:
+            destination.write_table_event(
+                self.con,
+                pipeline=self.pipeline,
+                commit_id=commit_id,
+                seq=self._next_table_event_seq(),
+                **marker,
+            )
+        self._table_events = []
+
+    def _next_table_event_seq(self) -> int:
+        self._table_event_seq += 1
+        return self._table_event_seq
+
+    def _apply_catalog_changes(self, commit_id: int, durable_lsn: int, stats: dict) -> None:
+        """Apply the source-catalog changes whose fence has opened (rubric 1.5).
+
+        Runs inside the commit group's transaction, *after* the group's events, so a
+        `DROP` cannot remove rows that an event of this same group had still to add,
+        and a crash between the drop and the resume-point write replays both. The
+        policy - supersession, revalidation, the circuit breaker, `awaiting_snapshot` -
+        is `catalog_apply.CatalogCoordinator`'s; this is only where it is executed.
+        """
+        coordinator = self.catalog_coordinator
+        if not coordinator.enabled:
             return
-        if snapshot is not None:
-            target = snapshot.shadow
-            event_id = self.snapshots.event_id(event)
-        else:
-            target = self.snapshots.target_table(event.schema, event.table)
-            event_id = _stream_event_id(event)
-        item = table_work.work_for(work, target, event, snapshot is not None)
-        self._collect_prepared(item, event, commit_id, event_id, stats)
+        plan = coordinator.plan(durable_lsn)
+        if not plan.actions and not plan.relations and not plan.alerts:
+            return
+        self._catalog_plan = plan
+        self._table_events.extend(coordinator.apply(self.con, plan, stats))
+        # A destructive action that could not be applied is exactly the signal an
+        # operator must still get when the group rolls back; one that describes an
+        # applied action must NOT outlive the rollback that undid it (Codex 7).
+        self._pending_alerts.extend(plan.alerts)
+        if self._table_events:
+            self._flush_table_events(commit_id)
+
+    def _settle_catalog(self) -> None:
+        """Forget the catalog work this group made durable. Runs after COMMIT."""
+        if self.catalog is None:
+            return
+        plan = self._catalog_plan
+        if plan is not None:
+            self.catalog_coordinator.settle(plan, self._group_source_tables)
+            self._catalog_plan = None
+        elif self._group_source_tables:
+            self.catalog.observe_replicated(self._group_source_tables)
+
+    def _flush_alerts(self) -> None:
+        for alert in self._pending_alerts:
+            self._raise_alert(alert)
+        self._pending_alerts = []
+
+    def _raise_alert(self, alert: dict) -> None:
+        self.alerts.raise_alert(
+            severity=alert["severity"],
+            code=alert["code"],
+            message=alert["message"],
+            context=alert.get("context"),
+        )
 
     # ------------------------------------------------------------------ #
     # spill (ADR §3.4)
@@ -713,7 +770,7 @@ class Applier:
         """Stage one unit's events inside the group's own transaction (ADR §3.4).
 
         `unit_seq` and `snapshot` are **inputs**, not inferences. This callback used
-        to look the phase up in the applier's snapshot mapping, which `_apply_units`
+        to look the phase up in the applier's snapshot mapping, which the apply pass
         populates only later, so on the first spilled chunk of every snapshot it
         concluded "streaming" and staged the rows into the **live** table with a
         `<lsn>:None:None` identity; a consumer could then see a partial snapshot, and
@@ -749,7 +806,7 @@ class Applier:
                 prepared.append(
                     StagedEvent(
                         event=event,
-                        event_id=_stream_event_id(event),
+                        event_id=stream_event_id(event),
                         target=self.snapshots.target_table(event.schema, event.table),
                         # Mandatory and validated by the assembler, so there is
                         # nothing to substitute a local sequence for: doing that gave
@@ -763,38 +820,6 @@ class Applier:
         self.spilled_events += staged
         maybe_crash("spill", self.data_commit_groups + 1)
         return len(events)
-
-    def _load_staged(
-        self, unit: CompleteUnit, work: dict[str, TableWork], commit_id: int, stats: dict
-    ) -> None:
-        """Load one unit's staged prefix into the group's shared `work` map."""
-        for staged in self.spill.load(commit_id=commit_id, unit_seq=unit.spill_unit_seq):
-            item = table_work.work_for(
-                work,
-                staged.target,
-                staged.event,
-                staged.target.endswith(naming.SHADOW_SUFFIX),
-            )
-            self._collect_prepared(item, staged.event, commit_id, staged.event_id, stats)
-
-    def _collect_prepared(
-        self, item: TableWork, event: PendingRecord, commit_id: int, event_id: str, stats: dict
-    ) -> None:
-        """Fold one event into the plan, in either storage mode.
-
-        In-memory collection and staged-row projection used to be two functions that
-        drifted: the drain updated neither `table_counts` nor `stats["max_source_ts"]`,
-        so a spilled group under-reported in `last_run.json` and in
-        `commit_log.max_source_ts` (Opus MINOR-1). There is one path now.
-        """
-        row = table_work.row_for(event, commit_id, event_id, snapshot=item.snapshot)
-        table_work.collect(item, event, row, event_id)
-        stats["events"] += 1
-        if event.lsn:
-            stats["first_lsn"] = stats["first_lsn"] or event.lsn
-            stats["last_lsn"] = event.lsn
-        if event.source_ts_ms:
-            stats["max_source_ts"] = max(stats["max_source_ts"] or 0, event.source_ts_ms)
 
     # ------------------------------------------------------------------ #
     # shutdown
@@ -837,29 +862,6 @@ class Applier:
         return self.assembler.discard_open_unit()
 
 
-def _stream_event_id(event: PendingRecord) -> str:
-    """`"<event lsn>:<source.txId>:<transaction.total_order>"` (ADR §6, §15/A3).
-
-    The **event's own** LSN, not the transaction's commit LSN (ADR §15/A3 records
-    the change; this docstring and `apply_sql`'s used to say "commit lsn" —
-    Opus MINOR-14).
-
-    `total_order` is the connector's own 1-based ordinal within the transaction, so
-    it is stable across a replay of the same WAL: a resume point can only ever sit
-    on a transaction boundary, so a replayed transaction renumbers from 1 and
-    recomputes identical identities. `source.sequence` is NOT an ordinal (it is
-    `[lastCommitLsn, currentLsn]`, `SourceInfo.java:180-196`) and several events can
-    share one LSN, which is why the LSN alone cannot be the identity (Codex 3).
-
-    Uniqueness is **structural, not conventional**, and only because
-    `TransactionAssembler` refuses a unit whose ordinals are absent, non-positive,
-    repeated, or not exactly `1..event_count` (Codex 4; ADR §15/A18). Without that
-    validation two accepted events could reach this function with the same triple
-    and the keyless collection would silently keep one of them.
-    """
-    return f"{event.lsn}:{event.txn_id}:{event.total_order}"
-
-
 def _epoch_ms(value) -> Any:
     """Debezium's `source.ts_ms` as a timestamp, so end-to-end lag is a SQL
     subtraction rather than an arithmetic puzzle for whoever writes rubric 6.1."""
@@ -870,8 +872,3 @@ def _epoch_ms(value) -> Any:
     return datetime.fromtimestamp(value / 1000.0, tz=UTC)
 
 
-def _serialise_entries(entries: dict[bytes, bytes]) -> bytes:
-    return json.dumps(
-        {k.decode("utf-8", "replace"): v.decode("utf-8", "replace") for k, v in entries.items()},
-        separators=(",", ":"),
-    ).encode("utf-8")
