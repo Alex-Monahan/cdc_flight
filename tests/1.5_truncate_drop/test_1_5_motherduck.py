@@ -46,9 +46,16 @@ def md_token() -> str:
 
 @pytest.fixture(scope="module")
 def md_truncate_drop(sandbox, md_token) -> dict:
-    dataset = f"cdc_15_{uuid.uuid4().hex[:8]}"
+    suffix = uuid.uuid4().hex[:8]
+    dataset = f"cdc_15_{suffix}"
+    # A unique pipeline name, because `_cdc_flight` is SHARED by every run against this
+    # MotherDuck database: a marker row from an earlier run of this module would
+    # otherwise be indistinguishable from this run's (measured - the row-count assertion
+    # saw two).
+    pipeline = f"cdc_15_{suffix}"
     dsn = f"md:{MD_DATABASE}?motherduck_token={md_token}"
     env = {
+        "CDC_PIPELINE_NAME": pipeline,
         "CDC_DATASET": dataset,
         "CDC_MD_DATABASE": MD_DATABASE,
         "MOTHERDUCK_TOKEN": md_token,
@@ -96,10 +103,15 @@ def md_truncate_drop(sandbox, md_token) -> dict:
     con = duckdb.connect(dsn)
     con.execute(REFRESH)
     try:
-        yield {"box": box, "con": con, "dataset": dataset,
+        yield {"box": box, "con": con, "dataset": dataset, "pipeline": pipeline,
                "streamed": streamed, "settled": settled}
     finally:
         con.execute(f'DROP SCHEMA IF EXISTS "{MD_DATABASE}"."{dataset}" CASCADE')
+        for table in (
+            "table_events", "commit_log", "debezium_offsets", "table_state",
+            "source_relations", "lease", "alerts",
+        ):
+            con.execute(f"DELETE FROM _cdc_flight.{table} WHERE pipeline = ?", [pipeline])
         con.close()
         box.reseed()
 
@@ -124,8 +136,9 @@ def test_the_truncate_marker_counted_the_rows_motherduck_removed(md_truncate_dro
     "unknown" where the whole point is to say what was lost."""
     rows = _rows(
         md_truncate_drop,
-        "SELECT rows_removed FROM _cdc_flight.table_events WHERE event = 'truncate' "
-        "AND source_table = 'md_trunc'",
+        "SELECT rows_removed FROM _cdc_flight.table_events WHERE pipeline = ? "
+        "AND event = 'truncate' AND source_table = 'md_trunc'",
+        [md_truncate_drop["pipeline"]],
     )
     assert rows == [(3,)]
 
