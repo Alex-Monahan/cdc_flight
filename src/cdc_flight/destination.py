@@ -23,7 +23,7 @@ from typing import Any
 from . import faults, table_lifecycle
 from .control_schema import CONTROL_DDL, ensure_control_schema
 from .errors import LeaseLost
-from .machines import LIFECYCLE_DURABLE_VALUES
+from .machines import LIFECYCLE_DURABLE_VALUES, SLOT_VERDICTS
 from .naming import quote
 
 __all__ = ["CONTROL_DDL", "ensure_control_schema"]
@@ -490,7 +490,8 @@ def read_slot_state(con, pipeline: str, slot_name: str) -> dict | None:
     """The last recorded observation of this pipeline's slot, or None (rubric 1.8)."""
     rows = con.execute(
         f"SELECT system_identifier, timeline_id, restart_lsn, confirmed_flush_lsn, "
-        f"       current_wal_lsn, durable_lsn, observed_at "
+        f"       current_wal_lsn, durable_lsn, observed_at, verdict, verdict_message, "
+        f"       verdict_at "
         f"FROM {CONTROL_SCHEMA}.slot_state WHERE pipeline = ? AND slot_name = ?",
         [pipeline, slot_name],
     ).fetchall()
@@ -498,12 +499,21 @@ def read_slot_state(con, pipeline: str, slot_name: str) -> dict | None:
         return None
     keys = (
         "system_identifier", "timeline_id", "restart_lsn", "confirmed_flush_lsn",
-        "current_wal_lsn", "durable_lsn", "observed_at",
+        "current_wal_lsn", "durable_lsn", "observed_at", "verdict", "verdict_message",
+        "verdict_at",
     )
     return dict(zip(keys, rows[0], strict=True))
 
 
-def write_slot_state(con, *, pipeline: str, slot_name: str, observation: dict) -> None:
+def write_slot_state(
+    con,
+    *,
+    pipeline: str,
+    slot_name: str,
+    observation: dict,
+    verdict: str | None = None,
+    verdict_message: str | None = None,
+) -> None:
     """Record what the slot and the source cluster look like now (rubric 1.8).
 
     DELETE + INSERT **in one transaction**. It used to be two autocommitted statements,
@@ -511,7 +521,14 @@ def write_slot_state(con, *, pipeline: str, slot_name: str, observation: dict) -
     the next acquisition's detectable set - `slot_recreated` and `source_identity_changed`
     both need memory to fire at all (Codex M6 / Opus MINOR-7). Called on its own, never
     inside a commit group: see the DDL comment.
+
+    The **verdict** goes in the same transaction as the observation it was computed from
+    (Codex r1 MAJOR-5): "why did this state machine begin" was previously answerable only
+    from `last_run.json` on whichever host happened to run, so the destination could not
+    explain its own rebuild. Validated through `machines.SLOT_VERDICTS`.
     """
+    if verdict is not None:
+        verdict = SLOT_VERDICTS.parse(verdict)
     con.execute("BEGIN TRANSACTION")
     try:
         con.execute(
@@ -521,8 +538,9 @@ def write_slot_state(con, *, pipeline: str, slot_name: str, observation: dict) -
         con.execute(
             f"INSERT INTO {CONTROL_SCHEMA}.slot_state "
             "(pipeline, slot_name, system_identifier, timeline_id, restart_lsn, "
-            " confirmed_flush_lsn, current_wal_lsn, durable_lsn, observed_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
+            " confirmed_flush_lsn, current_wal_lsn, durable_lsn, observed_at, "
+            " verdict, verdict_message, verdict_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             [
                 pipeline,
                 slot_name,
@@ -533,6 +551,9 @@ def write_slot_state(con, *, pipeline: str, slot_name: str, observation: dict) -
                 observation.get("current_wal_lsn"),
                 observation.get("durable_lsn"),
                 now(),
+                verdict,
+                verdict_message,
+                now() if verdict is not None else None,
             ],
         )
         con.execute("COMMIT")
@@ -620,12 +641,7 @@ def request_snapshot(
     `len(tables)` unconditionally and the test asserting on it restated its own
     configuration (Opus MINOR-1).
     """
-    # rubric 1.7: the durable to-do list is being written. A crash here must leave
-    # either "nothing is owed" or "these tables are owed" and never a half-written
-    # queue that a journal claims to explain - which is why `recovery.begin` wraps this
-    # and the journal INSERT in one transaction.
-    faults.maybe_crash("table_rebuild_queued", _queueing())
-    for schema, table, target in tables:
+    for index, (schema, table, target) in enumerate(tables):
         # One call: `absent -> awaiting_snapshot` (INSERT) and `x -> awaiting_snapshot`
         # (UPDATE) are the same declared edge set, and the machine picks the statement.
         table_lifecycle.transition(
@@ -637,6 +653,15 @@ def request_snapshot(
             reason=detail,
             target_table=target,
         )
+        if index == 0:
+            # rubric 1.7: the durable to-do list is **mid-write** — one table has taken
+            # its lifecycle edge and the rest have not. The anchor used to fire before
+            # the loop, which proves that a pre-write rollback is clean and nothing
+            # about a partially-written queue (Codex r1 MAJOR-6). A crash here must
+            # leave either "nothing is owed" or "these tables are owed" and never a
+            # half-written queue that a journal claims to explain — which is why
+            # `recovery.begin` wraps this and the journal INSERT in one transaction.
+            faults.maybe_crash("table_rebuild_queued", _queueing())
     marked = 0
     for schema, table, _target in tables:
         rows = con.execute(

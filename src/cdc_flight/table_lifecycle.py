@@ -50,6 +50,7 @@ __all__ = [
     "IN_PROGRESS",
     "NONE",
     "OWING_WORK",
+    "check_transition",
     "forget",
     "read",
     "read_all",
@@ -124,6 +125,36 @@ def _parse(value, qualified: str) -> str:
             "skipped (ADR 0001 §4.8, §20/A55)."
         )
     return text
+
+
+def check_transition(
+    con,
+    *,
+    pipeline: str,
+    source_schema: str,
+    source_table: str,
+    to: str,
+    reason: str,
+    alerts=None,
+) -> str:
+    """Assert `current -> to` is declared WITHOUT writing anything. Returns `current`.
+
+    For callers whose first act is a side effect that the transition would have to be
+    legal for. `SnapshotCoordinator.state_for` is the case: it drops the shadow table,
+    forgets it in the registry and adds it to `created_in_txn` *before* asking the
+    lifecycle whether opening a snapshot is legal at all, so a durable `in_progress`
+    residue was already half-acted-on by the time the edge was refused (Codex r1
+    MINOR-3). Check first, then mutate.
+    """
+    frm = read(
+        con, pipeline=pipeline, source_schema=source_schema, source_table=source_table
+    )
+    _check(
+        frm, to,
+        pipeline=pipeline, qualified=f"{source_schema}.{source_table}",
+        reason=reason, alerts=alerts,
+    )
+    return frm
 
 
 # --------------------------------------------------------------------------- #

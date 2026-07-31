@@ -19,7 +19,7 @@ serialisation buffer that Debezium happens to require on disk. The truth is
 | present, **ahead of** table on the scalar LSN | present | overwrite from the table; `warning offset_file_ahead` |
 | present, differs in *any* typed offset field, key or entry count | present | overwrite from the table |
 | present, corrupt | present | overwrite from the table |
-| present (any state) | **absent** | **REFUSE TO START** (`orphan_offset_file`) |
+| present (any state) | **absent** | **REFUSE TO START** (`orphan_offset_file`), unless `--accept-orphan-offsets`, which classifies `orphan_accepted_resnapshot` and hands the destructive sequence to the recovery journal |
 | any | present, but `slot.confirmed_flush_lsn > last_lsn` | `critical slot_ahead_of_destination` -> rubric 1.8 |
 | any | **absent**, but the slot exists and has advanced | **REFUSE TO START** (`no_durable_destination_row`) unless `snapshot.mode` re-reads every table |
 
@@ -34,8 +34,13 @@ streams from the slot's confirmed position and everything before it is gone.
 The refusal row is the one that matters and the one that is easy to get wrong: a
 file with no matching destination row may be arbitrarily *ahead* of anything
 durable, so trusting it silently loses every event in between. `--accept-orphan-
-offsets` is the deliberate escape hatch, and it deletes the file and forces a
-re-snapshot rather than trusting it.
+offsets` is the deliberate escape hatch, and it forces a re-snapshot rather than
+trusting the file.
+
+**This module classifies; it does not mutate** (Codex r1 BLOCKER-1). The escape hatch
+used to drop the slot and unlink the file here and journal the intent afterwards, which
+put a crash window between destroying the evidence and recording why. `cdc_flight.
+recovery` owns the sequence now, journal first, exactly like the acquisition recovery.
 
 Correctness does **not** depend on the repair: under Invariant O the file can
 only ever lag the table, and a lagging file replays units the applier then
@@ -53,24 +58,28 @@ from pathlib import Path
 
 from . import offset_file
 from .destination import ResumePoint, raise_alert, read_offset_blobs
-from .errors import ReconciliationRefused, RecoveryFailed
-
-
-def _drop_slot(dsn: str, slot_name: str) -> str:
-    from .reconcile import drop_slot
-
-    return drop_slot(dsn, slot_name)
+from .errors import ReconciliationRefused
+from .machines import RECONCILE_DECISIONS
 
 log = logging.getLogger("cdc_flight.offset_reconcile")
 
 
 @dataclass
 class Reconciliation:
+    """What the file turned out to be. `decision` is parsed through the frozen domain.
+
+    Validated in production rather than only in a test (Codex r1 MAJOR-5): the domain
+    existed and this class accepted any string, so it froze nothing.
+    """
+
     decision: str
     resume_point: ResumePoint
     file_lsn: int | None = None
     repaired: bool = False
     message: str = ""
+
+    def __post_init__(self) -> None:
+        self.decision = RECONCILE_DECISIONS.parse(self.decision)
 
 
 def reconcile(
@@ -84,6 +93,12 @@ def reconcile(
     dsn: str | None = None,
     slot_name: str | None = None,
 ) -> Reconciliation:
+    """Classify. **This function destroys nothing** (Codex r1 BLOCKER-1).
+
+    `dsn` and `slot_name` are accepted and ignored; they were the parameters the
+    orphan-acceptance slot drop needed, and the signature is kept so that a caller
+    passing them is not silently mis-wired.
+    """
     from .destination import read_resume_point
 
     row = read_resume_point(con, pipeline, namespace)
@@ -100,45 +115,26 @@ def reconcile(
             return Reconciliation("fresh_start", ResumePoint(), None, False,
                                   "no offsets file and no destination row")
         if accept_orphan:
-            # The slot goes FIRST, and a failure is FATAL. The re-snapshot this returns
-            # to is only exact if Debezium *creates* the slot (`drop_slot`'s docstring),
-            # and an existing slot whose `confirmed_flush_lsn` we cannot account for
-            # would make the stream resume past the snapshot's consistent point - which
-            # is precisely the loss window rubric 1.8 is about. The operator authorised
-            # "rebuild this destination"; they did not authorise an uncoordinated
-            # image/stream boundary, and best-effort here meant the two were the same
-            # switch (Codex B4 / Opus Q4a). Nothing is deleted if the slot survives, so
-            # the next run retries from an unchanged state.
-            slot_action = "not attempted"
-            if dsn and slot_name:
-                try:
-                    slot_action = _drop_slot(dsn, slot_name)
-                except Exception as exc:
-                    log.error("could not drop %r for the orphan re-snapshot: %s", slot_name, exc)
-                    raise RecoveryFailed(
-                        f"--accept-orphan-offsets cannot proceed: the replication slot "
-                        f"{slot_name!r} could not be dropped ({exc}). Re-snapshotting "
-                        "against a surviving slot resumes the stream past the "
-                        "snapshot's consistent point (ADR 0001 §19/A45), so the orphan "
-                        "file has been left in place and nothing was rebuilt. Free the "
-                        "slot and retry."
-                    ) from exc
-                if slot_action not in ("dropped", "absent"):  # pragma: no cover
-                    raise RecoveryFailed(
-                        f"dropping {slot_name!r} returned {slot_action!r}: the slot "
-                        "cannot be shown to be gone"
-                    )
-            Path(offset_path).unlink(missing_ok=True)
-            raise_alert(
-                con, pipeline=pipeline, severity="warning", code="orphan_offset_file",
-                message="orphan offsets.dat deleted on operator request; re-snapshotting",
-                context={
-                    "offset_file": str(offset_path), "file_lsn": file_lsn,
-                    "slot": slot_action,
-                },
+            # CLASSIFY ONLY. This branch used to drop the replication slot and unlink
+            # the file, and `pipeline.run()` journalled the recovery *afterwards* -
+            # deliberately, and wrongly. A hard exit in that gap left no resume row, no
+            # offsets file, no slot and no journal, which the next run reads as an
+            # ordinary `fresh_start`: the operator's authorised rebuild is forgotten and
+            # a configured non-data `snapshot.mode` then streams onto a destination
+            # nobody rebuilt. That is the exact B3/A53 shape the journal exists to
+            # prevent, recreated on the one route an operator reaches for when something
+            # has already gone wrong (Codex r1 BLOCKER-1).
+            #
+            # The caller now writes the recovery intent and the full table obligation
+            # FIRST, with `recovery.begin()`, and lets the one idempotent
+            # `recovery.resume()` ladder remove the file, delete the (already absent)
+            # row and drop the slot - each step anchored, each step re-entrant, each
+            # step recognisable from durable state alone after a crash.
+            return Reconciliation(
+                "orphan_accepted_resnapshot", ResumePoint(), file_lsn, False,
+                "an operator authorised --accept-orphan-offsets; NOTHING has been "
+                "destroyed yet and the recovery journal owns the sequence",
             )
-            return Reconciliation("orphan_accepted_resnapshot", ResumePoint(), file_lsn,
-                                  True, f"orphan offsets file deleted; slot {slot_action}")
         raise_alert(
             con, pipeline=pipeline, severity="critical", code="orphan_offset_file",
             message=(

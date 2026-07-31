@@ -29,6 +29,7 @@ from .errors import (
     NoDurableDestinationRow,
     SlotAheadOfDestination,
 )
+from .machines import SLOT_VERDICTS
 from .offset_reconcile import Reconciliation, reconcile
 
 __all__ = ["Reconciliation", "reconcile"]
@@ -163,7 +164,14 @@ FORGET_CATALOG_DECISIONS = (
 
 @dataclass
 class SlotVerdict:
-    """What the slot check concluded, and what the run must do about it."""
+    """What the slot check concluded, and what the run must do about it.
+
+    `decision` is parsed through `machines.SLOT_VERDICTS` **at construction, in
+    production** (Codex r1 MAJOR-5). The domain was declared and referenced only by
+    tests, so it froze nothing: this class accepted any string, and a typo in a new
+    branch would have produced a verdict no consumer had a rule for. Freezing costs one
+    dictionary lookup per run.
+    """
 
     decision: str
     ok: bool
@@ -171,6 +179,9 @@ class SlotVerdict:
     refuse: bool = False
     message: str = ""
     context: dict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.decision = SLOT_VERDICTS.parse(self.decision)
 
     def as_dict(self) -> dict:
         return {

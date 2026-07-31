@@ -65,16 +65,20 @@ it next time (Codex B4).
 
 from __future__ import annotations
 
+import json
 import logging
+import shutil
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import table_lifecycle
 from .destination import CONTROL_SCHEMA, now, raise_alert, request_snapshot
 from .errors import RecoveryFailed
 from .faults import arrival, maybe_crash
 from .machines import (
     ACQUISITION_RECOVERY,
+    LIFECYCLE_OWING_WORK,
     RECOVERY_ABSENT,
     RECOVERY_ARMED,
     RECOVERY_FILE_DELETED,
@@ -83,6 +87,28 @@ from .machines import (
 )
 
 log = logging.getLogger("cdc_flight.recovery")
+
+#: The decision an operator's `--accept-orphan-offsets` writes. It is a recovery like
+#: any other now (Codex r1 BLOCKER-1): `offset_reconcile` used to drop the slot and
+#: unlink the file and only *then* journal what it had done, so a hard exit in that gap
+#: lost the durable obligation to rebuild and the next run called the leftovers an
+#: ordinary fresh start - the exact B3/A53 state the journal exists to prevent.
+ORPHAN_DECISION = "orphan_offsets_accepted"
+
+#: The decision `--reset-state` writes. Same reasoning (Codex r1 MAJOR-4): reset used to
+#: be five independent durable mutations plus a process-local `snapshot.mode='initial'`,
+#: argued convergent. It is not: with a positioned slot and a populated destination the
+#: next run's slot check hits the deliberate `no_durable_destination_row` refusal before
+#: `will_snapshot_everything` is even computed, and repeating the flag does not drop
+#: that slot. Journalled, it is one idempotent sequence that finishes without the flag.
+RESET_DECISION = "operator_reset"
+
+#: Decisions whose table obligation is "put the snapshot bookkeeping back to `none`"
+#: rather than "every captured table owes a fresh image". `--reset-state` means start
+#: over, and the run's own forced `initial` snapshot re-reads everything; marking the
+#: tables `awaiting_snapshot` instead would additionally demand a *throwaway*
+#: re-snapshot of tables the main engine is about to rebuild anyway.
+RESET_TABLE_DECISIONS = (RESET_DECISION,)
 
 #: In the order they happen. `armed` is terminal for the *mutation* sequence and is
 #: cleared only once the snapshot the recovery asked for has actually been taken.
@@ -122,6 +148,15 @@ class RecoveryRecord:
     forget_catalog: bool = False
     tables_marked: int = 0
     message: str = ""
+    #: The captured set this recovery took responsibility for, `["schema.table", ...]`.
+    #: Persisted (Codex r1 MAJOR-5): completion used to be re-derived from *all* current
+    #: lifecycle rows, so "the rebuild finished" was a statement about whatever the
+    #: destination happens to hold now rather than about the obligation the recovery
+    #: recorded. A table added to the include list mid-rebuild changed the answer.
+    captured: list[str] = field(default_factory=list)
+    #: For `--reset-state`: the state directory the reset must clear. `offset_path`
+    #: alone is not enough, because "start over" means the whole Debezium scratch area.
+    state_dir: str | None = None
 
     def as_dict(self) -> dict:
         return {
@@ -132,21 +167,41 @@ class RecoveryRecord:
             "snapshot_mode": self.snapshot_mode,
             "forget_catalog": self.forget_catalog,
             "tables_marked": self.tables_marked,
+            "captured": list(self.captured),
             "message": self.message,
         }
+
+
+@dataclass
+class Completion:
+    """Whether a journalled recovery has actually finished, and why not if it has not.
+
+    Returned by `complete_if_ready`, which is the ONE owner of that predicate
+    (Codex r1 MAJOR-5 / open question 2). It used to be six lines inside
+    `pipeline.run()` that read every lifecycle row and called `clear()` directly, so the
+    recovery machine did not own its own terminal edge and a run could report `ok: true`
+    with the journal still armed.
+    """
+
+    cleared: bool
+    recovery_id: str
+    still_owed: tuple[str, ...] = ()
+    has_resume_point: bool = True
+    reason: str = ""
 
 
 def read(con, *, pipeline: str, namespace: str) -> RecoveryRecord | None:
     """The recovery this pipeline is in the middle of, or None."""
     rows = con.execute(
         f"SELECT recovery_id, decision, phase, slot_name, offset_path, snapshot_mode, "
-        f"       forget_catalog, tables_marked, message "
+        f"       forget_catalog, tables_marked, message, captured_json, state_dir "
         f"FROM {CONTROL_SCHEMA}.recovery_state WHERE pipeline = ? AND namespace = ?",
         [pipeline, namespace],
     ).fetchall()
     if not rows:
         return None
-    (rid, decision, phase, slot, path, mode, forget, marked, message) = rows[0]
+    (rid, decision, phase, slot, path, mode, forget, marked, message,
+     captured_json, state_dir) = rows[0]
     if str(phase) not in PHASES:
         # `PHASES` was declared and never enforced: `read()` accepted any string and
         # `resume()` then matched none of its branches, fell through every `if`, and
@@ -158,6 +213,11 @@ def read(con, *, pipeline: str, namespace: str) -> RecoveryRecord | None:
             f"records phase {phase!r}, which is not one of {list(PHASES)}. Refusing to "
             "guess which durable mutations have already happened."
         )
+    try:
+        captured = list(json.loads(captured_json)) if captured_json else []
+    except ValueError:  # pragma: no cover - a corrupted journal column
+        log.error("recovery journal captured_json did not decode; treating as empty")
+        captured = []
     return RecoveryRecord(
         recovery_id=str(rid),
         decision=str(decision),
@@ -168,6 +228,8 @@ def read(con, *, pipeline: str, namespace: str) -> RecoveryRecord | None:
         forget_catalog=bool(forget),
         tables_marked=int(marked or 0),
         message=str(message or ""),
+        captured=[str(c) for c in captured],
+        state_dir=str(state_dir) if state_dir is not None else None,
     )
 
 
@@ -217,6 +279,8 @@ def begin(
     captured_tables: list[tuple[str, str, str]],
     forget_catalog: bool,
     context: dict | None = None,
+    state_dir: Path | None = None,
+    severity: str = "critical",
 ) -> RecoveryRecord:
     """Write the intent, atomically with the to-do list. NOTHING is destroyed here.
 
@@ -232,6 +296,7 @@ def begin(
     ACQUISITION_RECOVERY.check(
         existing.phase if existing is not None else RECOVERY_ABSENT, RECOVERY_REQUESTED
     )
+    captured = [f"{schema}.{table}" for schema, table, _target in captured_tables]
     record = RecoveryRecord(
         recovery_id=uuid.uuid4().hex,
         decision=decision,
@@ -241,9 +306,11 @@ def begin(
         snapshot_mode=FORCED_SNAPSHOT_MODE,
         forget_catalog=forget_catalog,
         message=message,
+        captured=captured,
+        state_dir=str(state_dir) if state_dir is not None else None,
     )
     raise_alert(
-        con, pipeline=pipeline, severity="critical", code=decision,
+        con, pipeline=pipeline, severity=severity, code=decision,
         message=(
             f"{message}. Rebuilding every captured table from the source "
             f"({len(captured_tables)} tables); the destination stays queryable until "
@@ -253,12 +320,19 @@ def begin(
     )
     con.execute("BEGIN TRANSACTION")
     try:
-        marked = request_snapshot(
-            con,
-            pipeline=pipeline,
-            tables=captured_tables,
-            detail=f"{decision}: {message}",
-        )
+        if decision in RESET_TABLE_DECISIONS:
+            # `--reset-state`: the bookkeeping goes back to `none`, not to
+            # `awaiting_snapshot`. Still through `TableLifecycle`, still inside this
+            # transaction, so "a reset is owed" and "the tables were reset" are one fact.
+            table_lifecycle.reset_all(con, pipeline=pipeline, reason=f"{decision}: {message}")
+            marked = 0
+        else:
+            marked = request_snapshot(
+                con,
+                pipeline=pipeline,
+                tables=captured_tables,
+                detail=f"{decision}: {message}",
+            )
         record.tables_marked = marked
         if forget_catalog:
             # A different cluster's oids are not our relations' oids, and comparing them
@@ -282,11 +356,12 @@ def begin(
             f"INSERT INTO {CONTROL_SCHEMA}.recovery_state "
             "(pipeline, namespace, recovery_id, decision, phase, slot_name, "
             " offset_path, snapshot_mode, forget_catalog, tables_marked, message, "
-            " requested_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " captured_json, state_dir, requested_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [
                 pipeline, namespace, record.recovery_id, decision, PHASE_REQUESTED,
                 slot_name, str(offset_path), FORCED_SNAPSHOT_MODE, forget_catalog,
-                marked, message, now(), now(),
+                marked, message, json.dumps(captured), record.state_dir, now(), now(),
             ],
         )
         con.execute("COMMIT")
@@ -345,7 +420,17 @@ def resume(
         # recovery. This order leaves `file absent / row present`, which reconciliation
         # simply rebuilds.
         removed = False
-        if offset_path is not None:
+        if record.state_dir:
+            # `--reset-state` means start over at the Debezium end too, and `offsets.dat`
+            # is not the only scratch file in there. Removing the tree and recreating it
+            # is idempotent: a crash between the two leaves no directory, which the next
+            # run's `state_dir.mkdir(parents=True, exist_ok=True)` restores.
+            directory = Path(record.state_dir)
+            removed = offset_path is not None and offset_path.exists()
+            shutil.rmtree(directory, ignore_errors=True)
+            directory.mkdir(parents=True, exist_ok=True)
+            result["state_dir"] = "cleared"
+        elif offset_path is not None:
             removed = offset_path.exists()
             offset_path.unlink(missing_ok=True)
         result["offset_file"] = "removed" if removed else "absent"
@@ -410,6 +495,74 @@ def resume(
         result["offset_file"], result["slot"],
     )
     return result
+
+
+def complete_if_ready(
+    con, *, pipeline: str, namespace: str, record: RecoveryRecord
+) -> Completion:
+    """Has the rebuild this journal demanded actually happened? Clear it if so.
+
+    **The recovery machine owns its own terminal edge** (Codex r1 MAJOR-5, and the
+    review's answer to open question 2). This predicate used to live inline in
+    `pipeline.run()`, reading every current `table_state` row and calling `clear()`
+    directly, which meant three things the machine could not defend:
+
+    * the obligation was re-derived from whatever the destination holds *now* rather
+      than from the captured set the journal recorded — so a table that joined or left
+      the include list mid-rebuild changed the answer;
+    * `clear()` was reachable from outside the module that declares
+      `armed -> absent`;
+    * a false predicate only added a summary key, so the run still reported success
+      with a destructive sequence half-finished.
+
+    The caller gets a typed result; `pipeline.run()` turns "not cleared" into a
+    non-successful run.
+    """
+    states = table_lifecycle.read_all(con, pipeline)
+    #: The captured set the JOURNAL recorded, falling back to everything the pipeline
+    #: currently knows about for journals written before the column existed.
+    obligation = list(record.captured) or sorted(states)
+    still_owed = tuple(
+        name for name in obligation if states.get(name) in LIFECYCLE_OWING_WORK
+    )
+    has_resume = bool(
+        con.execute(
+            f"SELECT 1 FROM {CONTROL_SCHEMA}.debezium_offsets "
+            "WHERE pipeline = ? AND namespace = ?",
+            [pipeline, namespace],
+        ).fetchall()
+    )
+    # A resume point proves the rebuilt image was handed over to a stream. A recovery
+    # that marked no table (`--reset-state`, whose obligation is "put the bookkeeping
+    # back", not "rebuild these N tables") has nothing to hand over, so requiring one
+    # would leave every reset of an idle source permanently armed.
+    needs_resume = record.tables_marked > 0
+    if still_owed or (needs_resume and not has_resume):
+        reason = (
+            f"{len(still_owed)} captured table(s) still owe work "
+            f"({', '.join(still_owed)})" if still_owed
+            else "the destination has no resume point, so the rebuilt image was never "
+                 "handed over to a stream"
+        )
+        log.warning(
+            "rubric 1.8 recovery %s is STILL ARMED: %s", record.recovery_id, reason
+        )
+        return Completion(
+            cleared=False,
+            recovery_id=record.recovery_id,
+            still_owed=still_owed,
+            has_resume_point=has_resume,
+            reason=reason,
+        )
+    clear(con, pipeline=pipeline, namespace=namespace)
+    log.warning(
+        "rubric 1.8 recovery %s is COMPLETE: every captured table has a fresh image "
+        "and the destination has a resume point again", record.recovery_id,
+    )
+    return Completion(
+        cleared=True, recovery_id=record.recovery_id, has_resume_point=has_resume,
+        reason="every captured table reached a terminal lifecycle state",
+    )
 
 
 def _drop_the_slot_or_fail(drop_slot, *, dsn: str, slot_name: str | None, record) -> str:

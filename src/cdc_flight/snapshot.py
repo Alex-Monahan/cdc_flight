@@ -136,6 +136,22 @@ class SnapshotCoordinator:
         state = SnapshotTable(
             schema=schema, table=table, target=target, shadow=naming.shadow_table(target)
         )
+        # THE EDGE IS CHECKED BEFORE THE FIRST SIDE EFFECT (Codex r1 MINOR-3). The
+        # three statements below drop the shadow, forget it in the registry and add it
+        # to `created_in_txn`; all three are only correct if opening a snapshot for this
+        # table is legal, and `in_progress -> in_progress` is deliberately NOT legal -
+        # it means a durable half-snapshot from a previous process was never promoted to
+        # owed work. Refusing after mutating left the coordinator's view of the shadow
+        # and the transaction disagreeing with the destination.
+        table_lifecycle.check_transition(
+            self.con,
+            pipeline=self.pipeline,
+            source_schema=schema,
+            source_table=table,
+            to=table_lifecycle.IN_PROGRESS,
+            reason=f"a snapshot shadow is about to be opened for {key}",
+            alerts=self.alerts,
+        )
         # A crash mid-snapshot means Debezium re-snapshots from the beginning
         # (`InitialSnapshotter.shouldSnapshotData` returns true while the offset
         # says a snapshot was in progress). Dropping the shadow here is what makes
