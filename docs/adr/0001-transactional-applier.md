@@ -1679,3 +1679,21 @@ Two design points worth recording alongside them:
   events/s; decode **and buffer** ≈ 26 500 events/s. So the full-envelope decode
   is *not* the bottleneck ADR §5.1 feared - at least not at this payload size -
   and 5.3's work should start with the apply path rather than the converter.
+
+### A17 — spill re-opens an Invariant-B hole that §3.4 does not mention
+
+§3.4 says staging and drain happen "in the same transaction, before `COMMIT`", and
+concludes that spill therefore weakens nothing. That is true for the unit being
+spilled and false for the *group*: a commit group can already hold several whole
+transactions when a large one starts spilling, and the group's soft triggers would
+then close it and drain the staging table — applying events from a transaction
+whose `END` has not arrived. The group itself cannot detect this, because by
+construction it contains only whole units; the partial transaction is in the
+staging table, not in the group.
+
+The applier therefore refuses to close a group while
+`TransactionAssembler.open_unit_has_spilled` is true, and
+`tests/test_assembler.py::test_an_open_unit_that_has_spilled_blocks_the_group_from_closing`
+pins it. The cost is that the destination transaction stays open until the large
+unit completes, which is inherent to §3.4's in-transaction staging and is the
+trade §3.4 already records.

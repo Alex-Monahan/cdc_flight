@@ -177,6 +177,19 @@ class TransactionAssembler:
         return self._txn.txn_id if self._txn else None
 
     @property
+    def open_unit_has_spilled(self) -> bool:
+        """True while the *incomplete* unit has rows staged in `spill_events`.
+
+        The applier must not close a commit group in this state. Spilled rows are
+        staged inside the group's own transaction, so draining them would apply
+        events belonging to a transaction whose `END` has not arrived - i.e. commit
+        part of a Postgres transaction, which is exactly what Invariant B forbids.
+        Nothing else in the design would catch it, because the group itself
+        contains only whole units.
+        """
+        return self._txn_spilled > 0 or self._chunk_spilled > 0
+
+    @property
     def buffered_events(self) -> int:
         n = len(self._txn.events) if self._txn else 0
         n += len(self._chunk.events) if self._chunk else 0

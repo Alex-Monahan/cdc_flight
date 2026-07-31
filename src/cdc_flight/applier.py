@@ -317,6 +317,11 @@ class Applier:
         # `max.batch.size` means the queue drained, so commit now; a full batch
         # means more is already queued, so keep accumulating up to the triggers.
         drained = n < self.cfg.max_batch_size
+        if self.assembler.open_unit_has_spilled:
+            # Invariant B: the rows staged for the still-open unit live in this
+            # group's transaction, so committing now would drain a PARTIAL Postgres
+            # transaction into the destination. Wait for its END.
+            return
         if self._close_requested or drained or self._soft_trigger_hit():
             self.commit_group(self._trigger_name(drained))
 

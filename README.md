@@ -173,7 +173,7 @@ Measured on an M-series Mac. Only executed runs are reported here; see
 
 | suite | result | wall clock | measured |
 |---|---|---|---|
-| `make test` (local only) | **109 passed, 0 xfail** | **416 s** (6:55) | 2026-07-31, after the applier |
+| `make test` (local only) | **110 passed, 0 xfail** | **417 s** (6:57) | 2026-07-31, after the applier |
 | `make test-md` | **5 passed** | **94 s** | 2026-07-31, after the applier |
 | `make test-slow` | **3 passed** | **136 s** | 2026-07-31, after the applier |
 

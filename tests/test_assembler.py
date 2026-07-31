@@ -309,3 +309,25 @@ def test_spill_does_not_retrigger_on_every_subsequent_event():
     # 12 events x 100 bytes = 1200 bytes => 4 spills of 3, never 1-per-event.
     assert calls == [3, 3, 3, 3], calls
     assert all(n > 1 for n in calls)
+
+
+def test_an_open_unit_that_has_spilled_blocks_the_group_from_closing():
+    """Invariant B's one remaining escape hatch, closed.
+
+    Spilled rows are staged inside the commit group's own transaction. If the group
+    were allowed to close while the unit that owns them is still open, the drain
+    would apply events from a transaction whose END has not arrived - a partial
+    Postgres transaction committed at the destination. The group itself cannot
+    catch this, because it contains only whole units.
+    """
+    a = TransactionAssembler(spill_events=2, on_spill=lambda events: len(events))
+    assert a.open_unit_has_spilled is False
+
+    feed_all(a, [begin("7"), data("7", 1, 101), data("7", 2, 102)])
+    assert a.open_unit_has_spilled is True, "the spill did not register"
+
+    units = a.feed(end("7", 2, lsn=103))
+    assert len(units) == 1
+    assert units[0].spilled_events == 2
+    # Once the unit is whole, the group is free to close and drain.
+    assert a.open_unit_has_spilled is False
