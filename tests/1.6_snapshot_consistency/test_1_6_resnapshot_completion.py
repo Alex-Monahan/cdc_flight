@@ -242,6 +242,41 @@ def test_a_verified_empty_table_is_emptied_and_fenced_at_the_verified_lsn(tmp_pa
 
 
 # --------------------------------------------------------------------------- #
+# 2b. an entirely empty capture set has no record for the marker to ride on
+# --------------------------------------------------------------------------- #
+class _FakeApplier:
+    def __init__(self, final_seen: bool, seen: set[str]):
+        self.snapshot_final_seen = final_seen
+        self.snapshot_tables_seen = seen
+
+
+def test_debeziums_own_marker_ends_the_snapshot_phase():
+    applier = _FakeApplier(True, {"app.customers"})
+    assert resnapshot_mod.snapshot_phase_ended(applier, "work_done") is True
+
+
+def test_an_entirely_empty_capture_set_ends_when_the_connector_reaches_streaming():
+    """Otherwise a genuinely empty table could never complete, on any run, for ever.
+
+    An empty capture set emits no records, so there is no record for `snapshot='last'`
+    to ride on. `stop_reason == 'idle'` is the positive evidence that the phase ended:
+    `SourceHealth.may_declare_idle()` requires the slot to have been *streaming*, and
+    the connector only streams once its snapshot is over.
+    """
+    applier = _FakeApplier(False, set())
+    assert resnapshot_mod.snapshot_phase_ended(applier, "idle") is True
+
+
+def test_an_interrupted_engine_never_counts_as_an_ended_snapshot_phase():
+    for stop_reason in ("max_seconds", "work_done", "hung", "engine_error", "source_dark"):
+        assert resnapshot_mod.snapshot_phase_ended(_FakeApplier(False, set()), stop_reason) is False
+    # ... and neither does a run that scanned SOMETHING but never saw the marker.
+    assert resnapshot_mod.snapshot_phase_ended(
+        _FakeApplier(False, {"app.customers"}), "idle"
+    ) is False
+
+
+# --------------------------------------------------------------------------- #
 # 3. the guard that used to be dead code
 # --------------------------------------------------------------------------- #
 def test_still_owed_is_reachable_and_raises(tmp_path):

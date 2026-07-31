@@ -127,6 +127,17 @@ def read(con, *, pipeline: str, namespace: str) -> RecoveryRecord | None:
     if not rows:
         return None
     (rid, decision, phase, slot, path, mode, forget, marked, message) = rows[0]
+    if str(phase) not in PHASES:
+        # `PHASES` was declared and never enforced: `read()` accepted any string and
+        # `resume()` then matched none of its branches, fell through every `if`, and
+        # logged "recovery is ARMED" while having done nothing at all - a silent no-op
+        # wearing a success message (architecture review, finding 3). A phase we cannot
+        # resume from is a loud failure; the row is still there for a human to read.
+        raise RecoveryFailed(
+            f"the recovery journal for pipeline={pipeline!r} namespace={namespace!r} "
+            f"records phase {phase!r}, which is not one of {list(PHASES)}. Refusing to "
+            "guess which durable mutations have already happened."
+        )
     return RecoveryRecord(
         recovery_id=str(rid),
         decision=str(decision),
@@ -319,6 +330,11 @@ def resume(
         _write_phase(con, pipeline=pipeline, namespace=namespace, phase=PHASE_ARMED)
         record.phase = PHASE_ARMED
 
+    if record.phase != PHASE_ARMED:  # pragma: no cover - the ladder above is total
+        raise RecoveryFailed(
+            f"recovery {record.recovery_id} did not reach {PHASE_ARMED!r} (stopped at "
+            f"{record.phase!r}); refusing to report an armed recovery that is not armed"
+        )
     result["phase"] = record.phase
     result.setdefault("slot", "already dropped by an earlier attempt")
     result.setdefault("offset_file", "already removed by an earlier attempt")

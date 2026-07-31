@@ -95,7 +95,7 @@ implementation.
 
 | finding | disposition |
 |---|---|
-| **Codex B1 = Opus BLOCKER-1** — re-snapshot completion meant "all tables seen so far"; an unreached table was classified empty and its live destination rows deleted; the `still_owed` guard was dead code | **fixed.** Completion is Debezium's own end-of-snapshot marker; "empty" needs three independent facts; `still_owed` is reachable and raises. `test_1_6_resnapshot_completion.py` (10 tests, all fail on the old code) + `test_1_6_resnapshot_multi_table.py` (4 tables, keyless, empty, concurrent writer, crash-after-first-swap). ADR §19/A52 |
+| **Codex B1 = Opus BLOCKER-1** — re-snapshot completion meant "all tables seen so far"; an unreached table was classified empty and its live destination rows deleted; the `still_owed` guard was dead code | **fixed.** Completion is Debezium's own end-of-snapshot marker; "empty" needs three independent facts; `still_owed` is reachable and raises. `test_1_6_resnapshot_completion.py` (13 tests; the 10 that address the reported defect all fail on the old code) + `test_1_6_resnapshot_multi_table.py` (4 tables, keyless, empty, concurrent writer, crash-after-first-swap). ADR §19/A52 |
 | **Codex B2** — the all-empty consistent point was a polled race; `_agree` took the `min()` and only logged | **fixed.** A verified-empty table is fenced at a WAL position sampled *before* the emptiness check, which cannot be ahead of the image; a disagreement between the two readings of `C` is fatal (both reviewers' Q1 answer). Both `_agree` branches tested |
 | **Codex B3 = Opus MAJOR-1** — the recovery was not crash-recoverable; the documented order stranded a crash-between as a permanent `orphan_offset_file`; the forced snapshot mode did not survive a crash | **fixed.** `cdc_flight.recovery`: a durable journal written before any mutation, idempotent re-entrant phases, file deleted before the row, snapshot mode persisted. `test_1_8_recovery_state_machine.py` cuts at every phase boundary. ADR §19/A53, and A50's order claim is corrected |
 | **Codex B4 = Opus MAJOR-2/Q4a** — a failed drop of the load-bearing slot was logged and stepped over, and the LSN baseline was cleared as if it had succeeded; failed re-snapshots leaked `_rs` slots | **fixed.** `RecoveryFailed` with the journal intact, in both the automatic path and `--accept-orphan-offsets`; `try/finally` around the whole engine section plus an unconditional start-up sweep; the shared cluster's leaked slots were dropped and the suite now sweeps stale slots at session start |
@@ -115,6 +115,11 @@ implementation.
 | **Opus MINOR-2** — `SILENT` and `RECOVERS` are both empty | **stated** in 1.7's detail rather than papered over |
 | **Opus MINOR-9** — two pipelines sharing a dataset + `topic_prefix` | **carry-forward, 4.2.** Not touched here |
 | **Opus MINOR-3** — `_agree` untested | **fixed** by the hard-fail plus both-branch tests |
+| **Architecture review, finding 1** — `snapshot_state='in_progress'` is durable, non-terminal, and selected by no durable queue; its only recovery was an `except BaseException` that `os._exit`/`SIGKILL` skip, so the journal could report "recovery COMPLETE" over a half-built table | **fixed.** `promote_interrupted_snapshots()` at start-up, and the journal-clear test uses the same `SNAPSHOT_STATES_OWING_WORK` predicate as the queue |
+| **Architecture review, finding 2** — ADR §4.8's declared `snapshot_state` domain omitted `awaiting_snapshot` and included a `failed` nothing writes; nothing validated a read | **fixed.** Frozen in `destination.SNAPSHOT_STATES`, validated by `read_snapshot_states()`, ADR corrected |
+| **Architecture review, finding 3** — `recovery.PHASES` was declared and never enforced, so an unknown phase made `resume()` a silent no-op that logged ARMED | **fixed.** An unrecognised phase is `RecoveryFailed` |
+| **Architecture review, finding 4** — `--reset-state` and `--accept-orphan-offsets` are unjournalled multi-step durable mutations, the same shape as B3 | **`--accept-orphan-offsets` journalled** (its forced snapshot mode lived in a local variable, exactly B3's defect). **`--reset-state` deliberately not**, with the convergence argument written at the code and in A53: every intermediate state lands on the requested outcome rather than a refusal, and the one hole (a non-data snapshot mode) is closed by forcing the mode |
+| **Architecture review, finding 5** — `_cdc_flight.heartbeat` is declared in ADR §4.8/D9.1 and never created | **fixed.** The table is created; the writer belongs to 4.4/6.1 and is still a carry-forward |
 | **Codex M4** — the re-snapshot tests avoided the cases the proof depends on | **fixed** for multi-table, empty-with-concurrent-insert, keyless, straddling and the `C` disagreement; `CompleteUnit.commit_lsn` vs `last_lsn` is a **carry-forward** (the assembler constructs `last_lsn >= commit_lsn`, so no regression, but the alias should go) |
 
 ### Suite partition (2026-07-31, after the 1.6-1.8 review round)
@@ -131,7 +136,7 @@ each *behaviour class* in the default lane at the cheapest level that can actual
 | what moved IN (default) | why it is the right representative |
 |---|---|
 | `test_1_7_anchor_guards.py` (25 tests, **0.8 s**) | every one of the thirteen anchors, in-process: it parses, it fires where it says it fires, and it produces its own mechanism. The commit watchdog's exit 75 is proved in a subprocess because the thing under test is `os._exit` |
-| `test_1_6_resnapshot_completion.py` (10 tests, **0.9 s**) | the completion semantics and both `C`-agreement branches, deterministically. Every assertion fails on the previous implementation |
+| `test_1_6_resnapshot_completion.py` (13 tests, **0.9 s**) | the completion semantics and both `C`-agreement branches, deterministically. The ten that address the reported defect all fail on the previous implementation |
 | `test_1_8_recovery_state_machine.py` (12 tests, **0.9 s**) | a crash at **every** phase boundary of the acquisition recovery, plus the fatal slot-drop failure |
 | `test_1_6_resnapshot_multi_table.py` (7 tests, **70 s**) | the one expensive addition, and the one the branch's worst defect needed: four tables at once, a keyless one, a genuinely empty one, a concurrent writer |
 | `test_4_7_inventory.py` (6 tests, **0 s**) | the A51 counts, parsed rather than recalled |
@@ -155,8 +160,9 @@ one default-suite guard:
 | 9 `check_slot` cells | `test_1_8_decision_table.py`, 25 pure-function tests, plus the advanced-slot recovery end to end |
 | 4 recovery phases | `test_1_8_recovery_state_machine.py` |
 
-**Measured: 433 passed in 8:44** (was 384 in 8:21). Forty-nine more tests, every anchor
-guarded, twenty-three seconds more, still inside the 10-minute budget. The single largest
+**Measured: 441 passed in 8:46** (was 384 in 8:21). Fifty-seven more tests, every anchor
+guarded, twenty-five seconds more, still inside the 10-minute budget. `make test-slow` is
+78 passed in 17:45 and `make test-md` is 22 passed in 4:50, both green. The single largest
 remaining default cost is `test_1_1_fault_matrix.py`'s module fixture at 75 s — six real
 crash/recovery cycles — and it stays, because it is the exactly-once evidence for 1.1 and
 1.2 and it is deterministic protocol coverage rather than an environmental scenario.
@@ -1170,7 +1176,7 @@ this item was claimed at 5 while the machinery behind it could destroy a live ta
   stay owed, and the next run takes a fresh `C`.
 
 Evidence: `test_1_6_resnapshot_completion.py` (default suite, deterministic, no engine —
-every one of its ten assertions fails on the previous implementation) and
+the ten that predate the empty-capture-set case all fail on the previous implementation) and
 `test_1_6_resnapshot_multi_table.py` (four tables at once including a keyless one and a
 genuinely empty one, a concurrent writer throughout, and a `swap`-anchor crash after the
 first table in the slow lane). Full reasoning in ADR §19/A52.

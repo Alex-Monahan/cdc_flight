@@ -202,7 +202,14 @@ def test_a_hung_commit_is_bounded_and_never_reports_success(dest_fault_box):
     fired = box.fired_fault()
     assert fired is not None and fired["point"] == "destination_hang", fired
     assert fired["action"].startswith("hang:600"), fired
-    assert "commit" in (failed.get("error") or "").lower(), failed.get("error")
+    # No `last_run.json` here, and that is correct: the watchdog `os._exit`s, which runs
+    # no atexit hook - the same hard-death shape a `kill -9` produces. The evidence is
+    # the fsynced fired record above, the exact exit code, and the watchdog's own log
+    # line, which has to name the commit it abandoned or an operator cannot tell this
+    # from any other abort.
+    output = failed["output"].lower()
+    assert "commit" in output and "did not return within" in output, output[-2000:]
+    assert "ambiguous" in output, "the log must say the commit may already be durable"
     _assert_exact_after_recovery(box, tag)
 
 

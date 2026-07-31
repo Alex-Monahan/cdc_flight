@@ -437,7 +437,9 @@ def run(
         evidence = _gather_emptiness_evidence(
             source.dsn,
             pending=pending,
-            snapshot_phase_ended=applier.snapshot_final_seen,
+            snapshot_phase_ended=snapshot_phase_ended(
+                applier, str(outcome.engine_stop_reason)
+            ),
             tables_seen=set(applier.snapshot_tables_seen),
         )
         outcome.empty_check_lsn = evidence.wal_lsn
@@ -490,6 +492,29 @@ def run(
         outcome.consistent_lsn, outcome.swapped or "-", outcome.emptied or "-",
     )
     return outcome
+
+
+def snapshot_phase_ended(applier, stop_reason: str) -> bool:
+    """Did the engine reach the end of the WHOLE requested snapshot? Two ways to know.
+
+    1. **Debezium said so.** `snapshot='last'` rides on the final snapshot record, so any
+       capture set with at least one row produces it. This is the ordinary case and the
+       one that fixes the batch-boundary defect (A52).
+    2. **There were no records at all AND the connector reached streaming.** An entirely
+       empty capture set emits nothing, so there is no record for the marker to ride on —
+       and if the marker were the only evidence accepted, a genuinely empty table could
+       never complete and the re-snapshot would fail on every run for ever. `stop_reason
+       == 'idle'` is the positive evidence: `SourceHealth.may_declare_idle()` requires
+       the slot to have been *streaming*, and the connector only streams once its
+       snapshot phase is over. Every other exit from `run_engine_bounded` raises.
+
+    Anything else — `max_seconds`, `work_done` without a marker, a stop we did not ask
+    for — means the engine may have been interrupted mid-scan, and a table it had not
+    reached must not be mistaken for an empty one.
+    """
+    if applier.snapshot_final_seen:
+        return True
+    return not applier.snapshot_tables_seen and stop_reason == "idle"
 
 
 def reassert_owed(

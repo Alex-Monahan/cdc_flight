@@ -174,6 +174,15 @@ class SnapshotCoordinator:
     def swap(self, state: SnapshotTable, *, commit_id: int, snapshot_lsn) -> bool:
         """Put the shadow live. Returns True if a table was actually swapped.
 
+        SCOPE NOTE (Opus MINOR-9, carried forward to rubric 4.2). The lease, the resume
+        point and `table_state` are all scoped by *pipeline name*, but the destination
+        table name comes from `naming.destination_table(topic_prefix, schema, table)` —
+        so two differently-named pipelines sharing one dataset and one `topic_prefix`
+        would `DROP` and `RENAME` over each other here, and the ownership registry A39
+        built for rubric 1.5's drops is not consulted by the swap. Not reachable with the
+        shipped single-pipeline configuration, not fixed here, and recorded so it is not
+        rediscovered as a surprise.
+
         Runs inside the commit group's transaction, so an observer sees the old
         table or the new one and never an intermediate state. Where the destination
         does not honour `DROP`/`RENAME` transactionally (probed per run, ADR §14.1)

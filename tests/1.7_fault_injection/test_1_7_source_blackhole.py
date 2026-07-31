@@ -73,6 +73,7 @@ def test_a_blackholed_source_never_reports_ok(tmp_path, postgres_cluster, relay)
     }
     _drop(postgres_cluster.dsn, slot)
     try:
+        started_at = time.monotonic()
         proc = subprocess.Popen(
             [
                 _executable("cdc-flight"),
@@ -90,10 +91,9 @@ def test_a_blackholed_source_never_reports_ok(tmp_path, postgres_cluster, relay)
         assert _wait_for(lambda: relay.bytes_relayed > 200_000, timeout=90), (
             "the pipeline never streamed anything through the relay"
         )
+        went_dark_at = time.monotonic() - started_at
         relay.blackhole()
-        went_dark_at = time.monotonic()
         returncode = proc.wait(timeout=200)
-        detected_in = time.monotonic() - went_dark_at
     finally:
         with_suppress = getattr(proc, "poll", lambda: None)()
         if with_suppress is None:
@@ -115,14 +115,23 @@ def test_a_blackholed_source_never_reports_ok(tmp_path, postgres_cluster, relay)
     # And the BOUND is measured, not asserted from the configuration. RUBRIC_STATUS
     # claims detection "within CDC_SOURCE_DARK_SECONDS (45 s)"; with `--max-seconds 70`
     # the run could equally have died of the not-streaming guard at 70 s, so the claim
-    # was unproven by the test that carried it. Generous headroom for a loaded machine:
-    # what is being falsified is "detection is bounded by the deadline, not by the dark
-    # timer", and that is a 25-second difference.
-    assert detected_in < 60, (
-        f"the dark source was only detected after {detected_in:.1f}s; "
-        "CDC_SOURCE_DARK_SECONDS is 45s and --max-seconds is 70s, so this run may have "
-        "been ended by the deadline rather than by dark-source detection"
+    # was unproven by the test that carried it (Opus MINOR-5).
+    #
+    # The measurement is the run's OWN detection instant, not the process's exit: a
+    # connector blocked on a dead socket takes another minute to tear its JVM down, so
+    # time-to-exit is a measurement of the shutdown path and not of the detector.
+    detected_at = summary.get("source_dark_detected_after_sec")
+    assert detected_at is not None, summary
+    detected_in = detected_at - went_dark_at
+    assert 0 < detected_in < 60, (
+        f"the dark source was detected {detected_in:.1f}s after the blackhole "
+        f"(run-relative: dark at {went_dark_at:.1f}s, detected at {detected_at:.1f}s). "
+        "CDC_SOURCE_DARK_SECONDS is 45 s; anything near --max-seconds=70 would mean the "
+        "deadline ended this run rather than the detector"
     )
+    # The engine cannot be closed cleanly against a dead socket, and that is expected -
+    # what must not happen is the shutdown symptom replacing the diagnosis.
+    assert summary.get("close_hung") is True, summary
 
 
 def _drop(dsn: str, slot: str) -> None:

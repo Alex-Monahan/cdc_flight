@@ -325,6 +325,30 @@ def run(
         dest_mod.ensure_dataset(con, dest.dataset_name)
 
         if reset_state:
+            # WHY THIS ONE IS NOT JOURNALLED (architecture review, finding 4). It is the
+            # same shape as the acquisition recovery - several independent durable
+            # mutations with no transaction spanning them - and the reason it does not
+            # need a journal is that **every** intermediate state converges on the same
+            # outcome rather than on a refusal:
+            #
+            #   * state dir gone, resume row present -> `file_missing_rebuilt`; the run
+            #     resumes and the *next* `--reset-state` finishes the job;
+            #   * resume row gone, table_state not yet reset -> no durable offset, so
+            #     `will_snapshot_everything` is true and the snapshot overwrites the
+            #     stale rows anyway;
+            #   * everything gone -> a fresh start, which is what was asked for.
+            #
+            # There is exactly one hole, and it is closed two lines below rather than
+            # journalled: a non-data `snapshot.mode` would turn "start over" into "stream
+            # onto tables we just declared empty". An operator running `--reset-state` is
+            # also present, unlike the crash-recovery case, which is the other half of
+            # why a durable intent buys less here.
+            if props["snapshot.mode"] not in reconcile_mod.SNAPSHOT_MODES_WITH_DATA:
+                log.warning(
+                    "--reset-state asks to start over but snapshot.mode=%s does not read "
+                    "table data; using 'initial'", props["snapshot.mode"],
+                )
+                props["snapshot.mode"] = "initial"
             # "Start over" has to mean start over at *both* ends, or the file is
             # deleted while the destination still claims a resume point and
             # reconciliation correctly refuses to re-snapshot.
@@ -463,17 +487,56 @@ def run(
 
         # rubric 4.7: an operator who passed `--accept-orphan-offsets` has asked for a
         # re-snapshot, so a `snapshot.mode` that does not read table data would turn
-        # their request into a refusal three lines later. Same reasoning as the recovery
-        # above: do not leave a manual-intervention case where the intent is unambiguous.
+        # their request into a refusal three lines later.
+        #
+        # JOURNALLED, for the same reason the slot-check recovery is (architecture
+        # review, finding 4): this is a multi-step durable mutation - drop the slot,
+        # delete the file, force a data-reading snapshot - and the forced mode used to
+        # live only in this local variable. A crash after the file was deleted would
+        # lose it exactly the way Codex B3 described, and the next run would call the
+        # leftovers an ordinary fresh start. The journal is written *after* the
+        # destructive steps here rather than before, because reconciliation has already
+        # proven the slot gone and the file deleted; what has to survive is the
+        # obligation to rebuild.
+        if outcome.decision == "orphan_accepted_resnapshot" and journal is None:
+            journal = recovery_mod.begin(
+                con,
+                pipeline=dest.pipeline_name,
+                namespace=namespace,
+                decision="orphan_offsets_accepted",
+                message=(
+                    "an operator passed --accept-orphan-offsets: the untrusted file and "
+                    "the unaccounted slot are gone and every captured table is owed a "
+                    "fresh image"
+                ),
+                slot_name=replication.slot_name,
+                offset_path=replication.offset_file,
+                captured_tables=captured_tables,
+                forget_catalog=False,
+            )
+            # The destructive steps already happened inside reconciliation, so the
+            # journal goes straight to its terminal phase; what it carries forward is
+            # the forced snapshot mode and the durable to-do list.
+            recovery_mod.resume(
+                con,
+                pipeline=dest.pipeline_name,
+                namespace=namespace,
+                record=journal,
+                dsn=source.dsn,
+            )
+            summary_extra["recovery_journal"] = journal.as_dict()
         if (
-            outcome.decision == "orphan_accepted_resnapshot"
+            journal is not None
             and props["snapshot.mode"] not in reconcile_mod.SNAPSHOT_MODES_WITH_DATA
         ):
             log.warning(
-                "--accept-orphan-offsets asks for a re-snapshot but snapshot.mode=%s does "
-                "not read table data; using 'initial'", props["snapshot.mode"],
+                "a rebuild is owed (%s) but snapshot.mode=%s does not read table data; "
+                "using %r", journal.decision, props["snapshot.mode"],
+                journal.snapshot_mode or recovery_mod.FORCED_SNAPSHOT_MODE,
             )
-            props["snapshot.mode"] = "initial"
+            props["snapshot.mode"] = (
+                journal.snapshot_mode or recovery_mod.FORCED_SNAPSHOT_MODE
+            )
 
         # ADR §4.7 - the Invariant-O guard, at start-up. `snapshot_mode` is what
         # decides the "slot exists / no durable destination row" cell (Codex 3).
@@ -500,28 +563,50 @@ def run(
         # not consumed anything yet, so there is no in-flight event to buffer": see
         # `cdc_flight.resnapshot`. A run whose own `snapshot.mode` is about to re-read
         # every table needs none of this - the fresh snapshot IS the re-snapshot.
+        # A table left `in_progress` by a process that died inside its snapshot is
+        # durable, non-terminal, and was selected by no durable queue - so the recovery
+        # journal's "nothing owes a snapshot any more" test could pass over it and the
+        # run could log that every captured table had a fresh image while one sat half
+        # built (architecture review, finding 1). Nothing is mid-snapshot at start-up by
+        # definition, so `in_progress` here means exactly that, and promoting it is what
+        # makes it discoverable from durable state after ANY crash - including the ones
+        # `except BaseException` never sees.
+        interrupted = dest_mod.promote_interrupted_snapshots(con, dest.pipeline_name)
+        if interrupted:
+            summary_extra["interrupted_snapshots_requeued"] = interrupted
         owed = dest_mod.tables_awaiting_snapshot(con, dest.pipeline_name)
         will_snapshot_everything = (
             outcome.resume_point.last_lsn == 0
             and props["snapshot.mode"] in reconcile_mod.SNAPSHOT_MODES_WITH_DATA
         )
-        if owed and journal is not None and not will_snapshot_everything:
-            # A47/A53: the main slot is what retains WAL continuously from the durable
-            # resume point, and an armed recovery has deleted that resume point and
-            # dropped that slot. Running the throwaway re-snapshot here would open a
-            # window between the throwaway slot's lifetime and the main slot's, and a
-            # transaction committing inside it is retained by neither (Codex B3's
-            # "retain at least one slot continuously"). The recovery path is
-            # constructed so that `will_snapshot_everything` is always true - the main
-            # engine's own coordinated snapshot IS the rebuild - so this is an assertion
-            # that the construction still holds, not a branch that is expected to run.
+        if (
+            owed
+            and not will_snapshot_everything
+            and resnapshot_enabled()
+            and outcome.resume_point.last_lsn == 0
+        ):
+            # A47/A53: the throwaway re-snapshot is only safe because the MAIN slot is
+            # retaining WAL continuously from the durable resume point throughout — the
+            # image at `C` hands over to a stream that never stopped. With no durable
+            # resume point there is no such guarantee: the main slot may not exist yet,
+            # and a transaction committing between the throwaway slot's lifetime and the
+            # main slot's creation would be retained by neither (Codex B3, "retain at
+            # least one slot continuously").
+            #
+            # Reachable with `--snapshot-mode no_data` (or any non-data mode) on a fresh
+            # state directory that still owes tables. An armed recovery cannot reach it,
+            # because the journal forces a data-reading mode precisely so that the main
+            # engine's own coordinated snapshot IS the rebuild.
             raise EngineFailure(
-                f"recovery {journal.recovery_id} ({journal.decision}) is armed and "
-                f"{len(owed)} table(s) owe a snapshot, but this run is not snapshotting "
-                f"everything (snapshot.mode={props['snapshot.mode']!r}, resume lsn="
-                f"{outcome.resume_point.last_lsn}). A throwaway re-snapshot here would "
-                "leave no slot retaining WAL between the image and the main stream. "
-                "Refusing rather than opening that window.",
+                f"{len(owed)} table(s) owe a snapshot and there is no durable resume "
+                f"point, but snapshot.mode={props['snapshot.mode']!r} does not read "
+                "table data. A throwaway re-snapshot here would leave no slot retaining "
+                "WAL between the image and the main stream, so a transaction committing "
+                "in between would be in neither. Use a snapshot mode that backfills."
+                + (
+                    f" (recovery {journal.recovery_id} is armed)"
+                    if journal is not None else ""
+                ),
                 dict(summary_extra),
             )
         if owed and not will_snapshot_everything and resnapshot_enabled():
@@ -675,7 +760,15 @@ def run(
             # again. Clearing it any earlier would throw away the forced snapshot mode
             # that the rest of the rebuild depends on.
             if journal is not None:
-                still_owed = dest_mod.tables_awaiting_snapshot(con, dest.pipeline_name)
+                # The SAME definition of "owes work" the queue uses, including the
+                # `in_progress` rows a crash can leave behind: clearing the journal is
+                # the claim that the rebuild finished, and it may not be made over a
+                # table that is still mid-snapshot.
+                states = dest_mod.read_snapshot_states(con, dest.pipeline_name)
+                still_owed = [
+                    name for name, state in states.items()
+                    if state in dest_mod.SNAPSHOT_STATES_OWING_WORK
+                ]
                 has_resume = bool(
                     con.execute(
                         f"SELECT 1 FROM {CONTROL_SCHEMA}.debezium_offsets "

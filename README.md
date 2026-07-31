@@ -202,7 +202,10 @@ Measured on an M-series Mac. Only executed runs are reported here; see
 
 | suite | result | wall clock | measured |
 |---|---|---|---|
-| `make test` (local only) | **384 passed, 0 xfail** | **502 s** (8:21) | 2026-07-31, after 1.6 + 1.7 + 1.8 + 4.7 |
+| `make test` (local only) | **441 passed, 0 xfail** | **526 s** (8:46) | 2026-07-31, after the 1.6-1.8 review round |
+| `make test-slow` | **78 passed** | **1 066 s** (17:45) | 2026-07-31, after the 1.6-1.8 review round |
+| `make test-md` | **22 passed** | **291 s** (4:50) | 2026-07-31, after the 1.6-1.8 review round |
+| `make test` (local only) | 384 passed, 0 xfail | 502 s (8:21) | 2026-07-31, after 1.6 + 1.7 + 1.8 + 4.7 |
 | `make test-slow` | **54 passed** | **851 s** (14:10) | 2026-07-31, after 1.6 + 1.7 + 1.8 + 4.7 |
 | `make test-md` | **22 passed** | **284 s** (4:44) | 2026-07-31, after 1.6 + 1.7 + 1.8 + 4.7 |
 | `make test` (local only) | 326 passed, 0 xfail | 344 s (5:44) | 2026-07-31, after the 1.4/1.5 review round |
@@ -215,18 +218,27 @@ Measured on an M-series Mac. Only executed runs are reported here; see
 | `make test-slow` | 9 passed | 179 s (2:58) | 2026-07-31, after the 1.1-1.3 review round |
 | `make test-md` | 12 passed | 155 s (2:34) | 2026-07-31, after the 1.1-1.3 review round |
 
-The default suite is at **8:21 of a 10-minute budget**, so 1.6/1.7/1.8 spent their
-budget deliberately rather than by accident: one representative per *mechanism* stays in
-the default suite and the exhaustive matrices are `slow`. What moved out, and why it is
-safe to have moved: the full 12-anchor fault matrix (the default suite runs one
-`maybe_crash` and one `FaultyConnection` representative, which share all the machinery),
-the dropped-slot and restored-cluster recoveries (the advanced-slot recovery, which is
-1.8's own headline, stays in), the interrupted snapshot (the default suite keeps
-`tests/1.1_exactly_once_pk/test_1_1_fault_interleavings.py`'s guard for the same
-mechanism), the recreated-relation rebuild, the TCP blackhole and the chaos harness.
+The default suite is at **8:46 of a 10-minute budget** with 57 more tests than the
+previous measurement, and the partition was rebalanced rather than the ceiling raised.
+The 1.6-1.8 review found that 10 of 12 fault anchors and 57 of 91 new tests ran only
+under `-m slow` — a guard outside the gate that runs on every change is not a guard.
 
-`make test-slow` grew from 4:28 to 14:10. It is not on a budget, but it is now long
-enough that it belongs in a review round rather than in a tight edit loop.
+What that cost, and what paid for it, is enumerated in `RUBRIC_STATUS.md` under "Suite
+partition". The short version: every anchor and every `check_slot` decision cell now has
+a default-suite guard, most of them **in-process** and costing milliseconds
+(`tests/1.7_fault_injection/test_1_7_anchor_guards.py` covers all thirteen anchors in
+0.8 s), while the expensive end-to-end matrices stay `slow`. Two modules whose claims are
+now covered more cheaply elsewhere moved out (`test_1_6_resnapshot.py`,
+`test_1_5_truncate_drop_e2e.py`). Nothing was deleted.
+
+The one expensive addition is deliberate: `test_1_6_resnapshot_multi_table.py` costs 70 s
+and is the guard for the worst defect this branch shipped — a re-snapshot that could
+delete a live destination table it had merely not reached. That defect was invisible to
+91 tests because every one of them re-snapshotted exactly **one** table.
+
+`make test-slow` is long enough that it belongs in a review round rather than in a tight
+edit loop, and it grew again here: the chaos harness now plans a cover of the anchor set
+and injects faults *during recovery*, over more than one seed.
 
 The xfail count is zero because every target test passes; the gap pins they superseded
 were deleted, as each suite's README said they should be. 1.4 and 1.5 added 78 default

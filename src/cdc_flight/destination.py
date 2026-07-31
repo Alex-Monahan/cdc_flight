@@ -38,6 +38,27 @@ CONTROL_SCHEMA = "_cdc_flight"
 #: already depend on.
 AWAITING_SNAPSHOT = "awaiting_snapshot"
 
+#: `table_state.snapshot_state`, frozen. ADR §4.8 declared `none|in_progress|complete|
+#: failed` and the value the whole re-snapshot machinery runs on - `awaiting_snapshot` -
+#: was not in the declared domain, while `failed` was declared and never written by
+#: anything. Nothing validated a read, so a typo anywhere would have produced a state
+#: that silently belongs to no queue (architecture review, finding 2). The set is now
+#: here, `failed` is gone because nothing writes it, and reads are validated.
+SNAPSHOT_NONE = "none"
+SNAPSHOT_IN_PROGRESS = "in_progress"
+SNAPSHOT_COMPLETE = "complete"
+SNAPSHOT_STATES = frozenset(
+    {SNAPSHOT_NONE, SNAPSHOT_IN_PROGRESS, SNAPSHOT_COMPLETE, AWAITING_SNAPSHOT}
+)
+
+#: States that mean "this table does not hold a trustworthy image of the source".
+#: `in_progress` is in here and that is the whole point: it is durable, it is NOT
+#: terminal, and until now no durable query selected it, so a table whose snapshot was
+#: interrupted by anything the `except BaseException` handler cannot catch - `os._exit`,
+#: `SIGKILL`, the commit watchdog - was invisible to every queue and to the recovery
+#: journal's "is the rebuild finished?" test (architecture review, finding 1).
+SNAPSHOT_STATES_OWING_WORK = frozenset({AWAITING_SNAPSHOT, SNAPSHOT_IN_PROGRESS})
+
 #: How long a lease write may keep retrying a write-write conflict, and how long it
 #: waits between attempts. See `Lease._write` - this exists because a hard crash
 #: leaves an abandoned MotherDuck transaction holding the lease row.
@@ -512,6 +533,9 @@ def tables_awaiting_snapshot(con, pipeline: str) -> list[tuple[str, str, str]]:
     The queue rubric 1.6's re-snapshot works from and rubric 1.5's `recreated` action
     and rubric 1.8's recovery both write into. Ordered so a re-snapshot is
     deterministic and its logs are diffable.
+
+    `promote_interrupted_snapshots()` is what makes this queue complete: run it once at
+    start-up and every durable non-terminal state is in here.
     """
     rows = con.execute(
         f"SELECT source_schema, source_table, target_table FROM {CONTROL_SCHEMA}.table_state "
@@ -519,6 +543,66 @@ def tables_awaiting_snapshot(con, pipeline: str) -> list[tuple[str, str, str]]:
         [pipeline, AWAITING_SNAPSHOT],
     ).fetchall()
     return [(str(a), str(b), str(c)) for a, b, c in rows]
+
+
+def read_snapshot_states(con, pipeline: str) -> dict[str, str]:
+    """`"<schema>.<table>" -> snapshot_state`, VALIDATED against the frozen domain.
+
+    A state outside `SNAPSHOT_STATES` is a bug in whatever wrote it, and the honest
+    response is a loud failure rather than a table that quietly belongs to no queue.
+    """
+    out: dict[str, str] = {}
+    for schema, table, state in con.execute(
+        f"SELECT source_schema, source_table, snapshot_state FROM "
+        f"{CONTROL_SCHEMA}.table_state WHERE pipeline = ?",
+        [pipeline],
+    ).fetchall():
+        value = str(state)
+        if value not in SNAPSHOT_STATES:
+            raise ValueError(
+                f"{CONTROL_SCHEMA}.table_state for {schema}.{table} carries "
+                f"snapshot_state={value!r}, which is not one of {sorted(SNAPSHOT_STATES)}. "
+                "A state outside the frozen domain belongs to no queue and no recovery "
+                "path, so it is refused rather than skipped (ADR 0001 §4.8)."
+            )
+        out[f"{schema}.{table}"] = value
+    return out
+
+
+def promote_interrupted_snapshots(con, pipeline: str) -> list[str]:
+    """Turn every durable `in_progress` row into owed work. Call once, at start-up.
+
+    `in_progress` is written the instant a table's first snapshot record arrives and is
+    cleared only by the swap. It is durable and it is **not** terminal, and until this
+    existed the only thing that recovered from it was the applier's
+    `except BaseException` - a handler that `os._exit` (the fault injector, the commit
+    watchdog) and `SIGKILL` both step straight over. The consequence was concrete: the
+    recovery journal's "no table owes a snapshot any more" test could pass, and the run
+    could log "recovery COMPLETE: every captured table has a fresh image", while a table
+    sat half-snapshotted (architecture review, finding 1).
+
+    At start-up nothing is mid-snapshot by definition, so `in_progress` can only mean a
+    previous process died inside one. Promoting it to `awaiting_snapshot` is what makes
+    that discoverable from durable state alone, after ANY crash.
+    """
+    rows = con.execute(
+        f"SELECT source_schema, source_table FROM {CONTROL_SCHEMA}.table_state "
+        "WHERE pipeline = ? AND snapshot_state = ? ORDER BY source_schema, source_table",
+        [pipeline, SNAPSHOT_IN_PROGRESS],
+    ).fetchall()
+    if not rows:
+        return []
+    con.execute(
+        f"UPDATE {CONTROL_SCHEMA}.table_state SET snapshot_state = ? "
+        "WHERE pipeline = ? AND snapshot_state = ?",
+        [AWAITING_SNAPSHOT, pipeline, SNAPSHOT_IN_PROGRESS],
+    )
+    names = [f"{a}.{b}" for a, b in rows]
+    log.warning(
+        "%s table(s) were left mid-snapshot by an earlier process and are now marked "
+        "awaiting_snapshot: %s", len(names), ", ".join(names),
+    )
+    return names
 
 
 def request_snapshot(

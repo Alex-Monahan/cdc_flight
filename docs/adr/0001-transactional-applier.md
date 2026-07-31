@@ -1,6 +1,6 @@
 # ADR 0001 — The transactional applier
 
-* **Status:** accepted (revision 5, 2026-07-31 — implemented; §15 records the amendments the implementation forced, §16 those the 1.1–1.3 review round forced, §17 those 1.4/1.5 forced)
+* **Status:** accepted (revision 8, 2026-07-31 — implemented; §15 records the amendments the implementation forced, §16 those the 1.1–1.3 review round forced, §17 those 1.4/1.5 forced, §18 the 1.4/1.5 review round, §19 the 1.6-1.8 work and its review round)
 * **Date:** 2026-07-30
 * **Task:** TODO 1.0(a); revised under TODO 1.0(feedback)
 * **Decides rubric items:** 1.1, 1.2, 1.3, 1.7 (directly), and 1.4, 1.6, 1.8, 3.2,
@@ -22,6 +22,7 @@
 | 6 | 2026-07-31 | **Amendments from the 1.4/1.5 review round** (§18). The fold rebuilt around **physical rows**, which supersedes A31 and closes five reproduced silent-loss/duplication orderings (A35); where it cannot attribute, it refuses rather than guessing (A36); Invariant O restated as bounding *ordering only*, so the fold is the second half of the exactly-once claim (A37); four guards added between detection and destruction, and `CDC_CATALOG_GRACE` excluded from the guarantee (A38); `table_state` made the canonical ownership registry, which `--reset-state` no longer deletes (A39); the destructive-DDL alert genuinely moved out of the transaction and classified by whether it describes a refusal or an applied action (A40); a rolled-back group discarded in the process too (A41); one source writer shared with D9 (A42); a run with an unresolved destructive change is not a success (A43); module boundaries restored (A44). |
 | 7 | 2026-07-31 | **Amendments from 1.6 / 1.7 / 1.8 and the mid-task addition of rubric 4.7** (§19): the re-snapshot mechanism, and why Debezium only pairs a snapshot with an exact LSN on a slot it creates itself (A45); the hand-over fenced per table on the COMMIT LSN, with the changelog cost stated (A46); undecidable folds self-heal instead of failing identically for ever (A47); destination and network fault injection, the commit watchdog and the mis-reported cause (A48); `unknown` source health no longer licenses an idle declaration (A49); rubric 1.8's decision table and the one refusal that survives it (A50); the failure-mode inventory rubric 4.7 needs (A51). |
 | 5 | 2026-07-31 | **Amendments from 1.4 / 1.5** (§17): a key-changing UPDATE is always `d`+`c` for Postgres, so 1.4's atomicity is a corollary of §3.2/§3.3 (A30); the merge cannot collapse a group by key alone when one key is worn by two rows in one transaction (A31); TRUNCATE is a counted, key-less data event and `skipped.operations` was the whole gap (A32); DROP TABLE needs a catalog poller whose WAL fence marker must be **transactional** (A33 — which also constrains D9); what a table-level event means for history (A34). |
+| 8 | 2026-07-31 | **Amendments from the 1.6-1.8 review round** (§19, continued). Re-snapshot completion means *every requested table*, and "empty" needs positive evidence rather than the absence of our own records (A52 — which also corrects A45's `min()` resolution of a disagreeing `C` to a hard failure). The acquisition recovery becomes a journalled, idempotent, crash-re-entrant state machine, and A50's claim that its *order* made every intermediate state recoverable is withdrawn as false (A53). A fault test must name the anchor that fired, and three fault-injection accidents are fixed (A54). A50 gains a timeline decision and a destination-emptiness input. A51 is recounted (the old headline did not add up), split to one failure and one class per row, extended with the modes this branch exposed, and made machine-checked. |
 
 ---
 
@@ -805,7 +806,13 @@ CREATE TABLE IF NOT EXISTS _cdc_flight.table_state (
     history_mode    VARCHAR     NOT NULL,   -- none|changelog|scd2|both
     key_strategy    VARCHAR     NOT NULL,   -- pk|synthetic
     key_columns     VARCHAR[],
-    snapshot_state  VARCHAR     NOT NULL,   -- none|in_progress|complete|failed
+    snapshot_state  VARCHAR     NOT NULL,   -- none|in_progress|complete|awaiting_snapshot
+                                            -- (rev 8: `failed` withdrawn - nothing ever
+                                            --  wrote it; `awaiting_snapshot` added - the
+                                            --  whole re-snapshot queue runs on it and it
+                                            --  was never in the declared domain. Frozen in
+                                            --  `destination.SNAPSHOT_STATES` and validated
+                                            --  on read.)
     snapshot_epoch  BIGINT      NOT NULL DEFAULT 0,  -- §3.5 event identity
     snapshot_lsn    BIGINT,                 -- 1.6: where the snapshot hands over
     last_commit_id  BIGINT,
@@ -2404,7 +2411,7 @@ redistributed:
 
 ---
 
-## 19. Amendments from 1.6 / 1.7 / 1.8 (rev 7, 2026-07-31)
+## 19. Amendments from 1.6 / 1.7 / 1.8, and from their review round (rev 7-8, 2026-07-31)
 
 Written while implementing TODO 1.6 (snapshot/CDC consistency), 1.7 (fault injection)
 and 1.8 (externally-advanced slot), plus the mid-task addition of rubric **4.7**
@@ -2441,10 +2448,20 @@ Consequences that are now design rules:
 3. `--accept-orphan-offsets` drops the slot too — same argument, previously missing.
 
 `C` (the consistent point) is read two independent ways — every snapshot record's
-`source.lsn`, and the first `confirmed_flush_lsn` the throwaway slot ever shows — and they
-must agree. On disagreement the **minimum** is used and an error is logged: fencing too
-low re-applies (converges for a keyed table, duplicates for a keyless one), fencing too
-high skips (silent loss), so given a choice, take the one that cannot lose.
+`source.lsn` (which *is* `slotCreatedInfo.startLsn()`), and the first
+`confirmed_flush_lsn` the throwaway slot ever shows — and they must agree.
+
+**CORRECTED at rev 8 (Codex B2, Opus Q1).** This section used to say a disagreement takes
+the **minimum** and logs an error, on the argument that fencing too low can only
+re-apply. The argument is true and insufficient: re-applying **duplicates** on a keyless
+table, which violates rubric 1.2's exactly-once claim, so `min` did not avoid a
+correctness violation — it chose a different one. And a disagreement has already
+falsified the assumption that either reading identifies the exported snapshot, so neither
+value is a boundary anything may rest on. It is now fatal; the tables stay
+`awaiting_snapshot` and the next run takes a fresh `C`. The polled slot value is a
+**corroboration only** and is never the sole basis for `C`: for an all-empty capture set
+it was a race with no upper bound, and that case is handled by A52's own construction
+instead.
 
 ### A46 — the hand-over is fenced per table, on the COMMIT LSN
 
@@ -2541,6 +2558,21 @@ succeeded (no `psycopg`, no privilege, a firewall that was always there) still d
 timer-only idle detection; one that *was* answering and has gone dark forbids idle, counts
 as not-streaming, and after `CDC_SOURCE_DARK_SECONDS` (45 s) fails the run outright — which
 makes detection bounded rather than "whenever `--max-seconds` happens to expire".
+
+**Amended at rev 8 (Opus MINOR-5).** Two things the blackhole scenario exposed once the
+test stopped accepting `"source" in json.dumps(summary)` as evidence:
+
+* **the shutdown symptom was replacing the diagnosis.** A source that has gone dark makes
+  `engine.close()` hang almost by definition — the connector is waiting on a socket that
+  will never answer — and the supervisor overwrote `stop_reason='source_dark'` with
+  `'hung'` in its `finally`. The cause is now preserved and `close_hung: true` is recorded
+  alongside it, which is the same cause-before-symptom rule the `EngineFailure` path
+  already followed.
+* **the 45-second claim was unmeasurable from outside.** Time-to-process-exit includes
+  tearing down a JVM whose connector is blocked on a dead socket — another minute — so it
+  measures the shutdown path, not the detector. The summary now carries
+  `source_dark_detected_after_sec`, taken at the instant of detection, and the test
+  asserts the interval from the blackhole to that instant.
 
 ### A50 — rubric 1.8's decision table, and the one refusal that survives it
 
@@ -2785,14 +2817,59 @@ first and refuses to delete anything if the drop fails, because the operator aut
 rebuilding a destination and not an uncoordinated image/stream boundary.
 
 **Continuous WAL retention.** Codex B3 asks for at least one slot retaining WAL from the
-snapshot's `C` through main-stream takeover. It holds by construction rather than by a new
-mechanism, and the construction is now asserted: after a recovery the resume point is gone
-and `snapshot.mode` reads data, so `will_snapshot_everything` is true and the **main**
-engine's own coordinated snapshot is the rebuild — Debezium creates the slot and exports
-the snapshot in one operation, with no gap. The throwaway `_rs` path is only ever used
-when a durable resume point exists, and in that case the main slot has retained WAL
-continuously throughout and is never dropped. `pipeline.run` raises if it ever finds an
-armed recovery and a throwaway re-snapshot in the same run.
+snapshot's `C` through main-stream takeover, and the precise condition is now checked
+rather than argued.
+
+The throwaway `_rs` re-snapshot is safe **iff a durable resume point exists**: the main
+slot is then retaining WAL continuously from that point and is never dropped, so the
+image at `C` hands over to a stream that never stopped. With no durable resume point
+there is no such guarantee — the main slot may not exist yet, and a transaction
+committing between the throwaway slot's lifetime and the main slot's creation would be
+retained by neither. `pipeline.run` therefore refuses to run a throwaway re-snapshot when
+tables are owed, the resume point is absent, and `snapshot.mode` does not read data. That
+combination is reachable (`--snapshot-mode no_data` on a fresh state directory that still
+owes tables) and it is the only shape that opens the window.
+
+After a *recovery* it cannot arise: the journal forces a data-reading mode and the resume
+point is gone, so `will_snapshot_everything` is true and the **main** engine's own
+coordinated snapshot is the rebuild — Debezium creates the slot and exports the snapshot
+in one operation, with no gap at all.
+
+**Five facts a parallel state-machine architecture review supplied, folded in here
+rather than left for the refactor that will own them.**
+
+1. **`in_progress` is durable, non-terminal, and belonged to no queue.** It is written
+   the instant a table's first snapshot record arrives and cleared only by the swap, so
+   a process that dies inside a snapshot leaves it behind — and the only thing that ever
+   recovered from it was the applier's `except BaseException`, which `os._exit` (the
+   fault injector, the commit watchdog's `EX_TEMPFAIL`) and `SIGKILL` step straight
+   over. The journal's "no table owes a snapshot any more" test could therefore pass
+   over a half-built table and the run could log that every captured table had a fresh
+   image. `promote_interrupted_snapshots()` runs once at start-up — nothing is
+   mid-snapshot then, by definition — and the journal-clear test uses the same
+   `SNAPSHOT_STATES_OWING_WORK` predicate the queue does.
+2. **The `snapshot_state` domain is frozen and validated on read.** §4.8 declared
+   `none|in_progress|complete|failed`; `failed` was never written by anything and
+   `awaiting_snapshot`, which the entire re-snapshot machinery runs on, was not in the
+   declared set. A value outside `destination.SNAPSHOT_STATES` now raises rather than
+   silently belonging to no queue.
+3. **`recovery.PHASES` is enforced.** It was declared and never checked: `read()`
+   accepted any string, `resume()` matched none of its branches, fell through every
+   `if`, and logged "recovery is ARMED" having done nothing — a silent no-op wearing a
+   success message. An unrecognised phase is now `RecoveryFailed`.
+4. **`--accept-orphan-offsets` is journalled; `--reset-state` deliberately is not.**
+   The first is the same shape as the acquisition recovery — drop the slot, delete the
+   file, force a data-reading snapshot — and its forced mode lived only in a local
+   variable, so a crash lost it exactly the way B3 described. The second needs no
+   journal because **every** intermediate state converges on the outcome that was asked
+   for rather than on a refusal (state-dir gone + row present is `file_missing_rebuilt`;
+   row gone is a full snapshot anyway), and the one hole — a non-data `snapshot.mode`
+   turning "start over" into "stream onto tables we just cleared" — is closed by forcing
+   the mode rather than by persisting an intent. The reasoning is written at the code.
+5. **`_cdc_flight.heartbeat` now exists.** §4.8 and D9.1 declared it and nothing ever
+   created it, so the observability surface rubrics 4.5/4.6/6.1/6.2 are scored against
+   was absent. The writer belongs to 4.4/6.1 and is still absent; creating the table now
+   means that task lands a writer rather than a migration.
 
 **The throwaway slot is swept.** It leaked on every failure route out of `resnapshot.run`
 (there was no `try/finally`), and a leaked logical slot holds WAL on the source for ever

@@ -340,3 +340,88 @@ def test_a_forgotten_catalog_is_part_of_the_same_transaction(world):
     ).fetchone()[0]
     assert remaining == 0
     assert world.journal().forget_catalog is True
+
+
+# --------------------------------------------------------------------------- #
+# durable non-terminal states, and the phase domain
+# (findings 1-3 of the parallel state-machine architecture review)
+# --------------------------------------------------------------------------- #
+def test_a_table_left_mid_snapshot_is_owed_work_after_ANY_crash(world):
+    """`in_progress` is durable, non-terminal, and used to belong to no queue.
+
+    It is written the instant a table's first snapshot record arrives and cleared only
+    by the swap, so a process that dies inside a snapshot leaves it behind. The only
+    thing that ever recovered from it was the applier's `except BaseException` — which
+    `os._exit` (the fault injector, the commit watchdog) and `SIGKILL` both step over.
+
+    The consequence was concrete: the recovery journal's "no table owes a snapshot any
+    more" test could pass, and the run could log "recovery COMPLETE: every captured
+    table has a fresh image", over a table that was half built.
+    """
+    world.con.execute(
+        "UPDATE _cdc_flight.table_state SET snapshot_state = 'in_progress' "
+        "WHERE pipeline = ? AND source_table = 'orders'",
+        [PIPELINE],
+    )
+    assert world.owed == [], "this is the gap: no durable queue selected it"
+
+    promoted = dest_mod.promote_interrupted_snapshots(world.con, PIPELINE)
+    assert promoted == ["app.orders"]
+    assert world.owed == ["app.orders"]
+
+    # Idempotent, and a no-op when nothing was interrupted.
+    assert dest_mod.promote_interrupted_snapshots(world.con, PIPELINE) == []
+
+
+def test_the_owes_work_predicate_covers_both_non_terminal_states(world):
+    assert {"awaiting_snapshot", "in_progress"} == dest_mod.SNAPSHOT_STATES_OWING_WORK
+    assert dest_mod.SNAPSHOT_STATES_OWING_WORK <= dest_mod.SNAPSHOT_STATES
+
+
+def test_a_snapshot_state_outside_the_frozen_domain_is_refused(world):
+    """ADR §4.8 declared a domain that did not include the value everything uses.
+
+    `failed` was declared and never written; `awaiting_snapshot` was written by three
+    modules and never declared; nothing validated a read. A state outside the domain
+    belongs to no queue and no recovery path, so it is refused rather than skipped.
+    """
+    states = dest_mod.read_snapshot_states(world.con, PIPELINE)
+    assert set(states.values()) <= dest_mod.SNAPSHOT_STATES
+
+    world.con.execute(
+        "UPDATE _cdc_flight.table_state SET snapshot_state = 'failed' "
+        "WHERE pipeline = ? AND source_table = 'orders'",
+        [PIPELINE],
+    )
+    with pytest.raises(ValueError) as raised:
+        dest_mod.read_snapshot_states(world.con, PIPELINE)
+    assert "app.orders" in str(raised.value)
+    assert "failed" in str(raised.value)
+
+
+def test_an_unknown_recovery_phase_is_loud_rather_than_a_silent_no_op(world):
+    """`PHASES` was declared and never enforced.
+
+    `read()` accepted any string and `resume()` then matched none of its branches, fell
+    through every `if`, and logged "recovery is ARMED" while having done nothing at all.
+    """
+    world.begin()
+    world.con.execute(
+        "UPDATE _cdc_flight.recovery_state SET phase = 'halfway' WHERE pipeline = ?",
+        [PIPELINE],
+    )
+    with pytest.raises(RecoveryFailed) as raised:
+        world.journal()
+    assert "halfway" in str(raised.value)
+
+
+def test_the_heartbeat_table_declared_by_the_adr_actually_exists(world):
+    """ADR §4.8 / D9.1 declared it and nothing ever created it."""
+    columns = {
+        str(row[0])
+        for row in world.con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = '_cdc_flight' AND table_name = 'heartbeat'"
+        ).fetchall()
+    }
+    assert {"pipeline", "runner_id", "beat_at", "phase", "lag_seconds"} <= columns

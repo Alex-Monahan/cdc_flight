@@ -79,6 +79,8 @@ def run_engine_bounded(
 
     stop_reason = "max_seconds"
     idle_blocked_by_source = 0
+    source_dark_after: float | None = None
+    close_hung = False
     try:
         while thread.is_alive():
             elapsed = time.monotonic() - started
@@ -100,6 +102,7 @@ def run_engine_bounded(
                 and health.unknown_for >= run.source_dark_seconds
             ):
                 stop_reason = "source_dark"
+                source_dark_after = round(elapsed, 2)
                 break
             # An explicit "the work this engine was started for is done" signal. Only
             # `cdc_flight.resnapshot` supplies one: a re-snapshot is finished the moment
@@ -168,11 +171,20 @@ def run_engine_bounded(
         closer.join(timeout=run.close_timeout)
         if closer.is_alive():
             log.error("engine.close() did not return within %ss", run.close_timeout)
-            stop_reason = "hung"
+            close_hung = True
+            # The CAUSE, not the symptom. A source that has gone dark makes
+            # `engine.close()` hang almost by definition - the connector is waiting on a
+            # socket that will never answer - and overwriting `source_dark` with `hung`
+            # reported the consequence and lost the diagnosis. The same principle the
+            # error path already applies to `EngineFailure`'s cause ordering.
+            if stop_reason not in ("source_dark", "engine_error"):
+                stop_reason = "hung"
         thread.join(timeout=60)
         if thread.is_alive():
             log.error("debezium engine thread did not stop within 60s")
-            stop_reason = "hung"
+            close_hung = True
+            if stop_reason not in ("source_dark", "engine_error"):
+                stop_reason = "hung"
         # ADR 0001 §3.2: the un-ENDed tail is DISCARDED, never guessed at. It is
         # safe to discard precisely because Invariant O means the offset store
         # still points before it, so it replays on the next run.
@@ -191,6 +203,16 @@ def run_engine_bounded(
         "offset_flushes_verified": engine.offset_flushes_verified,
         **handler.stats(),
     }
+    if close_hung:
+        # Recorded even when it is not the reported reason, because "we could not shut
+        # the engine down" is operationally interesting whatever caused it.
+        summary["close_hung"] = True
+    if source_dark_after is not None:
+        # The number RUBRIC_STATUS's `CDC_SOURCE_DARK_SECONDS` claim rests on, measured
+        # at the moment of detection rather than inferred from when the process happened
+        # to exit - the process still has to tear down a JVM whose connector is blocked
+        # on a dead socket, which is another minute (Opus MINOR-5).
+        summary["source_dark_detected_after_sec"] = source_dark_after
     if health is not None:
         summary.update(health.summary())
     if engine.suppressed_message:
