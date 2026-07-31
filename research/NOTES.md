@@ -2,7 +2,7 @@
 
 Everything here is measured against the running baseline in this repo, not guessed.
 Source material: [`dlthub_debezium_and_dlt.md`](dlthub_debezium_and_dlt.md) (saved copy of
-the dlthub post) and the forks catalogued in `../../repos/FORKS.md`.
+the dlthub post) and the forks catalogued in `FORKS.md`.
 
 **The rubric outranks the blog.** Where the blog's design would score below 5 on
 `cdc_tool_decision_matrix_v3_for_swarm.md`, the blog is wrong and gets replaced in a later
