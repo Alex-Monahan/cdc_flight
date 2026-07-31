@@ -53,6 +53,35 @@ file the branch deleted - was a documentation merge blocker in its own right
 * Items whose evidence is incomplete are marked **provisional** with the missing
   evidence named explicitly.
 
+### The 1.4 / 1.5 review round (2026-07-31)
+
+Two independent reviews attacked this branch's 1.4 and 1.5 claims and both reproduced
+correctness defects **inside correctly committed transactions**. Codex scored 1/5 and
+2/5, Opus 3/5 and 4/5. Every reproduced counterexample is now a test in the default
+suite that asserts source/destination **equality**, and the two items are rescored
+conservatively at **5** and **4** — 1.5 deliberately not restored to 5.
+
+| finding | disposition |
+|---|---|
+| Codex 1 / Opus B-1, B-2 — the fold asked a group-scoped question about a per-row ambiguity | **fixed.** `table_work` folds physical rows (ADR §18/A35); five orderings closed |
+| Codex 2 — spill bypassed the truncate policy and audit | **fixed.** One dispatcher (`planner.GroupPlan`); a `{memory,spill} x {replicate,log}` matrix; positional audit |
+| Codex 3 — cross-transaction truncate zombie | **fixed** by the same fold |
+| Codex 4 / Opus M-3 — a stale drop could destroy a live replacement | **fixed.** Confirmation, supersession, fail-closed revalidation, a circuit breaker, a zero-relations guard (ADR §18/A38) |
+| Codex 5 — no durable source→destination ownership | **fixed.** `table_state` written by whoever creates the table; `--reset-state` keeps it (A39) |
+| Codex 6 — the no-writable-primary fallback reported success | **fixed.** Final synchronous poll, drain barrier, `stop_reason=catalog_unresolved` (A43) |
+| Codex 7 / Opus M-2 — the alert was inside the transaction | **fixed.** `AlertSink` on `con.cursor()`, classified by refusal vs applied action (A40) |
+| Codex 8 — `applier.py` back over 1,000 lines | **fixed.** 1,185 → 874, along the planner/coordinator boundaries (A44) |
+| Codex 9 / Opus MINOR-2 — stale non-transactional-marker docs | **fixed**, including D9's own heartbeat (A42) |
+| Opus M-1 — a rolled-back group was folded twice | **fixed.** `_reset_group()` on the rollback path, with a test that measures the loss (A41) |
+| Opus M-4 — `--reset-state` made a permanent zombie | **fixed** by A39 |
+| Opus M-5 — the recorded falsifier named a case that works | **fixed.** A31 marked superseded; the real shapes are named |
+| Opus Q1 — recreated-table policy | **drop + alert + persistent `awaiting_snapshot`**, surfaced by `inspect` and the run summary. Automatic re-snapshot is 2.3/3.4, and it is why 1.5 is 4 |
+| Opus Q2, Q5 — mass-drop breaker, confirm polls | **built**, defaults 1 and 2 |
+| Opus Q3 — unify the fence marker with D9 | **`source_marker.SourceMarker`**: the interface and the reasons, not the heartbeat loop (4.4 owns the cadence) |
+| Opus Q4 — `rows_removed` must not degrade to NULL | **asserted** on DuckDB and MotherDuck |
+| Opus MINOR-1, -3, -4, -6, -7 | **fixed** (marker write budget; a truncate no longer clobbers the cached identity; no `dropped` outside the polled schema; `DROP_IGNORE` constant; `test-slow` re-measured at 4:28 on a quiet machine) |
+| Opus MINOR-5 — drop+recreate silent for a pre-mechanism table | **no longer reachable for a new table** (every table now gets both rows); the transitional case is documented |
+
 ### Reproducing the evidence
 
 ```bash
