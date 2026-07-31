@@ -192,6 +192,43 @@ CONTROL_DDL = [
             after_json     VARCHAR,
             key_json       VARCHAR
         )""",
+    # rubric 1.5. The audit trail for everything that happens to a table rather than
+    # to a row: TRUNCATE, DROP, a drop-and-recreate, leaving or joining the
+    # publication, and (for 2.3) a table appearing. Written INSIDE the commit group's
+    # transaction, so "the destination table was emptied" and "here is why" are one
+    # atomic fact. It is also the answer to what a truncate means for history: the
+    # current-state table is emptied because Postgres emptied it, and the marker is
+    # what a changelog table (8.2) will carry as its truncate row.
+    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.table_events (
+            pipeline        VARCHAR     NOT NULL,
+            commit_id       BIGINT      NOT NULL,
+            seq             BIGINT      NOT NULL DEFAULT 0,
+            occurred_at     TIMESTAMPTZ NOT NULL,
+            event           VARCHAR     NOT NULL,
+            source_schema   VARCHAR     NOT NULL,
+            source_table    VARCHAR     NOT NULL,
+            target_table    VARCHAR,
+            applied         BOOLEAN     NOT NULL,
+            lsn             BIGINT,
+            txn_id          VARCHAR,
+            rows_removed    BIGINT,
+            detail          VARCHAR
+        )""",
+    # rubric 1.5 / 2.3. What the source catalog looked like the last time we saw it.
+    # The `relation_oid` is the load-bearing column: it is the only thing that tells a
+    # dropped-and-recreated table from the one we were replicating, and persisting it
+    # is what makes that detection survive a restart.
+    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.source_relations (
+            pipeline          VARCHAR     NOT NULL,
+            source_schema     VARCHAR     NOT NULL,
+            source_table      VARCHAR     NOT NULL,
+            relation_oid      BIGINT      NOT NULL,
+            published         BOOLEAN     NOT NULL,
+            replica_identity  VARCHAR,
+            first_seen_at     TIMESTAMPTZ NOT NULL,
+            last_seen_at      TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (pipeline, source_schema, source_table)
+        )""",
     f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.alerts (
             pipeline        VARCHAR     NOT NULL,
             raised_at       TIMESTAMPTZ NOT NULL,
@@ -395,6 +432,89 @@ def write_commit_log(con, **kwargs) -> None:
             kwargs["max_source_ts"],
             kwargs["tables_touched"],
         ],
+    )
+
+
+def write_table_event(
+    con,
+    *,
+    pipeline: str,
+    commit_id: int,
+    seq: int,
+    event: str,
+    source_schema: str,
+    source_table: str,
+    target_table: str | None,
+    applied: bool,
+    lsn: int | None = None,
+    txn_id: str | None = None,
+    rows_removed: int | None = None,
+    detail: str | None = None,
+) -> None:
+    """One `table_events` row, inside the commit group's transaction (rubric 1.5)."""
+    con.execute(
+        f"INSERT INTO {CONTROL_SCHEMA}.table_events "
+        "(pipeline, commit_id, seq, occurred_at, event, source_schema, source_table, "
+        " target_table, applied, lsn, txn_id, rows_removed, detail) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            pipeline, commit_id, seq, now(), event, source_schema, source_table,
+            target_table, applied, lsn, txn_id, rows_removed, detail,
+        ],
+    )
+
+
+def upsert_source_relation(
+    con,
+    *,
+    pipeline: str,
+    source_schema: str,
+    source_table: str,
+    relation_oid: int,
+    published: bool,
+    replica_identity: str | None,
+) -> None:
+    """Record what the source catalog says, inside the commit group's transaction.
+
+    DELETE + INSERT rather than an upsert: the destination is DuckDB/MotherDuck and
+    this is the same pattern `write_resume_point` uses, so there is one idiom for
+    "replace this row" in the whole control schema.
+    """
+    first_seen = con.execute(
+        f"SELECT first_seen_at FROM {CONTROL_SCHEMA}.source_relations "
+        "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+        [pipeline, source_schema, source_table],
+    ).fetchall()
+    current = now()
+    con.execute(
+        f"DELETE FROM {CONTROL_SCHEMA}.source_relations "
+        "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+        [pipeline, source_schema, source_table],
+    )
+    con.execute(
+        f"INSERT INTO {CONTROL_SCHEMA}.source_relations "
+        "(pipeline, source_schema, source_table, relation_oid, published, "
+        " replica_identity, first_seen_at, last_seen_at) VALUES (?,?,?,?,?,?,?,?)",
+        [
+            pipeline, source_schema, source_table, relation_oid, published,
+            replica_identity, (first_seen[0][0] if first_seen else current), current,
+        ],
+    )
+
+
+def forget_source_relation(con, *, pipeline: str, source_schema: str, source_table: str) -> None:
+    con.execute(
+        f"DELETE FROM {CONTROL_SCHEMA}.source_relations "
+        "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+        [pipeline, source_schema, source_table],
+    )
+
+
+def forget_table_state(con, *, pipeline: str, source_schema: str, source_table: str) -> None:
+    con.execute(
+        f"DELETE FROM {CONTROL_SCHEMA}.table_state "
+        "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+        [pipeline, source_schema, source_table],
     )
 
 

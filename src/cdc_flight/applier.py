@@ -44,8 +44,20 @@ from .assembler import (
     CompleteUnit,
     TransactionAssembler,
 )
+from .catalog import (
+    CHANGE_DROPPED,
+    CHANGE_RECREATED,
+    DESTRUCTIVE,
+    CatalogChange,
+)
+from .config import (
+    DROP_MODES,
+    DROP_REPLICATE,
+    TRUNCATE_MODES,
+    TRUNCATE_REPLICATE,
+)
 from .destination import Lease, ResumePoint
-from .envelope import PendingRecord, decode
+from .envelope import KIND_TRUNCATE, PendingRecord, decode
 from .envelope import offsets_of as envelope_offsets
 from .errors import ResumePointDrift
 from .faults import maybe_crash
@@ -83,6 +95,21 @@ class ApplierConfig:
     #: and holds 200 000 Java references alive. Terminal-only is the default;
     #: `CDC_ACK_EVERY_RECORD=1` restores the conservative behaviour.
     ack_every_record: bool = False
+    #: rubric 1.5, `CDC_TRUNCATE_MODE` / `CDC_DROP_MODE`. `replicate` is what the
+    #: rubric's 5 asks for ("replicated just like Postgres handles them"); the other
+    #: modes exist because "faithful" destroys destination data, and an operator who
+    #: wants the audit trail without the destruction should not have to fork.
+    truncate_mode: str = TRUNCATE_REPLICATE
+    drop_mode: str = DROP_REPLICATE
+
+    def __post_init__(self) -> None:
+        # A typo must not silently restore Debezium's "truncates are skipped" default.
+        if self.truncate_mode not in TRUNCATE_MODES:
+            raise ValueError(
+                f"CDC_TRUNCATE_MODE={self.truncate_mode!r} is not one of {TRUNCATE_MODES}"
+            )
+        if self.drop_mode not in DROP_MODES:
+            raise ValueError(f"CDC_DROP_MODE={self.drop_mode!r} is not one of {DROP_MODES}")
 
 
 class Applier:
@@ -103,6 +130,7 @@ class Applier:
         runner_id: str,
         verifier=None,
         transactional_ddl: bool = True,
+        catalog=None,
     ):
         self.con = con
         self.pipeline = pipeline
@@ -116,6 +144,9 @@ class Applier:
         self.runner_id = runner_id
         self.verifier = verifier
         self.transactional_ddl = transactional_ddl
+        #: `catalog.CatalogWatcher` or None. The only source of DROP TABLE knowledge
+        #: (rubric 1.5): logical decoding does not carry DDL at all.
+        self.catalog = catalog
 
         self.registry = apply_sql.SchemaRegistry(
             con, dataset, constraints=config.destination_constraints
@@ -174,6 +205,18 @@ class Applier:
         self.fenced_spilled_events = 0
         self.deferred_units = 0
         self.deferred_events = 0
+        self.truncates_applied = 0
+        self.truncates_logged = 0
+        self.tables_dropped = 0
+        self.catalog_changes_applied = 0
+        #: table-level events (rubric 1.5) collected while applying THIS group, all
+        #: written to `_cdc_flight.table_events` inside its transaction.
+        self._table_events: list[dict] = []
+        self._table_event_seq = 0
+        self._applied_catalog_changes: list[CatalogChange] = []
+        self._applied_catalog_dirty: list = []
+        #: source tables this group actually wrote, handed to the watcher after COMMIT
+        self._group_source_tables: set[str] = set()
         self.table_counts: dict[str, int] = {}
         self.last_commit_id = resume_point.commit_id
         self.error: BaseException | None = None
@@ -225,6 +268,12 @@ class Applier:
             "last_commit_id": self.last_commit_id,
             "durable_lsn": self.resume_point.last_lsn,
             "transactional_ddl": self.transactional_ddl,
+            # rubric 1.5
+            "truncates_applied": self.truncates_applied,
+            "truncates_logged": self.truncates_logged,
+            "tables_dropped": self.tables_dropped,
+            "catalog_changes_applied": self.catalog_changes_applied,
+            **(self.catalog.summary() if self.catalog is not None else {}),
         }
 
     def _age_timer(self) -> None:
@@ -369,6 +418,9 @@ class Applier:
         # `.clear()`, not a fresh set: `SnapshotCoordinator` holds the same object.
         self._created_in_txn.clear()
         self._spill_commit_id = None
+        self._table_events = []
+        self._table_event_seq = 0
+        self._group_source_tables = set()
 
     # ------------------------------------------------------------------ #
     # the transaction
@@ -396,6 +448,9 @@ class Applier:
             self.lease.renew(self.con)
             stats = self._apply_units(group, commit_id, has_data=has_data)
             new_point = self._resume_point_for(group, commit_id)
+            # rubric 1.5: DDL the stream cannot carry, fenced on the resume point this
+            # group is about to make durable.
+            self._apply_catalog_changes(commit_id, new_point.last_lsn, stats)
             destination.write_commit_log(
                 self.con,
                 commit_id=commit_id,
@@ -457,6 +512,7 @@ class Applier:
         if self.verifier is not None and marked:
             self._pending_verification = (offset_fingerprint, marked)
 
+        self._settle_catalog()
         self.commit_groups += 1
         if has_data:
             self.data_commit_groups += 1
@@ -476,6 +532,12 @@ class Applier:
             log.debug("rollback failed", exc_info=True)
         finally:
             self._txn_open = False
+            # Markers describe an apply that did not happen, and the catalog work of a
+            # rolled-back group must stay pending so it is applied (or re-detected)
+            # rather than silently forgotten.
+            self._table_events = []
+            self._applied_catalog_changes = []
+            self._applied_catalog_dirty = []
             # Every CREATE / ALTER we issued is gone with the transaction, so the
             # cached destination shape is now a lie. Rebuilding it is cheap and
             # not doing it is how a rolled-back run corrupts the next one.
@@ -678,7 +740,153 @@ class Applier:
                 state, commit_id=commit_id, snapshot_lsn=stats.get("last_lsn")
             ):
                 stats["tables"].add(state.target)
+        self._flush_table_events(commit_id)
         return stats
+
+    # ------------------------------------------------------------------ #
+    # table-level events: TRUNCATE, DROP, publication changes (rubric 1.5)
+    # ------------------------------------------------------------------ #
+    def _flush_table_events(self, commit_id: int) -> None:
+        """Write this group's `table_events` rows, inside its transaction.
+
+        Deliberately transactional with the data: "the destination table was emptied"
+        and "here is the source event that emptied it" must become true together, or
+        the audit trail can outlive a rolled-back apply and describe something that
+        never happened.
+        """
+        for marker in self._table_events:
+            item = marker.pop("item", None)
+            destination.write_table_event(
+                self.con,
+                pipeline=self.pipeline,
+                commit_id=commit_id,
+                seq=self._next_table_event_seq(),
+                rows_removed=None if item is None else item.rows_removed,
+                **marker,
+            )
+        self._table_events = []
+
+    def _settle_catalog(self) -> None:
+        """Forget the catalog work this group made durable. Runs after COMMIT."""
+        if self.catalog is None:
+            return
+        if self._applied_catalog_changes:
+            self.catalog.resolve(self._applied_catalog_changes)
+            for change in self._applied_catalog_changes:
+                if change.kind == CHANGE_DROPPED:
+                    # No destination table any more, so it is not a replicated table
+                    # any more: if the name comes back it is a NEW table (2.3), not a
+                    # continuation of this one.
+                    self.catalog.forget(change.qualified)
+            self._applied_catalog_changes = []
+        if self._applied_catalog_dirty:
+            self.catalog.clear_dirty([rel.qualified for rel in self._applied_catalog_dirty])
+            self._applied_catalog_dirty = []
+        if self._group_source_tables:
+            self.catalog.observe_replicated(self._group_source_tables)
+
+    def _next_table_event_seq(self) -> int:
+        self._table_event_seq += 1
+        return self._table_event_seq
+
+    def _apply_catalog_changes(self, commit_id: int, durable_lsn: int, stats: dict) -> None:
+        """Apply the source-catalog changes whose fence has opened (rubric 1.5).
+
+        Runs inside the commit group's transaction, *after* the group's events, so a
+        `DROP` cannot remove rows that an event of this same group had still to add,
+        and a crash between the drop and the resume-point write replays both.
+        """
+        if self.catalog is None or self.cfg.drop_mode == "ignore":
+            return
+        due = self.catalog.due(durable_lsn)
+        applied: list[CatalogChange] = []
+        for change in due:
+            destructive = change.kind in DESTRUCTIVE and self.cfg.drop_mode == DROP_REPLICATE
+            detail = None
+            if change.kind in DESTRUCTIVE and not destructive:
+                detail = f"drop_mode={self.cfg.drop_mode}"
+            if destructive:
+                target = naming.destination_table(
+                    self.topic_prefix, change.schema, change.table
+                )
+                # The shadow goes too: a table dropped mid-backfill would otherwise
+                # leave `<target>__cdcf_tmp` behind forever.
+                self.registry.drop(naming.shadow_table(target))
+                self.registry.drop(target)
+                destination.forget_table_state(
+                    self.con,
+                    pipeline=self.pipeline,
+                    source_schema=change.schema,
+                    source_table=change.table,
+                )
+                stats["tables"].add(target)
+                self.tables_dropped += 1
+                if change.kind == CHANGE_RECREATED:
+                    detail = (
+                        f"recreated with oid {change.new_oid} (was {change.old_oid}); the "
+                        "destination table was dropped, and rows inserted into the new "
+                        "table before this point are only recovered by a re-snapshot "
+                        "(rubric 2.3/3.4)"
+                    )
+                elif not change.fenced:
+                    detail = "applied without a WAL fence marker (CDC_CATALOG_GRACE)"
+            else:
+                target = naming.destination_table(
+                    self.topic_prefix, change.schema, change.table
+                )
+            if change.kind == CHANGE_DROPPED:
+                destination.forget_source_relation(
+                    self.con,
+                    pipeline=self.pipeline,
+                    source_schema=change.schema,
+                    source_table=change.table,
+                )
+            self._table_events.append(
+                {
+                    "event": change.kind,
+                    "source_schema": change.schema,
+                    "source_table": change.table,
+                    "target_table": target,
+                    "applied": destructive,
+                    "lsn": change.detected_lsn,
+                    "txn_id": None,
+                    "detail": detail,
+                }
+            )
+            applied.append(change)
+            self.catalog_changes_applied += 1
+        # Resolved only AFTER the transaction commits (see `commit_group`): forgetting
+        # a change whose DDL then rolled back would leave the destination table in
+        # place with nothing left to re-detect it in this process.
+        self._applied_catalog_changes = applied
+        # Persist the observation LAST, and never for a table that still has an
+        # unapplied change: a `source_relations` row that runs ahead of the action it
+        # implies would make the *next* run agree with the source and never notice the
+        # drop at all. Written inside this transaction, so state and data stay atomic.
+        # Only a change that would REMOVE the destination table has to block
+        # persistence: writing the new oid before that action makes the next run agree
+        # with the source and never notice. A `new` or `unpublished` change implies no
+        # destructive action, and letting it block persistence was measured to leave a
+        # table with no `source_relations` row at all - which is how a drop between two
+        # runs went undetected.
+        remaining = {
+            change.qualified
+            for change in self.catalog.pending()
+            if change.kind in DESTRUCTIVE and change not in applied
+        }
+        self._applied_catalog_dirty = self.catalog.dirty(exclude=remaining)
+        for relation in self._applied_catalog_dirty:
+            destination.upsert_source_relation(
+                self.con,
+                pipeline=self.pipeline,
+                source_schema=relation.schema,
+                source_table=relation.table,
+                relation_oid=relation.oid,
+                published=relation.published,
+                replica_identity=relation.replica_identity,
+            )
+        if self._table_events:
+            self._flush_table_events(commit_id)
 
     def _collect(
         self,
@@ -691,6 +899,9 @@ class Applier:
     ) -> None:
         if not event.schema or not event.table:
             return
+        if event.kind == KIND_TRUNCATE:
+            self._collect_truncate(work, event, commit_id, stats, snapshot=snapshot)
+            return
         if snapshot is not None:
             target = snapshot.shadow
             event_id = self.snapshots.event_id(event)
@@ -699,6 +910,85 @@ class Applier:
             event_id = _stream_event_id(event)
         item = table_work.work_for(work, target, event, snapshot is not None)
         self._collect_prepared(item, event, commit_id, event_id, stats)
+
+    def _collect_truncate(
+        self,
+        work: dict[str, TableWork],
+        event: PendingRecord,
+        commit_id: int,
+        stats: dict,
+        *,
+        snapshot: SnapshotTable | None,
+    ) -> None:
+        """Fold one `op="t"` event (rubric 1.5).
+
+        A truncate is a table-level fact, so it always produces a `table_events`
+        marker; whether it also empties the destination table is `truncate_mode`.
+        `log` keeps the rows on purpose - that is the rubric's "handled with
+        tombstones / soft delete" behaviour, and it is the only sane setting for a
+        destination whose consumers treat the table as an append-only log.
+        """
+        target = (
+            snapshot.shadow
+            if snapshot is not None
+            else self.snapshots.target_table(event.schema, event.table)
+        )
+        replicate = self.cfg.truncate_mode == TRUNCATE_REPLICATE
+        marker = {
+            "event": "truncate",
+            "source_schema": event.schema,
+            "source_table": event.table,
+            "target_table": target,
+            "applied": replicate,
+            "lsn": event.lsn,
+            "txn_id": event.txn_id,
+            "detail": None if replicate else f"truncate_mode={self.cfg.truncate_mode}",
+        }
+        self._table_events.append(marker)
+        # The event happened whatever we do with it, so it counts towards the group's
+        # event total and its LSN bookkeeping either way.
+        stats["events"] += 1
+        if event.lsn:
+            stats["first_lsn"] = stats["first_lsn"] or event.lsn
+            stats["last_lsn"] = event.lsn
+        if event.source_ts_ms:
+            stats["max_source_ts"] = max(stats["max_source_ts"] or 0, event.source_ts_ms)
+        if not replicate:
+            self.truncates_logged += 1
+            return
+        item = table_work.work_for(work, target, event, snapshot is not None)
+        table_work.collect(item, event, {}, "", probe=None)
+        stats["tables"].add(target)
+        self.truncates_applied += 1
+        marker["item"] = item
+
+    def _pre_group_key_exists(self, item: TableWork, key: tuple) -> bool:
+        """Did `key` already hold a row at the destination when this group opened?
+
+        Rubric 1.4's disambiguator (`table_work._remove`): inside one Postgres
+        transaction a key can be worn by two different rows, and only the answer to
+        this question says which of them a delete removes. It runs during the fold,
+        which is *before* the group issues any DELETE or INSERT for the table, so
+        what it reads is genuinely the pre-group state. Asked at most once per
+        ambiguous key and cached on the `TableWork`; a group with no key reuse never
+        reaches it.
+        """
+        if item.snapshot or item.target in self._created_in_txn or not item.key_columns:
+            return False
+        table = self.registry.get(item.target)
+        if not table.exists:
+            return False
+        predicate = " AND ".join(
+            f"{naming.quote(column)} IS NOT DISTINCT FROM ?" for column in item.key_columns
+        )
+        params = [
+            apply_sql.bind(value, table.columns.get(column, apply_sql.VARCHAR))
+            for column, value in zip(item.key_columns, key, strict=False)
+        ]
+        found = self.con.execute(
+            f"SELECT 1 FROM {table.qualified} WHERE {predicate} LIMIT 1", params
+        ).fetchone()
+        return found is not None
 
     # ------------------------------------------------------------------ #
     # spill (ADR §3.4)
@@ -788,7 +1078,9 @@ class Applier:
         `commit_log.max_source_ts` (Opus MINOR-1). There is one path now.
         """
         row = table_work.row_for(event, commit_id, event_id, snapshot=item.snapshot)
-        table_work.collect(item, event, row, event_id)
+        table_work.collect(item, event, row, event_id, probe=self._pre_group_key_exists)
+        if event.schema and event.table:
+            self._group_source_tables.add(f"{event.schema}.{event.table}")
         stats["events"] += 1
         if event.lsn:
             stats["first_lsn"] = stats["first_lsn"] or event.lsn

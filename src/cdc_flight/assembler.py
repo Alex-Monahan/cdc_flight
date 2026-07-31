@@ -60,6 +60,7 @@ from .envelope import (
     KIND_MESSAGE,
     KIND_SCHEMA_CHANGE,
     KIND_SNAPSHOT,
+    KIND_TRUNCATE,
     KIND_TXN_BEGIN,
     KIND_TXN_END,
     SNAPSHOT_INCREMENTAL,
@@ -262,7 +263,11 @@ class TransactionAssembler:
             units.extend(self._feed_begin(rec))
         elif kind == KIND_TXN_END:
             units.extend(self._feed_end(rec))
-        elif kind == KIND_DATA:
+        elif kind in (KIND_DATA, KIND_TRUNCATE):
+            # A truncate goes through Debezium's `changeRecord` path, so it is counted
+            # in `END.event_count`, occupies a `total_order` ordinal and appears in
+            # `data_collections`. Feeding it as anything else would make every
+            # transaction that truncates a table fail the completeness rule.
             units.extend(self._feed_data(rec))
         elif kind in (KIND_HEARTBEAT, KIND_MESSAGE, KIND_SCHEMA_CHANGE):
             units.extend(self._feed_control(rec))

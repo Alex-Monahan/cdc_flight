@@ -109,6 +109,16 @@ METADATA_COLUMNS = (
 )
 
 
+#: Debezium's own default is `"t"`: **truncates are skipped unless you say
+#: otherwise** (`CommonConnectorConfig.java:865-875`, "By default, only truncate
+#: operations will be skipped"), and the pgoutput decoder then drops the 'T' message
+#: before it is ever decoded (`PgOutputMessageDecoder.isTruncateEventsIncluded`).
+#: That single default is the whole of rubric 1.5's truncate half, and it is why the
+#: baseline's `skipped` counter did not even increment for a TRUNCATE.
+SKIP_NOTHING = "none"
+SKIP_TRUNCATE = "t"
+
+
 def build_properties(
     source: SourceConfig,
     replication: ReplicationConfig,
@@ -117,6 +127,7 @@ def build_properties(
     max_batch_size: int = 2048,
     poll_interval_ms: int = 500,
     overrides: dict[str, str] | None = None,
+    truncate_mode: str = "replicate",
 ) -> dict[str, str]:
     """Return Debezium engine properties as a plain dict.
 
@@ -213,7 +224,16 @@ def build_properties(
         "replace.null.with.default": "false",
         # Postgres DDL events would arrive on the bare `<prefix>` topic and are
         # rubric 2.x work; keep them off until there is code that handles them.
+        # (For Postgres this is a no-op anyway: the connector has no DDL event
+        # source, which is exactly why rubric 1.5's DROP detection has to poll the
+        # catalog - see `cdc_flight.catalog`.)
         "include.schema.changes": "false",
+        # rubric 1.5: TRUNCATE reaches the applier because we ask for it. `none`
+        # means "skip no operation at all"; the connector's default `t` is what made
+        # a TRUNCATE invisible even to the skipped-record counter.
+        "skipped.operations": (
+            SKIP_TRUNCATE if truncate_mode == "ignore" else SKIP_NOTHING
+        ),
         # --- resilience -------------------------------------------------------
         "errors.max.retries": "3",
         "errors.retry.delay.initial.ms": "300",

@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import apply_sql, naming
-from .envelope import PendingRecord
+from .envelope import KIND_TRUNCATE, PendingRecord
 from .naming import CDCF_COMMIT_ID, CDCF_EVENT_ID, CDCF_TOTAL_ORDER
 
 log = logging.getLogger("cdc_flight.table_work")
@@ -64,6 +64,28 @@ class TableWork:
     final: dict[tuple, dict | None] = field(default_factory=dict)
     snapshot: bool = False
     events: int = 0
+    #: keys whose PRE-GROUP row has already been consumed by a delete (or by the
+    #: old-key half of a key change) inside this group. See `_remove`.
+    absented: set[tuple] = field(default_factory=set)
+    #: keys a NEW row moved onto during this group (an insert, or the new-key half
+    #: of a key change). An UPDATE of a row that already wore the key is not one:
+    #: that is the same row, and a later delete of it is unambiguous.
+    acquired: set[tuple] = field(default_factory=set)
+    #: cache of "did this key exist at the destination before the group?", so the
+    #: probe runs at most once per ambiguous key.
+    pre_existing: dict[tuple, bool] = field(default_factory=dict)
+    #: rubric 1.5: the group truncated this table, so every row that predates the
+    #: truncate is gone and only the rows collected *after* it survive.
+    truncated: bool = False
+    #: how many `op="t"` events the group carried for this table (a `TRUNCATE a, b`
+    #: sends one per relation, so this is 1 per table in the normal case).
+    truncates: int = 0
+    #: filled in by `write`: how many destination rows the truncate removed, for the
+    #: `_cdc_flight.table_events` marker.
+    rows_removed: int | None = None
+    #: True when the identity (`key_columns` / `keyless`) has been established from an
+    #: identity-bearing event. A truncate carries no key and must not establish one.
+    identified: bool = False
 
 
 def work_for(
@@ -73,16 +95,24 @@ def work_for(
 
     One map per commit group, shared by the in-memory and the staged path, so the
     merge sees the whole group at once and in source order (Opus B-1).
+
+    The identity is taken from the first event that HAS one. A truncate event carries
+    no message key (Debezium sends truncates to the table topic with a null key
+    schema, `EventDispatcher.java:526`), and reading that absent key as "this table is
+    keyless" would give a keyed table the keyless identity for the whole group.
     """
     item = work.get(target)
     if item is None:
-        item = TableWork(target=target, keyless=event.key is None, snapshot=snapshot)
+        item = TableWork(target=target, snapshot=snapshot)
+        work[target] = item
+    if not item.identified and event.kind != KIND_TRUNCATE:
+        item.identified = True
+        item.keyless = event.key is None
         item.key_columns = (
             tuple(naming.normalize(k) for k in event.key)
             if event.key
             else (CDCF_EVENT_ID,)
         )
-        work[target] = item
     return item
 
 
@@ -108,26 +138,128 @@ def row_for(
     return row
 
 
-def collect(item: TableWork, event: PendingRecord, row: dict[str, Any], event_id: str) -> None:
-    """Fold one event's row into the table's plan."""
+def collect(
+    item: TableWork,
+    event: PendingRecord,
+    row: dict[str, Any],
+    event_id: str,
+    *,
+    probe=None,
+) -> None:
+    """Fold one event's row into the table's plan.
+
+    `probe(item, key) -> bool` answers "did this key exist at the destination before
+    this commit group?". It is called only for the one ambiguous shape described in
+    `_remove`, so a group with no key reuse issues no extra queries at all.
+    """
+    if event.kind == KIND_TRUNCATE:
+        _truncate(item)
+        return
     for column, value in row.items():
         item.columns[column] = apply_sql.widen(
             item.columns.get(column), apply_sql.sql_type(value)
         )
     item.events += 1
     if item.keyless:
+        # A keyless table is a changelog (ADR §15/A12): one row per event, identified
+        # by `cdcf_event_id`, and a delete is a row like any other.
         key: tuple = (event_id,)
-    else:
-        key = tuple(event.key[k] for k in event.key)
-        # A primary-key UPDATE under REPLICA IDENTITY FULL arrives as one event whose
-        # `before` carries the OLD key. Touching both keys is what makes "delete old,
-        # insert new" fall out of the normal path (rubric 1.4).
-        if event.before and all(k in event.before for k in event.key):
-            old = tuple(event.before[k] for k in event.key)
-            if old != key:
-                item.touched.setdefault(old, None)
+        item.touched.setdefault(key, None)
+        item.final[key] = row
+        return
+
+    key = tuple(event.key[k] for k in event.key)
+    if event.op == "d":
+        item.touched.setdefault(key, None)
+        _remove(item, key, probe)
+        return
+
+    # A primary-key UPDATE that reaches us as a single `u` (not Postgres - see
+    # rubric 1.4's README - but other connectors and older versions do this) carries
+    # the OLD key in `before`. The old key has to be REMOVED FROM THE PLAN, not just
+    # added to `touched`: a row this same group inserted under it would otherwise be
+    # re-inserted and the destination would hold the row under both keys.
+    key_changed = False
+    if event.before and all(k in event.before for k in event.key):
+        old = tuple(event.before[k] for k in event.key)
+        if old != key:
+            key_changed = True
+            item.touched.setdefault(old, None)
+            _remove(item, old, probe)
     item.touched.setdefault(key, None)
-    item.final[key] = None if (event.op == "d" and not item.keyless) else row
+    if event.op != "u" or key_changed or key in item.absented:
+        # A row that was not under this key before now is: an insert, the new-key
+        # half of a key change, or a re-insert after this group deleted what was
+        # here. That is what makes a *later* delete of this key ambiguous.
+        item.acquired.add(key)
+    item.final[key] = row
+
+
+def _truncate(item: TableWork) -> None:
+    """Fold one `op="t"` event: everything this group planned so far is gone.
+
+    Postgres semantics, and they are exact: `TRUNCATE` inside a transaction removes
+    every row that existed when it ran, including rows the same transaction inserted
+    before it. So the plan drops its accumulated rows *and* its per-key bookkeeping —
+    the `DELETE FROM <table>` that `write` issues instead of the keyed delete covers
+    every key the group had touched — and rows collected *after* the truncate survive
+    (`TRUNCATE t; INSERT …` in one transaction leaves the inserted rows).
+    """
+    item.truncated = True
+    item.truncates += 1
+    item.events += 1
+    item.final.clear()
+    item.touched.clear()
+    item.absented.clear()
+    item.acquired.clear()
+    item.pre_existing.clear()
+
+
+def _remove(item: TableWork, key: tuple, probe) -> None:
+    """Record that `key` no longer holds the row it held. Rubric 1.4's hard case.
+
+    The easy reading - "set `final[key] = None`" - is wrong exactly when this group
+    has already *inserted* a row under `key`, because then two different rows have
+    worn that key inside one transaction and the event stream does not say which one
+    is being removed. Postgres does, and the two answers differ:
+
+    | one transaction | events | truth |
+    |---|---|---|
+    | `UPDATE t SET id = id + 1` over rows 1,2 (DEFERRABLE key) | `d(1) c(2) d(2) c(3)` | `{2, 3}` |
+    | `UPDATE … id=2 WHERE id=1; UPDATE … id=3 WHERE id=2` | `d(1) c(2) d(2) c(3)` | `{3}` |
+
+    Byte-identical streams. What separates them is whether key 2 existed *before*
+    the transaction: in the permutation the `d(2)` removes the pre-transaction row 2
+    (and the row that just became 2 survives), in the chain it removes the row the
+    transaction itself created.
+
+    So: if the group inserted a row under `key` and a pre-group row under `key` is
+    still unconsumed, this removal takes the **pre-group** row - which the merge's
+    `DELETE … WHERE key IN touched` already performs - and the in-group row stays.
+    Otherwise it takes the in-group row, and the plan drops it.
+
+    A snapshot chunk cannot reach the ambiguous branch: it writes into a shadow
+    table this transaction created and carries no deletes.
+    """
+    pending = item.final.get(key)
+    ambiguous = (
+        pending is not None
+        and key in item.acquired
+        and key not in item.absented
+        and probe is not None
+    )
+    if not ambiguous:
+        # Either there is no in-group row under this key, or the row under it is the
+        # pre-group row itself (an UPDATE of it), or the pre-group row is already
+        # spoken for. In every one of those the key simply ends the group absent.
+        item.absented.add(key)
+        item.final[key] = None
+        return
+    if item.pre_existing.get(key) is None:
+        item.pre_existing[key] = bool(probe(item, key))
+    item.absented.add(key)
+    if not item.pre_existing[key]:
+        item.final[key] = None
 
 
 def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
@@ -136,6 +268,12 @@ def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
     Runs on the caller's connection and never opens or closes a transaction: the
     commit group owns that (principle 4).
     """
+    if item.truncated and not item.final and not registry.get(item.target).exists:
+        # A truncate of a table this destination has never held. There is nothing to
+        # empty and nothing to insert, and CREATEing an empty table from a truncate
+        # would invent a shape out of an event that carries no columns at all.
+        item.rows_removed = 0
+        return
     # A column every event left NULL tells us nothing about its type; VARCHAR is the
     # honest placeholder and `widen()` upgrades it the moment a real value shows up
     # (rubric 2.1/2.5 own the better answer).
@@ -159,7 +297,14 @@ def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
     ]
     column_order = list(dict.fromkeys(column_order))
 
-    if not (fresh or item.snapshot):
+    if item.truncated:
+        # Rubric 1.5, "replicated just like Postgres handles them": the destination
+        # table is emptied, and the rows this group collected *after* the truncate are
+        # inserted below. `DELETE FROM` rather than `TRUNCATE`: it is unambiguously
+        # transactional on both DuckDB and MotherDuck, and the whole point is that a
+        # rolled-back commit group leaves the rows in place.
+        item.rows_removed = 0 if fresh else _delete_all(con, table)
+    elif not item.snapshot and not fresh:
         keys = [
             tuple(
                 apply_sql.bind(value, table.columns.get(col, apply_sql.VARCHAR))
@@ -185,6 +330,27 @@ def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
     # what keeps "duplication is impossible" enforced by the destination rather than
     # asserted by us (Opus M-2).
     apply_sql.assert_identity_is_unique(con, table)
+
+
+def _delete_all(con, table) -> int | None:
+    """Empty one destination table inside the caller's transaction.
+
+    Returns the number of rows removed when the destination reports it (DuckDB and
+    MotherDuck both return a `Count` for a DELETE), so the truncate marker in
+    `_cdc_flight.table_events` records what the destination actually lost. `None`
+    when it cannot be read — the marker then says "unknown" rather than "0".
+    """
+    result = con.execute(f"DELETE FROM {table.qualified}")
+    try:
+        row = result.fetchone()
+    except Exception:  # pragma: no cover - a destination that returns no result set
+        return None
+    if not row or row[0] is None:
+        return None
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):  # pragma: no cover
+        return None
 
 
 def live_names(tables: set[str]) -> set[str]:

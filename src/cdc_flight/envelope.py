@@ -57,8 +57,22 @@ SNAPSHOT_LAST = "last"
 #: a `last` marker and carry no `txId`/`lsn` (Opus M-7).
 SNAPSHOT_INCREMENTAL = "incremental"
 
+#: Debezium operation codes the applier treats specially.
+OP_DELETE = "d"
+OP_UPDATE = "u"
+OP_TRUNCATE = "t"
+OP_MESSAGE = "m"
+
 KIND_DATA = "data"
 KIND_SNAPSHOT = "snapshot"
+#: `op="t"`. A truncate is a *data* event for every purpose Debezium counts
+#: (`EventDispatcher` sends it through the same `changeRecord` path, so
+#: `TransactionMonitor.dataEvent` counts it in `END.event_count`, it occupies a
+#: `transaction.total_order` ordinal and it gets a `data_collections` entry), and it
+#: is a *table* event for every purpose we count: it carries no key and no row, and
+#: it empties the destination table (rubric 1.5). Its own kind, because giving it
+#: `KIND_DATA` made `work_for` read its absent key as "this table is keyless".
+KIND_TRUNCATE = "truncate"
 KIND_TXN_BEGIN = "txn_begin"
 KIND_TXN_END = "txn_end"
 KIND_HEARTBEAT = "heartbeat"
@@ -102,7 +116,7 @@ class PendingRecord:
 
     @property
     def is_data(self) -> bool:
-        return self.kind in (KIND_DATA, KIND_SNAPSHOT)
+        return self.kind in (KIND_DATA, KIND_SNAPSHOT, KIND_TRUNCATE)
 
     @property
     def qualified_table(self) -> str | None:
@@ -326,7 +340,13 @@ def decode(raw: Any, *, topic_prefix: str, want_offsets: bool = False) -> Pendin
             except json.JSONDecodeError:  # pragma: no cover
                 rec.key = None
 
-    if rec.op == "m":
+    if rec.op == OP_TRUNCATE:
+        # `skipped.operations=none` is what lets these through at all; the pgoutput
+        # decoder drops the 'T' message outright while TRUNCATE is skipped
+        # (`PgOutputMessageDecoder.isTruncateEventsIncluded`). One event per relation
+        # of a `TRUNCATE a, b CASCADE`, all inside one transaction.
+        rec.kind = KIND_TRUNCATE
+    elif rec.op == OP_MESSAGE:
         rec.kind = KIND_MESSAGE
     elif rec.op is None and "ddl" in payload:
         rec.kind = KIND_SCHEMA_CHANGE

@@ -146,7 +146,58 @@ def applier_settings() -> dict:
         #: `CDC_DESTINATION_CONSTRAINTS=0` falls back to the post-apply uniqueness
         #: assertion inside the commit group.
         "destination_constraints": _flag("CDC_DESTINATION_CONSTRAINTS", True),
+        #: rubric 1.5. `replicate` empties the destination table inside the commit
+        #: group, exactly as Postgres emptied the source, and records a marker in
+        #: `_cdc_flight.table_events`. `log` records the marker and keeps the rows
+        #: (the rubric's "tombstone/soft delete" behaviour, =3). `ignore` restores
+        #: Debezium's default of not even decoding the event.
+        "truncate_mode": _env("CDC_TRUNCATE_MODE", TRUNCATE_REPLICATE).strip().lower(),
+        #: rubric 1.5. `replicate` drops the destination table when the source table
+        #: is gone; `log` records the marker only; `ignore` disables detection.
+        "drop_mode": _env("CDC_DROP_MODE", DROP_REPLICATE).strip().lower(),
     }
+
+
+#: Truncate policies (`CDC_TRUNCATE_MODE`).
+TRUNCATE_REPLICATE = "replicate"
+TRUNCATE_LOG = "log"
+TRUNCATE_IGNORE = "ignore"
+TRUNCATE_MODES = (TRUNCATE_REPLICATE, TRUNCATE_LOG, TRUNCATE_IGNORE)
+
+#: Drop policies (`CDC_DROP_MODE`).
+DROP_REPLICATE = "replicate"
+DROP_LOG = "log"
+DROP_IGNORE = "ignore"
+DROP_MODES = (DROP_REPLICATE, DROP_LOG, DROP_IGNORE)
+
+
+@dataclass(frozen=True)
+class CatalogConfig:
+    """Source-catalog polling — the only way to see a `DROP TABLE` (rubric 1.5).
+
+    The interval is deliberately short: rubric 2.3 wants new tables discovered
+    "automatically on short interval", and this is the mechanism it will use, so the
+    default is chosen for that rather than for drop detection alone. One poll is two
+    small catalog queries on a separate connection.
+    """
+
+    poll_seconds: float = field(
+        default_factory=lambda: float(_env("CDC_CATALOG_POLL_SECONDS", "10"))
+    )
+    #: Emit `pg_logical_emit_message(false, …)` on the source after a change is
+    #: detected, so an LSN past the DDL is guaranteed to flow and the fence can open
+    #: (ADR 0001 D9). Writes go to the PRIMARY; with 7.2's replica reads this is the
+    #: same separate primary connection D9 already requires.
+    emit_marker: bool = field(default_factory=lambda: _flag("CDC_CATALOG_MARKER", True))
+    marker_prefix: str = field(
+        default_factory=lambda: _env("CDC_CATALOG_MARKER_PREFIX", "cdcf_catalog")
+    )
+    #: 0 = never apply a DDL action the fence has not cleared. Anything else trades
+    #: "the destination table might be re-created by an in-flight event" for
+    #: "the drop is applied even though the source cannot be written to".
+    grace_seconds: float = field(
+        default_factory=lambda: float(_env("CDC_CATALOG_GRACE", "0"))
+    )
 
 
 def lease_ttl_seconds() -> float:

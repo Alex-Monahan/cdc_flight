@@ -151,19 +151,6 @@ def test_the_moved_row_keeps_the_values_it_had_after_the_move(pk_scenario):
     assert rows == [("Renamed", '["moved"]')]
 
 
-def test_gap_a_deferred_key_permutation_loses_a_row(pk_scenario):
-    """MEASURED GAP (real Postgres, real Debezium, 2026-07-31): Postgres holds
-    `{2, 3}` and the destination holds `{3}`. Deleted with the fix."""
-    box = pk_scenario["box"]
-    assert _source(box, "SELECT id, label FROM app.pk_demo ORDER BY id") == [(2, "a"), (3, "b")]
-    assert box.duck_query(f"SELECT id, label FROM {box.table(PK_DEMO)} ORDER BY id") == [(3, "b")]
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="1.4 target: the fold collapses by key, so the second `d` of the "
-    "permutation deletes the row the first key change created",
-)
 def test_a_deferred_key_permutation_lands_both_rows(pk_scenario):
     """`UPDATE app.pk_demo SET id = id + 1` — the collision case Postgres allows."""
     box = pk_scenario["box"]

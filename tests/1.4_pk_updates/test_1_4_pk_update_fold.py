@@ -226,41 +226,8 @@ def test_delete_reinsert_delete_of_a_pre_existing_key_leaves_nothing(lab):
 
 
 # --------------------------------------------------------------------------- #
-# the two shapes that were wrong
-#
-# The `test_gap_*` pair below records what the shipped fold produced when 1.4 was
-# picked up (measured, 2026-07-31). They are deleted in the commit that fixes the
-# fold; the `xfail(strict=True)` targets beneath them are what comes off.
+# the two shapes that were wrong (both fixed by `table_work._remove`)
 # --------------------------------------------------------------------------- #
-def test_gap_a_deferred_permutation_loses_a_row(lab):
-    """MEASURED GAP: `{1,2} -> {2,3}` landed as `{3}`. One row Postgres holds is
-    gone from the destination — worse than the rubric's `duplication=2`."""
-    box = lab()
-    preload(box, {1: "a", 2: "b"})
-    box.run(
-        txn("2", [*pk_change("2", 1, 200, 1, 2, "a"), *pk_change("2", 3, 201, 2, 3, "b")])
-    )
-    assert state(box) == [(3, "b")]
-
-
-def test_gap_a_key_changing_update_duplicates_the_row(lab):
-    """MEASURED GAP: `c(1)` then `u(1 -> 2)` in one transaction landed the row
-    under BOTH keys — the rubric's `duplication=2`, exactly."""
-    box = lab()
-    box.run(
-        txn(
-            "2",
-            [insert("2", 1, 200, 1, "a"), key_change_as_one_update("2", 2, 201, 1, 2, "a")],
-        )
-    )
-    assert state(box) == [(1, "a"), (2, "a")]
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="1.4 target: the fold collapses by key only, so the second `d` of a "
-    "deferred permutation deletes the row the first key change created",
-)
 def test_a_deferred_primary_key_permutation_keeps_both_rows(lab):
     """`UPDATE t SET id = id + 1` with a DEFERRABLE PRIMARY KEY: `{1,2} -> {2,3}`.
 
@@ -280,11 +247,6 @@ def test_a_deferred_primary_key_permutation_keeps_both_rows(lab):
     assert state(box) == [(2, "a"), (3, "b")]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="1.4 target: a key-changing `u` touches the old key but never tombstones "
-    "it in the plan, so a row inserted under it in the same group is re-inserted",
-)
 def test_a_key_changing_update_after_an_insert_of_the_old_key_does_not_duplicate(lab):
     """The defensive `u` path: `c(1)` then `u(before id=1, after id=2)`.
 

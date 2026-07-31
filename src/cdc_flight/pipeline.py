@@ -31,10 +31,12 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from . import catalog as catalog_mod
 from . import destination as dest_mod
 from . import reconcile as reconcile_mod
 from .applier import Applier, ApplierConfig
 from .config import (
+    CatalogConfig,
     DestinationConfig,
     ReplicationConfig,
     RunConfig,
@@ -230,7 +232,16 @@ def run(
     )
 
     replication.state_dir.mkdir(parents=True, exist_ok=True)
-    props = build_properties(source, replication, snapshot_mode=snapshot_mode)
+    settings = applier_settings()
+    # `skipped.operations` is what decides whether a TRUNCATE is decoded at all, so
+    # the truncate policy has to be known before the engine properties are built
+    # (rubric 1.5).
+    props = build_properties(
+        source,
+        replication,
+        snapshot_mode=snapshot_mode,
+        truncate_mode=settings["truncate_mode"],
+    )
     # A captured table whose topic collides with `<prefix>.transaction` would be
     # decoded as transaction metadata and never applied. Not reachable with the
     # pinned topic-naming strategy, and asserted rather than reasoned about
@@ -271,7 +282,6 @@ def run(
                 [dest.pipeline_name],
             )
 
-        settings = applier_settings()
         applier_cfg = ApplierConfig(
             max_batch_size=int(props["max.batch.size"]),
             **settings,
@@ -309,6 +319,26 @@ def run(
         transactional_ddl = dest_mod.probe_transactional_ddl(con)
         summary_extra["transactional_ddl"] = transactional_ddl
 
+        # rubric 1.5: `DROP TABLE` is not in the replication stream, so the source
+        # catalog is polled on its own connection. Started BEFORE the engine, so a
+        # table dropped while this pipeline was down is detected on this run rather
+        # than one poll interval into it.
+        catalog_cfg = CatalogConfig()
+        watcher = None
+        if applier_cfg.drop_mode != "ignore" and catalog_cfg.poll_seconds > 0:
+            watcher = catalog_mod.CatalogWatcher(
+                dsn=source.dsn,
+                publication=replication.publication_name,
+                schema=source.schema,
+                include={t if "." in t else f"{source.schema}.{t}" for t in source.tables},
+                known=catalog_mod.read_known_relations(con, dest.pipeline_name),
+                replicated=catalog_mod.seed_from_table_state(con, dest.pipeline_name),
+                poll_seconds=catalog_cfg.poll_seconds,
+                emit_marker=catalog_cfg.emit_marker,
+                marker_prefix=catalog_cfg.marker_prefix,
+                grace_seconds=catalog_cfg.grace_seconds,
+            ).start()
+
         # Imported late: importing pydbzengine boots a JVM.
         from .engine import SupervisedDebeziumEngine
 
@@ -324,6 +354,7 @@ def run(
             lease=lease,
             runner_id=runner_id,
             transactional_ddl=transactional_ddl,
+            catalog=watcher,
         )
         engine = SupervisedDebeziumEngine(
             properties=props,
@@ -377,6 +408,8 @@ def run(
             raise
         finally:
             health.stop()
+            if watcher is not None:
+                watcher.stop()
             applier.shutdown()
             lease.release(con)
     finally:
