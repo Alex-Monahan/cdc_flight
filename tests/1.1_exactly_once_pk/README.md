@@ -2,6 +2,7 @@
 
 **Rubric 1.1** — *Delivery guarantees for tables with a primary key.*
 `at-most-once=1, at-least-once=3, exactly-once=5`. Baseline score: **3**.
+**Status: the target tests pass** — the transactional applier landed (ADR 0001).
 
 ## The gap
 
@@ -62,16 +63,40 @@ printed either way, and **no loss** is asserted in both cases.
 
 ## What the tests assert
 
-| test | today | after the applier lands |
-|---|---|---|
-| `test_gap_replay_duplicates_pk_rows` | **passes** — the 50 replayed customers exist twice | starts failing; delete it |
-| `test_gap_some_ids_are_delivered_twice` | **passes** | delete it |
-| `test_gap_duplicates_span_a_contiguous_prefix` | **passes** — the duplication is an offset window, not scattered rows | delete it |
-| `test_no_rows_are_lost` | passes | must keep passing |
-| `test_target_change_event_ledger_balances` | **xfail(strict)** | must pass, then drop the marker |
-| `test_target_exactly_once_pk` | **xfail(strict)** | must pass, then drop the marker |
-| `test_target_no_duplicate_change_events` | **xfail(strict)** | must pass, then drop the marker |
-| `test_target_slot_never_outruns_the_destination` | **xfail(strict)** — `_cdc_flight.debezium_offsets` does not exist yet | must pass from ADR implementation step 3 onwards |
+| test | status |
+|---|---|
+| ~~`test_gap_replay_duplicates_pk_rows`~~ | DELETED — it asserted duplication, which no longer happens |
+| ~~`test_gap_some_ids_are_delivered_twice`~~ | DELETED — same reason |
+| ~~`test_gap_duplicates_span_a_contiguous_prefix`~~ | DELETED — same reason |
+| `test_scenario_crashed_after_commit_and_recovered` | passes — the guard, rewritten (see below) |
+| `test_no_rows_are_lost` | passes |
+| `test_target_change_event_ledger_balances` | **passes** (marker removed) |
+| `test_target_exactly_once_pk` | **passes** (marker removed) |
+| `test_target_no_duplicate_change_events` | **passes** (marker removed) |
+| `test_target_slot_never_outruns_the_destination` | **passes** (marker removed) |
+
+### The guard had to change, and that is the result
+
+`test_scenario_actually_replayed` used to assert `replayed["records"] > 0` —
+"the crash caused a replay, so the duplication assertions are not vacuous".
+Under Invariant O there is nothing to replay: the resume point went into the same
+destination transaction as the rows, so start-up reconciliation rebuilds
+`offsets.dat` from it and the connector resumes *after* the committed batch.
+"No replay happened" is the improvement, so it cannot also be the guard. The
+guard is now: the fault really fired (exit 137), the restart really succeeded,
+and the committed rows really are there.
+
+## Two more test modules landed with the applier
+
+* `test_1_1_fault_matrix.py` — crashes at **all five** commit-group anchors
+  (`begin`, `mid_apply`, `pre_commit`, `post_commit_pre_ack`, `post_ack`) and
+  asserts no loss, no duplicates and the Invariant-O guard at each. The keyless
+  table is the decisive half: a merge on a primary key can hide a double
+  delivery, an append keyed on event identity cannot.
+* `test_1_1_reconciliation.py` — ADR §4.5's decision table, including the row
+  that must **refuse to start** (offsets file present, destination row missing),
+  and a run with `CDC_OFFSET_FILE_REPAIR=0` proving that correctness does not
+  depend on the file repair at all.
 
 ### Why row counts are not enough (review finding)
 

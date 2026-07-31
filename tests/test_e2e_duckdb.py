@@ -153,8 +153,9 @@ def test_baseline_end_to_end(fresh_seed, run_pipeline, generate_changes, duck, d
 def test_commit_log_accounts_for_the_whole_run(fresh_seed, run_pipeline, generate_changes, duck):
     """`_cdc_flight.commit_log` is the audit trail rubric 1.7 and 6.1 rest on."""
     run_pipeline(reset_state=True, max_seconds=120, idle_seconds=6)
-    generate_changes(scale=1, seed=11)
+    changes = generate_changes(scale=1, seed=11)
     run_pipeline(max_seconds=120, idle_seconds=6)
+    expected = 20 + changes["total"]  # 20 seeded rows + the generated wave
 
     con = duck()
     try:
@@ -168,7 +169,9 @@ def test_commit_log_accounts_for_the_whole_run(fresh_seed, run_pipeline, generat
         lsns = [r[4] for r in rows if r[4] is not None]
         assert lsns == sorted(lsns), lsns
         assert rows[0][1] == "snapshot_chunk"
-        assert sum(r[3] for r in rows) == 50  # 20 snapshot + 30 streamed
+        # Every change event the source produced is accounted for by exactly one
+        # commit group - no more, no fewer.
+        assert sum(r[3] for r in rows) == expected
 
         # The resume point is a single row and agrees with the last commit group.
         offsets = con.execute(

@@ -1,6 +1,6 @@
 # ADR 0001 — The transactional applier
 
-* **Status:** accepted (revision 2, 2026-07-30, after dual review of TODO 1.0)
+* **Status:** accepted (revision 3, 2026-07-30 — implemented; see §15 for the amendments the implementation forced)
 * **Date:** 2026-07-30
 * **Task:** TODO 1.0(a); revised under TODO 1.0(feedback)
 * **Decides rubric items:** 1.1, 1.2, 1.3, 1.7 (directly), and 1.4, 1.6, 1.8, 3.2,
@@ -17,6 +17,7 @@
 |---|---|---|
 | 1 | 2026-07-30 | original |
 | 2 | 2026-07-30 | **P2 withdrawn** and replaced by **Invariant O** (§4.1). Crash matrix rebuilt over all three engine lifecycle paths **and** the snapshot phase (§4.6). Transaction assembly made a state machine with one boundary rule (§3.2). Triggers restated as soft group-close requests plus a hard spill threshold (§3.3). Start-up reconciliation decision table added (§4.5). Keyless event identity moved off `source.sequence` (§6). D10 rewritten: dlt demoted to a **library**, not removed (§10). Throughput risk of D5 recorded as a measurement task (§5). |
+| 3 | 2026-07-30 | **Amendments from the implementation** (§15): `transaction.id` is not a transaction identifier (A1); the Connect schema stays off, so rubric 2.4 is untouched (A2); `verify_offset_file` becomes a rebuild plus a one-directional assertion (A4); a drained batch closes the group (A5); a provably-dead lease is reclaimed (A6); §14.1 answered for DuckDB (A8); §10's dlt exit criterion evaluated (A10). |
 
 ---
 
@@ -1417,5 +1418,184 @@ Each step must be able to land with the suite green.
    re-snapshot always required? Determines whether §3.5's `snapshot_epoch` ever
    has to survive a restart, and whether 3.7 ("resume midway per table") can use
    the connector's own snapshot at all.
-</content>
-</invoke>
+
+---
+
+## 15. Amendments from the implementation (rev 3, 2026-07-30)
+
+Written while implementing TODO 1.1/1.2/1.3. Each entry is a place where
+reality forced a deviation from rev 2, recorded here rather than silently
+diverging. Everything not listed below was implemented as specified.
+
+### A1 — `transaction.id` is NOT a transaction identifier (corrects §3.2, §6)
+
+Rev 2 read `AbstractTransactionStructMaker.addTransactionBlock` and concluded
+that the envelope's `transaction.id` identifies the transaction. **Measured
+against the shipped Debezium 3.6.0.Final + pgoutput, it does not.** It is
+`"<txId>:<the LSN at the moment that struct was built>"`, so it differs for
+every event of one transaction *and* between `BEGIN` and `END`:
+
+```
+BEGIN  {"status":"BEGIN","id":"11115:937926432"}
+data   {"transaction":{"id":"11115:937926432","total_order":1,...}}
+data   {"transaction":{"id":"11115:937926736","total_order":2,...}}
+data   {"transaction":{"id":"11115:937927016","total_order":3,...}}
+END    {"status":"END","id":"11115:937927152","event_count":3,
+        "data_collections":[{"data_collection":"app.customers","event_count":2},
+                            {"data_collection":"app.sensor_readings","event_count":1}]}
+```
+
+Taken literally, every multi-event transaction looks like "the txId changed
+without an `END`" — which §3.2 correctly declares fatal, so the applier died on
+its first real transaction. The stable identifier is the **prefix**, which
+equals `source.txId` and equals the offset's `transaction_id`. The assembler
+therefore keys on `source.txId` for data events and on the prefix of
+`transaction.id` for the markers. `envelope._txn_id()` is that one line, and
+`tests/test_assembler.py` pins the behaviour.
+
+Everything else §3.2 relies on was confirmed exactly as documented:
+`event_count`, per-`data_collection` counts, `total_order` as a 1-based ordinal,
+and snapshot records carrying `"transaction": null`.
+
+### A2 — the Connect schema stays OFF; only the envelope lands here
+
+D5 says `value.converter.schemas.enable` becomes `true`. It is still `false`.
+The applier needs the **envelope** (`before` / `after` / `source` / `transaction`
+/ `op`) — that is what rubric 1.1/1.2/1.3/1.4 depend on, and dropping
+`ExtractNewRecordState` delivers it. It does *not* need the **Connect schema**,
+which is what rubric 2.4/2.6 depend on, and which §5.1 flags as an unmeasured
+3–5× payload inflation owned by 5.3.
+
+Consequence, stated plainly rather than buried: **type mapping is unchanged from
+the baseline and rubric 2.4 is still a 1.** `timestamptz` lands as `VARCHAR`
+(the baseline got `TIMESTAMP` only because dlt *inferred* it from the string —
+inference the applier deliberately does not do, per §10). `numeric` is still
+base64, `date`/`interval` still integers. Two things did improve for free:
+arrays are a native `JSON` column instead of a dlt child table, and the all-NaN
+`numeric` column that dlt dropped entirely now exists.
+`tests/test_e2e_duckdb.py::test_documented_type_gaps` pins all of it.
+
+### A3 — `cdcf_event_id` uses the event's own LSN, not the commit LSN
+
+§6 specifies `"<lsn_of_txn_commit>:<txn_id>:<total_order>"`. The implementation
+uses the **event's** LSN. Both are monotonic and both are deterministic on
+replay, so the disambiguation §6 wanted (a wrapped 32-bit `txid`) is equally
+served. The reason for the change is spill mode: events are staged to
+`_cdc_flight.spill_events` *before* the `END` marker exists, so the commit LSN
+is not knowable at the moment an identity has to be assigned, and an identity
+that differs between the spilled and in-memory paths would be worse than either.
+
+### A4 — `verify_offset_file` becomes "rebuild + one-directional assertion"
+
+§4.3 asks for a byte-for-byte comparison of `offsets.dat` against
+`serialize(new_point)` after every acknowledgement. Two problems surfaced:
+
+1. The file legitimately **lags** — `markBatchFinished()` may flush nothing
+   (§4.2), and the poll loop flushes on its own schedule — so byte equality
+   false-fires on a healthy pipeline.
+2. Only one direction signals a bug. The file being *behind* is expected; the
+   file being *ahead* of the durable resume point is an Invariant-O violation.
+
+The implementation therefore (a) writes the file itself when reconciliation says
+so, byte-compatibly with Kafka's `FileOffsetBackingStore` — the format was read
+off a live file and is round-tripped byte-identically in
+`tests/test_offset_file.py` — and (b) asserts after every acknowledgement that
+`file_lsn <= durable_lsn`, raising `ResumePointDrift` otherwise. That is
+strictly the Invariant-O direction and cannot false-fire on a lagging flush.
+
+A related correctness detail that cost a debugging cycle: the Connect offset map
+must be round-tripped with its **Java types preserved**. `transaction_id` and
+`messageType` are `String`, `lsn`/`txId`/`ts_usec` are `Long`. Coercing
+`"11115"` to an integer makes the connector die on start-up with
+`ClassCastException: java.lang.Long cannot be cast to java.lang.String`.
+
+### A5 — a drained batch closes the group (adds to §3.3)
+
+§3.6's pseudocode closes a group only on a soft trigger. That deadlocks a quiet
+stream: Debezium calls `committer.markBatchFinished()` **directly** on an empty
+poll (`AsyncEmbeddedEngine.java:1320-1325`) and never calls the consumer, so a
+group holding complete units would sit in memory until the run ended and then be
+discarded. The added rule: a batch smaller than `max.batch.size` means the
+connector's queue drained, so the group closes now; a full batch means more is
+already queued, so accumulation continues up to the soft triggers. This keeps
+batching under load and bounds latency at idle, and it can still never split a
+unit.
+
+### A6 — a lease whose owner is provably dead is reclaimed (refines §4.6 F15)
+
+F15 assumes the loser of a lease race exits. It does not cover the case that
+matters far more often: a runner that was `SIGKILL`ed never released its lease,
+so **crash recovery** — the normal path this design exists to make safe — would
+have to wait out the TTL. `Lease.acquire` now reclaims a lease whose recorded
+host is this host and whose pid no longer exists, and logs a warning when it
+does. A lease from any other host is still only released by its TTL, because
+there we cannot prove anything.
+
+### A7 — `--reset-state` also clears the destination resume point
+
+With §4.5 in place, deleting only `offsets.dat` produces "absent file, present
+row", which correctly resumes instead of re-snapshotting — so `--reset-state`
+silently did nothing. It now deletes the `debezium_offsets`, `table_state` and
+`lease` rows for the pipeline as well.
+
+### A8 — §14.1 answered for DuckDB, and probed at run time
+
+`destination.probe_transactional_ddl()` runs a real `DROP` + `ALTER … RENAME`
+inside a rolled-back transaction at start-up and records the answer in the run
+summary. **Local DuckDB 1.5.4: transactional (`transactional_ddl: true`).** The
+swap uses `DROP` + `RENAME` when the probe says yes and falls back to
+`CREATE OR REPLACE TABLE … AS SELECT` when it says no, which is the fallback §7
+already specified and which the rubric explicitly allows. §14.1 stays open only
+for MotherDuck until the `motherduck`-marked run confirms it.
+
+### A9 — correctness must not depend on the offsets-file repair
+
+`CDC_OFFSET_FILE_REPAIR=0` disables §4.5's rebuild. The suite runs the
+`post_commit_pre_ack` crash both ways: with the repair (no replay at all) and
+without it (Postgres re-delivers, and the §4.4 fence drops every re-delivered
+unit). If the second case ever failed, exactly-once would have quietly become an
+ordering argument again.
+
+### A10 — §10's dlt exit criterion, evaluated
+
+* **Retained:** `dlt.common.normalizers.naming.snake_case`. Three calls, no
+  adapter. It keeps every destination identifier byte-identical across this
+  migration, which every existing probe and `RUBRIC_STATUS.md` entry depends on.
+* **Not retained:** `dlt.destinations.sql_jobs.gen_merge_sql`. Calling it needs a
+  dlt `Schema`, a `TTableSchema` chain, a staging dataset and a `SqlClientBase`
+  wrapper — comfortably more than §10's "~100 lines of adapter" budget, for a
+  merge that is two statements here. This is §10's own exit criterion firing, not
+  a change of mind; `gen_scd2_sql` is re-evaluated when 8.2 is implemented.
+* **`dlt.common.schema`** is untouched by this task and is re-evaluated before
+  Phase 2, as §10 says.
+
+### A11 — snapshot phase details §3.5 did not specify
+
+* A table's shadow is dropped and recreated when its first snapshot record of a
+  run arrives, which is what makes a re-snapshot after a crash idempotent.
+* A table whose snapshot ends without a `last` marker (Debezium emits
+  `last_in_data_collection` per table and `last` only once) is swapped on its
+  own marker; **the first non-snapshot record closes the snapshot phase and
+  swaps whatever is left.** Without that rule a table could stay behind its
+  shadow forever.
+* Snapshot units are never fenced by LSN. Every snapshot record of a run carries
+  the *same* `source.lsn`, so an LSN fence would drop the entire snapshot after
+  the first chunk. Snapshot idempotence comes from D7, exactly as §3.5 says.
+
+### A12 — keyless tables are a changelog, not current state
+
+§6 notes that a keyless table can have a current-state form under
+`REPLICA IDENTITY FULL`. This task implements the changelog form only: keyless
+tables are keyed on `cdcf_event_id`, so every change event is a row. That is
+what makes rubric 1.2 measurable at all (a merge can hide a double delivery; an
+append-keyed-on-event-identity table cannot). Keyless current state belongs to
+8.1/8.2.
+
+### A13 — fault anchors extended (Codex 9 carry-forward)
+
+`decode`, `begin`, `spill` and `mid_apply` join `pre_commit`,
+`post_commit_pre_ack` and `post_ack`; `<nth>` now counts **data-carrying commit
+groups** rather than data batches, because the commit group is the unit the
+protocol is about. `tests/1.1_exactly_once_pk/test_1_1_fault_matrix.py` crashes
+at all five commit-group anchors and asserts no loss, no duplicates and
+Invariant O at each.
