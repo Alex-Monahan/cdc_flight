@@ -39,7 +39,10 @@ second path had grown alongside the first.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -61,7 +64,7 @@ from .config import (
 )
 from .destination import AlertSink, Lease, ResumePoint
 from .envelope import PendingRecord, decode
-from .faults import maybe_crash
+from .faults import arm_group, maybe_crash
 from .planner import GroupPlan, stream_event_id
 from .snapshot import SnapshotCoordinator
 from .spill import SpillBuffer, StagedEvent
@@ -110,6 +113,9 @@ class ApplierConfig:
     #: Re-read the source relation immediately before destroying its destination
     #: table, and fail closed if the source cannot be asked (Codex 4).
     drop_revalidate: bool = True
+    #: How long `COMMIT` may take before the process aborts (rubric 1.7 / 4.5).
+    #: 0 disables the watchdog.
+    commit_timeout: float = 300.0
 
     def __post_init__(self) -> None:
         # A typo must not silently restore Debezium's "truncates are skipped" default.
@@ -461,6 +467,10 @@ class Applier:
             return
         commit_id = self._spill_commit_id or self._next_commit_id
         opened_at = destination.now()
+        # Tell the destination-fault wrapper which data group this is, so a
+        # `destination_*` fault fires at the group the spec names rather than at one
+        # the wrapper inferred from the SQL it happened to see (rubric 1.7).
+        arm_group(self.data_commit_groups + 1)
         # NOT `or spill.rows > 0`: staged rows belonging only to *fenced*
         # units are about to be discarded, and counting them made a group with no
         # applicable content a "data group", which shifts every `<nth>`-indexed
@@ -520,7 +530,8 @@ class Applier:
             # HERE, before the commit, because it is only a *forensic* baseline -
             # it does not need to lengthen the commit->ack path (Codex 7).
             offset_fingerprint = self.verifier.before() if self.verifier else None
-            self.con.execute("COMMIT")
+            with _commit_watchdog(self.cfg.commit_timeout, commit_id):
+                self.con.execute("COMMIT")
             self._txn_open = False
             if has_data:
                 maybe_crash("post_commit_pre_ack", self.data_commit_groups + 1)
@@ -860,6 +871,48 @@ class Applier:
             if self.error is None:
                 self.error = exc
         return self.assembler.discard_open_unit()
+
+
+@contextlib.contextmanager
+def _commit_watchdog(timeout: float, commit_id: int):
+    """Bound `COMMIT`. A hung commit kills the process; that is the honest answer.
+
+    Rubric 1.7 requires every injected fault to end in a clean recovery or a loud
+    failure. A `COMMIT` that never returns is neither, and nothing in DuckDB or the
+    MotherDuck client imposes a deadline of its own, so the run would hang for ever
+    holding the lease (which is also rubric 4.5's "hanging or locking that prevents
+    recovery").
+
+    Hard-exiting is safe precisely *because* of Invariant O. The commit is ambiguous
+    - it may already have been durable server-side - but nothing has entered
+    Debezium's offset store, so the next run reads whichever of `W` / `W-prime` the
+    destination actually holds and resumes from exactly there (ADR 0001 §4.6 F5).
+    Exit code 75 (`EX_TEMPFAIL`) rather than the fault injector's 137: this is a real
+    operational failure and a supervisor should retry it.
+    """
+    if not timeout or timeout <= 0:
+        yield
+        return
+
+    def _fire() -> None:  # pragma: no cover - exercised by the fault test in a child
+        log.critical(
+            "destination COMMIT for commit_id=%s did not return within %.0fs; aborting "
+            "the process. The commit is AMBIGUOUS and that is safe: nothing was "
+            "acknowledged to Debezium, so the next run resumes from whatever the "
+            "destination actually holds (ADR 0001 §4.6 F5).",
+            commit_id, timeout,
+        )
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(75)
+
+    timer = threading.Timer(timeout, _fire)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
 
 
 def _epoch_ms(value) -> Any:

@@ -108,6 +108,10 @@ class SourceHealth:
     _streaming_since: float | None = field(default=None, repr=False)
     _lag_decreased_at: float | None = field(default=None, repr=False)
     _prev_lag: int | None = field(default=None, repr=False)
+    #: when the sampler last started failing outright, and whether it ever worked
+    _unknown_since: float | None = field(default=None, repr=False)
+    _ever_sampled: bool = field(default=False, repr=False)
+    _unknown_samples: int = field(default=0, repr=False)
 
     # -- lifecycle ---------------------------------------------------------- #
     def start(self) -> SourceHealth:
@@ -122,31 +126,52 @@ class SourceHealth:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            sample = self.sample_once()
-            with self._lock:
-                self._last = sample
-                if sample.streaming or sample.unknown:
-                    self._not_streaming_since = None
-                elif self._not_streaming_since is None:
-                    self._not_streaming_since = sample.at
-
-                if sample.streaming:
-                    if self._streaming_since is None:
-                        self._streaming_since = sample.at
-                else:
-                    self._streaming_since = None
-
-                # "Still catching up" == the backlog is shrinking. A backlog that
-                # has stopped shrinking means nothing more is coming, even when it
-                # is large (see `may_declare_idle`).
-                lag = sample.lag_bytes
-                if lag is not None and self._prev_lag is not None and lag < self._prev_lag:
-                    self._lag_decreased_at = sample.at
-                if lag is not None:
-                    self._prev_lag = lag
-                if self._lag_decreased_at is None:
-                    self._lag_decreased_at = sample.at
+            self._ingest(self.sample_once())
             self._stop.wait(self.interval)
+
+    def _ingest(self, sample: SlotSample) -> None:
+        """Fold one observation into the derived clocks.
+
+        A separate method because the *interesting* transitions (a sampler that
+        worked and then went dark) are otherwise only reachable by breaking a real
+        network, and they are the ones TODO 4.6(b) is about.
+        """
+        with self._lock:
+            self._last = sample
+            # `unknown` used to be treated as "streaming" here, which RESET the
+            # not-streaming clock: a blackholed Postgres therefore reported
+            # `not_streaming_for == 0` and `run_engine_bounded`'s --max-seconds
+            # guard could never fire (TODO 4.6(b), measured). An observation we
+            # could not make is not evidence that anything is healthy.
+            if sample.streaming:
+                self._not_streaming_since = None
+            elif self._not_streaming_since is None:
+                self._not_streaming_since = sample.at
+
+            if sample.unknown:
+                self._unknown_samples += 1
+                if self._unknown_since is None:
+                    self._unknown_since = sample.at
+            else:
+                self._unknown_since = None
+                self._ever_sampled = True
+
+            if sample.streaming:
+                if self._streaming_since is None:
+                    self._streaming_since = sample.at
+            else:
+                self._streaming_since = None
+
+            # "Still catching up" == the backlog is shrinking. A backlog that
+            # has stopped shrinking means nothing more is coming, even when it
+            # is large (see `may_declare_idle`).
+            lag = sample.lag_bytes
+            if lag is not None and self._prev_lag is not None and lag < self._prev_lag:
+                self._lag_decreased_at = sample.at
+            if lag is not None:
+                self._prev_lag = lag
+            if self._lag_decreased_at is None:
+                self._lag_decreased_at = sample.at
 
     # -- sampling ----------------------------------------------------------- #
     def sample_once(self) -> SlotSample:
@@ -193,6 +218,29 @@ class SourceHealth:
             return time.monotonic() - self._streaming_since
 
     @property
+    def unknown_for(self) -> float:
+        """Seconds the source has continuously been *unaskable*.
+
+        0.0 when the last sample succeeded. This is the signal the supervisor uses
+        to refuse a successful run on a source it cannot see (TODO 4.6(b)).
+        """
+        with self._lock:
+            if self._unknown_since is None:
+                return 0.0
+            return time.monotonic() - self._unknown_since
+
+    @property
+    def ever_sampled(self) -> bool:
+        """True once the slot has been read successfully at least once.
+
+        The whole of the fail-soft distinction: a sampler that never worked cannot
+        tell us anything and must not block a run; one that worked and stopped is
+        reporting an outage.
+        """
+        with self._lock:
+            return self._ever_sampled
+
+    @property
     def lag_steady_for(self) -> float:
         """Seconds since the slot's backlog last got smaller."""
         with self._lock:
@@ -209,15 +257,19 @@ class SourceHealth:
         second between restart attempts, and a point-in-time check that happened
         to land in that second declared a 2.3 MB backlog "idle".
 
-        Returns `True` when the source cannot be consulted at all, so a missing
-        `psycopg`, bad credentials or a firewall degrade to the old timer-only
-        behaviour instead of turning every run into a `--max-seconds` wait.
+        Returns `True` when the source could **never** be consulted, so a missing
+        `psycopg`, bad credentials or a firewall that was always there degrade to
+        the old timer-only behaviour instead of turning every run into a
+        `--max-seconds` wait. It does **not** return True for a source that was
+        answering and has gone dark: that is the silently-dead-node shape (rubric
+        4.6), and the measured consequence of the old unconditional fail-soft was a
+        blackholed Postgres exiting `ok: true` on a partial delivery (TODO 4.6(b)).
         """
         sample = self.last
         if sample is None:
             return False  # not sampled yet - the run has barely started
         if sample.unknown:
-            return True  # fail-soft
+            return not self._ever_sampled
         # (1) A walsender must have been attached to our slot for the whole quiet
         #     window. This is the signal that catches the B5 failure: during a
         #     retriable restart the slot is released, and the connector briefly
@@ -241,7 +293,13 @@ class SourceHealth:
         if sample is None:
             return {"slot_health": "unsampled"}
         if sample.unknown:
-            return {"slot_health": "unknown", "slot_error": sample.error}
+            return {
+                "slot_health": "unknown",
+                "slot_error": sample.error,
+                "slot_unknown_for_sec": round(self.unknown_for, 1),
+                "slot_ever_sampled": self.ever_sampled,
+                "slot_not_streaming_for_sec": round(self.not_streaming_for, 1),
+            }
         return {
             "slot_health": "streaming" if sample.streaming else "not_streaming",
             "slot_exists": sample.exists,

@@ -110,6 +110,23 @@ class RunConfig:
     close_timeout: float = field(
         default_factory=lambda: float(_env("CDC_CLOSE_TIMEOUT", "30"))
     )
+    #: How long the *source* may be completely unaskable before the run is failed
+    #: (TODO 4.6(b)). A sampler that has never succeeded is exempt - see
+    #: `SourceHealth.may_declare_idle` - so this only ever fires on a source that
+    #: was answering and went dark, which is the silently-dead-node shape. It makes
+    #: detection bounded instead of "whenever --max-seconds happens to expire".
+    source_dark_seconds: float = field(
+        default_factory=lambda: float(_env("CDC_SOURCE_DARK_SECONDS", "45"))
+    )
+    #: How long a destination `COMMIT` may take before the run is aborted with a
+    #: non-zero exit (rubric 1.7 / 4.5). A hung COMMIT is otherwise unbounded, and
+    #: "the process hangs" is neither a clean recovery nor a loud failure. Killing
+    #: the process is safe *because* of Invariant O: the offset store is untouched
+    #: until after COMMIT returns, so whichever way the ambiguous commit went, the
+    #: next run resumes at exactly what the destination holds.
+    commit_timeout: float = field(
+        default_factory=lambda: float(_env("CDC_COMMIT_TIMEOUT", "300"))
+    )
 
 
 def _flag(name: str, default: bool) -> bool:

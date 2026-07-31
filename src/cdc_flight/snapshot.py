@@ -27,6 +27,7 @@ from . import naming
 from .destination import CONTROL_SCHEMA
 from .envelope import PendingRecord
 from .errors import ResumePointDrift
+from .faults import maybe_crash
 from .naming import quote
 
 log = logging.getLogger("cdc_flight.snapshot")
@@ -193,6 +194,16 @@ class SnapshotCoordinator:
         if exists:
             if self.transactional_ddl:
                 self.con.execute(f"DROP TABLE IF EXISTS {live}")
+                # rubric 1.7: the most dangerous instant of a backfill is between
+                # the DROP and the RENAME - the live table is gone and the shadow is
+                # not yet in its place. A crash here must leave the OLD table intact,
+                # which is only true if the swap is genuinely transactional.
+                #
+                # `<nth>` counts SWAPS in this process, not commit groups: which
+                # group a swap lands in depends on chunk sizes and table order, and a
+                # fault anchor whose index is a function of the workload is one that
+                # silently stops firing (Opus M7).
+                maybe_crash("swap", self.swaps + 1)
                 self.con.execute(
                     f"ALTER TABLE {shadow} RENAME TO {quote(state.target)}"
                 )

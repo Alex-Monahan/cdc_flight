@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING
 
 from . import catalog as catalog_mod
 from . import destination as dest_mod
+from . import faults as faults_mod
 from . import reconcile as reconcile_mod
 from .applier import Applier, ApplierConfig
 from .config import (
@@ -117,6 +118,19 @@ def run_engine_bounded(
                 break
             if error_box or engine.failure is not None:
                 stop_reason = "engine_error"
+                break
+            # TODO 4.6(b): a source that was answering and has gone completely dark
+            # is a failure with a bounded detection time, not something to discover
+            # when --max-seconds happens to expire. `ever_sampled` keeps an
+            # environment where the slot could never be read (no psycopg, no
+            # privilege) on the old timer-only path.
+            if (
+                health is not None
+                and run.source_dark_seconds > 0
+                and health.ever_sampled
+                and health.unknown_for >= run.source_dark_seconds
+            ):
+                stop_reason = "source_dark"
                 break
             enough = handler.record_count >= run.min_records
             quiet = handler.seconds_since_last_batch >= run.idle_seconds
@@ -208,12 +222,33 @@ def run_engine_bounded(
     failure = engine.failure
     if error_box or handler.error is not None or failure is not None:
         cause = error_box[0] if error_box else handler.error
-        message = failure if failure is not None else f"{type(cause).__name__}: {cause}"
+        # OUR exception is the root cause; Debezium's is the consequence. It used to
+        # be the other way round, and the consequence is always the more generic
+        # message: a destination write that failed mid-transaction was reported as
+        # `java.lang.InterruptedException` (pydbzengine interrupts the engine thread
+        # when the handler raises), which makes `last_run.json` accurate about *that
+        # something failed* and wrong about what. Rubric 1.7 asks for an accurate
+        # summary, so both are reported, cause first.
+        parts = []
+        if cause is not None:
+            parts.append(f"{type(cause).__name__}: {cause}")
+            summary["error_cause_type"] = type(cause).__name__
+        if failure is not None:
+            parts.append(f"debezium engine: {failure}")
+        message = " | ".join(parts) or "the engine failed without a message"
         summary["stop_reason"] = "engine_error"
         raise EngineFailure(message, summary) from cause
 
     if stop_reason == "hung":
         raise EngineFailure("debezium engine thread did not stop within 60s", summary)
+
+    if stop_reason == "source_dark":
+        raise EngineFailure(
+            f"the source has been unreachable for {health.unknown_for:.1f}s "
+            f"({health.summary()}); the delivery cannot be shown to be complete, so "
+            "this run is not a success (TODO 4.6(b))",
+            summary,
+        )
 
     if stop_reason == "engine_finished" and not engine_terminates_normally:
         raise EngineFailure(
@@ -230,6 +265,15 @@ def run_engine_bounded(
                 "reached --max-seconds while the connector was not streaming for "
                 f"{not_streaming_for:.1f}s ({health.summary()}); the delivery is "
                 "incomplete, so this run is not a success",
+                summary,
+            )
+        # A source that has gone dark reports `not_streaming_for` now (it used to be
+        # reset by every `unknown` sample), but say so explicitly: "I could not ask"
+        # and "I asked and it was idle" must never share an exit code.
+        if health.ever_sampled and health.unknown_for >= run.idle_seconds:
+            raise EngineFailure(
+                "reached --max-seconds while the source could not be consulted for "
+                f"{health.unknown_for:.1f}s ({health.summary()})",
                 summary,
             )
 
@@ -317,7 +361,11 @@ def run(
         replication.slot_name, props["snapshot.mode"], dest.kind,
     )
 
-    con = dest_mod.connect(dest)
+    # rubric 1.7: a `destination_*` fault is injected by wrapping the one connection
+    # the applier writes through, rather than by scattering anchors through the SQL
+    # builders. `AlertSink`'s independent `cursor()` is delegated untouched on
+    # purpose - see `faults.FaultyConnection`.
+    con = faults_mod.wrap_destination(dest_mod.connect(dest))
     summary_extra: dict = {}
     try:
         dest_mod.ensure_control_schema(con)
@@ -369,6 +417,7 @@ def run(
 
         applier_cfg = ApplierConfig(
             max_batch_size=int(props["max.batch.size"]),
+            commit_timeout=run_cfg.commit_timeout,
             **settings,
         )
 
