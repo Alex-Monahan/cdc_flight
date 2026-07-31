@@ -91,7 +91,9 @@ def test_a_blackholed_source_never_reports_ok(tmp_path, postgres_cluster, relay)
             "the pipeline never streamed anything through the relay"
         )
         relay.blackhole()
+        went_dark_at = time.monotonic()
         returncode = proc.wait(timeout=200)
+        detected_in = time.monotonic() - went_dark_at
     finally:
         with_suppress = getattr(proc, "poll", lambda: None)()
         if with_suppress is None:
@@ -105,9 +107,22 @@ def test_a_blackholed_source_never_reports_ok(tmp_path, postgres_cluster, relay)
         f"summary={ {k: v for k, v in summary.items() if k != 'output'} }"
     )
     assert summary.get("ok") is not True, f"summary claims ok on a dead source: {summary}"
-    # And it must say *why*, or an operator cannot tell this from a crash.
-    blob = json.dumps(summary)
-    assert "slot_health" in blob or "source" in blob.lower(), summary
+    # And it must say *why*, by NAME. `"source" in json.dumps(summary).lower()` used to
+    # stand here, which `source_schema` and half a dozen other keys satisfy (Opus
+    # MINOR-5). The mechanism has a name and the summary carries it.
+    assert summary.get("stop_reason") == "source_dark", summary
+    assert "unreachable" in (summary.get("error") or "").lower(), summary.get("error")
+    # And the BOUND is measured, not asserted from the configuration. RUBRIC_STATUS
+    # claims detection "within CDC_SOURCE_DARK_SECONDS (45 s)"; with `--max-seconds 70`
+    # the run could equally have died of the not-streaming guard at 70 s, so the claim
+    # was unproven by the test that carried it. Generous headroom for a loaded machine:
+    # what is being falsified is "detection is bounded by the deadline, not by the dark
+    # timer", and that is a 25-second difference.
+    assert detected_in < 60, (
+        f"the dark source was only detected after {detected_in:.1f}s; "
+        "CDC_SOURCE_DARK_SECONDS is 45s and --max-seconds is 70s, so this run may have "
+        "been ended by the deadline rather than by dark-source detection"
+    )
 
 
 def _drop(dsn: str, slot: str) -> None:

@@ -39,16 +39,13 @@ second path had grown alongside the first.
 
 from __future__ import annotations
 
-import contextlib
 import logging
-import os
-import sys
 import threading
 import time
-from dataclasses import dataclass
 from typing import Any
 
-from . import apply_sql, destination, naming, resume, table_work
+from . import apply_sql, destination, resume, self_heal, table_work
+from .applier_config import ApplierConfig
 from .assembler import (
     UNIT_SNAPSHOT_CHUNK,
     UNIT_TXN,
@@ -56,12 +53,6 @@ from .assembler import (
     TransactionAssembler,
 )
 from .catalog_apply import CatalogCoordinator
-from .config import (
-    DROP_MODES,
-    DROP_REPLICATE,
-    TRUNCATE_MODES,
-    TRUNCATE_REPLICATE,
-)
 from .destination import AlertSink, Lease, ResumePoint
 from .envelope import PendingRecord, decode
 from .errors import AmbiguousDelete, DestinationIdentityCollision
@@ -71,71 +62,6 @@ from .snapshot import SnapshotCoordinator
 from .spill import SpillBuffer, StagedEvent
 
 log = logging.getLogger("cdc_flight.applier")
-
-
-@dataclass
-class ApplierConfig:
-    """Trigger policy (ADR §3.3). Soft triggers close a group at the *next* unit
-    boundary and can never split a unit; the spill thresholds are the only hard
-    ones and they change storage representation, never visibility."""
-
-    commit_max_age: float = 5.0
-    commit_max_events: int = 200_000
-    commit_max_bytes: int = 256 * 1024 * 1024
-    unit_spill_events: int = 500_000
-    unit_spill_bytes: int = 64 * 1024 * 1024
-    snapshot_chunk_events: int = 50_000
-    snapshot_chunk_bytes: int = 64 * 1024 * 1024
-    max_batch_size: int = 2048
-    repair_offset_file: bool = True
-    verify_offset_file: bool = True
-    #: PRIMARY KEY on every generated table's identity columns (Opus M-2).
-    destination_constraints: bool = True
-    #: ADR 0001 §14.6, answered. `markProcessed(record)` is
-    #: `offsetWriter.offset(record.sourcePartition(), record.sourceOffset())`
-    #: (`AsyncEmbeddedEngine.java:1361-1366`) - a last-write-wins map put - so
-    #: marking every record of a unit in order ends at exactly the value marking
-    #: only its terminal record produces. Marking every record costs one JPype
-    #: round trip each, which on a 200 000-event transaction is 200 000 of them
-    #: and holds 200 000 Java references alive. Terminal-only is the default;
-    #: `CDC_ACK_EVERY_RECORD=1` restores the conservative behaviour.
-    ack_every_record: bool = False
-    #: rubric 1.5, `CDC_TRUNCATE_MODE` / `CDC_DROP_MODE`. `replicate` is what the
-    #: rubric's 5 asks for ("replicated just like Postgres handles them"); the other
-    #: modes exist because "faithful" destroys destination data, and an operator who
-    #: wants the audit trail without the destruction should not have to fork.
-    truncate_mode: str = TRUNCATE_REPLICATE
-    drop_mode: str = DROP_REPLICATE
-    #: rubric 1.5 circuit breaker (Opus MAJOR-3 / Q2). At most this many destination
-    #: tables may be destroyed by one commit group; the whole set is refused when the
-    #: limit is exceeded, never half of it.
-    drop_max_per_group: int = 1
-    drop_allow_mass: bool = False
-    #: Re-read the source relation immediately before destroying its destination
-    #: table, and fail closed if the source cannot be asked (Codex 4).
-    drop_revalidate: bool = True
-    #: How long `COMMIT` may take before the process aborts (rubric 1.7 / 4.5).
-    #: 0 disables the watchdog.
-    commit_timeout: float = 300.0
-    #: rubric 4.7: an undecidable fold (`AmbiguousDelete`) queues an automatic
-    #: re-snapshot of the affected table instead of failing identically for ever.
-    #: `CDC_AMBIGUOUS_RESNAPSHOT=0` restores the permanent-failure behaviour.
-    resnapshot_on_ambiguity: bool = True
-    #: rubric 1.6: this applier is serving a **re-snapshot** engine, not the pipeline's
-    #: own stream. It applies snapshot chunks and DISCARDS streaming units: the
-    #: re-snapshot's slot is a throwaway whose offsets nobody reads, so a streaming
-    #: event applied here would be delivered a second time by the real slot. See
-    #: `cdc_flight.resnapshot`.
-    resnapshot: bool = False
-
-    def __post_init__(self) -> None:
-        # A typo must not silently restore Debezium's "truncates are skipped" default.
-        if self.truncate_mode not in TRUNCATE_MODES:
-            raise ValueError(
-                f"CDC_TRUNCATE_MODE={self.truncate_mode!r} is not one of {TRUNCATE_MODES}"
-            )
-        if self.drop_mode not in DROP_MODES:
-            raise ValueError(f"CDC_DROP_MODE={self.drop_mode!r} is not one of {DROP_MODES}")
 
 
 class Applier:
@@ -183,8 +109,20 @@ class Applier:
         self.watermarks: dict[str, int] = dict(watermarks or {})
         #: the consistent point of the snapshot this run applied, if any
         self.last_snapshot_lsn: int | None = None
-        #: True once every table that entered the snapshot phase has been swapped in
+        #: True once Debezium's OWN end-of-snapshot marker has been applied and every
+        #: table it opened has been swapped in. Never inferred from "no table is
+        #: currently mid-snapshot": at a Debezium batch boundary between table A's
+        #: last record and table B's first, that is true and the snapshot is not over
+        #: (Codex B1 / Opus BLOCKER-1).
         self.snapshot_completed = False
+        #: True once a committed group carried `snapshot='last'` — Debezium saying the
+        #: whole snapshot, over the whole requested capture set, has ended.
+        self.snapshot_final_seen = False
+        #: `"<schema>.<table>"` for every table that produced at least one snapshot
+        #: record on this run. The positive evidence behind "this table was scanned":
+        #: a requested table absent from this set was either never reached or is
+        #: genuinely empty, and only a source check can tell those apart.
+        self.snapshot_tables_seen: set[str] = set()
 
         self.registry = apply_sql.SchemaRegistry(
             con, dataset, constraints=config.destination_constraints
@@ -574,7 +512,7 @@ class Applier:
             # HERE, before the commit, because it is only a *forensic* baseline -
             # it does not need to lengthen the commit->ack path (Codex 7).
             offset_fingerprint = self.verifier.before() if self.verifier else None
-            with _commit_watchdog(self.cfg.commit_timeout, commit_id):
+            with self_heal.commit_watchdog(self.cfg.commit_timeout, commit_id):
                 self.con.execute("COMMIT")
             self._txn_open = False
             if has_data:
@@ -618,10 +556,26 @@ class Applier:
 
         self._settle_catalog()
         self._flush_alerts()
-        if self.snapshots.swaps and not self.snapshots.active:
-            # Every table that entered the snapshot phase has been swapped in and the
-            # swap is durable. `cdc_flight.resnapshot` stops its engine on this rather
-            # than waiting out an idle window it does not need.
+        # Recorded only after COMMIT: what the re-snapshot decides on the strength of
+        # these must be durable, not merely applied.
+        for unit in group:
+            if unit.kind != UNIT_SNAPSHOT_CHUNK or unit.fenced:
+                continue
+            if unit.schema and unit.table:
+                self.snapshot_tables_seen.add(f"{unit.schema}.{unit.table}")
+            if unit.snapshot_last:
+                self.snapshot_final_seen = True
+        if self.snapshot_final_seen and not self.snapshots.active:
+            # Debezium has emitted its own end-of-snapshot marker AND every table it
+            # opened has been swapped in, durably. `cdc_flight.resnapshot` stops its
+            # engine on this rather than waiting out an idle window it does not need.
+            #
+            # `snapshot_final_seen` and not `swaps and not active`: the old condition
+            # was a statement about the tables seen SO FAR, and Debezium closes a
+            # table's chunk the moment a record for the NEXT table arrives. A batch
+            # boundary in that gap satisfied "swaps and not active" with the next table
+            # unscanned, and the caller then classified it as empty and deleted its
+            # live destination rows (Codex B1 / Opus BLOCKER-1).
             self.snapshot_completed = True
         self.commit_groups += 1
         if has_data:
@@ -639,67 +593,16 @@ class Applier:
     def _request_resnapshot_for(
         self, ambiguous: AmbiguousDelete | DestinationIdentityCollision
     ) -> None:
-        """Turn an undecidable fold into a durable re-snapshot request (rubric 4.7).
-
-        Deliberately best-effort and deliberately loud either way: the run still fails
-        with a non-zero exit, because "I could not fold this and I have queued a rebuild"
-        is information an operator wants even though no human action is required.
-
-        The honesty note that belongs with it, and which `resnapshot` records in
-        `table_events`: a re-snapshot replaces **current state**. The individual change
-        events of the fenced span are not delivered, so a changelog (rubric 8.2) sees a
-        discontinuity there - an image at the consistent point rather than the events
-        that produced it. Current state is exact; per-event history for that span is not
-        recoverable, because the ambiguity was precisely that the events did not say what
-        they did.
-        """
-        if not self.cfg.resnapshot_on_ambiguity:
-            log.error(
-                "CDC_AMBIGUOUS_RESNAPSHOT=0: not queueing a re-snapshot for the fold "
-                "that could not be decided, so this failure will repeat on every run "
-                "until a human intervenes"
-            )
-            return
-        schema, table = ambiguous.source_schema, ambiguous.source_table
-        if not schema or not table:
-            log.error(
-                "an undecidable fold did not name its table, so no re-snapshot can be "
-                "queued for it: %s", ambiguous,
-            )
-            return
-        target = ambiguous.target or naming.destination_table(
-            self.topic_prefix, schema, table
+        """Rubric 4.7's automatic rebuild request. The policy is `cdc_flight.self_heal`."""
+        recorded, alert = self_heal.request_resnapshot_for(
+            ambiguous,
+            alerts=self.alerts,
+            pipeline=self.pipeline,
+            topic_prefix=self.topic_prefix,
+            enabled=self.cfg.resnapshot_on_ambiguity,
         )
-        recorded = self.alerts.request_snapshot(
-            pipeline=self.pipeline, schema=schema, table=table, target=target
-        )
-        self._pending_alerts.append(
-            {
-                "severity": "critical",
-                "code": "ambiguous_delete_resnapshot",
-                "on_rollback": True,
-                "message": (
-                    f"the fold for {schema}.{table} could not be decided, so the commit "
-                    "group was refused. "
-                    + (
-                        "The table is now marked awaiting_snapshot and the next run "
-                        "rebuilds it automatically; no human action is required, but "
-                        "per-event history for the rebuilt span is replaced by the "
-                        "snapshot image (rubric 4.7 / ADR 0001 §19/A47)."
-                        if recorded
-                        else "The re-snapshot request could NOT be recorded, so this "
-                        "failure WILL repeat until a human intervenes."
-                    )
-                ),
-                "context": {
-                    "source_schema": schema,
-                    "source_table": table,
-                    "target_table": target,
-                    "resnapshot_queued": recorded,
-                    "detail": str(ambiguous),
-                },
-            }
-        )
+        if alert is not None:
+            self._pending_alerts.append(alert)
         self.ambiguous_resnapshots_queued += int(recorded)
 
     def _rollback_quietly(self) -> None:
@@ -1006,48 +909,6 @@ class Applier:
             if self.error is None:
                 self.error = exc
         return self.assembler.discard_open_unit()
-
-
-@contextlib.contextmanager
-def _commit_watchdog(timeout: float, commit_id: int):
-    """Bound `COMMIT`. A hung commit kills the process; that is the honest answer.
-
-    Rubric 1.7 requires every injected fault to end in a clean recovery or a loud
-    failure. A `COMMIT` that never returns is neither, and nothing in DuckDB or the
-    MotherDuck client imposes a deadline of its own, so the run would hang for ever
-    holding the lease (which is also rubric 4.5's "hanging or locking that prevents
-    recovery").
-
-    Hard-exiting is safe precisely *because* of Invariant O. The commit is ambiguous
-    - it may already have been durable server-side - but nothing has entered
-    Debezium's offset store, so the next run reads whichever of `W` / `W-prime` the
-    destination actually holds and resumes from exactly there (ADR 0001 §4.6 F5).
-    Exit code 75 (`EX_TEMPFAIL`) rather than the fault injector's 137: this is a real
-    operational failure and a supervisor should retry it.
-    """
-    if not timeout or timeout <= 0:
-        yield
-        return
-
-    def _fire() -> None:  # pragma: no cover - exercised by the fault test in a child
-        log.critical(
-            "destination COMMIT for commit_id=%s did not return within %.0fs; aborting "
-            "the process. The commit is AMBIGUOUS and that is safe: nothing was "
-            "acknowledged to Debezium, so the next run resumes from whatever the "
-            "destination actually holds (ADR 0001 §4.6 F5).",
-            commit_id, timeout,
-        )
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(75)
-
-    timer = threading.Timer(timeout, _fire)
-    timer.daemon = True
-    timer.start()
-    try:
-        yield
-    finally:
-        timer.cancel()
 
 
 def _epoch_ms(value) -> Any:

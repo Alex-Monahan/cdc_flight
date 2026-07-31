@@ -100,9 +100,19 @@ def test_the_advance_triggers_an_automatic_resnapshot_of_every_captured_table(ad
     summary = advanced["recovered"]
     recovery = summary["slot_recovery"]
     assert recovery["decision"] == "slot_ahead_of_destination"
-    # "all captured tables, unless provable otherwise" - and it is not provable otherwise.
-    assert recovery["tables_marked"] >= 6, recovery
+    # "all captured tables, unless provable otherwise" - and it is not provable
+    # otherwise. EXACTLY the capture set, not `>= 6`: `request_snapshot` used to
+    # increment once per input tuple whatever happened, so the old assertion restated
+    # this test's own configuration (Opus MINOR-1). It now counts `table_state` rows
+    # verified to carry `awaiting_snapshot`, so the number is evidence.
+    from conftest import CAPTURED_TABLES
+
+    assert recovery["tables_marked"] == len(CAPTURED_TABLES), recovery
     assert recovery["slot"] == "dropped", recovery
+    # The journal is the durable record of all that, and it is CLEARED once the rebuild
+    # it asked for actually happened - a recovery that stays armed for ever would mean
+    # the next run keeps forcing a snapshot mode nobody asked for.
+    assert summary.get("recovery_cleared"), summary
     assert summary["ok"] is True, summary
 
 

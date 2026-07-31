@@ -26,15 +26,14 @@ import os
 import shutil
 import sys
 import threading
-import time
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from . import catalog as catalog_mod
 from . import destination as dest_mod
 from . import faults as faults_mod
 from . import reconcile as reconcile_mod
+from . import recovery as recovery_mod
 from . import resnapshot as resnapshot_mod
 from .applier import Applier, ApplierConfig
 from .config import (
@@ -51,265 +50,9 @@ from .destination import CONTROL_SCHEMA, Lease
 from .errors import EngineFailure
 from .faults import validate_env as validate_fault_env
 from .source_health import SourceHealth
-
-if TYPE_CHECKING:  # `engine` imports pydbzengine, which boots a JVM on import.
-    from .engine import SupervisedDebeziumEngine
+from .supervisor import run_engine_bounded
 
 log = logging.getLogger("cdc_flight.pipeline")
-
-
-# --------------------------------------------------------------------------- #
-# bounded engine runner
-# --------------------------------------------------------------------------- #
-def run_engine_bounded(
-    engine: SupervisedDebeziumEngine,
-    handler: Applier,
-    run: RunConfig,
-    health: SourceHealth | None = None,
-    *,
-    engine_terminates_normally: bool = False,
-    catalog=None,
-    catalog_drain_seconds: float = 30.0,
-    stop_when=None,
-) -> dict:
-    """Run the Debezium engine until the *source* agrees it is idle, or the deadline hits.
-
-    Four independent things can go wrong, and all four must reach the caller:
-
-    * `engine.run()` raises on this process's engine thread (rare);
-    * the applier raises (captured by `handler.error`);
-    * the *engine itself* fails - a connector that cannot start, or a streaming
-      error. Debezium reports that through its `CompletionCallback` and returns
-      normally, so it is only visible via `SupervisedDebeziumEngine.failure`;
-    * the connector stops streaming *without failing* - a retriable exception
-      puts it into a restart backoff that is longer than our idle window, so an
-      idle timer alone reports success on a partial delivery (Opus B5). `health`
-      corroborates "quiet" against `pg_replication_slots`.
-
-    Before a quiet run is allowed to shut down there is one more barrier (Codex 6):
-    a **synchronous final catalog poll**, and then a bounded wait for any destructive
-    change it queued to be fenced and applied. Without it a `DROP TABLE` on a quiet
-    source normally could not be seen until the *next* scheduled run - the watcher
-    polls every 10 s while the idle window is 8 s - which makes "detected in 10
-    seconds" misleading. A change that is still unresolved when the barrier expires
-    makes the run **non-successful**: the destination is knowingly out of step with the
-    source, and reporting `ok: true` on that is not honest.
-    """
-    started = time.monotonic()
-    error_box: list[BaseException] = []
-    final_poll_done = False
-    drain_until = 0.0
-    catalog_unresolved: list[str] = []
-
-    def _run():
-        try:
-            engine.run()
-        except BaseException as exc:
-            error_box.append(exc)
-
-    thread = threading.Thread(target=_run, name="debezium-engine", daemon=True)
-    thread.start()
-
-    stop_reason = "max_seconds"
-    idle_blocked_by_source = 0
-    try:
-        while thread.is_alive():
-            elapsed = time.monotonic() - started
-            if elapsed >= run.max_seconds:
-                stop_reason = "max_seconds"
-                break
-            if error_box or engine.failure is not None:
-                stop_reason = "engine_error"
-                break
-            # TODO 4.6(b): a source that was answering and has gone completely dark
-            # is a failure with a bounded detection time, not something to discover
-            # when --max-seconds happens to expire. `ever_sampled` keeps an
-            # environment where the slot could never be read (no psycopg, no
-            # privilege) on the old timer-only path.
-            if (
-                health is not None
-                and run.source_dark_seconds > 0
-                and health.ever_sampled
-                and health.unknown_for >= run.source_dark_seconds
-            ):
-                stop_reason = "source_dark"
-                break
-            # An explicit "the work this engine was started for is done" signal. Only
-            # `cdc_flight.resnapshot` supplies one: a re-snapshot is finished the moment
-            # its last shadow is swapped in, and waiting out an idle window instead
-            # would add `--idle-seconds` to every recovery for nothing. Checked with the
-            # applier NOT busy so a group in flight is never abandoned.
-            if stop_when is not None and not handler.busy and stop_when():
-                stop_reason = "work_done"
-                break
-            enough = handler.record_count >= run.min_records
-            quiet = handler.seconds_since_last_batch >= run.idle_seconds
-            # Never stop before the connector has had a chance to start, and
-            # never stop while a commit group is being applied.
-            warmed_up = elapsed >= min(run.idle_seconds, 5.0)
-            if enough and quiet and warmed_up and not handler.busy:
-                if health is None or health.may_declare_idle(min_seconds=run.idle_seconds):
-                    if catalog is not None and not final_poll_done:
-                        # The synchronous final poll. A DROP that happened after the
-                        # last scheduled poll is seen by THIS run, and it is also the
-                        # poll that completes `CDC_DROP_CONFIRM_POLLS` on a short run.
-                        final_poll_done = True
-                        catalog.poll_quietly()
-                        drain_until = time.monotonic() + catalog_drain_seconds
-                    unresolved = (
-                        [c.qualified for c in catalog.pending_destructive()]
-                        if catalog is not None
-                        else []
-                    )
-                    if unresolved and time.monotonic() < drain_until:
-                        # The drain barrier: the fence marker has been emitted, so a
-                        # WAL record past the detection point is on its way and the
-                        # applier will apply the change on the group that carries it.
-                        if idle_blocked_by_source % 40 == 0:
-                            log.info(
-                                "holding the engine open for %s unresolved destructive "
-                                "catalog change(s): %s",
-                                len(unresolved), ", ".join(sorted(unresolved)),
-                            )
-                        idle_blocked_by_source += 1
-                        time.sleep(0.25)
-                        continue
-                    catalog_unresolved = unresolved
-                    stop_reason = "idle"
-                    break
-                idle_blocked_by_source += 1
-                if idle_blocked_by_source % 20 == 1:
-                    log.warning(
-                        "stream quiet for %.1fs but the source disagrees it is idle: %s",
-                        handler.seconds_since_last_batch,
-                        health.summary(),
-                    )
-            time.sleep(0.25)
-        else:
-            stop_reason = "engine_finished"
-    finally:
-        intentional = stop_reason != "engine_error" and handler.error is None and not error_box
-        log.info("closing debezium engine (reason=%s, intentional=%s)", stop_reason, intentional)
-
-        closer = threading.Thread(
-            target=engine.close,
-            kwargs={"intentional": intentional},
-            name="debezium-close",
-            daemon=True,
-        )
-        closer.start()
-        closer.join(timeout=run.close_timeout)
-        if closer.is_alive():
-            log.error("engine.close() did not return within %ss", run.close_timeout)
-            stop_reason = "hung"
-        thread.join(timeout=60)
-        if thread.is_alive():
-            log.error("debezium engine thread did not stop within 60s")
-            stop_reason = "hung"
-        # ADR 0001 §3.2: the un-ENDed tail is DISCARDED, never guessed at. It is
-        # safe to discard precisely because Invariant O means the offset store
-        # still points before it, so it replays on the next run.
-        discarded = handler.drain_on_shutdown()
-        if discarded:
-            log.info("discarded %s un-committed tail events at shutdown", discarded)
-
-    summary = {
-        "stop_reason": stop_reason,
-        "elapsed_sec": round(time.monotonic() - started, 2),
-        "records": handler.record_count,
-        "batches": handler.batch_count,
-        "data_batches": handler.data_batch_count,
-        "skipped": handler.skipped_count,
-        "tables": handler.snapshot_counts(),
-        "offset_flushes_verified": engine.offset_flushes_verified,
-        **handler.stats(),
-    }
-    if health is not None:
-        summary.update(health.summary())
-    if engine.suppressed_message:
-        summary["suppressed_engine_message"] = engine.suppressed_message
-
-    failure = engine.failure
-    if error_box or handler.error is not None or failure is not None:
-        cause = error_box[0] if error_box else handler.error
-        # OUR exception is the root cause; Debezium's is the consequence. It used to
-        # be the other way round, and the consequence is always the more generic
-        # message: a destination write that failed mid-transaction was reported as
-        # `java.lang.InterruptedException` (pydbzengine interrupts the engine thread
-        # when the handler raises), which makes `last_run.json` accurate about *that
-        # something failed* and wrong about what. Rubric 1.7 asks for an accurate
-        # summary, so both are reported, cause first.
-        parts = []
-        if cause is not None:
-            parts.append(f"{type(cause).__name__}: {cause}")
-            summary["error_cause_type"] = type(cause).__name__
-        if failure is not None:
-            parts.append(f"debezium engine: {failure}")
-        message = " | ".join(parts) or "the engine failed without a message"
-        summary["stop_reason"] = "engine_error"
-        raise EngineFailure(message, summary) from cause
-
-    if stop_reason == "hung":
-        raise EngineFailure("debezium engine thread did not stop within 60s", summary)
-
-    if stop_reason == "source_dark":
-        raise EngineFailure(
-            f"the source has been unreachable for {health.unknown_for:.1f}s "
-            f"({health.summary()}); the delivery cannot be shown to be complete, so "
-            "this run is not a success (TODO 4.6(b))",
-            summary,
-        )
-
-    if stop_reason == "engine_finished" and not engine_terminates_normally:
-        raise EngineFailure(
-            "the Debezium engine terminated before the supervisor requested a stop "
-            f"(completion success={engine.completed_success}); in streaming mode "
-            "that is engine death, not a clean finish",
-            summary,
-        )
-
-    if health is not None and stop_reason == "max_seconds":
-        not_streaming_for = health.not_streaming_for
-        if not_streaming_for >= run.idle_seconds:
-            raise EngineFailure(
-                "reached --max-seconds while the connector was not streaming for "
-                f"{not_streaming_for:.1f}s ({health.summary()}); the delivery is "
-                "incomplete, so this run is not a success",
-                summary,
-            )
-        # A source that has gone dark reports `not_streaming_for` now (it used to be
-        # reset by every `unknown` sample), but say so explicitly: "I could not ask"
-        # and "I asked and it was idle" must never share an exit code.
-        if health.ever_sampled and health.unknown_for >= run.idle_seconds:
-            raise EngineFailure(
-                "reached --max-seconds while the source could not be consulted for "
-                f"{health.unknown_for:.1f}s ({health.summary()})",
-                summary,
-            )
-
-    if catalog is not None:
-        still_pending = [c.qualified for c in catalog.pending_destructive()]
-        if still_pending or catalog_unresolved:
-            names = sorted(set(still_pending) | set(catalog_unresolved))
-            summary["stop_reason"] = "catalog_unresolved"
-            summary["catalog_unresolved_tables"] = names
-            # Codex 6: deferring is the correct *safety* choice - a destructive action
-            # whose fence has not opened must not be guessed past - but it is not
-            # faithful propagation and it is not honest to call the run successful.
-            # The most common cause is a source that cannot be written to (a read-only
-            # replica, a missing privilege), which `catalog_marker_error` names.
-            raise EngineFailure(
-                f"{len(names)} destructive source-catalog change(s) are still "
-                f"unresolved at shutdown ({', '.join(names)}): the destination is "
-                "knowingly out of step with the source. Most often the WAL fence "
-                "marker could not be written to the source (see "
-                f"catalog_marker_error={summary.get('catalog_marker_error')!r}), so no "
-                "LSN past the detection point can be proven to have flowed",
-                summary,
-            )
-
-    summary["ok"] = True
-    return summary
 
 
 # --------------------------------------------------------------------------- #
@@ -359,6 +102,50 @@ def _captured_tables(con, pipeline: str, source, replication) -> list[tuple[str,
     return out
 
 
+def _resume_any_journalled_recovery(
+    con, *, source, replication, dest, namespace: str
+) -> tuple:
+    """Finish a recovery an earlier process left half-done, BEFORE anything else looks.
+
+    Returns `(record_or_None, result_or_None)`. This is what makes rubric 1.8's recovery
+    crash-recoverable rather than crash-fatal: the journal says which phase was reached,
+    every step is idempotent, and the run resumes from there instead of diagnosing its
+    own intermediate state as an operator error (Codex B3 / Opus MAJOR-1). It runs
+    before `_check_the_slot` because a half-finished recovery has, by construction, the
+    exact durable shape - no resume row, maybe no slot - that the slot check reads as a
+    brand-new problem.
+    """
+    record = recovery_mod.read(con, pipeline=dest.pipeline_name, namespace=namespace)
+    if record is None:
+        return None, None
+    if record.phase == recovery_mod.PHASE_ARMED:
+        log.warning(
+            "resuming rubric 1.8 recovery %s (%s): the destructive phase is complete "
+            "and %s table(s) still owe a snapshot",
+            record.recovery_id, record.decision, record.tables_marked,
+        )
+        return record, {
+            "recovery_id": record.recovery_id,
+            "decision": record.decision,
+            "resumed_from": record.phase,
+            "phase": record.phase,
+            "tables_marked": record.tables_marked,
+            "message": record.message,
+        }
+    log.warning(
+        "resuming rubric 1.8 recovery %s (%s) from phase %r: an earlier run did not "
+        "finish it", record.recovery_id, record.decision, record.phase,
+    )
+    result = recovery_mod.resume(
+        con,
+        pipeline=dest.pipeline_name,
+        namespace=namespace,
+        record=record,
+        dsn=source.dsn,
+    )
+    return record, result
+
+
 def _check_the_slot(
     con, *, source, replication, dest, namespace: str, captured, orphan_file: bool
 ) -> tuple:
@@ -376,12 +163,33 @@ def _check_the_slot(
     durable_lsn = int(durable[0][0]) if durable else None
     observation = reconcile_mod.observe_slot(source.dsn, replication.slot_name)
     previous = dest_mod.read_slot_state(con, dest.pipeline_name, replication.slot_name)
+    # What the destination actually holds, not what a control row says about it. The
+    # `no_durable_destination_row` cell is defined as "destination EMPTY, slot
+    # positioned" and used to be decided without ever looking (Opus BLOCKER-2). Only
+    # read when there is no resume point, because that is the only cell it decides and
+    # counting every captured table on every start-up is not free.
+    destination_rows = (
+        dest_mod.destination_holds_rows(con, dataset=dest.dataset_name, tables=captured)
+        if durable_lsn is None
+        else None
+    )
     verdict = reconcile_mod.check_slot(
-        durable_lsn=durable_lsn, observation=observation, previous=previous
+        durable_lsn=durable_lsn,
+        observation=observation,
+        previous=previous,
+        destination_rows=destination_rows,
     )
     log.info("slot check: %s (%s)", verdict.decision, verdict.message or "healthy")
 
     recovery = None
+    if verdict.refuse and verdict.decision == "no_durable_destination_row":
+        log.error(
+            "%s: %s", verdict.decision, verdict.message,
+        )
+        dest_mod.raise_alert(
+            con, pipeline=dest.pipeline_name, severity="critical",
+            code=verdict.decision, message=verdict.message, context=verdict.as_dict(),
+        )
     if verdict.resnapshot and orphan_file and verdict.decision == "no_durable_destination_row":
         # The one place a re-snapshot is NOT the right automatic answer, and the reason
         # the refusal in ADR 0001 §4.5 survives this whole feature: an `offsets.dat` with
@@ -425,7 +233,7 @@ def _check_the_slot(
             offset_path=replication.offset_file,
             verdict=verdict,
             captured_tables=captured,
-            forget_catalog=verdict.decision == "source_identity_changed",
+            forget_catalog=verdict.decision in reconcile_mod.FORGET_CATALOG_DECISIONS,
         )
     if observation.observable:
         recorded = observation.as_dict() | {"durable_lsn": durable_lsn}
@@ -578,13 +386,32 @@ def run(
         lease.acquire(con)
         lease_held = True
 
+        # rubric 4.7: a throwaway `_rs` slot left behind by an interrupted re-snapshot
+        # holds WAL on the source for ever and counts against `max_replication_slots`.
+        # Swept unconditionally, by the one name this pipeline derives from its own slot
+        # (Opus MAJOR-2, observed leaking twice on the shared cluster in one day).
+        summary_extra["stale_resnapshot_slot"] = resnapshot_mod.sweep_stale_slot(
+            source.dsn, replication.slot_name
+        )
+
+        # A recovery an earlier process did not finish is resumed BEFORE the slot check
+        # looks at anything: its intermediate state is, by construction, indistinguish-
+        # able from a fresh problem, and the Flight used to diagnose its own half-done
+        # work as an operator error and refuse for ever (Codex B3 / Opus MAJOR-1).
+        journal, resumed = _resume_any_journalled_recovery(
+            con, source=source, replication=replication, dest=dest, namespace=namespace
+        )
+        if resumed is not None:
+            summary_extra["recovery_resumed"] = resumed
+
+        captured_tables = _captured_tables(con, dest.pipeline_name, source, replication)
         verdict, recovery = _check_the_slot(
             con,
             source=source,
             replication=replication,
             dest=dest,
             namespace=namespace,
-            captured=_captured_tables(con, dest.pipeline_name, source, replication),
+            captured=captured_tables,
             # Deliberately independent of `--accept-orphan-offsets`: whether the file is
             # trusted, refused or deleted is reconciliation's decision, and it is the one
             # place that knows the difference. The slot check only has to stay out of it.
@@ -596,15 +423,29 @@ def run(
         summary_extra["slot_check"] = verdict.as_dict()
         if recovery is not None:
             summary_extra["slot_recovery"] = recovery
-            # A recovery has just deleted the resume point, so the run has to snapshot
-            # data whatever `snapshot.mode` said. `no_data` plus "every table is owed a
+            journal = recovery_mod.read(
+                con, pipeline=dest.pipeline_name, namespace=namespace
+            )
+        if journal is not None:
+            # A recovery has deleted the resume point, so the run has to snapshot data
+            # whatever `snapshot.mode` said. `no_data` plus "every table is owed a
             # snapshot" is a run that streams onto tables it knows are wrong.
+            #
+            # Read from the JOURNAL, not from a local variable: the intent has to
+            # outlive the process that formed it. A crash after the slot was dropped
+            # used to leave no row, no file and no slot, which the next run called an
+            # ordinary fresh start - and a fresh start under a configured `no_data` mode
+            # streams onto tables that were never rebuilt (Codex B3).
             if props["snapshot.mode"] not in reconcile_mod.SNAPSHOT_MODES_WITH_DATA:
                 log.warning(
-                    "snapshot.mode=%s does not read table data; using 'initial' for "
-                    "this recovery run", props["snapshot.mode"],
+                    "snapshot.mode=%s does not read table data; using %r for this "
+                    "recovery run (journal %s)",
+                    props["snapshot.mode"], journal.snapshot_mode, journal.recovery_id,
                 )
-                props["snapshot.mode"] = "initial"
+                props["snapshot.mode"] = (
+                    journal.snapshot_mode or recovery_mod.FORCED_SNAPSHOT_MODE
+                )
+            summary_extra["recovery_journal"] = journal.as_dict()
 
         outcome = reconcile_mod.reconcile(
             con,
@@ -664,6 +505,25 @@ def run(
             outcome.resume_point.last_lsn == 0
             and props["snapshot.mode"] in reconcile_mod.SNAPSHOT_MODES_WITH_DATA
         )
+        if owed and journal is not None and not will_snapshot_everything:
+            # A47/A53: the main slot is what retains WAL continuously from the durable
+            # resume point, and an armed recovery has deleted that resume point and
+            # dropped that slot. Running the throwaway re-snapshot here would open a
+            # window between the throwaway slot's lifetime and the main slot's, and a
+            # transaction committing inside it is retained by neither (Codex B3's
+            # "retain at least one slot continuously"). The recovery path is
+            # constructed so that `will_snapshot_everything` is always true - the main
+            # engine's own coordinated snapshot IS the rebuild - so this is an assertion
+            # that the construction still holds, not a branch that is expected to run.
+            raise EngineFailure(
+                f"recovery {journal.recovery_id} ({journal.decision}) is armed and "
+                f"{len(owed)} table(s) owe a snapshot, but this run is not snapshotting "
+                f"everything (snapshot.mode={props['snapshot.mode']!r}, resume lsn="
+                f"{outcome.resume_point.last_lsn}). A throwaway re-snapshot here would "
+                "leave no slot retaining WAL between the image and the main stream. "
+                "Refusing rather than opening that window.",
+                dict(summary_extra),
+            )
         if owed and not will_snapshot_everything and resnapshot_enabled():
             resnap = resnapshot_mod.run(
                 con,
@@ -810,6 +670,31 @@ def run(
                 dsn=source.dsn, slot_name=replication.slot_name,
                 snapshot_mode=props["snapshot.mode"],
             )
+            # The recovery is over when the work it asked for has actually been done:
+            # nothing owes a snapshot any more, and the destination has a resume point
+            # again. Clearing it any earlier would throw away the forced snapshot mode
+            # that the rest of the rebuild depends on.
+            if journal is not None:
+                still_owed = dest_mod.tables_awaiting_snapshot(con, dest.pipeline_name)
+                has_resume = bool(
+                    con.execute(
+                        f"SELECT 1 FROM {CONTROL_SCHEMA}.debezium_offsets "
+                        "WHERE pipeline = ? AND namespace = ?",
+                        [dest.pipeline_name, namespace],
+                    ).fetchall()
+                )
+                if not still_owed and has_resume:
+                    recovery_mod.clear(
+                        con, pipeline=dest.pipeline_name, namespace=namespace
+                    )
+                    summary_extra["recovery_cleared"] = journal.recovery_id
+                    log.warning(
+                        "rubric 1.8 recovery %s is COMPLETE: every captured table has a "
+                        "fresh image and the destination has a resume point again",
+                        journal.recovery_id,
+                    )
+                else:
+                    summary_extra["recovery_still_armed"] = journal.recovery_id
             return _decorate(result)
         except EngineFailure as failure:
             _decorate(failure.summary)

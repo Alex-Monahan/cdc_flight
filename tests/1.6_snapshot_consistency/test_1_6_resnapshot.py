@@ -23,6 +23,15 @@ from __future__ import annotations
 import pytest
 from conftest import Sandbox
 
+#: **Moved to the `slow` lane in the 1.6-1.8 review round** (Opus Q5). The default suite
+#: guards the same claims more strongly and more cheaply now: the multi-table re-snapshot
+#: in `test_1_6_resnapshot_multi_table.py` covers a keyless table, a verified-empty table,
+#: a concurrent writer and the hand-over, and `test_1_6_resnapshot_completion.py` covers
+#: the completion semantics deterministically in milliseconds. This module is the
+#: single-table original: still worth running, no longer the cheapest representative of
+#: its class. Nothing was deleted.
+pytestmark = pytest.mark.slow
+
 
 @pytest.fixture(scope="module")
 def resnap(tmp_path_factory, postgres_cluster):
@@ -198,13 +207,40 @@ def test_the_resnapshot_left_no_throwaway_slot_behind(resnap):
     assert leftover == [], f"a throwaway re-snapshot slot is still holding WAL: {leftover}"
 
 
-def test_the_resnapshot_discarded_its_own_streaming_events(resnap):
+def test_the_resnapshot_applied_the_image_and_ONLY_the_image(resnap):
     """Its slot is a throwaway; anything it streamed belongs to the real slot.
 
-    Not asserted as `> 0`: whether the short-lived engine gets as far as streaming is a
-    race with how quickly we notice the swap. What must never happen is that it *applied*
-    them, and `resnapshot_discarded_events` is how that stays visible.
+    `assert resnapshot_discarded_events >= 0` used to stand here, which a count always
+    satisfies (Opus MINOR-1). The checkable claim is that the short-lived engine applied
+    the image and nothing else: its applied-event count must equal the number of rows
+    the source held for the re-snapshotted table, exactly. Whether it also *streamed*
+    anything is a race with how fast we notice the swap, but if it had applied a
+    streamed event this number would exceed the row count.
     """
+    box = resnap["box"]
     summary = resnap["resnapshotted"]
-    assert summary.get("resnapshot_discarded_events", 0) >= 0
     assert "app.customers" in summary["resnapshot_swapped"]
+    # Every row the re-snapshot wrote carries `dbz_op = 'r'` (a snapshot read); every
+    # row the main stream wrote afterwards carries an operation. So the image's own row
+    # count is queryable after the fact, and it must equal the number of events the
+    # short-lived engine applied. Anything above it is a *streamed* event that belongs
+    # to the real slot and was applied here as well — a double delivery.
+    image_rows = box.scalar(
+        f"SELECT count(*) FROM {box.table('cdcflight_app_customers')} WHERE dbz_op = 'r'"
+    )
+    assert image_rows > 0
+    assert summary["resnapshot_events"] == image_rows, (
+        f"the re-snapshot applied {summary['resnapshot_events']} events for an image of "
+        f"{image_rows} rows"
+    )
+    # The deterministic half of the same claim - a streaming unit reaching a re-snapshot
+    # applier is fenced, counted and never written - is
+    # `test_1_6_resnapshot_completion.py`, which does not depend on a race.
+
+    # And the consistent point is the one BOTH readings agreed on: a disagreement is
+    # fatal now, so a run that got here has a cross-checked C.
+    assert summary["resnapshot_consistent_lsn"] == summary["resnapshot_snapshot_record_lsn"]
+    assert summary["resnapshot_snapshot_phase_ended"] is True, (
+        "the re-snapshot must stop on Debezium's own end-of-snapshot marker, not on "
+        "'no table is currently mid-snapshot'"
+    )

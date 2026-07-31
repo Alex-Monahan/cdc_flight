@@ -57,12 +57,25 @@ all places *we* stand; they cannot express "the destination refused the write" o
 `wrap_destination()`, which wraps the single connection the applier writes through:
 
     CDC_FAULT_INJECT=destination_write:2    # a data write is rejected mid-transaction
-    CDC_FAULT_INJECT=destination_commit:1   # COMMIT raises - AMBIGUOUS (§4.6 F5)
+    CDC_FAULT_INJECT=destination_commit:1   # COMMIT raises BEFORE executing
+    CDC_FAULT_INJECT=destination_commit_late:1  # COMMIT EXECUTES, then raises -
+                                            # genuinely AMBIGUOUS (§4.6 F5)
     CDC_FAULT_INJECT=destination_hang:1     # COMMIT never returns (bounded by
                                             # CDC_COMMIT_TIMEOUT, then exit 75)
     CDC_FAULT_INJECT=destination_close:1    # the connection is severed mid-transaction
     CDC_FAULT_INJECT=swap:1                 # between the DROP and the RENAME of a
                                             # backfill swap (1.6)
+
+`destination_hang`'s duration is `CDC_FAULT_HANG_SECONDS` (default 3600). It used to be
+read out of `<action>`, so `destination_hang:1` hung for 137 seconds - the *default exit
+code* reinterpreted as a duration - which is undocumented, surprising, and (with the
+shipped `CDC_COMMIT_TIMEOUT=300`) would have ended the hang before the watchdog it
+exists to test could fire (Opus MAJOR-5).
+
+**Every fired anchor writes a machine-readable record** to `$CDC_STATE_DIR/fault_fired.json`
+before it does anything else, including before `os._exit`. A fault test that only checks
+an exit code cannot tell "the watchdog bounded a hung COMMIT" from "the harness killed
+the process"; with the record it can assert the exact anchor that fired (Codex M2).
 
 The *network* fault that matters most cannot be injected from inside the process at
 all - a source whose packets simply stop arriving, with the sockets left open - so it
@@ -76,6 +89,7 @@ duplicate are all failures of the item.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -128,9 +142,16 @@ POINTS = (
 #:   `CDC_COMMIT_TIMEOUT`; the run must die loudly rather than hang for ever.
 #: * `destination_close`  - the connection is severed mid-transaction, which is
 #:   what a dropped network route to MotherDuck looks like.
+#: * `destination_commit_late` - `COMMIT` is EXECUTED and then raises. This is the
+#:   genuinely ambiguous shape: the server committed, the client saw an error, and the
+#:   two are indistinguishable from where we stand. `destination_commit` raises
+#:   *before* the statement runs, which is an ordinary uncommitted failure wearing an
+#:   ambiguous name (Codex M2); both are kept, because the recovery has to be right
+#:   either way and only having the easy one proved half the claim.
 DESTINATION_POINTS = (
     "destination_write",
     "destination_commit",
+    "destination_commit_late",
     "destination_hang",
     "destination_close",
 )
@@ -284,15 +305,30 @@ class FaultyConnection:
 
     # -- the injected surface ---------------------------------------------- #
     def execute(self, sql, *args, **kwargs):
+        late = False
         if not self.fired and _current_group == self._nth:
             statement = sql if isinstance(sql, str) else str(sql)
             self._maybe_fire(statement)
-        return self._con.execute(sql, *args, **kwargs)
+            late = self.fired and self._point == "destination_commit_late"
+        result = self._con.execute(sql, *args, **kwargs)
+        if late:
+            # The COMMIT really ran, and THEN the client lost the answer. This is the
+            # shape §4.6 F5 is about and the shape `destination_commit` is not.
+            log.error(
+                "FAULT INJECTION: destination COMMIT executed, then the client lost "
+                "the answer (group %s)", self._nth,
+            )
+            raise DestinationFault(
+                "injected destination COMMIT failure AFTER the statement executed "
+                "(genuinely ambiguous: the destination committed and we cannot know it)"
+            )
+        return result
 
     def _maybe_fire(self, statement: str) -> None:
         lowered = statement.lstrip().lower()
         if self._point == "destination_write" and _is_data_statement(statement):
             self.fired = True
+            record_fired(self._point, self._nth, "raise")
             log.error("FAULT INJECTION: destination rejects %r (group %s)",
                       statement[:60], self._nth)
             raise DestinationFault(
@@ -301,15 +337,27 @@ class FaultyConnection:
         if lowered.startswith("commit"):
             if self._point == "destination_commit":
                 self.fired = True
+                record_fired(self._point, self._nth, "raise")
                 log.error("FAULT INJECTION: destination COMMIT fails (group %s)", self._nth)
-                raise DestinationFault("injected destination COMMIT failure (ambiguous)")
+                raise DestinationFault(
+                    "injected destination COMMIT failure before the statement ran"
+                )
+            if self._point == "destination_commit_late":
+                self.fired = True
+                record_fired(self._point, self._nth, "raise")
+                return
             if self._point == "destination_hang":
                 self.fired = True
-                log.error("FAULT INJECTION: destination COMMIT hangs (group %s)", self._nth)
+                record_fired(self._point, self._nth, f"hang:{self._hang_seconds}")
+                log.error(
+                    "FAULT INJECTION: destination COMMIT hangs for %ss (group %s)",
+                    self._hang_seconds, self._nth,
+                )
                 sys.stdout.flush()
                 time.sleep(self._hang_seconds)
         if self._point == "destination_close" and _is_data_statement(statement):
             self.fired = True
+            record_fired(self._point, self._nth, "close")
             log.error("FAULT INJECTION: severing the destination connection (group %s)",
                       self._nth)
             try:
@@ -323,19 +371,88 @@ class FaultyConnection:
         return getattr(self._con, name)
 
 
+#: How long `destination_hang` blocks inside `COMMIT`. Its OWN environment variable.
+#: It used to be `<action>` reinterpreted as seconds, so a bare `destination_hang:1`
+#: hung for 137 s (the default exit code) - undocumented, and shorter than the shipped
+#: `CDC_COMMIT_TIMEOUT` of 300 s, which means the anchor would have quietly failed to
+#: exercise the watchdog it exists for (Opus MAJOR-5).
+HANG_SECONDS_ENV = "CDC_FAULT_HANG_SECONDS"
+DEFAULT_HANG_SECONDS = 3600.0
+
+
+def hang_seconds() -> float:
+    raw = os.environ.get(HANG_SECONDS_ENV)
+    if not raw:
+        return DEFAULT_HANG_SECONDS
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise FaultSpecError(
+            f"{HANG_SECONDS_ENV}: expected a number of seconds, got {raw!r}"
+        ) from exc
+
+
 def wrap_destination(con, *, hang_seconds: float | None = None):
     """Return `con`, or a `FaultyConnection` when a `destination_*` fault is armed."""
     spec = _spec()
     if spec is None:
         return con
-    point, nth, action = spec
+    point, nth, _action = spec
     if point not in DESTINATION_POINTS:
         return con
-    hang = hang_seconds if hang_seconds is not None else (
-        float(action) if isinstance(action, int) else 3600.0
+    hang = hang_seconds if hang_seconds is not None else globals()["hang_seconds"]()
+    log.warning(
+        "destination fault armed: %s at data group %s%s",
+        point, nth, f" (hang {hang}s)" if point == "destination_hang" else "",
     )
-    log.warning("destination fault armed: %s at data group %s", point, nth)
     return FaultyConnection(con, point, nth, hang_seconds=hang)
+
+
+#: Where a fired anchor records itself. Inside `CDC_STATE_DIR` so a test that owns a
+#: sandbox owns the record too, and so a hard `os._exit` cannot outrun it.
+FIRED_FILENAME = "fault_fired.json"
+
+
+def fired_record_path() -> str | None:
+    state_dir = os.environ.get("CDC_STATE_DIR")
+    if not state_dir:
+        return None
+    return os.path.join(state_dir, FIRED_FILENAME)
+
+
+def record_fired(point: str, nth: int, action) -> None:
+    """Write the machine-readable "this anchor fired" record. Never raises.
+
+    Rubric 1.7's claim is that a fault produced a specific outcome, and an exit code
+    alone cannot carry that: `test_a_hung_commit_...` accepted 75, -9, 137 or 1, so it
+    passed if the run died of anything at all (Opus MAJOR-5), and the matrix accepted
+    any non-zero run without establishing that the selected fault had fired (Codex M2).
+    A test can now assert the exact anchor.
+    """
+    path = fired_record_path()
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            json.dump(
+                {"point": point, "nth": nth, "action": str(action), "pid": os.getpid()},
+                handle,
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:  # pragma: no cover - reporting must never mask the fault
+        log.debug("could not write the fired-fault record", exc_info=True)
+
+
+def read_fired_record(state_dir) -> dict | None:
+    """The anchor that fired in a run whose state directory is `state_dir`, or None."""
+    path = os.path.join(str(state_dir), FIRED_FILENAME)
+    try:
+        with open(path) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
 
 
 def maybe_crash(point: str, nth: int) -> None:
@@ -354,6 +471,10 @@ def maybe_crash(point: str, nth: int) -> None:
     if ALIASES.get(point, point) != want_point or nth != want_nth:
         return
     log.error("FAULT INJECTION: firing at %s (data batch %s) action=%s", point, nth, action)
+    # BEFORE the exit, and fsynced: `os._exit` runs no atexit hook, so this is the only
+    # evidence a hard-killed run leaves behind that the anchor it was armed at is the
+    # one that fired.
+    record_fired(point, nth, action)
     sys.stdout.flush()
     sys.stderr.flush()
     if action == RAISE:

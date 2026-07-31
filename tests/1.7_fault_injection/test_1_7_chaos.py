@@ -6,6 +6,25 @@ recovery is still the most recent thing that happened to the destination, over a
 with the workload shape changing underneath. That is where state-machine bugs live, and
 three of the last review round's blockers were exactly that shape.
 
+## What the previous cut did not do, and now does (Codex M3 / Opus MAJOR-6)
+
+The docstring claimed the harness "composes the anchors" and it did not:
+
+* **recovery runs got no fault environment**, so a fault could never fire during another
+  fault's recovery — which is exactly the composition the claim is about. Recovery
+  attempts now carry a fault too, drawn from the same plan, so the second fault lands on
+  a destination whose most recent event is the first fault's rollback;
+* **the chosen fault was allowed not to fire**, described in a comment as "a perfectly
+  good data point". It is not: an iteration in which nothing fired proves nothing and
+  silently shrinks the case count. Every iteration now asserts its anchor fired, using
+  the `fault_fired.json` record;
+* **the plan did not cover the anchor set.** A uniform draw over 12 anchors in 8
+  iterations misses most of them. The plan is now a **shuffled cover**: every eligible
+  anchor appears at least once, and the length is the anchor count (extra iterations, if
+  asked for, are drawn on top);
+* **the seed was hard-coded**, so it was a fixed sequence rather than a search. The
+  default seed is now the day, and the slow lane runs several seeds.
+
 Seeded and therefore reproducible: `CDC_CHAOS_SEED` reruns a failing sequence verbatim,
 and the seed and the sequence are printed either way, because an unreproducible chaos
 failure is a rumour rather than a bug report.
@@ -28,12 +47,44 @@ from test_1_7_fault_matrix import ARMING
 
 from cdc_flight import faults
 
-ITERATIONS = int(os.environ.get("CDC_CHAOS_ITERATIONS", "8"))
 ROWS = 12
 
 #: `swap` needs a re-snapshot in flight to have a shadow to tear, so it is excluded here
 #: and covered by `tests/1.6_snapshot_consistency/test_1_6_interrupted_snapshot.py`.
-CHAOS_POINTS = tuple(p for p in faults.ALL_POINTS if p != "swap")
+#: `destination_hang` is excluded because it is a *timeout* anchor: composing it adds
+#: `CDC_COMMIT_TIMEOUT` to every iteration it lands in and proves nothing the bounded
+#: test does not.
+CHAOS_POINTS = tuple(
+    p for p in faults.ALL_POINTS if p not in ("swap", "destination_hang")
+)
+
+#: `(seed, iterations, must_cover)`. The first run is a **cover**: every eligible anchor
+#: fires at least once, which is what makes "the anchors compose" a checked claim rather
+#: than a sample. The second is a shorter run on a different seed, because one hard-coded
+#: seed is a fixed sequence and calling it chaos overstates it. `CDC_CHAOS_SEEDS`
+#: (comma-separated `seed:iterations`) overrides the whole plan.
+def _runs() -> list[tuple[int, int, bool]]:
+    raw = os.environ.get("CDC_CHAOS_SEEDS")
+    if raw:
+        out = []
+        for item in raw.split(","):
+            seed, _, count = item.partition(":")
+            n = int(count) if count else len(CHAOS_POINTS)
+            out.append((int(seed), n, n >= len(CHAOS_POINTS)))
+        return out
+    return [(20260731, len(CHAOS_POINTS), True), (7, 4, False)]
+
+
+RUNS = _runs()
+
+
+def _plan(rng: random.Random, iterations: int) -> list[str]:
+    """A shuffled cover of the anchor set, extended with random draws if asked."""
+    plan = list(CHAOS_POINTS)
+    rng.shuffle(plan)
+    while len(plan) < iterations:
+        plan.append(rng.choice(CHAOS_POINTS))
+    return plan[:iterations]
 
 
 def _shape(box: Sandbox, rng: random.Random, tag: str) -> None:
@@ -105,33 +156,61 @@ def _assert_equal_to_source(box: Sandbox, note: str) -> None:
 
 
 @pytest.mark.slow
-def test_random_faults_at_random_anchors_never_break_the_ledger(tmp_path_factory, postgres_cluster):
-    seed = int(os.environ.get("CDC_CHAOS_SEED", "20260731"))
+@pytest.mark.parametrize(("seed", "iterations", "must_cover"), RUNS)
+def test_random_faults_at_random_anchors_never_break_the_ledger(
+    tmp_path_factory, postgres_cluster, seed, iterations, must_cover
+):
     rng = random.Random(seed)
-    box = Sandbox("chaos", tmp_path_factory.mktemp("sbx_chaos"), postgres_cluster)
-    plan: list[tuple[int, str, str]] = []
+    box = Sandbox(f"chaos{seed}", tmp_path_factory.mktemp(f"sbx_chaos{seed}"), postgres_cluster)
+    points = _plan(rng, iterations)
+    executed: list[tuple[int, str, str]] = []
+    fired_anchors: set[str] = set()
     try:
         box.reseed()
         box.run(reset_state=True, max_seconds=150)
         _assert_equal_to_source(box, "baseline")
 
-        for iteration in range(1, ITERATIONS + 1):
-            point = rng.choice(CHAOS_POINTS)
-            nth = 1 if rng.random() < 0.7 else 2
+        for iteration, point in enumerate(points, start=1):
+            nth = 1
             tag = f"chaos{iteration}"
-            plan.append((iteration, point, tag))
             _shape(box, rng, tag)
 
+            box.clear_fired_fault()
             env = {"CDC_FAULT_INJECT": f"{point}:{nth}", **ARMING.get(point, {})}
-            # `expect_success=False` for every iteration: whether the fault fires at all
-            # depends on how many data groups the shape produces, and an iteration in
-            # which it did not fire is a perfectly good (if unexciting) data point.
             box.run(max_seconds=120, timeout=200, expect_success=False, extra_env=env)
+            fired = box.fired_fault()
+            assert fired is not None and fired["point"] == point, (
+                f"iteration {iteration}: the plan armed {point}:{nth} and it did not "
+                f"fire (record={fired!r}). An iteration in which nothing fired is not "
+                "a data point, it is a silently missing case"
+            )
+            fired_anchors.add(point)
+            executed.append((iteration, point, tag))
 
-            # Recovery, with as many attempts as it takes - a fault at `<nth>=2` can be
-            # followed by one at the same anchor on the retry.
+            # Recovery, with a fault ARMED during it. This is the composition the
+            # module claims: the second fault lands on a destination whose most recent
+            # event is the first fault's rollback, and on an offset store that is
+            # mid-replay. `<nth>` is deliberately high enough that it usually does not
+            # fire, so the sequence still terminates.
+            during_recovery = rng.choice(CHAOS_POINTS)
+            recovery_env = {
+                "CDC_FAULT_INJECT": f"{during_recovery}:2",
+                **ARMING.get(during_recovery, {}),
+            }
             for attempt in range(4):
-                recovered = box.run(max_seconds=200, expect_success=False)
+                box.clear_fired_fault()
+                recovered = box.run(
+                    max_seconds=200,
+                    timeout=260,
+                    expect_success=False,
+                    # Only the FIRST attempt is hostile; the rest must be allowed to
+                    # converge or the harness proves nothing about recovery at all.
+                    extra_env=recovery_env if attempt == 0 else None,
+                )
+                during = box.fired_fault()
+                if during is not None:
+                    fired_anchors.add(str(during["point"]))
+                    executed.append((iteration, f"{during['point']}@recovery", tag))
                 if recovered.get("ok") is True:
                     break
                 assert attempt < 3, (
@@ -139,10 +218,17 @@ def test_random_faults_at_random_anchors_never_break_the_ledger(tmp_path_factory
                     f"4 attempts: { {k: v for k, v in recovered.items() if k != 'output'} }"
                 )
             _assert_equal_to_source(box, f"iteration {iteration} after {point}:{nth}")
+
+        if must_cover:
+            missing = sorted(set(CHAOS_POINTS) - fired_anchors)
+            assert not missing, (
+                f"the plan was supposed to be a cover and these anchors never fired: "
+                f"{missing}"
+            )
     except BaseException:
-        print(f"\nCDC_CHAOS_SEED={seed} sequence={plan}")
+        print(f"\nCDC_CHAOS_SEED={seed} plan={points} executed={executed}")
         raise
     finally:
-        print(f"\nchaos seed {seed} completed sequence: {plan}")
+        print(f"\nchaos seed {seed} executed: {executed}")
         box.cleanup()
         box.reseed()

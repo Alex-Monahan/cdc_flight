@@ -7,8 +7,17 @@ from __future__ import annotations
 
 import pytest
 
-# The Debezium message emitted when the publication the connector needs is gone.
-PUBLICATION_GONE = "publication"
+#: The Debezium message emitted when the publication the connector needs is gone, as a
+#: DISTINCTIVE phrase rather than a bare common noun.
+#:
+#: It was briefly just `"publication"`, matched case-insensitively against the whole
+#: output — which the word "publication" appears in for many reasons, including our own
+#: log lines naming the publication (Opus MINOR-6 / Q3). A sentinel a healthy run could
+#: also satisfy is not a witness. These are the connector's own texts when
+#: `publication.autocreate.mode=disabled` and the publication is missing; the fixture
+#: asserts the connector failed for THIS reason and not for some other start-up problem.
+PUBLICATION_GONE = "publication autocreation is disabled"
+PUBLICATION_MISSING = 'publication "cdc_flight_pub" does not exist'
 
 
 @pytest.fixture(scope="module")
@@ -80,9 +89,15 @@ def test_engine_death_surfaces_as_a_failure(engine_death_scenario):
 def test_failure_carries_the_debezium_error_message(engine_death_scenario):
     """An operator (and rubric 6.2 alerting) needs the *reason*, not just a code."""
     broken = engine_death_scenario["broken"]
-    assert PUBLICATION_GONE in broken["output"].lower(), broken["output"][-2000:]
+    output = broken["output"].lower()
+    assert PUBLICATION_GONE in output or PUBLICATION_MISSING in output, (
+        "the run must carry Debezium's own distinctive message about the missing "
+        f"publication, not merely the word 'publication': {broken['output'][-2000:]}"
+    )
+    assert broken["returncode"] != 0, broken["returncode"]
     assert broken.get("stop_reason") == "engine_error", broken
-    assert PUBLICATION_GONE in (broken.get("error") or "").lower(), broken
+    error = (broken.get("error") or "").lower()
+    assert PUBLICATION_GONE in error or PUBLICATION_MISSING in error, broken
 
 
 def test_failed_run_does_not_claim_records(engine_death_scenario):

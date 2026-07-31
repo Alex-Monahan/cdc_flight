@@ -71,14 +71,40 @@ def test_a_missing_slot_triggers_a_resnapshot():
 
 
 def test_a_recreated_slot_is_caught_by_the_previous_observation():
-    """Same name, ordinary position, but `restart_lsn` went backwards."""
+    """Same name, ordinary position, but BOTH positions went backwards."""
     verdict = check_slot(
         durable_lsn=1_000,
         observation=obs(restart_lsn=500, confirmed_flush_lsn=500),
-        previous={"restart_lsn": 900, "system_identifier": "7000000000000000001"},
+        previous={
+            "restart_lsn": 900,
+            "confirmed_flush_lsn": 950,
+            "system_identifier": "7000000000000000001",
+        },
     )
     assert verdict.decision == "slot_recreated"
     assert verdict.resnapshot is True
+
+
+def test_a_checkpoint_artefact_is_not_a_recreated_slot():
+    """Opus MINOR-4: `restart_lsn` alone has a false-positive mode.
+
+    A logical slot's `restart_lsn` is only persisted at checkpoint, so after an unclean
+    Postgres restart the recovered value can be behind the one we recorded — on a slot
+    that is perfectly healthy. Firing there rebuilds every captured table, which
+    replaces a keyless changelog with an image: a worse outcome than the case being
+    detected. A genuinely recreated slot cannot have confirmed a position we never saw
+    it reach, so the confirmed position is the discriminator.
+    """
+    verdict = check_slot(
+        durable_lsn=1_000,
+        observation=obs(restart_lsn=500, confirmed_flush_lsn=1_000),
+        previous={
+            "restart_lsn": 900,
+            "confirmed_flush_lsn": 900,
+            "system_identifier": "7000000000000000001",
+        },
+    )
+    assert verdict.decision == "ok", verdict.message
 
 
 def test_a_recreated_slot_is_invisible_without_a_previous_observation():
@@ -131,11 +157,99 @@ def test_the_cause_is_reported_not_the_symptom():
     assert verdict.decision == "source_identity_changed"
 
 
-def test_no_durable_row_with_a_positioned_slot_triggers_a_resnapshot():
-    """This cell used to REFUSE unless `snapshot.mode` happened to read data."""
-    verdict = check_slot(durable_lsn=None, observation=obs(), previous=None)
+def test_no_durable_row_with_a_positioned_slot_and_an_EMPTY_destination_rebuilds():
+    """Rebuilding an empty destination destroys nothing, so it is automatic."""
+    verdict = check_slot(
+        durable_lsn=None, observation=obs(), previous=None, destination_rows={}
+    )
     assert verdict.decision == "no_durable_destination_row"
     assert verdict.resnapshot is True
+    assert verdict.refuse is False
+
+
+def test_no_durable_row_with_a_POPULATED_destination_refuses(caplog):
+    """Opus BLOCKER-2, reproduced: this cell rebuilt a healthy warehouse.
+
+    Both ADR §19/A50 and RUBRIC_STATUS describe the cell as "destination **empty**,
+    slot positioned". The code tested only that `_cdc_flight.debezium_offsets` had no
+    row and never looked at the destination, so a state directory pointed at an
+    existing warehouse - `--reset-state`, a restore without `_cdc_flight`, a wrong DSN -
+    silently dropped and rebuilt every captured table. The `offsets.dat` refusal that
+    was supposed to be the guard is a fact about a FILE, not about the destination.
+
+    This is a safety REGRESSION against `main`, where the same cell raised.
+    """
+    verdict = check_slot(
+        durable_lsn=None,
+        observation=obs(),
+        previous=None,
+        destination_rows={"app.customers": 5, "app.orders": 12},
+    )
+    assert verdict.decision == "no_durable_destination_row"
+    assert verdict.refuse is True, "a populated destination must not be auto-rebuilt"
+    assert verdict.resnapshot is False
+    assert verdict.ok is False
+    assert "app.customers (5 rows)" in verdict.message
+
+
+def test_a_destination_that_was_not_inspected_is_treated_as_populated():
+    """`None` is "I did not look", which is never a licence to destroy."""
+    verdict = check_slot(
+        durable_lsn=None, observation=obs(), previous=None, destination_rows=None
+    )
+    assert verdict.refuse is True
+    assert verdict.resnapshot is False
+
+
+def test_a_forked_timeline_is_detected(caplog):
+    """Codex B5, reproduced: the same system id + a new timeline returned `ok`.
+
+    `timeline_id` was persisted in `slot_state` from the first cut and never read.
+    Postgres REUSES WAL positions across a fork, so every scalar comparison in the
+    table - current position, restart position, confirmed position - can look perfectly
+    healthy while the destination's offset names a point on a history that no longer
+    exists.
+    """
+    verdict = check_slot(
+        durable_lsn=1_000,
+        observation=obs(timeline_id=2),
+        previous={"system_identifier": "7000000000000000001", "timeline_id": 1,
+                  "restart_lsn": 900},
+    )
+    assert verdict.decision == "source_timeline_changed"
+    assert verdict.resnapshot is True
+    assert verdict.ok is False
+    assert "1" in verdict.message and "2" in verdict.message
+
+
+def test_an_unchanged_timeline_is_not_a_fork():
+    verdict = check_slot(
+        durable_lsn=1_000,
+        observation=obs(timeline_id=1),
+        previous={"system_identifier": "7000000000000000001", "timeline_id": 1,
+                  "restart_lsn": 900},
+    )
+    assert verdict.decision == "ok"
+
+
+def test_a_changed_identity_outranks_a_changed_timeline():
+    """A restore changes both; "this is a different cluster" is the useful sentence."""
+    verdict = check_slot(
+        durable_lsn=1_000,
+        observation=obs(system_identifier="7999999999999999999", timeline_id=3),
+        previous={"system_identifier": "7000000000000000001", "timeline_id": 1,
+                  "restart_lsn": 900},
+    )
+    assert verdict.decision == "source_identity_changed"
+
+
+def test_a_forked_timeline_invalidates_the_recorded_catalog():
+    """Codex M1: a fork can keep the system id and change every relation oid."""
+    from cdc_flight.reconcile import FORGET_CATALOG_DECISIONS
+
+    assert "source_timeline_changed" in FORGET_CATALOG_DECISIONS
+    assert "source_lsn_regressed" in FORGET_CATALOG_DECISIONS
+    assert "source_identity_changed" in FORGET_CATALOG_DECISIONS
 
 
 def test_nothing_anywhere_is_a_fresh_start():
@@ -173,15 +287,27 @@ def test_every_resnapshot_decision_is_reachable(decision):
             None,
         ),
         "slot_recreated": (
-            1_000, obs(restart_lsn=500, confirmed_flush_lsn=500), {"restart_lsn": 900}
+            1_000,
+            obs(restart_lsn=500, confirmed_flush_lsn=500),
+            {"restart_lsn": 900, "confirmed_flush_lsn": 950},
         ),
         "source_identity_changed": (
             1_000, obs(system_identifier="9"), {"system_identifier": "1"}
         ),
         "source_lsn_regressed": (9_000, obs(current_wal_lsn=4_000), None),
+        "source_timeline_changed": (
+            1_000, obs(timeline_id=7), {"timeline_id": 1}
+        ),
         "no_durable_destination_row": (None, obs(), None),
     }
     durable, observation, previous = cases[decision]
-    verdict = check_slot(durable_lsn=durable, observation=observation, previous=previous)
+    verdict = check_slot(
+        durable_lsn=durable,
+        observation=observation,
+        previous=previous,
+        # Every one of these decisions is safe to automate; the destination-emptiness
+        # input only gates `no_durable_destination_row`.
+        destination_rows={},
+    )
     assert verdict.decision == decision
     assert verdict.resnapshot is True

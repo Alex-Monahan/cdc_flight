@@ -169,11 +169,25 @@ def test_the_boundary_is_a_queryable_lsn(boundary):
         [consistent],
     )[0][0]
     # Streamed events may carry an event LSN below the consistent point ONLY if their
-    # transaction committed at or after it (the straddling case). What must be true is
-    # that nothing streamed is a *re-delivery* of something in the image, which
-    # `test_no_row_is_on_both_sides_of_the_boundary` covers; this records the count so a
-    # change in that number is noticed rather than silent.
-    assert below >= 0
+    # transaction committed at or after it - the straddling case, and the single thing
+    # this whole fixture exists to exercise.
+    #
+    # `assert below >= 0` used to stand here, which a count always satisfies (Opus
+    # MINOR-1). The real claim is stronger and checkable: every such event's own
+    # transaction must appear on the STREAM side of the fence, i.e. its commit LSN is at
+    # or above the consistent point. If that is ever false the event is a re-delivery of
+    # something already in the image, which is the duplication 1.2 is scored on.
+    straddling = box.duck_query(
+        f"SELECT count(*) FROM {box.table('cdcflight_app_customers')} c "
+        f"JOIN _cdc_flight.commit_log l ON l.commit_id = c.cdcf_commit_id "
+        "WHERE c.dbz_op <> 'r' AND c.dbz_lsn < ? AND l.last_lsn < ?",
+        [consistent, consistent],
+    )[0][0]
+    assert straddling == 0, (
+        f"{straddling} streamed event(s) carry an LSN below the consistent point AND "
+        "belong to a group that committed below it, so they are a re-delivery of rows "
+        f"the image already holds ({below} events are below C in total)"
+    )
     assert boundary["summary"]["snapshot_consistent_lsn"] == consistent, boundary["summary"]
 
 

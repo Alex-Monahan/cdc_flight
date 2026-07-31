@@ -62,6 +62,20 @@ def _dest_count(box: Sandbox, tag: str) -> int:
     )
 
 
+def _assert_the_named_anchor_fired(box: Sandbox, point: str) -> None:
+    """The run must say WHICH anchor fired, and it must be the one that was armed.
+
+    Without this, every assertion in this file is conditional on an unproven premise:
+    a run that fails to start for an unrelated reason also exits non-zero (Codex M2).
+    """
+    fired = box.fired_fault()
+    assert fired is not None, (
+        f"no fault-fired record was written, so nothing establishes that {point!r} is "
+        "what ended this run"
+    )
+    assert fired["point"] == point, fired
+
+
 def _assert_exact_after_recovery(box: Sandbox, tag: str) -> None:
     """The recovery run must land every row of the tagged batch exactly once."""
     recovered = box.run(max_seconds=150)
@@ -86,6 +100,7 @@ def _assert_exact_after_recovery(box: Sandbox, tag: str) -> None:
 def test_a_destination_error_mid_transaction_loses_nothing(dest_fault_box, point):
     box = dest_fault_box
     tag = point.replace("_", "")
+    box.clear_fired_fault()
     _insert(box, tag)
     failed = box.run(
         max_seconds=120,
@@ -101,27 +116,44 @@ def test_a_destination_error_mid_transaction_loses_nothing(dest_fault_box, point
     # says nothing is not "accurate last_run.json" - and an exit that came from
     # something *other* than the injected fault would make this test vacuous.
     assert "injected" in (failed.get("error") or "").lower(), failed.get("error")
+    _assert_the_named_anchor_fired(box, point)
     _assert_exact_after_recovery(box, tag)
 
 
-@pytest.mark.slow
-def test_an_ambiguous_commit_recovers_exactly(dest_fault_box):
-    """`COMMIT` raises. The transaction may or may not be durable - both are safe.
+@pytest.mark.parametrize(
+    "point",
+    [
+        # The genuinely ambiguous one: `COMMIT` EXECUTES and then the client loses the
+        # answer, so the destination really did commit and we really cannot know it.
+        # It is in the DEFAULT suite because it is the only anchor that exercises
+        # recovery from a *durable* group the offset store never heard about, which is
+        # the state Invariant O exists for.
+        "destination_commit_late",
+        # The easy one, kept: `COMMIT` raises before running. Codex M2 is right that
+        # this is an ordinary uncommitted failure wearing an ambiguous name, and the
+        # recovery still has to be exact for it.
+        pytest.param("destination_commit", marks=pytest.mark.slow),
+    ],
+)
+def test_an_ambiguous_commit_recovers_exactly(dest_fault_box, point):
+    """`COMMIT` fails. The transaction may or may not be durable - both are safe.
 
     This is ADR 0001 §4.6 F5, and it is the case Invariant O exists for: nothing has
     entered Debezium's offset store, so the next run reads whichever resume point the
     destination actually holds and continues from exactly there.
     """
     box = dest_fault_box
-    tag = "ambiguouscommit"
+    tag = point.replace("_", "")
+    box.clear_fired_fault()
     _insert(box, tag)
     failed = box.run(
         max_seconds=120,
         expect_success=False,
-        extra_env={"CDC_FAULT_INJECT": "destination_commit:1"},
+        extra_env={"CDC_FAULT_INJECT": f"{point}:1"},
     )
     assert failed["returncode"] != 0, failed
     assert "injected" in (failed.get("error") or "").lower(), failed.get("error")
+    _assert_the_named_anchor_fired(box, point)
     landed = _dest_count(box, tag)
     assert landed in (0, CUSTOMERS), (
         f"an ambiguous commit left a PARTIAL batch of {landed} rows; the group is "
@@ -132,8 +164,22 @@ def test_an_ambiguous_commit_recovers_exactly(dest_fault_box):
 
 @pytest.mark.slow
 def test_a_hung_commit_is_bounded_and_never_reports_success(dest_fault_box):
+    """The commit watchdog, and ONLY the commit watchdog, must end this run.
+
+    The assertion used to be `returncode in (75, -9, 137, 1)`, which passes if the run
+    dies of anything at all: `-9` is the harness giving up, `137` is the fault
+    injector's default, `1` is any unrelated failure (Opus MAJOR-5). Only 75
+    (`EX_TEMPFAIL`) is the watchdog's own code and only the watchdog is the mechanism
+    this test exists for.
+
+    It also used to depend on a second undocumented accident: `hang_seconds` was
+    `<action>` reinterpreted as seconds, so a bare `destination_hang:1` hung for 137 s -
+    *shorter* than the shipped 300 s watchdog, which would have let the COMMIT succeed.
+    The duration now has its own variable and is set longer than the watchdog on purpose.
+    """
     box = dest_fault_box
     tag = "hungcommit"
+    box.clear_fired_fault()
     _insert(box, tag)
     failed = box.run(
         max_seconds=200,
@@ -143,12 +189,48 @@ def test_a_hung_commit_is_bounded_and_never_reports_success(dest_fault_box):
             "CDC_FAULT_INJECT": "destination_hang:1",
             # The watchdog, wound right down. Without it this run never ends.
             "CDC_COMMIT_TIMEOUT": "5",
+            # ... and the hang is much longer than the watchdog, so only the watchdog
+            # can be what ended the run.
+            "CDC_FAULT_HANG_SECONDS": "600",
         },
     )
-    assert failed["returncode"] != 0, failed
     # 75 = EX_TEMPFAIL, the watchdog's own exit code: a supervisor should retry.
-    assert failed["returncode"] in (75, -9, 137, 1), failed["returncode"]
+    assert failed["returncode"] == 75, (
+        f"expected the commit watchdog's EX_TEMPFAIL, got {failed['returncode']}; "
+        "any other code means something other than the watchdog bounded this run"
+    )
+    fired = box.fired_fault()
+    assert fired is not None and fired["point"] == "destination_hang", fired
+    assert fired["action"].startswith("hang:600"), fired
+    assert "commit" in (failed.get("error") or "").lower(), failed.get("error")
     _assert_exact_after_recovery(box, tag)
+
+
+def test_the_hang_duration_is_its_own_setting_not_the_exit_code(monkeypatch):
+    """Opus MAJOR-5's second half, as a unit test.
+
+    `wrap_destination` used to read `<action>` as a duration, so `destination_hang:1`
+    hung for **137** seconds - the default exit code - which is neither documented nor
+    what anybody writing that spec means.
+    """
+    from cdc_flight import faults
+
+    class Dummy:
+        def execute(self, sql, *a, **k):
+            return None
+
+    monkeypatch.setenv(faults.ENV_VAR, "destination_hang:1")
+    monkeypatch.delenv(faults.HANG_SECONDS_ENV, raising=False)
+    faults.refresh()
+    assert faults.wrap_destination(Dummy())._hang_seconds == faults.DEFAULT_HANG_SECONDS
+
+    monkeypatch.setenv(faults.HANG_SECONDS_ENV, "12.5")
+    assert faults.wrap_destination(Dummy())._hang_seconds == 12.5
+
+    monkeypatch.setenv(faults.ENV_VAR, "destination_hang:1:99")
+    faults.refresh()
+    wrapped = faults.wrap_destination(Dummy())
+    assert wrapped._hang_seconds == 12.5, "the exit code is not a duration"
 
 
 def test_the_commit_watchdog_is_off_by_default_for_nothing():

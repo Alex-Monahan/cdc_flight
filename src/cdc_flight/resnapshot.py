@@ -64,6 +64,45 @@ exported snapshot **iff** it committed before `C`. That makes the hand-over exac
 **CDC during the re-snapshot** therefore has one-line semantics: there is none, because
 the main stream is not running; and everything the main stream later delivers for the
 table is either fenced (before `C`) or applied on top (at or after `C`).
+
+## Completion, and the two things it is not (Codex B1 / Opus BLOCKER-1)
+
+"The re-snapshot completed" means **every requested table reached a terminal state**,
+and there are exactly two terminal states:
+
+* `swapped` — a shadow was built and atomically renamed over the live table. `C` is the
+  snapshot records' own `source.lsn`, which is `slotCreatedInfo.startLsn()`.
+* `verified_empty` — three independent facts agree: Debezium emitted its own
+  end-of-snapshot marker (so the engine reached the end of the *whole* capture set),
+  this table produced **zero** snapshot records, and a source count taken afterwards
+  says the relation holds no rows. Only then is the destination table emptied.
+
+Anything else leaves the table `awaiting_snapshot` and fails the run. The previous
+implementation inferred "empty" from "not swapped", which is a statement about *our*
+engine and not about the source: a table the engine stopped before reaching had its
+live destination rows deleted and an audit row written claiming the source was empty.
+
+### `C` for a verified-empty table is not `C` for a swapped one
+
+An empty table produces no snapshot records, so it has no `source.lsn` to read `C` out
+of. Polling the throwaway slot for one is a race: for an all-empty capture set the
+engine can finish the image, enter streaming and advance `confirmed_flush_lsn` before
+the first poll lands, and fencing at a value *ahead* of the image is silent loss
+(Codex B2).
+
+So a verified-empty table is fenced at `pg_current_wal_lsn()` **sampled before** the
+emptiness is verified, in that order and on that connection. The argument is exact:
+every transaction with commit LSN below that sample committed before the sample, so it
+is visible to the `REPEATABLE READ` snapshot the count is taken in; a count of zero
+therefore means no transaction below the sample left a row behind, and emptying the
+destination is correct for all of them. Every transaction at or above the sample is
+**not** fenced and is applied by the main stream on top. Neither direction can lose.
+
+The two readings of `C` for a *swapped* table (the snapshot records, and the throwaway
+slot's first observed `confirmed_flush_lsn`) are cross-checked and a disagreement is
+**fatal**: it falsifies the assumption that either reading identifies the exported
+snapshot, and the old `min()` resolution knowingly duplicated keyless rows, which
+trades a rubric-1.6 violation for a rubric-1.2 one.
 """
 
 from __future__ import annotations
@@ -101,6 +140,9 @@ class ResnapshotOutcome:
     consistent_lsn: int | None = None
     slot_consistent_lsn: int | None = None
     snapshot_record_lsn: int | None = None
+    empty_check_lsn: int | None = None
+    snapshot_phase_ended: bool = False
+    tables_scanned: list[str] = field(default_factory=list)
     events: int = 0
     reason: str = ""
     engine_stop_reason: str = ""
@@ -113,23 +155,84 @@ class ResnapshotOutcome:
             "resnapshot_consistent_lsn": self.consistent_lsn,
             "resnapshot_slot_consistent_lsn": self.slot_consistent_lsn,
             "resnapshot_snapshot_record_lsn": self.snapshot_record_lsn,
+            "resnapshot_empty_check_lsn": self.empty_check_lsn,
+            "resnapshot_snapshot_phase_ended": self.snapshot_phase_ended,
+            "resnapshot_tables_scanned": self.tables_scanned,
             "resnapshot_events": self.events,
             "resnapshot_reason": self.reason,
             "resnapshot_engine_stop_reason": self.engine_stop_reason,
         }
 
+    @property
+    def still_owed(self) -> list[str]:
+        """Requested tables that reached neither terminal state."""
+        return sorted(set(self.requested) - set(self.swapped) - set(self.emptied))
+
+
+@dataclass
+class EmptinessEvidence:
+    """The three independent facts a `verified_empty` classification needs.
+
+    Separated from the code that gathers them so the classification itself is a pure,
+    directly testable function of its evidence — the destructive path in this module
+    had zero test coverage precisely because it could only be reached through a live
+    Debezium engine (Opus BLOCKER-1, "test coverage of this path: zero").
+    """
+
+    #: Debezium emitted `snapshot='last'`, i.e. the engine reached the end of the
+    #: WHOLE requested capture set rather than stopping somewhere inside it.
+    snapshot_phase_ended: bool
+    #: `"<schema>.<table>"` for every table that produced at least one snapshot record.
+    tables_seen: set[str]
+    #: `"<schema>.<table>" -> current source row count`, read after the engine stopped.
+    source_empty_at: dict[str, int]
+    #: `pg_current_wal_lsn()` sampled BEFORE those counts were taken. The fence for a
+    #: verified-empty table; see the module docstring.
+    wal_lsn: int | None
+
+    def verdict(self, qualified: str) -> tuple[bool, str]:
+        """`(is_verified_empty, why not)` for one requested table."""
+        if not self.snapshot_phase_ended:
+            return False, (
+                "the snapshot engine never emitted its end-of-snapshot marker, so this "
+                "table may simply not have been reached"
+            )
+        if qualified in self.tables_seen:
+            return False, (
+                "the engine produced snapshot records for this table but no shadow was "
+                "swapped in, so the image is partial, not empty"
+            )
+        if self.wal_lsn is None:
+            return False, "no source WAL position was sampled for the emptiness check"
+        count = self.source_empty_at.get(qualified)
+        if count is None:
+            return False, "the source row count for this table could not be read"
+        if count != 0:
+            return False, f"the source relation holds {count} row(s)"
+        return True, ""
+
 
 class _SlotWatcher:
     """Records the FIRST `confirmed_flush_lsn` the throwaway slot ever shows.
 
-    That first value is the slot's consistent point: while the snapshot is running the
-    only offset the connector has is the snapshot's own LSN, so any flush confirms
-    exactly `C`. It is the fallback for a re-snapshot in which every requested table is
-    **empty** — no snapshot records means no `source.lsn` to read `C` out of, and a
-    guessed `C` in the wrong direction is silent loss.
+    That first value should be the slot's consistent point: while the snapshot is
+    running the only offset the connector has is the snapshot's own LSN, so any flush
+    confirms exactly `C`.
+
+    It is a **corroboration** and never a source of `C` on its own. It used to be the
+    fallback for an all-empty capture set, and that was a race with no upper bound:
+    with no rows to scan, the engine can finish the image, enter streaming and advance
+    `confirmed_flush_lsn` before the first poll lands (Codex B2). An empty table is now
+    fenced at a WAL position we sample ourselves, immediately before verifying the
+    emptiness, which cannot be ahead of the image.
     """
 
-    def __init__(self, dsn: str, slot_name: str, interval: float = 0.1):
+    #: Tight, because the value is only trustworthy for as long as the slot has not
+    #: advanced, and the slot may exist for only a few milliseconds before the first
+    #: snapshot record is emitted.
+    INTERVAL = 0.02
+
+    def __init__(self, dsn: str, slot_name: str, interval: float = INTERVAL):
         self.dsn = dsn
         self.slot_name = slot_name
         self.interval = interval
@@ -159,12 +262,39 @@ class _SlotWatcher:
                         "re-snapshot slot %s reached its consistent point at %s",
                         self.slot_name, self.first_confirmed,
                     )
+                    return
             self._stop.wait(self.interval)
 
 
 def slot_name_for(base: str) -> str:
     """A throwaway slot name derived from the pipeline's own, within 63 characters."""
     return f"{base[: 63 - len(SLOT_SUFFIX)]}{SLOT_SUFFIX}"
+
+
+def sweep_stale_slot(dsn: str, base_slot_name: str) -> str:
+    """Drop OUR throwaway slot if a previous run left one behind (Opus MAJOR-2).
+
+    A leaked `_rs` slot holds WAL on the source for ever and counts against
+    `max_replication_slots`; two independent review sessions leaked one on the shared
+    development cluster in a single day. Called unconditionally at start-up, so the
+    slot is reclaimed on the next run of the pipeline that created it whether or not
+    another re-snapshot is due.
+
+    Only ever the name this pipeline derives from its own slot: sweeping by suffix
+    would delete another pipeline's in-flight re-snapshot slot.
+    """
+    slot = slot_name_for(base_slot_name)
+    try:
+        action = reconcile_mod.drop_slot(dsn, slot)
+    except Exception as exc:  # pragma: no cover - the slot may be held right now
+        log.warning("could not sweep the stale re-snapshot slot %r: %s", slot, exc)
+        return f"sweep_failed: {exc}"
+    if action == "dropped":
+        log.warning(
+            "dropped a leaked re-snapshot slot %r left by an earlier run; it had been "
+            "holding WAL on the source", slot,
+        )
+    return action
 
 
 def run(
@@ -263,35 +393,87 @@ def run(
     health = SourceHealth(
         dsn=source.dsn, slot_name=slot, max_lag_bytes=run_cfg.idle_max_lag_bytes
     ).start()
+    # try/finally around the WHOLE engine section, including everything that follows
+    # it: every failure route out of here used to leak the throwaway slot, which then
+    # held WAL on the source until somebody noticed `max_replication_slots` was
+    # exhausted (Opus MAJOR-2, observed twice on the shared cluster in one day).
     try:
-        summary = run_engine_bounded(
-            engine,
-            applier,
-            dataclasses.replace(
-                run_cfg,
-                # The snapshot is over the moment every table has swapped, so the idle
-                # window is only a fallback for a capture set that turns out to be
-                # entirely empty.
-                idle_seconds=min(run_cfg.idle_seconds, 6.0),
-                min_records=0,
-            ),
-            health,
-            stop_when=lambda: applier.snapshot_completed,
-        )
-        outcome.engine_stop_reason = str(summary.get("stop_reason"))
-        outcome.events = int(summary.get("applied_events") or 0)
-    finally:
-        health.stop()
-        watcher.stop()
-        applier.shutdown()
-        applier.alerts.close()
+        try:
+            summary = run_engine_bounded(
+                engine,
+                applier,
+                dataclasses.replace(
+                    run_cfg,
+                    # The snapshot is over the moment Debezium says it is, so the idle
+                    # window is only a fallback for a capture set that turns out to be
+                    # entirely empty (which emits no records and therefore no marker).
+                    idle_seconds=min(run_cfg.idle_seconds, 6.0),
+                    min_records=0,
+                ),
+                health,
+                stop_when=lambda: applier.snapshot_completed,
+            )
+            outcome.engine_stop_reason = str(summary.get("stop_reason"))
+            outcome.events = int(summary.get("applied_events") or 0)
+        finally:
+            health.stop()
+            watcher.stop()
+            outcome.snapshot_phase_ended = applier.snapshot_final_seen
+            outcome.tables_scanned = sorted(applier.snapshot_tables_seen)
+            applier.shutdown()
+            applier.alerts.close()
 
-    outcome.slot_consistent_lsn = watcher.first_confirmed
-    outcome.snapshot_record_lsn = applier.last_snapshot_lsn
-    outcome.consistent_lsn = _agree(
-        applier.last_snapshot_lsn, watcher.first_confirmed
-    )
-    if outcome.consistent_lsn is None:
+        outcome.slot_consistent_lsn = watcher.first_confirmed
+        outcome.snapshot_record_lsn = applier.last_snapshot_lsn
+        outcome.consistent_lsn = agree_on_consistent_point(
+            applier.last_snapshot_lsn, watcher.first_confirmed
+        )
+
+        if outcome.consistent_lsn is not None:
+            outcome.swapped = _completed_tables(
+                con, pipeline, tables, outcome.consistent_lsn, reason=reason
+            )
+        pending = [t for t in tables if f"{t[0]}.{t[1]}" not in set(outcome.swapped)]
+        evidence = _gather_emptiness_evidence(
+            source.dsn,
+            pending=pending,
+            snapshot_phase_ended=applier.snapshot_final_seen,
+            tables_seen=set(applier.snapshot_tables_seen),
+        )
+        outcome.empty_check_lsn = evidence.wal_lsn
+        outcome.emptied = finish_verified_empty_tables(
+            con,
+            pipeline=pipeline,
+            dataset=dataset,
+            tables=tables,
+            done=set(outcome.swapped),
+            evidence=evidence,
+        )
+    except BaseException:
+        # Anything that escapes leaves the requested tables in whatever state the
+        # engine got them to. `SnapshotCoordinator` writes `in_progress` the moment a
+        # table's first record arrives, and `in_progress` is NOT in the
+        # `tables_awaiting_snapshot` queue - so a partial re-snapshot that simply
+        # raised would drop the table off the durable to-do list and the next run
+        # would stream CDC onto a half-built image. Re-assert the to-do list first.
+        reassert_owed(con, pipeline=pipeline, tables=tables, terminal=outcome)
+        raise
+    finally:
+        # Named by us, created by Debezium, ours to reclaim on EVERY exit.
+        try:
+            reconcile_mod.drop_slot(source.dsn, slot)
+        except Exception:  # pragma: no cover - the source may be unreachable
+            log.error(
+                "could not drop the throwaway re-snapshot slot %r; it is holding WAL "
+                "on the source and the next run of this pipeline will sweep it",
+                slot, exc_info=True,
+            )
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+    if outcome.consistent_lsn is None and sorted(outcome.requested) != sorted(
+        outcome.emptied
+    ):
+        reassert_owed(con, pipeline=pipeline, tables=tables, terminal=outcome)
         raise EngineFailure(
             "the re-snapshot produced no consistent point: neither a snapshot record "
             f"nor the throwaway slot {slot!r} yielded an LSN, so the hand-over between "
@@ -300,29 +482,9 @@ def run(
             outcome.as_dict(),
         )
 
-    outcome.swapped = _completed_tables(
-        con, pipeline, tables, outcome.consistent_lsn, reason=reason
-    )
-    outcome.emptied = _finish_empty_tables(
-        con,
-        pipeline=pipeline,
-        dataset=dataset,
-        tables=tables,
-        done=set(outcome.swapped),
-        consistent_lsn=outcome.consistent_lsn,
-    )
-    still_owed = sorted(
-        set(outcome.requested) - set(outcome.swapped) - set(outcome.emptied)
-    )
-    reconcile_mod.drop_slot(source.dsn, slot)
-    shutil.rmtree(state_dir, ignore_errors=True)
-    if still_owed:
-        raise EngineFailure(
-            f"the re-snapshot did not complete for {', '.join(still_owed)}: those "
-            "tables are still marked `awaiting_snapshot` and the destination is "
-            "knowingly incomplete for them (rubric 1.6)",
-            outcome.as_dict(),
-        )
+    if outcome.still_owed:
+        reassert_owed(con, pipeline=pipeline, tables=tables, terminal=outcome)
+    assert_every_requested_table_completed(outcome)
     log.warning(
         "RE-SNAPSHOT complete at consistent point %s: swapped %s, emptied %s",
         outcome.consistent_lsn, outcome.swapped or "-", outcome.emptied or "-",
@@ -330,28 +492,123 @@ def run(
     return outcome
 
 
-def _agree(record_lsn: int | None, slot_lsn: int | None) -> int | None:
-    """Reconcile the two independent readings of `C`.
+def reassert_owed(
+    con,
+    *,
+    pipeline: str,
+    tables: list[tuple[str, str, str]],
+    terminal: ResnapshotOutcome,
+) -> list[str]:
+    """Put every non-terminal requested table back on the durable to-do list.
 
-    They are the same number by construction, and they are read two completely
-    different ways, so a disagreement means one of the assumptions in this module's
-    docstring is wrong. The **minimum** is taken in that case: fencing at too low an
-    LSN re-applies transactions that are already in the image, which for a keyed table
-    converges and for a keyless one duplicates; fencing at too high an LSN drops
-    transactions that are in neither, which is silent loss. Given a choice, take the
-    one that cannot lose data, and say so loudly.
+    The two terminal states are `swapped` (a complete image with a published
+    watermark) and `emptied` (verified empty at the source). Everything else has to be
+    `awaiting_snapshot` when this function returns, whatever intermediate state the
+    engine left it in, or the next run cannot know it is owed.
     """
-    if record_lsn is not None and slot_lsn is not None:
-        if record_lsn != slot_lsn:
-            log.error(
-                "the re-snapshot's two readings of the consistent point DISAGREE: "
-                "snapshot records say %s, the slot said %s. Using the lower value, "
-                "which can only ever re-apply, never skip. This should not happen: see "
-                "cdc_flight.resnapshot's docstring.",
-                record_lsn, slot_lsn,
-            )
-        return min(record_lsn, slot_lsn)
+    finished = set(terminal.swapped) | set(terminal.emptied)
+    owed = [t for t in tables if f"{t[0]}.{t[1]}" not in finished]
+    if not owed:
+        return []
+    dest_mod.request_snapshot(
+        con,
+        pipeline=pipeline,
+        tables=owed,
+        detail="the re-snapshot did not complete for these tables (rubric 1.6)",
+    )
+    return [f"{s}.{t}" for s, t, _ in owed]
+
+
+def assert_every_requested_table_completed(outcome: ResnapshotOutcome) -> None:
+    """Completion means every REQUESTED table reached a terminal state, or nothing.
+
+    This guard used to be unreachable: the function that produced `emptied` appended
+    every not-yet-swapped table to it unconditionally, so `still_owed` was provably
+    `[]` for every possible input and the `EngineFailure` below was dead code (Opus
+    BLOCKER-1). Now that a table can end a re-snapshot neither swapped nor
+    verified-empty, it has a live branch — and the run has to fail, because the
+    alternative is streaming CDC onto a destination table we know is incomplete.
+    """
+    owed = outcome.still_owed
+    if not owed:
+        return
+    raise EngineFailure(
+        f"the re-snapshot did not complete for {', '.join(owed)}: those tables are "
+        "still marked `awaiting_snapshot` and the destination is knowingly incomplete "
+        "for them (rubric 1.6). Nothing about them was changed, so the next run "
+        "finishes the job.",
+        outcome.as_dict(),
+    )
+
+
+def agree_on_consistent_point(record_lsn: int | None, slot_lsn: int | None) -> int | None:
+    """Cross-check the two independent readings of `C`. A disagreement is FATAL.
+
+    They are the same number by construction and they are read two completely
+    different ways, so a disagreement means one of the assumptions in this module's
+    docstring is wrong — and once that is true, *neither* reading can be shown to
+    identify the exported snapshot, so neither is a boundary anything may rest on.
+
+    This used to take the `min()`, on the argument that fencing too low can only
+    re-apply. That argument is true and insufficient: re-applying **duplicates** on a
+    keyless table, which is a violation of rubric 1.2's exactly-once claim, so `min`
+    does not avoid a correctness violation, it chooses a different one. Both reviewers
+    independently reached "hard-fail" (Codex B2, Opus Q1). The cost is one extra run:
+    the tables stay `awaiting_snapshot` and the next attempt takes a fresh `C`.
+    """
+    if record_lsn is not None and slot_lsn is not None and record_lsn != slot_lsn:
+        raise EngineFailure(
+            "the re-snapshot's two readings of the consistent point DISAGREE: the "
+            f"snapshot records say {record_lsn}, the throwaway slot said {slot_lsn}. "
+            "One of them does not identify the exported snapshot, so neither can fence "
+            "the hand-over between the image and the stream. Refusing to publish a "
+            "watermark; the tables stay marked for a re-snapshot and the next run takes "
+            "a fresh consistent point (rubric 1.6, ADR 0001 §19/A52).",
+            {"snapshot_record_lsn": record_lsn, "slot_consistent_lsn": slot_lsn},
+        )
     return record_lsn if record_lsn is not None else slot_lsn
+
+
+def _gather_emptiness_evidence(
+    dsn: str,
+    *,
+    pending: list[tuple[str, str, str]],
+    snapshot_phase_ended: bool,
+    tables_seen: set[str],
+) -> EmptinessEvidence:
+    """Sample the WAL position, then count the pending relations. In that order.
+
+    The order is the whole argument (see the module docstring): `pg_current_wal_lsn()`
+    is read on its own statement **before** the `REPEATABLE READ` snapshot the counts
+    are taken in, so every transaction whose commit LSN is below the sample is visible
+    to those counts. A count of zero then proves that no transaction below the sample
+    left a row behind, which is exactly what fencing at the sample asserts.
+    """
+    if not pending:
+        return EmptinessEvidence(snapshot_phase_ended, tables_seen, {}, None)
+    counts: dict[str, int] = {}
+    wal_lsn: int | None = None
+    try:
+        import psycopg
+
+        with psycopg.connect(dsn, autocommit=True, connect_timeout=10) as conn:
+            row = conn.execute("SELECT (pg_current_wal_lsn() - '0/0')::bigint").fetchone()
+            wal_lsn = int(row[0]) if row and row[0] is not None else None
+        with psycopg.connect(dsn, connect_timeout=10) as conn:
+            conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            for schema, table, _target in pending:
+                found = conn.execute(
+                    f"SELECT count(*) FROM {quote(schema)}.{quote(table)}"
+                ).fetchone()
+                counts[f"{schema}.{table}"] = int(found[0]) if found else -1
+            conn.commit()
+    except Exception as exc:  # pragma: no cover - the source may be unreachable
+        log.error(
+            "could not verify at the source whether %s is empty: %s",
+            ", ".join(f"{s}.{t}" for s, t, _ in pending), exc,
+        )
+        return EmptinessEvidence(snapshot_phase_ended, tables_seen, counts, None)
+    return EmptinessEvidence(snapshot_phase_ended, tables_seen, counts, wal_lsn)
 
 
 def _completed_tables(
@@ -412,31 +669,49 @@ def _completed_tables(
     return done
 
 
-def _finish_empty_tables(
+def finish_verified_empty_tables(
     con,
     *,
     pipeline: str,
     dataset: str,
     tables: list[tuple[str, str, str]],
     done: set[str],
-    consistent_lsn: int,
+    evidence: EmptinessEvidence,
 ) -> list[str]:
-    """Finish the tables the snapshot produced no records for: they are empty now.
+    """Empty the destination for the tables PROVEN empty at the source. Nothing else.
 
     A table with no rows emits no snapshot records, so no shadow is created and no swap
     happens — and the destination table would keep the rows it had, which after a
-    re-snapshot is stale data presented as current. The source says the table is empty,
-    so the destination table is emptied, in one transaction with its `table_state` row
-    and an audit marker.
+    re-snapshot is stale data presented as current. So the destination table is
+    emptied, in one transaction with its `table_state` row and an audit marker.
+
+    The classification is the dangerous half, and it is what this function exists to
+    make explicit. "Produced no snapshot records" is a fact about *our engine*, not
+    about the source: a table the engine stopped before reaching also produces no
+    records, and deleting its live destination rows is silent destruction (Opus
+    BLOCKER-1, reproduced against a populated table). Every pending table is therefore
+    checked against `EmptinessEvidence`, which requires an end-of-snapshot marker, zero
+    records for *this* table, and a source count of zero. A table that fails any of the
+    three is left completely untouched and stays `awaiting_snapshot`; the caller then
+    fails the run through `assert_every_requested_table_completed`.
     """
     emptied: list[str] = []
-    pending = [
-        (schema, table, target)
-        for schema, table, target in tables
-        if f"{schema}.{table}" not in done
-    ]
+    pending: list[tuple[str, str, str]] = []
+    for schema, table, target in tables:
+        qualified = f"{schema}.{table}"
+        if qualified in done:
+            continue
+        ok, why = evidence.verdict(qualified)
+        if ok:
+            pending.append((schema, table, target))
+        else:
+            log.error(
+                "NOT classifying %s as empty and NOT touching its destination table: "
+                "%s. It stays marked awaiting_snapshot (rubric 1.6).", qualified, why,
+            )
     if not pending:
         return emptied
+    consistent_lsn = evidence.wal_lsn
     con.execute("BEGIN TRANSACTION")
     try:
         for schema, table, target in pending:
@@ -470,8 +745,12 @@ def _finish_empty_tables(
                 lsn=consistent_lsn,
                 rows_removed=removed,
                 detail=(
-                    "the source relation held no rows at the re-snapshot's consistent "
-                    "point, so the destination table was emptied rather than swapped"
+                    "the source relation was VERIFIED to hold no rows: the snapshot "
+                    "engine reached its end-of-snapshot marker, produced no record for "
+                    "this table, and a REPEATABLE READ count taken after "
+                    f"pg_current_wal_lsn()={consistent_lsn} returned zero. The "
+                    "destination table was emptied rather than swapped, and is fenced "
+                    "at that LSN so every later transaction is applied on top."
                 ),
             )
             emptied.append(f"{schema}.{table}")

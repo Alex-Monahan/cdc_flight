@@ -82,6 +82,91 @@ conservatively at **5** and **4** — 1.5 deliberately not restored to 5.
 | Opus MINOR-1, -3, -4, -6, -7 | **fixed** (marker write budget; a truncate no longer clobbers the cached identity; no `dropped` outside the polled schema; `DROP_IGNORE` constant; `test-slow` re-measured at 4:28 on a quiet machine) |
 | Opus MINOR-5 — drop+recreate silent for a pre-mechanism table | **no longer reachable for a new table** (every table now gets both rows); the transitional case is documented |
 
+### The 1.6 / 1.7 / 1.8 review round (2026-07-31)
+
+Two independent reviews attacked this branch's 1.5-1.8 and 4.6-4.7 claims. Both agreed
+the narrow `BEGIN -> data + durable resume state -> COMMIT -> markProcessed/
+markBatchFinished` protocol still preserves Invariant O and found no new commit path that
+acknowledges data before durability. Both then found the **recovery layer around it** was
+where loss now lived. Codex recorded 6 BLOCKER / 6 MAJOR / 3 MINOR and scored
+1.5/1.6/1.7/1.8 at 2/1/1/1; Opus recorded 2 BLOCKER / 6 MAJOR / 9 MINOR and scored them
+4/4/4/4. Every reproduced defect below is now a test that fails on the previous
+implementation.
+
+| finding | disposition |
+|---|---|
+| **Codex B1 = Opus BLOCKER-1** — re-snapshot completion meant "all tables seen so far"; an unreached table was classified empty and its live destination rows deleted; the `still_owed` guard was dead code | **fixed.** Completion is Debezium's own end-of-snapshot marker; "empty" needs three independent facts; `still_owed` is reachable and raises. `test_1_6_resnapshot_completion.py` (10 tests, all fail on the old code) + `test_1_6_resnapshot_multi_table.py` (4 tables, keyless, empty, concurrent writer, crash-after-first-swap). ADR §19/A52 |
+| **Codex B2** — the all-empty consistent point was a polled race; `_agree` took the `min()` and only logged | **fixed.** A verified-empty table is fenced at a WAL position sampled *before* the emptiness check, which cannot be ahead of the image; a disagreement between the two readings of `C` is fatal (both reviewers' Q1 answer). Both `_agree` branches tested |
+| **Codex B3 = Opus MAJOR-1** — the recovery was not crash-recoverable; the documented order stranded a crash-between as a permanent `orphan_offset_file`; the forced snapshot mode did not survive a crash | **fixed.** `cdc_flight.recovery`: a durable journal written before any mutation, idempotent re-entrant phases, file deleted before the row, snapshot mode persisted. `test_1_8_recovery_state_machine.py` cuts at every phase boundary. ADR §19/A53, and A50's order claim is corrected |
+| **Codex B4 = Opus MAJOR-2/Q4a** — a failed drop of the load-bearing slot was logged and stepped over, and the LSN baseline was cleared as if it had succeeded; failed re-snapshots leaked `_rs` slots | **fixed.** `RecoveryFailed` with the journal intact, in both the automatic path and `--accept-orphan-offsets`; `try/finally` around the whole engine section plus an unconditional start-up sweep; the shared cluster's leaked slots were dropped and the suite now sweeps stale slots at session start |
+| **Opus BLOCKER-2** — `no_durable_destination_row` rebuilt a healthy populated destination; a safety regression against `main` | **fixed.** `check_slot` takes the destination's actual contents; a populated destination refuses with the orphan cell's own justification |
+| **Codex B5** — the persisted timeline never participated in the decision | **fixed.** `source_timeline_changed`, ordered after identity and before LSN regression, with the catalog discarded (which also closes **Codex M1**) |
+| **Codex B6** — the four giant modules regrew | **fixed.** `applier.py` 1,062 -> 923 and back to the commit protocol (`applier_config.py`, `self_heal.py`); `pipeline.py` 929 -> 814 (`supervisor.py`); `destination.py` 996 -> 835 (`control_schema.py`); `reconcile.py`'s destructive half is `recovery.py`. `reconcile.py` itself is 784 (was 713): the growth is `check_slot`'s two new inputs and is a **carry-forward** |
+| **Codex M2 / M3, Opus MAJOR-5 / MAJOR-6, MINOR-1** — the fault matrix proved declared labels, not outcomes; four tautologies; the hung-commit test accepted any death; `hang_seconds` was the exit code; the chaos harness did not compose | **fixed.** Every anchor writes a fsynced `fault_fired.json`; the outcome class is derived from the run; exact exit codes; `CDC_FAULT_HANG_SECONDS`; `destination_commit_late` for genuine ambiguity; chaos injects during recovery over a shuffled cover with a per-iteration fired assertion. ADR §19/A54 |
+| **Codex M5, Opus MAJOR-3** — the A51 counts were arithmetically false and the inventory incomplete | **fixed.** 54 rows, one failure and one class each, **34/12/8**, with `tests/4.7_self_healing/test_4_7_inventory.py` parsing the table so the headline cannot drift again. The missing modes (`CDC_RESNAPSHOT=0`, the unqueueable folds, drop-failure, `C` disagreement, the startup-dark fail-open, and more) are rows |
+| **Codex M6, Opus MINOR-7** — `write_slot_state` was a non-atomic DELETE+INSERT | **fixed.** One transaction. "Typed record" is a **carry-forward**: it is still a dict |
+| **Opus MAJOR-4** — `RUBRIC_STATUS` contradicted itself on 1.5 and 4.6 and had no 4.7 detail | **fixed.** Headings reconciled, 1.5's stale falsifier struck through with what replaced it, 4.6's "no test exists" replaced by what the test measures, 4.7 has a detail section |
+| **Opus Q5, Codex m3** — 57 of 91 new tests and 10 of 12 fault anchors were slow-only | **fixed.** Every anchor and every reconciliation cell now has a default-suite guard; see "Suite partition" below |
+| **Opus MINOR-4** — `slot_recreated` false-positives after an unclean Postgres restart | **fixed.** Both positions must regress, with the checkpoint-artefact case logged and tested |
+| **Opus MINOR-6 / Q3** — the 1.0 sentinel was weakened to the bare word "publication" | **fixed.** Debezium's distinctive phrase, plus a non-zero-exit assertion; the stale README rows are corrected (**Codex m2**) |
+| **Opus MINOR-5** — the 45 s dark-source bound was claimed, not measured | **fixed.** `stop_reason == "source_dark"` and a measured elapsed bound below the deadline |
+| **Opus MINOR-8** — A47 needed `C > L` strictly | **fixed** in the ADR |
+| **Codex m1** — startup-dark fail-open | **documented** as A51 row 50 with its rationale, and named in 4.6's detail. Closing it belongs with 4.4's heartbeat |
+| **Opus MINOR-2** — `SILENT` and `RECOVERS` are both empty | **stated** in 1.7's detail rather than papered over |
+| **Opus MINOR-9** — two pipelines sharing a dataset + `topic_prefix` | **carry-forward, 4.2.** Not touched here |
+| **Opus MINOR-3** — `_agree` untested | **fixed** by the hard-fail plus both-branch tests |
+| **Codex M4** — the re-snapshot tests avoided the cases the proof depends on | **fixed** for multi-table, empty-with-concurrent-insert, keyless, straddling and the `C` disagreement; `CompleteUnit.commit_lsn` vs `last_lsn` is a **carry-forward** (the assembler constructs `last_lsn >= commit_lsn`, so no regression, but the alias should go) |
+
+### Suite partition (2026-07-31, after the 1.6-1.8 review round)
+
+Opus Q5 and Codex m3 both said the same thing about the *shape* of the suite rather than
+its size: **57 of the 91 tests this branch added, and 10 of its 12 fault anchors, ran only
+under `-m slow`.** A guard outside the gate that runs on every change is not a guard, and
+"the default suite is at 8:21 of a 10-minute budget" was being spent on the wrong things.
+
+The fix was not to move every crash/recovery cycle into the default lane — each costs
+25-40 s and the budget is the whole reason the split exists. It was to put a guard for
+each *behaviour class* in the default lane at the cheapest level that can actually fail:
+
+| what moved IN (default) | why it is the right representative |
+|---|---|
+| `test_1_7_anchor_guards.py` (25 tests, **0.8 s**) | every one of the thirteen anchors, in-process: it parses, it fires where it says it fires, and it produces its own mechanism. The commit watchdog's exit 75 is proved in a subprocess because the thing under test is `os._exit` |
+| `test_1_6_resnapshot_completion.py` (10 tests, **0.9 s**) | the completion semantics and both `C`-agreement branches, deterministically. Every assertion fails on the previous implementation |
+| `test_1_8_recovery_state_machine.py` (12 tests, **0.9 s**) | a crash at **every** phase boundary of the acquisition recovery, plus the fatal slot-drop failure |
+| `test_1_6_resnapshot_multi_table.py` (7 tests, **70 s**) | the one expensive addition, and the one the branch's worst defect needed: four tables at once, a keyless one, a genuinely empty one, a concurrent writer |
+| `test_4_7_inventory.py` (6 tests, **0 s**) | the A51 counts, parsed rather than recalled |
+| matrix `post_commit_pre_ack` (was `pre_commit`) | the at-least-once window is the most dangerous protocol anchor, so it is the one the default lane should hold |
+| `destination_commit_late` | the genuinely ambiguous commit — the only anchor that exercises recovery from a *durable* group the offset store never heard about |
+
+| what moved OUT (slow) | why nothing is lost |
+|---|---|
+| `test_1_6_resnapshot.py` (10 tests, ~38 s) | the single-table original. The multi-table module covers a strict superset of its claims — keyless, empty, concurrent writer, hand-over — more cheaply per claim |
+| `test_1_5_truncate_drop_e2e.py` (12 tests, ~34 s) | 1.5 keeps **98** deterministic tests in the default lane; what moved is the three-run end-to-end scenario the unit tests already pin |
+| matrix `pre_commit`, `destination_commit` | superseded in the default lane by the two representatives above; both still run under `-m slow` |
+
+Nothing was deleted. Every anchor and every `check_slot` decision cell now has at least
+one default-suite guard:
+
+| coverage | default-suite guard |
+|---|---|
+| 8 protocol anchors | `test_1_1_fault_matrix.py` fires six end to end; `test_1_7_anchor_guards.py` covers `decode` and `swap` in-process |
+| 5 destination anchors | `test_1_7_anchor_guards.py` fires all five against a real connection wrapper; two also run end to end |
+| the network blackhole | the unit half of `test_1_7_source_blackhole.py` (the real relay stays slow — it costs 106 s) |
+| 9 `check_slot` cells | `test_1_8_decision_table.py`, 25 pure-function tests, plus the advanced-slot recovery end to end |
+| 4 recovery phases | `test_1_8_recovery_state_machine.py` |
+
+**Measured: 433 passed in 8:44** (was 384 in 8:21). Forty-nine more tests, every anchor
+guarded, twenty-three seconds more, still inside the 10-minute budget. The single largest
+remaining default cost is `test_1_1_fault_matrix.py`'s module fixture at 75 s — six real
+crash/recovery cycles — and it stays, because it is the exactly-once evidence for 1.1 and
+1.2 and it is deterministic protocol coverage rather than an environmental scenario.
+
+Two structural notes for whoever takes the suite-optimisation task: `dest_fault_box` and
+`matrix_box` are module-scoped fixtures shared across the default/slow boundary, so
+`-m "not slow"` still pays their full baseline run to execute two or three cases each;
+and every e2e module serialises on the session `flock`, so partitioning across processes
+buys nothing until per-worker databases land.
+
 ### Reproducing the evidence
 
 ```bash
@@ -272,10 +357,10 @@ correct assumptions in the notes below:
 | 1.2 | Delivery guarantees, tables WITHOUT a primary key | ~~3~~ → **5** | Keyless rows are keyed on a connector-derived `cdcf_event_id` whose ordinal contract is enforced at the boundary, so two identical source rows survive and a replay does not. |
 | 1.3 | CDC changes atomic in MotherDuck | ~~1~~ → **5** | A commit group is an integral number of whole multi-table Postgres transactions, proven whole in every storage mode; a concurrent MotherDuck observer never sees a partial one, including across an injected crash. |
 | 1.4 | Primary-key update handled correctly | ~~2~~ → **5** | The `d(old)`/`c(new)` pair is one transaction and a commit group holds whole transactions, so the move is atomic by construction. The fold models **physical rows** rather than keys, so a key worn by two rows inside a transaction (or freed and re-taken across two transactions of one group) is expressible; where the before-image cannot attribute a delete the group is refused rather than folded. Five reproduced silent-loss/duplication orderings are now equality tests. |
-| 1.5 | TRUNCATE / DROP propagate | ~~1~~ → **5** | `skipped.operations=none` brings truncates through; **one** dispatcher applies them in every storage mode and each truncate's audit records what *it* removed. `DROP TABLE` is not in the stream, so the source catalog is polled and the action passes six guards (fence, zero-relations, confirmation, supersession, revalidation, circuit breaker) before any DDL. A dropped-and-recreated relation is now dropped, marked `awaiting_snapshot` and **re-snapshotted automatically on the next run** (`cdc_flight.resnapshot`), proven end to end against a relation recreated with rows that produce no change events at all. |
-| 1.6 | Snapshot/backfill consistent with CDC | ~~3~~ → **5** | Postgres's **exported snapshot** makes the boundary an iff: a transaction is in the image exactly when it committed before the slot's `consistent_point`. Proven with ~200 transactions committing throughout a snapshot — every row on exactly one side, none on both. A re-snapshot of a live table hands over through a per-table watermark on the **commit** LSN, and an interrupted snapshot or a crash inside the swap leaves the old table intact. Cost stated: a re-snapshot replaces current state, so a changelog is discontinuous across it (recorded in `table_events`). |
-| 1.7 | Failures do not cause correctness issues | ~~1~~ → **5** | Twelve anchors: eight protocol, four destination (`destination_write` / `_commit` / `_hang` / `_close`), plus a real **network** blackhole injected from outside the process. The matrix is enumerated **from `faults.ALL_POINTS`**, so an anchor with no declared outcome fails the suite, and a seeded chaos harness composes them over 8 iterations. Every fault lands in one of two classes — clean recovery or non-zero exit with an accurate summary — measured against the source's own counts. |
-| 1.8 | Externally-advanced slot detected → backfill | ~~1~~ → **5** | Checked on every slot acquisition. Six decisions trigger an **automatic** re-snapshot of every captured table: slot ahead, slot missing, slot recreated (`restart_lsn` regression), source identity changed (`system_identifier`), source WAL rewound, destination empty with a positioned slot. Proven by comparing the whole destination against the whole source after a real `pg_replication_slot_advance` and a real `pg_drop_replication_slot`. One refusal survives and is documented: an orphan `offsets.dat`, where the automatic action could destroy another destination's tables. |
+| 1.5 | TRUNCATE / DROP propagate | ~~1~~ → **5** | `skipped.operations=none` brings truncates through; **one** dispatcher applies them in every storage mode and each truncate's audit records what *it* removed. `DROP TABLE` is not in the stream, so the source catalog is polled and the action passes six guards before any DDL. A dropped-and-recreated relation is dropped, marked `awaiting_snapshot` and **re-snapshotted automatically on the next run**. Held at 4 through the 1.6-1.8 review because the rebuild machinery could delete a live destination table it had merely not reached; that is closed with positive-evidence emptiness and multi-table proof (ADR §19/A52). A mass drop still needs an operator, deliberately. |
+| 1.6 | Snapshot/backfill consistent with CDC | ~~3~~ → **5** | Postgres's **exported snapshot** makes the boundary an iff, and the fence is on the transaction's **commit** LSN, so a transaction straddling `C` is applied in full rather than lost. Proven with ~200 transactions committing throughout a snapshot — every row on exactly one side. A re-snapshot is complete only when **every requested table** reaches a terminal state: swapped, or verified empty on three independent facts (Debezium's own end-of-snapshot marker, zero records for that table, and a source count of zero). A disagreement between the two readings of `C` is fatal. Proven against a four-table re-snapshot with a keyless table, a genuinely empty table and a concurrent writer. |
+| 1.7 | Failures do not cause correctness issues | ~~1~~ → **4** | Thirteen anchors: eight protocol, five destination (including `destination_commit_late`, the genuinely ambiguous *committed-then-lost-the-answer* case), plus a real **network** blackhole injected from outside the process. The matrix is enumerated **from `faults.ALL_POINTS`**, every anchor writes a machine-readable fired record so the outcome class is *derived* from the run rather than read back out of the table, and the chaos harness injects **during recovery** over a shuffled cover of the anchor set. Not 5: the acquisition recovery has no fault anchors of its own — its crash cuts are proven through a test seam, not an injected `kill -9`. |
+| 1.8 | Externally-advanced slot detected → backfill | ~~1~~ → **5** | Checked on every slot acquisition. Seven decisions trigger an **automatic** re-snapshot: slot ahead, slot missing, slot recreated, source identity changed, **source timeline forked**, source WAL rewound, and an empty destination with a positioned slot. The recovery is a **journalled state machine**: the intent is durable before any mutation, every step is idempotent and re-entrant after a crash at any phase, and a slot that will not drop fails the recovery rather than being logged and stepped over. A **populated** destination with no resume point refuses instead of being rebuilt. Proven by comparing the whole destination against the whole source after a real `pg_replication_slot_advance` and a real `pg_drop_replication_slot`, and by cutting the recovery at every phase boundary. |
 | 2.1 | Added / dropped columns handled | 2 | Adds work correctly; a dropped column silently lingers and reads NULL, indistinguishable from a real NULL. |
 | 2.2 | Renamed columns handled well | 1 | Rename lands as "new column + old column silently goes NULL". No tombstone, no linkage. |
 | 2.3 | New tables and schemas auto-discovered | 1 | Needs `ALTER PUBLICATION` + config change + restart, and pre-existing rows are silently never snapshotted. |
@@ -295,7 +380,7 @@ correct assumptions in the notes below:
 | 4.4 | Idle-slot heartbeat | 1 | `heartbeat.interval.ms` unset, no `heartbeat.action.query`. |
 | 4.5 | Errors must not hang or lock | 2 | Bounded runner + JVM watchdog make hangs survivable (one observed in p09), but nothing systematic prevents them. |
 | 4.6 | Detect silently-dead Postgres connection | ~~1~~ → **3** | TODO 4.6(b) closed: a blackholed Postgres used to exit `ok: true` on a partial delivery, because `unknown` slot health licensed an idle declaration *and* reset the not-streaming clock. A source that was answering and goes dark now fails the run within `CDC_SOURCE_DARK_SECONDS` (45 s), proven against a real TCP blackhole. Not 5: there is still no heartbeat (4.4) and no bounded JDBC socket timeout (4.6(c)), so detection depends on our 0.5 s sampler rather than on the connection itself. |
-| 4.7 | Self-heal without human intervention | **3** (new item, first scored here) | 24 of the 40 enumerated failure modes recover automatically, including six that used to be permanent: an externally advanced/dropped/recreated slot, a restored source, an undecidable fold (`AmbiguousDelete`) and a destination identity collision — the last two previously looped for ever. Nine remain manual and are **scored exceptions** with reasons (orphan offsets, mass-drop breaker, unwritable fence marker, config errors); six are **undefined** (malformed WAL, assembly errors, resume drift, keepalive death, WAL pressure). Full inventory: ADR 0001 §19/A51. Not 5 while the undefined bucket is non-empty. |
+| 4.7 | Self-heal without human intervention | **1** (new item; claimed 3, rescored 1) | The rubric's 1-band is a **count**: "more than 2 cases that cause manual human intervention". The corrected inventory (ADR §19/A51, 54 rows, parsed by `tests/4.7_self_healing/test_4_7_inventory.py`) is **34 AUTO / 12 MANUAL / 8 UNDEFINED**. Twelve is more than two, so it is a 1 under every defensible reading. The direction is right — eight previously-permanent failures became automatic this round, including the Flight's own half-finished recovery — and enumerating them properly *found four more manual cases*. See the detail section. |
 | 5.1 | CDC fast on large changes | 3 | 50 k-row transaction absorbed at ~3.5 k rows/s into local DuckDB; no failure, but a full `dlt.run()` per 2048-row batch is the ceiling. |
 | 5.2 | Low latency on small changes | 1 | Capture latency is 83 ms, but the deliverable is a bounded batch job with no defined cadence — end-to-end latency is the schedule interval. |
 | 5.3 | Keep up with high Postgres TPS | 2 | ~1 k events/s inside the engine, but ~17 s of per-run JVM/connect overhead drops the shipped bounded job to ~157 events/s to MotherDuck. |
@@ -322,10 +407,19 @@ The denominator is 41, not 40: the user added rubric **4.7** ("the Flight should
 always be able to self-heal without human intervention") on 2026-07-31, and it is
 scored for the first time here.
 
-The delta over the baseline is +34 points across eleven items: 1.1 (3 -> 5),
-1.2 (3 -> 5), 1.3 (1 -> 5), 1.4 (2 -> 5), 1.5 (1 -> 5), 1.6 (3 -> 5), 1.7 (1 -> 5),
-1.8 (1 -> 5), 4.6 (1 -> 3), 4.7 (new, 3). Every other row is still the baseline
+The delta over the baseline is +26 points across ten items: 1.1 (3 -> 5), 1.2 (3 -> 5),
+1.3 (1 -> 5), 1.4 (2 -> 5), 1.5 (1 -> 5), 1.6 (3 -> 5), 1.7 (1 -> 4), 1.8 (1 -> 5),
+4.6 (1 -> 3), plus 4.7 as a new item scored **1**. Every other row is still the baseline
 score, and the detail sections say so.
+
+**Rescored 2026-07-31 after the 1.6-1.8 review round**, in both directions and
+conservatively. 1.5 rose from 4 to 5 (its stated condition is met and the machinery it
+rests on is now safe); 1.7 fell from a claimed 5 to 4 (the acquisition recovery has no
+fault anchors); 4.7 fell from a claimed 3 to 1 (the band is a count, and the corrected
+count is twelve). Where the two reviewers disagreed, the lower reading was taken unless
+the specific defect each of them named is closed and tested — which is why 1.6 and 1.8
+are 5 despite Codex scoring them 1: every reason given is reproduced, fixed, and guarded
+by a test that fails on the previous implementation.
 
 **1.5 goes from 4 to 5** (2026-07-31). It was deliberately held at 4 with one
 stated condition — "automatic re-snapshot of a recreated relation" — and that
@@ -338,9 +432,12 @@ with the destination proven equal to the source afterwards.
 **Conservative-scoring notes for this round.** 1.6 and 1.8 are claimed at 5 on
 whole-table content comparisons against the source, not on counts. 1.7's 5 rests on
 the anchor set being enumerated *from the code*, so it cannot silently fall behind.
-4.7 is deliberately **3, not 5**: 24 of 40 failure modes self-heal, but six are
-undefined (ADR §19/A51 rows 30-32, 35, 37, 39) and an item that claims "100% of
-cases" cannot be claimed while any case is unclassified. 4.6 is 3, not 5, because
+4.7 is **1**, rescored down from a claimed 3 after both reviewers pointed at the same
+thing: the band is a literal count of manual-intervention cases, the corrected
+inventory has twelve of them, and twelve is more than two. Scoring the remainder after
+setting the manual rows aside as "exceptions" is scoring a hand-selected subset.
+1.7 is **4**, not 5: every vacuous assertion the round found is replaced with a derived
+one, but the acquisition recovery still has no fault anchors of its own. 4.6 is 3, not 5, because
 the detection that closed TODO 4.6(b) is ours (a 0.5 s slot sampler), not the
 connection's — 4.4's heartbeat and 4.6(c)'s socket timeouts are still absent.
 
@@ -708,22 +805,28 @@ the destination was append-only. That is the `duplication=2` this item scored.
 
 ---
 
-### 1.5 TRUNCATE and DROP TABLE propagate — **4 / 5**
+### 1.5 TRUNCATE and DROP TABLE propagate — ~~1~~ **5 / 5**
 
 `silently ignored=1, logged=2, tombstones/soft delete=3, replicated faithfully=5`
 
-**Rescored 2026-07-31, conservatively, and deliberately not restored to 5.** Codex
-scored this **2/5** and Opus **4/5**. Every reproduced counterexample is closed (the
-storage-mode divergence, the cross-transaction zombie, the two-truncate audit alias, the
-stale-drop race, the missing ownership registry, the transactional alert), and the
-guards both reviews asked for are built and tested. It stays at 4 because of one thing
-neither review disputed and this branch cannot fix: **a dropped-and-recreated relation
-cannot be re-snapshotted here**, so the destination table is dropped and the rows
-inserted into the replacement before detection are gone. That is now *loud* rather than
-silent — `table_state.snapshot_state='awaiting_snapshot'`, an alert, and a line in
-`inspect` — but "the destination is incomplete and a human must trigger a backfill" is
-not "replicated just like Postgres handles them". The 5 belongs to whoever lands
-2.3/3.4's automatic re-snapshot.
+**Rescored 2026-07-31 to 5, after the 1.6-1.8 review round closed the last defect.**
+The history is worth keeping because the score moved twice and both moves were
+conditional:
+
+* the 1.4/1.5 round scored it **4**, with one stated condition — "no automatic
+  re-snapshot for a recreated relation" — and that condition was met by
+  `cdc_flight.resnapshot` (`tests/1.6_snapshot_consistency/test_1_6_recreated_relation.py`);
+* the 1.6-1.8 round then found that the *machinery* the new 5 rested on could delete a
+  live destination table: `_finish_empty_tables` inferred "the source relation is empty"
+  from "our engine did not reach this table", and the guard meant to catch a partial
+  re-snapshot was dead code (Codex B1 scored this **2/5**; Opus BLOCKER-1 held it at
+  **4/5** for the same reason). Both reviewers named that one defect and nothing else;
+* it is now closed with positive evidence on three independent facts and proven against
+  a real multi-table re-snapshot including a genuinely empty table (ADR §19/A52,
+  `test_1_6_resnapshot_completion.py`, `test_1_6_resnapshot_multi_table.py`).
+
+What keeps the 5 honest rather than absolute is written in the falsifiers below: a mass
+drop still needs an operator, deliberately.
 
 #### TRUNCATE
 
@@ -943,11 +1046,20 @@ cannot silently restore "truncates are skipped".
 
 #### Falsifiers (what would drop this score — and what keeps it off 5)
 
-* **No automatic re-snapshot for a recreated relation. This is why the score is 4.**
-  The destination table is dropped because it holds a *different* relation's rows, and
-  rows inserted into the replacement before detection are gone until someone backfills.
-  It is loud now (`awaiting_snapshot`, an alert, `inspect` output) rather than silent,
-  but faithful replication would rebuild it. Owned by **2.3 / 3.4**.
+* ~~**No automatic re-snapshot for a recreated relation. This is why the score is 4.**~~
+  **Closed 2026-07-31.** A recreated relation is dropped, marked `awaiting_snapshot` and
+  rebuilt automatically on the next run through `cdc_flight.resnapshot`, proven end to
+  end against a relation recreated with rows that produce no change events at all
+  (`test_1_6_recreated_relation.py`). The stale text that still argued for a 4 lived here
+  and in the section heading while the summary table said 5 — the file's own preamble
+  calls that a documentation merge blocker, and it was one (Opus MAJOR-4).
+* **The rebuild machinery must never classify an unreached table as empty.** This is the
+  falsifier that replaced the one above, because it is where the risk actually is: the
+  re-snapshot may only empty a destination table on positive evidence (end-of-snapshot
+  marker + zero records for that table + a source count of zero), and a table it did not
+  reach must stay `awaiting_snapshot` with its destination untouched. Guarded in the
+  default suite by `test_1_6_resnapshot_completion.py` and end to end by
+  `test_1_6_resnapshot_multi_table.py`.
 * **A mass drop needs a human by default.** `DROP SCHEMA app CASCADE` is *not*
   replicated automatically: the breaker refuses the set, alerts, and the run fails as
   `catalog_unresolved` until an operator sets `CDC_DROP_ALLOW_MASS=1`. That is a
@@ -1032,6 +1144,37 @@ applied, so a changelog (rubric 8.2) is discontinuous there: an image at `C` ins
 the events that produced it. A `table_events` row with `event='resnapshot'` records where.
 Current state is exact either way, which is what 1.6 asks about.
 
+#### What the 1.6-1.8 review round found here, and what closed it
+
+Both reviewers reproduced the same defect from different directions and it is the reason
+this item was claimed at 5 while the machinery behind it could destroy a live table
+(Codex B1 scored 1.6 **1/5**; Opus BLOCKER-1 held it at **4/5**).
+
+* **Completion meant "no table is currently mid-snapshot".** Debezium closes a table's
+  snapshot chunk when a record for the *next* table arrives, so at a batch boundary in
+  that gap both halves of the old condition are true and the next table has not been
+  scanned. Every unreached table was then classified empty and `DELETE FROM` ran against
+  its live destination table, with an audit row asserting an emptiness nothing checked.
+  The `still_owed` guard was provably dead code. Completion is now Debezium's own
+  end-of-snapshot marker, "empty" needs three independent facts, and `still_owed` is
+  reachable and tested.
+* **The all-empty consistent point was a race.** With no snapshot records there was no
+  `source.lsn`, so `C` came from the first polled `confirmed_flush_lsn` of the throwaway
+  slot — which for an all-empty capture set can be sampled *after* the engine has entered
+  streaming and advanced it. A verified-empty table is now fenced at a WAL position we
+  sample ourselves, immediately before the emptiness check, which cannot be ahead of the
+  image.
+* **A disagreement between the two readings of `C` took the `min()`.** That knowingly
+  duplicates a keyless table, which breaks rubric 1.2's exactly-once claim: it did not
+  avoid a correctness violation, it chose a different one. It is now fatal, the tables
+  stay owed, and the next run takes a fresh `C`.
+
+Evidence: `test_1_6_resnapshot_completion.py` (default suite, deterministic, no engine —
+every one of its ten assertions fails on the previous implementation) and
+`test_1_6_resnapshot_multi_table.py` (four tables at once including a keyless one and a
+genuinely empty one, a concurrent writer throughout, and a `swap`-anchor crash after the
+first table in the slow lane). Full reasoning in ADR §19/A52.
+
 #### Baseline (historical)
 
 120 005 preloaded rows, 300 rows inserted during the snapshot at ~30/s: all present
@@ -1039,18 +1182,23 @@ exactly once. What kept it at 3 was the *failure* path — Debezium restarts a s
 scratch, and with an append-style destination the abandoned partial was already there — and
 the absence of any re-snapshot at all.
 
-### 1.7 Failures do not cause correctness issues — ~~3~~ **5 / 5**
+### 1.7 Failures do not cause correctness issues — ~~1~~ **4 / 5**
 
 `duplication possible due to crash=1, impossible but not well tested=3, robust fault injection=5`
 
 #### The anchor set
 
-Twelve anchors, in two mechanisms plus one that cannot live in the process at all:
+**Rescored 2026-07-31 from 5 to 4, conservatively.** Codex scored this **1/5** and Opus
+**4/5**; the reasons both gave are now closed, and the reason it is not a 5 is stated at
+the bottom of this section and is one both reviews would have raised had the rest been
+fixed.
+
+Thirteen anchors, in two mechanisms plus one that cannot live in the process at all:
 
 | mechanism | anchors |
 |---|---|
 | `faults.maybe_crash` — the process dies at an exact protocol point | `decode`, `begin`, `spill`, `mid_apply`, `swap`, `pre_commit`, `post_commit_pre_ack`, `post_ack` |
-| `faults.FaultyConnection` — the destination misbehaves | `destination_write`, `destination_commit` (ambiguous), `destination_hang`, `destination_close` |
+| `faults.FaultyConnection` — the destination misbehaves | `destination_write`, `destination_commit`, `destination_commit_late` (the genuinely ambiguous one), `destination_hang`, `destination_close` |
 | `tests/tcp_relay.py` — the source stops answering with the sockets left open | the network blackhole |
 
 The destination anchors fire at the data group the **applier declares**
@@ -1088,6 +1236,54 @@ after each; `CDC_CHAOS_SEED` replays a failing sequence verbatim.
    assertions were strengthened to require the summary to *name* the injected fault. And
    `spill` could not fire at all at shipped defaults, so the matrix records the arming each
    anchor needs.
+
+#### What the 1.6-1.8 review round found here, and what closed it
+
+The item whose whole premise is "not vacuously green" had four more assertions that could
+not fail, and the mechanism for proving *which* fault ended a run did not exist
+(ADR §19/A54):
+
+* `test_no_anchor_is_allowed_to_be_silent()` asserted that a hand-written dictionary
+  contained no `SILENT` string. It could only fail if somebody edited the dictionary — and
+  it was the test the "the SILENT bucket is empty" claim pointed at. The outcome class is
+  now **derived from the run**: an armed anchor that left no fired record is `SILENT` and
+  fails the test, whatever the exit code said.
+* the matrix accepted any non-zero exit without establishing that the *selected* fault had
+  fired, so a run that died of an unrelated start-up problem passed.
+* `test_a_hung_commit_...` accepted `returncode in (75, -9, 137, 1)`: 75 is the commit
+  watchdog's own `EX_TEMPFAIL` and the entire point of the test, and the other three are
+  "something killed it". It now requires exactly 75, and the hang duration is longer than
+  the watchdog so nothing else can have ended the run.
+* `destination_hang`'s duration was `<action>` reinterpreted as seconds, so
+  `destination_hang:1` hung for **137** seconds — undocumented, and *shorter* than the
+  shipped 300 s watchdog it exists to exercise. It is now `CDC_FAULT_HANG_SECONDS`.
+* `destination_commit` raised *before* `COMMIT` ran, which is an ordinary uncommitted
+  failure wearing an ambiguous name. `destination_commit_late` executes the `COMMIT` and
+  then raises: the destination committed and we cannot know it.
+* the chaos harness gave its recovery runs **no** fault environment, so a fault could
+  never fire during another fault's recovery — the composition its own docstring claimed.
+  It now injects during recovery, plans a shuffled **cover** of the anchor set, asserts
+  every iteration's anchor actually fired, and runs more than one seed.
+
+Every anchor now writes `$CDC_STATE_DIR/fault_fired.json` before it does anything else,
+fsynced, so even `os._exit` leaves the evidence, and every fault assertion rests on it.
+
+#### Why 4 and not 5
+
+**The acquisition recovery has no fault anchors inside it.** Its crash cuts are covered
+deterministically and at every phase boundary
+(`tests/1.8_slot_mismatch/test_1_8_recovery_state_machine.py`), which is what closes the
+*correctness* question — but that is a test seam, not an injected fault, so there is no
+end-to-end `kill -9` in the middle of the recovery sequence against a real Postgres. For
+an item scored on "robust injection of failures **in testing**", the newest and most
+state-machine-shaped code in the tree not having an anchor set is the gap. Owner: 1.7,
+with `recovery_phase` anchors as the shape.
+
+Two smaller honesty notes: `RECOVERS` and `SILENT` are both empty in practice — every
+injected fault ends in a non-zero exit — so "two permitted outcome classes" is really one
+class plus two that must stay empty; and `swap` is exercised end to end only in the slow
+lane, with a deterministic default-suite guard standing in for it
+(`test_1_7_anchor_guards.py`).
 
 #### Baseline (historical)
 
@@ -1138,6 +1334,37 @@ duplicate cannot hide behind an upsert:
 * a changed `system_identifier` and a rewound WAL position → detected and repaired
   (`test_1_8_restore_and_observation.py`);
 * `CDC_RESNAPSHOT=0` → the rubric's 4, chosen deliberately rather than by accident.
+
+#### What the 1.6-1.8 review round found here, and what closed it
+
+The *detection* survived both reviews intact. The **recovery** did not (Codex B3/B4
+scored 1.8 **1/5**; Opus BLOCKER-2 + MAJOR-1 held it at **4/5**):
+
+* **One cell rebuilt a healthy populated destination.** `no_durable_destination_row` is
+  documented — here and in the ADR — as "destination *empty*, slot positioned", and the
+  code tested only that the control row was missing. A state directory pointed at an
+  existing warehouse silently dropped and rebuilt every captured table. That was a safety
+  **regression** against `main`, where the same cell refused. It refuses again, on the
+  destination's actual contents.
+* **The recovery could strand itself for ever.** Four independent durable mutations, no
+  journal: a crash between deleting the resume row and deleting `offsets.dat` left the
+  exact state the Flight diagnoses as `orphan_offset_file`, and it then refused to start
+  across three consecutive restarts until a human passed a CLI flag. A crash after the
+  slot drop lost the forced `snapshot.mode` entirely. There is now a durable journal
+  written **before** any mutation, every step is idempotent, and the file goes before the
+  row.
+* **A failed slot drop was logged and stepped over.** A45 is the reason it may not be: a
+  re-snapshot against a surviving slot resumes the stream past the snapshot's consistent
+  point. It now raises with the journal intact, and so does `--accept-orphan-offsets`.
+* **The persisted timeline never participated in the decision.** A promotion or a PITR
+  keeps the `system_identifier` and forks the timeline, and Postgres reuses WAL positions
+  across a fork, so every scalar comparison could look healthy. `source_timeline_changed`
+  is now a decision, and a fork or a rewind discards the recorded catalog as well.
+
+Evidence: `test_1_8_recovery_state_machine.py` cuts at **every** phase boundary and proves
+the next attempt finishes the job, `test_1_8_decision_table.py` covers the populated-
+destination refusal and the forked timeline, and the end-to-end `pg_replication_slot_advance`
+scenario now also asserts the journal was cleared. Full reasoning in ADR §19/A53.
 
 #### The refusal that survives, and why
 
@@ -1534,7 +1761,7 @@ updated by the engine, watched by the supervisor), bounded socket-level timeouts
 on the Postgres connection, and a non-zero exit whenever the watchdog rather than
 a clean shutdown ends the process.
 
-### 4.6 Detect failure of a Postgres node with a silently-dead connection — **1 / 5**
+### 4.6 Detect failure of a Postgres node with a silently-dead connection — ~~1~~ **3 / 5**
 
 `unable to detect=1, TCP keepalives under 30 min=3, full heartbeat under 1 h=5`
 
@@ -1545,16 +1772,120 @@ govern the timing — ~2 hours idle on macOS/Linux — and we override nothing.
 (`PostgresConnectorConfig.java:998-1006`), which does put writes on the socket,
 but the resulting TCP retransmission timeout is neither configured nor measured.
 The `wal_sender_timeout = 60s` in `scripts/pg.sh` protects the *server* from a
-dead client, not us from a dead server. No test exists.
+dead client, not us from a dead server.
 
-**Evidence that would raise this.** A probe that severs the connection (packet
-filter or SIGSTOP on the postmaster) and measures time-to-detection.
+**Now (2026-07-31) — 3/5.** TODO 4.6(b) is closed and the probe the baseline asked for
+exists. `tests/tcp_relay.py` is an out-of-process TCP relay that accepts the pipeline's
+connections and then stops forwarding packets with the sockets left open — a real
+silently-dead source, not a killed process. What it found: `unknown` slot health used to
+license an idle declaration *and* reset the not-streaming clock, so a blackholed Postgres
+exited `ok: true` on a partial delivery (ADR §19/A49). A source that was answering and
+goes dark now forbids the idle declaration and fails the run within
+`CDC_SOURCE_DARK_SECONDS` (45 s), with `stop_reason='source_dark'`.
+
+The test that carries the 45-second claim now **measures** it. It used to assert only
+`returncode != 0` plus `"source" in json.dumps(summary).lower()` — which `source_schema`
+and half a dozen other keys satisfy — while running with `--max-seconds 70`, so the run
+could equally have been ended by the deadline (Opus MINOR-5). It now asserts
+`stop_reason == "source_dark"` and an elapsed bound below the deadline.
+
+**Not 5, and the honest reason.** Detection is *ours* — a 0.5 s slot sampler on a second
+connection — not the connection's. There is still no application heartbeat (4.4) and no
+bounded JDBC socket timeout (4.6(c)), so a source that is dark from the **first** sample
+(no privilege, no psycopg, dark before we ever looked) still degrades to the timer-only
+path and can report success on a delivery that never started. That fail-open is
+deliberate and it is now written down as an inventory row rather than left implicit
+(ADR §19/A51 row 50, Codex m1).
+
+**Evidence that would raise this.** The 4.4 heartbeat as the authoritative liveness
+signal, plus an explicit socket read timeout, with time-to-detection measured against
+both.
 
 **Gap to 5.** Set explicit keepalive parameters on the JDBC connection
 (`database.tcpKeepAlive` plus OS-level `tcp_keepidle`/`tcp_keepintvl` via socket
 options), add a connection-level read timeout, and add the application heartbeat
 from 4.4 as the authoritative liveness signal with a detection budget well under
 an hour. Then measure it.
+
+---
+
+### 4.7 The Flight self-heals without human intervention — **1 / 5**
+
+`more than 2 manual-intervention cases=1, human needed only in a catastrophic scenario=3, self-heals in 100% of cases=5`
+
+*Added 2026-07-31 by user directive, and it is the only scored item whose band is a
+literal count rather than a judgement. That is why it is scored the way it is.*
+
+#### The number, and where it comes from
+
+ADR §19/A51 enumerates every raise site, fatal log, refusal and `stop_reason` in the
+tree: **54 rows, 34 AUTO / 12 MANUAL / 8 UNDEFINED**. Twelve manual cases is more than
+two, so the 1-band's test is met on our own evidence.
+
+The count is not recalled: `tests/4.7_self_healing/test_4_7_inventory.py` re-parses the
+ADR table and fails if the headline stops matching the rows, or if any row carries two
+terminal classes in one cell. That test exists because the previous headline —
+`24 AUTO / 9 MANUAL / 6 UNDEFINED` — totalled 39 against a 40-row table and matched no
+reading of the class column, and **both** reviewers had to count the rows by hand to find
+that out (Codex M5, Opus MAJOR-3). A number a score rests on is code.
+
+#### Why it was claimed at 3, and why that was wrong
+
+The 3-band describes a Flight that needs a human only in a *catastrophic* scenario. The
+manual cases are not catastrophic: an orphan `offsets.dat`, a `DROP SCHEMA … CASCADE`, a
+read-only replica that cannot take a fence marker, a typo'd `CDC_TRUNCATE_MODE`, a full
+destination. Those are routine. The previous 3 was reached by treating the manual rows as
+"scored exceptions" and scoring the remainder — which is scoring a hand-selected subset,
+not the item.
+
+#### The manual cases, and why each is manual
+
+| why | rows |
+|---|---|
+| protecting a destination from an automatic action that could destroy it | 17b (populated destination, no resume point), 25 (orphan offsets), 26 (mass-drop breaker), 27 (unwritable fence marker), 38 (destination full), 44b (a slot that never frees) |
+| configuration a human wrote and only a human can fix | 28 (malformed env), 29 (missing token / unreachable destination), 49 (topic collision) |
+| a deliberate opt-out of automation | 41 (`CDC_RESNAPSHOT=0`), 42 (`CDC_AMBIGUOUS_RESNAPSHOT=0` and the two unqueueable folds) |
+| a source-side misconfiguration | 33 (publication dropped / privileges revoked) |
+
+Six of the twelve are *correct* engineering decisions — refusing to auto-destroy a
+destination is the right call — and the rubric scores outcomes, not intentions.
+
+#### What this round actually moved
+
+Eight failure modes that used to require a human are now automatic:
+
+* an externally advanced slot, a dropped slot, a recreated slot (rubric 1.8);
+* a restored/cloned source, and now a **forked timeline** as well;
+* a rewound source, with the stale catalog discarded so the mass-drop breaker no longer
+  fires spuriously on our own bookkeeping;
+* an undecidable fold (`AmbiguousDelete`) and a `DestinationIdentityCollision`, which
+  previously failed identically for ever (A47);
+* **the Flight's own half-finished recovery** — which this round *introduced* as a
+  permanent manual case and then closed with a durable journal (A53).
+
+And enumerating the inventory honestly *found four more manual cases* than the previous
+count admitted. That is the shape of real progress on this item: the number goes up
+before it goes down, because the first thing self-healing needs is an accurate list.
+
+#### The one fail-open, stated
+
+If the slot sampler has **never** succeeded — no privilege, no psycopg, a source that was
+dark before we ever looked — the run degrades to the timer-only idle path and can report
+success on a delivery that never started (A51 row 50, Codex m1). Once the sampler has
+succeeded, a source that goes dark forbids the idle declaration and fails the run within
+45 s (A49). The fail-open is deliberate and is classified `UNDEFINED` rather than `AUTO`,
+because "reported success and delivered nothing" is not a recovery.
+
+#### What would raise this
+
+Not more argument: fewer rows. The 3-band needs the routine manual cases gone —
+`no_durable_destination_row` and `orphan_offset_file` become automatic once durable
+source/destination *ownership* proves the file and the target belong together (both
+reviewers agree that proof does not exist today); the mass-drop breaker needs a
+confirmation channel that is not a human; the unwritable fence marker needs 7.2's
+primary-side write path. The 5-band additionally needs the `UNDEFINED` bucket empty,
+which is rubric 4.3's work on malformed WAL and assembly errors.
+
 
 ---
 

@@ -7,22 +7,34 @@ this module parametrises over `faults.ALL_POINTS` itself, and a new anchor added
 `faults.py` without a matrix entry fails `test_every_anchor_has_a_declared_outcome`
 rather than being quietly untested.
 
-Every fault must land in exactly one of two outcome classes:
+Every fault must land in exactly one of two outcome classes, and the class is
+**derived from what the run did**, not read back out of the table:
 
-* `RECOVERS` — the run may fail, but the ledger is intact and a following run makes the
-  destination equal the source. No loss, no duplication.
-* `LOUD` — the run exits non-zero with an accurate `last_run.json`. (Every `LOUD` case
-  here is also asserted to recover, because a loud failure that cannot be recovered from
-  is not much better than a silent one.)
+* `RECOVERS` — the run exits zero and the ledger is intact.
+* `LOUD` — the run exits non-zero, `last_run.json` is accurate, the anchor that fired is
+  the anchor that was armed, and a following run makes the destination equal the source
+  exactly. (Every `LOUD` case is also asserted to recover, because a loud failure that
+  cannot be recovered from is not much better than a silent one.)
+* `SILENT` — anything else. The table declares no `SILENT` anchor, and
+  `_observed_outcome()` is what makes that a *finding* rather than a spelling
+  convention: the old `test_no_anchor_is_allowed_to_be_silent` asserted that a
+  hand-written dict contained no `SILENT` string, which could only fail if somebody
+  edited the dict (Opus MINOR-1, "it is the test the SILENT-bucket claim points at").
 
-Nothing may be `SILENT`. That class exists in the table only so the third possibility is
-written down and visibly empty.
+Two things were vacuous here and are not any more (Codex M2):
 
-The default suite runs one representative per *mechanism*; `-m slow` runs the whole
-matrix. Splitting it that way is not a coverage compromise: the mechanisms are
-`maybe_crash` (a process that dies at an exact protocol point) and `FaultyConnection` (a
-destination that misbehaves), and a representative of each exercises all the shared
-machinery in the default suite.
+* the run was accepted as loud on `returncode != 0` alone, without establishing that the
+  **selected** fault had fired — a start-up failure for an unrelated reason passed;
+* recovery was asserted with counts against a tag, but nothing named the anchor in the
+  summary, so a scenario that quietly stopped firing looked identical to one that fired
+  and recovered.
+
+Both are fixed by `faults.record_fired()`: every anchor writes `fault_fired.json` into
+the run's state directory before it does anything else, fsynced, so even `os._exit`
+leaves the evidence.
+
+The default suite runs a representative of each *mechanism and each outcome shape*;
+`-m slow` runs the whole matrix.
 """
 
 from __future__ import annotations
@@ -34,6 +46,7 @@ from cdc_flight import faults
 
 RECOVERS = "recovers"
 LOUD = "loud"
+SILENT = "silent"
 
 #: anchor -> (outcome class, what the fault means, `<nth>` to use)
 #:
@@ -51,13 +64,21 @@ MATRIX: dict[str, tuple[str, str]] = {
     "post_ack": (LOUD, "the process dies acknowledged but with the slot unconfirmed"),
     "swap": (LOUD, "the process dies between the DROP and the RENAME of a swap"),
     "destination_write": (LOUD, "the destination rejects a data write mid-transaction"),
-    "destination_commit": (LOUD, "COMMIT raises - the ambiguous case"),
+    "destination_commit": (LOUD, "COMMIT raises before the statement runs"),
+    "destination_commit_late": (
+        LOUD, "COMMIT EXECUTES and then raises - the genuinely ambiguous case"
+    ),
     "destination_hang": (LOUD, "COMMIT never returns - bounded by CDC_COMMIT_TIMEOUT"),
     "destination_close": (LOUD, "the destination connection is severed mid-transaction"),
 }
 
-#: One per mechanism in the default suite; the rest are slow.
-DEFAULT_SUITE = {"pre_commit", "destination_write"}
+#: What the default suite guards. One per *behaviour class*, not one per mechanism
+#: (Opus Q5): a hard process death at the commit boundary (`post_commit_pre_ack`, the
+#: at-least-once window and the most dangerous anchor in the protocol), a destination
+#: that rejects a write (`destination_write`), and a destination that committed and
+#: could not say so (`destination_commit_late`). 10 of 12 anchors used to be slow-only,
+#: which put the guard for the machinery this branch added outside the gate that runs.
+DEFAULT_SUITE = {"post_commit_pre_ack", "destination_write", "destination_commit_late"}
 
 #: Extra environment some anchors need before they can fire at all.
 #:
@@ -68,7 +89,18 @@ DEFAULT_SUITE = {"pre_commit", "destination_write"}
 #: anchor whose arming depends on the workload has to say what workload arms it.
 ARMING: dict[str, dict[str, str]] = {
     "spill": {"CDC_UNIT_SPILL_EVENTS": "5", "CDC_UNIT_SPILL_BYTES": "512"},
-    "destination_hang": {"CDC_COMMIT_TIMEOUT": "5"},
+    # The hang duration is now its own variable rather than `<action>` reinterpreted as
+    # seconds, so this says what it means: hang for longer than the watchdog, and wind
+    # the watchdog down so the test does not take five minutes.
+    "destination_hang": {"CDC_COMMIT_TIMEOUT": "5", "CDC_FAULT_HANG_SECONDS": "600"},
+}
+
+#: The exit code an anchor is required to produce. `EX_TEMPFAIL` for the commit
+#: watchdog, because that is the whole point of it; the injector's own code for a hard
+#: process death; 1 for anything that unwinds through `main()`'s handler.
+EX_TEMPFAIL = 75
+EXPECTED_EXIT: dict[str, int] = {
+    "destination_hang": EX_TEMPFAIL,
 }
 
 ROWS = 30
@@ -86,9 +118,18 @@ def test_every_anchor_has_a_declared_outcome():
     assert not extra, f"MATRIX names anchor(s) that do not exist: {extra}"
 
 
-def test_no_anchor_is_allowed_to_be_silent():
-    """The third outcome class is written down so its emptiness is a statement."""
-    assert {outcome for outcome, _ in MATRIX.values()} <= {RECOVERS, LOUD}
+def test_the_declared_outcome_classes_are_the_ones_this_file_can_observe():
+    """A declared class nothing can observe is a class nothing is proving.
+
+    This replaces `test_no_anchor_is_allowed_to_be_silent`, which asserted that a
+    hand-written dict contained no `SILENT` value and could therefore only fail if
+    somebody edited the dict (Opus MINOR-1). The emptiness of the SILENT bucket is now
+    established by `_observed_outcome()` in every scenario below, which *derives* the
+    class from the run and fails if it is `SILENT`.
+    """
+    declared = {outcome for outcome, _ in MATRIX.values()}
+    assert declared <= {RECOVERS, LOUD}
+    assert SILENT not in declared
 
 
 @pytest.fixture(scope="module")
@@ -113,10 +154,33 @@ def _params():
     return out
 
 
+def _observed_outcome(box: Sandbox, point: str, failed: dict) -> tuple[str, str]:
+    """DERIVE the outcome class from the run. Returns `(class, why)`.
+
+    The classification is:
+
+    * the armed anchor did not fire at all -> `SILENT`, whatever the exit code says. A
+      run that dies of an unrelated start-up error is not evidence about this anchor;
+    * it fired and the run exited zero -> `RECOVERS`;
+    * it fired and the run exited non-zero -> `LOUD`.
+    """
+    fired = box.fired_fault()
+    if fired is None or fired.get("point") != point:
+        return SILENT, (
+            f"the armed anchor {point!r} left no fired record (saw {fired!r}); the run "
+            f"ended rc={failed['returncode']} for some other reason, so this scenario "
+            "proves nothing about the anchor it names"
+        )
+    if failed["returncode"] == 0 and failed.get("ok") is True:
+        return RECOVERS, "the anchor fired and the run still finished cleanly"
+    return LOUD, f"the anchor fired and the run exited {failed['returncode']}"
+
+
 @pytest.mark.parametrize(("point", "outcome", "description"), _params())
 def test_the_fault_lands_in_its_declared_outcome_class(matrix_box, point, outcome, description):
     box = matrix_box
     tag = f"mx{point.replace('_', '')}"
+    box.clear_fired_fault()
     box.sql(
         "INSERT INTO app.customers (name, email) SELECT "
         f"'{tag}-' || i, '{tag}-' || i || '@example.com' "
@@ -132,13 +196,18 @@ def test_the_fault_lands_in_its_declared_outcome_class(matrix_box, point, outcom
     )
     env = {"CDC_FAULT_INJECT": f"{point}:1", **ARMING.get(point, {})}
     failed = box.run(max_seconds=120, timeout=200, expect_success=False, extra_env=env)
-    assert outcome == LOUD
-    assert failed["returncode"] != 0, (
-        f"{point} ({description}) produced a SUCCESSFUL run; rubric 1.7 permits a clean "
-        "recovery or a loud failure and this is neither: "
-        f"{ {k: v for k, v in failed.items() if k != 'output'} }"
+
+    observed, why = _observed_outcome(box, point, failed)
+    assert observed != SILENT, f"{point} ({description}): {why}"
+    assert observed == outcome, (
+        f"{point} ({description}) was declared {outcome} and behaved {observed}: {why}"
     )
     assert failed.get("ok") is not True, failed
+    expected_exit = EXPECTED_EXIT.get(point)
+    if expected_exit is not None:
+        assert failed["returncode"] == expected_exit, (
+            f"{point} must exit exactly {expected_exit}, not {failed['returncode']}"
+        )
 
     recovered = box.run(max_seconds=200)
     assert recovered["ok"] is True, recovered
@@ -146,7 +215,11 @@ def test_the_fault_lands_in_its_declared_outcome_class(matrix_box, point, outcom
 
 
 def _assert_ledger_intact(box: Sandbox, tag: str) -> None:
-    """The source's own counts are the ledger; the destination must match them."""
+    """The source's own counts are the ledger; the destination must match them.
+
+    EXACT counts on both sides, never "at least": `>=` cannot see a duplicate and `!= 0`
+    cannot see a short delivery, and both are what a recovery test exists to catch.
+    """
     src_customers = box.pg_query(
         "SELECT count(*) FROM app.customers WHERE name LIKE %s", (f"{tag}-%",)
     )[0][0]

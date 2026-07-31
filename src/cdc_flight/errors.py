@@ -174,5 +174,19 @@ class SlotAheadOfDestination(RuntimeError):
     """
 
 
+class RecoveryFailed(RuntimeError):
+    """A step of the durable acquisition recovery could not be completed.
+
+    Rubric 1.8 / ADR 0001 §19/A53. The recovery is a journalled state machine, and a
+    step that cannot be completed must **stop the run** with the journal intact rather
+    than continue into a state the design calls unsafe. The load-bearing case is a
+    replication slot that will not drop: A45 shows that Debezium only pairs the
+    snapshot with an exact WAL position when it creates the slot itself, so a
+    re-snapshot started against a surviving slot has an uncoordinated image/stream
+    boundary — precisely the loss window rubric 1.8 exists to close. It used to be
+    logged as `drop_failed: ...` and stepped over (Codex B4).
+    """
+
+
 class LeaseLost(RuntimeError):
     """Another runner owns `_cdc_flight.lease` for this pipeline (rubric 4.2)."""
