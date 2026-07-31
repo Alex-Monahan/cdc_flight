@@ -281,6 +281,19 @@ def run(
                 f"DELETE FROM {CONTROL_SCHEMA}.lease WHERE pipeline = ?",
                 [dest.pipeline_name],
             )
+            # And what we last saw of the source catalog (rubric 1.5). MEASURED: a
+            # stale `source_relations` row makes the next run compare the *new*
+            # relation oids against the old ones and correctly conclude that every
+            # table was dropped and recreated - which is exactly right for a rebuilt
+            # source and exactly wrong for "start over", where the re-snapshot is
+            # about to rebuild the destination anyway. Without this,
+            # `tests/1.1_exactly_once_pk/test_1_1_fault_interleavings.py::
+            # test_a_crash_during_the_snapshot_phase_leaves_no_partial_table` lost its
+            # tables to a `recreated` action mid-run.
+            con.execute(
+                f"DELETE FROM {CONTROL_SCHEMA}.source_relations WHERE pipeline = ?",
+                [dest.pipeline_name],
+            )
 
         applier_cfg = ApplierConfig(
             max_batch_size=int(props["max.batch.size"]),

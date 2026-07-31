@@ -152,8 +152,19 @@ Every row is the event's `after` image (or, for a delete, its `before` image) pl
 
 Alongside the data, the applier owns a `_cdc_flight` schema: `debezium_offsets` (the
 resume point, written inside the data transaction), `commit_log` (one row per destination
-transaction), `lease` (single-writer, rubric 4.2), `table_state`, `spill_events` and
-`alerts`.
+transaction), `lease` (single-writer, rubric 4.2), `table_state`, `spill_events`,
+`table_events` (one row per TRUNCATE / DROP / recreate / publication change, rubric 1.5),
+`source_relations` (the last-seen source catalog, including each table's relation `oid`)
+and `alerts`.
+
+**Table-level changes (rubric 1.5).** A `TRUNCATE` empties the destination table inside
+the same commit group (`TRUNCATE a, b CASCADE` is one Postgres transaction, so it is one
+`COMMIT`). `DROP TABLE` is not in the replication stream at all, so the source catalog is
+polled (`CDC_CATALOG_POLL_SECONDS`, default 10 s) and a detected drop is applied only once
+the destination's resume point has passed the LSN at which it was detected — the watcher
+emits a transactional `pg_logical_emit_message` on the source to guarantee that happens on
+an idle stream. Policy: `CDC_TRUNCATE_MODE` and `CDC_DROP_MODE`, each
+`replicate` (default) | `log` | `ignore`.
 
 ## Testing
 
@@ -218,6 +229,8 @@ Rubric work lives in `tests/<item>_<slug>/`, each with a README explaining the g
 | `tests/1.1_exactly_once_pk/` | 1.1 delivery guarantees, tables with a PK |
 | `tests/1.2_exactly_once_nopk/` | 1.2 delivery guarantees, tables without a PK |
 | `tests/1.3_atomic_batches/` | 1.3 multi-table transactional atomicity |
+| `tests/1.4_pk_updates/` | 1.4 primary-key updates |
+| `tests/1.5_truncate_drop/` | 1.5 TRUNCATE and DROP TABLE |
 
 Three naming conventions carry meaning:
 
@@ -297,7 +310,8 @@ cdc_flight/
 
 [`RUBRIC_STATUS.md`](RUBRIC_STATUS.md) scores this baseline against every item of
 the 40-item Postgres-CDC decision matrix, with the evidence for each score.
-**Baseline average: 1.65 / 5; one item (7.1, pgoutput) is already at 5.**
+**Baseline average: 1.65 / 5; one item (7.1, pgoutput) was already at 5.**
+**On this branch: 2.08 / 5, six items at 5 (1.1, 1.2, 1.3, 1.4, 1.5, 7.1).**
 
 The evidence comes from [`probes/`](probes/) — small, reproducible experiments
 (`uv run python probes/p01_dml_edge_cases.py`, output in `probes/.out/`). They

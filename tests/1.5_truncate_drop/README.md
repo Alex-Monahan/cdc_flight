@@ -59,6 +59,7 @@ drop; with a transactional one it applies in about a second.
 | `test_1_5_truncate_fold.py` | default | every truncate fold shape and the application of a detected drop, through the shipped `Applier` and a real DuckDB file: multi-table atomicity, rows before/after the truncate, the keyless trap, the marker, `truncate_mode=log`, a spilled truncate, the LSN fence, `recreated`, `unpublished`, `drop_mode=log`, and a rolled-back drop staying pending |
 | `test_1_5_catalog_detection.py` | default | the comparison and the fence in isolation, including the restart case (a replicated table with no persisted oid that is gone **is** a drop) and that a marker failure leaves the change unapplied rather than forced |
 | `test_1_5_truncate_drop_e2e.py` | default (`e2e`) | one 33 s scenario: real `TRUNCATE parent CASCADE` + inserts in one transaction, a real `DROP TABLE`, the audit trail, and that the fence marker does not break the assembler |
+| `test_1_5_motherduck.py` | `motherduck` | the truncate and the drop against real MotherDuck, including that `DELETE FROM` reports its row count there (the marker would otherwise say "unknown") |
 | `test_1_5_drop_recreate.py` | `slow` | the live gap under `CDC_TRUNCATE_MODE=ignore`, a `SIGKILL`-equivalent in the commit→ack window of a truncating group, and drop-then-recreate with a different schema |
 
 ## Policy switches

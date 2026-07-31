@@ -853,6 +853,22 @@ class Applier:
                     "detail": detail,
                 }
             )
+            if change.kind in DESTRUCTIVE:
+                # Deliberately NOT in this transaction (ADR §9.1): a signal that
+                # disappears when the apply rolls back is the signal an operator needs
+                # most. "Your destination table is gone" is exactly that signal.
+                destination.raise_alert(
+                    self.con,
+                    pipeline=self.pipeline,
+                    severity="warning" if destructive else "info",
+                    code=f"table_{change.kind}",
+                    message=(
+                        f"{change.qualified} {change.kind} at the source; the "
+                        + ("destination table was dropped" if destructive else
+                           f"destination table was KEPT (drop_mode={self.cfg.drop_mode})")
+                    ),
+                    context=change.context(),
+                )
             applied.append(change)
             self.catalog_changes_applied += 1
         # Resolved only AFTER the transaction commits (see `commit_group`): forgetting

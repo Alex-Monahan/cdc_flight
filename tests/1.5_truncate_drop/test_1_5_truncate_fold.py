@@ -303,6 +303,25 @@ def test_a_recreated_table_drops_the_destination_and_says_why(lab):
     assert "re-snapshot" in detail and "99999" in detail
 
 
+def test_a_dropped_table_raises_an_alert(lab):
+    """"Your destination table is gone" is the one signal an operator must not have
+    to go looking for, and `alerts` is deliberately written outside the commit
+    group's transaction (ADR §9.1)."""
+    watcher = _watcher()
+    box = lab(catalog=watcher)
+    preload(box)
+    _queue(
+        watcher,
+        CatalogChange(
+            kind=CHANGE_DROPPED, schema="app", table="customers",
+            detected_lsn=100, old_oid=1, fenced=True,
+        ),
+    )
+    box.run(txn("2", [keyed("2", 1, 300, 9, "unrelated", table="orders")]))
+    alerts = box.q("SELECT severity, code FROM _cdc_flight.alerts")
+    assert alerts == [("warning", "table_dropped")]
+
+
 def test_a_dropped_table_forgets_its_table_state_row(lab):
     watcher = _watcher()
     box = lab(catalog=watcher)

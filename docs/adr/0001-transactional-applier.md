@@ -1,6 +1,6 @@
 # ADR 0001 — The transactional applier
 
-* **Status:** accepted (revision 4, 2026-07-31 — implemented; §15 records the amendments the implementation forced, §16 those the 1.1–1.3 review round forced)
+* **Status:** accepted (revision 5, 2026-07-31 — implemented; §15 records the amendments the implementation forced, §16 those the 1.1–1.3 review round forced, §17 those 1.4/1.5 forced)
 * **Date:** 2026-07-30
 * **Task:** TODO 1.0(a); revised under TODO 1.0(feedback)
 * **Decides rubric items:** 1.1, 1.2, 1.3, 1.7 (directly), and 1.4, 1.6, 1.8, 3.2,
@@ -19,6 +19,7 @@
 | 2 | 2026-07-30 | **P2 withdrawn** and replaced by **Invariant O** (§4.1). Crash matrix rebuilt over all three engine lifecycle paths **and** the snapshot phase (§4.6). Transaction assembly made a state machine with one boundary rule (§3.2). Triggers restated as soft group-close requests plus a hard spill threshold (§3.3). Start-up reconciliation decision table added (§4.5). Keyless event identity moved off `source.sequence` (§6). D10 rewritten: dlt demoted to a **library**, not removed (§10). Throughput risk of D5 recorded as a measurement task (§5). |
 | 3 | 2026-07-30 | **Amendments from the implementation** (§15): the apply path must insert through Arrow - `executemany` is 300x slower and makes a large commit group unfinishable (A14); `transaction.id` is not a transaction identifier (A1); the Connect schema stays off, so rubric 2.4 is untouched (A2); `verify_offset_file` becomes a rebuild plus a one-directional assertion (A4); a drained batch closes the group (A5); a provably-dead lease is reclaimed (A6); §14.1 answered for DuckDB (A8); §10's dlt exit criterion evaluated (A10). |
 | 4 | 2026-07-31 | **Amendments from the 1.1-1.3 review round** (§16). The boundary rule made unconditional in every storage mode (A20); the ordinal contract enforced, which is how the keyless-identity disagreement between the two reviews resolves (A18); spill made one ordered pass with explicit identity and a fence that covers staged rows (A19); the destination enforces the identity with a PRIMARY KEY (A21); reconciliation compares the whole typed offset map and gains §4.5's missing "slot exists / no durable row" row (A22); `lsn.flush.mode` pinned (A23); the commit->ack window emptied (A24); the fault anchors corrected and extended (A25); `commit_id` scoped per pipeline (A26); the applier decomposed (A29); deferrals stated (A28). |
+| 5 | 2026-07-31 | **Amendments from 1.4 / 1.5** (§17): a key-changing UPDATE is always `d`+`c` for Postgres, so 1.4's atomicity is a corollary of §3.2/§3.3 (A30); the merge cannot collapse a group by key alone when one key is worn by two rows in one transaction (A31); TRUNCATE is a counted, key-less data event and `skipped.operations` was the whole gap (A32); DROP TABLE needs a catalog poller whose WAL fence marker must be **transactional** (A33 — which also constrains D9); what a table-level event means for history (A34). |
 
 ---
 
@@ -2040,3 +2041,137 @@ line rather than a line count:
 Still on the large side, and stated plainly rather than claimed as small: what
 changed is that each module has one owner, and the exactly-once argument can be
 read in `applier.py` without following state into three other concerns.
+
+---
+
+## 17. Amendments from 1.4 / 1.5 (rev 5, 2026-07-31)
+
+Written while implementing rubric 1.4 (primary-key updates) and 1.5 (TRUNCATE and
+DROP TABLE). §6.1 and the 1.5 gap notes turned out to be *nearly* right; what
+follows is what the source and the destination actually required.
+
+### A30 — a key-changing UPDATE is always `d` + `c` for Postgres (corrects §6.1)
+
+§6.1 said a PK update arrives as "either two events in one transaction, or one `u`
+whose `before.key != after.key` under `REPLICA IDENTITY FULL`". The second shape does
+not exist for this connector: `RelationalChangeRecordEmitter.emitUpdateRecord` splits
+the update into `d(old key)` + `c(new key)` whenever `oldKey != null`, and pgoutput
+sends the old key whenever the key changed — under `DEFAULT` as well as `FULL`. The
+`u` path is kept and tested because other connectors do produce it, and because it is
+the shape the applier's own docstring claimed to normalise; it is not the Postgres
+path.
+
+Consequence: **the atomicity half of 1.4 is a corollary of §3.2/§3.3 and needs no
+mechanism.** The pair is one transaction, a commit group holds whole transactions, and
+the merge deletes every touched key before inserting the group's final rows. The
+guard test proves it by setting every commit trigger to fire on a single event and
+showing the group still cannot close mid-pair.
+
+### A31 — the fold cannot collapse by key alone (new; corrects D6's merge rule)
+
+D6 defines the keyed apply as "delete every touched key, then insert the final row per
+key". That is wrong when **one key is worn by two different rows inside one Postgres
+transaction**, which `DEFERRABLE` constraints make legal:
+
+| one transaction | events | truth | collapse-by-key |
+|---|---|---|---|
+| `UPDATE t SET id = id + 1` over rows 1,2 | `d(1) c(2) d(2) c(3)` | `{2, 3}` | `{3}` — a lost row |
+| `UPDATE … id=2 WHERE id=1; UPDATE … id=3 WHERE id=2` | `d(1) c(2) d(2) c(3)` | `{3}` | `{3}` ✓ |
+
+The event streams are byte-identical and the answers differ. The distinguishing fact
+is not in the stream: it is whether key 2 existed **before** the transaction. The
+destination holds that fact, so `table_work._remove` asks it — at most once per
+ambiguous key, cached on the `TableWork`, and never in a group that does not re-use a
+key. `TableWork.acquired` is the other half: an `UPDATE` of the row already wearing
+the key is the *same* row, so a later delete of it is unambiguous. Reading every
+non-None `final[key]` as "a new row moved here" made a plain `UPDATE … ; DELETE …`
+leave the row behind, which was measured and fixed before it shipped.
+
+What this does **not** solve, stated plainly: three rows rotating through one key
+under a deferred constraint, where two *in-group* rows compete for the same key. That
+needs row-level identity we do not have (a full before-image would give it; rubric
+2.6/8.2 territory). The probe answers "pre-group or in-group", not "which in-group
+row".
+
+### A32 — TRUNCATE is a counted, key-less data event (fills in §3.2 and 1.5)
+
+`skipped.operations` defaults to `"t"`, and the pgoutput decoder drops the `'T'`
+message before decoding it, so the *entire* baseline gap for truncate was one
+connector default. With `skipped.operations=none`:
+
+* a truncate goes through `EventDispatcher`'s normal `changeRecord` path, so
+  `TransactionMonitor.dataEvent` counts it in `END.event_count`, it occupies a
+  `transaction.total_order` ordinal and it gets a `data_collections` entry. §3.2's
+  boundary rule therefore applies to it unchanged, and it must be fed through the
+  data path or every truncating transaction fails the completeness check;
+* it carries **no message key**, so `work_for` must not derive identity from it —
+  otherwise a keyed table becomes keyless for the rest of the group;
+* the fold clears what the group had planned for that table and keeps what follows,
+  because that is what `TRUNCATE` does inside a Postgres transaction;
+* the destination table is emptied with `DELETE FROM` inside the group's transaction.
+  `TRUNCATE a, b CASCADE` is one transaction, so it is one `COMMIT` — 1.3 applied to
+  1.5 — and a rolled-back group leaves every row in place.
+
+Policy: `CDC_TRUNCATE_MODE=replicate|log|ignore`, defaulting to `replicate` because
+that is what the rubric's 5 asks for. `log` is the rubric's own `=3` behaviour and
+exists for destinations whose consumers treat the table as an append-only log.
+
+### A33 — DROP TABLE needs a catalog poller, and the poller needs a WAL fence
+
+Logical decoding carries no DDL, so `catalog.py` polls `pg_class` + `pg_publication_rel`
+for the two facts the stream cannot carry: the relation `oid` and publication
+membership. Four outcomes — `dropped`, `recreated`, `unpublished`, `new` — of which
+only the first two are destructive, and `unpublished` is *never* destructive because
+Postgres still holds those rows. The same poll is the mechanism rubric 2.3 will
+generalise (its `new` outcome is already recorded); what 2.3 adds is snapshotting the
+new table, a collision registry for `naming.destination_table`, and per-table
+include/exclude evolution.
+
+Two things the design turns on:
+
+1. **The fence.** A drop is discovered after the fact, so the action carries the
+   `pg_current_wal_lsn()` of its poll and the applier holds it until the resume point
+   it is about to make durable reaches that LSN. Applying earlier could delete rows
+   that an in-flight event then re-adds — a zombie table. `CDC_CATALOG_GRACE=0` (the
+   default) means an unfenced action is never forced.
+2. **The marker must be transactional.** On a quiet source nothing advances the
+   resume point, so the watcher emits `pg_logical_emit_message` past the change (D9's
+   mechanism, one poll early). MEASURED 2026-07-31: with `transactional => false` a
+   quiet run delivered `records=0`, sat 770 KB behind the source and never applied the
+   drop, because `WalPositionLocator.resumeFromLsn` only ends its restart search on a
+   **COMMIT** past the stored LSN (`case MESSAGE:` falls through) and `skipMessage()`
+   drops everything while searching. With `transactional => true` the same drop applies
+   in about a second. This also matters to D9 itself: **a non-transactional source
+   heartbeat cannot be relied on to advance an idle slot after a restart.**
+
+Persisted state (`_cdc_flight.source_relations`) is written inside the commit group's
+transaction and is never allowed to run ahead of a destructive action it implies —
+otherwise the next run would agree with the source and never notice the drop.
+Detection also must not *depend* on a persisted oid: a table we replicate that is
+simply absent from `pg_class` is a drop, which is what makes a `DROP` performed while
+the pipeline was down detectable at all. `--reset-state` clears `source_relations`
+too, or "start over" would be read as "every table was recreated".
+
+### A34 — what a table-level event means for history (refines D8)
+
+D8 gives every table up to three shapes (current state, changelog, SCD2). 1.5 has to
+say what a TRUNCATE or a DROP does to each, and the answer separates replication from
+audit rather than trading them off:
+
+* the **current-state** table is emptied or dropped, because that is what Postgres
+  did. Faithful replication is the rubric's 5 and it wins;
+* `_cdc_flight.table_events` records every table-level event with its commit id,
+  source LSN, transaction id and the number of rows the destination lost, **inside the
+  same transaction as the data**, so the audit trail can never describe an apply that
+  rolled back;
+* a destructive action additionally raises an `_cdc_flight.alerts` row *outside* that
+  transaction (§9.1's rule: a signal that vanishes with the rollback is the one you
+  need most);
+* when 8.2 lands, a **changelog table is append-only and is never emptied**: it gains
+  a truncate marker row derived from this same fact. That is why the marker carries
+  the LSN and the transaction id rather than just a timestamp.
+
+Keyless tables are a changelog today (A12), so a truncate does empty them. That is
+the honest consequence of having only one materialisation: the rows are gone at the
+source, the marker records what was lost, and 8.2 is where "current state *and*
+changelog" makes the distinction physical.
