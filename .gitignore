@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# uv
+# (uv.lock IS committed on purpose)
+
+# dlt
+.dlt/secrets.toml
+~/.dlt/
+*.duckdb
+*.duckdb.wal
+_storage/
+
+# CDC runtime state (Debezium offsets, engine logs)
+.cdc_state/
+logs/
+
+# Local env
+.env
+
+# OS
+.DS_Store
+
+# Project-local Postgres cluster (disposable; recreate with `make pg-init`)
+.pgdata/
+.cdc_state_md/
+
+# JVM crash dumps
+hs_err_pid*.log
+replay_pid*.log

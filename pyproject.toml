@@ -1,0 +1,64 @@
+[project]
+name = "cdc-flight"
+version = "0.1.0"
+description = "Postgres -> MotherDuck CDC pipeline using Debezium (embedded engine) + dlt"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+
+dependencies = [
+    # Debezium embedded engine, driven from Python via JPype.
+    # NOTE: pydbzengine is NOT published to PyPI any more (the jars make the sdist
+    # too large), so it is installed straight from the tagged GitHub release.
+    # 3.6.0.0 bundles Debezium 3.6.0.Final.
+    "pydbzengine @ git+https://github.com/memiiso/pydbzengine.git@3.6.0.0",
+    "dlt[duckdb,motherduck]>=1.19.0",
+    # Upper bound is deliberate: MotherDuck only supports DuckDB releases it has
+    # shipped an extension for (1.5.5 is rejected at connect time, 1.5.4 works).
+    "duckdb>=1.4.0,<1.5.5",
+    "psycopg[binary]>=3.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-timeout>=2.3.0",
+    "ruff>=0.8.0",
+]
+
+[project.scripts]
+cdc-flight = "cdc_flight.pipeline:main"
+cdc-datagen = "cdc_flight.datagen:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cdc_flight"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --durations=20 --strict-markers"
+markers = [
+    "motherduck: test talks to MotherDuck cloud (needs `motherduck_token`); deselected by default",
+    "e2e: full docker + debezium + dlt end-to-end test",
+]
+timeout = 600
+log_cli_level = "INFO"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402", "SIM112"]
+# `motherduck_token` (lowercase) is the spelling the MotherDuck tooling exports.
+"src/cdc_flight/config.py" = ["SIM112"]
