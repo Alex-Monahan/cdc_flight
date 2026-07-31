@@ -2181,7 +2181,9 @@ audit rather than trading them off:
   rolled back;
 * a destructive action additionally raises an `_cdc_flight.alerts` row *outside* that
   transaction (§9.1's rule: a signal that vanishes with the rollback is the one you
-  need most);
+  need most). **This was a claim, not an implementation, until rev 6** — the row was
+  written on the applier's own connection with `BEGIN TRANSACTION` open, so it was
+  fully transactional and a rolled-back apply discarded it. See §18/A40;
 * when 8.2 lands, a **changelog table is append-only and is never emptied**: it gains
   a truncate marker row derived from this same fact. That is why the marker carries
   the LSN and the transaction id rather than just a timestamp.

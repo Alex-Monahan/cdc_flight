@@ -247,8 +247,12 @@ def md_truncate_rollback(sandbox, md_token) -> dict:
     after_failure = con.execute(
         f'SELECT id FROM "{dataset}"."{TR}" ORDER BY id'
     ).fetchall()
+    # Scoped to truncate markers: the first run records one `new` row per discovered
+    # table (rubric 2.3's hook), which is not what this asserts.
     markers_after_failure = con.execute(
-        "SELECT count(*) FROM _cdc_flight.table_events WHERE pipeline = ?", [pipeline]
+        "SELECT count(*) FROM _cdc_flight.table_events WHERE pipeline = ? "
+        "AND event = 'truncate'",
+        [pipeline],
     ).fetchall()
     con.close()
 
@@ -284,7 +288,7 @@ def test_the_injected_fault_actually_failed_the_run(md_truncate_rollback):
 def test_a_rolled_back_truncate_leaves_every_motherduck_row(md_truncate_rollback):
     assert md_truncate_rollback["after_failure"] == [(1,), (2,), (3,)]
     assert md_truncate_rollback["markers_after_failure"] == [(0,)], (
-        "no marker may outlive the apply it describes"
+        "no truncate marker may outlive the apply it describes"
     )
 
 

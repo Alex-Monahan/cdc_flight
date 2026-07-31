@@ -1,4 +1,4 @@
-"""Rubric 1.5 — the four guards between "the table is gone" and `DROP TABLE`.
+"""Rubric 1.5 — the guards between "the table is gone" and `DROP TABLE`.
 
 A detected drop and the DDL that acts on it are separated in time by the LSN fence,
 and on a quiet source that gap is unbounded. The review round found that the code
@@ -8,10 +8,16 @@ destroy every destination table it owned. So:
 | guard | what it refuses | finding |
 |---|---|---|
 | the fence | applying before the destination has consumed everything before the DDL | (already held) |
+| the zero-relations guard | acting on a poll that saw an empty schema | Opus Q2 |
 | confirmation | acting on a single observation | Opus Q5 |
 | supersession | acting on an observation a later poll contradicted | Codex 4 |
 | revalidation | acting without re-reading the source, and acting when it cannot be read | Codex 4 |
 | the circuit breaker | destroying more than one relation at once | Opus MAJOR-3 / Q2 |
+
+The last section is Codex's 9-point item 9: a catalog action combined with a fault at
+**every** relevant boundary, and a multi-table `CASCADE` under the same faults. The DDL,
+the marker, the ownership rows and the resume point are one transaction, and the only
+way to know that is to tear the group at each anchor and look.
 
 Everything here drives the shipped `CatalogWatcher` and `CatalogCoordinator`; the
 source query itself is stubbed, because a watcher with no DSN must never fall back to
@@ -381,3 +387,72 @@ def test_an_alert_about_an_applied_drop_does_not_outlive_a_rollback(lab, monkeyp
     tick(box, "3", 400)
     assert not box.exists(CUSTOMERS)
     assert alerts(box) == [("warning", "table_dropped")]
+
+
+# --------------------------------------------------------------------------- #
+# a catalog action at every fault boundary (Codex's 9-point item 9)
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("point", ["begin", "mid_apply", "pre_commit"])
+def test_a_fault_at_any_boundary_leaves_the_drop_pending_and_the_table_there(
+    lab, monkeypatch, point
+):
+    """The DDL, the marker, the `table_state`/`source_relations` writes and the resume
+    point are one transaction. A fault at any anchor before COMMIT must leave the
+    destination table in place, nothing in the audit trail, and the change still to be
+    applied — then the next group applies it exactly once."""
+    w = watcher()
+    box = lab(catalog=w)
+    preload(box)
+    queue(w, "customers", old_oid=1)
+    nth = box.applier.data_commit_groups + 1
+    monkeypatch.setenv("CDC_FAULT_INJECT", f"{point}:{nth}:raise")
+    faults.refresh()
+    with pytest.raises(faults.InjectedFault):
+        tick(box)
+    monkeypatch.delenv("CDC_FAULT_INJECT")
+    faults.refresh()
+    assert box.exists(CUSTOMERS), "the DROP rolled back with the group"
+    assert box.q("SELECT count(*) FROM _cdc_flight.table_events") == [(0,)]
+    assert box.q(
+        "SELECT count(*) FROM _cdc_flight.table_state WHERE source_table = 'customers'"
+    ) == [(1,)], "the ownership row rolled back with the DROP too"
+    assert len(w.pending_destructive()) == 1
+
+    tick(box, "3", 400)
+    assert not box.exists(CUSTOMERS)
+    assert box.q(
+        "SELECT event, applied FROM _cdc_flight.table_events"
+    ) == [("dropped", True)]
+    assert w.pending_destructive() == []
+
+
+@pytest.mark.parametrize("point", ["begin", "mid_apply", "pre_commit"])
+def test_a_fault_around_a_multi_table_truncate_keeps_both_tables(lab, monkeypatch, point):
+    """`TRUNCATE customers, orders CASCADE` is one Postgres transaction, so it is one
+    `COMMIT`. A fault at any anchor must leave BOTH tables full — a group torn between
+    table A and table B is the one interleaving rubric 1.3 is about, and `mid_apply`
+    fires between two `table_work.write()` calls precisely to reach it."""
+    from applier_lab import truncate
+
+    box = lab()
+    preload(box)
+    nth = box.applier.data_commit_groups + 1
+    monkeypatch.setenv("CDC_FAULT_INJECT", f"{point}:{nth}:raise")
+    faults.refresh()
+    with pytest.raises(faults.InjectedFault):
+        box.run(
+            txn("2", [truncate("2", 1, 200), truncate("2", 2, 200, table="orders")])
+        )
+    monkeypatch.delenv("CDC_FAULT_INJECT")
+    faults.refresh()
+    assert box.q(f'SELECT id FROM "{DATASET}"."{CUSTOMERS}"') == [(1,)]
+    assert box.q(f'SELECT id FROM "{DATASET}"."{ORDERS}"') == [(7,)]
+    assert box.q("SELECT count(*) FROM _cdc_flight.table_events") == [(0,)]
+
+    box.applier.drain_on_shutdown()
+    box.run(txn("2", [truncate("2", 1, 200), truncate("2", 2, 200, table="orders")]))
+    assert box.q(f'SELECT count(*) FROM "{DATASET}"."{CUSTOMERS}"') == [(0,)]
+    assert box.q(f'SELECT count(*) FROM "{DATASET}"."{ORDERS}"') == [(0,)]
+    assert box.q(
+        "SELECT source_table, rows_removed FROM _cdc_flight.table_events ORDER BY seq"
+    ) == [("customers", 1), ("orders", 1)]
