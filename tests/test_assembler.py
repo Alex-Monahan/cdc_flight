@@ -69,7 +69,7 @@ def feed_all(assembler, records):
 # the boundary rule
 # --------------------------------------------------------------------------- #
 def test_a_transaction_is_emitted_only_on_a_verified_end():
-    a = TransactionAssembler()
+    a = TransactionAssembler(keep_all_records=True)
     assert feed_all(a, [begin("7"), data("7", 1, 101), data("7", 2, 102)]) == []
     assert a.buffered_events == 2
 
@@ -154,7 +154,7 @@ def test_a_heartbeat_outside_a_transaction_is_its_own_control_unit():
 def test_a_heartbeat_inside_a_transaction_is_carried_by_it():
     """Otherwise an unconditional heartbeat branch declares a half-buffered
     transaction complete and the resume point jumps over it (Opus M3)."""
-    a = TransactionAssembler()
+    a = TransactionAssembler(keep_all_records=True)
     feed_all(a, [begin("7"), data("7", 1, 101)])
     hb = PendingRecord(raw=object(), kind=KIND_HEARTBEAT, topic="__debezium-heartbeat.p",
                        nbytes=5, lsn=150)
@@ -252,3 +252,60 @@ def test_spill_takes_events_out_of_memory_without_changing_the_boundary():
     assert unit.event_count == 3
     assert unit.spilled is True
     assert unit.spilled_events == 2
+
+
+# --------------------------------------------------------------------------- #
+# retention (ADR §15/A16)
+# --------------------------------------------------------------------------- #
+def test_by_default_a_unit_retains_only_its_terminal_record():
+    """MEASURED: retaining one JPype reference per record collapses throughput on a
+    large transaction (12 500 events/s for the first 88 000, then ~1 000/s). Only
+    the terminal record's offset matters, because `markProcessed()` is a
+    last-write-wins map put, so the rest are released as soon as they are
+    superseded."""
+    a = TransactionAssembler()
+    records = [begin("7"), data("7", 1, 101), data("7", 2, 102)]
+    feed_all(a, records)
+    units = a.feed(end("7", 2, lsn=103))
+    unit = units[0]
+
+    assert len(unit.records) == 1
+    assert unit.records[0].kind == KIND_TXN_END
+    # ... and the superseded Java references really were let go.
+    assert [r.raw for r in records] == [None, None, None]
+    # The data events themselves are still there - only the ACK list was trimmed.
+    assert len(unit.events) == 2
+    assert unit.last_lsn == 103
+
+
+def test_ack_every_record_keeps_the_whole_chain():
+    a = TransactionAssembler(keep_all_records=True)
+    records = [begin("7"), data("7", 1, 101), data("7", 2, 102)]
+    feed_all(a, records)
+    unit = a.feed(end("7", 2, lsn=103))[0]
+    assert len(unit.records) == 4
+    assert all(r.raw is not None for r in records)
+
+
+def test_spill_does_not_retrigger_on_every_subsequent_event():
+    """The bug this pins cost 30x throughput.
+
+    The spill threshold must test what is still **in memory**, not the unit's
+    total size. Testing the total means that once a large transaction crosses the
+    byte threshold it stays crossed for every remaining record, so each record
+    becomes its own spill statement.
+    """
+    calls: list[int] = []
+
+    def on_spill(events):
+        calls.append(len(events))
+        return len(events)
+
+    # bytes threshold only: 100-byte events, spill at 250 bytes
+    a = TransactionAssembler(spill_events=10**9, spill_bytes=250, on_spill=on_spill)
+    feed_all(a, [begin("7")] + [data("7", i, 100 + i) for i in range(1, 13)])
+    a.feed(end("7", 12, lsn=200))
+
+    # 12 events x 100 bytes = 1200 bytes => 4 spills of 3, never 1-per-event.
+    assert calls == [3, 3, 3, 3], calls
+    assert all(n > 1 for n in calls)

@@ -179,8 +179,19 @@ def offsets_of(raw: Any) -> tuple[dict | None, dict | None]:
         return None, None
 
 
-def decode(raw: Any, *, topic_prefix: str, want_offsets: bool = True) -> PendingRecord:
-    """Decode one `ChangeEvent`. Never raises for an unexpected payload shape."""
+def decode(raw: Any, *, topic_prefix: str, want_offsets: bool = False) -> PendingRecord:
+    """Decode one `ChangeEvent`. Never raises for an unexpected payload shape.
+
+    `want_offsets` is **off** by default and that is a measured decision, not a
+    micro-optimisation. Reading the Connect offset maps costs ~20 JPype calls per
+    record (`sourceRecord()`, `sourcePartition()`, `sourceOffset()`, then an
+    `entrySet()` walk), and it retains two dicts per record. On a 200 000-event
+    transaction that dominated decode and made throughput *degrade* as the buffer
+    grew. Only two records per transaction actually need them - the `BEGIN`/`END`
+    markers, whose payload carries no `source` block and therefore no LSN - plus
+    the one terminal record the resume point is built from, which
+    `Applier._resume_point_for` fetches on demand.
+    """
     topic = str(raw.destination())
     value = raw.value()
     text = "" if value is None else str(value)
@@ -191,6 +202,7 @@ def decode(raw: Any, *, topic_prefix: str, want_offsets: bool = True) -> Pending
         rec.source_partition, rec.source_offset = offsets_of(raw)
 
     if topic.startswith("__debezium-heartbeat"):
+        rec.source_partition, rec.source_offset = offsets_of(raw)
         rec.kind = KIND_HEARTBEAT
         rec.lsn = _offset_lsn(rec.source_offset)
         return rec
@@ -208,6 +220,11 @@ def decode(raw: Any, *, topic_prefix: str, want_offsets: bool = True) -> Pending
         return rec
 
     if topic == f"{topic_prefix}.transaction":
+        # The only records whose LSN is NOT in the payload: the transaction value
+        # schema is {status, id, ts_ms, event_count, data_collections}, so the
+        # commit LSN has to come from the Connect offset.
+        if rec.source_offset is None:
+            rec.source_partition, rec.source_offset = offsets_of(raw)
         status = str(payload.get("status") or "").upper()
         rec.kind = KIND_TXN_BEGIN if status == "BEGIN" else KIND_TXN_END
         rec.txn_status = status

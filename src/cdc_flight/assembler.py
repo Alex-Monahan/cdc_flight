@@ -102,19 +102,25 @@ class CompleteUnit:
 
 
 class _OpenTxn:
-    __slots__ = ("begin_seen", "events", "nbytes", "per_table", "records", "txn_id")
+    __slots__ = (
+        "begin_seen", "events", "mem_bytes", "nbytes", "per_table", "records", "txn_id",
+    )
 
     def __init__(self, txn_id: str, begin_seen: bool):
         self.txn_id = txn_id
         self.begin_seen = begin_seen
         self.events: list[PendingRecord] = []
         self.records: list[PendingRecord] = []
+        #: total size of the unit, for the group's byte trigger
         self.nbytes = 0
+        #: size of what is still IN MEMORY. Reset on every spill - see
+        #: `_maybe_spill_txn` for why conflating the two was a 30x throughput bug.
+        self.mem_bytes = 0
         self.per_table: dict[str, int] = {}
 
 
 class _OpenChunk:
-    __slots__ = ("events", "nbytes", "records", "schema", "table")
+    __slots__ = ("events", "mem_bytes", "nbytes", "records", "schema", "table")
 
     def __init__(self, schema: str | None, table: str | None):
         self.schema = schema
@@ -122,6 +128,7 @@ class _OpenChunk:
         self.events: list[PendingRecord] = []
         self.records: list[PendingRecord] = []
         self.nbytes = 0
+        self.mem_bytes = 0
 
 
 class TransactionAssembler:
@@ -135,9 +142,19 @@ class TransactionAssembler:
         on_spill: Any = None,
         spill_events: int = 500_000,
         spill_bytes: int = 64 * 1024 * 1024,
+        keep_all_records: bool = False,
     ):
         self.snapshot_chunk_events = snapshot_chunk_events
         self.snapshot_chunk_bytes = snapshot_chunk_bytes
+        #: When False (the default) a unit retains only its MOST RECENT record and
+        #: releases the Java reference on every earlier one. That is safe because
+        #: `markProcessed()` is a last-write-wins map put, so only the terminal
+        #: record's offset matters (ADR §14.6, answered in §15/A16), and it is
+        #: necessary because a 200 000-event transaction otherwise holds 200 000
+        #: live JPype global references and throughput collapses as the JVM
+        #: struggles: MEASURED 12 500 events/s for the first 88 000 and then
+        #: ~1 000 events/s. `CDC_ACK_EVERY_RECORD=1` restores full retention.
+        self.keep_all_records = keep_all_records
         #: callback(unit_events) -> int, invoked while a unit is over the hard
         #: spill threshold. Returns how many events it took off our hands.
         self.on_spill = on_spill
@@ -208,7 +225,7 @@ class TransactionAssembler:
         if rec.txn_id is None:
             raise TransactionAssemblyError("BEGIN marker without a transaction id")
         self._txn = _OpenTxn(rec.txn_id, begin_seen=True)
-        self._txn.records.append(rec)
+        self._retain(self._txn, rec)
         self._txn.nbytes += rec.nbytes
         return []
 
@@ -233,8 +250,9 @@ class TransactionAssembler:
                 "That is a fatal consistency error, not a boundary (ADR 0001 §3.2)."
             )
         self._txn.events.append(rec)
-        self._txn.records.append(rec)
+        self._retain(self._txn, rec)
         self._txn.nbytes += rec.nbytes
+        self._txn.mem_bytes += rec.nbytes
         table = rec.qualified_table
         if table:
             self._txn.per_table[table] = self._txn.per_table.get(table, 0) + 1
@@ -257,7 +275,7 @@ class TransactionAssembler:
         spilled = self._txn_spilled
         self._txn = None
         self._txn_spilled = 0
-        txn.records.append(rec)
+        self._retain(txn, rec)
         txn.nbytes += rec.nbytes
 
         buffered = len(txn.events) + spilled
@@ -300,7 +318,7 @@ class TransactionAssembler:
             # ADR §3.2: a control record inside an open transaction is carried by
             # that transaction, never emitted on its own - otherwise a heartbeat
             # would advance the resume point past a half-buffered transaction.
-            self._txn.records.append(rec)
+            self._retain(self._txn, rec)
             self._txn.nbytes += rec.nbytes
             return []
         return [self._control_unit(rec)]
@@ -330,8 +348,9 @@ class TransactionAssembler:
         if self._chunk is None:
             self._chunk = _OpenChunk(rec.schema, rec.table)
         self._chunk.events.append(rec)
-        self._chunk.records.append(rec)
+        self._retain(self._chunk, rec)
         self._chunk.nbytes += rec.nbytes
+        self._chunk.mem_bytes += rec.nbytes
         self._maybe_spill_chunk()
 
         table_last = rec.snapshot in SNAPSHOT_TABLE_LAST
@@ -373,32 +392,60 @@ class TransactionAssembler:
         )
         return [unit]
 
+    def _retain(self, target, rec: PendingRecord) -> None:
+        """Add `rec` to the unit's acknowledgement list, dropping what it supersedes."""
+        if self.keep_all_records:
+            target.records.append(rec)
+            return
+        for older in target.records:
+            older.raw = None
+        target.records = [rec]
+
     # -- spill (ADR 0001 §3.4) ---------------------------------------------- #
     def _maybe_spill_txn(self) -> None:
+        """Stage the in-memory tail when it exceeds the hard threshold.
+
+        The condition is on what is still **in memory**, not on the unit's total
+        size. Testing the total was a 30x throughput bug: once a 200 000-event
+        transaction passed 64 MB the threshold stayed tripped for every remaining
+        record, so each record became its own `INSERT INTO spill_events`.
+        MEASURED before the fix: 12 500 events/s up to ~88 000 events, then
+        ~1 000 events/s; after it, the whole 200 000 in one spill batch.
+        """
         if self.on_spill is None or self._txn is None:
             return
         if (
             len(self._txn.events) < self.spill_events
-            and self._txn.nbytes < self.spill_bytes
+            and self._txn.mem_bytes < self.spill_bytes
         ):
             return
         staged = self.on_spill(self._txn.events)
         if staged:
             self._txn_spilled += staged
+            retained = set(map(id, self._txn.records))
+            for event in self._txn.events:
+                if id(event) not in retained:
+                    event.raw = None
             self._txn.events = []
+            self._txn.mem_bytes = 0
 
     def _maybe_spill_chunk(self) -> None:
         if self.on_spill is None or self._chunk is None:
             return
         if (
             len(self._chunk.events) < self.spill_events
-            and self._chunk.nbytes < self.spill_bytes
+            and self._chunk.mem_bytes < self.spill_bytes
         ):
             return
         staged = self.on_spill(self._chunk.events)
         if staged:
             self._chunk_spilled += staged
+            retained = set(map(id, self._chunk.records))
+            for event in self._chunk.events:
+                if id(event) not in retained:
+                    event.raw = None
             self._chunk.events = []
+            self._chunk.mem_bytes = 0
 
     # -- shutdown ----------------------------------------------------------- #
     def discard_open_unit(self) -> int:

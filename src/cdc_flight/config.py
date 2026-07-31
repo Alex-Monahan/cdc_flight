@@ -139,6 +139,7 @@ def applier_settings() -> dict:
         "snapshot_chunk_bytes": int(_env("CDC_SNAPSHOT_CHUNK_BYTES", str(64 * 1024 * 1024))),
         "repair_offset_file": _flag("CDC_OFFSET_FILE_REPAIR", True),
         "verify_offset_file": _flag("CDC_VERIFY_OFFSET_FILE", True),
+        "ack_every_record": _flag("CDC_ACK_EVERY_RECORD", False),
     }
 
 

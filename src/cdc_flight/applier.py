@@ -46,6 +46,7 @@ from .assembler import (
 )
 from .destination import CONTROL_SCHEMA, Lease, ResumePoint
 from .envelope import PendingRecord, decode
+from .envelope import offsets_of as envelope_offsets
 from .errors import ResumePointDrift
 from .faults import maybe_crash
 from .naming import (
@@ -89,6 +90,15 @@ class ApplierConfig:
     max_batch_size: int = 2048
     repair_offset_file: bool = True
     verify_offset_file: bool = True
+    #: ADR 0001 §14.6, answered. `markProcessed(record)` is
+    #: `offsetWriter.offset(record.sourcePartition(), record.sourceOffset())`
+    #: (`AsyncEmbeddedEngine.java:1361-1366`) - a last-write-wins map put - so
+    #: marking every record of a unit in order ends at exactly the value marking
+    #: only its terminal record produces. Marking every record costs one JPype
+    #: round trip each, which on a 200 000-event transaction is 200 000 of them
+    #: and holds 200 000 Java references alive. Terminal-only is the default;
+    #: `CDC_ACK_EVERY_RECORD=1` restores the conservative behaviour.
+    ack_every_record: bool = False
 
 
 @dataclass
@@ -111,9 +121,12 @@ class _TableWork:
     columns: dict[str, str] = field(default_factory=dict)
     #: ordered, deduplicated identity keys touched by the group
     touched: dict[tuple, None] = field(default_factory=dict)
-    #: identity key -> final row (None when the key's last event is a delete)
+    #: identity key -> final row (None when the key's last event is a delete).
+    #: A dict, so insertion order IS source order and membership is O(1). It used
+    #: to be paired with an `order` list and `if key not in order`, which is a
+    #: linear scan per event: MEASURED 458 s for one 200 000-event transaction,
+    #: 1.6 s after this change.
     final: dict[tuple, dict | None] = field(default_factory=dict)
-    order: list[tuple] = field(default_factory=list)
     snapshot: bool = False
     events: int = 0
 
@@ -157,6 +170,7 @@ class Applier:
             spill_events=config.unit_spill_events,
             spill_bytes=config.unit_spill_bytes,
             on_spill=self._spill_events,
+            keep_all_records=config.ack_every_record,
         )
 
         self._group: list[CompleteUnit] = []
@@ -350,6 +364,14 @@ class Applier:
                 unit.txn_id, unit.last_lsn, self.resume_point.last_lsn,
             )
 
+        if not self.cfg.ack_every_record and len(unit.records) > 1:
+            # Keep the terminal record (that is what carries the offset) and let
+            # go of every other Java reference in the unit. This is what bounds
+            # JVM memory for a large transaction; see ApplierConfig.
+            for record in unit.records[:-1]:
+                record.raw = None
+            unit.records = [unit.records[-1]]
+
         self._group.append(unit)
         self._group_events += unit.event_count
         self._group_bytes += unit.nbytes
@@ -428,6 +450,8 @@ class Applier:
         marked = 0
         for unit in group:
             for rec in unit.records:
+                if rec.raw is None:  # released by `_add_unit`
+                    continue
                 self._committer.markProcessed(rec.raw)
                 marked += 1
         before = self.verifier.before() if self.verifier else None
@@ -470,6 +494,10 @@ class Applier:
             if unit.records:
                 terminal = unit.records[-1]
                 break
+        if terminal is not None and terminal.source_offset is None and terminal.raw is not None:
+            # Decoded lazily: only this one record's Connect offset is needed, and
+            # reading it for all 200 000 of them is what made decode the bottleneck.
+            terminal.source_partition, terminal.source_offset = envelope_offsets(terminal.raw)
         last_unit = group[-1]
         last_lsn = max(
             [self.resume_point.last_lsn] + [u.last_lsn or 0 for u in group]
@@ -626,9 +654,8 @@ class Applier:
 
         if item.keyless:
             key = (event_id,)
-            item.touched.setdefault(key, None)
+            item.touched[key] = None
             item.final[key] = row
-            item.order.append(key)
             return
 
         raw_key = tuple(event.key[k] for k in event.key)
@@ -640,12 +667,7 @@ class Applier:
             old_key = tuple(event.before[k] for k in event.key)
             if old_key != raw_key:
                 item.touched.setdefault(old_key, None)
-        if event.op == "d":
-            item.final[raw_key] = None
-        else:
-            item.final[raw_key] = row
-        if raw_key not in item.order:
-            item.order.append(raw_key)
+        item.final[raw_key] = None if event.op == "d" else row
 
     def _row_for(
         self, event: PendingRecord, commit_id: int, event_id: str, *, snapshot: bool
@@ -707,8 +729,7 @@ class Applier:
             apply_sql.delete_keys(self.con, table, item.key_columns, keys)
 
         rows: list[list] = []
-        for key in item.order:
-            row = item.final.get(key)
+        for row in item.final.values():
             if row is None:
                 continue
             rows.append(
@@ -944,8 +965,6 @@ class Applier:
                     item.touched.setdefault(old, None)
         item.touched.setdefault(key, None)
         item.final[key] = None if (event.op == "d" and not item.keyless) else row
-        if key not in item.order:
-            item.order.append(key)
 
     # ------------------------------------------------------------------ #
     # shutdown

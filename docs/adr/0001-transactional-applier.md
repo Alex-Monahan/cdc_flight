@@ -1636,3 +1636,46 @@ run is its own process), but a test that verifies a MotherDuck write from the
 parent process will read an empty schema and conclude nothing was written. It is
 recorded here because the same trap will catch anyone writing 6.1's observability
 queries. `tests/test_motherduck.py::wait_for_tables` handles it.
+
+### A16 — the throughput bugs the whole-transaction design exposes
+
+A commit group holds *whole* Postgres transactions, so one 200 000-event
+transaction is one group. That turns anything super-linear in the per-event path
+from a slow query into a **run that cannot finish**, and this ADR's design is what
+makes that failure mode reachable at all. Three separate defects were found and
+fixed by measuring one 200 000-row transaction end to end (local DuckDB, one
+commit group, wall clock for the whole run):
+
+| state | wall clock |
+|---|---|
+| `executemany` insert (A14) | did not finish (410 s in the insert alone) |
+| + Arrow insert, spill threshold on the unit's TOTAL size | **239 s** |
+| + Arrow insert, spill threshold on total size, spill disabled | **458 s** |
+| + all three fixed | **32 s** (spill engaged: 168 885 events staged and drained) |
+
+1. **A14's `executemany`.**
+2. **The spill threshold tested the unit's total size, not what was still in
+   memory.** Once a large transaction crossed `UNIT_SPILL_BYTES` the threshold
+   stayed crossed for every remaining record, so each record became its own
+   `INSERT INTO spill_events`. Measured: 12 500 events/s for the first ~88 000,
+   then ~1 000 events/s. The threshold now means "spill each time the in-memory
+   tail exceeds X", which is what §3.4 intended.
+3. **`_TableWork` kept an `order` list and tested `if key not in order` per
+   event** — a linear scan, so O(n²) over the group. This was the dominant term:
+   458 s → 1.6 s of apply. The ordered `final` dict is both the ordering and the
+   membership test.
+
+Two design points worth recording alongside them:
+
+* **Retention.** A unit retains only its most recent record for the
+  acknowledgement and releases the Java reference on every earlier one, which is
+  safe because `markProcessed()` is a last-write-wins map put
+  (`AsyncEmbeddedEngine.java:1361-1366`). That **answers §14.6**: marking only the
+  terminal record is sufficient, and `CDC_ACK_EVERY_RECORD=1` restores the
+  conservative behaviour for anyone who wants to re-test the claim.
+* **Isolated throughput measurements** (200 000-event transaction, same machine),
+  which bound where the remaining time goes and partly answer §5.1: raw
+  `ChangeEvent` field access ≈ 40 000 events/s; full-envelope `decode()` ≈ 39 400
+  events/s; decode **and buffer** ≈ 26 500 events/s. So the full-envelope decode
+  is *not* the bottleneck ADR §5.1 feared - at least not at this payload size -
+  and 5.3's work should start with the apply path rather than the converter.
