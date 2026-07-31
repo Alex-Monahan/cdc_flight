@@ -85,16 +85,20 @@ query: ## show what landed in the local DuckDB file
 ## ---------------------------------------------------------------------------
 
 .PHONY: test
-test: ## run the default (local-only) suite with timings
-	$(UV) run pytest -m "not motherduck" --durations=20
+test: ## run the default (local-only, fast) suite with timings
+	$(UV) run pytest -m "not motherduck and not slow" --durations=20
 
 .PHONY: test-all
-test-all: ## run everything including the MotherDuck smoke test
+test-all: ## run everything: MotherDuck smoke test + slow fault injection
 	$(UV) run pytest --durations=20
 
 .PHONY: test-md
 test-md: ## run only the MotherDuck tests
 	$(UV) run pytest -m motherduck --durations=20
+
+.PHONY: test-slow
+test-slow: ## run only the slow fault-injection tests (real SIGKILL, big loads)
+	$(UV) run pytest -m "slow and not motherduck" --durations=20
 
 .PHONY: lint
 lint: ## ruff

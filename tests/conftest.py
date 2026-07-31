@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import psycopg
@@ -133,39 +135,82 @@ def run_pipeline(cdc_env: dict[str, str]):
         snapshot_mode: str | None = None,
         extra_env: dict[str, str] | None = None,
         timeout: float = 300,
+        expect_success: bool = True,
     ) -> dict:
-        cmd = [
-            _executable("cdc-flight"),
-            "--destination",
-            destination,
-            "--max-seconds",
-            str(max_seconds),
-            "--idle-seconds",
-            str(idle_seconds),
-            "--min-records",
-            str(min_records),
-        ]
-        if reset_state:
-            cmd.append("--reset-state")
-        if snapshot_mode:
-            cmd += ["--snapshot-mode", snapshot_mode]
-
-        env = {**cdc_env, **(extra_env or {})}
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, env=env, cwd=PROJECT_DIR, timeout=timeout
+        return _invoke_pipeline(
+            {**cdc_env, **(extra_env or {})},
+            destination=destination,
+            max_seconds=max_seconds,
+            idle_seconds=idle_seconds,
+            min_records=min_records,
+            reset_state=reset_state,
+            snapshot_mode=snapshot_mode,
+            timeout=timeout,
+            expect_success=expect_success,
         )
-        if proc.returncode != 0:
-            raise AssertionError(
-                f"pipeline exited {proc.returncode}\n--- stdout ---\n{proc.stdout[-4000:]}"
-                f"\n--- stderr ---\n{proc.stderr[-4000:]}"
-            )
-        # Debezium logs to stdout as well, so read the machine-readable summary
-        # the CLI writes rather than trying to carve JSON out of the log stream.
-        summary = Path(env["CDC_STATE_DIR"]) / "last_run.json"
-        assert summary.exists(), f"no run summary at {summary}\n{proc.stdout[-4000:]}"
-        return json.loads(summary.read_text())
 
     return _run
+
+
+def _invoke_pipeline(
+    env: dict[str, str],
+    *,
+    destination: str = "duckdb",
+    max_seconds: float = 90,
+    idle_seconds: float = 8,
+    min_records: int = 0,
+    reset_state: bool = False,
+    snapshot_mode: str | None = None,
+    timeout: float = 300,
+    expect_success: bool = True,
+) -> dict:
+    """Run the `cdc-flight` CLI once and return its summary plus process outcome.
+
+    A subprocess (rather than an in-process call) keeps each run's JVM lifecycle
+    clean - JPype allows exactly one JVM per process, and Debezium leaves
+    non-daemon threads behind.
+    """
+    cmd = [
+        _executable("cdc-flight"),
+        "--destination",
+        destination,
+        "--max-seconds",
+        str(max_seconds),
+        "--idle-seconds",
+        str(idle_seconds),
+        "--min-records",
+        str(min_records),
+    ]
+    if reset_state:
+        cmd.append("--reset-state")
+    if snapshot_mode:
+        cmd += ["--snapshot-mode", snapshot_mode]
+
+    # Drop any previous summary so the one we read back is unambiguously this
+    # run's - a crash-injected run writes none at all.
+    summary_path = Path(env["CDC_STATE_DIR"]) / "last_run.json"
+    summary_path.unlink(missing_ok=True)
+
+    proc = subprocess.run(
+        cmd, capture_output=True, text=True, env=env, cwd=PROJECT_DIR, timeout=timeout
+    )
+    if expect_success and proc.returncode != 0:
+        raise AssertionError(
+            f"pipeline exited {proc.returncode}\n--- stdout ---\n{proc.stdout[-4000:]}"
+            f"\n--- stderr ---\n{proc.stderr[-4000:]}"
+        )
+
+    # Debezium logs to stdout as well, so read the machine-readable summary the
+    # CLI writes rather than trying to carve JSON out of the log stream.
+    summary: dict[str, Any] = {}
+    if summary_path.exists():
+        summary = json.loads(summary_path.read_text())
+    if expect_success:
+        assert summary, f"no run summary at {summary_path}\n{proc.stdout[-4000:]}"
+    summary["returncode"] = proc.returncode
+    # Kept short on purpose: this dict is printed verbatim in assertion messages.
+    summary["output"] = (proc.stdout + proc.stderr)[-6000:]
+    return summary
 
 
 @pytest.fixture
@@ -203,6 +248,180 @@ def duck(cdc_env: dict[str, str]):
         return duckdb.connect(path, read_only=True)
 
     return _connect
+
+
+# --------------------------------------------------------------------------- #
+# module-scoped sandbox (used by the rubric gap suites under tests/<item>_*/)
+# --------------------------------------------------------------------------- #
+class Sandbox:
+    """An isolated CDC environment: own slot, offsets, dlt state and DuckDB file.
+
+    The rubric gap suites need a *scenario* (several pipeline runs plus source
+    DML) that many assertions then interrogate. Re-running the scenario per test
+    would cost ~30 s each, so the scenario fixture is module-scoped - pytest runs
+    all tests in a module consecutively, so a module-scoped sandbox is never
+    interleaved with another module's `seed` calls.
+    """
+
+    DATASET = "cdc_raw"
+
+    def __init__(self, name: str, base: Path, source: SourceConfig):
+        self.name = name
+        self.dir = base
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.source = source
+        self.slot = re.sub(r"[^a-z0-9_]", "_", f"t_{name}_{os.getpid()}".lower())[:60]
+        self.duckdb_path = self.dir / "cdc_flight.duckdb"
+        self.state_dir = self.dir / "cdc_state"
+        self.env = {
+            **os.environ,
+            "CDC_STATE_DIR": str(self.state_dir),
+            "CDC_PIPELINES_DIR": str(self.state_dir / "dlt_pipelines"),
+            "CDC_DUCKDB_PATH": str(self.duckdb_path),
+            "CDC_SLOT_NAME": self.slot,
+            "CDC_PIPELINE_NAME": f"cdc_flight_{re.sub(r'[^a-z0-9_]', '_', name.lower())}",
+            "RUNTIME__DLTHUB_TELEMETRY": "false",
+        }
+        self.drop_slot()
+
+    # -- lifecycle ---------------------------------------------------------- #
+    @property
+    def offset_file(self) -> Path:
+        return self.state_dir / "offsets.dat"
+
+    def drop_slot(self) -> None:
+        _drop_slot(self.source, self.slot)
+
+    def reseed(self) -> None:
+        _pg("seed")
+
+    def cleanup(self) -> None:
+        self.drop_slot()
+
+    # -- source ------------------------------------------------------------- #
+    def sql(self, statements: str | list[str], *, one_transaction: bool = False) -> None:
+        if isinstance(statements, str):
+            statements = [statements]
+        with psycopg.connect(self.source.dsn, autocommit=not one_transaction) as conn:
+            for stmt in statements:
+                conn.execute(stmt)
+            if one_transaction:
+                conn.commit()
+
+    def pg_query(self, stmt: str, params: tuple | None = None) -> list[tuple]:
+        with psycopg.connect(self.source.dsn, autocommit=True) as conn:
+            return conn.execute(stmt, params).fetchall()
+
+    # -- pipeline ----------------------------------------------------------- #
+    def run(self, *, extra_env: dict[str, str] | None = None, **kwargs) -> dict:
+        kwargs.setdefault("max_seconds", 120)
+        kwargs.setdefault("idle_seconds", 6)
+        return _invoke_pipeline({**self.env, **(extra_env or {})}, **kwargs)
+
+    def spawn(self, *, max_seconds: float = 300, idle_seconds: float = 10) -> subprocess.Popen:
+        """Start the pipeline as a killable child process (fault injection)."""
+        return subprocess.Popen(
+            [
+                _executable("cdc-flight"),
+                "--destination",
+                "duckdb",
+                "--max-seconds",
+                str(max_seconds),
+                "--idle-seconds",
+                str(idle_seconds),
+            ],
+            env=self.env,
+            cwd=PROJECT_DIR,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    # -- destination -------------------------------------------------------- #
+    def duck_query(self, stmt: str, params: list | None = None) -> list[tuple]:
+        con = duckdb.connect(str(self.duckdb_path), read_only=True)
+        try:
+            return con.execute(stmt, params or []).fetchall()
+        finally:
+            con.close()
+
+    def scalar(self, stmt: str, params: list | None = None):
+        return self.duck_query(stmt, params)[0][0]
+
+    def table(self, name: str) -> str:
+        return f'"{self.DATASET}"."{name}"'
+
+
+CRASH_REPLAY_CUSTOMERS = 50
+CRASH_REPLAY_READINGS = 60
+
+
+@pytest.fixture(scope="session")
+def crash_replay(tmp_path_factory, postgres_cluster: SourceConfig) -> Iterator[dict]:
+    """Deterministic crash in the at-least-once window, then a restart.
+
+    Shared by `tests/1.1_exactly_once_pk/` and `tests/1.2_exactly_once_nopk/` so
+    the ~75 s scenario is paid for once. It is safe as a session fixture because
+    the whole scenario completes inside a single fixture setup - no other test
+    can interleave a `seed` into it - and every later assertion only reads the
+    sandbox's private DuckDB file.
+
+    The fault is injected at `after_load` (see `cdc_flight.faults`): the batch is
+    committed to the destination and then the process is `os._exit`-ed *before*
+    `markProcessed()` / `markBatchFinished()` run, so Debezium's offset file
+    still points before the batch and the replication slot was never confirmed
+    past it. That is precisely the window a `kill -9` hits, made exact.
+
+    (Rolling the offset *file* back instead does not work reliably: Postgres will
+    not stream from before the slot's `restart_lsn`, which has already advanced,
+    so only the tail of the batch replays. Measured, not assumed.)
+    """
+    box = Sandbox("crash_replay", tmp_path_factory.mktemp("sbx_crash_replay"), postgres_cluster)
+    try:
+        box.reseed()
+        baseline = box.run(reset_state=True, max_seconds=150)
+
+        box.sql(
+            [
+                "INSERT INTO app.customers (name, email) SELECT "
+                "'replay-c-' || i, 'replay-c-' || i || '@example.com' "
+                f"FROM generate_series(1, {CRASH_REPLAY_CUSTOMERS}) i",
+                "INSERT INTO app.sensor_readings (sensor_id, value, unit) SELECT "
+                "'REPLAY', i * 1.5, 'C' "
+                f"FROM generate_series(1, {CRASH_REPLAY_READINGS}) i",
+            ],
+            one_transaction=True,
+        )
+
+        crashed = box.run(
+            max_seconds=150,
+            expect_success=False,
+            extra_env={"CDC_FAULT_INJECT": "after_load:1"},
+        )
+        assert crashed["returncode"] == 137, f"fault injection did not fire: {crashed}"
+
+        replayed = box.run(max_seconds=150)
+
+        yield {
+            "box": box,
+            "baseline": baseline,
+            "crashed": crashed,
+            "replayed": replayed,
+            "customers": CRASH_REPLAY_CUSTOMERS,
+            "readings": CRASH_REPLAY_READINGS,
+        }
+    finally:
+        box.cleanup()
+
+
+@pytest.fixture(scope="module")
+def sandbox(request, tmp_path_factory, postgres_cluster: SourceConfig) -> Iterator[Sandbox]:
+    name = Path(request.module.__file__).stem.replace("test_", "")
+    box = Sandbox(name, tmp_path_factory.mktemp(f"sbx_{abs(hash(name)) % 10000}"), postgres_cluster)
+    try:
+        yield box
+    finally:
+        box.cleanup()
+        shutil.rmtree(box.state_dir, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- #

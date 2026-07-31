@@ -1,0 +1,62 @@
+# tests/1.3_atomic_batches
+
+**Rubric 1.3** — *CDC changes should be atomic in MotherDuck.*
+`no Postgres transactional boundaries respected=1, single-table transactional
+batches respected=3, multi-table transactional batches=5`. Baseline score: **1**.
+
+## The gap
+
+Postgres transaction boundaries are never consulted. A Debezium batch is a fixed
+window of up to `max.batch.size=2048` records
+(`src/cdc_flight/debezium_props.py`), each batch becomes one `dlt_pipeline.run()`
+(`src/cdc_flight/handler.py`), and inside a load package dlt opens **one
+transaction per table**
+(`repos/dlt/dlt/destinations/insert_job_client.py:21-29`). So:
+
+1. a Postgres transaction larger than 2 048 events is **split across several
+   destination commits** — a reader can see half of it;
+2. two tables written by the *same* Postgres transaction are committed
+   **separately** — a reader can see the parent without the child.
+
+`probes/p06` recorded 25 batches for one 50 000-row `INSERT`; `probes/p13`
+recorded 174 batches for one 400 000-row transaction; `probes/p12` recorded one
+MotherDuck load package per batch per table.
+
+## Scenario
+
+One Postgres `BEGIN … COMMIT` inserting 1 500 `app.customers` **and** 1 500
+`app.orders` (3 000 change events, one `dbz_tx_id`). 3 000 > 2 048, so Debezium
+must cut it into at least two batches, and the cut necessarily falls inside the
+transaction and between the two tables.
+
+## Observing atomicity without a concurrent reader
+
+DuckDB is single-writer: while the pipeline holds the write lock on the file, a
+second process cannot open it even read-only, so a polling observer is not
+possible here. Instead the tests reconstruct the sequence of destination commits
+**after the fact** from `_dlt_load_id` (dlt writes one load package per
+`dlt.run()`, and load ids sort chronologically). If the events of one Postgres
+transaction span more than one load id, then there was a point in time at which
+the earlier package was committed and the later one was not — i.e. a torn
+transaction was visible. `test_gap_torn_transaction_is_observable` computes that
+intermediate state explicitly.
+
+## What the tests assert
+
+| test | today | after the applier lands |
+|---|---|---|
+| `test_scenario_is_one_postgres_transaction` | passes | must keep passing |
+| `test_gap_pg_transaction_is_split_across_commits` | **passes** — >1 destination commit for one PG txn | starts failing; delete it |
+| `test_gap_torn_transaction_is_observable` | **passes** — all customers visible, only part of the orders | starts failing; delete it |
+| `test_target_pg_transaction_lands_in_one_commit` | **xfail(strict)** | must pass, then drop the marker |
+| `test_target_commit_group_metadata_is_present` | **xfail(strict)** | must pass, then drop the marker |
+
+Conventions are described in `tests/1.0_engine_error_propagation/README.md`.
+
+## Note on the target shape
+
+The target tests assert on `cdcf_commit_id` — the MotherDuck commit-group
+identifier defined in `docs/adr/0001-transactional-applier.md`. A commit group is
+allowed to contain *many whole* Postgres transactions (MotherDuck sustains only
+~100 txn/s), but never part of one. So the invariant is
+"`count(DISTINCT cdcf_commit_id) = 1` per `dbz_tx_id`", **not** the reverse.

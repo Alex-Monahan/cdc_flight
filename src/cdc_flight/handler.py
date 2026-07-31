@@ -21,6 +21,7 @@ import dlt
 from pydbzengine import BasePythonChangeHandler, ChangeEvent
 
 from .debezium_props import METADATA_PREFIX
+from .faults import maybe_crash
 
 log = logging.getLogger("cdc_flight.handler")
 
@@ -105,6 +106,7 @@ class DltChangeHandler(BasePythonChangeHandler):
             grouped.setdefault(resolve_table_name(topic, payload), []).append(payload)
 
         n = sum(len(v) for v in grouped.values())
+        nth = self.batch_count + 1
         if grouped:
             log.info(
                 "loading batch: %s records across %s tables (%s)",
@@ -112,11 +114,16 @@ class DltChangeHandler(BasePythonChangeHandler):
                 len(grouped),
                 ", ".join(f"{k}={len(v)}" for k, v in sorted(grouped.items())),
             )
+            maybe_crash("before_load", nth)
             try:
                 self.dlt_pipeline.run(debezium_source_events(grouped))
             except BaseException as exc:  # surfaced to the caller by the engine
                 self.error = exc
                 raise
+            # The at-least-once window: rows are committed at the destination,
+            # the Debezium offset is not yet flushed. Inert unless a test asks
+            # for it (see cdc_flight.faults).
+            maybe_crash("after_load", nth)
 
         with self._lock:
             self.record_count += n
