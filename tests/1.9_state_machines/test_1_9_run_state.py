@@ -16,6 +16,7 @@ In-process, DuckDB in a tmp dir, no engine.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import duckdb
 import pytest
@@ -287,3 +288,190 @@ def test_a_reason_outside_the_domain_is_logged_rather_than_raised(con):
         assert terminal == "max_seconds", "it kept the value it had"
     finally:
         phases.close()
+
+
+# --------------------------------------------------------------------------- #
+# Codex r1 MAJOR-2 / MAJOR-3 / MINOR-1
+# --------------------------------------------------------------------------- #
+def test_one_outcome_object_is_shared_with_whoever_supervises_the_run(con):
+    """`stop_reason` and `run_outcome` are two projections of ONE value.
+
+    They used to be two objects: `run_engine_bounded` built one and `RunPhaseWriter`
+    built another, so ordinary successful runs shipped `stop_reason="idle"` beside
+    `run_outcome="max_seconds"`, and a severe supervisor result could be published as
+    the mild phase-writer default (Codex r1 MAJOR-2).
+    """
+    shared = RunOutcome()
+    phases = RunPhaseWriter(con, pipeline=PIPELINE, runner_id=RUNNER, outcome=shared)
+    try:
+        assert phases.outcome is shared
+        shared.record("source_dark")
+        assert phases.summary()["run_outcome"] == "source_dark"
+        phases.to(m.PHASE_RECONCILING)
+        phases.finish(ok=False)
+        assert _row(con)[0] == "failed"
+        assert _row(con)[1] == "source_dark"
+    finally:
+        phases.close()
+
+
+def test_engine_finished_is_not_called_a_failure_by_the_precedence(con):
+    """It is a SUCCESS for a terminating snapshot mode and a failure otherwise, and
+    severity alone cannot decide that — `run_engine_bounded` knows which run it is."""
+    outcome = RunOutcome()
+    outcome.record("engine_finished")
+    assert outcome.failed is False
+    outcome.record("hung")
+    assert outcome.failed is True
+
+
+def test_a_phase_write_inside_the_commit_ack_window_is_dropped_not_performed(con):
+    """The binding principle, in WALL CLOCK rather than program order.
+
+    The supervisor writes `draining` on its own thread the moment `max_seconds`, an
+    engine error or source-dark breaks the loop — without asking whether the engine
+    thread is between `COMMIT` and `markBatchFinished()`. The callback's instruction
+    sequence was clean; "never in the window" was still false (Codex r1 MAJOR-3).
+    """
+    from cdc_flight.run_state import COMMIT_ACK
+
+    COMMIT_ACK.reset()
+    phases = RunPhaseWriter(con, pipeline=PIPELINE, runner_id=RUNNER)
+    try:
+        phases.to(m.PHASE_RECONCILING)
+        assert _row(con)[0] == "reconciling"
+
+        COMMIT_ACK.enter()
+        try:
+            phases.to(m.PHASE_STREAMING)
+        finally:
+            COMMIT_ACK.leave()
+        # The machine still moved — an illegal phase order is a failure either way —
+        # but the destination was NOT written to inside the window.
+        assert phases.phase == "streaming"
+        assert _row(con)[0] == "reconciling"
+        assert COMMIT_ACK.dropped_writes == 1
+        assert phases.summary()["phase_writes_dropped_in_commit_ack"] == 1
+
+        # ... and the next transition restores the whole row, so nothing is lost.
+        phases.to(m.PHASE_DRAINING)
+        assert _row(con)[0] == "draining"
+    finally:
+        COMMIT_ACK.reset()
+        phases.close()
+
+
+def test_the_applier_really_holds_that_window_around_commit_to_ack():
+    """The flag is only worth anything if the applier is the thing that sets it."""
+    source = (
+        Path(__file__).resolve().parents[2] / "src" / "cdc_flight" / "applier.py"
+    ).read_text()
+    commit = source.index('self.con.execute("COMMIT")')
+    ack = source.index("self._committer.markBatchFinished()")
+    assert source.rindex("COMMIT_ACK.enter()", 0, commit) > commit - 800, (
+        "the window must be entered immediately before COMMIT"
+    )
+    assert source.index("COMMIT_ACK.leave()", ack) - ack < 200, (
+        "the window must be left immediately after the acknowledgement"
+    )
+
+
+def test_no_independent_connection_means_no_row_rather_than_the_primary_one(con):
+    """`con.cursor()` failing used to set `_sink = con`, so phase writes landed on the
+    applier's own connection, inside its open transaction, from another thread — which
+    is precisely what the transaction discipline forbids (Codex r1 MAJOR-3)."""
+
+    class _NoCursors:
+        def __init__(self, real):
+            self._real = real
+
+        def cursor(self):
+            raise RuntimeError("this destination has no cursors")
+
+        def execute(self, *a, **k):  # pragma: no cover - must never be reached
+            raise AssertionError("the phase writer borrowed the primary connection")
+
+    phases = RunPhaseWriter(_NoCursors(con), pipeline=PIPELINE, runner_id=RUNNER)
+    try:
+        assert phases.independent is False
+        phases.to(m.PHASE_RECONCILING)  # must not raise, must not write
+        assert phases.phase == "reconciling"
+        assert con.execute(
+            "SELECT count(*) FROM _cdc_flight.heartbeat WHERE runner_id = ?", [RUNNER]
+        ).fetchone()[0] == 0
+    finally:
+        phases.close()
+
+
+def test_a_migration_that_cannot_be_shown_to_have_happened_is_loud(tmp_path):
+    """Every `ALTER` exception used to be read as "a concurrent runner won the race",
+    with no re-check, so a permission or DDL failure looked like success and the writer
+    that depends on the column failed silently for ever (Codex r1 MINOR-1)."""
+    from cdc_flight import control_schema
+
+    path = str(tmp_path / "old.duckdb")
+    old = duckdb.connect(path)
+    old.execute("CREATE SCHEMA _cdc_flight")
+    old.execute(
+        "CREATE TABLE _cdc_flight.heartbeat (pipeline VARCHAR, runner_id VARCHAR, "
+        "beat_at TIMESTAMPTZ, phase VARCHAR)"
+    )
+    old.close()
+
+    fresh = duckdb.connect(path)
+
+    class _RefusesAlters:
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, *a, **k):
+            if "ADD COLUMN" in str(sql):
+                raise RuntimeError("permission denied")
+            return self._real.execute(sql, *a, **k)
+
+    try:
+        with pytest.raises(control_schema.ControlSchemaFailed) as failure:
+            dest_mod.ensure_control_schema(_RefusesAlters(fresh))
+        assert "phase_since" in str(failure.value)
+    finally:
+        fresh.close()
+
+
+def test_a_migration_that_lost_the_race_is_accepted_after_re_reading(tmp_path):
+    """The one benign reading, VERIFIED rather than assumed."""
+
+    path = str(tmp_path / "raced.duckdb")
+    old = duckdb.connect(path)
+    old.execute("CREATE SCHEMA _cdc_flight")
+    old.execute(
+        "CREATE TABLE _cdc_flight.heartbeat (pipeline VARCHAR, runner_id VARCHAR, "
+        "beat_at TIMESTAMPTZ, phase VARCHAR)"
+    )
+    old.close()
+
+    fresh = duckdb.connect(path)
+
+    class _RacedBy:
+        """Adds the column behind our back, then reports the ALTER as failed."""
+
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, *a, **k):
+            if "ADD COLUMN" in str(sql):
+                self._real.execute(sql)
+                raise RuntimeError("a concurrent runner added it first")
+            return self._real.execute(sql, *a, **k)
+
+    try:
+        dest_mod.ensure_control_schema(_RacedBy(fresh))  # must not raise
+        columns = {
+            str(row[0])
+            for row in fresh.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = '_cdc_flight' AND table_name = 'heartbeat'"
+            ).fetchall()
+        }
+        assert {"phase_since", "terminal_reason", "phase_history"} <= columns
+    finally:
+        fresh.close()

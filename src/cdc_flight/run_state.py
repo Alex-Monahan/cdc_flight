@@ -32,6 +32,21 @@ commit→ack window. The binding principle is that the window between `COMMIT` a
 acknowledgement contains nothing but the acknowledgement; an observability write there
 would be exactly the unrelated work that principle excludes. Every write is wrapped:
 a heartbeat that cannot be written must never fail a run that is otherwise correct.
+
+Two parts of that used to be aspiration rather than mechanism (Codex r1 MAJOR-3):
+
+* **the window is now a wall-clock exclusion, not a program-order one.** The phase
+  writer runs on the *supervisor's* thread, and `max_seconds` / engine error /
+  source-dark all break out of the supervision loop and write `draining` without asking
+  whether the engine thread happens to be between `COMMIT` and `markBatchFinished()`.
+  `COMMIT_ACK` is entered by the applier around exactly that interval; a phase write
+  that lands inside it is **dropped**, never deferred-with-a-lock and never blocked,
+  because the one thing an observability writer must not do is make the acknowledgement
+  wait. The next transition rewrites the whole row, so nothing is lost but a timestamp.
+* **there is no fallback to the primary connection.** `con.cursor()` failing used to set
+  `_sink = con`, so a destination without cursors got phase writes on the applier's own
+  connection, inside its open transaction, from another thread. The honest degradation
+  is no row at all.
 """
 
 from __future__ import annotations
@@ -52,7 +67,47 @@ from .states import IllegalTransition
 
 log = logging.getLogger("cdc_flight.run_state")
 
-__all__ = ["RunOutcome", "RunPhaseWriter"]
+__all__ = ["COMMIT_ACK", "RunOutcome", "RunPhaseWriter"]
+
+
+class _CommitAckWindow:
+    """The interval between `COMMIT` and Debezium's acknowledgement, as a flag.
+
+    Deliberately two plain attribute assignments and no lock: it is entered and left on
+    the applier's own thread around the one sequence the whole design says must contain
+    nothing else, and taking a mutex there would be exactly the unrelated work the
+    principle excludes. Attribute assignment is atomic under the GIL, readers only ever
+    ask "is it set right now", and a reader that loses the race by a microsecond drops a
+    phase write it did not have to drop — which costs a timestamp, not correctness.
+    """
+
+    __slots__ = ("_active", "dropped_writes")
+
+    def __init__(self) -> None:
+        self._active = False
+        #: how many observability writes this process declined because of the window.
+        #: Surfaced in the run summary, so "we never wrote inside it" is measured.
+        self.dropped_writes = 0
+
+    def enter(self) -> None:
+        self._active = True
+
+    def leave(self) -> None:
+        self._active = False
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def reset(self) -> None:
+        """Test seam."""
+        self._active = False
+        self.dropped_writes = 0
+
+
+#: Process-global because the applier and the supervisor are different threads of the
+#: same run and there is exactly one applier per run.
+COMMIT_ACK = _CommitAckWindow()
 
 
 class RunOutcome:
@@ -120,11 +175,17 @@ class RunPhaseWriter:
     is not written.
     """
 
-    def __init__(self, con, *, pipeline: str, runner_id: str) -> None:
+    def __init__(
+        self, con, *, pipeline: str, runner_id: str, outcome: RunOutcome | None = None
+    ) -> None:
         self.pipeline = pipeline
         self.runner_id = runner_id
         self.phase = PHASE_STARTING
-        self.outcome = RunOutcome()
+        #: The run's ONE outcome. `pipeline.run()` hands the same object to
+        #: `supervisor.run_engine_bounded`, so `last_run.json`'s `stop_reason` and the
+        #: destination heartbeat's `terminal_reason` are two projections of one value
+        #: rather than two objects that were free to disagree (Codex r1 MAJOR-2).
+        self.outcome = outcome if outcome is not None else RunOutcome()
         self.transitions: list[str] = [PHASE_STARTING]
         self.independent = False
         self._sink = None
@@ -133,11 +194,17 @@ class RunPhaseWriter:
             self._sink = con.cursor()
             self.independent = True
         except Exception:  # pragma: no cover - a destination without cursors
+            # NOT `self._sink = con`. Writing phases on the applier's own connection
+            # puts an observability statement inside its open transaction, on another
+            # thread, which is what the transaction discipline forbids (Codex r1
+            # MAJOR-3). No independent connection means no row; the phase is still
+            # tracked (and edge-checked) in memory.
             log.warning(
                 "could not open an independent connection for the run-phase heartbeat; "
-                "the phase will be tracked in memory only", exc_info=True,
+                "the phase will be tracked in memory only and NOT written",
+                exc_info=True,
             )
-            self._sink = con
+            self._sink = None
         self._write(PHASE_STARTING, insert=True)
 
     # -- phases ------------------------------------------------------------- #
@@ -184,6 +251,19 @@ class RunPhaseWriter:
     def _write(self, phase: str, *, insert: bool = False) -> None:
         if self._sink is None:
             return
+        if COMMIT_ACK.active:
+            # The binding principle, enforced in wall-clock rather than in program
+            # order (Codex r1 MAJOR-3). The engine thread is between `COMMIT` and
+            # `markBatchFinished()`; this write is DROPPED rather than deferred behind a
+            # lock, because an observability writer must never be able to make the
+            # acknowledgement wait. Every write states the whole row, so the next
+            # transition restores it.
+            COMMIT_ACK.dropped_writes += 1
+            log.debug(
+                "dropped the %r phase write: the applier is inside the commit->ack "
+                "window", phase,
+            )
+            return
         try:
             from .destination import now
 
@@ -227,6 +307,10 @@ class RunPhaseWriter:
             "run_outcome": self.outcome.value,
             "heartbeat_independent": self.independent,
         }
+        if COMMIT_ACK.dropped_writes:
+            # Evidence, not decoration: it is the count of times the commit->ack
+            # exclusion actually fired.
+            out["phase_writes_dropped_in_commit_ack"] = COMMIT_ACK.dropped_writes
         if self.outcome.refusals:
             # A49's guard, as evidence rather than as a comment.
             out["outcome_downgrades_refused"] = [

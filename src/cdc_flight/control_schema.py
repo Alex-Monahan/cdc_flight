@@ -163,6 +163,16 @@ CONTROL_DDL = [
             current_wal_lsn    BIGINT,
             durable_lsn        BIGINT,
             observed_at        TIMESTAMPTZ NOT NULL,
+            -- The VERDICT, written atomically with the observation it was computed
+            -- from (Codex r1 MAJOR-5 / open question 3). It used to exist only in
+            -- `last_run.json`, so a destination could not explain why a rebuild had
+            -- started - and the answer to "why is this table being re-snapshotted"
+            -- lived on the filesystem of whichever host happened to run it. Validated
+            -- through `machines.SLOT_VERDICTS` at construction; a typed classification,
+            -- not a state machine, because nothing moves through these values.
+            verdict            VARCHAR,
+            verdict_message    VARCHAR,
+            verdict_at         TIMESTAMPTZ,
             PRIMARY KEY (pipeline, slot_name)
         )""",
     # rubric 1.8 / 4.7. The durable journal of an acquisition recovery in progress.
@@ -191,6 +201,13 @@ CONTROL_DDL = [
             forget_catalog    BOOLEAN     NOT NULL DEFAULT false,
             tables_marked     BIGINT      NOT NULL DEFAULT 0,
             message           VARCHAR,
+            -- The captured set this recovery took responsibility for, as JSON. Its
+            -- completion predicate is a statement about THIS obligation, not about
+            -- whatever the destination happens to hold when the run ends (Codex r1
+            -- MAJOR-5).
+            captured_json     VARCHAR,
+            -- `--reset-state` only: the Debezium scratch directory the reset clears.
+            state_dir         VARCHAR,
             requested_at      TIMESTAMPTZ NOT NULL,
             updated_at        TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (pipeline, namespace)
@@ -249,50 +266,96 @@ _COMMIT_LOG_COLUMNS = (
 )
 
 
-#: Columns added to `heartbeat` after it first shipped. `CREATE TABLE IF NOT EXISTS`
-#: cannot add a column, and the table was created (empty, writer-less) one round ago, so
-#: a destination that already has it - including the shared MotherDuck development
-#: database - would otherwise reject every run-phase write with "column not found".
-_HEARTBEAT_ADDED_COLUMNS = (
-    ("phase_since", "TIMESTAMPTZ"),
-    ("terminal_reason", "VARCHAR"),
-    ("phase_history", "VARCHAR"),
-)
+class ControlSchemaFailed(RuntimeError):
+    """A control-schema migration could not be shown to have happened.
+
+    Loud on purpose (Codex r1 MINOR-1). Every `ALTER` exception used to be read as "a
+    concurrent runner won the race", with no re-check: a permission failure, an
+    unsupported DDL, a network error or a real MotherDuck error all looked like success,
+    and the writer that depends on the column then failed silently on every write.
+    """
+
+
+#: Columns added to control tables after they first shipped. `CREATE TABLE IF NOT
+#: EXISTS` cannot add a column, and these tables already exist on destinations that
+#: have run an earlier version - including the shared MotherDuck development database -
+#: so without this every write naming a new column would fail with "column not found".
+_ADDED_COLUMNS = {
+    "heartbeat": (
+        ("phase_since", "TIMESTAMPTZ"),
+        ("terminal_reason", "VARCHAR"),
+        ("phase_history", "VARCHAR"),
+    ),
+    "recovery_state": (
+        ("captured_json", "VARCHAR"),
+        ("state_dir", "VARCHAR"),
+    ),
+    "slot_state": (
+        ("verdict", "VARCHAR"),
+        ("verdict_message", "VARCHAR"),
+        ("verdict_at", "TIMESTAMPTZ"),
+    ),
+}
 
 
 def ensure_control_schema(con) -> None:
     _migrate_commit_log_key(con)
     for statement in CONTROL_DDL:
         con.execute(statement)
-    _migrate_heartbeat_columns(con)
+    for table, columns in _ADDED_COLUMNS.items():
+        _migrate_added_columns(con, table, columns)
 
 
-def _migrate_heartbeat_columns(con) -> None:
-    """Add the run-phase columns to an already-created `heartbeat`. Idempotent."""
+def _table_columns(con, table: str) -> set[str] | None:
     try:
-        existing = {
+        return {
             str(row[0])
             for row in con.execute(
                 "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema = ? AND table_name = 'heartbeat'",
-                [CONTROL_SCHEMA],
+                "WHERE table_schema = ? AND table_name = ?",
+                [CONTROL_SCHEMA, table],
             ).fetchall()
         }
     except Exception:  # pragma: no cover - a destination without information_schema
-        log.debug("could not read heartbeat columns", exc_info=True)
-        return
+        log.debug("could not read %s columns", table, exc_info=True)
+        return None
+
+
+def _migrate_added_columns(con, table: str, columns: tuple[tuple[str, str], ...]) -> None:
+    """Add late-arriving columns to an already-created control table. Idempotent.
+
+    A failed `ALTER` is **re-checked, not assumed benign**: the only reading of the
+    exception that is safe to step over is "the column is there now", and the way to
+    know that is to look. Anything else raises, because the alternative is a writer that
+    silently fails on every statement for the life of the destination (Codex r1 MINOR-1).
+    """
+    existing = _table_columns(con, table)
     if not existing:
         return
-    for column, sql_type in _HEARTBEAT_ADDED_COLUMNS:
+    for column, sql_type in columns:
         if column in existing:
             continue
-        log.warning("adding %s.heartbeat.%s", CONTROL_SCHEMA, column)
+        log.warning("adding %s.%s.%s", CONTROL_SCHEMA, table, column)
         try:
             con.execute(
-                f"ALTER TABLE {CONTROL_SCHEMA}.heartbeat ADD COLUMN {column} {sql_type}"
+                f"ALTER TABLE {CONTROL_SCHEMA}.{table} ADD COLUMN {column} {sql_type}"
             )
-        except Exception:  # pragma: no cover - a concurrent runner won the race
-            log.debug("could not add heartbeat.%s", column, exc_info=True)
+        except Exception as exc:
+            after = _table_columns(con, table)
+            if after is not None and column in after:
+                # The only benign reading: a concurrent runner added it between our
+                # read and our ALTER. Verified rather than assumed.
+                log.info(
+                    "%s.%s.%s already existed by the time the ALTER ran (a concurrent "
+                    "runner won the race)", CONTROL_SCHEMA, table, column,
+                )
+                continue
+            raise ControlSchemaFailed(
+                f"could not add {CONTROL_SCHEMA}.{table}.{column} ({exc}), and it is "
+                "still absent. Refusing to continue: every write naming that column "
+                "would fail silently for the life of this destination. Grant the DDL "
+                f"privilege, or drop {CONTROL_SCHEMA}.{table} if it is empty."
+            ) from exc
 
 
 def _commit_log_primary_key(con) -> tuple[str, ...] | None:
