@@ -14,6 +14,8 @@ the JVM and the snapshot are paid for once:
 | T2 | insert 7001, rename it, `SET id = 7002`, then update it again | one customer, 7002, `name='Renamed'` |
 | T3 | `DELETE … WHERE id = 9001; UPDATE … SET id = 9001 WHERE id = 7002` | 9001 = the renamed row |
 | T4 | `UPDATE app.pk_demo SET id = id + 1` under a DEFERRABLE primary key | `{2, 3}` |
+| T5 | move a row onto a key another row holds, then move it off again | the *other* row survives under that key |
+| T6 | move two rows onto ONE key, then delete one of them | the other survives under it |
 
 Customer 3 is chosen deliberately: `app.orders` has a foreign key to
 `app.customers (id)` with `ON DELETE CASCADE` and no `ON UPDATE`, so Postgres
@@ -82,6 +84,31 @@ def pk_scenario(sandbox):
     )
     # T4 — a permutation Postgres only allows because the key check is deferred.
     box.sql("UPDATE app.pk_demo SET id = id + 1", one_transaction=True)
+    # T5 / T6 — the two shapes the 1.4/1.5 review round reproduced as silent loss,
+    # driven through real Postgres rather than constructed records. Both need a
+    # DEFERRABLE key (two rows transiently wear one key), which is why they live on
+    # `app.pk_demo` with REPLICA IDENTITY FULL.
+    box.sql("INSERT INTO app.pk_demo (id, label) VALUES (10, 'x'), (11, 'y')")
+    # T5, Opus BLOCKER-2: row x moves onto key 11 (which y holds), then off to 12.
+    # Truth: y survives at 11 and x is at 12. The old fold kept x at 11 and lost y.
+    box.sql(
+        [
+            "UPDATE app.pk_demo SET id = 11 WHERE label = 'x'",
+            "UPDATE app.pk_demo SET id = 12 WHERE label = 'x'",
+        ],
+        one_transaction=True,
+    )
+    # T6, Codex finding 1's second case: two rows move onto ONE key, then one of them
+    # is deleted. Truth: the other survives under that key. The old fold emptied it.
+    box.sql("INSERT INTO app.pk_demo (id, label) VALUES (20, 'p'), (21, 'q')")
+    box.sql(
+        [
+            "UPDATE app.pk_demo SET id = 30 WHERE label = 'p'",
+            "UPDATE app.pk_demo SET id = 30 WHERE label = 'q'",
+            "DELETE FROM app.pk_demo WHERE id = 30 AND label = 'p'",
+        ],
+        one_transaction=True,
+    )
 
     streamed = box.run(max_seconds=150, min_records=1)
     try:
@@ -154,11 +181,50 @@ def test_the_moved_row_keeps_the_values_it_had_after_the_move(pk_scenario):
 def test_a_deferred_key_permutation_lands_both_rows(pk_scenario):
     """`UPDATE app.pk_demo SET id = id + 1` — the collision case Postgres allows."""
     box = pk_scenario["box"]
-    assert _source(box, "SELECT id, label FROM app.pk_demo ORDER BY id") == [(2, "a"), (3, "b")]
-    assert box.duck_query(f"SELECT id, label FROM {box.table(PK_DEMO)} ORDER BY id") == [
-        (2, "a"),
-        (3, "b"),
-    ]
+    assert box.duck_query(
+        f"SELECT id, label FROM {box.table(PK_DEMO)} WHERE id IN (2, 3) ORDER BY id"
+    ) == [(2, "a"), (3, "b")]
+
+
+def test_the_whole_deferred_key_table_matches_postgres_row_for_row(pk_scenario):
+    """The load-bearing assertion of this module, and the one the review round forced.
+
+    `app.pk_demo` carries every shape that made the old fold lose or duplicate a row:
+    the `id = id + 1` permutation, a row moved onto a key another row holds and then
+    moved off it (Opus BLOCKER-2), and two rows moved onto ONE key with one of them
+    then deleted (Codex finding 1's second case). **Equality with the source**, not
+    "no duplicate key": the defects this replaces produced destinations that were
+    perfectly unique and wrong.
+    """
+    box = pk_scenario["box"]
+    source = _source(box, "SELECT id, label FROM app.pk_demo ORDER BY id")
+    assert box.duck_query(
+        f"SELECT id, label FROM {box.table(PK_DEMO)} ORDER BY id"
+    ) == source
+    # Stated explicitly too, so a change in Postgres's own behaviour is visible rather
+    # than absorbed into "they still agree".
+    assert source == [(2, "a"), (3, "b"), (11, "y"), (12, "x"), (30, "q")]
+
+
+def test_the_moved_row_did_not_evict_the_row_that_already_held_the_key(pk_scenario):
+    """Opus BLOCKER-2, end to end. Row `y` was never touched by the source, so the
+    destination must still hold the row it always had under key 11 — the group touched
+    that key and must nonetheless leave it alone."""
+    box = pk_scenario["box"]
+    assert box.duck_query(
+        f"SELECT label FROM {box.table(PK_DEMO)} WHERE id = 11"
+    ) == [("y",)]
+    assert box.duck_query(
+        f"SELECT count(*) FROM {box.table(PK_DEMO)} WHERE label = 'x'"
+    ) == [(1,)]
+
+
+def test_two_rows_on_one_key_with_one_deleted_keeps_the_other(pk_scenario):
+    """Codex finding 1's second case, end to end. Measured before the fix: empty."""
+    box = pk_scenario["box"]
+    assert box.duck_query(
+        f"SELECT label FROM {box.table(PK_DEMO)} WHERE id = 30"
+    ) == [("q",)]
 
 
 def test_a_key_update_on_a_table_with_an_array_column_stays_one_table(pk_scenario):
