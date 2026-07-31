@@ -137,7 +137,6 @@ class Applier:
         self._close_requested = False
         self._txn_open = False
         self._spill_commit_id: int | None = None
-        self._spill_rows = 0
         self._pending_verification: tuple | None = None
 
         self._created_in_txn: set[str] = set()
@@ -370,7 +369,6 @@ class Applier:
         # `.clear()`, not a fresh set: `SnapshotCoordinator` holds the same object.
         self._created_in_txn.clear()
         self._spill_commit_id = None
-        self._spill_rows = 0
 
     # ------------------------------------------------------------------ #
     # the transaction
@@ -381,7 +379,7 @@ class Applier:
             return
         commit_id = self._spill_commit_id or self._next_commit_id
         opened_at = destination.now()
-        # NOT `or self._spill_rows > 0`: staged rows belonging only to *fenced*
+        # NOT `or spill.rows > 0`: staged rows belonging only to *fenced*
         # units are about to be discarded, and counting them made a group with no
         # applicable content a "data group", which shifts every `<nth>`-indexed
         # fault anchor by one (Codex 5).
@@ -672,7 +670,6 @@ class Applier:
 
         if staged_units:
             self.spill.clear(commit_id)
-            self._spill_rows = 0
 
         if swap_all:
             swaps = self.snapshots.states()
@@ -763,7 +760,6 @@ class Applier:
         staged = self.spill.stage(
             commit_id=commit_id, unit_seq=unit_seq, prepared=prepared
         )
-        self._spill_rows += staged
         self.spilled_events += staged
         maybe_crash("spill", self.data_commit_groups + 1)
         return len(events)

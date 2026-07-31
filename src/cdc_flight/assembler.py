@@ -684,7 +684,3 @@ class TransactionAssembler:
             self._chunk = None
         self.discarded_tail_events += discarded
         return discarded
-
-    def close_snapshot_chunk(self) -> list[CompleteUnit]:
-        """Emit the buffered snapshot chunk without claiming the snapshot ended."""
-        return self._close_chunk(last_for_table=False)

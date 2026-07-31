@@ -2017,6 +2017,8 @@ each. None of them is a loss or duplication path.
 | Keyless tables are a changelog, not current state (A12) | 8.1 / 8.2 | unchanged, and it is what makes 1.2 measurable at all. |
 | Spill throughput against MotherDuck | 5.3 | correctness first; the local 200 000-event measurement stands (A16). |
 | Probes not migrated to the applier | — | they are baseline-era evidence and `RUBRIC_STATUS.md` now labels them as such where it cites them for §1. |
+| Codex's note that `naming.destination_table()` is not injective (two source tables can normalise to one destination name) | 2.3 | not reachable with the captured schema, and a collision registry belongs with automatic table discovery. The narrower case Codex asked to pin - a captured table whose topic collides with `<prefix>.transaction` - is a start-up assertion now (`assert_no_internal_topic_collision`), so the silent-loss shape is closed even though the general injectivity question is not. |
+| Keyless update/delete acceptance tests beyond op-mix coverage | 8.1 / 8.2 | `test_e2e_duckdb.py` pins the op mix (`{"r":4,"c":6,"u":4,"d":2}`) and A12 states plainly that the table is a changelog; what "correct update/delete" *means* for a keyless table is the current-state question 8.1/8.2 own. |
 
 ### A29 — module decomposition (Codex 8)
 
