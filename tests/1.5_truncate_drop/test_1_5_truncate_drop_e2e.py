@@ -209,10 +209,16 @@ def test_the_catalog_watcher_recorded_the_relations_it_is_watching(truncate_scen
 
 
 def test_the_fence_marker_did_not_break_the_transaction_assembler(truncate_scenario):
-    """The watcher writes a non-transactional `pg_logical_emit_message` to guarantee
-    an LSN past the DDL flows. Those arrive as `op="m"` records, and Debezium counts
-    *transactional* messages in `END.event_count` but not these — so if the assembler
-    counted them the run would fail hard. It did not."""
+    """The watcher writes a **transactional** `pg_logical_emit_message(true, …)` to
+    guarantee an LSN past the DDL flows (`cdc_flight.source_marker` records the
+    measurement that makes `true` load-bearing: a non-transactional message does not
+    end `WalPositionLocator.resumeFromLsn`'s search after a restart, so a quiet run
+    delivered `records=0` and never applied the drop).
+
+    A transactional message arrives as BEGIN + `op="m"` + END and Debezium DOES count
+    it in `END.event_count`, so the assembler has to prove that unit whole through its
+    `message_count` pseudo-entry - if it did not, every fenced run would fail hard on
+    the completeness rule. It did not."""
     assert truncate_scenario["streamed"]["ok"] is True
     assert truncate_scenario["settled"]["ok"] is True
     assert truncate_scenario["streamed"].get("catalog_markers", 0) >= 1

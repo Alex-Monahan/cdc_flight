@@ -242,8 +242,8 @@ correct assumptions in the notes below:
 | 1.1 | Delivery guarantees, tables WITH a primary key | ~~3~~ → **5** | Exactly-once by construction (Invariant O), with the identity enforced by a destination `PRIMARY KEY`. Crash at six commit-group anchors incl. `spill` and a true between-table `mid_apply`, plus MotherDuck. |
 | 1.2 | Delivery guarantees, tables WITHOUT a primary key | ~~3~~ → **5** | Keyless rows are keyed on a connector-derived `cdcf_event_id` whose ordinal contract is enforced at the boundary, so two identical source rows survive and a replay does not. |
 | 1.3 | CDC changes atomic in MotherDuck | ~~1~~ → **5** | A commit group is an integral number of whole multi-table Postgres transactions, proven whole in every storage mode; a concurrent MotherDuck observer never sees a partial one, including across an injected crash. |
-| 1.4 | Primary-key update handled correctly | ~~2~~ → **5** | The `d(old)`/`c(new)` pair is one transaction and a commit group holds whole transactions, so the move is atomic by construction; the fold now asks the destination which row a re-used key belongs to, which is what closes the deferred-permutation loss and the key-changing-`u` duplication. |
-| 1.5 | TRUNCATE / DROP propagate | ~~1~~ → **5** | `skipped.operations=none` brings truncates through; they empty the destination table inside the commit group (multi-table `CASCADE` in one `COMMIT`). `DROP TABLE` is not in the stream at all, so the source catalog is polled, the action is fenced on an LSN with a transactional WAL marker, and both are audited in `_cdc_flight.table_events`. |
+| 1.4 | Primary-key update handled correctly | ~~2~~ → **5** | The `d(old)`/`c(new)` pair is one transaction and a commit group holds whole transactions, so the move is atomic by construction. The fold models **physical rows** rather than keys, so a key worn by two rows inside a transaction (or freed and re-taken across two transactions of one group) is expressible; where the before-image cannot attribute a delete the group is refused rather than folded. Five reproduced silent-loss/duplication orderings are now equality tests. |
+| 1.5 | TRUNCATE / DROP propagate | ~~1~~ → **4** | `skipped.operations=none` brings truncates through; **one** dispatcher applies them in every storage mode and each truncate's audit records what *it* removed. `DROP TABLE` is not in the stream, so the source catalog is polled and the action passes six guards (fence, zero-relations, confirmation, supersession, revalidation, circuit breaker) before any DDL. Not 5: a dropped-and-recreated relation cannot be re-snapshotted here, so its destination table is dropped and marked `awaiting_snapshot` — loud, but incomplete (2.3/3.4 owns the 5). |
 | 1.6 | Snapshot/backfill consistent with CDC | 3 | Consistent on the healthy path (proven), and an interrupted snapshot no longer leaves a partial table behind (shadow + swap). Still 3: the *restart* re-reads from scratch, and consistency across a re-snapshot is 1.6's own task. |
 | 1.7 | Failures do not cause correctness issues | ~~1~~ → **3** | Deterministic injection at seven protocol anchors, exercised at six in the default suite plus five interleavings and two against MotherDuck; duplication is impossible by construction. Not 5: nothing injects faults into the destination/network layer or the WAL-message surface. |
 | 1.8 | Externally-advanced slot detected → backfill | 1 | **Proven silent data loss**: 31 change events skipped, run reported `records: 0`, exit 0. |
@@ -283,13 +283,20 @@ correct assumptions in the notes below:
 **Baseline average: 66 / 40 = 1.65 out of 5.** Items at 5 in the baseline:
 **1 of 40** (7.1).
 
-**Current average (this branch): 83 / 40 = 2.08 out of 5.** Items at 5: **6 of
-40** (1.1, 1.2, 1.3, 1.4, 1.5, 7.1). Distribution: 22 at 1, 3 at 2, 9 at 3, 0 at 4,
-6 at 5. Distance to target: **117 rubric points**.
+**Current average (this branch): 82 / 40 = 2.05 out of 5.** Items at 5: **5 of
+40** (1.1, 1.2, 1.3, 1.4, 7.1). Distribution: 22 at 1, 3 at 2, 9 at 3, 1 at 4,
+5 at 5. Distance to target: **118 rubric points**.
 
-The delta is +17 points over six items: 1.1 (3 -> 5), 1.2 (3 -> 5), 1.3 (1 -> 5),
-1.4 (2 -> 5), 1.5 (1 -> 5), 1.7 (1 -> 3). Every other row is still the baseline
+The delta is +16 points over six items: 1.1 (3 -> 5), 1.2 (3 -> 5), 1.3 (1 -> 5),
+1.4 (2 -> 5), 1.5 (1 -> 4), 1.7 (1 -> 3). Every other row is still the baseline
 score, and the detail sections say so.
+
+**1.5 was claimed as 5 and is corrected to 4 here** (2026-07-31). Two independent
+reviews scored the same branch 1/5 and 3/5 for 1.4 and 2/5 and 4/5 for 1.5, with
+executable counterexamples. Every one of those is closed and tested, but the honest
+reading of "replicated just like Postgres handles them" does not include "the
+destination table is dropped and a human must trigger a backfill", which is what a
+recreated relation still means here.
 
 ---
 
@@ -506,6 +513,15 @@ a time trigger, and the offset write (1.1) has to ride in the same transaction.
 
 `error=1, duplication=2, correctly deleted and inserted or updated=5`
 
+**Rescored 2026-07-31 after two independent reviews reproduced silent-loss paths.**
+The previous 5 was not defensible: Codex scored this **1/5** and Opus **3/5**, both with
+executable counterexamples. Five orderings were wrong, all of them one defect, and the
+5 below is claimed only because every one of them is now a test that asserts
+source/destination *equality*. What changed is recorded in ADR §18/A35–A37, and A31 —
+the amendment that described the old fold — is marked **superseded**, including its
+falsifier list, which pointed at a shape that worked while the shape that failed sat
+next to it unnamed.
+
 #### What the source actually emits (measured, not assumed)
 
 A key-changing `UPDATE` never reaches us as an `u`. Whenever the old key is
@@ -526,32 +542,72 @@ drives the shipped applier with `commit_max_events=1`, `commit_max_bytes=1`,
 `commit_max_age=0` - a commit trigger on **every single event** - and shows the group
 still cannot close between the two.
 
-#### What did need code, and was measured wrong first
+#### The fold: a key is not a row (the correction)
 
-The fold collapses a group by key, and a key can be worn by two different rows inside
-one Postgres transaction. The event stream is then ambiguous:
+The old fold indexed the plan by key and asked the destination one question: *did this
+key exist before this commit group?* Both halves were wrong. A key can be worn by
+several rows at once inside a transaction (a **deferred** unique constraint), and a key
+can be freed and re-taken across the transactions of one commit group — so no
+group-level or even transaction-level question about a *key* can decide what a delete
+removed. What decides it is which physical **row** the delete's before-image describes.
 
-| one transaction | events | Postgres truth | old fold |
+`table_work` therefore holds `live[key] = [entry, …]` where an entry is a row or
+`START` (the row the destination already held), and each event is one physical
+operation: `c`/`r` append, `u` replaces the entry its before-image identifies, `d`
+removes it, `t` discards every entry *including* `START`. At group end a key holds at
+most one row — the source enforces uniqueness at every transaction boundary, and
+`end_transaction` asserts it per unit — and the three cases are `[row]` → delete the key
+and insert, `[]` → delete the key, **`[START]` → leave it alone** (the destination's own
+row survived; deleting it as a "touched key" was one of the measured losses, and not
+rewriting it also keeps its original `cdcf_commit_id`).
+
+The five orderings this fixes, each now a test asserting equality with Postgres:
+
+| ordering | Postgres | old fold | reproduced by |
 |---|---|---|---|
-| `UPDATE t SET id = id + 1` over rows 1,2 (DEFERRABLE key) | `d(1) c(2) d(2) c(3)` | `{2, 3}` | `{3}` - **a lost row** |
-| `UPDATE … id=2 WHERE id=1; UPDATE … id=3 WHERE id=2` | `d(1) c(2) d(2) c(3)` | `{3}` | `{3}` ✓ |
-| `c(1)` then a key-changing `u(1 -> 2)` | | `{2}` | `{1, 2}` - **duplication=2** |
+| T1 inserts key 2; T2 permutes `{1,2} -> {2,3}`; one group | `{2:a, 3:b}` | `{3:b}` — lost row | Codex 1 |
+| one txn `d(1,a) c(3,a) d(2,b) c(3,b) d(3,a)` (two rows on key 3) | `{3:b}` | `{}` — lost row | Codex 1 |
+| one txn `d(1,a) c(2,a) d(2,a) c(5,a)` (pre-group row `b` on key 2) | `{2:b, 5:a}` | `{2:a, 5:a}` — lost `b`, duplicated `a` | Opus B-2 |
+| one txn `TRUNCATE; INSERT 5; DELETE 5` | `{}` | `{5}` — spurious row | Opus B-1 |
+| T1 `TRUNCATE; INSERT 1`; T2 `DELETE 1`; one group | `{}` | `{1}` — zombie row | Codex 3 |
 
-Both are decided by one question: does the key this event removes belong to a row
-that existed *before* this commit group, or to a row the group itself inserted? The
-destination knows, so `table_work._remove` asks it - once per ambiguous key, cached,
-and never at all in a group without key reuse - and `TableWork.acquired` distinguishes
-"a new row moved onto this key" from "the row already here was updated".
+#### Where it cannot decide, it refuses
+
+Two entries compete only under a deferred constraint, and **a deferrable primary key is
+not a valid replica identity** (verified on the cluster: `relreplident='d'` but
+`pg_index.indisreplident=false`, and `UPDATE` fails with *"does not have a replica
+identity and publishes updates"* until `REPLICA IDENTITY FULL`). So wherever
+attribution is needed the full before-image is present. Comparison against `START` runs
+**at the destination**, with each value bound to the destination column's own type,
+because comparing a Debezium JSON value to a value that has been through DuckDB's type
+system in Python is not a comparison; Debezium's TOAST placeholder is excluded because
+it distinguishes nothing.
+
+Where the image cannot distinguish and only one row can really wear the key, the key
+collapses to empty (right for `INSERT (5,…); DELETE WHERE id=5` under `REPLICA IDENTITY
+DEFAULT`). Where two *concrete* rows compete and nothing can choose, `AmbiguousDelete`
+**fails the commit group** — the rubric's own scale puts an error above silent loss, and
+a rolled-back group replays for free. `test_an_unattributable_delete_fails_the_group_instead_of_folding_silently`
+pins that, including that the destination still holds the pre-group state afterwards.
 
 #### Evidence
 
-* `tests/1.4_pk_updates/test_1_4_pk_update_fold.py` - 20 tests, default suite, ~1 s.
-  The plain move, mixed with other changes to the same row, the freed-key collision,
-  the chain, the deferred permutation, both `u`-shaped variants, composite keys
-  (`app.audit_log`), two transactions in one group, a **spilled** unit whose `d` is
-  staged and whose `c` is in memory, and a fault at `begin` / `mid_apply` /
-  `pre_commit` around the move (the destination must stay on the OLD key, and the
-  replay must land it once).
+* `tests/1.4_pk_updates/test_1_4_fold_counterexamples.py` - **14 tests, default suite**,
+  the reproduced counterexamples plus the orderings both reviews verified as *correct*
+  and which the rewrite must not break: 3-ring and 4-ring rotations, a swap through a
+  temporary key, a delete matching two transiently identical rows, the ambiguous shape
+  under **spill**, over **two tables**, and **re-folded with fresh LSNs** so the fence
+  cannot help (a fold that is only correct once is not correct).
+* `tests/1.4_pk_updates/test_1_4_pk_update_fold.py` - 20 tests: the plain move, mixed
+  with other changes to the same row, the freed-key collision, the chain, the deferred
+  permutation, both `u`-shaped variants, composite keys (`app.audit_log`), two
+  transactions in one group, a spilled unit whose `d` is staged and whose `c` is in
+  memory, and a fault at `begin` / `mid_apply` / `pre_commit` around the move.
+* `tests/1.3_atomic_batches/test_1_3_rollback_resets_the_group.py` - **6 tests**: a
+  rolled-back group must not be folded a second time (Opus M-1, measured to lose a row
+  through exactly the ambiguous shape), must not contaminate the next group, and must
+  not leave `_created_in_txn` behind — which independently makes `write()` skip the
+  DELETE half of the merge.
 * `tests/1.4_pk_updates/test_1_4_pk_update_e2e.py` - one 18 s scenario against real
   Postgres and real Debezium: four transactions, row-for-row agreement with the
   source, no duplicate key, the old key gone, the moved row keeping its post-move
@@ -567,16 +623,25 @@ and never at all in a group without key reuse - and `TableWork.acquired` disting
   published table fails with *"cannot update table … because it does not have a
   replica identity and publishes updates"*. The deferred-permutation collision is
   therefore only reachable with `REPLICA IDENTITY FULL` (or another non-deferrable
-  unique index). The message key still comes from the primary key.
+  unique index). The message key still comes from the primary key. **This is load-bearing
+  for the fold**: it is why the disambiguating before-image is always available in the
+  only configuration where ambiguity is reachable.
 * `app.orders` references `app.customers (id)` with `ON DELETE CASCADE` and no
   `ON UPDATE`, so Postgres refuses a key update on a customer that has orders.
 
 #### Falsifiers (what would drop this score)
 
-* A transaction that transiently violates uniqueness in a way the pre-group probe
-  cannot resolve - three rows rotating through one key with a *deferred* constraint
-  and no full before-image would need row-level identity we do not have. The probe
-  answers "pre-group or in-group", not "which of two in-group rows".
+* **A deferred-constraint transaction on a TOAST-heavy table.** If every non-key column
+  of a before-image is `__debezium_unavailable_value` *and* two concrete rows compete
+  for the key, nothing can attribute the delete and the group fails loudly. That is the
+  designed outcome, not loss, but a run that fails is not a run that replicated. Rubric
+  2.6 owns making TOAST images complete.
+* **A destination whose type coercion disagrees with the bind.** `start_matches`
+  compares at the destination with `IS NOT DISTINCT FROM` on the column's own type. If
+  a destination coerced a bound value differently from the stored one, an attribution
+  could match nothing and the group would fail (loudly, not silently). Verified on
+  DuckDB and MotherDuck for the types the suite exercises; not proven for every type in
+  2.4's list.
 * Array/JSON **child tables**: this applier lands an array as one JSON column
   (asserted by `test_a_key_update_on_a_table_with_an_array_column_stays_one_table`).
   If rubric 2.4 introduces `<root>__tags` child tables, the key move must move the
@@ -591,9 +656,22 @@ the destination was append-only. That is the `duplication=2` this item scored.
 
 ---
 
-### 1.5 TRUNCATE and DROP TABLE propagate — **5 / 5**
+### 1.5 TRUNCATE and DROP TABLE propagate — **4 / 5**
 
 `silently ignored=1, logged=2, tombstones/soft delete=3, replicated faithfully=5`
+
+**Rescored 2026-07-31, conservatively, and deliberately not restored to 5.** Codex
+scored this **2/5** and Opus **4/5**. Every reproduced counterexample is closed (the
+storage-mode divergence, the cross-transaction zombie, the two-truncate audit alias, the
+stale-drop race, the missing ownership registry, the transactional alert), and the
+guards both reviews asked for are built and tested. It stays at 4 because of one thing
+neither review disputed and this branch cannot fix: **a dropped-and-recreated relation
+cannot be re-snapshotted here**, so the destination table is dropped and the rows
+inserted into the replacement before detection are gone. That is now *loud* rather than
+silent — `table_state.snapshot_state='awaiting_snapshot'`, an alert, and a line in
+`inspect` — but "the destination is incomplete and a human must trigger a backfill" is
+not "replicated just like Postgres handles them". The 5 belongs to whoever lands
+2.3/3.4's automatic re-snapshot.
 
 #### TRUNCATE
 
@@ -619,10 +697,30 @@ Three properties the events then need:
 2. it carries **no message key** (`EventDispatcher.java:526` sends truncates with a
    null key schema), and reading that as "this table is keyless" would give a keyed
    table the keyless identity for the rest of the group - `TableWork.identified` is
-   what prevents it;
-3. the fold drops what the group planned *before* it and keeps what came *after*:
-   Postgres removes rows the same transaction inserted, and `TRUNCATE t; INSERT …`
-   in one transaction leaves the inserted rows.
+   what prevents it. It must not clobber the cached identity either, or
+   `assert_identity_is_unique` is silently disarmed for the rest of the run
+   (Opus MINOR-3, fixed in `SchemaRegistry.ensure`);
+3. the fold drops what the group planned *before* it and keeps what came *after* -
+   and it must also record that the destination's **pre-group image is gone**, which is
+   what the old fold never did. That omission is the whole of Opus BLOCKER-1: a
+   post-truncate key reuse asked the destination "does this key exist?" and got `True`
+   from a row the truncate had already logically removed, because the `DELETE FROM` that
+   empties the table is issued much later, at write time.
+
+**One dispatcher, in every storage mode.** There used to be two: in-memory events
+carried the policy, the marker and the counters, while staged (spilled) events entered
+*below* that layer and unconditionally emptied the table. Measured with
+`unit_spill_events=1`: `truncate_mode=log` **emptied** the table, neither mode wrote a
+`table_events` row, and both counters stayed at zero. `planner.GroupPlan` is now the
+only entry point and does not know which representation an event arrived in;
+`test_1_5_truncate_storage_modes.py` is a `{memory, spill} x {replicate, log}` matrix
+over rows, marker, counters and `rows_removed`.
+
+**The audit is positional.** `TRUNCATE; INSERT 1 row; TRUNCATE` reported `rows_removed=3`
+on **both** markers, because each marker held a reference to the same mutable plan and
+the field was read only after the final write. Each truncate now records the rows *it*
+dropped, and the first one — the only one whose `DELETE FROM` reaches the destination's
+own rows — adds that count: `3` then `1`.
 
 The destination table is emptied with `DELETE FROM` **inside the commit group's
 transaction** (unambiguously transactional on DuckDB and MotherDuck), so
@@ -637,20 +735,44 @@ catalog on its own connection (default 10 s, `CDC_CATALOG_POLL_SECONDS`) for the
 facts logical decoding cannot give us - the relation `oid` and publication membership
 - and reports four things: `dropped`, `recreated` (same name, new oid),
 `unpublished` (**never** destructive: Postgres still holds those rows) and `new`
-(rubric 2.3's hook, recorded only). The observed oids are persisted in
-`_cdc_flight.source_relations` inside the commit group's transaction, which is what
-makes detection survive a restart, and persistence is never allowed to run ahead of a
-destructive action it implies.
+(rubric 2.3's hook, recorded only). It **observes and never decides**:
+`src/cdc_flight/catalog_apply.py` owns the policy, because the observation and the DDL
+are separated in time by the fence and that gap is where a stale fact becomes a wrong
+drop.
+
+**Six guards** (ADR §18/A38), in the order they run:
+
+| guard | refuses | the failure it closes |
+|---|---|---|
+| the LSN fence | applying before the destination consumed everything before the DDL | a zombie re-created by an in-flight event |
+| the zero-relations guard | acting on a poll that saw an empty schema | the wrong-database / mid-`pg_restore` signature |
+| confirmation (`CDC_DROP_CONFIRM_POLLS=2`) | acting on a single observation | a transient catalog read mid-DDL |
+| supersession | acting on an observation a later poll contradicted | dropping the destination table of a **live replacement relation** |
+| revalidation | acting without re-reading the source, and acting when it cannot be read | the same, for a fence that opened long after detection |
+| the circuit breaker (`CDC_DROP_MAX_PER_POLL=1`) | destroying more than one relation at once | `DROP SCHEMA … CASCADE`, a DSN repointed at an empty database, a failover target |
+
+Revalidation fails **closed**: "I could not ask the source" is never read as "it is
+gone". The breaker refuses the **whole** set, never the first N, and raises a `critical`
+alert that survives a rollback. A `recreated` relation is dropped, alerted on, and
+marked `awaiting_snapshot` in `table_state`, which `inspect` and the run summary print.
+
+**Ownership.** "A replicated table absent from `pg_class` is always detected" was not
+durably true: the watcher seeds itself from `_cdc_flight.table_state`, and that row was
+written only by the snapshot coordinator — so a table first materialised by streaming
+DML had none, and a `DROP` while the pipeline was down left an orphan destination table
+no later poll could report. It is now written by whoever first creates the table, in the
+same transaction. For the same reason `--reset-state` no longer DELETEs `table_state`
+(it resets the snapshot fields in place): deleting it made that zombie **permanent**.
 
 **The fence.** A drop is discovered after the fact, so applying it immediately could
-delete rows an in-flight event would then re-add - a zombie table. Each *destructive*
-change carries the `pg_current_wal_lsn()` of its poll and the applier holds it until the
-resume point it is about to make durable reaches that LSN. On a quiet source nothing
-would ever advance it, so the watcher emits a **transactional**
-`pg_logical_emit_message` past the change (ADR D9's mechanism, one poll early) and keeps
-emitting one per poll while a destructive change is pending, which makes the fence
-self-healing. A `new` / `unpublished` / `republished` change removes nothing, so it is
-never fenced and never causes a write to the source.
+delete rows an in-flight event would then re-add. Each *destructive* change carries the
+`pg_current_wal_lsn()` of its poll and the applier holds it until the resume point it is
+about to make durable reaches that LSN. On a quiet source nothing would ever advance it,
+so `src/cdc_flight/source_marker.py` writes a **transactional**
+`pg_logical_emit_message(true, 'cdcf_catalog_fence', …)` past the change — one component,
+shared with D9's idle heartbeat (Opus Q3), owning the capability probe, the error state
+and a **write budget** (`CDC_CATALOG_MARKER_MAX=60`, so a fence that never opens cannot
+write one WAL record per poll for ever against a source we otherwise only read).
 
 That the marker is transactional is measured, not stylistic. A non-transactional one
 looks better (it stays out of every `END.event_count`) but does not end Debezium's
@@ -658,7 +780,18 @@ WAL-position search after a restart: `WalPositionLocator.resumeFromLsn` only sto
 a **COMMIT** past the stored LSN, and while it searches `skipMessage()` drops every
 record - including the marker. MEASURED 2026-07-31: a quiet run whose only new WAL was
 a non-transactional marker delivered `records=0`, sat 770 KB behind the source and
-never applied the drop; with a transactional marker it applies in about a second.
+never applied the drop; with a transactional marker it applies in about a second. That
+is a constraint on **D9 itself**, and ADR §9's heartbeat has been corrected to match.
+
+**A quiet run is honest about it.** Deferring a destructive action whose fence has not
+opened is the correct safety choice, and reporting `ok: true` while it is deferred is
+not. A run now performs a **synchronous final catalog poll** before shutting down (the
+watcher polls every 10 s while the idle window is 8 s, so a `DROP` otherwise could not
+be seen until the next scheduled run), holds the engine open for
+`CDC_CATALOG_DRAIN_SECONDS` so the change it just queued is fenced and applied by *this*
+run, and **fails** with `stop_reason=catalog_unresolved` if a destructive change is
+still pending at shutdown. Marker failures are preserved in `catalog_marker_error`
+rather than cleared by the next successful poll.
 
 #### What a truncate or a drop means for history
 
@@ -670,10 +803,15 @@ rather than trading one off:
 * `_cdc_flight.table_events` records every table-level event (`truncate`, `dropped`,
   `recreated`, `unpublished`, `new`) with its commit id, source LSN, transaction id
   and the number of rows the destination lost, written **inside the same transaction
-  as the data**, so the audit trail cannot describe an apply that rolled back;
-* destructive actions also raise an `_cdc_flight.alerts` row *outside* that
-  transaction (ADR §9.1), because "your destination table is gone" is the signal an
-  operator most needs to survive a rollback;
+  as the data**, so the audit trail cannot describe an apply that rolled back. The
+  count is asserted never to degrade to NULL for an applied truncate (Opus Q4) on
+  DuckDB and on MotherDuck;
+* destructive actions also raise an `_cdc_flight.alerts` row on an **independent
+  connection** (`destination.AlertSink`, `con.cursor()`), which is what ADR §9.1 always
+  claimed and the code did not do: it wrote on the applier's own connection inside the
+  open transaction, so a destructive change that kept *failing* to apply produced no
+  signal at all. Alerts are also classified — one that describes a refusal survives the
+  rollback, one that describes an applied action must not;
 * when 8.2 lands, a changelog table is append-only and is **never** emptied: it gains
   a truncate marker row derived from this same fact. That is the design decision, and
   it is why the marker carries the LSN and transaction id.
@@ -685,68 +823,101 @@ rather than trading one off:
 | `CDC_TRUNCATE_MODE` | `replicate` | `replicate` empties the destination (=5); `log` keeps the rows and records the marker (the rubric's "tombstone/soft delete" =3); `ignore` restores Debezium's skip |
 | `CDC_DROP_MODE` | `replicate` | `replicate` drops the destination table (=5); `log` records the marker only; `ignore` disables catalog polling |
 | `CDC_CATALOG_POLL_SECONDS` | `10` | poll interval (also 2.3's discovery interval) |
+| `CDC_DROP_CONFIRM_POLLS` | `2` | consecutive polls that must agree before a destructive change is queued |
+| `CDC_DROP_MAX_PER_POLL` | `1` | how many relations one commit group may destroy; the whole set is refused above it |
+| `CDC_DROP_ALLOW_MASS` | `0` | authorise a mass drop (an operator who really is replicating a `DROP SCHEMA`) |
+| `CDC_DROP_REVALIDATE` | `1` | re-read the relation immediately before destroying its destination table |
 | `CDC_CATALOG_MARKER` | `1` | emit the WAL fence marker on the source (writes go to the PRIMARY, per 7.2/D9) |
-| `CDC_CATALOG_GRACE` | `0` | never apply a DDL action the fence has not cleared |
+| `CDC_CATALOG_MARKER_MAX` | `60` | cap on fence markers per run while a change stays unresolved |
+| `CDC_CATALOG_DRAIN_SECONDS` | `30` | how long a quiet run holds the engine open for a change it just queued |
+| `CDC_CATALOG_GRACE` | `0` | never apply a DDL action the fence has not cleared. **A non-zero value is excluded from the structural correctness guarantee** (ADR §18/A38) and the run logs that at start-up |
 
 An unknown value for either mode is refused at start-up rather than logged, so a typo
 cannot silently restore "truncates are skipped".
 
 #### Evidence
 
-* `tests/1.5_truncate_drop/test_1_5_truncate_fold.py` - 19 tests, default suite, ~1 s:
-  multi-table atomicity, rows before/after the truncate, the keyless trap, the marker
-  and its row count, `truncate_mode=log`, a spilled truncate, a truncate of a table
-  the destination never held, a rolled-back truncate leaving every row *and* no
-  marker, the LSN fence (a drop is *not* applied while the destination is behind, and
-  is applied once a later record arrives), `recreated`, `unpublished`, `drop_mode=log`,
-  the alert, and a rolled-back drop staying pending.
-* `tests/1.5_truncate_drop/test_1_5_catalog_detection.py` - 22 tests: the comparison
-  in isolation, including the restart case (a replicated table absent from `pg_class`
-  **is** a drop even with no persisted oid - without that, a `DROP` between two runs
-  went unnoticed), that partitions are not discovery events, that `dirty` state is not
-  forgotten until the caller commits, and that a marker failure leaves the change
-  unapplied rather than forced.
+* `tests/1.5_truncate_drop/test_1_5_truncate_key_reuse.py` - **10 tests, default
+  suite**: both reproduced Opus BLOCKER-1 shapes (a spurious row that never healed; a
+  row present under two keys with an **ordinary** primary key), Codex 3's
+  cross-transaction zombie, the reverse orders, and the cross-transaction case under
+  **spill** and over **two tables**.
+* `tests/1.5_truncate_drop/test_1_5_truncate_storage_modes.py` - **15 tests**: the
+  `{memory, spill} x {replicate, log}` matrix over rows / marker / counters /
+  `rows_removed`, a lone spilled truncate, two truncates in one transaction reporting
+  `3` then `1`, per-table counts for a multi-table truncate, a keyless-table truncate,
+  and a fault at `spill` / `mid_apply` / `pre_commit` around a **staged** truncate
+  (every row kept, no marker, the staging table empty, and the replay exact).
+* `tests/1.5_truncate_drop/test_1_5_catalog_guards.py` - **18 tests**: one observation
+  is not enough; a relation that reappears cancels its pending drop (and a different
+  oid replaces it with a `recreated`); a relation that goes away cancels a pending
+  recreate; a live relation is never dropped; a source that cannot be re-read fails
+  closed; a watcher with no DSN refuses to query rather than falling back to libpq
+  defaults; two drops in one group are both refused with a `critical` alert; a poll that
+  saw an empty schema is discarded; **an alert about a refusal survives a rollback and
+  an alert about an applied drop does not**.
+* `tests/1.5_truncate_drop/test_1_5_ownership_and_honesty.py` - **10 tests**: streaming
+  DML registers ownership in the same transaction that creates the table, a rolled-back
+  group leaves neither, a watcher seeded from `table_state` detects a drop it never saw,
+  `--reset-state` keeps ownership and drops only the oids, the final catalog poll
+  happens, an unresolved destructive change fails the run, a marker failure is preserved
+  in the summary, and the marker write budget is bounded.
+* `tests/1.5_truncate_drop/test_1_5_truncate_fold.py` - 19 tests: multi-table
+  atomicity, rows before/after the truncate, the keyless trap, the marker and its row
+  count, `truncate_mode=log`, a truncate of a table the destination never held, a
+  rolled-back truncate leaving every row *and* no marker, the LSN fence, `recreated`
+  (with its `awaiting_snapshot` flag), `unpublished`, `drop_mode=log`, the alert, and a
+  rolled-back drop staying pending.
+* `tests/1.5_truncate_drop/test_1_5_catalog_detection.py` - 21 tests: the comparison in
+  isolation, including the restart case (a replicated table absent from `pg_class` **is**
+  a drop even with no persisted oid), that partitions are not discovery events, that
+  `dirty` state is not forgotten until the caller commits, and that a marker failure
+  leaves the change unapplied rather than forced.
 * `tests/1.5_truncate_drop/test_1_5_truncate_drop_e2e.py` - one 33 s scenario against
   real Postgres: `TRUNCATE parent CASCADE` plus inserts in one transaction (both
   tables emptied in **one** commit group, the inserts surviving), a real `DROP TABLE`
   detected/fenced/applied with its `source_relations` and `table_state` rows gone, the
   audit trail, the rest of the stream unaffected, and the fence marker not breaking
   the assembler.
-* `tests/1.5_truncate_drop/test_1_5_motherduck.py` (`motherduck`, ~60 s) - the truncate
-  and the drop against real MotherDuck, including that `DELETE FROM` reports its row
-  count there.
-* `tests/1.5_truncate_drop/test_1_5_drop_recreate.py` (`slow`, ~70 s) - the live gap
-  under `ignore`, the same truncate replicated, a `SIGKILL`-equivalent in the
-  commit->ack window of a truncating group (the replayed transaction leaves the table
-  empty), and drop-then-recreate with a **different schema** landing in a table with
-  the new shape and none of the old columns.
+* `tests/1.5_truncate_drop/test_1_5_motherduck.py` (`motherduck`) - the truncate and the
+  drop against real MotherDuck, that `DELETE FROM` reports its row count there, that
+  the alert sink really is an independent connection on a server-side transaction
+  implementation, that ownership survives — **and a second scenario** injecting
+  `pre_commit` on a truncating group: every row kept, no marker, then a replay landing
+  it exactly once (Codex's 9-point item 9).
+* `tests/1.5_truncate_drop/test_1_5_drop_recreate.py` (`slow`) - the live gap under
+  `ignore`, the same truncate replicated, a `SIGKILL`-equivalent in the commit->ack
+  window of a truncating group, and drop-then-recreate with a **different schema**.
 
-#### Falsifiers (what would drop this score)
+#### Falsifiers (what would drop this score — and what keeps it off 5)
 
-* **The recreate window.** A table dropped and recreated *between two polls*, with
-  rows inserted into the new table before the change is detected, loses those rows:
-  the destination table is dropped and only a re-snapshot brings them back. The marker
-  says so and an alert is raised, but automatic re-snapshotting is 2.3/3.4's work.
-  With `CDC_CATALOG_POLL_SECONDS=10` that window is up to ~10 s wide.
-* **Detection latency is a poll interval, not zero.** Between the `DROP` and the next
-  poll the destination table still exists.
-* **The fence needs a writable primary.** With `CDC_CATALOG_MARKER=0` (or no
-  permission to emit a message) a drop on an otherwise idle source stays pending
-  until some other event advances the resume point. That is deliberate - forcing it
-  would risk a zombie table - but it means 1.5 on a strictly read-only source is
-  "detected and logged", not "replicated".
-* **`DROP SCHEMA … CASCADE` + recreate** is faithfully replicated as a `recreated` per
-  table, which destroys the destination tables. That is correct and it is also how a
-  test harness reseed behaves, which is why `--reset-state` now clears
-  `source_relations` as well.
+* **No automatic re-snapshot for a recreated relation. This is why the score is 4.**
+  The destination table is dropped because it holds a *different* relation's rows, and
+  rows inserted into the replacement before detection are gone until someone backfills.
+  It is loud now (`awaiting_snapshot`, an alert, `inspect` output) rather than silent,
+  but faithful replication would rebuild it. Owned by **2.3 / 3.4**.
+* **A mass drop needs a human by default.** `DROP SCHEMA app CASCADE` is *not*
+  replicated automatically: the breaker refuses the set, alerts, and the run fails as
+  `catalog_unresolved` until an operator sets `CDC_DROP_ALLOW_MASS=1`. That is a
+  deliberate trade against "loss structurally impossible" and it is a divergence from
+  "replicated just like Postgres handles them".
+* **Detection latency is a poll interval plus a confirmation, not zero.** Between the
+  `DROP` and the second agreeing poll the destination table still exists.
+* **The fence needs a writable primary.** With `CDC_CATALOG_MARKER=0`, no permission, or
+  a read-only replica, a drop on an otherwise idle source stays pending — and the run
+  now **fails** rather than reporting success. 1.5 on a strictly read-only source is
+  "detected, logged and reported as a failure", not "replicated".
+* **`CDC_CATALOG_GRACE>0` is outside the guarantee.** It applies a destructive action
+  before the fence that makes it safe, and can therefore create the zombie table the
+  design says is impossible. Documented, warned at start-up, and never a default.
+* **Attribution can fail loudly on a TOAST-heavy deferred transaction** (see 1.4's
+  falsifiers): the truncate/drop path is unaffected, but the group that carries it fails.
 * Partition DETACH/DROP is still 7.3's item: a detached partition leaves the
   publication as `unpublished` (non-destructive), which is not the same as replicating
   the detach.
-* MotherDuck coverage is one small scenario
-  (`tests/1.5_truncate_drop/test_1_5_motherduck.py`, `motherduck` marker, ~60 s): the
-  truncate empties the table, `DELETE FROM` reports its row count so the marker is not
-  "unknown", and the detected drop removes the table. It does **not** cover a crash
-  around either statement at MotherDuck, or a multi-table `CASCADE` there.
+* **Multi-schema capture is guarded, not supported.** A replicated name outside the
+  polled schema is never reported as `dropped` (Opus MINOR-4), which is what stops 2.3/3.x
+  from destroying those tables — but one poller still polls one schema.
 
 **Baseline (historical).** `TRUNCATE TABLE app.orders` in `p01`: the destination still
 showed `{'r': 5}`, `any_op_t == 0`, and the run's `skipped` counter was 0 - the event

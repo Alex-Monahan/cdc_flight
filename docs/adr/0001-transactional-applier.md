@@ -19,6 +19,7 @@
 | 2 | 2026-07-30 | **P2 withdrawn** and replaced by **Invariant O** (§4.1). Crash matrix rebuilt over all three engine lifecycle paths **and** the snapshot phase (§4.6). Transaction assembly made a state machine with one boundary rule (§3.2). Triggers restated as soft group-close requests plus a hard spill threshold (§3.3). Start-up reconciliation decision table added (§4.5). Keyless event identity moved off `source.sequence` (§6). D10 rewritten: dlt demoted to a **library**, not removed (§10). Throughput risk of D5 recorded as a measurement task (§5). |
 | 3 | 2026-07-30 | **Amendments from the implementation** (§15): the apply path must insert through Arrow - `executemany` is 300x slower and makes a large commit group unfinishable (A14); `transaction.id` is not a transaction identifier (A1); the Connect schema stays off, so rubric 2.4 is untouched (A2); `verify_offset_file` becomes a rebuild plus a one-directional assertion (A4); a drained batch closes the group (A5); a provably-dead lease is reclaimed (A6); §14.1 answered for DuckDB (A8); §10's dlt exit criterion evaluated (A10). |
 | 4 | 2026-07-31 | **Amendments from the 1.1-1.3 review round** (§16). The boundary rule made unconditional in every storage mode (A20); the ordinal contract enforced, which is how the keyless-identity disagreement between the two reviews resolves (A18); spill made one ordered pass with explicit identity and a fence that covers staged rows (A19); the destination enforces the identity with a PRIMARY KEY (A21); reconciliation compares the whole typed offset map and gains §4.5's missing "slot exists / no durable row" row (A22); `lsn.flush.mode` pinned (A23); the commit->ack window emptied (A24); the fault anchors corrected and extended (A25); `commit_id` scoped per pipeline (A26); the applier decomposed (A29); deferrals stated (A28). |
+| 6 | 2026-07-31 | **Amendments from the 1.4/1.5 review round** (§18). The fold rebuilt around **physical rows**, which supersedes A31 and closes five reproduced silent-loss/duplication orderings (A35); where it cannot attribute, it refuses rather than guessing (A36); Invariant O restated as bounding *ordering only*, so the fold is the second half of the exactly-once claim (A37); four guards added between detection and destruction, and `CDC_CATALOG_GRACE` excluded from the guarantee (A38); `table_state` made the canonical ownership registry, which `--reset-state` no longer deletes (A39); the destructive-DDL alert genuinely moved out of the transaction and classified by whether it describes a refusal or an applied action (A40); a rolled-back group discarded in the process too (A41); one source writer shared with D9 (A42); a run with an unresolved destructive change is not a success (A43); module boundaries restored (A44). |
 | 5 | 2026-07-31 | **Amendments from 1.4 / 1.5** (§17): a key-changing UPDATE is always `d`+`c` for Postgres, so 1.4's atomicity is a corollary of §3.2/§3.3 (A30); the merge cannot collapse a group by key alone when one key is worn by two rows in one transaction (A31); TRUNCATE is a counted, key-less data event and `skipped.operations` was the whole gap (A32); DROP TABLE needs a catalog poller whose WAL fence marker must be **transactional** (A33 — which also constrains D9); what a table-level event means for history (A34). |
 
 ---
@@ -1148,10 +1149,16 @@ connection to the primary.
   `HEARTBEAT_INTERVAL_MS` it runs exactly one statement:
 
   ```sql
-  SELECT pg_logical_emit_message(false, 'cdcf_hb', <runner_id>||':'||now()::text);
+  SELECT pg_logical_emit_message(true, 'cdcf_idle_heartbeat', <payload>);
   ```
 
-  The message is a single non-transactional WAL record — no table, no rows, no
+  **Corrected in rev 6 (§18/A42): `true`, not `false`.** A33's measurement is a
+  constraint on this heartbeat, not a local detail of the catalog fence — a
+  non-transactional message does not end `WalPositionLocator.resumeFromLsn`'s search
+  after a restart, so it cannot be relied on to advance an idle slot. It is emitted
+  through the one shared `cdc_flight.source_marker`, which already owns the capability
+  probe, the error state and the write budget. The message is still a single tiny WAL
+  record (a BEGIN/message/COMMIT rather than one record) — no table, no rows, no
   bloat, no vacuum load. It replicates to the standby physically, is decoded
   there by our logical slot, and arrives on our stream as an `op='m'` event.
   `probes/p01` already proved such messages land, which is why 4.4 and 7.4 are
@@ -2069,6 +2076,14 @@ showing the group still cannot close mid-pair.
 
 ### A31 — the fold cannot collapse by key alone (new; corrects D6's merge rule)
 
+> **SUPERSEDED by §18/A35 (rev 6).** The probe described below answers "did this key
+> exist before this commit **group**?", and the ambiguity is not group-scoped. Worse,
+> the falsifier this amendment records is not a hole (three-ring rotations were
+> verified to work) while the shape that *was* broken — **one** pre-group row and
+> **one** in-group row wearing a key, two rows not three — is not named here at all.
+> A falsifier list that points the next agent at a non-hole while the real hole sits
+> next to it is worse than no list. Read A35/A36 instead.
+
 D6 defines the keyed apply as "delete every touched key, then insert the final row per
 key". That is wrong when **one key is worn by two different rows inside one Postgres
 transaction**, which `DEFERRABLE` constraints make legal:
@@ -2175,3 +2190,211 @@ Keyless tables are a changelog today (A12), so a truncate does empty them. That 
 the honest consequence of having only one materialisation: the rows are gone at the
 source, the marker records what was lost, and 8.2 is where "current state *and*
 changelog" makes the distinction physical.
+
+---
+
+## 18. Amendments from the 1.4 / 1.5 review round (rev 6, 2026-07-31)
+
+Two independent reviews reproduced silent-loss and duplication paths inside correctly
+committed transactions. Codex named the root, and it is a modelling error rather than a
+missing branch: **the fold was group-wide, but the ambiguity it was resolving is
+per-source-transaction — and neither scope is the right one, because the ambiguity is
+about physical rows.** These amendments record what replaced it, and they supersede
+A31 (which was both incomplete and wrong about which case it could not handle).
+
+### A35 — the fold models physical rows, not keys (supersedes A31, corrects D6)
+
+A key is not a row. Two facts make that load-bearing:
+
+* inside one Postgres transaction a **deferred** unique constraint lets several rows
+  wear one key at once (`UPDATE t SET id = id + 1`);
+* across the transactions of one **commit group** a key can be freed and re-taken by a
+  different row, and a group holds several whole transactions.
+
+A plan indexed by key cannot express either, and A31's "did this key exist before the
+group?" probe answers a question about the wrong scope. Measured consequences, all
+reproduced against the shipped applier:
+
+| ordering | Postgres | old fold |
+|---|---|---|
+| T1 inserts key 2; T2 permutes `{1,2} -> {2,3}`; one group | `{2:a, 3:b}` | `{3:b}` — lost row |
+| one txn: `d(1,a) c(3,a) d(2,b) c(3,b) d(3,a)` (two rows on key 3) | `{3:b}` | `{}` — lost row |
+| one txn: `d(1,a) c(2,a) d(2,a) c(5,a)` (pre-group row `b` on key 2) | `{2:b, 5:a}` | `{2:a, 5:a}` — lost `b`, duplicated `a` |
+| one txn: `TRUNCATE; INSERT 5; DELETE 5` | `{}` | `{5}` — spurious row |
+| T1 `TRUNCATE; INSERT 1`; T2 `DELETE 1`; one group | `{}` | `{1}` — zombie row |
+
+`table_work` now holds, per destination table:
+
+    live[key] = [entry, ...]      # the rows that currently wear `key`
+    entry     = START | row       # START is the row the destination already held
+
+and every event is one physical operation on that list: `c`/`r` and the new-key half of
+a key change **append**; `u` with an unchanged key **replaces** the entry its
+before-image identifies; `d` and the old-key half of a key change **remove** it; `t`
+discards every entry **including `START`**. Attribution needs no notion of scope at
+all — a row an earlier transaction of the group placed is a concrete entry — and the
+destination is consulted only about `START`, only where two entries compete, and at
+most once per key.
+
+At group end each key holds at most one row (the source enforces uniqueness at every
+transaction boundary, which `table_work.end_transaction` asserts per unit), and the
+three cases are: `[row]` → delete the key and insert; `[]` → delete the key;
+**`[START]` → leave it alone**. That last case is the one A31 could not express, and it
+is what the third row of the table above needs: the destination's own row survives
+under a key the group touched, so the key is excluded from the merge's DELETE rather
+than being deleted and re-inserted. It also keeps its original `cdcf_commit_id`, which
+is honest — nothing in the source changed it.
+
+### A36 — where the fold cannot decide, it refuses (new)
+
+Two entries can compete only under a deferred unique constraint, and **a deferrable
+primary key is not a valid replica identity** — verified on the cluster:
+`relreplident='d'` but `pg_index.indisreplident=false`, and `UPDATE` on the published
+table fails with *"does not have a replica identity and publishes updates"* until
+`REPLICA IDENTITY FULL` is set. So in every shape where attribution is *needed*, the
+full before-image that answers it is *present*. Comparison against `START` is done at
+the destination with each value bound to the destination column's own type, because a
+Python comparison of a Debezium JSON value against a value that has been through
+DuckDB's type system is not a comparison; Debezium's TOAST placeholder is excluded,
+because it distinguishes nothing.
+
+Where the before-image cannot distinguish and at most one row can really wear the key
+(no deferred constraint ⇒ no ambiguity), the key collapses to empty — that is the
+right answer for `INSERT (5,…); DELETE WHERE id=5` under `REPLICA IDENTITY DEFAULT`.
+Where two *concrete* rows compete and nothing can choose, `AmbiguousDelete` **fails the
+commit group**. The rubric's own scale puts an error (=1) above silent loss, the group
+rolls back, and the transaction replays for free under Invariant O. This is the one
+place in the design that deliberately prefers a failed run to a committed answer.
+
+### A37 — Invariant O bounds ordering, not semantics (sharpens §4.1)
+
+Invariant O proves the slot cannot advance past data the destination has not committed.
+It says nothing about whether what was committed is *right*, and a durably committed
+wrong fold advances the slot exactly as happily as a right one. The exactly-once claim
+therefore has two halves, and only one of them was ever proven:
+
+1. **ordering** — Invariant O, which the 1.4/1.5 diff did not regress;
+2. **the fold** — that the state each group commits is the state Postgres has.
+
+A green crash suite cannot falsify (2): a deterministic fold commits the same wrong
+answer before and after a replay. What falsifies it is adversarial *orderings*, which
+is why the counterexample suites (`tests/1.4_pk_updates/test_1_4_fold_counterexamples.py`,
+`tests/1.5_truncate_drop/test_1_5_truncate_key_reuse.py`,
+`test_1_5_truncate_storage_modes.py`) assert source/destination equality rather than
+mere uniqueness, and why the module boundaries below exist: every blocker of the last
+two review rounds was a second code path doing one job.
+
+### A38 — the four guards between detection and destruction (extends A33)
+
+A33 gave the drop a WAL fence. The fence is necessary and it is not sufficient: the
+observation and the DDL are separated in time, and on a quiet source that gap is
+unbounded, so the code has to ask whether the fact still holds.
+
+| guard | refuses | reachable failure it closes |
+|---|---|---|
+| the fence | applying before the destination consumed everything before the DDL | a zombie re-created by an in-flight event |
+| **confirmation** (`CDC_DROP_CONFIRM_POLLS`, default 2) | acting on a single observation | a transient catalog read mid-DDL |
+| **supersession** | acting on an observation a later poll contradicted | dropping the destination table of a **live replacement relation** |
+| **revalidation** | acting without re-reading the source, and acting when it cannot be read | the same, for a fence that opened long after detection |
+| **the circuit breaker** (`CDC_DROP_MAX_PER_POLL`, default 1) | destroying more than one relation at once | `DROP SCHEMA … CASCADE`, a DSN repointed at an empty database, a failover target, a source mid-`pg_restore` |
+| **the zero-relations guard** | acting on a poll that saw an empty schema | the wrong-database signature, which can never mean "drop everything" |
+
+Revalidation fails **closed**: "I could not ask" is never read as "it is gone". The
+circuit breaker refuses the **whole** set, never the first N. And `CDC_CATALOG_GRACE>0`
+applies a destructive action *before* the fence that makes it safe, so it is
+**explicitly excluded from the structural correctness guarantee** — the run logs that
+at start-up.
+
+`recreated` is the one case where the source relation exists and the destination table
+is still wrong, because it holds a *different* relation's rows. Keeping them presents
+pre-drop data as current; dropping them and letting ordinary CDC rebuild a partial
+table is worse, because the destination then looks healthy while being silently
+incomplete. So: drop, alert, and persist `table_state.snapshot_state='awaiting_snapshot'`
+which the run summary and `inspect` surface. Rubric 2.3/3.4 own clearing it.
+
+### A39 — `table_state` is the canonical ownership registry (new)
+
+"A replicated table absent from `pg_class` is always detected" was not durably true.
+The watcher learns which names it owns from `_cdc_flight.table_state`, and that row was
+written only by the snapshot coordinator — so a table first materialised by streaming
+DML had **no** durable row, and a `DROP TABLE` while the pipeline was down left an
+orphan destination table that no later poll could ever report. Ownership is now
+persisted by whoever first creates the table, in the same transaction, whatever the
+origin.
+
+For the same reason `--reset-state` no longer DELETEs `table_state`; it resets the
+*snapshot* bookkeeping in place. Deleting it produced a **permanent** zombie: a
+source-dropped table produces no events, so nothing re-teaches the watcher that the
+name is ours, and detection was disabled for it for ever.
+
+### A40 — the alert really is out of transaction (corrects §9.1's implementation)
+
+§9.1 says a destructive-DDL alert must survive the rollback of the apply it describes.
+The code said so in a comment and then wrote the row on the applier's **own**
+connection with `BEGIN TRANSACTION` open, so it was fully transactional: measured,
+inject `pre_commit:raise` after a detected drop and the DDL correctly rolls back while
+`_cdc_flight.alerts` is empty — the exact case §9.1 exists for.
+
+`destination.AlertSink` holds `con.cursor()`, a separate connection to the same
+database with its own transaction context (VERIFIED on DuckDB 1.5.4: an INSERT on the
+cursor while the parent holds an open write transaction succeeds and survives the
+parent's ROLLBACK). Alerts are also now **classified**: one that describes a refusal
+("I did not destroy your warehouse") survives the rollback; one that describes an
+applied action ("your table was dropped") must not outlive the rollback that undid it.
+If a destination cannot provide an independent connection the sink degrades to the
+caller's and says so in the row itself, rather than labelling a same-connection insert
+non-transactional.
+
+### A41 — a rolled-back group is discarded, in the process too (fills a gap in §3.3)
+
+`_reset_group()` ran only after a successful COMMIT. On the exception path the markers,
+catalog lists and registry cache were cleared — but `_group`, `_created_in_txn` and
+`_spill_commit_id` were not, so the next `commit_group` folded the rolled-back units a
+**second** time alongside whatever arrived after them. Harmless for an idempotent
+shape, which is why the fault suite passed; measured to lose a row for a key-reuse
+shape. `_created_in_txn` surviving a rollback is independently dangerous: it makes
+`write()` compute `fresh=True` and skip the DELETE half of the merge. The ADR's rule is
+that a rolled-back group replays *from the source*; that is now true of the process as
+well as of the offset store, and the discarded units are counted as deferrals.
+
+### A42 — one source writer, shared with D9 (answers §17's open question 3)
+
+The catalog fence marker and D9's idle-slot heartbeat are the same write to the same
+place for the same reason, so they are one component: `cdc_flight.source_marker`
+emits `pg_logical_emit_message(true, '<prefix>_<reason>', …)` with `reason` in
+`{catalog_fence, idle_heartbeat}`, and owns the capability probe, the error state and
+the **write budget** (`CDC_CATALOG_MARKER_MAX`, default 60 — a fence that never opens
+must not write one WAL record per poll for ever against a source we otherwise only
+read). 4.4/7.2 extend it with the heartbeat cadence and the primary routing rather than
+building a second writer. A33's measurement is a constraint on D9 itself: a
+non-transactional heartbeat cannot be relied on to advance an idle slot after a restart.
+
+### A43 — a run with an unresolved destructive change is not a success (extends §9.1)
+
+Deferring a destructive action whose fence has not opened is the correct *safety*
+choice. It is not faithful propagation, and the run used to report `ok: true` with
+`catalog_error: null` and `catalog_pending > 0` — because `poll()` cleared `last_error`
+unconditionally and the alert was raised only when a change was *applied*. Three
+changes: marker failures are preserved in `catalog_marker_error`; a quiet run performs
+a **synchronous final catalog poll** and then holds the engine open for
+`CDC_CATALOG_DRAIN_SECONDS` so a change it just queued is fenced and applied by *this*
+run rather than the next one; and a destructive change still unresolved at shutdown
+makes the run **fail** with `stop_reason=catalog_unresolved`.
+
+### A44 — module boundaries (extends A29)
+
+A29 left `applier.py` owning "the commit protocol, and only that". The 1.4/1.5 work put
+catalog policy, destructive DDL, audit construction, truncate dispatch and
+source-catalog persistence back into it, and that is exactly where the duplicated
+truncate dispatcher came from. Restored, with the *semantics* moved rather than
+redistributed:
+
+| module | owns |
+|---|---|
+| `applier.py` | the commit protocol: `BEGIN -> apply -> state -> COMMIT -> ack`, the group triggers, the fence, spill staging |
+| `planner.py` | `GroupPlan`: one canonical event dispatcher for both storage modes, the truncate policy and audit, the destination probe |
+| `table_work.py` | the physical-row fold and the merge for one table |
+| `catalog.py` | observing the source catalog. It never decides |
+| `catalog_apply.py` | the destructive-DDL policy and the four guards, as an immutable plan |
+| `resume.py` | the resume point and the `offsets.dat` forensics |
+| `source_marker.py` | the only writes cdc_flight makes to the source |
