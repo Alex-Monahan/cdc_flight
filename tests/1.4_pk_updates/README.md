@@ -18,23 +18,35 @@ merge deletes every key the group touched before inserting the group's final row
 applier with a commit trigger on **every event** and shows it still cannot split
 them.
 
-## What was not free
+## What was not free: **a key is not a row**
 
-Two shapes were wrong when 1.4 was picked up, both measured:
+The first attempt indexed the plan by key and asked the destination one question —
+*did this key exist before this commit group?* Two independent reviews then reproduced
+five orderings where that is the wrong question, three of them losing a row:
 
-* `UPDATE t SET id = id + 1` over two rows (only legal with a `DEFERRABLE` primary
-  key) emits `d(1) c(2) d(2) c(3)`. Collapsing by key made the `d(2)` delete the row
-  the `c(2)` had just created: Postgres held `{2, 3}`, the destination held `{3}` —
-  a **lost row**, reproduced end to end in `test_gap_a_deferred_key_permutation_*`.
-* a key-changing `u` (the defensive non-Postgres path) after an insert of the old
-  key in the same group left the row under **both** keys — the rubric's
-  `duplication=2` exactly.
+| ordering | Postgres | the key-indexed fold |
+|---|---|---|
+| T1 inserts key 2; T2 permutes `{1,2} -> {2,3}`; one commit group | `{2:a, 3:b}` | `{3:b}` — lost row |
+| one txn `d(1,a) c(3,a) d(2,b) c(3,b) d(3,a)` (two rows on key 3) | `{3:b}` | `{}` — lost row |
+| one txn `d(1,a) c(2,a) d(2,a) c(5,a)` (the destination's row `b` on key 2) | `{2:b, 5:a}` | `{2:a, 5:a}` — lost `b`, duplicated `a` |
+| one txn `TRUNCATE; INSERT 5; DELETE 5` | `{}` | `{5}` — spurious row |
+| T1 `TRUNCATE; INSERT 1`; T2 `DELETE 1`; one group | `{}` | `{1}` — zombie row |
 
-Both are the same question: does the key this event removes belong to a row that
-existed *before* this commit group, or to a row the group itself inserted? The
-event stream cannot answer it (`d(1) c(2) d(2) c(3)` is byte-identical for the
-permutation, whose answer is `{2,3}`, and for a chained `1->2->3`, whose answer is
-`{3}`) — but the destination can, so the fold asks it, once per ambiguous key.
+A key can be worn by several rows at once inside a transaction (a **deferred** unique
+constraint), and freed and re-taken across the transactions of one commit group. So no
+question about a *key* — at any scope — decides what a delete removed. What decides it
+is which physical **row** the delete's before-image describes.
+
+`table_work` therefore holds `live[key] = [entry, …]`, where an entry is a row or
+`START` (the row the destination already held), and every event is one physical
+operation on that list: `c`/`r` append, `u` replaces the entry its before-image
+identifies, `d` removes it, `t` discards every entry **including `START`**. At group
+end each key holds at most one row, and `[START]` alone means *leave the destination's
+row completely alone* — the case the key-indexed plan could not express at all.
+
+Where two entries compete and the before-image cannot choose, the group is **refused**
+(`AmbiguousDelete`) rather than folded on a guess: the rubric's own scale puts an error
+above silent loss, and a rolled-back group replays for free. See ADR 0001 §18/A35–A37.
 
 ## Two Postgres facts worth knowing
 
@@ -42,7 +54,9 @@ permutation, whose answer is `{2,3}`, and for a chained `1->2->3`, whose answer 
   published table fails with *"cannot update table … because it does not have a
   replica identity and publishes updates"*, so the deferred-permutation collision
   is only reachable with `REPLICA IDENTITY FULL` (or another non-deferrable unique
-  index). The message key still comes from the primary key.
+  index). The message key still comes from the primary key. **This is load-bearing for
+  the fold**: it is exactly why the disambiguating full before-image is always present
+  in the only configuration where the ambiguity is reachable.
 * `app.orders` references `app.customers (id)` with `ON DELETE CASCADE` and no
   `ON UPDATE`, so Postgres refuses a key update on a customer that has orders. The
   e2e scenario moves customer 3, which has none.
@@ -51,6 +65,7 @@ permutation, whose answer is `{2,3}`, and for a chained `1->2->3`, whose answer 
 
 | file | suite | what it proves |
 |---|---|---|
+| `test_1_4_fold_counterexamples.py` | default | the orderings both reviews **reproduced** against the shipped applier (the table above), each asserting equality with Postgres rather than mere uniqueness — plus the ones they verified as *correct* and which the rewrite must not break: 3-ring and 4-ring rotations, a swap through a temporary key, a delete matching two transiently identical rows, the ambiguous shape under spill, over two tables, and re-folded with fresh LSNs so the idempotency fence cannot help |
 | `test_1_4_pk_update_fold.py` | default | every fold shape, through the shipped `Applier` and a real DuckDB file: the plain move, mixed with other changes to the same row, the freed-key collision, the chained move, the deferred permutation, composite keys, a spilled unit, two units in one group, and a fault at `begin` / `mid_apply` / `pre_commit` around the move |
 | `test_1_4_pk_update_e2e.py` | default (`e2e`) | the same properties through real Postgres + Debezium in one 18 s scenario, plus "no error", the array-column table shape, and row-for-row agreement with the source |
 | `test_1_4_pk_update_crash.py` | `slow` | a real `SIGKILL`-equivalent in the commit→ack window of the group that carries a PK update, then recovery |

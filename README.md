@@ -157,14 +157,32 @@ transaction), `lease` (single-writer, rubric 4.2), `table_state`, `spill_events`
 `source_relations` (the last-seen source catalog, including each table's relation `oid`)
 and `alerts`.
 
+**The fold models physical rows, not keys (rubric 1.4).** A key is not a row: inside one
+Postgres transaction a *deferred* unique constraint lets several rows wear one key at
+once, and across the transactions of one commit group a key can be freed and re-taken. So
+`table_work` holds `live[key] = [entry, …]` where an entry is a row or `START` (the row
+the destination already held), and every event is one physical operation on that list. The
+destination is consulted only about `START`, only where two entries compete for one key,
+and at most once per key. Where the delete's before-image cannot say which row it
+describes, the commit group is **refused** rather than folded on a guess — the rubric's
+own scale puts an error above silent loss, and a rolled-back group replays for free
+(ADR 0001 §18/A35–A37).
+
 **Table-level changes (rubric 1.5).** A `TRUNCATE` empties the destination table inside
 the same commit group (`TRUNCATE a, b CASCADE` is one Postgres transaction, so it is one
-`COMMIT`). `DROP TABLE` is not in the replication stream at all, so the source catalog is
-polled (`CDC_CATALOG_POLL_SECONDS`, default 10 s) and a detected drop is applied only once
-the destination's resume point has passed the LSN at which it was detected — the watcher
-emits a transactional `pg_logical_emit_message` on the source to guarantee that happens on
-an idle stream. Policy: `CDC_TRUNCATE_MODE` and `CDC_DROP_MODE`, each
-`replicate` (default) | `log` | `ignore`.
+`COMMIT`), through the *same* dispatcher whether the event arrived in memory or came back
+out of the spill table. `DROP TABLE` is not in the replication stream at all, so the
+source catalog is polled (`CDC_CATALOG_POLL_SECONDS`, default 10 s) and a detected drop
+passes six guards before any DDL runs: the LSN fence, a zero-relations guard, two
+confirming polls (`CDC_DROP_CONFIRM_POLLS`), supersession by a newer observation,
+fail-closed revalidation against the source, and a circuit breaker that refuses to destroy
+more than `CDC_DROP_MAX_PER_POLL` (default **1**) relations at once. The fence needs an
+LSN past the DDL to flow, so `source_marker.py` writes a transactional
+`pg_logical_emit_message` on the source — the one component that writes there at all,
+shared with D9's idle heartbeat and bounded by a write budget. A destructive change still
+unresolved at shutdown makes the run **fail**; it does not report `ok: true`.
+Policy: `CDC_TRUNCATE_MODE` and `CDC_DROP_MODE`, each `replicate` (default) | `log` |
+`ignore`.
 
 ## Testing
 
@@ -184,9 +202,12 @@ Measured on an M-series Mac. Only executed runs are reported here; see
 
 | suite | result | wall clock | measured |
 |---|---|---|---|
-| `make test` (local only) | **246 passed, 0 xfail** | **337 s** (5:37) | 2026-07-31, after 1.4 + 1.5 |
-| `make test-slow` | **20 passed** | **268 s** (4:28) | 2026-07-31, after 1.4 + 1.5 |
-| `make test-md` | **17 passed** | **221 s** (3:41) | 2026-07-31, after 1.4 + 1.5 |
+| `make test` (local only) | **317 passed, 0 xfail** | **344 s** (5:44) | 2026-07-31, after the 1.4/1.5 review round |
+| `make test-slow` | **20 passed** | **268 s** (4:28) | 2026-07-31, after the 1.4/1.5 review round |
+| `make test-md` | **MD_RESULT** | **MD_TIME** | 2026-07-31, after the 1.4/1.5 review round |
+| `make test` (local only) | 246 passed | 337 s (5:37) | 2026-07-31, after 1.4 + 1.5 |
+| `make test-slow` | 20 passed | 268 s (4:28) | 2026-07-31, after 1.4 + 1.5 |
+| `make test-md` | 17 passed | 221 s (3:41) | 2026-07-31, after 1.4 + 1.5 |
 | `make test` (local only) | 168 passed | 283 s (4:43) | 2026-07-31, after the 1.1-1.3 review round |
 | `make test-slow` | 9 passed | 179 s (2:58) | 2026-07-31, after the 1.1-1.3 review round |
 | `make test-md` | 12 passed | 155 s (2:34) | 2026-07-31, after the 1.1-1.3 review round |
@@ -195,6 +216,14 @@ The xfail count is zero because every target test passes; the gap pins they supe
 were deleted, as each suite's README said they should be. 1.4 and 1.5 added 78 default
 tests for +54 s, because all but two of their modules are in-process (`applier_lab`) or
 share one scenario per module.
+
+The 1.4/1.5 **review round** then added 71 more default tests for **+7 s**, which is the
+same reason: every one of them drives the shipped `Applier` against a real DuckDB file
+through `tests/applier_lab.py`. That is deliberate rather than lucky — the five defects
+those reviews reproduced each need one *specific* interleaving of assembler and applier
+state, and a subprocess suite cannot construct them at all, let alone in milliseconds.
+`test-slow` measured 4:28 again on a quiet machine, which settles the one figure a
+reviewer could not reproduce (their 9:52 was a contended run).
 
 The default suite grew from 110 tests to 168 and got *faster*, which is worth
 explaining because it looks wrong. The 58 new tests are almost all in-process: they
@@ -295,7 +324,15 @@ cdc_flight/
 │   ├── faults.py                 # deterministic crash injection (test-only)
 │   ├── envelope.py               # decode the full Debezium envelope
 │   ├── assembler.py              # TransactionAssembler: whole units only
-│   ├── applier.py                # commit groups, fence, snapshot swap, spill
+│   ├── applier.py                # the commit protocol, and only that
+│   ├── planner.py                # one event dispatcher for both storage modes
+│   ├── table_work.py            # the physical-row fold + the merge, per table
+│   ├── snapshot.py              # epochs, shadow tables, the swap
+│   ├── spill.py                 # the staging buffer for an oversized unit
+│   ├── resume.py                # the resume point + offsets.dat forensics
+│   ├── catalog.py               # observing the source catalog (DROP detection)
+│   ├── catalog_apply.py         # the destructive-DDL policy and its guards
+│   ├── source_marker.py         # the only writes cdc_flight makes to the source
 │   ├── apply_sql.py              # merge/DDL SQL inside the caller's transaction
 │   ├── destination.py            # _cdc_flight control schema + lease
 │   ├── offset_file.py            # read/write Debezium's offsets.dat
@@ -316,7 +353,7 @@ cdc_flight/
 [`RUBRIC_STATUS.md`](RUBRIC_STATUS.md) scores this baseline against every item of
 the 40-item Postgres-CDC decision matrix, with the evidence for each score.
 **Baseline average: 1.65 / 5; one item (7.1, pgoutput) was already at 5.**
-**On this branch: 2.08 / 5, six items at 5 (1.1, 1.2, 1.3, 1.4, 1.5, 7.1).**
+**On this branch: 2.05 / 5, five items at 5 (1.1, 1.2, 1.3, 1.4, 7.1) and 1.5 at 4.**
 
 The evidence comes from [`probes/`](probes/) — small, reproducible experiments
 (`uv run python probes/p01_dml_edge_cases.py`, output in `probes/.out/`). They
