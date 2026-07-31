@@ -202,7 +202,7 @@ Measured on an M-series Mac. Only executed runs are reported here; see
 
 | suite | result | wall clock | measured |
 |---|---|---|---|
-| `make test` (local only) | **323 passed, 0 xfail** | **346 s** (5:46) | 2026-07-31, after the 1.4/1.5 review round |
+| `make test` (local only) | **326 passed, 0 xfail** | **344 s** (5:44) | 2026-07-31, after the 1.4/1.5 review round |
 | `make test-slow` | **20 passed** | **268 s** (4:28) | 2026-07-31, after the 1.4/1.5 review round |
 | `make test-md` | **22 passed** | **265 s** (4:25) | 2026-07-31, after the 1.4/1.5 review round |
 | `make test` (local only) | 246 passed | 337 s (5:37) | 2026-07-31, after 1.4 + 1.5 |
@@ -217,7 +217,7 @@ were deleted, as each suite's README said they should be. 1.4 and 1.5 added 78 d
 tests for +54 s, because all but two of their modules are in-process (`applier_lab`) or
 share one scenario per module.
 
-The 1.4/1.5 **review round** then added 77 more default tests for **+9 s**, which is the
+The 1.4/1.5 **review round** then added 80 more default tests for **+7 s**, which is the
 same reason: every one of them drives the shipped `Applier` against a real DuckDB file
 through `tests/applier_lab.py`. That is deliberate rather than lucky — the five defects
 those reviews reproduced each need one *specific* interleaving of assembler and applier
