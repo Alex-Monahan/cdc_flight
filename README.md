@@ -173,12 +173,28 @@ Measured on an M-series Mac. Only executed runs are reported here; see
 
 | suite | result | wall clock | measured |
 |---|---|---|---|
-| `make test` (local only) | **110 passed, 0 xfail** | **417 s** (6:57) | 2026-07-31, after the applier |
-| `make test-md` | **5 passed** | **94 s** | 2026-07-31, after the applier |
-| `make test-slow` | **3 passed** | **136 s** | 2026-07-31, after the applier |
+| `make test` (local only) | **168 passed, 0 xfail** | **283 s** (4:43) | 2026-07-31, after the 1.1-1.3 review round |
+| `make test-slow` | **9 passed** | **179 s** (2:58) | 2026-07-31, after the 1.1-1.3 review round |
+| `make test-md` | **12 passed** | **155 s** (2:34) | 2026-07-31, after the 1.1-1.3 review round |
 
-The xfail count is now zero because the 1.1/1.2/1.3 target tests pass; the gap pins they
+The xfail count is zero because the 1.1/1.2/1.3 target tests pass; the gap pins they
 superseded were deleted, as each suite's README said they should be.
+
+The default suite grew from 110 tests to 168 and got *faster*, which is worth
+explaining because it looks wrong. The 58 new tests are almost all in-process: they
+drive the real `Applier` against a real DuckDB file through `tests/applier_lab.py`
+with a faked `ChangeEvent` and `RecordCommitter`, so they cost milliseconds instead
+of the ~12 s a pipeline subprocess costs. That was not a performance choice - the
+four blockers the 1.1-1.3 review round reproduced each need an exact interleaving of
+assembler and applier state, which a subprocess cannot pin down, and all four
+coexisted with a fully green 110-test suite. Making the interleaving an argument to a
+function is what turned them into guards.
+
+The wall-clock *drop* (417 s -> 283 s) is measured and **not explained**: the two
+independent reviewers of the previous branch state measured 417 s and 463 s for the
+same 110 tests, and this branch adds an anchor to the fault matrix, so it should be
+slightly slower. It is recorded rather than accounted for; do not treat the 283 s as
+a performance claim about anything.
 
 Budget is 10 minutes for the default suite. The dominant cost is JVM startup plus the
 Debezium idle tail per pipeline invocation, so the suite is optimised by *sharing
