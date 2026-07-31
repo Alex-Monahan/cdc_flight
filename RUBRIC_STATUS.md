@@ -637,11 +637,17 @@ pins that, including that the destination still holds the pre-group state afterw
   through exactly the ambiguous shape), must not contaminate the next group, and must
   not leave `_created_in_txn` behind — which independently makes `write()` skip the
   DELETE half of the merge.
-* `tests/1.4_pk_updates/test_1_4_pk_update_e2e.py` - one 18 s scenario against real
-  Postgres and real Debezium: four transactions, row-for-row agreement with the
+* `tests/1.4_pk_updates/test_1_4_pk_update_e2e.py` - one 19 s scenario against real
+  Postgres and real Debezium, **six** transactions: row-for-row agreement with the
   source, no duplicate key, the old key gone, the moved row keeping its post-move
   values (`replace.null.with.default=false` matters here), the deferred permutation,
   and `ok: true` on every run (`error=1` is ruled out by measurement, not by hope).
+  T5 and T6 are the two hardest reproduced shapes driven through real Postgres rather
+  than constructed records - a row moved onto a key another row holds and then off it,
+  and two rows moved onto one key with one then deleted. Postgres ends at
+  `[(2,'a'),(3,'b'),(11,'y'),(12,'x'),(30,'q')]` and the destination is asserted
+  **equal to it**, because the defects this replaces produced destinations that were
+  perfectly unique and wrong.
 * `tests/1.4_pk_updates/test_1_4_pk_update_crash.py` (`slow`) - a `SIGKILL`-equivalent
   in the commit->ack window of the group carrying the PK update, then recovery: one
   row under the new key, no duplicate key anywhere, destination equals source.
