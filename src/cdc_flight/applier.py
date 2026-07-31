@@ -48,7 +48,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from . import apply_sql, destination, resume, table_work
+from . import apply_sql, destination, naming, resume, table_work
 from .assembler import (
     UNIT_SNAPSHOT_CHUNK,
     UNIT_TXN,
@@ -64,6 +64,7 @@ from .config import (
 )
 from .destination import AlertSink, Lease, ResumePoint
 from .envelope import PendingRecord, decode
+from .errors import AmbiguousDelete, DestinationIdentityCollision
 from .faults import arm_group, maybe_crash
 from .planner import GroupPlan, stream_event_id
 from .snapshot import SnapshotCoordinator
@@ -116,6 +117,10 @@ class ApplierConfig:
     #: How long `COMMIT` may take before the process aborts (rubric 1.7 / 4.5).
     #: 0 disables the watchdog.
     commit_timeout: float = 300.0
+    #: rubric 4.7: an undecidable fold (`AmbiguousDelete`) queues an automatic
+    #: re-snapshot of the affected table instead of failing identically for ever.
+    #: `CDC_AMBIGUOUS_RESNAPSHOT=0` restores the permanent-failure behaviour.
+    resnapshot_on_ambiguity: bool = True
     #: rubric 1.6: this applier is serving a **re-snapshot** engine, not the pipeline's
     #: own stream. It applies snapshot chunks and DISCARDS streaming units: the
     #: re-snapshot's slot is a throwaway whose offsets nobody reads, so a streaming
@@ -252,6 +257,8 @@ class Applier:
         self.truncates_applied = 0
         self.truncates_logged = 0
         self.resnapshot_discarded_events = 0
+        #: rubric 4.7: undecidable folds turned into automatic table rebuilds
+        self.ambiguous_resnapshots_queued = 0
         #: events dropped because their transaction is already inside a table's image
         self.watermark_fenced_events = 0
         #: `_cdc_flight.table_events` rows collected while applying THIS group, all
@@ -324,6 +331,7 @@ class Applier:
             # that belong to the real slot rather than to the throwaway one.
             "watermark_fenced_events": self.watermark_fenced_events,
             "resnapshot_discarded_events": self.resnapshot_discarded_events,
+            "ambiguous_resnapshots_queued": self.ambiguous_resnapshots_queued,
             "snapshot_consistent_lsn": self.last_snapshot_lsn,
             **self.catalog_coordinator.summary(),
             **(self.catalog.summary() if self.catalog is not None else {}),
@@ -571,6 +579,20 @@ class Applier:
             self._txn_open = False
             if has_data:
                 maybe_crash("post_commit_pre_ack", self.data_commit_groups + 1)
+        except (AmbiguousDelete, DestinationIdentityCollision) as ambiguous:
+            # Rubric 4.7. The group still rolls back - a fold that cannot be decided is
+            # never committed - but a bare rollback here is a *permanent* failure: the
+            # transaction replays on the next run and hits the same ambiguity, for ever,
+            # which is a manual-intervention case. So the table is marked for a
+            # re-snapshot on the independent connection, where the request survives this
+            # rollback, and the next run rebuilds it. The re-snapshot's consistent point
+            # is necessarily after this transaction (we already received it, so it is
+            # already in WAL), so the per-table watermark fences the transaction that
+            # cannot be folded and the loop terminates after exactly one re-snapshot
+            # (ADR 0001 §19/A47).
+            self._request_resnapshot_for(ambiguous)
+            self._rollback_quietly()
+            raise
         except BaseException:
             self._rollback_quietly()
             raise
@@ -613,6 +635,72 @@ class Applier:
                 resume.capture_offset_file(self.offset_path, new_point)
             )
         self._reset_group()
+
+    def _request_resnapshot_for(
+        self, ambiguous: AmbiguousDelete | DestinationIdentityCollision
+    ) -> None:
+        """Turn an undecidable fold into a durable re-snapshot request (rubric 4.7).
+
+        Deliberately best-effort and deliberately loud either way: the run still fails
+        with a non-zero exit, because "I could not fold this and I have queued a rebuild"
+        is information an operator wants even though no human action is required.
+
+        The honesty note that belongs with it, and which `resnapshot` records in
+        `table_events`: a re-snapshot replaces **current state**. The individual change
+        events of the fenced span are not delivered, so a changelog (rubric 8.2) sees a
+        discontinuity there - an image at the consistent point rather than the events
+        that produced it. Current state is exact; per-event history for that span is not
+        recoverable, because the ambiguity was precisely that the events did not say what
+        they did.
+        """
+        if not self.cfg.resnapshot_on_ambiguity:
+            log.error(
+                "CDC_AMBIGUOUS_RESNAPSHOT=0: not queueing a re-snapshot for the fold "
+                "that could not be decided, so this failure will repeat on every run "
+                "until a human intervenes"
+            )
+            return
+        schema, table = ambiguous.source_schema, ambiguous.source_table
+        if not schema or not table:
+            log.error(
+                "an undecidable fold did not name its table, so no re-snapshot can be "
+                "queued for it: %s", ambiguous,
+            )
+            return
+        target = ambiguous.target or naming.destination_table(
+            self.topic_prefix, schema, table
+        )
+        recorded = self.alerts.request_snapshot(
+            pipeline=self.pipeline, schema=schema, table=table, target=target
+        )
+        self._pending_alerts.append(
+            {
+                "severity": "critical",
+                "code": "ambiguous_delete_resnapshot",
+                "on_rollback": True,
+                "message": (
+                    f"the fold for {schema}.{table} could not be decided, so the commit "
+                    "group was refused. "
+                    + (
+                        "The table is now marked awaiting_snapshot and the next run "
+                        "rebuilds it automatically; no human action is required, but "
+                        "per-event history for the rebuilt span is replaced by the "
+                        "snapshot image (rubric 4.7 / ADR 0001 §19/A47)."
+                        if recorded
+                        else "The re-snapshot request could NOT be recorded, so this "
+                        "failure WILL repeat until a human intervenes."
+                    )
+                ),
+                "context": {
+                    "source_schema": schema,
+                    "source_table": table,
+                    "target_table": target,
+                    "resnapshot_queued": recorded,
+                    "detail": str(ambiguous),
+                },
+            }
+        )
+        self.ambiguous_resnapshots_queued += int(recorded)
 
     def _rollback_quietly(self) -> None:
         if not self._txn_open:

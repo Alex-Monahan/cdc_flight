@@ -104,6 +104,7 @@ def test_a_destination_error_mid_transaction_loses_nothing(dest_fault_box, point
     _assert_exact_after_recovery(box, tag)
 
 
+@pytest.mark.slow
 def test_an_ambiguous_commit_recovers_exactly(dest_fault_box):
     """`COMMIT` raises. The transaction may or may not be durable - both are safe.
 

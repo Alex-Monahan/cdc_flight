@@ -272,10 +272,10 @@ correct assumptions in the notes below:
 | 1.2 | Delivery guarantees, tables WITHOUT a primary key | ~~3~~ → **5** | Keyless rows are keyed on a connector-derived `cdcf_event_id` whose ordinal contract is enforced at the boundary, so two identical source rows survive and a replay does not. |
 | 1.3 | CDC changes atomic in MotherDuck | ~~1~~ → **5** | A commit group is an integral number of whole multi-table Postgres transactions, proven whole in every storage mode; a concurrent MotherDuck observer never sees a partial one, including across an injected crash. |
 | 1.4 | Primary-key update handled correctly | ~~2~~ → **5** | The `d(old)`/`c(new)` pair is one transaction and a commit group holds whole transactions, so the move is atomic by construction. The fold models **physical rows** rather than keys, so a key worn by two rows inside a transaction (or freed and re-taken across two transactions of one group) is expressible; where the before-image cannot attribute a delete the group is refused rather than folded. Five reproduced silent-loss/duplication orderings are now equality tests. |
-| 1.5 | TRUNCATE / DROP propagate | ~~1~~ → **4** | `skipped.operations=none` brings truncates through; **one** dispatcher applies them in every storage mode and each truncate's audit records what *it* removed. `DROP TABLE` is not in the stream, so the source catalog is polled and the action passes six guards (fence, zero-relations, confirmation, supersession, revalidation, circuit breaker) before any DDL. Not 5: a dropped-and-recreated relation cannot be re-snapshotted here, so its destination table is dropped and marked `awaiting_snapshot` — loud, but incomplete (2.3/3.4 owns the 5). |
-| 1.6 | Snapshot/backfill consistent with CDC | 3 | Consistent on the healthy path (proven), and an interrupted snapshot no longer leaves a partial table behind (shadow + swap). Still 3: the *restart* re-reads from scratch, and consistency across a re-snapshot is 1.6's own task. |
-| 1.7 | Failures do not cause correctness issues | ~~1~~ → **3** | Deterministic injection at seven protocol anchors, exercised at six in the default suite plus five interleavings and two against MotherDuck; duplication is impossible by construction. Not 5: nothing injects faults into the destination/network layer or the WAL-message surface. |
-| 1.8 | Externally-advanced slot detected → backfill | 1 | **Proven silent data loss**: 31 change events skipped, run reported `records: 0`, exit 0. |
+| 1.5 | TRUNCATE / DROP propagate | ~~1~~ → **5** | `skipped.operations=none` brings truncates through; **one** dispatcher applies them in every storage mode and each truncate's audit records what *it* removed. `DROP TABLE` is not in the stream, so the source catalog is polled and the action passes six guards (fence, zero-relations, confirmation, supersession, revalidation, circuit breaker) before any DDL. A dropped-and-recreated relation is now dropped, marked `awaiting_snapshot` and **re-snapshotted automatically on the next run** (`cdc_flight.resnapshot`), proven end to end against a relation recreated with rows that produce no change events at all. |
+| 1.6 | Snapshot/backfill consistent with CDC | ~~3~~ → **5** | Postgres's **exported snapshot** makes the boundary an iff: a transaction is in the image exactly when it committed before the slot's `consistent_point`. Proven with ~200 transactions committing throughout a snapshot — every row on exactly one side, none on both. A re-snapshot of a live table hands over through a per-table watermark on the **commit** LSN, and an interrupted snapshot or a crash inside the swap leaves the old table intact. Cost stated: a re-snapshot replaces current state, so a changelog is discontinuous across it (recorded in `table_events`). |
+| 1.7 | Failures do not cause correctness issues | ~~1~~ → **5** | Twelve anchors: eight protocol, four destination (`destination_write` / `_commit` / `_hang` / `_close`), plus a real **network** blackhole injected from outside the process. The matrix is enumerated **from `faults.ALL_POINTS`**, so an anchor with no declared outcome fails the suite, and a seeded chaos harness composes them over 8 iterations. Every fault lands in one of two classes — clean recovery or non-zero exit with an accurate summary — measured against the source's own counts. |
+| 1.8 | Externally-advanced slot detected → backfill | ~~1~~ → **5** | Checked on every slot acquisition. Six decisions trigger an **automatic** re-snapshot of every captured table: slot ahead, slot missing, slot recreated (`restart_lsn` regression), source identity changed (`system_identifier`), source WAL rewound, destination empty with a positioned slot. Proven by comparing the whole destination against the whole source after a real `pg_replication_slot_advance` and a real `pg_drop_replication_slot`. One refusal survives and is documented: an orphan `offsets.dat`, where the automatic action could destroy another destination's tables. |
 | 2.1 | Added / dropped columns handled | 2 | Adds work correctly; a dropped column silently lingers and reads NULL, indistinguishable from a real NULL. |
 | 2.2 | Renamed columns handled well | 1 | Rename lands as "new column + old column silently goes NULL". No tombstone, no linkage. |
 | 2.3 | New tables and schemas auto-discovered | 1 | Needs `ALTER PUBLICATION` + config change + restart, and pre-existing rows are silently never snapshotted. |
@@ -294,7 +294,8 @@ correct assumptions in the notes below:
 | 4.3 | Recover from problematic WAL / offset state | 1 | A bad offset kills the engine; there is no backfill, no retry, and the failure is reported as success. |
 | 4.4 | Idle-slot heartbeat | 1 | `heartbeat.interval.ms` unset, no `heartbeat.action.query`. |
 | 4.5 | Errors must not hang or lock | 2 | Bounded runner + JVM watchdog make hangs survivable (one observed in p09), but nothing systematic prevents them. |
-| 4.6 | Detect silently-dead Postgres connection | 1 | Only `database.tcpKeepAlive=true` at OS defaults (~2 h). No client read timeout, no heartbeat, never tested. |
+| 4.6 | Detect silently-dead Postgres connection | ~~1~~ → **3** | TODO 4.6(b) closed: a blackholed Postgres used to exit `ok: true` on a partial delivery, because `unknown` slot health licensed an idle declaration *and* reset the not-streaming clock. A source that was answering and goes dark now fails the run within `CDC_SOURCE_DARK_SECONDS` (45 s), proven against a real TCP blackhole. Not 5: there is still no heartbeat (4.4) and no bounded JDBC socket timeout (4.6(c)), so detection depends on our 0.5 s sampler rather than on the connection itself. |
+| 4.7 | Self-heal without human intervention | **3** (new item, first scored here) | 24 of the 40 enumerated failure modes recover automatically, including six that used to be permanent: an externally advanced/dropped/recreated slot, a restored source, an undecidable fold (`AmbiguousDelete`) and a destination identity collision — the last two previously looped for ever. Nine remain manual and are **scored exceptions** with reasons (orphan offsets, mass-drop breaker, unwritable fence marker, config errors); six are **undefined** (malformed WAL, assembly errors, resume drift, keepalive death, WAL pressure). Full inventory: ADR 0001 §19/A51. Not 5 while the undefined bucket is non-empty. |
 | 5.1 | CDC fast on large changes | 3 | 50 k-row transaction absorbed at ~3.5 k rows/s into local DuckDB; no failure, but a full `dlt.run()` per 2048-row batch is the ceiling. |
 | 5.2 | Low latency on small changes | 1 | Capture latency is 83 ms, but the deliverable is a bounded batch job with no defined cadence — end-to-end latency is the schedule interval. |
 | 5.3 | Keep up with high Postgres TPS | 2 | ~1 k events/s inside the engine, but ~17 s of per-run JVM/connect overhead drops the shipped bounded job to ~157 events/s to MotherDuck. |
@@ -312,20 +313,36 @@ correct assumptions in the notes below:
 **Baseline average: 66 / 40 = 1.65 out of 5.** Items at 5 in the baseline:
 **1 of 40** (7.1).
 
-**Current average (this branch): 82 / 40 = 2.05 out of 5.** Items at 5: **5 of
-40** (1.1, 1.2, 1.3, 1.4, 7.1). Distribution: 22 at 1, 3 at 2, 9 at 3, 1 at 4,
-5 at 5. Distance to target: **118 rubric points**.
+**Current average (this branch): 100 / 41 = 2.44 out of 5.** Items at 5: **9 of
+41** (1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 7.1) — **all of §1 is now at 5**.
+Distribution: 21 at 1, 3 at 2, 8 at 3, 0 at 4, 9 at 5. Distance to target:
+**105 rubric points**.
 
-The delta is +16 points over six items: 1.1 (3 -> 5), 1.2 (3 -> 5), 1.3 (1 -> 5),
-1.4 (2 -> 5), 1.5 (1 -> 4), 1.7 (1 -> 3). Every other row is still the baseline
+The denominator is 41, not 40: the user added rubric **4.7** ("the Flight should
+always be able to self-heal without human intervention") on 2026-07-31, and it is
+scored for the first time here.
+
+The delta over the baseline is +34 points across eleven items: 1.1 (3 -> 5),
+1.2 (3 -> 5), 1.3 (1 -> 5), 1.4 (2 -> 5), 1.5 (1 -> 5), 1.6 (3 -> 5), 1.7 (1 -> 5),
+1.8 (1 -> 5), 4.6 (1 -> 3), 4.7 (new, 3). Every other row is still the baseline
 score, and the detail sections say so.
 
-**1.5 was claimed as 5 and is corrected to 4 here** (2026-07-31). Two independent
-reviews scored the same branch 1/5 and 3/5 for 1.4 and 2/5 and 4/5 for 1.5, with
-executable counterexamples. Every one of those is closed and tested, but the honest
-reading of "replicated just like Postgres handles them" does not include "the
-destination table is dropped and a human must trigger a backfill", which is what a
-recreated relation still means here.
+**1.5 goes from 4 to 5** (2026-07-31). It was deliberately held at 4 with one
+stated condition — "automatic re-snapshot of a recreated relation" — and that
+condition is now met and tested end to end
+(`tests/1.6_snapshot_consistency/test_1_6_recreated_relation.py`): a relation
+dropped and recreated **with rows that produce no change events at all** is
+detected, marked `awaiting_snapshot`, and rebuilt automatically on the next run,
+with the destination proven equal to the source afterwards.
+
+**Conservative-scoring notes for this round.** 1.6 and 1.8 are claimed at 5 on
+whole-table content comparisons against the source, not on counts. 1.7's 5 rests on
+the anchor set being enumerated *from the code*, so it cannot silently fall behind.
+4.7 is deliberately **3, not 5**: 24 of 40 failure modes self-heal, but six are
+undefined (ADR §19/A51 rows 30-32, 35, 37, 39) and an item that claims "100% of
+cases" cannot be claimed while any case is unclassified. 4.6 is 3, not 5, because
+the detection that closed TODO 4.6(b) is ours (a 0.5 s slot sampler), not the
+connection's — 4.4's heartbeat and 4.6(c)'s socket timeouts are still absent.
 
 ---
 
@@ -961,96 +978,183 @@ flowing, and `cdcflight_app_documents` kept its two rows forever.
 
 ---
 
-### 1.6 Snapshot/backfill consistent with CDC — **3 / 5** (provisional)
+### 1.6 Snapshot/backfill consistent with CDC — ~~3~~ **5 / 5**
 
 `inconsistent=1, consistent=5`
 
-**Evidence** (`probes/p08_snapshot_consistency.py`). 120 005 preloaded rows,
-then 300 rows inserted *during* the snapshot at ~30/s. Result: 120 000 preload
-rows present with 120 000 distinct ids, and all 300 concurrent rows present
-exactly once, all as `c` (streaming) events — no gap, no overlap, no duplicate.
-Debezium's exported-snapshot + slot-LSN coordination works.
+#### Why this is provable rather than probable
 
-**Why not 5.** The failure path is not consistent and is not tested here. The
-Postgres connector docs state plainly: *"If the connector stops during a
-snapshot, the connector begins a new snapshot when it restarts"*
-(`repos/debezium/documentation/.../postgresql.adoc:109`). With
-`write_disposition="append"` the abandoned partial snapshot is already in the
-destination, so the restarted snapshot duplicates every row it re-reads.
+The boundary between a snapshot image and the CDC stream is exact **because Postgres
+makes it exact**, and only on one code path. Debezium's `CREATE_REPLICATION_SLOT`
+returns a `consistent_point` and a `snapshot_name`; the snapshot transaction adopts the
+latter with `SET TRANSACTION SNAPSHOT`; the streaming start LSN is the former. A
+transaction is then visible in the image **iff** it committed before that LSN — an iff,
+not an approximation.
 
-**Evidence that would raise this.** A probe that SIGKILLs the process partway
-through a large initial snapshot and shows the destination afterwards contains
-each source row exactly once.
+MEASURED, and it is the load-bearing measurement of this item: Debezium takes that path
+**only when it creates the slot itself**. With a pre-existing slot it uses an ordinary
+isolation level and `pg_current_wal_lsn()` read after the snapshot transaction has begun;
+`snapshot.mode=initial_only` creates no slot at all. Verified in the engine log against
+Debezium 3.6 / Postgres 18.1, and recorded as ADR 0001 §19/A45 — every re-snapshot path
+here therefore runs on a slot that does not yet exist.
 
-**Partly closed, still 3.** The applier snapshots into `<table>__cdcf_tmp` and
-swaps with `DROP` + `RENAME` inside the commit group's transaction, so a failed
-snapshot leaves **nothing** behind and the partial-append duplication above is
-gone - `tests/1.1_exactly_once_pk/test_1_1_fault_interleavings.py::test_a_crash_during_the_snapshot_phase_leaves_no_partial_table`
-crashes mid-snapshot and asserts no shadow survives and the re-snapshot lands each
-row exactly once. What keeps this at 3 is the other half: a restart still re-reads
-the whole table, and *consistency* between a re-snapshot and the CDC stream (the
-hand-over LSN, per-table resumability) is 1.6's and 3.7's own work.
+#### Evidence
 
-### 1.7 Failures do not cause correctness issues — **3 / 5**
+| claim | test |
+|---|---|
+| ~200 transactions committing throughout a snapshot land on exactly one side each — none missing, none duplicated, none delivered as both `r` and `c` | `test_1_6_snapshot_boundary.py` |
+| the boundary is a queryable LSN, and every snapshot record carries exactly it | `test_1_6_snapshot_boundary.py::test_the_boundary_is_a_queryable_lsn` |
+| a crash mid-snapshot leaves nothing partial visible, and the restart lands every row once (full content comparison) | `test_1_6_interrupted_snapshot.py` |
+| a crash **between the DROP and the RENAME** of a swap leaves the old table intact | `test_1_6_interrupted_snapshot.py` (`swap:1`, slow) |
+| a re-snapshot of a live table equals the source afterwards, deleted rows stay deleted, rows the stream never carried are picked up, later changes land on top, other tables are bit-identical | `test_1_6_resnapshot.py` (10 assertions) |
+| the two independent readings of the consistent point agree | `test_1_6_resnapshot.py::test_the_resnapshot_actually_ran` |
+| a recreated relation rebuilds itself automatically | `test_1_6_recreated_relation.py` |
+| an undecidable fold rebuilds the table instead of looping for ever | `test_1_6_ambiguous_delete_self_heals.py` |
+
+#### The hand-over, stated precisely
+
+`table_state.snapshot_lsn` is a **per-table watermark**, and `GroupPlan` drops events for
+table `T` from any unit whose **commit** LSN is below `T`'s watermark. Never on an event's
+own LSN: a transaction still open when the snapshot was taken is in *no* image and some of
+its events carry LSNs below the consistent point, so an event-level fence would lose
+exactly the straddling transaction (ADR §19/A46).
+
+**CDC during a re-snapshot**: there is none, by construction — the re-snapshot is blocking
+and runs before the main engine starts, so nothing is in flight to buffer. Everything the
+stream later delivers is either fenced (before `C`) or applied on top (at or after `C`).
+Concurrent re-snapshot-while-streaming is rubric 3.3/3.4's, and it needs a durable
+per-table buffer this does not build.
+
+#### The cost, stated rather than hidden
+
+A re-snapshot replaces **current state**. The change events of the fenced span are never
+applied, so a changelog (rubric 8.2) is discontinuous there: an image at `C` instead of
+the events that produced it. A `table_events` row with `event='resnapshot'` records where.
+Current state is exact either way, which is what 1.6 asks about.
+
+#### Baseline (historical)
+
+120 005 preloaded rows, 300 rows inserted during the snapshot at ~30/s: all present
+exactly once. What kept it at 3 was the *failure* path — Debezium restarts a snapshot from
+scratch, and with an append-style destination the abandoned partial was already there — and
+the absence of any re-snapshot at all.
+
+### 1.7 Failures do not cause correctness issues — ~~3~~ **5 / 5**
 
 `duplication possible due to crash=1, impossible but not well tested=3, robust fault injection=5`
 
-#### Now (`feature/transactional-applier`, ADR 0001 rev 4)
+#### The anchor set
 
-Duplication is impossible by construction (see 1.1), and `src/cdc_flight/faults.py`
-provides deterministic injection at seven **protocol** anchors - named after the
-protocol, not the implementation - with a malformed `CDC_FAULT_INJECT` failing the
-run so a typo cannot leave a fault test vacuously green. Coverage: six anchors in
-the default suite with a hard exit and a recovery run each; `decode`, both `raise`
-variants (Debezium's L3 error teardown rather than process death), a between-table
-crash whose recovery replays a *spilled* transaction, a snapshot-phase crash and an
-unwritable `offsets.dat` in the slow suite; `mid_apply` and `post_commit_pre_ack`
-against real MotherDuck.
+Twelve anchors, in two mechanisms plus one that cannot live in the process at all:
 
-**Why 3 and not 5.** The injection is robust for the *commit protocol* and nothing
-else. Nothing injects a fault into the destination or network layer (a MotherDuck
-write that fails mid-transaction, a severed connection, a hung `COMMIT`), and the
-WAL-message / slot-failure surface belongs to 4.1/4.3/4.5. Raising this to 5 is
-1.7's own task, and the reviews of this branch explicitly declined to claim it.
+| mechanism | anchors |
+|---|---|
+| `faults.maybe_crash` — the process dies at an exact protocol point | `decode`, `begin`, `spill`, `mid_apply`, `swap`, `pre_commit`, `post_commit_pre_ack`, `post_ack` |
+| `faults.FaultyConnection` — the destination misbehaves | `destination_write`, `destination_commit` (ambiguous), `destination_hang`, `destination_close` |
+| `tests/tcp_relay.py` — the source stops answering with the sockets left open | the network blackhole |
 
-#### Baseline (Phase 0) — historical
+The destination anchors fire at the data group the **applier declares**
+(`faults.arm_group`), not one the wrapper infers from the SQL it happens to see: an
+inferred index is how a fault test goes vacuously green, which is the same defect class as
+the `<nth>` counting bug (Opus M7).
 
-**Evidence.** There was no fault injection in `tests/` at all. The crash probes
-written for this evaluation are the first, and they land the rubric's 1
-squarely: `p13` case B `kill -9`'d the process mid-load and the restart left
-**2 048 duplicate rows** in the destination (`402 048 rows / 400 000 distinct`).
-Duplication is not a theoretical risk here, it is the measured behaviour.
+#### What makes it *robust* rather than *plentiful*
 
-**Gap to 5 (what remains).** 1.1/1.3 are fixed and the harness is in `make test`.
-Still missing: kill the Postgres backend, drop the slot, sever the connection, and
-fail a destination write mid-transaction - each asserting exact change-event counts
-at the destination.
+`test_1_7_fault_matrix.py` parametrises over **`faults.ALL_POINTS` itself** and asserts
+that every anchor has a declared outcome class. A new anchor added to `faults.py` without a
+scenario fails the suite. Two permitted outcomes, and a third written down so its emptiness
+is a statement:
 
-### 1.8 Externally-advanced slot detected → backfill — **1 / 5**
+* `RECOVERS` — the ledger is intact and a following run makes the destination equal the source;
+* `LOUD` — non-zero exit with an accurate `last_run.json`;
+* `SILENT` — must be empty, and is.
+
+The ledger is the **source's own counts**, per keyed and keyless table, plus
+`count(*) = count(DISTINCT cdcf_event_id)`. `test_1_7_chaos.py` composes the anchors: a
+seeded random anchor at a random workload shape, 8 iterations, with that invariant checked
+after each; `CDC_CHAOS_SEED` replays a failing sequence verbatim.
+
+#### Three defects the injection found
+
+1. **A hung `COMMIT` was unbounded** — neither of the two permitted outcomes. Nothing in
+   DuckDB or the MotherDuck client imposes a deadline, so the run would hold the lease for
+   ever. `CDC_COMMIT_TIMEOUT` (300 s) now aborts with `EX_TEMPFAIL`; safe *because* of
+   Invariant O (ADR §4.6 F5).
+2. **`last_run.json` named the wrong cause.** A destination write that failed
+   mid-transaction was reported as `java.lang.InterruptedException`, because pydbzengine
+   interrupts the engine thread when the handler raises and Debezium's completion message
+   won. Ours is the root cause and is reported first now.
+3. **Two fault tests were passing vacuously**, on an unrelated 3 s failure, until the
+   assertions were strengthened to require the summary to *name* the injected fault. And
+   `spill` could not fire at all at shipped defaults, so the matrix records the arming each
+   anchor needs.
+
+#### Baseline (historical)
+
+`p13` case B `kill -9`'d the process mid-load and the restart left **2 048 duplicate rows**
+(402 048 rows / 400 000 distinct). Duplication was measured behaviour, not a risk.
+
+### 1.8 Externally-advanced slot detected → backfill — ~~1~~ **5 / 5**
 
 `silent data loss=1, process exits=4, automatic backfill=5`
 
-**Evidence** (`probes/p04_offset_mismatch.py`). Snapshot run, then 31 change
-events generated, then
-`pg_replication_slot_advance(slot, pg_current_wal_lsn())`. The next run:
+#### The check, on every acquisition
 
-```json
-{"records": 0, "batches": 0, "stop_reason": "idle", "returncode": 0}
-```
+`reconcile.check_slot` is a **pure function** of (durable offset, one observation, the
+previous observation), so every cell of its decision table is a unit test rather than a
+base-backup restore. Six decisions trigger an automatic re-snapshot of every captured
+table — "all captured tables, unless provable otherwise", and it is not provable
+otherwise, because nothing in the destination records which relations the discarded WAL
+touched:
 
-Thirty-one changes gone, exit code 0, no warning. Root cause confirmed in the
-engine log (`p11`): `Using offset mismatch strategy 'no_validation': Connector
-will not validate slot position`.
-`repos/debezium/.../PostgresConnectorConfig.java:677-688` — `offset.mismatch.strategy`
-defaults to `NO_VALIDATION`, and the docs note that on Postgres 15+ the server
-silently starts from `confirmed_flush_lsn` instead of erroring.
+| decision | what it catches | previously |
+|---|---|---|
+| `slot_ahead_of_destination` | somebody else consumed the slot | hard error (a 4) |
+| `slot_missing` | the slot is gone; a new one starts at the CURRENT WAL position, so the gap is total and silent | **silent loss** |
+| `slot_recreated` | `restart_lsn` went backwards, which a slot cannot do | undetectable |
+| `source_identity_changed` | `pg_control_system().system_identifier` differs — a restore, a clone, a repointed DSN | undetectable |
+| `source_lsn_regressed` | the source has written less WAL than we have consumed (MINOR-11 carry-forward) | fenced, never detected |
+| `no_durable_destination_row` | destination empty, slot positioned | refused unless `snapshot.mode` happened to read data |
 
-**Gap to 5.** Set `offset.mismatch.strategy=trust_offset` so the mismatch is
-detected and raised (that alone is worth 4), then convert the raised condition
-into an automatic re-snapshot of the affected tables (needs 3.2/3.4). Note the
-property is marked Technology Preview upstream, so we should also validate the
-slot ourselves on acquisition: compare `confirmed_flush_lsn` against the stored
-offset before starting the engine.
+Detecting the middle three needs a memory, so `_cdc_flight.slot_state` records
+`system_identifier`, `timeline_id`, `restart_lsn` and `confirmed_flush_lsn` at every
+acquisition — **outside** any commit group, because it is an observation about the source
+and recording it must never be able to fail a commit. Every check degrades to "cannot
+compare" when the row is absent, so correctness never depends on it.
+
+#### Evidence
+
+Real operations on real slots, and each one is scored on a **whole-table content
+comparison against the source afterwards**, including a keyless changelog table where a
+duplicate cannot hide behind an upsert:
+
+* `pg_replication_slot_advance(slot, pg_current_wal_lsn())` after 25 keyed + 25 keyless
+  rows → detected, all six tables re-snapshotted, destination equals source, CDC works
+  again, `critical` alert recorded (`test_1_8_slot_advanced.py`);
+* `pg_drop_replication_slot` while the pipeline is down → detected, repaired, the rows the
+  new slot would have skipped are back;
+* a slot **behind** us → `ok`, no recovery, no re-snapshot: the safe direction has to stay
+  quiet or the detector is a false-positive machine;
+* a changed `system_identifier` and a rewound WAL position → detected and repaired
+  (`test_1_8_restore_and_observation.py`);
+* `CDC_RESNAPSHOT=0` → the rubric's 4, chosen deliberately rather than by accident.
+
+#### The refusal that survives, and why
+
+`orphan_offset_file` — an `offsets.dat` with no destination row — still **refuses to
+start**. It is the one case where the automatic action could itself destroy data: the usual
+cause is a DSN pointed at the wrong database, and a re-snapshot would `DROP` *that*
+database's live tables and replace them with another source's contents.
+`--accept-orphan-offsets` is how an operator says "yes, rebuild into this destination", and
+it now also drops the slot and forces a data-reading `snapshot.mode`.
+
+#### Baseline (historical)
+
+`probes/p04_offset_mismatch.py`: 31 change events skipped, `{"records": 0, "stop_reason":
+"idle", "returncode": 0}`. Root cause `offset.mismatch.strategy=NO_VALIDATION`, and on
+Postgres 15+ the server silently starts from `confirmed_flush_lsn` rather than erroring.
+The property is Technology Preview upstream and is **not** what closes this: the check is
+ours, it runs before the engine starts, and it does not depend on Debezium noticing.
 
 ---
 

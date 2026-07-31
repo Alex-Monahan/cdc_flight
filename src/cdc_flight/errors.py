@@ -105,7 +105,28 @@ class AmbiguousDelete(RuntimeError):
     if it ever is not, the honest outcome is a refused commit group, not a guess:
     the rubric's own scale puts an error (=1) above silent loss, the group rolls
     back, and the transaction replays for free under Invariant O.
+
+    **And then it replays into the same ambiguity, for ever** — which is a permanent
+    manual-intervention case, and rubric 4.7 scores those. So the exception carries the
+    table it could not fold, and the applier turns it into a durable re-snapshot request
+    for exactly that table (ADR 0001 §19/A47). The re-snapshot's consistent point is
+    necessarily *after* the offending transaction — we had already received it, so it is
+    already in WAL — so the per-table watermark fences the transaction that cannot be
+    folded, and the loop terminates after exactly one re-snapshot.
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        source_schema: str | None = None,
+        source_table: str | None = None,
+        target: str | None = None,
+    ):
+        super().__init__(message)
+        self.source_schema = source_schema
+        self.source_table = source_table
+        self.target = target
 
 
 class DestinationIdentityCollision(RuntimeError):
@@ -116,6 +137,21 @@ class DestinationIdentityCollision(RuntimeError):
     `PRIMARY KEY` the identity columns normally carry; where it can, the destination
     itself rejects the INSERT.
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        source_schema: str | None = None,
+        source_table: str | None = None,
+        target: str | None = None,
+    ):
+        super().__init__(message)
+        #: rubric 4.7: set by `table_work.write` so the applier can queue the rebuild
+        #: that turns this from a permanent failure into a self-healing one.
+        self.source_schema = source_schema
+        self.source_table = source_table
+        self.target = target
 
 
 class NoDurableDestinationRow(RuntimeError):

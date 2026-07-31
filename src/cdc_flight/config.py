@@ -185,6 +185,12 @@ def applier_settings() -> dict:
         #: and fail closed if the source cannot be asked (Codex 4). Off only for tests
         #: that drive the coordinator without a real source.
         "drop_revalidate": _flag("CDC_DROP_REVALIDATE", True),
+        #: rubric 4.7. An undecidable fold used to be a PERMANENT failure: the group
+        #: rolls back (correctly), the transaction replays, the same ambiguity is hit,
+        #: for ever. That is a manual-intervention case, which 4.7 scores. Default ON:
+        #: the affected table is queued for an automatic re-snapshot, whose consistent
+        #: point necessarily fences the transaction that cannot be folded.
+        "resnapshot_on_ambiguity": _flag("CDC_AMBIGUOUS_RESNAPSHOT", True),
     }
 
 

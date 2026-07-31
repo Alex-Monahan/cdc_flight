@@ -84,6 +84,7 @@ def restored(tmp_path_factory, postgres_cluster):
         box.reseed()
 
 
+@pytest.mark.slow
 def test_a_restored_cluster_is_detected_and_repaired(restored):
     summary = restored["recovered"]
     assert summary["slot_check"]["decision"] == "source_identity_changed", summary["slot_check"]
@@ -91,6 +92,7 @@ def test_a_restored_cluster_is_detected_and_repaired(restored):
     assert summary["ok"] is True, summary
 
 
+@pytest.mark.slow
 def test_a_restored_cluster_leaves_the_destination_equal_to_the_source(restored):
     box = restored["box"]
     source = {str(r[0]) for r in box.pg_query("SELECT name FROM app.customers")}
@@ -101,6 +103,7 @@ def test_a_restored_cluster_leaves_the_destination_equal_to_the_source(restored)
     assert dest == source
 
 
+@pytest.mark.slow
 def test_a_restored_cluster_forgets_the_old_catalog(restored):
     """Otherwise every relation looks dropped-and-recreated and the breaker refuses.
 
@@ -121,6 +124,7 @@ def test_a_restored_cluster_forgets_the_old_catalog(restored):
     assert recorded and str(recorded[0][0]) == str(live)
 
 
+@pytest.mark.slow
 def test_a_rewound_source_is_detected(tmp_path_factory, postgres_cluster):
     """MINOR-11 carry-forward: `pg_current_wal_lsn()` behind the durable offset.
 
@@ -153,6 +157,7 @@ def test_a_rewound_source_is_detected(tmp_path_factory, postgres_cluster):
         box.reseed()
 
 
+@pytest.mark.slow
 def test_resnapshot_can_be_turned_off_for_the_rubrics_four(tmp_path_factory, postgres_cluster):
     """`CDC_RESNAPSHOT=0` keeps the old behaviour: detect, alert, exit non-zero.
 

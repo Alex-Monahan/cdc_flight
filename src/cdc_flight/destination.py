@@ -610,6 +610,38 @@ class AlertSink:
         log.warning("ALERT %s/%s: %s", severity, code, message)
         return self.independent
 
+    def request_snapshot(self, *, pipeline: str, schema: str, table: str, target: str) -> bool:
+        """Mark a table `awaiting_snapshot` so the request OUTLIVES a rolled-back group.
+
+        Rubric 4.7. The one caller is `AmbiguousDelete`: the group that could not be
+        folded must roll back (never commit a guess), and the request to rebuild the
+        table must survive that rollback or the next run replays into the same ambiguity
+        for ever. Same connection as the alerts, for the same reason and with the same
+        verified property: an INSERT on `con.cursor()` survives the parent connection's
+        ROLLBACK.
+
+        Returns False when there is no independent connection, in which case the request
+        would be discarded with the group and saying so is the honest outcome.
+        """
+        if not self.independent or self._sink is None:
+            log.error(
+                "cannot record a re-snapshot request for %s.%s outside the transaction; "
+                "it would be discarded with the rolled-back group",
+                schema, table,
+            )
+            return False
+        try:
+            request_snapshot(
+                self._sink,
+                pipeline=pipeline,
+                tables=[(schema, table, target)],
+                detail=f"AmbiguousDelete on {schema}.{table} (rubric 4.7 self-heal)",
+            )
+        except Exception:  # pragma: no cover - never mask the original failure
+            log.warning("could not record the re-snapshot request", exc_info=True)
+            return False
+        return True
+
     def close(self) -> None:
         if self._sink is not None:
             with contextlib.suppress(Exception):

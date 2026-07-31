@@ -301,7 +301,9 @@ def run(
             outcome.as_dict(),
         )
 
-    outcome.swapped = _completed_tables(con, pipeline, tables, outcome.consistent_lsn)
+    outcome.swapped = _completed_tables(
+        con, pipeline, tables, outcome.consistent_lsn, reason=reason
+    )
     outcome.emptied = _finish_empty_tables(
         con,
         pipeline=pipeline,
@@ -354,17 +356,29 @@ def _agree(record_lsn: int | None, slot_lsn: int | None) -> int | None:
 
 
 def _completed_tables(
-    con, pipeline: str, tables: list[tuple[str, str, str]], consistent_lsn: int
+    con,
+    pipeline: str,
+    tables: list[tuple[str, str, str]],
+    consistent_lsn: int,
+    *,
+    reason: str = "",
 ) -> list[str]:
     """The requested tables whose shadow has been swapped in, per `table_state`.
 
-    Also pins `snapshot_lsn` to the consistent point. The swap records the group's last
-    event LSN, which for a snapshot group *is* `C` — but "is, because every snapshot
-    record carries the same LSN" is a derivation, and the watermark that fences the
-    whole main stream should not rest on one.
+    Also pins `snapshot_lsn` to the consistent point, and records a `table_events` row
+    saying where the per-event history is discontinuous.
+
+    The pinning: the swap records the group's last event LSN, which for a snapshot group
+    *is* `C` — but "is, because every snapshot record carries the same LSN" is a
+    derivation, and the watermark that fences the whole main stream should not rest on one.
+
+    The marker: a re-snapshot replaces **current state**, and the change events of every
+    transaction below `C` for this table are fenced rather than applied. Current state is
+    exact; a changelog (rubric 8.2) has a gap there, and rubric 8.2 needs to be able to
+    *find* the gap rather than be told about it in a docstring.
     """
     done: list[str] = []
-    for schema, table, _target in tables:
+    for schema, table, target in tables:
         rows = con.execute(
             f"SELECT snapshot_state FROM {CONTROL_SCHEMA}.table_state "
             "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
@@ -375,6 +389,25 @@ def _completed_tables(
                 f"UPDATE {CONTROL_SCHEMA}.table_state SET snapshot_lsn = ? "
                 "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
                 [consistent_lsn, pipeline, schema, table],
+            )
+            dest_mod.write_table_event(
+                con,
+                pipeline=pipeline,
+                commit_id=0,
+                seq=0,
+                event="resnapshot",
+                source_schema=schema,
+                source_table=table,
+                target_table=target,
+                applied=True,
+                lsn=consistent_lsn,
+                detail=(
+                    f"re-snapshotted at consistent point {consistent_lsn} ({reason}). "
+                    "The table holds exact current state; change events of transactions "
+                    "that committed before this LSN are fenced rather than applied, so "
+                    "per-event history for that span is the snapshot image and not the "
+                    "individual events (rubric 8.2's changelog is discontinuous here)."
+                ),
             )
             done.append(f"{schema}.{table}")
     return done

@@ -77,6 +77,8 @@ def reconcile(
     offset_path: Path,
     accept_orphan: bool = False,
     repair: bool = True,
+    dsn: str | None = None,
+    slot_name: str | None = None,
 ) -> Reconciliation:
     from .destination import read_resume_point
 
@@ -95,13 +97,29 @@ def reconcile(
                                   "no offsets file and no destination row")
         if accept_orphan:
             Path(offset_path).unlink(missing_ok=True)
+            # And the slot goes too. The re-snapshot this returns to is only exact if
+            # Debezium *creates* the slot (`drop_slot`'s docstring), and an existing slot
+            # whose `confirmed_flush_lsn` we cannot account for would additionally make
+            # the stream resume past the snapshot's consistent point - which is precisely
+            # the loss window rubric 1.8 is about. Best effort: an operator who has
+            # passed `--accept-orphan-offsets` has already said "rebuild this".
+            slot_action = "not attempted"
+            if dsn and slot_name:
+                try:
+                    slot_action = drop_slot(dsn, slot_name)
+                except Exception as exc:  # pragma: no cover - slot held elsewhere
+                    slot_action = f"drop_failed: {exc}"
+                    log.error("could not drop %r for the orphan re-snapshot: %s", slot_name, exc)
             raise_alert(
                 con, pipeline=pipeline, severity="warning", code="orphan_offset_file",
                 message="orphan offsets.dat deleted on operator request; re-snapshotting",
-                context={"offset_file": str(offset_path), "file_lsn": file_lsn},
+                context={
+                    "offset_file": str(offset_path), "file_lsn": file_lsn,
+                    "slot": slot_action,
+                },
             )
             return Reconciliation("orphan_accepted_resnapshot", ResumePoint(), file_lsn,
-                                  True, "orphan offsets file deleted")
+                                  True, f"orphan offsets file deleted; slot {slot_action}")
         raise_alert(
             con, pipeline=pipeline, severity="critical", code="orphan_offset_file",
             message=(

@@ -20,6 +20,7 @@
 | 3 | 2026-07-30 | **Amendments from the implementation** (§15): the apply path must insert through Arrow - `executemany` is 300x slower and makes a large commit group unfinishable (A14); `transaction.id` is not a transaction identifier (A1); the Connect schema stays off, so rubric 2.4 is untouched (A2); `verify_offset_file` becomes a rebuild plus a one-directional assertion (A4); a drained batch closes the group (A5); a provably-dead lease is reclaimed (A6); §14.1 answered for DuckDB (A8); §10's dlt exit criterion evaluated (A10). |
 | 4 | 2026-07-31 | **Amendments from the 1.1-1.3 review round** (§16). The boundary rule made unconditional in every storage mode (A20); the ordinal contract enforced, which is how the keyless-identity disagreement between the two reviews resolves (A18); spill made one ordered pass with explicit identity and a fence that covers staged rows (A19); the destination enforces the identity with a PRIMARY KEY (A21); reconciliation compares the whole typed offset map and gains §4.5's missing "slot exists / no durable row" row (A22); `lsn.flush.mode` pinned (A23); the commit->ack window emptied (A24); the fault anchors corrected and extended (A25); `commit_id` scoped per pipeline (A26); the applier decomposed (A29); deferrals stated (A28). |
 | 6 | 2026-07-31 | **Amendments from the 1.4/1.5 review round** (§18). The fold rebuilt around **physical rows**, which supersedes A31 and closes five reproduced silent-loss/duplication orderings (A35); where it cannot attribute, it refuses rather than guessing (A36); Invariant O restated as bounding *ordering only*, so the fold is the second half of the exactly-once claim (A37); four guards added between detection and destruction, and `CDC_CATALOG_GRACE` excluded from the guarantee (A38); `table_state` made the canonical ownership registry, which `--reset-state` no longer deletes (A39); the destructive-DDL alert genuinely moved out of the transaction and classified by whether it describes a refusal or an applied action (A40); a rolled-back group discarded in the process too (A41); one source writer shared with D9 (A42); a run with an unresolved destructive change is not a success (A43); module boundaries restored (A44). |
+| 7 | 2026-07-31 | **Amendments from 1.6 / 1.7 / 1.8 and the mid-task addition of rubric 4.7** (§19): the re-snapshot mechanism, and why Debezium only pairs a snapshot with an exact LSN on a slot it creates itself (A45); the hand-over fenced per table on the COMMIT LSN, with the changelog cost stated (A46); undecidable folds self-heal instead of failing identically for ever (A47); destination and network fault injection, the commit watchdog and the mis-reported cause (A48); `unknown` source health no longer licenses an idle declaration (A49); rubric 1.8's decision table and the one refusal that survives it (A50); the failure-mode inventory rubric 4.7 needs (A51). |
 | 5 | 2026-07-31 | **Amendments from 1.4 / 1.5** (§17): a key-changing UPDATE is always `d`+`c` for Postgres, so 1.4's atomicity is a corollary of §3.2/§3.3 (A30); the merge cannot collapse a group by key alone when one key is worn by two rows in one transaction (A31); TRUNCATE is a counted, key-less data event and `skipped.operations` was the whole gap (A32); DROP TABLE needs a catalog poller whose WAL fence marker must be **transactional** (A33 — which also constrains D9); what a table-level event means for history (A34). |
 
 ---
@@ -2400,3 +2401,216 @@ redistributed:
 | `catalog_apply.py` | the destructive-DDL policy and the four guards, as an immutable plan |
 | `resume.py` | the resume point and the `offsets.dat` forensics |
 | `source_marker.py` | the only writes cdc_flight makes to the source |
+
+---
+
+## 19. Amendments from 1.6 / 1.7 / 1.8 (rev 7, 2026-07-31)
+
+Written while implementing TODO 1.6 (snapshot/CDC consistency), 1.7 (fault injection)
+and 1.8 (externally-advanced slot), plus the mid-task addition of rubric **4.7**
+("the Flight should always be able to self-heal without human intervention").
+
+### A45 — the re-snapshot mechanism, and why a *fresh slot* is load-bearing
+
+Three items needed "rebuild this table from the source" and none of them had it. The
+mechanism is a **blocking re-snapshot through a short-lived Debezium engine with its own
+fresh replication slot, before the main stream starts** (`cdc_flight.resnapshot`).
+
+The load-bearing measurement, taken against Debezium 3.6 + Postgres 18.1 and recorded
+here because the whole consistency claim rests on it: Debezium pairs the snapshot with an
+exact WAL position **only when it creates the slot itself**.
+
+| slot | isolation statement | streaming start LSN |
+|---|---|---|
+| created by Debezium in this start-up | `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;` **+ `SET TRANSACTION SNAPSHOT '<exported>'`** | `slotCreatedInfo.startLsn()` — the slot's `consistent_point` |
+| already existed | the configured isolation mode, no exported snapshot | `pg_current_wal_lsn()`, read after the snapshot transaction has begun |
+
+(`PostgresSnapshotChangeEventSource.snapshotTransactionIsolationLevelStatement`,
+`getTransactionStartLsn`; the upstream comment on the first row is "crucial so that if any
+SQL operations occur mid-snapshot they'll be properly captured when streaming begins;
+otherwise they'll be lost".) `snapshot.mode=initial_only` creates **no slot at all** —
+verified in the engine log — so it takes the second path and is unusable for this.
+
+Consequences that are now design rules:
+
+1. the re-snapshot engine uses `snapshot.mode=initial` on a slot name that does not
+   exist, and is stopped the moment the snapshot completes (`stop_when`);
+2. rubric 1.8's recovery **drops** the pipeline's slot rather than reusing it, for the
+   same reason plus a second one: a slot whose `confirmed_flush_lsn` we cannot account for
+   makes the stream resume *past* the snapshot's consistent point;
+3. `--accept-orphan-offsets` drops the slot too — same argument, previously missing.
+
+`C` (the consistent point) is read two independent ways — every snapshot record's
+`source.lsn`, and the first `confirmed_flush_lsn` the throwaway slot ever shows — and they
+must agree. On disagreement the **minimum** is used and an error is logged: fencing too
+low re-applies (converges for a keyed table, duplicates for a keyless one), fencing too
+high skips (silent loss), so given a choice, take the one that cannot lose.
+
+### A46 — the hand-over is fenced per table, on the COMMIT LSN
+
+Postgres's exported snapshot makes visibility an **iff**: a transaction is in the image
+exactly when it committed before `C`. So `table_state.snapshot_lsn` becomes a per-table
+watermark and `GroupPlan` drops events for table `T` from any unit whose **commit** LSN is
+below `T`'s watermark.
+
+Never on an event's own LSN. A transaction that was still open when the snapshot was taken
+is in **no** image, and some of its events carry LSNs below `C`; fencing those would be
+silent loss of exactly the straddling transaction. The watermark is read for *every* table
+with a complete image, not only re-snapshotted ones — after an ordinary initial snapshot
+the same rule holds and is a no-op, and a fence armed only on some paths is one nobody can
+reason about.
+
+**CDC during a re-snapshot** therefore has one-line semantics: there is none, because the
+main stream has not started; and everything the main stream later delivers for the table is
+either fenced (before `C`) or applied on top (at or after `C`). Concurrent
+re-snapshot-while-streaming is rubric 3.3/3.4's, and it needs a durable per-table buffer
+this does not build.
+
+**The honest cost.** A re-snapshot replaces *current state*. The change events of the
+fenced span are never applied, so a changelog (rubric 8.2) is discontinuous there: an image
+at `C` instead of the events that produced it. A `table_events` row with
+`event='resnapshot'` records where, so 8.2 can *find* the discontinuity rather than be told
+about it in a docstring.
+
+### A47 — an undecidable fold self-heals (rubric 4.7)
+
+`AmbiguousDelete` (A36) and `DestinationIdentityCollision` (A21) were the right immediate
+answer and the wrong eventual one: the group rolls back, Invariant O replays the
+transaction, the same condition is hit, the run fails again — **for ever**. That is a
+permanent manual-intervention case.
+
+Both exceptions now carry the relation they could not fold, and the applier records an
+`awaiting_snapshot` request on the **independent** connection (the one `AlertSink`
+introduced, whose survival of a parent `ROLLBACK` is verified) so the request outlives the
+rollback that must still happen. The next run rebuilds that table.
+
+Termination is an argument, not a hope: the offending transaction had already been
+delivered, so its commit LSN was already in WAL when the re-snapshot starts; `C` is taken
+after that; so A46's watermark fences it. **One re-snapshot, always.** The run still exits
+non-zero — no human action is required, but an operator should know — and
+`CDC_AMBIGUOUS_RESNAPSHOT=0` restores the permanent failure for anyone who wants it.
+
+### A48 — destination and network faults, and the two outcome classes
+
+Rubric 1.7's anchors were all places *we* stand, which cannot express "the destination
+refused the write". Two mechanisms are added:
+
+* `faults.FaultyConnection` wraps the single destination connection and injects
+  `destination_write` / `destination_commit` / `destination_hang` / `destination_close` at
+  a data group the **applier declares** (`faults.arm_group`) rather than one the wrapper
+  infers from the SQL it sees — an inferred index is how a fault test goes vacuously green;
+* `tests/tcp_relay.py` blackholes the *source* from outside the process: bytes stop being
+  forwarded and both sockets stay open, which no in-process anchor can simulate and which
+  is the shape rubric 4.6 calls "silently-dead-connection".
+
+Every anchor must land in one of exactly two classes — a clean recovery with the ledger
+intact, or a non-zero exit with an accurate `last_run.json` — and
+`tests/1.7_fault_injection/test_1_7_fault_matrix.py` enumerates them **from
+`faults.ALL_POINTS`**, so a new anchor with no declared outcome fails the suite.
+
+Two defects this found:
+
+* a hung `COMMIT` was unbounded, which is neither class. `CDC_COMMIT_TIMEOUT` (300 s)
+  aborts the process with `EX_TEMPFAIL`. Safe *because* of Invariant O: the commit is
+  ambiguous and nothing was acknowledged, so the next run resumes from whatever the
+  destination actually holds (§4.6 F5);
+* `last_run.json` named the wrong cause. A destination write that failed mid-transaction
+  was reported as `java.lang.InterruptedException`, because pydbzengine interrupts the
+  engine thread when the handler raises and Debezium's completion message won the
+  comparison. Ours is the root cause and is now reported first.
+
+### A49 — `unknown` is not a reason to declare a stream idle (closes TODO 4.6(b))
+
+`SourceHealth` reported `unknown` when the slot could not be queried, and
+`may_declare_idle()` returned **True** for it *and* the sampler loop reset the
+not-streaming clock. A blackholed Postgres therefore exited `ok: true` on a partial
+delivery — measured, and the residual half of review finding B5.
+
+The fix keeps the distinction the fail-soft existed for. A sampler that has **never**
+succeeded (no `psycopg`, no privilege, a firewall that was always there) still degrades to
+timer-only idle detection; one that *was* answering and has gone dark forbids idle, counts
+as not-streaming, and after `CDC_SOURCE_DARK_SECONDS` (45 s) fails the run outright — which
+makes detection bounded rather than "whenever `--max-seconds` happens to expire".
+
+### A50 — rubric 1.8's decision table, and the one refusal that survives it
+
+`reconcile.check_slot` is a **pure function** of (durable offset, one observation, the
+previous observation), so every cell is a unit test rather than a base-backup restore.
+Six decisions trigger an automatic re-snapshot of every captured table:
+`slot_ahead_of_destination`, `slot_missing`, `slot_recreated`, `source_identity_changed`,
+`source_lsn_regressed`, `no_durable_destination_row`.
+
+Detecting a recreated slot or a restored cluster needs a memory, so `_cdc_flight.slot_state`
+records `system_identifier`, `timeline_id`, `restart_lsn` and `confirmed_flush_lsn` at every
+acquisition. It is written **outside** any commit group: it is an observation about the
+source, not a fact about the data, and recording it must never be able to fail a commit.
+Every check degrades to "cannot compare" when the row is absent, so correctness never
+depends on it — it only makes the detectable set larger.
+
+The recovery order is load-bearing: mark every captured table `awaiting_snapshot` (a
+durable to-do list, so a run that dies half way is resumed rather than restarted), *then*
+delete the resume point, *then* the offsets file, *then* drop the slot. Row-gone plus
+file-present is the orphan refusal, which is the right outcome for a misconfigured operator
+and the wrong one for us.
+
+**The refusal that survives.** `orphan_offset_file` — an `offsets.dat` with no destination
+row — still refuses to start, and it is the one place where automatic recovery could itself
+destroy data: the usual cause is a DSN pointed at the wrong database, and a re-snapshot
+would `DROP` *that* database's live tables and replace them with another source's contents.
+`--accept-orphan-offsets` is how an operator says "yes, rebuild into this destination", and
+it now also drops the slot (A45) and forces a data-reading `snapshot.mode`.
+
+### A51 — failure-mode inventory (rubric 4.7's baseline)
+
+Rubric 4.7 scores manual-intervention cases, so they have to be **enumerated**, not
+recalled. Every raise site, fatal log, refusal and `stop_reason` in the tree as of rev 7,
+classified as `AUTO` (recovers with no human action, possibly across runs), `MANUAL`
+(a human must act) or `UNDEFINED` (not established either way — the dangerous bucket).
+
+| # | failure mode | detection | recovery | consistency | class |
+|---|---|---|---|---|---|
+| 1 | crash at any of the 8 protocol anchors | process death | next run resumes from the durable resume point | exactly-once (Invariant O + fence) | AUTO |
+| 2 | destination write fails mid-transaction | exception | group rolls back, replays | exactly-once | AUTO |
+| 3 | destination `COMMIT` raises (ambiguous) | exception | next run reads whichever point is durable | exactly-once (§4.6 F5) | AUTO |
+| 4 | destination `COMMIT` hangs | `CDC_COMMIT_TIMEOUT` watchdog | process aborts (75), next run resumes | exactly-once | AUTO |
+| 5 | destination connection severed | exception | as 2 | exactly-once | AUTO |
+| 6 | MotherDuck lease row locked by an abandoned txn | conflict on DELETE | 30 s bounded retry (A27) | exactly-once | AUTO |
+| 7 | second concurrent runner | lease renewal inside the group | loser exits before writing; retry later | exactly-once | AUTO |
+| 8 | `offsets.dat` missing / corrupt / ahead / behind | start-up reconciliation | rebuilt from the destination | exactly-once | AUTO |
+| 9 | `markBatchFinished()` did not flush | `OffsetFlushVerifier` | non-zero exit; next run rebuilds the file | exactly-once | AUTO |
+| 10 | walsender killed / connector restart backoff | `SourceHealth` streaming clock | run fails; next run resumes | exactly-once | AUTO |
+| 11 | source blackholed (silently-dead connection) | `unknown` + `CDC_SOURCE_DARK_SECONDS` | run fails; next run resumes | exactly-once | AUTO |
+| 12 | slot advanced externally | `check_slot` | automatic full re-snapshot | current state exact; changelog gap (A46) | AUTO |
+| 13 | slot dropped | `check_slot` | automatic full re-snapshot | as 12 | AUTO |
+| 14 | slot recreated at the same name | `slot_state.restart_lsn` regression | automatic full re-snapshot | as 12 | AUTO |
+| 15 | source restored / cloned / DSN repointed | `system_identifier` change | automatic full re-snapshot + catalog forgotten | as 12 | AUTO |
+| 16 | source WAL rewound | `pg_current_wal_lsn() < durable` | automatic full re-snapshot | as 12 | AUTO |
+| 17 | destination empty, slot positioned | `check_slot` | automatic full re-snapshot | as 12 | AUTO |
+| 18 | crash mid-snapshot | process death | shadow dropped and rebuilt | nothing partial ever visible | AUTO |
+| 19 | crash between a swap's DROP and RENAME | process death | transactional DDL rolls back; table still owed | old table intact | AUTO |
+| 20 | crash mid-re-snapshot | process death | table stays `awaiting_snapshot`; next run redoes it | as 12 | AUTO |
+| 21 | source relation dropped and recreated | catalog poller | destination dropped, `awaiting_snapshot`, then auto re-snapshot | as 12 | AUTO |
+| 22 | undecidable fold (`AmbiguousDelete`) | fold refuses | auto re-snapshot of that table, terminating (A47) | current state exact; changelog gap | AUTO |
+| 23 | destination identity collision | post-apply assertion | as 22 | as 22 | AUTO |
+| 24 | source table emptied at the source during a re-snapshot | zero snapshot records | destination table emptied + audited | exact | AUTO |
+| 25 | orphan `offsets.dat` (no destination row) | reconciliation | **refuses to start** | protects a destination that may not be ours (A50) | **MANUAL** (scored exception) |
+| 26 | >1 destination table would be destroyed at once | mass-drop circuit breaker | **refuses**, stays pending | protects against whole-warehouse destruction | **MANUAL** (owned by 4.7's own task) |
+| 27 | destructive catalog change unresolved at shutdown (fence marker unwritable, e.g. read-only source) | `catalog_unresolved` | run fails; **repeats** while the source cannot be written to | destination knowingly stale, never wrong | **MANUAL** |
+| 28 | `CDC_FAULT_INJECT` / `CDC_TRUNCATE_MODE` / `CDC_DROP_MODE` malformed, `INVARIANT_O_PINS` overridden | start-up validation | refuses | n/a — a human wrote it | **MANUAL** (correctly) |
+| 29 | `motherduck_token` absent / destination unreachable at connect | connect raises | refuses; retry once fixed | nothing written | **MANUAL** (correctly) |
+| 30 | malformed / unknown WAL message (`EnvelopeDecodeError`) | decode refuses | run fails and **repeats** on the same record | nothing wrong is written | **UNDEFINED** — rubric 4.3 owns "handles backfill automatically" |
+| 31 | inconsistent Debezium transaction metadata (`TransactionAssemblyError`) | assembler refuses | as 30 | as 30 | **UNDEFINED** — 4.3 |
+| 32 | `ResumePointDrift` (offsets file disagrees post-COMMIT, or a snapshot record with no ordinal) | assertion | run fails; reconciliation repairs the file case; the ordinal case is an internal invariant | data already durable | **UNDEFINED** |
+| 33 | publication dropped / privileges revoked at the source | connector fails to start | run fails and repeats | nothing wrong is written | **MANUAL** (correctly — but 4.1 may want auto-recreate) |
+| 34 | `--reset-state` used against a live destination | none | n/a | operator-initiated re-snapshot | **MANUAL** (correctly) |
+| 35 | re-snapshot yields no consistent point at all | `resnapshot` refuses | run fails; tables stay owed; next run retries | nothing swapped | AUTO (retries) but **UNDEFINED** if it always fails |
+| 36 | engine `close()` hangs / engine thread will not stop | `close_timeout`, 60 s join | run fails; process exits via the JVM watchdog | exactly-once | AUTO |
+| 37 | Debezium keepalive thread dies silently | **not detected** | — | — | **UNDEFINED** — TODO 4.6(b) carry-forward |
+| 38 | destination disk full / MotherDuck quota | exception mid-apply | as 2, then repeats until space exists | exactly-once | **MANUAL** (correctly) |
+| 39 | WAL retained until the slot is consumed (source disk pressure) | not detected here | — | — | **UNDEFINED** — 3.6/4.4 |
+| 40 | throwaway re-snapshot slot leaked by a hard crash mid-re-snapshot | next re-snapshot drops it by name before use | dropped | no WAL held beyond the next run | AUTO |
+
+Rows 25-29, 33-34 and 38 are the **scored exceptions**: each is either protecting the
+destination from an automatic action that could destroy it, or a configuration error where
+a human is the only thing that can fix the input. Rows 30-32, 35, 37 and 39 are the
+**undefined** bucket and the real work left for 4.7's own task.

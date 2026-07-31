@@ -166,6 +166,7 @@ def dropped(tmp_path_factory, postgres_cluster):
         box.reseed()
 
 
+@pytest.mark.slow
 def test_a_dropped_slot_is_detected_not_silently_recreated(dropped):
     summary = dropped["recovered"]
     assert summary["slot_check"]["decision"] == "slot_missing", summary["slot_check"]
@@ -173,6 +174,7 @@ def test_a_dropped_slot_is_detected_not_silently_recreated(dropped):
     assert summary["ok"] is True, summary
 
 
+@pytest.mark.slow
 def test_a_dropped_slot_recovers_the_rows_it_would_have_skipped(dropped):
     box = dropped["box"]
     assert _dest_customers(box) == _customers(box)
@@ -180,6 +182,7 @@ def test_a_dropped_slot_recovers_the_rows_it_would_have_skipped(dropped):
 
 
 # --------------------------------------------------------------------------- #
+@pytest.mark.slow
 def test_a_slot_behind_us_is_not_treated_as_a_mismatch(tmp_path_factory, postgres_cluster):
     """The safe direction must stay quiet, or the detector is unusable.
 

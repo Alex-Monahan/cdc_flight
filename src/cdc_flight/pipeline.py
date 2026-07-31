@@ -360,7 +360,7 @@ def _captured_tables(con, pipeline: str, source, replication) -> list[tuple[str,
 
 
 def _check_the_slot(
-    con, *, source, replication, dest, namespace: str, captured
+    con, *, source, replication, dest, namespace: str, captured, orphan_file: bool
 ) -> tuple:
     """Run rubric 1.8's check and, if it says so, arm the automatic re-snapshot.
 
@@ -382,6 +382,28 @@ def _check_the_slot(
     log.info("slot check: %s (%s)", verdict.decision, verdict.message or "healthy")
 
     recovery = None
+    if verdict.resnapshot and orphan_file and verdict.decision == "no_durable_destination_row":
+        # The one place a re-snapshot is NOT the right automatic answer, and the reason
+        # the refusal in ADR 0001 §4.5 survives this whole feature: an `offsets.dat` with
+        # no destination row usually means the DSN is pointed at the wrong database. A
+        # re-snapshot would then DROP that database's live tables and replace them with
+        # another source's data, which is destruction, not repair. Reconciliation refuses
+        # a few lines later, and `--accept-orphan-offsets` is the operator's way to say
+        # "yes, re-snapshot into this destination".
+        log.error(
+            "%s, but an orphan %s is present: refusing rather than re-snapshotting, "
+            "because a re-snapshot would replace this destination's tables with data "
+            "from a source it may not belong to (ADR 0001 §4.5)",
+            verdict.decision, replication.offset_file,
+        )
+        verdict = reconcile_mod.SlotVerdict(
+            verdict.decision,
+            ok=False,
+            resnapshot=False,
+            refuse=True,
+            message=f"{verdict.message}; deferred to the orphan-offsets refusal",
+            context=verdict.context,
+        )
     if verdict.resnapshot:
         if not resnapshot_enabled():
             # The rubric's 4 rather than its 5, chosen explicitly.
@@ -563,6 +585,13 @@ def run(
             dest=dest,
             namespace=namespace,
             captured=_captured_tables(con, dest.pipeline_name, source, replication),
+            # Deliberately independent of `--accept-orphan-offsets`: whether the file is
+            # trusted, refused or deleted is reconciliation's decision, and it is the one
+            # place that knows the difference. The slot check only has to stay out of it.
+            orphan_file=(
+                replication.offset_file.exists()
+                and replication.offset_file.stat().st_size > 0
+            ),
         )
         summary_extra["slot_check"] = verdict.as_dict()
         if recovery is not None:
@@ -584,10 +613,26 @@ def run(
             offset_path=replication.offset_file,
             accept_orphan=accept_orphan_offsets,
             repair=applier_cfg.repair_offset_file,
+            dsn=source.dsn,
+            slot_name=replication.slot_name,
         )
         summary_extra["reconciliation"] = outcome.decision
         summary_extra["reconciliation_detail"] = outcome.message
         log.info("start-up reconciliation: %s (%s)", outcome.decision, outcome.message)
+
+        # rubric 4.7: an operator who passed `--accept-orphan-offsets` has asked for a
+        # re-snapshot, so a `snapshot.mode` that does not read table data would turn
+        # their request into a refusal three lines later. Same reasoning as the recovery
+        # above: do not leave a manual-intervention case where the intent is unambiguous.
+        if (
+            outcome.decision == "orphan_accepted_resnapshot"
+            and props["snapshot.mode"] not in reconcile_mod.SNAPSHOT_MODES_WITH_DATA
+        ):
+            log.warning(
+                "--accept-orphan-offsets asks for a re-snapshot but snapshot.mode=%s does "
+                "not read table data; using 'initial'", props["snapshot.mode"],
+            )
+            props["snapshot.mode"] = "initial"
 
         # ADR §4.7 - the Invariant-O guard, at start-up. `snapshot_mode` is what
         # decides the "slot exists / no durable destination row" cell (Codex 3).
