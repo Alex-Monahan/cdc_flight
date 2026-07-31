@@ -70,6 +70,14 @@ class FakeHandler:
     def snapshot_counts(self):
         return {}
 
+    # The applier's surface: the supervisor discards the un-ENDed tail at
+    # shutdown (ADR 0001 §3.2) and folds the applier's counters into the summary.
+    def drain_on_shutdown(self):
+        return 0
+
+    def stats(self):
+        return {}
+
 
 def _run_cfg(**kwargs) -> RunConfig:
     return RunConfig(**{"max_seconds": 5, "idle_seconds": 1, "min_records": 0, **kwargs})

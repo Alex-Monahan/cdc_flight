@@ -21,6 +21,24 @@ mapping is justified in the item's notes.
 > no item is skipped. If two items were lost in the v2→v3 re-categorisation they
 > need to be restored before Phase 9.2 sign-off.
 
+### Scope: two layers, and which one you are reading
+
+This file was written to score the **Phase-0 baseline**, and it still contains
+that evidence, because a later agent needs to know what the baseline actually did.
+As branches land, the *summary table* below records the current score and the
+per-item detail sections gain a **"Now"** block. So:
+
+* the **Summary** table is the current score;
+* a detail section's heading carries the current score, and its
+  **"Baseline (Phase 0)"** block is historical evidence about the dlt/`append`
+  pipeline that no longer exists;
+* anything citing `probes/` for a §1 item is **baseline-era evidence** unless the
+  "Now" block re-cites it. The probes have not been migrated to the applier.
+
+Having the score in two places with different values - one of them pointing at a
+file the branch deleted - was a documentation merge blocker in its own right
+(Opus M-8 in `reviews/1.1-1.3_opus_review.md`), and this structure is the fix.
+
 ### How these scores were produced
 
 * A score is only assigned from **observed behaviour**: an existing test, a probe
@@ -68,7 +86,88 @@ DuckDB file, so they never disturb `make pipeline` or the pytest suite.
 ## Changes since the baseline scoring
 
 The scores below are the **Phase-0 baseline** and are deliberately left
-unchanged until each item is re-measured. Two things have moved underneath them:
+unchanged until each item is re-measured. **1.1, 1.2 and 1.3 have now been
+re-measured and are listed at the top of the summary table**; everything else
+below is still the baseline.
+
+### TODO 1.1 / 1.2 / 1.3 — the transactional applier (implemented 2026-07-30)
+
+One mechanism, three items. `src/cdc_flight/applier.py` owns the destination
+transaction: a **commit group** is one `BEGIN … COMMIT` containing an integral
+number of *whole* Postgres transactions, the Debezium resume point is written
+**inside** that transaction (`_cdc_flight.debezium_offsets`), and the connector
+is acknowledged **only after** it commits. That is ADR 0001's **Invariant O**:
+Debezium's offset store can never contain an offset the destination has not
+already committed, so no lifecycle path — poll loop, graceful close, or error
+teardown — can confirm an LSN to Postgres that is not durable.
+
+Evidence:
+
+| claim | test |
+|---|---|
+| exactly-once, keyed tables | `tests/1.1_exactly_once_pk/test_1_1_exactly_once_pk.py` (4 target tests, xfail markers removed) |
+| exactly-once, keyless tables | `tests/1.2_exactly_once_nopk/` (5 target tests, markers removed) — including two byte-identical source rows that both survive while crash-replay copies do not |
+| no loss / no duplicates at **every** protocol anchor | `tests/1.1_exactly_once_pk/test_1_1_fault_matrix.py` — crashes at `begin`, `mid_apply`, `pre_commit`, `post_commit_pre_ack`, `post_ack` |
+| Invariant O (`slot.confirmed_flush_lsn <= debezium_offsets.last_lsn`) | asserted at start-up and shutdown of every run, and after every crash in the matrix |
+| multi-table atomicity in MotherDuck | `tests/1.3_atomic_batches/test_1_3_motherduck_atomicity.py` — a second MotherDuck connection polling both tables never observes a partial Postgres transaction, and is required to have seen both the before and after states |
+| start-up reconciliation, incl. the refuse-to-start case | `tests/1.1_exactly_once_pk/test_1_1_reconciliation.py` |
+| correctness without the offsets-file repair | same file, `CDC_OFFSET_FILE_REPAIR=0` |
+| exactly-once across a **real** `kill -9` | `tests/1.1_exactly_once_pk::test_slow_real_sigkill_is_exactly_once` (`slow`) - 40 transactions x 5 000 rows, SIGKILL mid-stream, restart: **200 000 rows / 200 000 distinct, 0 duplicates, 0 lost**, and the recovery run genuinely re-applied 95 000 events |
+
+Measurements made while implementing it, recorded because they contradict
+assumptions elsewhere in this document and in the ADR:
+
+1. **Debezium 3.6's envelope `transaction.id` is not a transaction identifier.**
+   It is `"<txId>:<lsn at struct-build time>"`, so it differs for every event of
+   one transaction and between `BEGIN` and `END`. `source.txId` is the stable
+   identifier. (ADR §15/A1.)
+2. **`executemany` against MotherDuck costs a network round trip per row** —
+   200 rows took 27.9 s (~140 ms/row). The same 1 500 rows as one chunked
+   multi-row `VALUES` statement took 0.65 s. Local DuckDB is in-process and does
+   not show this at all.
+3. **DuckDB caches the database instance per DSN within a process**, and
+   MotherDuck's catalog snapshot rides on it, so a reader that has already opened
+   `md:<db>` cannot immediately see what another *process* committed. This is a
+   test-harness hazard (each pipeline run is its own process) but it can make a
+   MotherDuck assertion pass vacuously; `tests/test_motherduck.py::wait_for_tables`
+   documents and handles it.
+4. **MotherDuck honours `DROP TABLE` + `ALTER TABLE … RENAME` inside a
+   transaction** — the shadow-table swap works as ADR §7 specifies, and the run
+   probes it rather than assuming (`transactional_ddl` in `last_run.json`). This
+   answers the ADR's single biggest open question (§14.1) for both destinations.
+
+Two things this did **not** change, stated so they are not overclaimed:
+
+* **Type mapping is untouched** (rubric 2.4 is still 1). The applier consumes the
+  full Debezium *envelope* but not the Connect *schema*; that lands with 2.4/2.6
+  after the decode-throughput measurement ADR §5.1 asks for.
+* **1.7 is not yet 5.** Fault injection is now genuinely robust at every commit
+  anchor, but the rubric item also wants the wider failure surface (WAL errors,
+  slot invalidation, network partitions) covered.
+
+### Throughput measured while implementing it (informs 5.1/5.3/5.4)
+
+One 200 000-row Postgres transaction, local DuckDB, one commit group, whole-run
+wall clock. Every row is a real measurement on the same machine:
+
+| state | wall clock |
+|---|---|
+| `executemany` insert | did not finish (410 s in the insert alone) |
+| Arrow insert; spill threshold on the unit's TOTAL size | 239 s |
+| Arrow insert; spill threshold on total size, spill disabled | 458 s |
+| Arrow insert; spill threshold on the in-memory tail; ordered-dict merge | **32 s** |
+
+and, isolated on the same workload: raw `ChangeEvent` field access ~40 000
+events/s, full-envelope `decode()` ~39 400 events/s, decode **and** buffer ~26 500
+events/s. So the full-envelope decode is **not** the bottleneck ADR §5.1 feared at
+this payload size; the apply path was. 5.3's work should start there.
+
+The baseline dlt path loaded 200 000 rows in ~35 s *at-least-once with no
+transactional boundaries*; the applier does it in ~32 s exactly-once, in one
+atomic multi-table transaction, with 168 885 of the events spilled to disk and
+drained inside that transaction.
+
+Two things had already moved underneath the baseline before that:
 
 * **TODO 1.0(b) — engine failures no longer exit 0.** `SupervisedDebeziumEngine`
   (`src/cdc_flight/engine.py`) registers a Debezium `CompletionCallback`, so a
@@ -140,13 +239,13 @@ correct assumptions in the notes below:
 
 | # | Item | Score | One-line gap |
 |---|---|---|---|
-| 1.1 | Delivery guarantees, tables WITH a primary key | 3 | At-least-once, **proven**: SIGKILL mid-load left 2 048 duplicate rows on restart; `append` makes them permanent. |
-| 1.2 | Delivery guarantees, tables WITHOUT a primary key | 3 | Same machinery, and with no key there is nothing to dedupe on afterwards. |
-| 1.3 | CDC changes atomic in MotherDuck | 1 | Batches are 2048-record windows, not Postgres transactions; each table is its own dlt transaction. |
+| 1.1 | Delivery guarantees, tables WITH a primary key | ~~3~~ → **5** | Exactly-once by construction (Invariant O), with the identity enforced by a destination `PRIMARY KEY`. Crash at six commit-group anchors incl. `spill` and a true between-table `mid_apply`, plus MotherDuck. |
+| 1.2 | Delivery guarantees, tables WITHOUT a primary key | ~~3~~ → **5** | Keyless rows are keyed on a connector-derived `cdcf_event_id` whose ordinal contract is enforced at the boundary, so two identical source rows survive and a replay does not. |
+| 1.3 | CDC changes atomic in MotherDuck | ~~1~~ → **5** | A commit group is an integral number of whole multi-table Postgres transactions, proven whole in every storage mode; a concurrent MotherDuck observer never sees a partial one, including across an injected crash. |
 | 1.4 | Primary-key update handled correctly | 2 | Debezium emits delete+insert correctly, but the append-only destination keeps both rows and the delete image is fabricated zeros/empty strings. |
 | 1.5 | TRUNCATE / DROP propagate | 1 | `skipped.operations` defaults to `t`, so truncate never reaches us; DROP TABLE is silently ignored. |
-| 1.6 | Snapshot/backfill consistent with CDC | 3 | Consistent on the healthy path (proven); an interrupted snapshot restarts from scratch and the partial snapshot is already appended. |
-| 1.7 | Failures do not cause correctness issues | 1 | Zero fault injection in the suite; a real `kill -9` mid-load produced 2 048 duplicate rows (`p13` case B). |
+| 1.6 | Snapshot/backfill consistent with CDC | 3 | Consistent on the healthy path (proven), and an interrupted snapshot no longer leaves a partial table behind (shadow + swap). Still 3: the *restart* re-reads from scratch, and consistency across a re-snapshot is 1.6's own task. |
+| 1.7 | Failures do not cause correctness issues | ~~1~~ → **3** | Deterministic injection at seven protocol anchors, exercised at six in the default suite plus five interleavings and two against MotherDuck; duplication is impossible by construction. Not 5: nothing injects faults into the destination/network layer or the WAL-message surface. |
 | 1.8 | Externally-advanced slot detected → backfill | 1 | **Proven silent data loss**: 31 change events skipped, run reported `records: 0`, exit 0. |
 | 2.1 | Added / dropped columns handled | 2 | Adds work correctly; a dropped column silently lingers and reads NULL, indistinguishable from a real NULL. |
 | 2.2 | Renamed columns handled well | 1 | Rename lands as "new column + old column silently goes NULL". No tombstone, no linkage. |
@@ -181,25 +280,83 @@ correct assumptions in the notes below:
 | 8.2 | Change history / SCD2 | 1 | Not supported in any form. |
 | 8.3 | PII controls | 1 | None: no column exclusion, masking, hashing or truncation. |
 
-**Average: 66 / 40 = 1.65 out of 5.** Items already at 5: **1 of 40** (7.1).
-Distribution: **26 items at 1**, 4 at 2, 9 at 3, 0 at 4, 1 at 5.
-Distance to target: **134 rubric points**.
+**Baseline average: 66 / 40 = 1.65 out of 5.** Items at 5 in the baseline:
+**1 of 40** (7.1).
+
+**Current average (this branch): 76 / 40 = 1.90 out of 5.** Items at 5: **4 of
+40** (1.1, 1.2, 1.3, 7.1). Distribution: 23 at 1, 4 at 2, 9 at 3, 0 at 4, 4 at 5.
+Distance to target: **124 rubric points**.
+
+The delta is +10 points over four items: 1.1 (3 -> 5), 1.2 (3 -> 5),
+1.3 (1 -> 5), 1.7 (1 -> 3). Every other row is still the baseline score, and the
+detail sections say so.
 
 ---
 
 ## 1. Delivery Guarantees & Correctness
 
-### 1.1 Delivery guarantees for tables WITH a primary key — **3 / 5**
+### 1.1 Delivery guarantees for tables WITH a primary key — **5 / 5**
 
 `at-most-once=1, at-least-once=3, exactly-once=5`
+
+#### Now (`feature/transactional-applier`, ADR 0001 rev 4)
+
+**Exactly-once, by construction.** The mechanism is Invariant O (ADR §4.1): the
+resume point is written **inside** the same destination transaction as the rows,
+and Debezium is acknowledged only **after** that transaction commits, so no
+lifecycle path can confirm an LSN to Postgres that the destination has not
+committed. Loss requires the slot to advance past durable data, which cannot
+happen; duplication requires the engine to resume before the durable resume
+point, which cannot happen because that point is what we hand it.
+
+**Evidence, all of it executable:**
+
+| claim | where |
+|---|---|
+| the acknowledgement is after `COMMIT` and the window contains nothing else | `tests/1.3_atomic_batches/test_1_3_commit_protocol.py::test_the_acknowledgement_happens_after_the_commit_and_only_after_it` |
+| a crash at six protocol anchors (`begin`, `mid_apply`, `spill`, `pre_commit`, `post_commit_pre_ack`, `post_ack`) loses nothing and duplicates nothing | `tests/1.1_exactly_once_pk/test_1_1_fault_matrix.py`, with a per-anchor vacuity guard asserting the fault really fired |
+| `mid_apply` genuinely fires between two table writes | `tests/1.1_exactly_once_pk/test_1_1_spill_and_snapshot.py::test_mid_apply_really_fires_between_two_table_writes` |
+| a spilled transaction applies in source order, and a fenced one's staged prefix is discarded | `test_1_1_spill_and_snapshot.py` (5 tests) |
+| the fence alone prevents duplication with `CDC_OFFSET_FILE_REPAIR=0`, asserting `fenced_units > 0` so it cannot pass vacuously | `test_1_1_reconciliation.py::test_the_fence_alone_prevents_duplication_with_repair_disabled` |
+| a real `kill -9` over 40 transactions: 200 000 keyed rows and 1 000 keyless change events, 0 duplicates, 0 lost | `test_1_1_exactly_once_pk.py::test_slow_real_sigkill_is_exactly_once` (slow) |
+| the same, against real MotherDuck, across an injected crash at `mid_apply` and `post_commit_pre_ack` | `tests/1.3_atomic_batches/test_1_3_motherduck_fault.py` |
+| the destination itself rejects a duplicate identity (`PRIMARY KEY` on the key columns), verified on MotherDuck and not only DuckDB | `test_1_3_motherduck_fault.py::test_motherduck_accepts_the_destination_side_primary_key` |
+
+**Why the previous claim of 5 was premature, and what changed.** The
+`1.1-1.3` review round reproduced a spill path that wrote **duplicate primary-key
+rows** and silently dropped a change event at shipped defaults, and it did so with
+the whole suite green. That is the rubric's band-1/3 language, so 1.1 was not 5
+then. ADR §16/A19 records the measurement, the fix (one ordered pass) and the
+guard; A21 records the destination-side constraint that makes the whole class of
+defect loud instead of silent.
+
+**What would falsify this score.** A crash or interleaving that leaves the keyless
+changelog holding a different number of change events than the source produced.
+That is the assertion every fault test makes, on the table where a primary-key
+merge cannot absorb a second delivery.
+
+**Known residuals, none of them a loss or duplication path** (ADR §16/A28): the
+lease is renewed only at group start, so a unit spilling for longer than
+`CDC_LEASE_TTL` currently relies on the destination's write-write conflict
+detection rather than on the lease protocol (rubric 4.2); and a *backward* LSN
+jump at the source (base-backup restore, `pg_resetwal`) would be fenced rather
+than detected (rubric 1.8).
+
+#### Baseline (Phase 0) — historical
+
+*The pipeline described below no longer exists: `handler.py` was deleted and the
+dlt load path was removed by ADR 0001 D1/D10. Kept because it is the measurement
+that motivated the design.*
 
 **Evidence.** `repos/pydbzengine/pydbzengine/_jvm.py:121-124` calls
 `committer.markProcessed()` / `markBatchFinished()` *after* `handleJsonBatch()`
 returns, and `offset.flush.interval.ms=1000`
 (`src/cdc_flight/debezium_props.py:77`). So the offset is never ahead of the
 destination write — losses are impossible on this path, replays are not. Write
-disposition is `append` (`src/cdc_flight/handler.py:62`), so a replay is a
-permanent duplicate.
+disposition was `append` (in the since-deleted `src/cdc_flight/handler.py`), so a
+replay was a permanent duplicate. (`offset.flush.interval.ms` is `0` now, not
+`1000`: ADR §4.2 needs every `markBatchFinished()` to attempt a flush so a flush
+that did not happen is observable.)
 
 `probes/p13_offset_replay.py` proves both halves:
 
@@ -217,21 +374,57 @@ MotherDuck. (`probes/p07_crash_duplication.py` tried to catch the window with a
 timed SIGKILL against only 60 k rows and lost the race — kept as a record of the
 failed attempt.)
 
-**Gap to 5.** Offsets must be committed inside the same destination transaction
-as the rows, or the write must be idempotent. Concretely, one of:
-(a) store the Debezium offset in a MotherDuck table written in the same
-`BEGIN/COMMIT` as the batch, and make the handler read it back on start; or
-(b) key every row by `(dbz_lsn, dbz_tx_id, table, pk)` and switch from `append`
-to a `merge`/`INSERT … ON CONFLICT` that is a no-op on replay. (a) is required
-anyway for 1.3.
+**How it was closed.** Option (a): the Debezium offset is written to
+`_cdc_flight.debezium_offsets` inside the same `BEGIN/COMMIT` as the rows, and
+start-up reconciliation reads it back (ADR §4.3, §4.5). Option (b) is *also* in
+place as a second line of defence - every row carries `cdcf_event_id` and the
+apply is a delete-then-insert on the identity - but correctness does not depend
+on it, which is what `CDC_OFFSET_FILE_REPAIR=0` exists to demonstrate.
 
-**Pointers.** `src/cdc_flight/handler.py`, `src/cdc_flight/debezium_props.py`
-(`offset.storage*`), `repos/pydbzengine/pydbzengine/_jvm.py`,
-`tests/test_e2e_duckdb.py::test_second_run_is_incremental`.
+**Pointers (current).** `src/cdc_flight/applier.py`,
+`src/cdc_flight/table_work.py`, `src/cdc_flight/reconcile.py`,
+`src/cdc_flight/destination.py`, `tests/1.1_exactly_once_pk/`.
 
-### 1.2 Delivery guarantees for tables WITHOUT a primary key — **3 / 5**
+### 1.2 Delivery guarantees for tables WITHOUT a primary key — **5 / 5**
 
-Same mechanism, same score. `app.sensor_readings` has `REPLICA IDENTITY FULL`,
+#### Now (`feature/transactional-applier`, ADR 0001 rev 4)
+
+Same delivery mechanism as 1.1, plus a **derived identity** for tables Debezium
+gives no message key: `cdcf_event_id = "<event lsn>:<source.txId>:<transaction.
+total_order>"` (ADR §6). It is the connector's own bookkeeping, so a replayed
+event recomputes the *same* id while two byte-identical source rows are two
+different events with two different ids. Nothing that deduplicates by row
+*content* can do both, and that is the point.
+
+**Evidence:**
+
+| claim | where |
+|---|---|
+| two byte-identical source rows both survive, and their replay copies do not | `tests/1.2_exactly_once_nopk/test_1_2_exactly_once_nopk.py::test_target_identical_source_rows_both_survive` |
+| the identity is a function of the envelope, asserted separately for streaming and snapshot rows | `test_1_2_exactly_once_nopk.py::test_target_event_identity_is_derived_not_random` |
+| a replay of the same transaction recomputes identical ids and cannot duplicate, with the fence disabled | `test_1_2_keyless_identity.py::test_a_replay_recomputes_the_same_identity_and_cannot_duplicate` |
+| several events sharing one LSN get distinct identities | `test_1_2_keyless_identity.py::test_identity_is_unique_for_distinct_events_sharing_one_lsn` |
+| a missing or duplicated `total_order` is refused at the boundary | `test_1_2_keyless_identity.py`, `tests/test_assembler.py` |
+| every keyless change event is one destination row, and `GROUP BY cdcf_event_id HAVING count(*) > 1` is empty after a crash at every anchor | `test_1_1_fault_matrix.py::test_no_duplicates_at_anchor` |
+| duplicates are rejected by the destination, not just by us | `PRIMARY KEY (cdcf_event_id)`, verified on MotherDuck |
+
+**The disagreement between the two reviews, and how it resolved.** Codex called
+this a blocker and reproduced two accepted events colliding on `cdcf_event_id`;
+Opus concluded the identity is structurally immune and signed 1.2 off. Both were
+right about different halves: the identity *is* unique given valid connector
+metadata, and the assembler *accepted metadata that was not valid*. The ordinal is
+now a contract enforced where units are proven whole. Full write-up in
+ADR §16/A18.
+
+**Honest limitation (unchanged, ADR §15/A12).** A keyless destination table is a
+**changelog**, not a current-state replica: an update or delete appends a change
+event rather than mutating a row. 1.2 is scored as exactly-once *change delivery*,
+which is what the rubric asks for; current state for keyless tables is 8.1/8.2's
+work.
+
+#### Baseline (Phase 0) — historical
+
+Same mechanism as baseline 1.1, same score. `app.sensor_readings` has `REPLICA IDENTITY FULL`,
 so Debezium *does* deliver complete before-images for updates and deletes
 (`tests/test_e2e_duckdb.py` asserts `{"r": 4, "c": 6, "u": 4, "d": 2}`), but
 there is no key to deduplicate on afterwards — a replayed batch is
@@ -243,11 +436,42 @@ comes free in the envelope). Note that `REPLICA IDENTITY FULL` is currently set
 in `sql/01_schema.sql`; a real source may not have it, and Postgres refuses to
 decode UPDATE/DELETE without it — that case is untested.
 
-### 1.3 CDC changes should be atomic in MotherDuck — **1 / 5**
+### 1.3 CDC changes should be atomic in MotherDuck — **5 / 5**
 
 `no transactional boundaries=1, single-table transactional batches=3, multi-table=5`
 
-**Evidence.** Postgres transaction boundaries are never consulted. A Debezium
+#### Now (`feature/transactional-applier`, ADR 0001 rev 4)
+
+**Multi-table transactional batches.** One destination transaction per *commit
+group*, and a commit group holds an integral number of **whole** Postgres
+transactions across every table they touch. "Whole" is a proof, not a heuristic:
+`TransactionAssembler` emits a unit only when the Debezium `END` marker's
+`event_count` equals the events counted for that transaction, the per-table
+`data_collections` counts match in **both** directions, and the observed
+`transaction.total_order` ordinals are exactly `1..event_count` - and the counters
+that is checked against are maintained on arrival, so the proof is identical
+whether the unit stayed in memory or spilled to disk.
+
+**Evidence:**
+
+| claim | where |
+|---|---|
+| an independent MotherDuck connection never observes a partial Postgres transaction, with a vacuity guard requiring it to have seen both `(0,0)` and `(N,N)` | `tests/1.3_atomic_batches/test_1_3_motherduck_atomicity.py` (motherduck) |
+| the same across an injected crash between two table writes: the torn state was never visible and the recovery run put both tables there in ONE commit group | `tests/1.3_atomic_batches/test_1_3_motherduck_fault.py::test_a_torn_group_was_never_visible_in_motherduck` |
+| a group spanning three tables is one transaction, and `commit_log` agrees | `test_1_3_commit_protocol.py::test_a_group_spanning_three_tables_is_one_destination_transaction` |
+| the boundary rule is unconditional: missing `event_count`, spill-mode per-table counts, an undeclared observed table, a non-contiguous ordinal set are each fatal | `tests/test_assembler.py` (10 tests) |
+| a transaction's events never straddle two commit groups, after a crash at every anchor | `test_1_1_fault_matrix.py::test_uncommitted_anchors_leave_nothing_behind` |
+| `DROP` + `RENAME` is transactional at this destination, probed per run rather than assumed | `destination.probe_transactional_ddl`, ADR §15/A8 |
+
+**What changed since the previous round.** Opus independently assessed 1.3 at 5
+and could not break it; Codex capped it at 3 because unit completeness was **not
+enforced in spill mode** and because no fault ever crashed between two table
+writes. Both of those are now closed (ADR §16/A20, A25), which is why the stricter
+reading also lands on 5.
+
+#### Baseline (Phase 0) — historical
+
+**Evidence.** Postgres transaction boundaries were never consulted. A Debezium
 batch is a fixed window of up to `max.batch.size=2048` records
 (`src/cdc_flight/debezium_props.py:79`), so a single PG transaction of 50 000
 rows is split across 25 batches — observed in `p06`
@@ -261,20 +485,22 @@ are not. Against MotherDuck the same shape holds: `p12` recorded
 `md_load_packages == 4` for 4 runs' worth of batches, one commit per batch per
 table.
 
-**Gap to 5.** The handler must buffer whole Postgres transactions (`dbz_tx_id`
-changes are the boundary; Debezium's transaction-metadata topic gives exact
-`event_count` per transaction) and emit one MotherDuck `BEGIN … COMMIT`
-containing an integral number of PG transactions across all tables. That means
-bypassing `dlt.run()`-per-batch and driving the destination connection directly,
-or teaching dlt to load a multi-table package in one transaction.
+**How it was closed.** Exactly as anticipated, with one correction: a `dbz_tx_id`
+change is **not** a usable boundary - it is a fatal consistency error, because the
+only authoritative statement of where a transaction ends is the `END` marker
+(ADR §3.2). The applier drives the destination connection directly;
+`dlt.run()`-per-batch is gone.
 
 **Architectural note.** MotherDuck sustains roughly 100 transactions/s, so
 batches must span many PG transactions — the commit policy needs both a size and
 a time trigger, and the offset write (1.1) has to ride in the same transaction.
 
-**Pointers.** `src/cdc_flight/handler.py:93-126`,
+**Pointers (baseline, deleted).** `src/cdc_flight/handler.py:93-126`,
 `repos/dlt/dlt/destinations/insert_job_client.py`,
 `repos/dlt/dlt/destinations/job_client_impl.py`.
+**Pointers (current).** `src/cdc_flight/assembler.py`,
+`src/cdc_flight/applier.py`, `src/cdc_flight/snapshot.py`,
+`src/cdc_flight/spill.py`.
 
 ### 1.4 Primary-key update handled correctly — **2 / 5**
 
@@ -353,24 +579,49 @@ destination, so the restarted snapshot duplicates every row it re-reads.
 through a large initial snapshot and shows the destination afterwards contains
 each source row exactly once.
 
-**Gap to 5.** Snapshot into a shadow table (3.2) and swap atomically, so a
-failed snapshot leaves nothing behind; and record the snapshot's start LSN so the
-swap and the stream hand over at a known point.
+**Partly closed, still 3.** The applier snapshots into `<table>__cdcf_tmp` and
+swaps with `DROP` + `RENAME` inside the commit group's transaction, so a failed
+snapshot leaves **nothing** behind and the partial-append duplication above is
+gone - `tests/1.1_exactly_once_pk/test_1_1_fault_interleavings.py::test_a_crash_during_the_snapshot_phase_leaves_no_partial_table`
+crashes mid-snapshot and asserts no shadow survives and the re-snapshot lands each
+row exactly once. What keeps this at 3 is the other half: a restart still re-reads
+the whole table, and *consistency* between a re-snapshot and the CDC stream (the
+hand-over LSN, per-table resumability) is 1.6's and 3.7's own work.
 
-### 1.7 Failures do not cause correctness issues — **1 / 5**
+### 1.7 Failures do not cause correctness issues — **3 / 5**
 
 `duplication possible due to crash=1, impossible but not well tested=3, robust fault injection=5`
 
-**Evidence.** There is no fault injection in `tests/` at all. The crash probes
+#### Now (`feature/transactional-applier`, ADR 0001 rev 4)
+
+Duplication is impossible by construction (see 1.1), and `src/cdc_flight/faults.py`
+provides deterministic injection at seven **protocol** anchors - named after the
+protocol, not the implementation - with a malformed `CDC_FAULT_INJECT` failing the
+run so a typo cannot leave a fault test vacuously green. Coverage: six anchors in
+the default suite with a hard exit and a recovery run each; `decode`, both `raise`
+variants (Debezium's L3 error teardown rather than process death), a between-table
+crash whose recovery replays a *spilled* transaction, a snapshot-phase crash and an
+unwritable `offsets.dat` in the slow suite; `mid_apply` and `post_commit_pre_ack`
+against real MotherDuck.
+
+**Why 3 and not 5.** The injection is robust for the *commit protocol* and nothing
+else. Nothing injects a fault into the destination or network layer (a MotherDuck
+write that fails mid-transaction, a severed connection, a hung `COMMIT`), and the
+WAL-message / slot-failure surface belongs to 4.1/4.3/4.5. Raising this to 5 is
+1.7's own task, and the reviews of this branch explicitly declined to claim it.
+
+#### Baseline (Phase 0) — historical
+
+**Evidence.** There was no fault injection in `tests/` at all. The crash probes
 written for this evaluation are the first, and they land the rubric's 1
 squarely: `p13` case B `kill -9`'d the process mid-load and the restart left
 **2 048 duplicate rows** in the destination (`402 048 rows / 400 000 distinct`).
 Duplication is not a theoretical risk here, it is the measured behaviour.
 
-**Gap to 5.** Fix 1.1/1.3 first, then build a fault-injection harness that is
-part of `make test`: kill mid-snapshot, kill mid-load, kill between load and
-offset flush, kill the Postgres backend, drop the slot, sever the connection —
-each asserting exact row counts at the destination.
+**Gap to 5 (what remains).** 1.1/1.3 are fixed and the harness is in `make test`.
+Still missing: kill the Postgres backend, drop the slot, sever the connection, and
+fail a destination write mid-transaction - each asserting exact change-event counts
+at the destination.
 
 ### 1.8 Externally-advanced slot detected → backfill — **1 / 5**
 
@@ -571,7 +822,7 @@ Debezium's incremental snapshot (with `signal.data.collection`) already chunks;
 
 `clear and repopulate=1, alternate table + rename swap=4, fully atomic=5`
 
-**Evidence.** `src/cdc_flight/handler.py:62` — every resource is
+**Evidence (baseline; `handler.py` was deleted by ADR 0001 D1).** `src/cdc_flight/handler.py:62` — every resource is
 `write_disposition="append"`, and the snapshot writes into the same destination
 table consumers read. `p08` shows the snapshot arriving as 59 separate load
 packages, so a consumer querying mid-backfill sees a partially populated table,

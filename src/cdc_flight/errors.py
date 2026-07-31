@@ -38,3 +38,92 @@ class SourceNotStreaming(RuntimeError):
     retriable-restart backoff looks exactly like an idle stream from the Python
     side (ADR 0001 §9.1; review finding Opus B5).
     """
+
+
+class UnsafeDebeziumProperty(RuntimeError):
+    """A Debezium property that Invariant O depends on was given an unsafe value.
+
+    ADR 0001 §4.10. `lsn.flush.mode=connector_and_driver` makes pgjdbc advance the
+    flushed LSN from server keepalives without ever consulting the offset store,
+    which confirms WAL to Postgres outside the invariant (Opus B-2); a false
+    `provide.transaction.metadata` removes the END marker the boundary rule needs;
+    a non-zero `offset.flush.interval.ms` makes a missing flush unobservable.
+    Also raised when a captured table's topic would collide with one of Debezium's
+    own internal topics.
+    """
+
+
+# --------------------------------------------------------------------------- #
+# transactional applier (ADR 0001 §3, §4)
+# --------------------------------------------------------------------------- #
+class EnvelopeDecodeError(RuntimeError):
+    """A Debezium payload cannot be decoded into a record we are willing to act on.
+
+    ADR 0001 §3.2. The load-bearing case is the transaction topic: a payload whose
+    `status` is neither `BEGIN` nor `END` used to become an `END` with no
+    `event_count`, which terminated the open transaction with no completeness
+    check at all (Opus M-1). Failing loud is the only safe reading of "unknown
+    control message".
+    """
+
+
+class TransactionAssemblyError(RuntimeError):
+    """Debezium's transaction metadata is not self-consistent.
+
+    ADR 0001 §3.2: a `txId` change without an intervening `END`, a `BEGIN` while
+    another transaction is open, or an `END` whose `event_count` disagrees with
+    what we buffered. Every one of these means a commit group could contain part
+    of a Postgres transaction, so the applier refuses rather than guessing.
+    """
+
+
+class ResumePointDrift(RuntimeError):
+    """`offsets.dat` does not agree with the resume point we just committed.
+
+    ADR 0001 §4.3. Raised *after* the destination COMMIT, so the data is already
+    durable; the process exits non-zero and start-up reconciliation (§4.5)
+    repairs the file from `_cdc_flight.debezium_offsets`.
+    """
+
+
+class ReconciliationRefused(RuntimeError):
+    """Start-up reconciliation cannot establish a safe resume point.
+
+    ADR 0001 §4.5. The load-bearing case is *file present / table row missing*:
+    the file may be arbitrarily ahead of anything durable in the destination, so
+    trusting it is silent data loss.
+    """
+
+
+class DestinationIdentityCollision(RuntimeError):
+    """Two destination rows share one identity (ADR 0001 §15/A21, Opus M-2).
+
+    Raised inside the commit group's transaction, so the group rolls back and the
+    events replay. Only reachable on a destination that cannot express the
+    `PRIMARY KEY` the identity columns normally carry; where it can, the destination
+    itself rejects the INSERT.
+    """
+
+
+class NoDurableDestinationRow(RuntimeError):
+    """The replication slot exists and has advanced, but nothing is durable here.
+
+    ADR 0001 §4.5's "absent/absent but slot exists" cell (Codex 3). The slot's
+    `confirmed_flush_lsn` may be arbitrarily far ahead of the empty destination, so
+    a start-up mode that streams from it without re-reading the tables silently
+    skips all the history in between. Refused unless the configured
+    `snapshot.mode` is one that re-reads every captured table in full.
+    """
+
+
+class SlotAheadOfDestination(RuntimeError):
+    """`slot.confirmed_flush_lsn > debezium_offsets.last_lsn` (ADR 0001 §4.7).
+
+    The Invariant-O guard. Under Invariant O this should be unfalsifiable; if it
+    ever fires, WAL that the destination never committed has already been
+    discarded by Postgres, and the only recovery is a re-snapshot (rubric 1.8).
+    """
+
+
+class LeaseLost(RuntimeError):
+    """Another runner owns `_cdc_flight.lease` for this pipeline (rubric 4.2)."""

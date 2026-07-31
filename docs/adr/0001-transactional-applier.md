@@ -1,6 +1,6 @@
 # ADR 0001 — The transactional applier
 
-* **Status:** accepted (revision 2, 2026-07-30, after dual review of TODO 1.0)
+* **Status:** accepted (revision 4, 2026-07-31 — implemented; §15 records the amendments the implementation forced, §16 those the 1.1–1.3 review round forced)
 * **Date:** 2026-07-30
 * **Task:** TODO 1.0(a); revised under TODO 1.0(feedback)
 * **Decides rubric items:** 1.1, 1.2, 1.3, 1.7 (directly), and 1.4, 1.6, 1.8, 3.2,
@@ -17,6 +17,8 @@
 |---|---|---|
 | 1 | 2026-07-30 | original |
 | 2 | 2026-07-30 | **P2 withdrawn** and replaced by **Invariant O** (§4.1). Crash matrix rebuilt over all three engine lifecycle paths **and** the snapshot phase (§4.6). Transaction assembly made a state machine with one boundary rule (§3.2). Triggers restated as soft group-close requests plus a hard spill threshold (§3.3). Start-up reconciliation decision table added (§4.5). Keyless event identity moved off `source.sequence` (§6). D10 rewritten: dlt demoted to a **library**, not removed (§10). Throughput risk of D5 recorded as a measurement task (§5). |
+| 3 | 2026-07-30 | **Amendments from the implementation** (§15): the apply path must insert through Arrow - `executemany` is 300x slower and makes a large commit group unfinishable (A14); `transaction.id` is not a transaction identifier (A1); the Connect schema stays off, so rubric 2.4 is untouched (A2); `verify_offset_file` becomes a rebuild plus a one-directional assertion (A4); a drained batch closes the group (A5); a provably-dead lease is reclaimed (A6); §14.1 answered for DuckDB (A8); §10's dlt exit criterion evaluated (A10). |
+| 4 | 2026-07-31 | **Amendments from the 1.1-1.3 review round** (§16). The boundary rule made unconditional in every storage mode (A20); the ordinal contract enforced, which is how the keyless-identity disagreement between the two reviews resolves (A18); spill made one ordered pass with explicit identity and a fence that covers staged rows (A19); the destination enforces the identity with a PRIMARY KEY (A21); reconciliation compares the whole typed offset map and gains §4.5's missing "slot exists / no durable row" row (A22); `lsn.flush.mode` pinned (A23); the commit->ack window emptied (A24); the fault anchors corrected and extended (A25); `commit_id` scoped per pipeline (A26); the applier decomposed (A29); deferrals stated (A28). |
 
 ---
 
@@ -1417,5 +1419,624 @@ Each step must be able to land with the suite green.
    re-snapshot always required? Determines whether §3.5's `snapshot_epoch` ever
    has to survive a restart, and whether 3.7 ("resume midway per table") can use
    the connector's own snapshot at all.
-</content>
-</invoke>
+
+---
+
+## 15. Amendments from the implementation (rev 3, 2026-07-30)
+
+Written while implementing TODO 1.1/1.2/1.3. Each entry is a place where
+reality forced a deviation from rev 2, recorded here rather than silently
+diverging. Everything not listed below was implemented as specified.
+
+### A1 — `transaction.id` is NOT a transaction identifier (corrects §3.2, §6)
+
+Rev 2 read `AbstractTransactionStructMaker.addTransactionBlock` and concluded
+that the envelope's `transaction.id` identifies the transaction. **Measured
+against the shipped Debezium 3.6.0.Final + pgoutput, it does not.** It is
+`"<txId>:<the LSN at the moment that struct was built>"`, so it differs for
+every event of one transaction *and* between `BEGIN` and `END`:
+
+```
+BEGIN  {"status":"BEGIN","id":"11115:937926432"}
+data   {"transaction":{"id":"11115:937926432","total_order":1,...}}
+data   {"transaction":{"id":"11115:937926736","total_order":2,...}}
+data   {"transaction":{"id":"11115:937927016","total_order":3,...}}
+END    {"status":"END","id":"11115:937927152","event_count":3,
+        "data_collections":[{"data_collection":"app.customers","event_count":2},
+                            {"data_collection":"app.sensor_readings","event_count":1}]}
+```
+
+Taken literally, every multi-event transaction looks like "the txId changed
+without an `END`" — which §3.2 correctly declares fatal, so the applier died on
+its first real transaction. The stable identifier is the **prefix**, which
+equals `source.txId` and equals the offset's `transaction_id`. The assembler
+therefore keys on `source.txId` for data events and on the prefix of
+`transaction.id` for the markers. `envelope._txn_id()` is that one line, and
+`tests/test_assembler.py` pins the behaviour.
+
+Everything else §3.2 relies on was confirmed exactly as documented:
+`event_count`, per-`data_collection` counts, `total_order` as a 1-based ordinal,
+and snapshot records carrying `"transaction": null`.
+
+### A2 — the Connect schema stays OFF; only the envelope lands here
+
+D5 says `value.converter.schemas.enable` becomes `true`. It is still `false`.
+The applier needs the **envelope** (`before` / `after` / `source` / `transaction`
+/ `op`) — that is what rubric 1.1/1.2/1.3/1.4 depend on, and dropping
+`ExtractNewRecordState` delivers it. It does *not* need the **Connect schema**,
+which is what rubric 2.4/2.6 depend on, and which §5.1 flags as an unmeasured
+3–5× payload inflation owned by 5.3.
+
+Consequence, stated plainly rather than buried: **type mapping is unchanged from
+the baseline and rubric 2.4 is still a 1.** `timestamptz` lands as `VARCHAR`
+(the baseline got `TIMESTAMP` only because dlt *inferred* it from the string —
+inference the applier deliberately does not do, per §10). `numeric` is still
+base64, `date`/`interval` still integers. Two things did improve for free:
+arrays are a native `JSON` column instead of a dlt child table, and the all-NaN
+`numeric` column that dlt dropped entirely now exists.
+`tests/test_e2e_duckdb.py::test_documented_type_gaps` pins all of it.
+
+### A3 — `cdcf_event_id` uses the event's own LSN, not the commit LSN
+
+§6 specifies `"<lsn_of_txn_commit>:<txn_id>:<total_order>"`. The implementation
+uses the **event's** LSN. Both are monotonic and both are deterministic on
+replay, so the disambiguation §6 wanted (a wrapped 32-bit `txid`) is equally
+served. The reason for the change is spill mode: events are staged to
+`_cdc_flight.spill_events` *before* the `END` marker exists, so the commit LSN
+is not knowable at the moment an identity has to be assigned, and an identity
+that differs between the spilled and in-memory paths would be worse than either.
+
+### A4 — `verify_offset_file` becomes "rebuild + one-directional assertion"
+
+§4.3 asks for a byte-for-byte comparison of `offsets.dat` against
+`serialize(new_point)` after every acknowledgement. Two problems surfaced:
+
+1. The file legitimately **lags** — `markBatchFinished()` may flush nothing
+   (§4.2), and the poll loop flushes on its own schedule — so byte equality
+   false-fires on a healthy pipeline.
+2. Only one direction signals a bug. The file being *behind* is expected; the
+   file being *ahead* of the durable resume point is an Invariant-O violation.
+
+The implementation therefore (a) writes the file itself when reconciliation says
+so, byte-compatibly with Kafka's `FileOffsetBackingStore` — the format was read
+off a live file and is round-tripped byte-identically in
+`tests/test_offset_file.py` — and (b) asserts after every acknowledgement that
+`file_lsn <= durable_lsn`, raising `ResumePointDrift` otherwise. That is
+strictly the Invariant-O direction and cannot false-fire on a lagging flush.
+
+A related correctness detail that cost a debugging cycle: the Connect offset map
+must be round-tripped with its **Java types preserved**. `transaction_id` and
+`messageType` are `String`, `lsn`/`txId`/`ts_usec` are `Long`. Coercing
+`"11115"` to an integer makes the connector die on start-up with
+`ClassCastException: java.lang.Long cannot be cast to java.lang.String`.
+
+### A5 — a drained batch closes the group (adds to §3.3)
+
+§3.6's pseudocode closes a group only on a soft trigger. That deadlocks a quiet
+stream: Debezium calls `committer.markBatchFinished()` **directly** on an empty
+poll (`AsyncEmbeddedEngine.java:1320-1325`) and never calls the consumer, so a
+group holding complete units would sit in memory until the run ended and then be
+discarded. The added rule: a batch smaller than `max.batch.size` means the
+connector's queue drained, so the group closes now; a full batch means more is
+already queued, so accumulation continues up to the soft triggers. This keeps
+batching under load and bounds latency at idle, and it can still never split a
+unit.
+
+### A6 — a lease whose owner is provably dead is reclaimed (refines §4.6 F15)
+
+F15 assumes the loser of a lease race exits. It does not cover the case that
+matters far more often: a runner that was `SIGKILL`ed never released its lease,
+so **crash recovery** — the normal path this design exists to make safe — would
+have to wait out the TTL. `Lease.acquire` now reclaims a lease whose recorded
+host is this host and whose pid no longer exists, and logs a warning when it
+does. A lease from any other host is still only released by its TTL, because
+there we cannot prove anything.
+
+### A7 — `--reset-state` also clears the destination resume point
+
+With §4.5 in place, deleting only `offsets.dat` produces "absent file, present
+row", which correctly resumes instead of re-snapshotting — so `--reset-state`
+silently did nothing. It now deletes the `debezium_offsets`, `table_state` and
+`lease` rows for the pipeline as well.
+
+### A8 — §14.1 answered for DuckDB, and probed at run time
+
+`destination.probe_transactional_ddl()` runs a real `DROP` + `ALTER … RENAME`
+inside a rolled-back transaction at start-up and records the answer in the run
+summary. **Local DuckDB 1.5.4: transactional (`transactional_ddl: true`).** The
+swap uses `DROP` + `RENAME` when the probe says yes and falls back to
+`CREATE OR REPLACE TABLE … AS SELECT` when it says no, which is the fallback §7
+already specified and which the rubric explicitly allows. §14.1 stays open only
+for MotherDuck until the `motherduck`-marked run confirms it.
+
+### A9 — correctness must not depend on the offsets-file repair
+
+`CDC_OFFSET_FILE_REPAIR=0` disables §4.5's rebuild. The suite runs the
+`post_commit_pre_ack` crash both ways: with the repair (no replay at all) and
+without it (Postgres re-delivers, and the §4.4 fence drops every re-delivered
+unit). If the second case ever failed, exactly-once would have quietly become an
+ordering argument again.
+
+### A10 — §10's dlt exit criterion, evaluated
+
+* **Retained:** `dlt.common.normalizers.naming.snake_case`. Three calls, no
+  adapter. It keeps every destination identifier byte-identical across this
+  migration, which every existing probe and `RUBRIC_STATUS.md` entry depends on.
+* **Not retained:** `dlt.destinations.sql_jobs.gen_merge_sql`. Calling it needs a
+  dlt `Schema`, a `TTableSchema` chain, a staging dataset and a `SqlClientBase`
+  wrapper — comfortably more than §10's "~100 lines of adapter" budget, for a
+  merge that is two statements here. This is §10's own exit criterion firing, not
+  a change of mind; `gen_scd2_sql` is re-evaluated when 8.2 is implemented.
+* **`dlt.common.schema`** is untouched by this task and is re-evaluated before
+  Phase 2, as §10 says.
+
+### A11 — snapshot phase details §3.5 did not specify
+
+* A table's shadow is dropped and recreated when its first snapshot record of a
+  run arrives, which is what makes a re-snapshot after a crash idempotent.
+* A table whose snapshot ends without a `last` marker (Debezium emits
+  `last_in_data_collection` per table and `last` only once) is swapped on its
+  own marker; **the first non-snapshot record closes the snapshot phase and
+  swaps whatever is left.** Without that rule a table could stay behind its
+  shadow forever.
+* Snapshot units are never fenced by LSN. Every snapshot record of a run carries
+  the *same* `source.lsn`, so an LSN fence would drop the entire snapshot after
+  the first chunk. Snapshot idempotence comes from D7, exactly as §3.5 says.
+
+### A12 — keyless tables are a changelog, not current state
+
+§6 notes that a keyless table can have a current-state form under
+`REPLICA IDENTITY FULL`. This task implements the changelog form only: keyless
+tables are keyed on `cdcf_event_id`, so every change event is a row. That is
+what makes rubric 1.2 measurable at all (a merge can hide a double delivery; an
+append-keyed-on-event-identity table cannot). Keyless current state belongs to
+8.1/8.2.
+
+### A13 — fault anchors extended (Codex 9 carry-forward)
+
+`decode`, `begin`, `spill` and `mid_apply` join `pre_commit`,
+`post_commit_pre_ack` and `post_ack`; `<nth>` now counts **data-carrying commit
+groups** rather than data batches, because the commit group is the unit the
+protocol is about. `tests/1.1_exactly_once_pk/test_1_1_fault_matrix.py` crashes
+at all five commit-group anchors and asserts no loss, no duplicates and
+Invariant O at each.
+
+### A14 — the apply path inserts through Arrow, and this is a correctness matter
+
+The ADR never says how rows reach the destination, and the obvious answer is
+wrong by two orders of magnitude. Measured, 200 000 rows x 19 columns into local
+DuckDB inside one transaction:
+
+| strategy | time |
+|---|---|
+| `con.executemany("INSERT … VALUES (?,…)", rows)` | **410 s** |
+| chunked multi-row `INSERT … VALUES (…),(…),…` | **> 7 min**, abandoned |
+| register a `pyarrow.Table` + `INSERT … SELECT` | **1.37 s** |
+
+and against MotherDuck, 1 500 rows: `executemany` **27.9 s** (a network round
+trip *per row*), multi-row `VALUES` 0.65 s, Arrow 1.87 s.
+
+This is not a performance footnote. A commit group holds an integral number of
+*whole* Postgres transactions (Invariant B), so a single 200 000-row transaction
+is a single group and a single `COMMIT`; at 410 s that group cannot finish inside
+any sane deadline, and the run is killed with the transaction open. The first
+symptom was `tests/1.1_exactly_once_pk::test_slow_real_sigkill_loses_nothing`
+timing out at 300 s, and the second was
+`tests/1.3_atomic_batches/test_1_3_motherduck_atomicity.py` reaching its deadline
+with **zero** commit groups. `pyarrow` is therefore a hard dependency, and
+§14.2's "measured MotherDuck commit latency for a 200 000-row group" is now
+partly answered: the write path, not the commit, was the cost.
+
+### A15 — MotherDuck's client caches the catalog per process (affects verification only)
+
+`duckdb.connect()` caches the database instance per DSN inside a process, and
+MotherDuck's catalog snapshot rides on that instance. A process that has already
+opened `md:<db>` — even on a connection it has since closed — can therefore not
+immediately see what another *process* committed. The applier is unaffected (each
+run is its own process), but a test that verifies a MotherDuck write from the
+parent process will read an empty schema and conclude nothing was written. It is
+recorded here because the same trap will catch anyone writing 6.1's observability
+queries. `tests/test_motherduck.py::wait_for_tables` handles it.
+
+### A16 — the throughput bugs the whole-transaction design exposes
+
+A commit group holds *whole* Postgres transactions, so one 200 000-event
+transaction is one group. That turns anything super-linear in the per-event path
+from a slow query into a **run that cannot finish**, and this ADR's design is what
+makes that failure mode reachable at all. Three separate defects were found and
+fixed by measuring one 200 000-row transaction end to end (local DuckDB, one
+commit group, wall clock for the whole run):
+
+| state | wall clock |
+|---|---|
+| `executemany` insert (A14) | did not finish (410 s in the insert alone) |
+| + Arrow insert, spill threshold on the unit's TOTAL size | **239 s** |
+| + Arrow insert, spill threshold on total size, spill disabled | **458 s** |
+| + all three fixed | **32 s** (spill engaged: 168 885 events staged and drained) |
+
+1. **A14's `executemany`.**
+2. **The spill threshold tested the unit's total size, not what was still in
+   memory.** Once a large transaction crossed `UNIT_SPILL_BYTES` the threshold
+   stayed crossed for every remaining record, so each record became its own
+   `INSERT INTO spill_events`. Measured: 12 500 events/s for the first ~88 000,
+   then ~1 000 events/s. The threshold now means "spill each time the in-memory
+   tail exceeds X", which is what §3.4 intended.
+3. **`_TableWork` kept an `order` list and tested `if key not in order` per
+   event** — a linear scan, so O(n²) over the group. This was the dominant term:
+   458 s → 1.6 s of apply. The ordered `final` dict is both the ordering and the
+   membership test.
+
+Two design points worth recording alongside them:
+
+* **Retention.** A unit retains only its most recent record for the
+  acknowledgement and releases the Java reference on every earlier one, which is
+  safe because `markProcessed()` is a last-write-wins map put
+  (`AsyncEmbeddedEngine.java:1361-1366`). That **answers §14.6**: marking only the
+  terminal record is sufficient, and `CDC_ACK_EVERY_RECORD=1` restores the
+  conservative behaviour for anyone who wants to re-test the claim.
+* **Isolated throughput measurements** (200 000-event transaction, same machine),
+  which bound where the remaining time goes and partly answer §5.1: raw
+  `ChangeEvent` field access ≈ 40 000 events/s; full-envelope `decode()` ≈ 39 400
+  events/s; decode **and buffer** ≈ 26 500 events/s. So the full-envelope decode
+  is *not* the bottleneck ADR §5.1 feared - at least not at this payload size -
+  and 5.3's work should start with the apply path rather than the converter.
+
+### A17 — spill re-opens an Invariant-B hole that §3.4 does not mention
+
+§3.4 says staging and drain happen "in the same transaction, before `COMMIT`", and
+concludes that spill therefore weakens nothing. That is true for the unit being
+spilled and false for the *group*: a commit group can already hold several whole
+transactions when a large one starts spilling, and the group's soft triggers would
+then close it and drain the staging table — applying events from a transaction
+whose `END` has not arrived. The group itself cannot detect this, because by
+construction it contains only whole units; the partial transaction is in the
+staging table, not in the group.
+
+The applier therefore refuses to close a group while
+`TransactionAssembler.open_unit_has_spilled` is true, and
+`tests/test_assembler.py::test_an_open_unit_that_has_spilled_blocks_the_group_from_closing`
+pins it. The cost is that the destination transaction stays open until the large
+unit completes, which is inherent to §3.4's in-transaction staging and is the
+trade §3.4 already records.
+
+---
+
+## 16. Amendments from the 1.1–1.3 review round (rev 4, 2026-07-31)
+
+Written while implementing the union of `reviews/1.1-1.3_codex_review.md`
+(4 BLOCKER / 6 MAJOR) and `reviews/1.1-1.3_opus_review.md`
+(2 BLOCKER / 8 MAJOR / 16 MINOR). Every entry below corrects something the
+reviews *reproduced by running the shipped classes*, not something they
+speculated about. Where the two reviews overlapped, the stricter reading won.
+
+The uncomfortable fact this section exists to record: **all four blockers
+coexisted with 110 default, 3 slow and 5 MotherDuck tests passing, and lint
+clean.** The suite could not see them because each needs a specific interleaving
+of assembler and applier state. That is why every fix below ships with a
+default-suite guard driven through `tests/applier_lab.py`, which runs the real
+`Applier` against a real DuckDB file with a faked `ChangeEvent` and
+`RecordCommitter` — the interleaving becomes an argument to a function instead of
+a race to win.
+
+### A18 — the ordinal contract, and the keyless-identity disagreement resolved
+
+The two reviews disagreed. Codex 4 called keyless identity a **blocker** and
+reproduced two accepted events colliding on `cdcf_event_id`; Opus's attack log
+concluded keyless identity is **structurally immune** and signed 1.2 off. The
+decisive tests are
+`tests/1.2_exactly_once_nopk/test_1_2_keyless_identity.py`, and they show both
+reviews were right about different halves of the question:
+
+* **Opus is right about the identity.** `<event lsn>:<source.txId>:<total_order>`
+  *is* unique and replay-stable given valid connector metadata:
+  `total_order` is a 1-based per-transaction ordinal, the event LSN separates
+  transactions, and a replayed transaction renumbers from 1 and recomputes
+  *identical* ids — because a resume point can only ever sit on a transaction
+  boundary. `test_a_replay_recomputes_the_same_identity_and_cannot_duplicate`
+  executes that with the fence disabled, so the merge on `cdcf_event_id` is what
+  has to hold, and it does. Opus's reason for it is also better than the one rev 2
+  wrote: it is the transaction-boundary property, not the offset restoring
+  `TransactionContext`.
+* **Codex is right about the input.** The assembler validated only that `txn_id`
+  existed. It never required `total_order`, never checked it was positive, and
+  never rejected a duplicate — so a stream with missing or repeated ordinals was
+  *accepted*, and `test_two_events_that_share_an_ordinal_are_refused` shows two
+  same-LSN events both producing `100:7:1` before the fix. Spill made it look
+  plausible by substituting a local sequence for `event_seq` while
+  `cdcf_event_id` still contained `None`.
+
+So the resolution is neither "it is fine" nor "change the identity". The ordinal
+is now a **contract enforced at the boundary**: non-null, integral, ≥ 1, no
+duplicates within a transaction, and the observed set exactly `1..event_count`.
+`TransactionAssembler` is the only producer of units, so nothing that could
+collide can reach the identity builder, and the uniqueness is structural rather
+than conventional. `_stream_event_id`'s docstring says so, and says what it
+depends on.
+
+Snapshot identity moved with it: the arrival ordinal is assigned **in the
+assembler**, when the record arrives, so it is arrival order whether the record is
+later spilled or kept in memory. It used to be a counter on the applier's snapshot
+state that the spill path incremented separately — see A19.
+
+### A19 — spill: one ordered pass, explicit identity, and the fence (corrects §3.4)
+
+Three findings, one root cause. §3.4 described spill as a change of *storage
+representation* that changes nothing about visibility or order. The
+implementation did not deliver that.
+
+**Ordering (Opus B-1, reproduced).** `_apply_units` was two passes: write every
+in-memory `TableWork`, then drain the staging table. A unit keeps accumulating an
+in-memory **tail** after it spills, so its staged rows are *earlier* in source
+order than its own tail — and reordering the two passes cannot fix it either,
+because a group can hold `unit1 (spilled + tail), unit2 (wholly in memory)` whose
+correct order interleaves the two representations. Measured, one PG transaction of
+three UPDATEs of one primary key (`a -> b -> c`) with `CDC_UNIT_SPILL_EVENTS=2`:
+
+```
+no spill (control)                -> [(1, 'c')]                ok
+spill, target table pre-existing  -> [(1, 'b')]                ORDER INVERTED
+spill, table created in this txn  -> [(1, 'c'), (1, 'b')]      DUPLICATE PRIMARY KEY
+```
+
+The first is silent wrong-final-state *plus* the loss of a change event; the
+second is a direct 1.1 violation, and it happens because `fresh` is true in both
+passes so both skip the DELETE half of the merge. Reachability was not
+theoretical: the headline 200 000-row measurement in A16 ran this exact path with
+168 885 events spilled and 31 115 left as the tail, and produced the right answer
+only because the workload never touched a key twice.
+
+It is now **one ordered pass**: walk the units in group order and, for each,
+load its staged prefix into the *shared* `work` map before collecting its
+in-memory tail. One write per destination table, source order preserved end to
+end, and the merge sees the whole group at once. This also means the drain is no
+longer a separate code path that can drift from the in-memory one — which is what
+had left it not updating `table_counts` or `max_source_ts`.
+
+**Routing and identity (Codex 1, reproduced).** `_spill_events` inferred whether
+a record was a snapshot record by looking in a mapping that `_apply_units`
+populates *later*. On the first spilled chunk of every snapshot that mapping is
+empty, so it staged the rows into the **live** table with a `<lsn>:None:None`
+streaming identity; a consumer could see a partial snapshot, and the swap then
+replaced the live table with a shadow holding only the later chunks. Measured:
+`[3, 6]` where `[1, 2, 3, 4, 5, 6]` was expected. The spill callback is now told
+the unit identity and the snapshot phase **explicitly**, and resolving the shadow
+goes through `SnapshotCoordinator.state_for()`, which creates the shadow, its
+`table_state` row and the epoch before anything can be staged.
+
+**The fence (Codex 5).** Rows are staged while the unit is still open; the resume
+fence is set at its `END`. Draining unconditionally therefore re-applied the
+prefix of a transaction the destination already held, which made A9's "the fence
+alone prevents duplication" false for every spilled unit. Staged rows now carry a
+`unit_seq`, a fenced unit's prefix is never loaded (and is deleted with the rest,
+inside the same transaction), and `has_data` is no longer forced true by rows a
+fence is about to discard — which had shifted every `<nth>`-indexed fault anchor
+by one.
+
+### A20 — the boundary rule is unconditional (corrects §3.2)
+
+§3.2 says a transaction is complete "only when the marker's `event_count`
+**equals** the number of events buffered". Three things made that conditional:
+
+1. a **missing** `event_count` skipped the check entirely and the unit was
+   emitted as whole (`declared is not None and ...`). `None` equals nothing;
+2. the per-table `data_collections` check was disabled wholesale as soon as any
+   event spilled, and the claimed "the drain re-derives them" had no
+   corresponding comparison anywhere;
+3. the per-table comparison ran in one direction only, so an **observed** table
+   the marker never declared was accepted — which is exactly what a misrouted or
+   mis-named event looks like.
+
+All three are closed, and the counters the rule is checked against (`count`,
+`per_table`, `orders`) are maintained *as records arrive* and never touched by
+spilling. So the proof is identical in memory and on disk: nothing about
+completeness is conditional on the storage representation any more.
+
+`envelope.decode` also failed open in the one direction that skips the check:
+`kind = KIND_TXN_BEGIN if status == "BEGIN" else KIND_TXN_END` turned **any**
+unrecognised payload on the transaction topic into an `END` with no
+`event_count`, terminating the open transaction with no completeness check at
+all. An unrecognised `status` and a malformed payload now raise
+`EnvelopeDecodeError`. The module docstring's claim that decode "never raises for
+an unexpected payload shape" was both untrue and the wrong goal.
+
+**Transactional logical-decoding messages** are counted now (Opus M-5). Verified
+against the vendored source: `LogicalDecodingMessageMonitor.java:106` calls
+`transactionMonitor.dataEvent(...)`, so an `op="m"` event *is* in
+`END.event_count`, occupies an ordinal, and gets its own `data_collections`
+pseudo-entry. It is counted toward the total and the ordinal set, carries no row
+of ours, and its declared collection is tolerated by an explicit allowance rather
+than by weakening the per-table check. This matters because ADR D9's source
+heartbeat is specified as exactly this mechanism, so the assembler had to stop
+being fatal for it before D9 lands.
+
+**Incremental snapshots are refused** rather than mishandled (Opus M-7, cheap
+half). `snapshot_last` — which swaps *every* shadow over its live table — was set
+by any non-snapshot record, and is now set only when Debezium actually said
+`last`. Per-table swaps still happen on `snapshot_last_for_table`, so nothing is
+lost today; what is removed is a live-table-destruction path that opens the moment
+incremental snapshots are enabled. `source.snapshot = "incremental"` is refused
+with a message pointing at rubric 3.3, because those records interleave with
+streaming events, never carry a `last` marker and carry no `txId`/`lsn` at all.
+Full incremental-snapshot support is 3.3's work, not this ADR's.
+
+### A21 — the destination enforces the identity (Opus M-2)
+
+Generated tables carried no `PRIMARY KEY` or `UNIQUE`, so exactly-once was
+enforced *procedurally* by the applier and a duplicate identity was not an error.
+That is why A19's defects corrupted silently instead of failing. Every table the
+applier creates now carries a `PRIMARY KEY` on its identity columns — the source
+key columns for a keyed table, `cdcf_event_id` for a keyless one — so principle
+(1) is a property of the destination rather than an assertion of ours, and the
+whole class of apply-path defect becomes a failed transaction. A failed
+transaction is safe: it rolls back and the events replay.
+
+Measured on DuckDB 1.5.4 before committing to it: 200 000 rows through Arrow into
+a table with a `PRIMARY KEY` takes 0.03 s, and `DELETE` then `INSERT` of the same
+key inside one transaction is accepted, so the merge path is unaffected. Verified
+enforced by **MotherDuck** too, not only DuckDB
+(`test_motherduck_accepts_the_destination_side_primary_key`). Where a destination
+cannot express the constraint, `apply_sql.assert_identity_is_unique` runs inside
+the commit group as the documented fallback, and `CDC_DESTINATION_CONSTRAINTS=0`
+selects it deliberately.
+
+### A22 — reconciliation compares the whole typed offset map (corrects §4.5)
+
+§4.5's decision table was implemented against a **scalar LSN**.
+`offset_file.lsn_of()` returns the first of `("lsn", "lsn_proc", "lsn_commit")`
+that is present, and several events share one commit LSN, so a file at
+`{lsn: 100, lsn_proc: 999}` and a durable `{lsn: 100, lsn_proc: 1}` produced
+`decision="resume"` — the file genuinely ahead within that LSN, and the guard
+saying it agreed. Only `parsed[0]` was consulted, so a second entry was invisible,
+and the decoded key was never checked against the expected namespace/partition
+even though Kafka looks the partition up by exact `ByteBuffer`.
+
+The destination's full partition + typed offset map is canonical now: exactly one
+entry, exactly the expected key, and every typed field equal, or the file is
+rewritten from the destination (`file_offset_mismatch_rebuilt`, with the
+differing fields in the message).
+
+**The row §4.5 named and the code did not have** is also in: *offsets absent,
+destination row absent, but the slot exists and has advanced.* That returned
+`ok=True` from `check_invariant_o` because `durable is None`. It now refuses to
+start unless the configured `snapshot.mode` re-reads every captured table's data
+in full, and even then it is reported as its own decision
+(`no_durable_row_full_snapshot`) rather than as Invariant-O healthy. With a
+non-backfilling mode the connector would stream from the slot's confirmed position
+and every change before it would be silently gone.
+
+Related, and the same failure shape: `envelope.offsets_of()` returns
+`(None, None)` for every bridge failure, after which `_resume_point_for` paired a
+**newer** `last_lsn` with the **previous** offset map. Debezium would resume from
+the older offset while our fence claimed the newer LSN was durable, so the replay
+would be fenced away — silent loss. A group that would advance `last_lsn` without
+a readable terminal Connect offset is now refused; a rollback replays, which is
+free.
+
+The codec tests keep a **real Debezium-written `offsets.dat`** as a committed
+fixture (`tests/fixtures/offsets_debezium_3.6.dat`). The previous
+"byte identical to one Debezium wrote" test created both files with our own
+writer, so it proved only that our writer is deterministic.
+
+### A23 — `lsn.flush.mode` is pinned, not inherited (adds to §4.10)
+
+Invariant O holds because `PostgresConnectorTask.performCommit()` re-reads the
+offset *backing store* rather than the task's in-memory offset context. Opus B-2
+traced the one bypass: with `lsn.flush.mode=connector_and_driver`,
+`PostgresReplicationConnection.java:1114-1123` sets `.withAutomaticFlush(true)`
+and the shipped pgjdbc then advances the flushed LSN to the **server-supplied**
+`lastServerLSN` on keepalives, never consulting the offset store. Debezium's
+default is `connector`, which is safe — and "the default happens to be safe" is
+precisely the conditional argument rev 2 exists to eliminate. It is pinned, and
+`provide.transaction.metadata`, `offset.flush.interval.ms` and it now **refuse**
+an override rather than warning about one.
+
+Worth recording as a fragility rather than a finding, per Opus: Invariant O rests
+on a **Postgres-connector-specific override**. The generic
+`BaseSourceTask.performCommit()` path would violate it. A different connector
+would need this re-derived from scratch.
+
+### A24 — the commit→ack window contains nothing else (principle 3, Codex 7)
+
+The post-commit ordering was safe with respect to Invariant O but did not satisfy
+the binding principle as implemented: between `COMMIT` and the next poll it ran a
+fault lookup that re-read and re-parsed an environment variable, all the
+`markProcessed()` calls, `verifier.before()` (which `stat`s and `sha256`s
+`offsets.dat`), `markBatchFinished()`, and `verifier.after()` (which hashes it
+again).
+
+Now: the fingerprint is taken **before** `COMMIT` — it is a forensic baseline and
+never needed to be in the window — and the comparison runs on the *next batch*,
+once Debezium has had its poll/commit opportunity, or at shutdown for the last
+group. The check is not weakened by deferring it: `markBatchFinished()` on an
+empty poll comes from an independent committer that never marked a record, so
+`beginFlush()` finds nothing and does not rewrite the file. Only our own
+acknowledgement can have moved it. The fault spec is parsed once and cached.
+
+The window now contains the `markProcessed()` calls and `markBatchFinished()`,
+and `test_the_acknowledgement_happens_after_the_commit_and_only_after_it` asserts
+exactly that sequence.
+
+### A25 — the fault anchors, and what the "22-test matrix" actually was
+
+`mid_apply` was documented as "some tables written, others not" and fired
+*before* the table-write loop, so it could not detect a transaction torn between
+table A and table B — the one interleaving rubric 1.3 is about (Codex 6). It
+fires after the first table write now, and
+`test_mid_apply_really_fires_between_two_table_writes` observes the torn state
+inside the still-open transaction, immediately before the rollback.
+
+`spill` and `decode` were declared anchors with no test behind them, and A13's
+claim that the anchors "bracket every state the commit group passes through" was
+therefore false for the two states where the blockers lived. Coverage now:
+
+| where | what |
+|---|---|
+| default matrix | `begin`, `mid_apply`, `spill`, `pre_commit`, `post_commit_pre_ack`, `post_ack`, each a hard exit plus a recovery run |
+| `test_1_1_fault_interleavings.py` (slow) | `decode`; the `raise` action before **and** after `COMMIT` (Debezium's L3 teardown, not process death); a between-table crash whose recovery replays a *spilled* transaction; a crash during the **snapshot** phase; a genuinely unwritable `offsets.dat` |
+| `test_1_3_motherduck_fault.py` (motherduck) | `mid_apply` and `post_commit_pre_ack` against real MotherDuck, with exactly-once measured on the keyless changelog |
+| `test_1_1_spill_and_snapshot.py`, `test_1_3_commit_protocol.py` (default) | the interleavings themselves, in process |
+
+The headline count is deliberately gone from the claims. What matters is which
+states are bracketed, not how many parametrised assertions run over them.
+
+### A26 — `commit_id` is scoped to the pipeline (corrects §4.8)
+
+`commit_log.commit_id` was globally unique and allocated as `max(commit_id) + 1`,
+which cannot be atomic on this destination, while leases are per pipeline. Two
+*different, valid* pipelines therefore raced into a primary-key failure: the loser
+rolled back safely, so it was never a loss hole, but a destination hosting more
+than one pipeline could not operate, and a global id was acting as a coordination
+mechanism with no global lease (Codex 9). The key is `(pipeline, commit_id)` now,
+allocated monotonically per pipeline — the same scope the lease already
+guarantees — with a migration for destinations that already carry the global key,
+which the shared MotherDuck development database did.
+
+### A27 — a hard crash leaves the lease row locked at MotherDuck (new, measured)
+
+Found by the new MotherDuck fault tests, and not visible before because no
+MotherDuck test had ever crashed the pipeline. After a hard crash the dead process
+leaves an **uncommitted server-side transaction** that had already touched
+`_cdc_flight.lease`, so the next runner's `DELETE` fails with
+`TransactionContext Error: Conflict on tuple deletion!` even though the lease is
+correctly reclaimable (the pid is provably gone). Safe — the run exits non-zero
+having applied nothing — but it made crash *recovery* fail, which is the path this
+whole design exists to make routine. The lease write retries a conflict for up to
+30 s; the statements are idempotent and run before any data is written.
+
+### A28 — deferrals, stated explicitly
+
+These are the review findings **not** fixed here, with the rubric item that owns
+each. None of them is a loss or duplication path.
+
+| finding | owner | why deferred |
+|---|---|---|
+| Opus M-6 — the lease is renewed only at group start, so a unit that spills for longer than `CDC_LEASE_TTL` lets a second runner `acquire()` | 4.2 | safety currently rests on the destination detecting a write-write conflict on `_cdc_flight.lease` at `COMMIT`, which holds for DuckDB/MotherDuck MVCC but is *emergent, not designed*. Recorded rather than fixed because the fix (renew on a timer inside the open transaction, or derive the TTL from `commit_max_age` + the spill ceiling) belongs with 4.2's concurrency work. |
+| Opus M-7 second half — actually supporting incremental snapshots | 3.3 | the guard is in (A20); the support is a design question about interleaved snapshot windows that 3.3 owns. |
+| Opus MINOR-11 — the resume point carries no source identity (`system_identifier`/timeline), so a source restored from a base backup or `pg_resetwal` can reuse LSNs below `last_lsn` and genuinely new events would be fenced | 1.8 | `check_invariant_o` detects the slot being *ahead*, not a backward jump. 1.8 owns slot/source divergence and the automatic re-snapshot it routes to. |
+| Opus MINOR-15 / the `timestamptz -> VARCHAR` regression | 2.4 / 2.5 | the honest consequence of dropping type inference (A2); `test_documented_type_gaps` pins it. `ensure()` now refuses to ALTER a column whose destination type is outside the widening lattice, so it can no longer narrow one by accident. |
+| Keyless tables are a changelog, not current state (A12) | 8.1 / 8.2 | unchanged, and it is what makes 1.2 measurable at all. |
+| Spill throughput against MotherDuck | 5.3 | correctness first; the local 200 000-event measurement stands (A16). |
+| Probes not migrated to the applier | — | they are baseline-era evidence and `RUBRIC_STATUS.md` now labels them as such where it cites them for §1. |
+| Codex's note that `naming.destination_table()` is not injective (two source tables can normalise to one destination name) | 2.3 | not reachable with the captured schema, and a collision registry belongs with automatic table discovery. The narrower case Codex asked to pin - a captured table whose topic collides with `<prefix>.transaction` - is a start-up assertion now (`assert_no_internal_topic_collision`), so the silent-loss shape is closed even though the general injectivity question is not. |
+| Keyless update/delete acceptance tests beyond op-mix coverage | 8.1 / 8.2 | `test_e2e_duckdb.py` pins the op mix (`{"r":4,"c":6,"u":4,"d":2}`) and A12 states plainly that the table is a changelog; what "correct update/delete" *means* for a keyless table is the current-state question 8.1/8.2 own. |
+
+### A29 — module decomposition (Codex 8)
+
+`applier.py` reached 1 032 lines owning the Debezium callbacks, the destination
+protocol, resume-point capture, PK/keyless apply planning, snapshot epochs and
+swaps, spill staging and drain, and the counters. The snapshot-spill blocker was
+a direct consequence of those boundaries, so the extraction follows that fault
+line rather than a line count:
+
+* `snapshot.py` — `SnapshotCoordinator`: epochs, shadow targets, snapshot
+  identity, the swap. `state_for()` is the only entry into the snapshot phase.
+* `spill.py` — `SpillBuffer` + `StagedEvent`: takes the identity, target and
+  ordinal as **inputs** and infers nothing, which makes the Codex 1 defect
+  unexpressible rather than merely fixed.
+* `table_work.py` — the apply plan and the one merge mechanism for both table
+  shapes.
+* `applier.py` (881 lines) — the commit protocol, and only that.
+
+Still on the large side, and stated plainly rather than claimed as small: what
+changed is that each module has one owner, and the exactly-once argument can be
+read in `applier.py` without following state into three other concerns.

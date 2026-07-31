@@ -74,14 +74,30 @@ def test_failed_run_does_not_claim_records(dropped_slot_scenario):
 
 
 @pytest.mark.slow
-def test_corrupt_offset_surfaces_as_a_failure(sandbox):
-    """A structurally invalid offset file must also fail loudly (rubric 4.3)."""
+def test_corrupt_offset_is_repaired_rather_than_fatal(sandbox):
+    """UPDATED when the transactional applier landed.
+
+    This used to assert that a structurally invalid `offsets.dat` fails loudly,
+    which was right when the file was the only record of where we were: reading
+    garbage and carrying on would have been silent loss.
+
+    It no longer is. Under ADR 0001 §4.5 the file is a scratch buffer and
+    `_cdc_flight.debezium_offsets` is the truth, so a corrupt file has a correct
+    answer - rebuild it from the destination and carry on - and failing instead
+    would be a needless outage. The property that must still hold is that the
+    corrupt file is never *trusted*: the run must report the repair, and it must
+    not re-deliver anything.
+    """
     sandbox.reseed()
     first = sandbox.run(reset_state=True, max_seconds=150)
     assert first["returncode"] == 0
+    landed = sandbox.scalar('SELECT count(*) FROM "cdc_raw"."cdcflight_app_customers"')
 
     sandbox.offset_file.write_bytes(b"this is not a serialized offset map\n")
 
-    broken = sandbox.run(max_seconds=90, expect_success=False)
-    assert broken["returncode"] != 0, broken
-    assert broken.get("stop_reason") == "engine_error", broken
+    repaired = sandbox.run(max_seconds=90)
+    assert repaired["reconciliation"] == "file_corrupt_rebuilt", repaired
+    assert repaired["applied_events"] == 0, repaired
+    assert (
+        sandbox.scalar('SELECT count(*) FROM "cdc_raw"."cdcflight_app_customers"') == landed
+    )

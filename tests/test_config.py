@@ -3,9 +3,15 @@ pieces that are pure logic."""
 
 from __future__ import annotations
 
-from cdc_flight.config import ReplicationConfig, SourceConfig
-from cdc_flight.debezium_props import METADATA_PREFIX, build_properties
-from cdc_flight.handler import resolve_table_name
+import pytest
+
+from cdc_flight.config import ReplicationConfig, SourceConfig, applier_settings
+from cdc_flight.debezium_props import (
+    assert_no_internal_topic_collision,
+    build_properties,
+)
+from cdc_flight.errors import UnsafeDebeziumProperty
+from cdc_flight.naming import destination_table, normalize, shadow_table
 
 
 def test_source_dsn_and_table_list():
@@ -23,11 +29,71 @@ def test_properties_use_pgoutput_and_a_version_controlled_publication(tmp_path):
     assert props["publication.autocreate.mode"] == "disabled"
     assert props["connector.class"].endswith("PostgresConnector")
     assert props["offset.storage.file.filename"].startswith(str(tmp_path))
-    assert props["transforms.unwrap.add.fields.prefix"] == METADATA_PREFIX
     # Deprecated Debezium 1.x/2.x spellings from the blog must not come back.
     for removed in ("table.whitelist", "schema.whitelist", "database.whitelist"):
         assert removed not in props
     assert "transforms.unwrap.delete.handling.mode" not in props
+
+
+def test_properties_configure_the_full_envelope(tmp_path):
+    """ADR 0001 D5. Each of these is load-bearing for a specific rubric item."""
+    props = build_properties(SourceConfig(), ReplicationConfig(state_dir=tmp_path))
+    # No SMT: the `before` image, the truncate/message ops and the transaction
+    # block must all survive to Python.
+    assert "transforms" not in props
+    assert not any(k.startswith("transforms.") for k in props)
+    # ADR 0001 §3.2: without this there is no END marker, so no commit group can
+    # be proven to contain whole Postgres transactions.
+    assert props["provide.transaction.metadata"] == "true"
+    assert props["tombstones.on.delete"] == "false"
+    assert props["replace.null.with.default"] == "false"
+    # ADR 0001 §4.2 / Opus B2: a flush that did not happen must be observable.
+    assert props["offset.flush.interval.ms"] == "0"
+
+
+def test_the_lsn_flush_mode_is_pinned_to_connector(tmp_path):
+    """Invariant O depends on it, and the safe value is only a Debezium *default*.
+
+    With `lsn.flush.mode=connector_and_driver`,
+    `PostgresReplicationConnection.java:1114-1123` sets `.withAutomaticFlush(true)`
+    and the shipped pgjdbc then advances the flushed LSN to the server-supplied
+    `lastServerLSN` on keepalives, **never consulting the offset store**. That
+    confirms WAL to Postgres outside the invariant, i.e. it is the withdrawn P2's
+    shape: an argument that holds because a default happens to be safe. Pin it
+    (Opus B-2).
+    """
+    props = build_properties(SourceConfig(), ReplicationConfig(state_dir=tmp_path))
+    assert props["lsn.flush.mode"] == "connector"
+
+
+def test_an_unsafe_lsn_flush_mode_is_refused(tmp_path):
+    with pytest.raises(UnsafeDebeziumProperty, match=r"lsn\.flush\.mode"):
+        build_properties(
+            SourceConfig(),
+            ReplicationConfig(state_dir=tmp_path),
+            overrides={"lsn.flush.mode": "connector_and_driver"},
+        )
+
+
+def test_an_override_that_would_break_invariant_o_is_refused(tmp_path):
+    """The other two properties the whole design rests on."""
+    for key, value in (
+        ("provide.transaction.metadata", "false"),
+        ("offset.flush.interval.ms", "60000"),
+    ):
+        with pytest.raises(UnsafeDebeziumProperty, match=key.replace(".", r"\.")):
+            build_properties(
+                SourceConfig(), ReplicationConfig(state_dir=tmp_path), overrides={key: value}
+            )
+
+
+def test_no_captured_table_can_collide_with_an_internal_topic():
+    """`internal_topic_prefixes()` was dead code left behind by the deleted
+    handler, which reads as protection that is not there (Opus MINOR-6). It is now
+    an assertion the run makes at start-up."""
+    assert_no_internal_topic_collision("cdcflight", ["app.customers", "app.orders"])
+    with pytest.raises(UnsafeDebeziumProperty, match="transaction"):
+        assert_no_internal_topic_collision("cdcflight", ["app.customers", "cdcflight.transaction"])
 
 
 def test_snapshot_mode_override(tmp_path):
@@ -37,15 +103,22 @@ def test_snapshot_mode_override(tmp_path):
     assert props["snapshot.mode"] == "never"
 
 
-def test_table_name_prefers_payload_schema_over_topic():
-    # Debezium 3.6 omits the schema from the topic; the payload still carries it.
-    payload = {f"{METADATA_PREFIX}schema": "app", f"{METADATA_PREFIX}table": "customers"}
-    assert resolve_table_name("cdcflight.customers", payload) == "cdcflight_app_customers"
+def test_destination_table_name_includes_the_source_schema():
     # Two same-named tables in different schemas must not collide.
-    other = {f"{METADATA_PREFIX}schema": "billing", f"{METADATA_PREFIX}table": "customers"}
-    assert resolve_table_name("cdcflight.customers", other) == "cdcflight_billing_customers"
+    assert destination_table("cdcflight", "app", "customers") == "cdcflight_app_customers"
+    assert destination_table("cdcflight", "billing", "customers") == "cdcflight_billing_customers"
 
 
-def test_table_name_falls_back_to_topic():
-    assert resolve_table_name("cdcflight.app.customers", None) == "cdcflight_app_customers"
-    assert resolve_table_name("cdcflight.customers", {}) == "cdcflight_customers"
+def test_identifier_normalisation_is_dlts():
+    """ADR 0001 D10: dlt stays as a *library*, and this is why - the names have to
+    keep matching the ones every existing probe and RUBRIC_STATUS entry uses."""
+    assert normalize("Col Name") == "col_name"
+    assert normalize("lifetime_value") == "lifetime_value"
+    assert shadow_table("cdcflight_app_customers") == "cdcflight_app_customers__cdcf_tmp"
+
+
+def test_applier_defaults_follow_the_adr():
+    settings = applier_settings()
+    assert settings["commit_max_age"] == 5.0
+    assert settings["commit_max_events"] == 200_000
+    assert settings["repair_offset_file"] is True

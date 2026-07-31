@@ -35,13 +35,18 @@ from cdc_flight.config import motherduck_token
 
 pytestmark = [pytest.mark.motherduck, pytest.mark.e2e]
 
+#: MEASURED, 2026-07-30: `duckdb.connect()` caches the database instance per DSN
+#: within a process and MotherDuck's catalog snapshot rides on it, so a reader in
+#: THIS process can go stale against writes made by the pipeline SUBPROCESS.
+#: `FORCE CHECKPOINT` re-syncs it. Without this the observer below would sample a
+#: frozen `(0, 0)` forever and `test_target_no_observer_ever_sees_a_partial_transaction`
+#: would pass vacuously - which is why that test now also requires the observer to
+#: have seen the transition.
+REFRESH = "FORCE CHECKPOINT"
+
 MD_DATABASE = "cdc_flight_dev"
 N = 1500  # per table; 2 * N = 3000 events > max.batch.size (2048)
 
-TARGET = (
-    "rubric 1.3: whole-transaction commit groups need the custom MotherDuck "
-    "applier with BEGIN/COMMIT (ADR 0001 D1/D2)"
-)
 
 
 @pytest.fixture(scope="module")
@@ -98,6 +103,7 @@ def md_observed_txn(sandbox, md_token) -> dict:
         try:
             while not stop.is_set():
                 try:
+                    con.execute(REFRESH)
                     row = con.execute(
                         f'SELECT (SELECT count(*) FROM "{dataset}"."cdcflight_app_customers" '
                         "        WHERE name LIKE 'mdatomic-c-%'), "
@@ -126,6 +132,7 @@ def md_observed_txn(sandbox, md_token) -> dict:
         watcher.join(timeout=15)
 
     con = duckdb.connect(dsn)
+    con.execute(REFRESH)
     try:
         yield {
             "box": sandbox,
@@ -141,34 +148,35 @@ def md_observed_txn(sandbox, md_token) -> dict:
 
 
 def test_scenario_reached_motherduck(md_observed_txn):
-    """Guard: without this, every assertion below is vacuous."""
+    """Guard: without this, every assertion below is vacuous.
+
+    "The observer never saw a partial transaction" is trivially true of an
+    observer that never saw anything, so the guard has to establish that it was
+    genuinely watching **across** the commit: it must have sampled the state
+    before the transaction landed AND the state after it landed.
+    """
     con, dataset, n = md_observed_txn["con"], md_observed_txn["dataset"], md_observed_txn["n"]
     landed = con.execute(
         f'SELECT count(*) FROM "{dataset}"."cdcflight_app_customers" '
         "WHERE name LIKE 'mdatomic-c-%'"
     ).fetchone()[0]
     assert landed == n, md_observed_txn["streamed"]
-    assert md_observed_txn["observations"], "the observer never sampled MotherDuck"
-
-
-def test_gap_a_torn_transaction_is_observable_in_motherduck(md_observed_txn):
-    """PIN OF TODAY'S BROKEN BEHAVIOUR - delete once the applier lands.
-
-    A reader on another MotherDuck connection saw a state in which part of one
-    Postgres transaction was visible and the rest was not.
-    """
-    n = md_observed_txn["n"]
-    torn = [pair for pair in md_observed_txn["observations"] if pair not in {(0, 0), (n, n)}]
-    assert torn, (
-        "no torn intermediate state was observed; either the observer was too slow "
-        "or atomicity has been fixed - update RUBRIC_STATUS. observations="
-        f"{md_observed_txn['observations'][:20]}"
+    observations = md_observed_txn["observations"]
+    assert observations, "the observer never sampled MotherDuck"
+    assert (0, 0) in observations, (
+        "the observer never saw the pre-transaction state, so it started too late "
+        f"to prove anything: {observations[:20]}"
+    )
+    assert (n, n) in observations, (
+        "the observer never saw the committed transaction, so it was reading a "
+        f"stale catalog and every atomicity assertion would pass vacuously: "
+        f"{observations[:20]}"
     )
 
 
-@pytest.mark.xfail(reason=TARGET, strict=True)
+
 def test_target_no_observer_ever_sees_a_partial_transaction(md_observed_txn):
-    """TARGET BEHAVIOUR - the actual proof of rubric 1.3.
+    """TARGET BEHAVIOUR (now met) - the actual proof of rubric 1.3.
 
     Every observation from an independent MotherDuck connection must be either
     "the transaction is not there yet" or "the whole transaction is there".
@@ -182,9 +190,8 @@ def test_target_no_observer_ever_sees_a_partial_transaction(md_observed_txn):
     )
 
 
-@pytest.mark.xfail(reason=TARGET, strict=True)
 def test_target_one_commit_group_per_pg_transaction_in_motherduck(md_observed_txn):
-    """TARGET BEHAVIOUR - and the metadata agrees with what the observer saw."""
+    """TARGET BEHAVIOUR (now met) - and the metadata agrees with what the observer saw."""
     con, dataset = md_observed_txn["con"], md_observed_txn["dataset"]
     commits = con.execute(
         f'SELECT DISTINCT cdcf_commit_id FROM "{dataset}"."cdcflight_app_customers" '

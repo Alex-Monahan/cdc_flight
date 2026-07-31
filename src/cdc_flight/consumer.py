@@ -163,11 +163,20 @@ def verifying_consumer_class():
             from pydbzengine._jvm import JavaLangThread
 
             try:
-                self.handler.handleJsonBatch(records=records)
+                if hasattr(self.handler, "handle_batch"):
+                    # ADR 0001 D3 / Invariant O: the handler owns the
+                    # acknowledgement, because `markProcessed()` may only run
+                    # AFTER the destination COMMIT, and a commit group can span
+                    # several Debezium batches. `SourceRecordCommitter` is created
+                    # once per poll loop (`AsyncEmbeddedEngine.java:1300`), so the
+                    # committer handed to us is the same object every batch and is
+                    # safe to hold across batches on this (single) poll thread.
+                    self.handler.handle_batch(records, self._wrap(committer))
+                    return
 
-                # ADR 0001 §3.6: the acknowledgement is one contiguous block with
-                # nothing between it and the destination commit. Today the
-                # "destination commit" is dlt's; after D1 it is ours.
+                # Legacy shape: consume, then acknowledge the whole batch. Kept so
+                # a handler that does not need the committer still works.
+                self.handler.handleJsonBatch(records=records)
                 marked = 0
                 for record in records:
                     committer.markProcessed(record)
@@ -176,13 +185,9 @@ def verifying_consumer_class():
                 committer.markBatchFinished()
                 if self.verifier is not None:
                     self.verifier.after(before, marked=marked)
-
                 with self._lock:
                     self.batches_acked += 1
                     self.records_acked += marked
-
-                # `post_ack`: offsets.dat is flushed, the slot is not confirmed
-                # yet (that happens on the next poll()). See cdc_flight.faults.
                 data_batches = getattr(self.handler, "data_batch_count", 0)
                 if marked:
                     maybe_crash("post_ack", data_batches)
@@ -191,6 +196,23 @@ def verifying_consumer_class():
                 self._exception = exc
                 # How pydbzengine propagates a handler error to the engine thread.
                 JavaLangThread.currentThread().interrupt()
+
+        def _wrap(self, committer):
+            """Count acknowledgements so the run summary can report them."""
+            consumer = self
+
+            class _Counting:
+                def markProcessed(self, record):
+                    committer.markProcessed(record)
+                    with consumer._lock:
+                        consumer.records_acked += 1
+
+                def markBatchFinished(self):
+                    committer.markBatchFinished()
+                    with consumer._lock:
+                        consumer.batches_acked += 1
+
+            return _Counting()
 
     _consumer_class = _VerifyingChangeConsumer
     return _consumer_class

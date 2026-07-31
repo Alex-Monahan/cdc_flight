@@ -3,6 +3,8 @@
 **Rubric 1.3** — *CDC changes should be atomic in MotherDuck.*
 `no Postgres transactional boundaries respected=1, single-table transactional
 batches respected=3, multi-table transactional batches=5`. Baseline score: **1**.
+**Status: the local target tests pass**; the MotherDuck visibility proof is in
+`test_1_3_motherduck_atomicity.py` (marker `motherduck`).
 
 ## The gap
 
@@ -29,14 +31,13 @@ One Postgres `BEGIN … COMMIT` inserting 1 500 `app.customers` **and** 1 500
 must cut it into at least two batches, and the cut necessarily falls inside the
 transaction and between the two tables.
 
-## ⚠ These gap tests key off `_dlt_load_id`
+## The `_dlt_load_id` gap tests were deleted
 
 `test_gap_pg_transaction_is_split_across_commits` and
 `test_gap_torn_transaction_is_observable` read `_dlt_load_id`. ADR 0001 D10
-removes dlt from the apply path, so that column **disappears** and both tests
-will fail with a DuckDB `CatalogException` rather than a clean assertion failure.
-That is expected: they are gap pins and must be **deleted** at that point, not
-debugged.
+removed dlt from the apply path, so that column no longer exists and both tests
+would have failed with a DuckDB `CatalogException` rather than a clean assertion
+failure. They were deleted, as this README said they should be.
 
 ## Observing atomicity without a concurrent reader
 
@@ -52,14 +53,14 @@ intermediate state explicitly.
 
 ## What the tests assert
 
-| test | today | after the applier lands |
-|---|---|---|
-| `test_scenario_is_one_postgres_transaction` | passes | must keep passing |
-| `test_gap_pg_transaction_is_split_across_commits` | **passes** — >1 destination commit for one PG txn | starts failing; delete it |
-| `test_gap_torn_transaction_is_observable` | **passes** — all customers visible, only part of the orders | starts failing; delete it |
-| `test_target_pg_transaction_lands_in_one_commit` | **xfail(strict)** | must pass, then drop the marker |
-| `test_target_commit_group_metadata_is_present` | **xfail(strict)** | must pass, then drop the marker |
-| `test_target_commit_log_accounts_for_every_row` | **xfail(strict)** | must pass, then drop the marker |
+| test | status |
+|---|---|
+| `test_scenario_is_one_postgres_transaction` | passes |
+| ~~`test_gap_pg_transaction_is_split_across_commits`~~ | DELETED (keyed off `_dlt_load_id`) |
+| ~~`test_gap_torn_transaction_is_observable`~~ | DELETED (same) |
+| `test_target_pg_transaction_lands_in_one_commit` | **passes** (marker removed) |
+| `test_target_commit_group_metadata_is_present` | **passes** (marker removed) |
+| `test_target_commit_log_accounts_for_every_row` | **passes** (marker removed) |
 
 ### The MotherDuck variant is where the real proof lives
 
@@ -75,7 +76,8 @@ That module streams one multi-table Postgres transaction into MotherDuck while a
 second MotherDuck connection samples both tables. Every observation must be
 either `(0, 0)` or `(N, N)`; anything else is a torn transaction that a consumer
 could have seen. Rubric 1.3 asks for atomicity *in MotherDuck*, so 1.3 is not
-scored 5 until that test passes. It is kept deliberately small (one 3 000-event
+scored 5 until that test passes. Its `test_gap_a_torn_transaction_is_observable_in_motherduck`
+counterpart was deleted for the same reason as the local gap pins. It is kept deliberately small (one 3 000-event
 transaction, no large loads) to keep MotherDuck usage light.
 
 Conventions are described in `tests/1.0_engine_error_propagation/README.md`.

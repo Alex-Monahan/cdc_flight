@@ -199,6 +199,11 @@ class SupervisedDebeziumEngine(DebeziumJsonEngine):
                 self._offset_file, always_commit=self._always_commit_offsets
             )
             consumer.verifier = self._verifier
+            # Under Invariant O the handler owns the acknowledgement, so it is the
+            # handler - not the consumer - that must check whether the flush
+            # actually happened.
+            if hasattr(self._handler, "handle_batch"):
+                self._handler.verifier = self._verifier
         return consumer
 
     @cached_property

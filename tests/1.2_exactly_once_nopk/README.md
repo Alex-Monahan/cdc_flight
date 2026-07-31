@@ -2,6 +2,7 @@
 
 **Rubric 1.2** — *Delivery guarantees for tables WITHOUT a primary key.*
 `at-most-once=1, at-least-once=3, exactly-once=5`. Baseline score: **3**.
+**Status: the target tests pass** — the transactional applier landed (ADR 0001).
 
 Table under test: `app.sensor_readings` (no PK, `REPLICA IDENTITY FULL`).
 
@@ -14,7 +15,8 @@ indistinguishable from six genuinely identical readings. Any fix that leans on
 `INSERT … ON CONFLICT` or a merge key therefore does not apply, and a downstream
 `SELECT DISTINCT` cannot rescue the data either — it would also collapse
 legitimately identical readings, which is *data loss*.
-`test_gap_dedup_would_destroy_real_data` pins both halves of that at once.
+`test_gap_dedup_would_destroy_real_data` pinned both halves of that at once; it
+was deleted when the applier landed, because it asserted the *broken* behaviour.
 
 The applier must give keyless tables a **stable synthetic identity**. Review
 correction: it cannot be built from `source.sequence` — that field is
@@ -48,16 +50,32 @@ and why the deterministic offset rollback is equivalent to the `kill -9` that
 
 ## What the tests assert
 
-| test | today | after the applier lands |
-|---|---|---|
-| `test_gap_replay_duplicates_keyless_rows` | **passes** — the 60 replayed readings appear twice | starts failing; delete it |
-| `test_gap_dedup_would_destroy_real_data` | **passes** — duplicates are byte-identical, *and so are two real rows* | delete it |
-| `test_no_readings_are_lost` | passes | must keep passing |
-| `test_identical_source_rows_are_never_lost` | passes | **must keep passing** — this is the anti-dedup guard |
-| `test_target_identical_source_rows_both_survive` | **xfail(strict)** | must pass, then drop the marker |
-| `test_target_change_event_ledger_balances` | **xfail(strict)** | must pass, then drop the marker |
-| `test_target_exactly_once_nopk` | **xfail(strict)** | must pass, then drop the marker |
-| `test_target_synthetic_key_is_present_and_unique` | **xfail(strict)** | must pass, then drop the marker |
-| `test_target_event_identity_is_derived_not_random` | **xfail(strict)** — uniqueness alone is satisfied by a random id, which would break replay matching | must pass, then drop the marker |
+| test | status |
+|---|---|
+| ~~`test_gap_replay_duplicates_keyless_rows`~~ | DELETED — it asserted duplication, which no longer happens |
+| ~~`test_gap_dedup_would_destroy_real_data`~~ | DELETED — same reason |
+| `test_no_readings_are_lost` | passes |
+| `test_identical_source_rows_are_never_lost` | passes — the anti-dedup guard |
+| `test_target_identical_source_rows_both_survive` | **passes** (marker removed) |
+| `test_target_change_event_ledger_balances` | **passes** (marker removed) |
+| `test_target_exactly_once_nopk` | **passes** (marker removed) |
+| `test_target_synthetic_key_is_present_and_unique` | **passes** (marker removed) |
+| `test_target_event_identity_is_derived_not_random` | **passes** (marker removed) |
+
+## How it is met
+
+Keyless tables are keyed on `cdcf_event_id` =
+`"<event lsn>:<source.txId>:<transaction.total_order>"` and applied as an
+append-only changelog, so:
+
+* two genuinely identical source rows are two different *events* and keep two
+  different ids — deduplication by content is impossible by construction;
+* a replayed event recomputes the *same* id, and the applier's unit-level fence
+  drops the whole replayed unit before it is ever applied.
+
+ADR 0001 §15/A1 records the correction that made this work: Debezium 3.6's
+envelope `transaction.id` is `"<txId>:<lsn>"` and changes per event, so the
+stable transaction identifier is `source.txId`. `transaction.total_order` is a
+genuine 1-based ordinal and is used as specified.
 
 Conventions are described in `tests/1.0_engine_error_propagation/README.md`.

@@ -15,6 +15,7 @@ dependencies = [
     { name = "dlt", extra = ["duckdb", "motherduck"] },
     { name = "duckdb" },
     { name = "psycopg", extra = ["binary"] },
+    { name = "pyarrow" },
     { name = "pydbzengine" },
 ]
 
@@ -30,6 +31,7 @@ requires-dist = [
     { name = "dlt", extras = ["duckdb", "motherduck"], specifier = ">=1.19.0" },
     { name = "duckdb", specifier = ">=1.4.0,<1.5.5" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2.0" },
+    { name = "pyarrow", specifier = ">=15.0.0" },
     { name = "pydbzengine", git = "https://github.com/memiiso/pydbzengine.git?rev=3.6.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3.0" },
     { name = "pytest-timeout", marker = "extra == 'dev'", specifier = ">=2.3.0" },

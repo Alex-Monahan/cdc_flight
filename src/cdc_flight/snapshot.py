@@ -1,0 +1,218 @@
+"""The snapshot phase: epochs, shadow tables, identity and the swap (ADR §3.5, D7).
+
+Extracted from `applier.py` unchanged in behaviour (Codex 8). It is a module rather
+than a section of a 1 200-line file because the snapshot-spill blocker was a direct
+consequence of the old ownership boundaries: the spill path reached into snapshot
+state that another part of the same file initialised only later, and there was no
+single place responsible for "this table's shadow, epoch and identity exist".
+
+There is now: `SnapshotCoordinator.state_for()` is the only way to enter the
+snapshot phase for a table, it is idempotent, and it does the three things that
+have to be true *before* any record of that table can be written or staged -
+create the shadow, register the `table_state` row, and fix the epoch.
+
+Why a shadow table at all (rubric 3.2/3.3): a backfill loads into
+`<table>__cdcf_tmp` and the swap is `DROP` + `RENAME` inside the commit group's
+transaction, so consumers of the live table never see a partial snapshot and CDC
+never has to stop. A crash mid-snapshot is idempotent because the shadow is
+**dropped and rebuilt**, not because of event identity.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+
+from . import naming
+from .destination import CONTROL_SCHEMA
+from .envelope import PendingRecord
+from .errors import ResumePointDrift
+from .naming import quote
+
+log = logging.getLogger("cdc_flight.snapshot")
+
+
+@dataclass
+class SnapshotTable:
+    """One table's in-progress backfill."""
+
+    schema: str
+    table: str
+    #: the live destination table the shadow will be renamed onto
+    target: str
+    #: `<target>__cdcf_tmp`
+    shadow: str
+
+
+class SnapshotCoordinator:
+    """Owns snapshot epochs, shadow targets, snapshot identity and the swap."""
+
+    def __init__(
+        self,
+        con,
+        *,
+        dataset: str,
+        pipeline: str,
+        topic_prefix: str,
+        created_in_txn: set[str],
+        get_registry,
+        epoch: int,
+        transactional_ddl: bool,
+    ):
+        self.con = con
+        self.dataset = dataset
+        self.pipeline = pipeline
+        self.topic_prefix = topic_prefix
+        #: shared with the applier: a table created inside the open transaction is
+        #: empty, so the DELETE half of a merge against it cannot match anything.
+        self.created_in_txn = created_in_txn
+        #: a callable, because `_rollback_quietly` rebuilds the registry (a
+        #: rolled-back CREATE would otherwise leave the cached shape lying).
+        self._get_registry = get_registry
+        self.epoch = epoch
+        self.transactional_ddl = transactional_ddl
+        self.swaps = 0
+        self._tables: dict[str, SnapshotTable] = {}
+        self._session = False
+
+    # -- introspection ------------------------------------------------------ #
+    @property
+    def active(self) -> bool:
+        return bool(self._tables)
+
+    def states(self) -> list[SnapshotTable]:
+        return list(self._tables.values())
+
+    @property
+    def registry(self):
+        return self._get_registry()
+
+    # -- entering the phase ------------------------------------------------- #
+    def target_table(self, schema: str, table: str) -> str:
+        """Where a record of `schema.table` belongs *right now*.
+
+        While a table is being backfilled that is its shadow, so CDC arriving during
+        the backfill lands in the shadow and the swap is instantaneous - which is
+        what makes rubric 3.3 "simple and elegant" rather than a special case
+        (ADR §7 note 2).
+        """
+        state = self._tables.get(f"{schema}.{table}")
+        if state is not None:
+            return state.shadow
+        return naming.destination_table(self.topic_prefix, schema, table)
+
+    def state_for(self, schema: str | None, table: str | None) -> SnapshotTable | None:
+        """Enter (or continue) the snapshot phase for one table. Idempotent.
+
+        Establishes the epoch, the shadow table and the `table_state` row. Every
+        caller that is about to write *or stage* a snapshot record goes through
+        here first, which is the invariant the snapshot-spill blocker violated
+        (Codex 1).
+        """
+        if not schema or not table:
+            return None
+        key = f"{schema}.{table}"
+        state = self._tables.get(key)
+        if state is not None:
+            return state
+        if not self._session:
+            self._session = True
+            self.epoch += 1
+            log.info("snapshot session started, epoch=%s", self.epoch)
+        target = naming.destination_table(self.topic_prefix, schema, table)
+        state = SnapshotTable(
+            schema=schema, table=table, target=target, shadow=naming.shadow_table(target)
+        )
+        # A crash mid-snapshot means Debezium re-snapshots from the beginning
+        # (`InitialSnapshotter.shouldSnapshotData` returns true while the offset
+        # says a snapshot was in progress). Dropping the shadow here is what makes
+        # that idempotent - not event identity (ADR §3.5).
+        self.con.execute(
+            f"DROP TABLE IF EXISTS {quote(self.dataset)}.{quote(state.shadow)}"
+        )
+        self.registry.forget(state.shadow)
+        self.created_in_txn.add(state.shadow)
+        self.con.execute(
+            f"DELETE FROM {CONTROL_SCHEMA}.table_state WHERE pipeline = ? AND "
+            "source_schema = ? AND source_table = ?",
+            [self.pipeline, schema, table],
+        )
+        self.con.execute(
+            f"INSERT INTO {CONTROL_SCHEMA}.table_state "
+            "(pipeline, source_schema, source_table, target_table, snapshot_state, "
+            " snapshot_epoch) VALUES (?,?,?,?,'in_progress',?)",
+            [self.pipeline, schema, table, target, self.epoch],
+        )
+        self._tables[key] = state
+        return state
+
+    # -- identity ----------------------------------------------------------- #
+    def event_id(self, event: PendingRecord) -> str:
+        """`snap:<epoch>:<schema>.<table>:<arrival ordinal>` (ADR §6, §15/A18).
+
+        The ordinal is assigned by the assembler when the record arrives, so it is
+        arrival order whether the record was later spilled or kept in memory. It
+        used to be assigned at apply time from a counter on the snapshot state,
+        which the spill path incremented separately and the *first* spilled chunk of
+        a snapshot could not reach at all (Codex 1).
+
+        The epoch plus the per-session drop of the shadow is what keeps this
+        disjoint from a previous run's ordinals; the `snap:` prefix keeps it
+        disjoint from streaming identity.
+        """
+        if event.snapshot_ordinal is None:  # pragma: no cover - assembler guarantees it
+            raise ResumePointDrift(
+                f"snapshot record for {event.schema}.{event.table} has no arrival "
+                "ordinal, so it has no stable identity (ADR 0001 §6)"
+            )
+        return (
+            f"snap:{self.epoch}:{event.schema}.{event.table}:{event.snapshot_ordinal}"
+        )
+
+    # -- leaving the phase -------------------------------------------------- #
+    def swap(self, state: SnapshotTable, *, commit_id: int, snapshot_lsn) -> bool:
+        """Put the shadow live. Returns True if a table was actually swapped.
+
+        Runs inside the commit group's transaction, so an observer sees the old
+        table or the new one and never an intermediate state. Where the destination
+        does not honour `DROP`/`RENAME` transactionally (probed per run, ADR §14.1)
+        it falls back to `CREATE OR REPLACE TABLE … AS SELECT`, which the rubric
+        explicitly allows.
+        """
+        key = f"{state.schema}.{state.table}"
+        if key not in self._tables:
+            return False
+        shadow = f"{quote(self.dataset)}.{quote(state.shadow)}"
+        live = f"{quote(self.dataset)}.{quote(state.target)}"
+        exists = self.con.execute(
+            "SELECT count(*) FROM information_schema.tables "
+            "WHERE table_schema = ? AND table_name = ?",
+            [self.dataset, state.shadow],
+        ).fetchone()[0]
+        swapped = False
+        if exists:
+            if self.transactional_ddl:
+                self.con.execute(f"DROP TABLE IF EXISTS {live}")
+                self.con.execute(
+                    f"ALTER TABLE {shadow} RENAME TO {quote(state.target)}"
+                )
+            else:
+                self.con.execute(
+                    f"CREATE OR REPLACE TABLE {live} AS SELECT * FROM {shadow}"
+                )
+                self.con.execute(f"DROP TABLE {shadow}")
+            self.registry.forget(state.shadow)
+            self.registry.forget(state.target)
+            self.created_in_txn.discard(state.shadow)
+            self.swaps += 1
+            swapped = True
+        self.con.execute(
+            f"UPDATE {CONTROL_SCHEMA}.table_state SET snapshot_state = 'complete', "
+            "snapshot_lsn = ?, last_commit_id = ? WHERE pipeline = ? AND "
+            "source_schema = ? AND source_table = ?",
+            [snapshot_lsn, commit_id, self.pipeline, state.schema, state.table],
+        )
+        self._tables.pop(key, None)
+        if not self._tables:
+            self._session = False
+        return swapped
