@@ -82,6 +82,12 @@ unchanged until each item is re-measured. Two things have moved underneath them:
   `CDC_FAULT_INJECT`). 1.7's "robust injection of failures in testing" now has
   machinery behind it; the score stays at 1 until the applier makes duplication
   impossible, which is what `tests/1.1_*` and `tests/1.2_*` measure.
+  A real `kill -9` at 200 000 rows reproduced the at-least-once behaviour again
+  under the new harness: **205 706 rows / 200 000 distinct = 5 706 duplicates**,
+  zero rows lost (`tests/1.1_exactly_once_pk::test_slow_real_sigkill_loses_nothing`).
+  An immediately preceding run of the same test killed outside the flush window
+  and produced 0 duplicates — which is precisely why the default suite relies on
+  the deterministic crash point rather than the race.
 * **The architecture that closes §1 is decided** in
   [`docs/adr/0001-transactional-applier.md`](docs/adr/0001-transactional-applier.md).
 

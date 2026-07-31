@@ -151,6 +151,7 @@ Measured on an M-series Mac (2026-07-30):
 |---|---|---|
 | `make test` (local only) | 22 passed + 6 xfail | **281 s** |
 | `make test-md` | 2 | **35 s** |
+| `make test-slow` | 2 | **142 s** |
 
 Budget is 10 minutes for the whole suite. The dominant cost is JVM startup (~17 s
 including the destination connect) plus the Debezium idle tail per pipeline invocation,

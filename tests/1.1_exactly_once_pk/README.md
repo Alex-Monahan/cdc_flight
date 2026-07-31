@@ -42,9 +42,21 @@ approaches were rejected:
 The scenario is the session-scoped `crash_replay` fixture in `tests/conftest.py`,
 shared with `tests/1.2_exactly_once_nopk/`.
 
-`test_slow_real_sigkill_duplicates` (marked `slow`, deselected by `make test`)
-does the real thing: a large single transaction, `kill -9` mid-load, restart,
-count duplicates.
+`test_slow_real_sigkill_loses_nothing` (marked `slow`, deselected by `make test`)
+does the real thing — a 200 000-row transaction, `kill -9` mid-load, restart —
+but asserts **no loss**, not duplication. Whether a SIGKILL duplicates depends on
+where it lands relative to the offset flush, and that race is not winnable
+reliably — two consecutive runs of *this same test* at 200 000 rows gave:
+
+```
+run 1: SIGKILL after ~200 000 rows: 200 000 rows / 200 000 distinct =>     0 duplicates
+run 2: SIGKILL after  151 552 rows: 205 706 rows / 200 000 distinct => 5 706 duplicates
+```
+
+(`probes/p07` lost the race at 60 k, `probes/p13` won it at 400 k.) Requiring
+duplication here would make the suite flaky for no gain; the duplication claim
+rests on the deterministic scenario instead. The observed duplicate count is
+printed either way, and **no loss** is asserted in both cases.
 
 ## What the tests assert
 
