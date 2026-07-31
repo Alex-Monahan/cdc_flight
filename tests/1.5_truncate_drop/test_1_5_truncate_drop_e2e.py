@@ -25,7 +25,12 @@ from __future__ import annotations
 
 import pytest
 
-pytestmark = pytest.mark.e2e
+#: **Moved to the `slow` lane in the 1.6-1.8 review round** (Opus Q5). 1.5 keeps 98
+#: deterministic tests in the default suite (catalog detection, the six guards, the fold,
+#: ownership, key reuse, every storage mode); what moves out is the three-run end-to-end
+#: scenario, which is the expensive part and the part the unit tests already pin. Nothing
+#: was deleted.
+pytestmark = [pytest.mark.slow, pytest.mark.e2e]
 
 PARENT = "cdcflight_app_trunc_parent"
 CHILD = "cdcflight_app_trunc_child"

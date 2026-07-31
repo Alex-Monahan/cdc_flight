@@ -50,13 +50,50 @@ Examples:
 
     CDC_FAULT_INJECT=post_commit_pre_ack:1 cdc-flight --destination duckdb
     CDC_FAULT_INJECT=pre_commit:2:raise   cdc-flight --destination duckdb
+
+**Destination and network faults (rubric 1.7's route to 5).** The anchors above are
+all places *we* stand; they cannot express "the destination refused the write" or
+"the connection went away". Those live in `DESTINATION_POINTS` and are injected by
+`wrap_destination()`, which wraps the single connection the applier writes through:
+
+    CDC_FAULT_INJECT=destination_write:2    # a data write is rejected mid-transaction
+    CDC_FAULT_INJECT=destination_commit:1   # COMMIT raises BEFORE executing
+    CDC_FAULT_INJECT=destination_commit_late:1  # COMMIT EXECUTES, then raises -
+                                            # genuinely AMBIGUOUS (§4.6 F5)
+    CDC_FAULT_INJECT=destination_hang:1     # COMMIT never returns (bounded by
+                                            # CDC_COMMIT_TIMEOUT, then exit 75)
+    CDC_FAULT_INJECT=destination_close:1    # the connection is severed mid-transaction
+    CDC_FAULT_INJECT=swap:1                 # between the DROP and the RENAME of a
+                                            # backfill swap (1.6)
+
+`destination_hang`'s duration is `CDC_FAULT_HANG_SECONDS` (default 3600). It used to be
+read out of `<action>`, so `destination_hang:1` hung for 137 seconds - the *default exit
+code* reinterpreted as a duration - which is undocumented, surprising, and (with the
+shipped `CDC_COMMIT_TIMEOUT=300`) would have ended the hang before the watchdog it
+exists to test could fire (Opus MAJOR-5).
+
+**Every fired anchor writes a machine-readable record** to `$CDC_STATE_DIR/fault_fired.json`
+before it does anything else, including before `os._exit`. A fault test that only checks
+an exit code cannot tell "the watchdog bounded a hung COMMIT" from "the harness killed
+the process"; with the record it can assert the exact anchor that fired (Codex M2).
+
+The *network* fault that matters most cannot be injected from inside the process at
+all - a source whose packets simply stop arriving, with the sockets left open - so it
+is injected from outside by a TCP relay the test owns (`tests/tcp_relay.py`).
+
+Every one of these must end in exactly one of two states, and `tests/1.7_fault_
+injection/` asserts which for each: a clean recovery with the ledger unchanged, or a
+non-zero exit with an accurate `last_run.json`. Silence, `ok: true`, a hang or a
+duplicate are all failures of the item.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
+import time
 
 log = logging.getLogger("cdc_flight.faults")
 
@@ -84,16 +121,58 @@ POINTS = (
     "begin",
     "spill",
     "mid_apply",
+    "swap",
     "pre_commit",
     "post_commit_pre_ack",
     "post_ack",
 )
+
+#: Points that are **not** reached by `maybe_crash`: they describe something the
+#: destination does to us rather than somewhere we can stand. They are injected by
+#: `FaultyConnection`, which wraps the one destination connection, and their action
+#: is fixed by the point (an error, a severed connection, a hang) rather than
+#: chosen with `<action>`. See `wrap_destination`.
+#:
+#: * `destination_write`  - the Nth data group's first data-modifying statement
+#:   raises, with the destination transaction open. Rolls back; must lose nothing.
+#: * `destination_commit` - `COMMIT` itself raises. **Ambiguous**: the destination
+#:   may or may not have committed, so recovery has to be right either way (ADR
+#:   0001 §4.6 F5).
+#: * `destination_hang`   - `COMMIT` never returns. Bounded by
+#:   `CDC_COMMIT_TIMEOUT`; the run must die loudly rather than hang for ever.
+#: * `destination_close`  - the connection is severed mid-transaction, which is
+#:   what a dropped network route to MotherDuck looks like.
+#: * `destination_commit_late` - `COMMIT` is EXECUTED and then raises. This is the
+#:   genuinely ambiguous shape: the server committed, the client saw an error, and the
+#:   two are indistinguishable from where we stand. `destination_commit` raises
+#:   *before* the statement runs, which is an ordinary uncommitted failure wearing an
+#:   ambiguous name (Codex M2); both are kept, because the recovery has to be right
+#:   either way and only having the easy one proved half the claim.
+DESTINATION_POINTS = (
+    "destination_write",
+    "destination_commit",
+    "destination_commit_late",
+    "destination_hang",
+    "destination_close",
+)
+
+ALL_POINTS = POINTS + DESTINATION_POINTS
 
 #: Names kept working from the first fault-injection cut.
 ALIASES = {"before_load": "pre_commit", "after_load": "post_commit_pre_ack"}
 
 DEFAULT_EXIT_CODE = 137
 RAISE = "raise"
+
+
+class DestinationFault(RuntimeError):
+    """Raised by `FaultyConnection` for a `destination_*` point.
+
+    Deliberately not an `InjectedFault`: it stands in for a real destination error
+    (a rejected write, a severed connection), so it must travel the same path a
+    genuine `duckdb.Error` travels - through `_rollback_quietly` and out of the run
+    with a non-zero exit - rather than a path that only fault tests take.
+    """
 
 
 class InjectedFault(RuntimeError):
@@ -114,10 +193,10 @@ def parse_spec(raw: str | None) -> tuple[str, int, int | str] | None:
         return None
     parts = raw.split(":")
     point = ALIASES.get(parts[0].strip(), parts[0].strip())
-    if point not in POINTS:
+    if point not in ALL_POINTS:
         raise FaultSpecError(
             f"{ENV_VAR}: unknown point {parts[0]!r}; expected one of "
-            f"{POINTS} (or aliases {tuple(ALIASES)})"
+            f"{ALL_POINTS} (or aliases {tuple(ALIASES)})"
         )
     try:
         nth = int(parts[1]) if len(parts) > 1 and parts[1] else 1
@@ -174,6 +253,208 @@ def _spec() -> tuple[str, int, int | str] | None:
     return _spec_cache  # type: ignore[return-value]
 
 
+#: Which data-carrying commit group the applier is currently building, 1-based.
+#: Set by the applier at the top of `commit_group`, read by `FaultyConnection`.
+#: A module-level int rather than a callback because the alternative is for the
+#: connection wrapper to *infer* the group index from the SQL it sees, and an
+#: inferred index is exactly how a fault test goes vacuously green (Opus M7).
+_current_group = 0
+
+
+def arm_group(nth: int) -> None:
+    global _current_group
+    _current_group = nth
+
+
+def current_group() -> int:
+    return _current_group
+
+
+#: Statements that count as "writing data" for `destination_write`. Bookkeeping
+#: (BEGIN, SELECT, the lease, the control schema) is deliberately excluded: the
+#: point is documented as "the destination rejected a write *of this group's data*",
+#: and firing on the lease renewal would test a different thing under the same name.
+_DATA_STATEMENTS = ("insert into", "update ", "delete from", "create table", "create or replace")
+
+
+def _is_data_statement(sql: str) -> bool:
+    lowered = sql.lstrip().lower()
+    if lowered.startswith(("insert into _cdc_flight", "delete from _cdc_flight",
+                           "update _cdc_flight", "insert or replace into _cdc_flight")):
+        return False
+    return lowered.startswith(_DATA_STATEMENTS)
+
+
+class FaultyConnection:
+    """A destination connection that fails the way a destination really fails.
+
+    Wraps the single DuckDB/MotherDuck connection the applier writes through and
+    injects one of `DESTINATION_POINTS` at the configured data-carrying commit
+    group. Everything else is delegated untouched, including `cursor()` (the alert
+    sink's independent connection is deliberately **not** made faulty: "the write
+    failed" and "you cannot even be told the write failed" are different faults, and
+    conflating them would hide which one the test proved).
+    """
+
+    def __init__(self, con, point: str, nth: int, *, hang_seconds: float = 3600.0):
+        self._con = con
+        self._point = point
+        self._nth = nth
+        self._hang_seconds = hang_seconds
+        self.fired = False
+
+    # -- the injected surface ---------------------------------------------- #
+    def execute(self, sql, *args, **kwargs):
+        late = False
+        if not self.fired and _current_group == self._nth:
+            statement = sql if isinstance(sql, str) else str(sql)
+            self._maybe_fire(statement)
+            late = self.fired and self._point == "destination_commit_late"
+        result = self._con.execute(sql, *args, **kwargs)
+        if late:
+            # The COMMIT really ran, and THEN the client lost the answer. This is the
+            # shape §4.6 F5 is about and the shape `destination_commit` is not.
+            log.error(
+                "FAULT INJECTION: destination COMMIT executed, then the client lost "
+                "the answer (group %s)", self._nth,
+            )
+            raise DestinationFault(
+                "injected destination COMMIT failure AFTER the statement executed "
+                "(genuinely ambiguous: the destination committed and we cannot know it)"
+            )
+        return result
+
+    def _maybe_fire(self, statement: str) -> None:
+        lowered = statement.lstrip().lower()
+        if self._point == "destination_write" and _is_data_statement(statement):
+            self.fired = True
+            record_fired(self._point, self._nth, "raise")
+            log.error("FAULT INJECTION: destination rejects %r (group %s)",
+                      statement[:60], self._nth)
+            raise DestinationFault(
+                f"injected destination write failure on {statement[:80]!r}"
+            )
+        if lowered.startswith("commit"):
+            if self._point == "destination_commit":
+                self.fired = True
+                record_fired(self._point, self._nth, "raise")
+                log.error("FAULT INJECTION: destination COMMIT fails (group %s)", self._nth)
+                raise DestinationFault(
+                    "injected destination COMMIT failure before the statement ran"
+                )
+            if self._point == "destination_commit_late":
+                self.fired = True
+                record_fired(self._point, self._nth, "raise")
+                return
+            if self._point == "destination_hang":
+                self.fired = True
+                record_fired(self._point, self._nth, f"hang:{self._hang_seconds}")
+                log.error(
+                    "FAULT INJECTION: destination COMMIT hangs for %ss (group %s)",
+                    self._hang_seconds, self._nth,
+                )
+                sys.stdout.flush()
+                time.sleep(self._hang_seconds)
+        if self._point == "destination_close" and _is_data_statement(statement):
+            self.fired = True
+            record_fired(self._point, self._nth, "close")
+            log.error("FAULT INJECTION: severing the destination connection (group %s)",
+                      self._nth)
+            try:
+                self._con.close()
+            except Exception:  # pragma: no cover - closing a broken handle
+                log.debug("closing the destination connection raised", exc_info=True)
+            raise DestinationFault("injected severed destination connection")
+
+    # -- everything else --------------------------------------------------- #
+    def __getattr__(self, name):
+        return getattr(self._con, name)
+
+
+#: How long `destination_hang` blocks inside `COMMIT`. Its OWN environment variable.
+#: It used to be `<action>` reinterpreted as seconds, so a bare `destination_hang:1`
+#: hung for 137 s (the default exit code) - undocumented, and shorter than the shipped
+#: `CDC_COMMIT_TIMEOUT` of 300 s, which means the anchor would have quietly failed to
+#: exercise the watchdog it exists for (Opus MAJOR-5).
+HANG_SECONDS_ENV = "CDC_FAULT_HANG_SECONDS"
+DEFAULT_HANG_SECONDS = 3600.0
+
+
+def hang_seconds() -> float:
+    raw = os.environ.get(HANG_SECONDS_ENV)
+    if not raw:
+        return DEFAULT_HANG_SECONDS
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise FaultSpecError(
+            f"{HANG_SECONDS_ENV}: expected a number of seconds, got {raw!r}"
+        ) from exc
+
+
+def wrap_destination(con, *, hang_seconds: float | None = None):
+    """Return `con`, or a `FaultyConnection` when a `destination_*` fault is armed."""
+    spec = _spec()
+    if spec is None:
+        return con
+    point, nth, _action = spec
+    if point not in DESTINATION_POINTS:
+        return con
+    hang = hang_seconds if hang_seconds is not None else globals()["hang_seconds"]()
+    log.warning(
+        "destination fault armed: %s at data group %s%s",
+        point, nth, f" (hang {hang}s)" if point == "destination_hang" else "",
+    )
+    return FaultyConnection(con, point, nth, hang_seconds=hang)
+
+
+#: Where a fired anchor records itself. Inside `CDC_STATE_DIR` so a test that owns a
+#: sandbox owns the record too, and so a hard `os._exit` cannot outrun it.
+FIRED_FILENAME = "fault_fired.json"
+
+
+def fired_record_path() -> str | None:
+    state_dir = os.environ.get("CDC_STATE_DIR")
+    if not state_dir:
+        return None
+    return os.path.join(state_dir, FIRED_FILENAME)
+
+
+def record_fired(point: str, nth: int, action) -> None:
+    """Write the machine-readable "this anchor fired" record. Never raises.
+
+    Rubric 1.7's claim is that a fault produced a specific outcome, and an exit code
+    alone cannot carry that: `test_a_hung_commit_...` accepted 75, -9, 137 or 1, so it
+    passed if the run died of anything at all (Opus MAJOR-5), and the matrix accepted
+    any non-zero run without establishing that the selected fault had fired (Codex M2).
+    A test can now assert the exact anchor.
+    """
+    path = fired_record_path()
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            json.dump(
+                {"point": point, "nth": nth, "action": str(action), "pid": os.getpid()},
+                handle,
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:  # pragma: no cover - reporting must never mask the fault
+        log.debug("could not write the fired-fault record", exc_info=True)
+
+
+def read_fired_record(state_dir) -> dict | None:
+    """The anchor that fired in a run whose state directory is `state_dir`, or None."""
+    path = os.path.join(str(state_dir), FIRED_FILENAME)
+    try:
+        with open(path) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
 def maybe_crash(point: str, nth: int) -> None:
     """Fire the configured fault if this is the configured point + data batch.
 
@@ -190,6 +471,10 @@ def maybe_crash(point: str, nth: int) -> None:
     if ALIASES.get(point, point) != want_point or nth != want_nth:
         return
     log.error("FAULT INJECTION: firing at %s (data batch %s) action=%s", point, nth, action)
+    # BEFORE the exit, and fsynced: `os._exit` runs no atexit hook, so this is the only
+    # evidence a hard-killed run leaves behind that the anchor it was armed at is the
+    # one that fired.
+    record_fired(point, nth, action)
     sys.stdout.flush()
     sys.stderr.flush()
     if action == RAISE:

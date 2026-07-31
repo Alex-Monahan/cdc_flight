@@ -51,6 +51,7 @@ class GroupPlan:
         spill,
         truncate_mode: str,
         created_in_txn: set[str],
+        watermarks: dict[str, int] | None = None,
     ):
         self.con = con
         self.commit_id = commit_id
@@ -61,6 +62,9 @@ class GroupPlan:
         self.spill = spill
         self.truncate_mode = truncate_mode
         self.created_in_txn = created_in_txn
+        #: rubric 1.6, per-table snapshot watermarks. See `add_unit`.
+        self.watermarks = watermarks or {}
+        self.watermark_fenced_events = 0
 
         self.work: dict[str, TableWork] = {}
         self.stats: dict = {
@@ -107,11 +111,24 @@ class GroupPlan:
         if unit.kind == UNIT_SNAPSHOT_CHUNK:
             snapshot_state = self.snapshots.state_for(unit.schema, unit.table)
 
+        # rubric 1.6, the snapshot/stream hand-over. A table whose image was taken at
+        # consistent point C already contains every transaction that committed before C,
+        # and Postgres's exported snapshot makes that an iff, not an approximation. So a
+        # unit whose COMMIT LSN is below C contributes nothing for that table.
+        #
+        # The comparison is on the unit's commit LSN and never on an event's own LSN: a
+        # transaction that was still open when the snapshot was taken is in NO image, and
+        # some of its events carry LSNs below C. Fencing those would be silent loss.
+        commit_lsn = unit.last_lsn if unit.kind != UNIT_SNAPSHOT_CHUNK else None
+        fence_below = self.watermarks if commit_lsn else {}
+
         if unit.spill_unit_seq is not None:
             self.staged_units = True
             for staged in self.spill.load(
                 commit_id=self.commit_id, unit_seq=unit.spill_unit_seq
             ):
+                if self._below_watermark(staged.event, commit_lsn, fence_below):
+                    continue
                 self._collect(
                     staged.event,
                     snapshot=snapshot_state,
@@ -119,6 +136,8 @@ class GroupPlan:
                     event_id=staged.event_id,
                 )
         for event in unit.events:
+            if self._below_watermark(event, commit_lsn, fence_below):
+                continue
             self._collect(event, snapshot=snapshot_state)
 
         if unit.kind == UNIT_SNAPSHOT_CHUNK:
@@ -137,6 +156,21 @@ class GroupPlan:
         if unit.txn_id:
             self.stats["first_txn_id"] = self.stats["first_txn_id"] or unit.txn_id
             self.stats["last_txn_id"] = unit.txn_id
+
+    def _below_watermark(
+        self, event: PendingRecord, commit_lsn: int | None, watermarks: dict[str, int]
+    ) -> bool:
+        """Is this event's table already holding a newer snapshot image of it?"""
+        if not commit_lsn or not watermarks or not event.schema or not event.table:
+            return False
+        mark = watermarks.get(f"{event.schema}.{event.table}")
+        if mark is None or commit_lsn >= mark:
+            return False
+        self.watermark_fenced_events += 1
+        # Counted, not silent: "some events for this table were dropped" is exactly the
+        # kind of claim that must be visible in the run summary rather than inferred.
+        self.stats["events"] += 1
+        return True
 
     def _collect(
         self,

@@ -20,12 +20,44 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from .control_schema import CONTROL_DDL, ensure_control_schema
 from .errors import LeaseLost
 from .naming import quote
+
+__all__ = ["CONTROL_DDL", "ensure_control_schema"]
 
 log = logging.getLogger("cdc_flight.destination")
 
 CONTROL_SCHEMA = "_cdc_flight"
+
+#: `table_state.snapshot_state` for a table whose destination data cannot be trusted
+#: and which CDC alone cannot rebuild: a source relation that was dropped and
+#: recreated (rubric 1.5), or a table caught by rubric 1.8's slot-mismatch recovery.
+#: It is the queue `cdc_flight.resnapshot` works from. Defined here rather than in
+#: `catalog_apply` because three modules now write it and this is the one they all
+#: already depend on.
+AWAITING_SNAPSHOT = "awaiting_snapshot"
+
+#: `table_state.snapshot_state`, frozen. ADR §4.8 declared `none|in_progress|complete|
+#: failed` and the value the whole re-snapshot machinery runs on - `awaiting_snapshot` -
+#: was not in the declared domain, while `failed` was declared and never written by
+#: anything. Nothing validated a read, so a typo anywhere would have produced a state
+#: that silently belongs to no queue (architecture review, finding 2). The set is now
+#: here, `failed` is gone because nothing writes it, and reads are validated.
+SNAPSHOT_NONE = "none"
+SNAPSHOT_IN_PROGRESS = "in_progress"
+SNAPSHOT_COMPLETE = "complete"
+SNAPSHOT_STATES = frozenset(
+    {SNAPSHOT_NONE, SNAPSHOT_IN_PROGRESS, SNAPSHOT_COMPLETE, AWAITING_SNAPSHOT}
+)
+
+#: States that mean "this table does not hold a trustworthy image of the source".
+#: `in_progress` is in here and that is the whole point: it is durable, it is NOT
+#: terminal, and until now no durable query selected it, so a table whose snapshot was
+#: interrupted by anything the `except BaseException` handler cannot catch - `os._exit`,
+#: `SIGKILL`, the commit watchdog - was invisible to every queue and to the recovery
+#: journal's "is the rebuild finished?" test (architecture review, finding 1).
+SNAPSHOT_STATES_OWING_WORK = frozenset({AWAITING_SNAPSHOT, SNAPSHOT_IN_PROGRESS})
 
 #: How long a lease write may keep retrying a write-write conflict, and how long it
 #: waits between attempts. See `Lease._write` - this exists because a hard crash
@@ -105,201 +137,6 @@ def connect(dest) -> Any:
         )
 
     raise ValueError(f"unknown destination {dest.kind!r} (expected duckdb|motherduck)")
-
-
-CONTROL_DDL = [
-    f"CREATE SCHEMA IF NOT EXISTS {CONTROL_SCHEMA}",
-    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.debezium_offsets (
-            pipeline          VARCHAR     NOT NULL,
-            namespace         VARCHAR     NOT NULL,
-            resume_json       VARCHAR     NOT NULL,
-            offset_blob       BLOB,
-            offset_key_blob   BLOB,
-            commit_id         BIGINT      NOT NULL,
-            last_lsn          BIGINT      NOT NULL,
-            last_txn_id       VARCHAR,
-            last_total_order  BIGINT,
-            snapshot_epoch    BIGINT      NOT NULL DEFAULT 0,
-            updated_at        TIMESTAMPTZ NOT NULL,
-            PRIMARY KEY (pipeline, namespace)
-        )""",
-    # `PRIMARY KEY (pipeline, commit_id)`, not `PRIMARY KEY (commit_id)`. The id is
-    # allocated as `max(commit_id) + 1` and that cannot be atomic on this
-    # destination, so a globally unique key made two *different, valid* pipelines
-    # race into a primary-key failure: the loser rolled back safely, but a
-    # destination with more than one pipeline could not operate, and "global
-    # commit_id" was acting as a coordination mechanism with no global lease
-    # (Codex 9). Scoped per pipeline it matches the lease's scope, and the
-    # allocation below is monotone within a pipeline.
-    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.commit_log (
-            commit_id       BIGINT      NOT NULL,
-            pipeline        VARCHAR     NOT NULL,
-            runner_id       VARCHAR     NOT NULL,
-            opened_at       TIMESTAMPTZ NOT NULL,
-            committed_at    TIMESTAMPTZ NOT NULL,
-            trigger         VARCHAR     NOT NULL,
-            unit_count      BIGINT      NOT NULL,
-            event_count     BIGINT      NOT NULL,
-            fenced_units    BIGINT      NOT NULL DEFAULT 0,
-            spilled         BOOLEAN     NOT NULL DEFAULT false,
-            first_txn_id    VARCHAR,
-            last_txn_id     VARCHAR,
-            first_lsn       BIGINT,
-            last_lsn        BIGINT,
-            max_source_ts   TIMESTAMPTZ,
-            tables_touched  VARCHAR[],
-            PRIMARY KEY (pipeline, commit_id)
-        )""",
-    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.lease (
-            pipeline        VARCHAR     PRIMARY KEY,
-            owner_id        VARCHAR     NOT NULL,
-            host            VARCHAR,
-            pid             BIGINT,
-            acquired_at     TIMESTAMPTZ NOT NULL,
-            renewed_at      TIMESTAMPTZ NOT NULL,
-            expires_at      TIMESTAMPTZ NOT NULL
-        )""",
-    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.table_state (
-            pipeline        VARCHAR     NOT NULL,
-            source_schema   VARCHAR     NOT NULL,
-            source_table    VARCHAR     NOT NULL,
-            target_table    VARCHAR     NOT NULL,
-            refresh_mode    VARCHAR     NOT NULL DEFAULT 'cdc',
-            delete_mode     VARCHAR     NOT NULL DEFAULT 'hard',
-            history_mode    VARCHAR     NOT NULL DEFAULT 'none',
-            key_strategy    VARCHAR     NOT NULL DEFAULT 'pk',
-            key_columns     VARCHAR[],
-            snapshot_state  VARCHAR     NOT NULL DEFAULT 'none',
-            snapshot_epoch  BIGINT      NOT NULL DEFAULT 0,
-            snapshot_lsn    BIGINT,
-            last_commit_id  BIGINT,
-            PRIMARY KEY (pipeline, source_schema, source_table)
-        )""",
-    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.spill_events (
-            commit_id      BIGINT   NOT NULL,
-            unit_seq       BIGINT   NOT NULL,
-            event_seq      BIGINT   NOT NULL,
-            target_table   VARCHAR  NOT NULL,
-            source_schema  VARCHAR,
-            source_table   VARCHAR,
-            lsn            BIGINT,
-            txn_id         VARCHAR,
-            total_order    BIGINT,
-            cdcf_event_id  VARCHAR  NOT NULL,
-            op             VARCHAR  NOT NULL,
-            source_ts_ms   BIGINT,
-            before_json    VARCHAR,
-            after_json     VARCHAR,
-            key_json       VARCHAR
-        )""",
-    # rubric 1.5. The audit trail for everything that happens to a table rather than
-    # to a row: TRUNCATE, DROP, a drop-and-recreate, leaving or joining the
-    # publication, and (for 2.3) a table appearing. Written INSIDE the commit group's
-    # transaction, so "the destination table was emptied" and "here is why" are one
-    # atomic fact. It is also the answer to what a truncate means for history: the
-    # current-state table is emptied because Postgres emptied it, and the marker is
-    # what a changelog table (8.2) will carry as its truncate row.
-    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.table_events (
-            pipeline        VARCHAR     NOT NULL,
-            commit_id       BIGINT      NOT NULL,
-            seq             BIGINT      NOT NULL DEFAULT 0,
-            occurred_at     TIMESTAMPTZ NOT NULL,
-            event           VARCHAR     NOT NULL,
-            source_schema   VARCHAR     NOT NULL,
-            source_table    VARCHAR     NOT NULL,
-            target_table    VARCHAR,
-            applied         BOOLEAN     NOT NULL,
-            lsn             BIGINT,
-            txn_id          VARCHAR,
-            rows_removed    BIGINT,
-            detail          VARCHAR
-        )""",
-    # rubric 1.5 / 2.3. What the source catalog looked like the last time we saw it.
-    # The `relation_oid` is the load-bearing column: it is the only thing that tells a
-    # dropped-and-recreated table from the one we were replicating, and persisting it
-    # is what makes that detection survive a restart.
-    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.source_relations (
-            pipeline          VARCHAR     NOT NULL,
-            source_schema     VARCHAR     NOT NULL,
-            source_table      VARCHAR     NOT NULL,
-            relation_oid      BIGINT      NOT NULL,
-            published         BOOLEAN     NOT NULL,
-            replica_identity  VARCHAR,
-            first_seen_at     TIMESTAMPTZ NOT NULL,
-            last_seen_at      TIMESTAMPTZ NOT NULL,
-            PRIMARY KEY (pipeline, source_schema, source_table)
-        )""",
-    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.alerts (
-            pipeline        VARCHAR     NOT NULL,
-            raised_at       TIMESTAMPTZ NOT NULL,
-            severity        VARCHAR     NOT NULL,
-            code            VARCHAR     NOT NULL,
-            message         VARCHAR     NOT NULL,
-            context         VARCHAR
-        )""",
-]
-
-
-#: Columns of `commit_log`, in DDL order, used by the key migration below.
-_COMMIT_LOG_COLUMNS = (
-    "commit_id", "pipeline", "runner_id", "opened_at", "committed_at", "trigger",
-    "unit_count", "event_count", "fenced_units", "spilled", "first_txn_id",
-    "last_txn_id", "first_lsn", "last_lsn", "max_source_ts", "tables_touched",
-)
-
-
-def ensure_control_schema(con) -> None:
-    _migrate_commit_log_key(con)
-    for statement in CONTROL_DDL:
-        con.execute(statement)
-
-
-def _commit_log_primary_key(con) -> tuple[str, ...] | None:
-    """The column list of `commit_log`'s PRIMARY KEY, or None if unknowable."""
-    try:
-        rows = con.execute(
-            "SELECT constraint_column_names FROM duckdb_constraints() "
-            "WHERE schema_name = ? AND table_name = 'commit_log' "
-            "AND constraint_type = 'PRIMARY KEY'",
-            [CONTROL_SCHEMA],
-        ).fetchall()
-    except Exception:  # pragma: no cover - a destination without duckdb_constraints()
-        log.debug("could not read commit_log constraints", exc_info=True)
-        return None
-    if not rows:
-        return ()
-    return tuple(str(c) for c in rows[0][0])
-
-
-def _migrate_commit_log_key(con) -> None:
-    """Move `commit_log` from `PRIMARY KEY (commit_id)` to `(pipeline, commit_id)`.
-
-    Needed because `CREATE TABLE IF NOT EXISTS` cannot change a key, and a
-    destination that already hosts a pipeline would otherwise reject the *first*
-    commit of a second pipeline: ids are now allocated per pipeline, so a new
-    pipeline starts again at 1 (Codex 9). MEASURED against the shared MotherDuck
-    development database, which already had the global key.
-
-    Runs before any commit group opens a transaction, and is a no-op once done.
-    """
-    existing = _commit_log_primary_key(con)
-    if existing is None or existing == () or set(existing) == {"pipeline", "commit_id"}:
-        return
-    log.warning(
-        "migrating %s.commit_log from PRIMARY KEY %s to (pipeline, commit_id)",
-        CONTROL_SCHEMA, existing,
-    )
-    columns = ", ".join(_COMMIT_LOG_COLUMNS)
-    old = f"{CONTROL_SCHEMA}.commit_log__cdcf_oldkey"
-    con.execute(f"DROP TABLE IF EXISTS {old}")
-    con.execute(f"ALTER TABLE {CONTROL_SCHEMA}.commit_log RENAME TO commit_log__cdcf_oldkey")
-    for statement in CONTROL_DDL:
-        if ".commit_log (" in statement:
-            con.execute(statement)
-    con.execute(
-        f"INSERT INTO {CONTROL_SCHEMA}.commit_log ({columns}) SELECT {columns} FROM {old}"
-    )
-    con.execute(f"DROP TABLE {old}")
 
 
 def ensure_dataset(con, dataset: str) -> None:
@@ -577,6 +414,38 @@ class AlertSink:
         log.warning("ALERT %s/%s: %s", severity, code, message)
         return self.independent
 
+    def request_snapshot(self, *, pipeline: str, schema: str, table: str, target: str) -> bool:
+        """Mark a table `awaiting_snapshot` so the request OUTLIVES a rolled-back group.
+
+        Rubric 4.7. The one caller is `AmbiguousDelete`: the group that could not be
+        folded must roll back (never commit a guess), and the request to rebuild the
+        table must survive that rollback or the next run replays into the same ambiguity
+        for ever. Same connection as the alerts, for the same reason and with the same
+        verified property: an INSERT on `con.cursor()` survives the parent connection's
+        ROLLBACK.
+
+        Returns False when there is no independent connection, in which case the request
+        would be discarded with the group and saying so is the honest outcome.
+        """
+        if not self.independent or self._sink is None:
+            log.error(
+                "cannot record a re-snapshot request for %s.%s outside the transaction; "
+                "it would be discarded with the rolled-back group",
+                schema, table,
+            )
+            return False
+        try:
+            request_snapshot(
+                self._sink,
+                pipeline=pipeline,
+                tables=[(schema, table, target)],
+                detail=f"AmbiguousDelete on {schema}.{table} (rubric 4.7 self-heal)",
+            )
+        except Exception:  # pragma: no cover - never mask the original failure
+            log.warning("could not record the re-snapshot request", exc_info=True)
+            return False
+        return True
+
     def close(self) -> None:
         if self._sink is not None:
             with contextlib.suppress(Exception):
@@ -600,6 +469,217 @@ def raise_alert(con, *, pipeline: str, severity: str, code: str, message: str, c
         )
     except Exception:  # pragma: no cover - alerting must never mask the cause
         log.warning("could not write alert %s", code, exc_info=True)
+
+
+def read_slot_state(con, pipeline: str, slot_name: str) -> dict | None:
+    """The last recorded observation of this pipeline's slot, or None (rubric 1.8)."""
+    rows = con.execute(
+        f"SELECT system_identifier, timeline_id, restart_lsn, confirmed_flush_lsn, "
+        f"       current_wal_lsn, durable_lsn, observed_at "
+        f"FROM {CONTROL_SCHEMA}.slot_state WHERE pipeline = ? AND slot_name = ?",
+        [pipeline, slot_name],
+    ).fetchall()
+    if not rows:
+        return None
+    keys = (
+        "system_identifier", "timeline_id", "restart_lsn", "confirmed_flush_lsn",
+        "current_wal_lsn", "durable_lsn", "observed_at",
+    )
+    return dict(zip(keys, rows[0], strict=True))
+
+
+def write_slot_state(con, *, pipeline: str, slot_name: str, observation: dict) -> None:
+    """Record what the slot and the source cluster look like now (rubric 1.8).
+
+    DELETE + INSERT **in one transaction**. It used to be two autocommitted statements,
+    so a crash between them destroyed the only previous observation and silently shrank
+    the next acquisition's detectable set - `slot_recreated` and `source_identity_changed`
+    both need memory to fire at all (Codex M6 / Opus MINOR-7). Called on its own, never
+    inside a commit group: see the DDL comment.
+    """
+    con.execute("BEGIN TRANSACTION")
+    try:
+        con.execute(
+            f"DELETE FROM {CONTROL_SCHEMA}.slot_state WHERE pipeline = ? AND slot_name = ?",
+            [pipeline, slot_name],
+        )
+        con.execute(
+            f"INSERT INTO {CONTROL_SCHEMA}.slot_state "
+            "(pipeline, slot_name, system_identifier, timeline_id, restart_lsn, "
+            " confirmed_flush_lsn, current_wal_lsn, durable_lsn, observed_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            [
+                pipeline,
+                slot_name,
+                observation.get("system_identifier"),
+                observation.get("timeline_id"),
+                observation.get("restart_lsn"),
+                observation.get("confirmed_flush_lsn"),
+                observation.get("current_wal_lsn"),
+                observation.get("durable_lsn"),
+                now(),
+            ],
+        )
+        con.execute("COMMIT")
+    except BaseException:
+        with contextlib.suppress(Exception):
+            con.execute("ROLLBACK")
+        raise
+
+
+def tables_awaiting_snapshot(con, pipeline: str) -> list[tuple[str, str, str]]:
+    """`(source_schema, source_table, target_table)` for every table owed a snapshot.
+
+    The queue rubric 1.6's re-snapshot works from and rubric 1.5's `recreated` action
+    and rubric 1.8's recovery both write into. Ordered so a re-snapshot is
+    deterministic and its logs are diffable.
+
+    `promote_interrupted_snapshots()` is what makes this queue complete: run it once at
+    start-up and every durable non-terminal state is in here.
+    """
+    rows = con.execute(
+        f"SELECT source_schema, source_table, target_table FROM {CONTROL_SCHEMA}.table_state "
+        "WHERE pipeline = ? AND snapshot_state = ? ORDER BY source_schema, source_table",
+        [pipeline, AWAITING_SNAPSHOT],
+    ).fetchall()
+    return [(str(a), str(b), str(c)) for a, b, c in rows]
+
+
+def read_snapshot_states(con, pipeline: str) -> dict[str, str]:
+    """`"<schema>.<table>" -> snapshot_state`, VALIDATED against the frozen domain.
+
+    A state outside `SNAPSHOT_STATES` is a bug in whatever wrote it, and the honest
+    response is a loud failure rather than a table that quietly belongs to no queue.
+    """
+    out: dict[str, str] = {}
+    for schema, table, state in con.execute(
+        f"SELECT source_schema, source_table, snapshot_state FROM "
+        f"{CONTROL_SCHEMA}.table_state WHERE pipeline = ?",
+        [pipeline],
+    ).fetchall():
+        value = str(state)
+        if value not in SNAPSHOT_STATES:
+            raise ValueError(
+                f"{CONTROL_SCHEMA}.table_state for {schema}.{table} carries "
+                f"snapshot_state={value!r}, which is not one of {sorted(SNAPSHOT_STATES)}. "
+                "A state outside the frozen domain belongs to no queue and no recovery "
+                "path, so it is refused rather than skipped (ADR 0001 §4.8)."
+            )
+        out[f"{schema}.{table}"] = value
+    return out
+
+
+def promote_interrupted_snapshots(con, pipeline: str) -> list[str]:
+    """Turn every durable `in_progress` row into owed work. Call once, at start-up.
+
+    `in_progress` is written the instant a table's first snapshot record arrives and is
+    cleared only by the swap. It is durable and it is **not** terminal, and until this
+    existed the only thing that recovered from it was the applier's
+    `except BaseException` - a handler that `os._exit` (the fault injector, the commit
+    watchdog) and `SIGKILL` both step straight over. The consequence was concrete: the
+    recovery journal's "no table owes a snapshot any more" test could pass, and the run
+    could log "recovery COMPLETE: every captured table has a fresh image", while a table
+    sat half-snapshotted (architecture review, finding 1).
+
+    At start-up nothing is mid-snapshot by definition, so `in_progress` can only mean a
+    previous process died inside one. Promoting it to `awaiting_snapshot` is what makes
+    that discoverable from durable state alone, after ANY crash.
+    """
+    rows = con.execute(
+        f"SELECT source_schema, source_table FROM {CONTROL_SCHEMA}.table_state "
+        "WHERE pipeline = ? AND snapshot_state = ? ORDER BY source_schema, source_table",
+        [pipeline, SNAPSHOT_IN_PROGRESS],
+    ).fetchall()
+    if not rows:
+        return []
+    con.execute(
+        f"UPDATE {CONTROL_SCHEMA}.table_state SET snapshot_state = ? "
+        "WHERE pipeline = ? AND snapshot_state = ?",
+        [AWAITING_SNAPSHOT, pipeline, SNAPSHOT_IN_PROGRESS],
+    )
+    names = [f"{a}.{b}" for a, b in rows]
+    log.warning(
+        "%s table(s) were left mid-snapshot by an earlier process and are now marked "
+        "awaiting_snapshot: %s", len(names), ", ".join(names),
+    )
+    return names
+
+
+def request_snapshot(
+    con, *, pipeline: str, tables: list[tuple[str, str, str]], detail: str
+) -> int:
+    """Mark tables as owing a snapshot. Returns how many `table_state` rows now say so.
+
+    Idempotent: a table already `awaiting_snapshot` stays so. It deliberately does
+    NOT touch the destination table - the data stays queryable, stale and flagged,
+    until the re-snapshot swaps a complete image over it in one transaction.
+
+    The return value counts rows **verified** to carry `awaiting_snapshot` afterwards.
+    It used to increment once per input tuple whatever happened, so it returned
+    `len(tables)` unconditionally and the test asserting on it restated its own
+    configuration (Opus MINOR-1).
+    """
+    for schema, table, target in tables:
+        con.execute(
+            f"UPDATE {CONTROL_SCHEMA}.table_state SET snapshot_state = ? "
+            "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+            [AWAITING_SNAPSHOT, pipeline, schema, table],
+        )
+        existing = con.execute(
+            f"SELECT 1 FROM {CONTROL_SCHEMA}.table_state "
+            "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+            [pipeline, schema, table],
+        ).fetchall()
+        if not existing:
+            mark_awaiting_snapshot(
+                con, pipeline=pipeline, source_schema=schema, source_table=table,
+                target_table=target, state=AWAITING_SNAPSHOT,
+            )
+    marked = 0
+    for schema, table, _target in tables:
+        rows = con.execute(
+            f"SELECT snapshot_state FROM {CONTROL_SCHEMA}.table_state "
+            "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+            [pipeline, schema, table],
+        ).fetchall()
+        if rows and str(rows[0][0]) == AWAITING_SNAPSHOT:
+            marked += 1
+    log.warning("marked %s table(s) as awaiting a snapshot: %s", marked, detail)
+    return marked
+
+
+def destination_holds_rows(
+    con, *, dataset: str, tables: list[tuple[str, str, str]]
+) -> dict[str, int]:
+    """`"<schema>.<table>" -> row count` for every captured table that EXISTS and is
+    non-empty in the destination.
+
+    The fact rubric 1.8's `no_durable_destination_row` cell was deciding without
+    (Opus BLOCKER-2). Both the ADR and `RUBRIC_STATUS` describe that cell as
+    "destination **empty**, slot positioned", and the code checked only that
+    `_cdc_flight.debezium_offsets` had no row - so a healthy, fully populated
+    destination whose control row had been lost was rebuilt from whatever source the
+    DSN happened to name. Tables that do not exist are simply absent from the result.
+    """
+    held: dict[str, int] = {}
+    for schema, table, target in tables:
+        exists = con.execute(
+            "SELECT count(*) FROM information_schema.tables "
+            "WHERE table_schema = ? AND table_name = ?",
+            [dataset, target],
+        ).fetchone()[0]
+        if not exists:
+            continue
+        try:
+            count = con.execute(
+                f"SELECT count(*) FROM {quote(dataset)}.{quote(target)}"
+            ).fetchone()[0]
+        except Exception:  # pragma: no cover - an unreadable table is not proof of empty
+            log.warning("could not count %s.%s", dataset, target, exc_info=True)
+            count = -1
+        if count != 0:
+            held[f"{schema}.{table}"] = int(count)
+    return held
 
 
 def mark_awaiting_snapshot(

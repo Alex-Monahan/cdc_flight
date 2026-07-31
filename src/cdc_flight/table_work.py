@@ -59,7 +59,7 @@ from typing import Any
 
 from . import apply_sql, naming
 from .envelope import KIND_TRUNCATE, PendingRecord
-from .errors import AmbiguousDelete
+from .errors import AmbiguousDelete, DestinationIdentityCollision
 from .naming import CDCF_COMMIT_ID, CDCF_EVENT_ID, CDCF_TOTAL_ORDER
 
 log = logging.getLogger("cdc_flight.table_work")
@@ -303,7 +303,10 @@ def end_transaction(item: TableWork) -> None:
         f"{item.target}: {len(keys)} identity key(s) end a source transaction wearing "
         f"two or more rows (first: {keys[0]!r}). A unique key admits one row per key "
         "at a transaction boundary, so this fold would durably commit a duplicate "
-        "(ADR 0001 §18/A35)."
+        "(ADR 0001 §18/A35).",
+        source_schema=item.source_schema,
+        source_table=item.source_table,
+        target=item.target,
     )
 
 
@@ -461,7 +464,10 @@ def _unattributable(item, key, entries, before, what, why) -> AmbiguousDelete:
         f"before-image {before!r} does not say which one this event describes. "
         "Folding a guess would durably commit a wrong answer, so the commit group is "
         "refused and replays instead (ADR 0001 §18/A35). A deferred unique constraint "
-        "requires REPLICA IDENTITY FULL, which supplies the image this needs."
+        "requires REPLICA IDENTITY FULL, which supplies the image this needs.",
+        source_schema=item.source_schema,
+        source_table=item.source_table,
+        target=item.target,
     )
 
 
@@ -553,7 +559,17 @@ def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
     # (it then rejects a duplicate on the INSERT itself). Where it could not, this is
     # what keeps "duplication is impossible" enforced by the destination rather than
     # asserted by us (Opus M-2).
-    apply_sql.assert_identity_is_unique(con, table)
+    try:
+        apply_sql.assert_identity_is_unique(con, table)
+    except DestinationIdentityCollision as collision:
+        # Rubric 4.7: the same permanent-loop shape as `AmbiguousDelete`. The group must
+        # roll back, and then it replays into the same collision for ever unless somebody
+        # rebuilds the table. Naming the source relation is what lets the applier queue
+        # that rebuild automatically.
+        collision.source_schema = item.source_schema
+        collision.source_table = item.source_table
+        collision.target = item.target
+        raise
 
 
 def _plan(item: TableWork) -> tuple[list[tuple], list[dict]]:
@@ -576,7 +592,10 @@ def _plan(item: TableWork) -> tuple[list[tuple], list[dict]]:
             if len(concrete) > 1:  # pragma: no cover - `end_transaction` catches it
                 raise AmbiguousDelete(
                     f"{item.target}: identity {key!r} would be written twice by one "
-                    "commit group (ADR 0001 §18/A35)"
+                    "commit group (ADR 0001 §18/A35)",
+                    source_schema=item.source_schema,
+                    source_table=item.source_table,
+                    target=item.target,
                 )
             rows.extend(concrete)
     return delete_keys, rows

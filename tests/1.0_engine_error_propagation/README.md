@@ -33,8 +33,24 @@ while the pipeline reports `{"records": 0, "stop_reason": "engine_finished",
 | test | asserts |
 |---|---|
 | `test_healthy_run_reports_success` | a healthy run still exits 0 with a summary — guards against an over-eager failure detector. Asserts a *scenario-specific* row count, not the seed's global total, so an unrelated seed change or another writer cannot break it. |
-| `test_dropped_slot_surfaces_as_a_failure` | slot dropped externally ⇒ non-zero exit, `stop_reason: "engine_error"`, and the Debezium message ("no longer available on the server") in the run summary and on stderr |
-| `test_corrupt_offset_surfaces_as_a_failure` (`slow`) | a corrupted offset file ⇒ non-zero exit and a Debezium error message |
+| `test_engine_death_surfaces_as_a_failure` | the connector cannot start (the **publication** is dropped) ⇒ non-zero exit and `ok: false` |
+| `test_failure_carries_the_debezium_error_message` | the run summary and stderr carry Debezium's own *distinctive* text for a missing publication, and `stop_reason: "engine_error"` |
+| `test_failed_run_does_not_claim_records` | `records: 0` alongside `ok: false`, the shape that made p04/p11 invisible |
+| `test_a_dropped_slot_is_now_recovered_rather_than_fatal` | a dropped slot no longer reaches the engine at all — rubric 1.8 detects and repairs it before start-up |
+| `test_corrupt_offset_is_repaired_rather_than_fatal` (`slow`) | a corrupted offset file is rebuilt from the destination rather than being fatal |
+
+**The subject changed when rubric 1.8 landed, and the README did not** (Codex m2). This
+file used to drop the **replication slot** to kill the connector; 1.8's slot check now
+detects a missing slot before start-up and repairs it with an automatic re-snapshot, so
+keeping that trigger would have turned a supervisor test into a recovery test. Dropping
+the **publication** breaks connector start-up the same way and is not something 1.8 can
+or should repair. The old coverage is not lost: the slot case has its own test above, and
+1.8's own suite proves the repair end to end.
+
+The sentinel matters as much as the subject. It was briefly the bare word `"publication"`,
+matched case-insensitively against the whole output, which our own log lines satisfy
+(Opus MINOR-6). It is now Debezium's distinctive phrase, so a run that fails for an
+unrelated start-up reason cannot pass this test.
 
 These are **target-behaviour** tests for a defect that is fixed in the same
 commit range, so they are expected to *pass*. They are not xfail-marked.

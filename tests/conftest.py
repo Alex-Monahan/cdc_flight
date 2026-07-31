@@ -135,7 +135,41 @@ def postgres_cluster(exclusive_source: Path) -> Iterator[SourceConfig]:
         pytest.skip("scripts/pg.sh missing")
     _pg("start")
     _pg("seed")
+    _sweep_stale_test_slots(SourceConfig())
     yield SourceConfig()
+
+
+def _sweep_stale_test_slots(source: SourceConfig) -> None:
+    """Drop replication slots left behind by earlier sessions (Opus MAJOR-2).
+
+    Every sandbox slot is named `t_<scenario>_<pid>` and dropped on cleanup, but a hard
+    crash - which several fault scenarios cause ON PURPOSE - leaves one behind, and so
+    does a `_rs` throwaway from an interrupted re-snapshot. A logical slot holds WAL for
+    ever and counts against `max_replication_slots`, so the leaks accumulate until the
+    suite fails with "all replication slots are in use" - which is exactly how this run
+    failed once while the fix was being written, and how two independent review sessions
+    degraded the shared cluster in a single day.
+
+    Safe to do unconditionally at session start: `exclusive_source` holds the whole-session
+    lock, so no other session owns a `t_...` slot right now, and an ACTIVE slot is never
+    touched.
+    """
+    try:
+        with psycopg.connect(source.dsn, autocommit=True, connect_timeout=10) as conn:
+            stale = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT slot_name FROM pg_replication_slots "
+                    "WHERE NOT active AND (slot_name LIKE 't\\_%' OR slot_name LIKE '%\\_rs')"
+                ).fetchall()
+            ]
+            for name in stale:
+                with contextlib.suppress(Exception):
+                    conn.execute("SELECT pg_drop_replication_slot(%s)", (name,))
+            if stale:
+                print(f"\nswept {len(stale)} stale replication slot(s): {sorted(stale)}")
+    except Exception as exc:  # pragma: no cover - hygiene must never fail a session
+        print(f"\ncould not sweep stale replication slots: {exc}")
 
 
 def source_fingerprint(source: SourceConfig) -> dict[str, int]:
@@ -457,6 +491,22 @@ class Sandbox:
         path = self.state_dir / "last_run.json"
         return json.loads(path.read_text()) if path.exists() else {}
 
+    def fired_fault(self) -> dict | None:
+        """Which fault anchor actually fired in the last run, per the run itself.
+
+        Rubric 1.7's claim is about a *named* anchor producing a *named* outcome, and an
+        exit code cannot carry that: `-9`, `137` and `1` are all "the process died" and
+        one of them is what the harness does when it gives up. `faults.record_fired()`
+        writes this before it exits, fsynced, so even a hard `os._exit` leaves it
+        (Codex M2 / Opus MAJOR-5).
+        """
+        from cdc_flight import faults
+
+        return faults.read_fired_record(self.state_dir)
+
+    def clear_fired_fault(self) -> None:
+        (self.state_dir / "fault_fired.json").unlink(missing_ok=True)
+
     def kill_walsender(self) -> int:
         return kill_walsender(self.source, self.slot)
 
@@ -465,6 +515,19 @@ class Sandbox:
         con = duckdb.connect(str(self.duckdb_path), read_only=True)
         try:
             return con.execute(stmt, params or []).fetchall()
+        finally:
+            con.close()
+
+    def duck_write(self, stmt: str, params: list | None = None) -> None:
+        """Mutate the destination directly, between runs.
+
+        Used to put the destination into a state a *cause* would have produced - a table
+        marked `awaiting_snapshot`, a rewritten `slot_state` row - without also having to
+        reproduce the cause. Only ever called with no pipeline running.
+        """
+        con = duckdb.connect(str(self.duckdb_path))
+        try:
+            con.execute(stmt, params or [])
         finally:
             con.close()
 

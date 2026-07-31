@@ -105,7 +105,28 @@ class AmbiguousDelete(RuntimeError):
     if it ever is not, the honest outcome is a refused commit group, not a guess:
     the rubric's own scale puts an error (=1) above silent loss, the group rolls
     back, and the transaction replays for free under Invariant O.
+
+    **And then it replays into the same ambiguity, for ever** — which is a permanent
+    manual-intervention case, and rubric 4.7 scores those. So the exception carries the
+    table it could not fold, and the applier turns it into a durable re-snapshot request
+    for exactly that table (ADR 0001 §19/A47). The re-snapshot's consistent point is
+    necessarily *after* the offending transaction — we had already received it, so it is
+    already in WAL — so the per-table watermark fences the transaction that cannot be
+    folded, and the loop terminates after exactly one re-snapshot.
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        source_schema: str | None = None,
+        source_table: str | None = None,
+        target: str | None = None,
+    ):
+        super().__init__(message)
+        self.source_schema = source_schema
+        self.source_table = source_table
+        self.target = target
 
 
 class DestinationIdentityCollision(RuntimeError):
@@ -116,6 +137,21 @@ class DestinationIdentityCollision(RuntimeError):
     `PRIMARY KEY` the identity columns normally carry; where it can, the destination
     itself rejects the INSERT.
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        source_schema: str | None = None,
+        source_table: str | None = None,
+        target: str | None = None,
+    ):
+        super().__init__(message)
+        #: rubric 4.7: set by `table_work.write` so the applier can queue the rebuild
+        #: that turns this from a permanent failure into a self-healing one.
+        self.source_schema = source_schema
+        self.source_table = source_table
+        self.target = target
 
 
 class NoDurableDestinationRow(RuntimeError):
@@ -135,6 +171,20 @@ class SlotAheadOfDestination(RuntimeError):
     The Invariant-O guard. Under Invariant O this should be unfalsifiable; if it
     ever fires, WAL that the destination never committed has already been
     discarded by Postgres, and the only recovery is a re-snapshot (rubric 1.8).
+    """
+
+
+class RecoveryFailed(RuntimeError):
+    """A step of the durable acquisition recovery could not be completed.
+
+    Rubric 1.8 / ADR 0001 §19/A53. The recovery is a journalled state machine, and a
+    step that cannot be completed must **stop the run** with the journal intact rather
+    than continue into a state the design calls unsafe. The load-bearing case is a
+    replication slot that will not drop: A45 shows that Debezium only pairs the
+    snapshot with an exact WAL position when it creates the slot itself, so a
+    re-snapshot started against a surviving slot has an uncoordinated image/stream
+    boundary — precisely the loss window rubric 1.8 exists to close. It used to be
+    logged as `drop_failed: ...` and stepped over (Codex B4).
     """
 
 

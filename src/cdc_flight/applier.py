@@ -42,10 +42,10 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import dataclass
 from typing import Any
 
-from . import apply_sql, destination, resume, table_work
+from . import apply_sql, destination, resume, self_heal, table_work
+from .applier_config import ApplierConfig
 from .assembler import (
     UNIT_SNAPSHOT_CHUNK,
     UNIT_TXN,
@@ -53,72 +53,15 @@ from .assembler import (
     TransactionAssembler,
 )
 from .catalog_apply import CatalogCoordinator
-from .config import (
-    DROP_MODES,
-    DROP_REPLICATE,
-    TRUNCATE_MODES,
-    TRUNCATE_REPLICATE,
-)
 from .destination import AlertSink, Lease, ResumePoint
 from .envelope import PendingRecord, decode
-from .faults import maybe_crash
+from .errors import AmbiguousDelete, DestinationIdentityCollision
+from .faults import arm_group, maybe_crash
 from .planner import GroupPlan, stream_event_id
 from .snapshot import SnapshotCoordinator
 from .spill import SpillBuffer, StagedEvent
 
 log = logging.getLogger("cdc_flight.applier")
-
-
-@dataclass
-class ApplierConfig:
-    """Trigger policy (ADR §3.3). Soft triggers close a group at the *next* unit
-    boundary and can never split a unit; the spill thresholds are the only hard
-    ones and they change storage representation, never visibility."""
-
-    commit_max_age: float = 5.0
-    commit_max_events: int = 200_000
-    commit_max_bytes: int = 256 * 1024 * 1024
-    unit_spill_events: int = 500_000
-    unit_spill_bytes: int = 64 * 1024 * 1024
-    snapshot_chunk_events: int = 50_000
-    snapshot_chunk_bytes: int = 64 * 1024 * 1024
-    max_batch_size: int = 2048
-    repair_offset_file: bool = True
-    verify_offset_file: bool = True
-    #: PRIMARY KEY on every generated table's identity columns (Opus M-2).
-    destination_constraints: bool = True
-    #: ADR 0001 §14.6, answered. `markProcessed(record)` is
-    #: `offsetWriter.offset(record.sourcePartition(), record.sourceOffset())`
-    #: (`AsyncEmbeddedEngine.java:1361-1366`) - a last-write-wins map put - so
-    #: marking every record of a unit in order ends at exactly the value marking
-    #: only its terminal record produces. Marking every record costs one JPype
-    #: round trip each, which on a 200 000-event transaction is 200 000 of them
-    #: and holds 200 000 Java references alive. Terminal-only is the default;
-    #: `CDC_ACK_EVERY_RECORD=1` restores the conservative behaviour.
-    ack_every_record: bool = False
-    #: rubric 1.5, `CDC_TRUNCATE_MODE` / `CDC_DROP_MODE`. `replicate` is what the
-    #: rubric's 5 asks for ("replicated just like Postgres handles them"); the other
-    #: modes exist because "faithful" destroys destination data, and an operator who
-    #: wants the audit trail without the destruction should not have to fork.
-    truncate_mode: str = TRUNCATE_REPLICATE
-    drop_mode: str = DROP_REPLICATE
-    #: rubric 1.5 circuit breaker (Opus MAJOR-3 / Q2). At most this many destination
-    #: tables may be destroyed by one commit group; the whole set is refused when the
-    #: limit is exceeded, never half of it.
-    drop_max_per_group: int = 1
-    drop_allow_mass: bool = False
-    #: Re-read the source relation immediately before destroying its destination
-    #: table, and fail closed if the source cannot be asked (Codex 4).
-    drop_revalidate: bool = True
-
-    def __post_init__(self) -> None:
-        # A typo must not silently restore Debezium's "truncates are skipped" default.
-        if self.truncate_mode not in TRUNCATE_MODES:
-            raise ValueError(
-                f"CDC_TRUNCATE_MODE={self.truncate_mode!r} is not one of {TRUNCATE_MODES}"
-            )
-        if self.drop_mode not in DROP_MODES:
-            raise ValueError(f"CDC_DROP_MODE={self.drop_mode!r} is not one of {DROP_MODES}")
 
 
 class Applier:
@@ -140,6 +83,7 @@ class Applier:
         verifier=None,
         transactional_ddl: bool = True,
         catalog=None,
+        watermarks: dict[str, int] | None = None,
     ):
         self.con = con
         self.pipeline = pipeline
@@ -156,6 +100,29 @@ class Applier:
         #: `catalog.CatalogWatcher` or None. The only source of DROP TABLE knowledge
         #: (rubric 1.5): logical decoding does not carry DDL at all.
         self.catalog = catalog
+        #: rubric 1.6: `"<schema>.<table>" -> snapshot_lsn`. A source transaction whose
+        #: **commit** LSN is below a table's watermark is already inside that table's
+        #: snapshot image, so its events for that table are dropped. Per table, because
+        #: only the re-snapshotted tables have a new image; per *commit* LSN, because a
+        #: transaction that straddles the consistent point is in no image at all and
+        #: must be applied in full (`cdc_flight.resnapshot`).
+        self.watermarks: dict[str, int] = dict(watermarks or {})
+        #: the consistent point of the snapshot this run applied, if any
+        self.last_snapshot_lsn: int | None = None
+        #: True once Debezium's OWN end-of-snapshot marker has been applied and every
+        #: table it opened has been swapped in. Never inferred from "no table is
+        #: currently mid-snapshot": at a Debezium batch boundary between table A's
+        #: last record and table B's first, that is true and the snapshot is not over
+        #: (Codex B1 / Opus BLOCKER-1).
+        self.snapshot_completed = False
+        #: True once a committed group carried `snapshot='last'` — Debezium saying the
+        #: whole snapshot, over the whole requested capture set, has ended.
+        self.snapshot_final_seen = False
+        #: `"<schema>.<table>"` for every table that produced at least one snapshot
+        #: record on this run. The positive evidence behind "this table was scanned":
+        #: a requested table absent from this set was either never reached or is
+        #: genuinely empty, and only a source check can tell those apart.
+        self.snapshot_tables_seen: set[str] = set()
 
         self.registry = apply_sql.SchemaRegistry(
             con, dataset, constraints=config.destination_constraints
@@ -227,6 +194,11 @@ class Applier:
         self.deferred_events = 0
         self.truncates_applied = 0
         self.truncates_logged = 0
+        self.resnapshot_discarded_events = 0
+        #: rubric 4.7: undecidable folds turned into automatic table rebuilds
+        self.ambiguous_resnapshots_queued = 0
+        #: events dropped because their transaction is already inside a table's image
+        self.watermark_fenced_events = 0
         #: `_cdc_flight.table_events` rows collected while applying THIS group, all
         #: written inside its transaction.
         self._table_events: list[dict] = []
@@ -292,6 +264,13 @@ class Applier:
             # rubric 1.5
             "truncates_applied": self.truncates_applied,
             "truncates_logged": self.truncates_logged,
+            # rubric 1.6: events that belonged to a transaction already inside a
+            # table's snapshot image, and (for a re-snapshot applier) streaming events
+            # that belong to the real slot rather than to the throwaway one.
+            "watermark_fenced_events": self.watermark_fenced_events,
+            "resnapshot_discarded_events": self.resnapshot_discarded_events,
+            "ambiguous_resnapshots_queued": self.ambiguous_resnapshots_queued,
+            "snapshot_consistent_lsn": self.last_snapshot_lsn,
             **self.catalog_coordinator.summary(),
             **(self.catalog.summary() if self.catalog is not None else {}),
         }
@@ -411,6 +390,15 @@ class Applier:
             self._group_is_snapshot = is_snapshot
             self._group_opened_at = time.monotonic()
 
+        if self.cfg.resnapshot and unit.kind == UNIT_TXN:
+            # A re-snapshot engine streams for as long as it takes us to notice the
+            # snapshot finished. Those events belong to the real slot, which has not
+            # consumed them, so applying them here would be a duplicate delivery.
+            unit.fenced = True
+            self.fenced_units += 1
+            self.fenced_events += unit.event_count
+            self.resnapshot_discarded_events += unit.event_count
+
         if unit.kind == UNIT_TXN and unit.last_lsn and unit.last_lsn <= self.resume_point.last_lsn:
             # ADR §4.4 idempotency fence. Correctness does not depend on it - the
             # resume point already excludes these - but it is the difference
@@ -461,6 +449,10 @@ class Applier:
             return
         commit_id = self._spill_commit_id or self._next_commit_id
         opened_at = destination.now()
+        # Tell the destination-fault wrapper which data group this is, so a
+        # `destination_*` fault fires at the group the spec names rather than at one
+        # the wrapper inferred from the SQL it happened to see (rubric 1.7).
+        arm_group(self.data_commit_groups + 1)
         # NOT `or spill.rows > 0`: staged rows belonging only to *fenced*
         # units are about to be discarded, and counting them made a group with no
         # applicable content a "data group", which shifts every `<nth>`-indexed
@@ -520,10 +512,25 @@ class Applier:
             # HERE, before the commit, because it is only a *forensic* baseline -
             # it does not need to lengthen the commit->ack path (Codex 7).
             offset_fingerprint = self.verifier.before() if self.verifier else None
-            self.con.execute("COMMIT")
+            with self_heal.commit_watchdog(self.cfg.commit_timeout, commit_id):
+                self.con.execute("COMMIT")
             self._txn_open = False
             if has_data:
                 maybe_crash("post_commit_pre_ack", self.data_commit_groups + 1)
+        except (AmbiguousDelete, DestinationIdentityCollision) as ambiguous:
+            # Rubric 4.7. The group still rolls back - a fold that cannot be decided is
+            # never committed - but a bare rollback here is a *permanent* failure: the
+            # transaction replays on the next run and hits the same ambiguity, for ever,
+            # which is a manual-intervention case. So the table is marked for a
+            # re-snapshot on the independent connection, where the request survives this
+            # rollback, and the next run rebuilds it. The re-snapshot's consistent point
+            # is necessarily after this transaction (we already received it, so it is
+            # already in WAL), so the per-table watermark fences the transaction that
+            # cannot be folded and the loop terminates after exactly one re-snapshot
+            # (ADR 0001 §19/A47).
+            self._request_resnapshot_for(ambiguous)
+            self._rollback_quietly()
+            raise
         except BaseException:
             self._rollback_quietly()
             raise
@@ -549,6 +556,27 @@ class Applier:
 
         self._settle_catalog()
         self._flush_alerts()
+        # Recorded only after COMMIT: what the re-snapshot decides on the strength of
+        # these must be durable, not merely applied.
+        for unit in group:
+            if unit.kind != UNIT_SNAPSHOT_CHUNK or unit.fenced:
+                continue
+            if unit.schema and unit.table:
+                self.snapshot_tables_seen.add(f"{unit.schema}.{unit.table}")
+            if unit.snapshot_last:
+                self.snapshot_final_seen = True
+        if self.snapshot_final_seen and not self.snapshots.active:
+            # Debezium has emitted its own end-of-snapshot marker AND every table it
+            # opened has been swapped in, durably. `cdc_flight.resnapshot` stops its
+            # engine on this rather than waiting out an idle window it does not need.
+            #
+            # `snapshot_final_seen` and not `swaps and not active`: the old condition
+            # was a statement about the tables seen SO FAR, and Debezium closes a
+            # table's chunk the moment a record for the NEXT table arrives. A batch
+            # boundary in that gap satisfied "swaps and not active" with the next table
+            # unscanned, and the caller then classified it as empty and deleted its
+            # live destination rows (Codex B1 / Opus BLOCKER-1).
+            self.snapshot_completed = True
         self.commit_groups += 1
         if has_data:
             self.data_commit_groups += 1
@@ -561,6 +589,21 @@ class Applier:
                 resume.capture_offset_file(self.offset_path, new_point)
             )
         self._reset_group()
+
+    def _request_resnapshot_for(
+        self, ambiguous: AmbiguousDelete | DestinationIdentityCollision
+    ) -> None:
+        """Rubric 4.7's automatic rebuild request. The policy is `cdc_flight.self_heal`."""
+        recorded, alert = self_heal.request_resnapshot_for(
+            ambiguous,
+            alerts=self.alerts,
+            pipeline=self.pipeline,
+            topic_prefix=self.topic_prefix,
+            enabled=self.cfg.resnapshot_on_ambiguity,
+        )
+        if alert is not None:
+            self._pending_alerts.append(alert)
+        self.ambiguous_resnapshots_queued += int(recorded)
 
     def _rollback_quietly(self) -> None:
         if not self._txn_open:
@@ -639,6 +682,7 @@ class Applier:
             spill=self.spill,
             truncate_mode=self.cfg.truncate_mode,
             created_in_txn=self._created_in_txn,
+            watermarks=self.watermarks,
         )
         for unit in group:
             if unit.fenced:
@@ -679,6 +723,11 @@ class Applier:
                 self.table_counts[target] = self.table_counts.get(target, 0) + count
         self.truncates_applied += plan.truncates_applied
         self.truncates_logged += plan.truncates_logged
+        self.watermark_fenced_events += plan.watermark_fenced_events
+        if self._group_is_snapshot and stats.get("last_lsn"):
+            # Every snapshot record of one snapshot carries the exported snapshot's
+            # consistent point, so this is `C` (rubric 1.6, `cdc_flight.resnapshot`).
+            self.last_snapshot_lsn = stats["last_lsn"]
         self._group_source_tables |= plan.source_tables
         self._table_events.extend(plan.markers())
         self._flush_table_events(commit_id)
