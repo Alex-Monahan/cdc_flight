@@ -33,10 +33,10 @@ import json
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
-from . import apply_sql, destination, naming, offset_file
+from . import apply_sql, destination, naming, offset_file, table_work
 from .assembler import (
     UNIT_CONTROL,
     UNIT_SNAPSHOT_CHUNK,
@@ -44,34 +44,16 @@ from .assembler import (
     CompleteUnit,
     TransactionAssembler,
 )
-from .destination import CONTROL_SCHEMA, Lease, ResumePoint
+from .destination import Lease, ResumePoint
 from .envelope import PendingRecord, decode
 from .envelope import offsets_of as envelope_offsets
 from .errors import ResumePointDrift
 from .faults import maybe_crash
-from .naming import (
-    CDCF_COMMIT_ID,
-    CDCF_EVENT_ID,
-    CDCF_TOTAL_ORDER,
-    quote,
-)
+from .snapshot import SnapshotCoordinator, SnapshotTable
+from .spill import SpillBuffer, StagedEvent
+from .table_work import TableWork
 
 log = logging.getLogger("cdc_flight.applier")
-
-DBZ_COLUMN_TYPES = {
-    "dbz_op": apply_sql.VARCHAR,
-    "dbz_lsn": apply_sql.BIGINT,
-    "dbz_tx_id": apply_sql.BIGINT,
-    "dbz_schema": apply_sql.VARCHAR,
-    "dbz_table": apply_sql.VARCHAR,
-    "dbz_source_ts_ms": apply_sql.BIGINT,
-}
-APPLIER_COLUMN_TYPES = {
-    CDCF_COMMIT_ID: apply_sql.BIGINT,
-    CDCF_EVENT_ID: apply_sql.VARCHAR,
-    CDCF_TOTAL_ORDER: apply_sql.BIGINT,
-    **DBZ_COLUMN_TYPES,
-}
 
 
 @dataclass
@@ -101,36 +83,6 @@ class ApplierConfig:
     #: and holds 200 000 Java references alive. Terminal-only is the default;
     #: `CDC_ACK_EVERY_RECORD=1` restores the conservative behaviour.
     ack_every_record: bool = False
-
-
-@dataclass
-class _SnapshotTable:
-    schema: str
-    table: str
-    target: str
-    shadow: str
-    ordinal: int = 0
-    reset_done: bool = False
-
-
-@dataclass
-class _TableWork:
-    """Everything one destination table needs from one commit group."""
-
-    target: str
-    key_columns: tuple[str, ...] = ()
-    keyless: bool = False
-    columns: dict[str, str] = field(default_factory=dict)
-    #: ordered, deduplicated identity keys touched by the group
-    touched: dict[tuple, None] = field(default_factory=dict)
-    #: identity key -> final row (None when the key's last event is a delete).
-    #: A dict, so insertion order IS source order and membership is O(1). It used
-    #: to be paired with an `order` list and `if key not in order`, which is a
-    #: linear scan per event: MEASURED 458 s for one 200 000-event transaction,
-    #: 1.6 s after this change.
-    final: dict[tuple, dict | None] = field(default_factory=dict)
-    snapshot: bool = False
-    events: int = 0
 
 
 class Applier:
@@ -188,10 +140,21 @@ class Applier:
         self._spill_rows = 0
         self._pending_verification: tuple | None = None
 
-        self._snapshot: dict[str, _SnapshotTable] = {}
-        self._snapshot_epoch = resume_point.snapshot_epoch
-        self._snapshot_session = False
         self._created_in_txn: set[str] = set()
+        # ADR §3.5 / D7 and §3.4 live in their own modules now (Codex 8): the
+        # snapshot-spill blocker was a direct consequence of spill routing reaching
+        # into snapshot state that a different part of this file initialised later.
+        self.snapshots = SnapshotCoordinator(
+            con,
+            dataset=dataset,
+            pipeline=pipeline,
+            topic_prefix=topic_prefix,
+            created_in_txn=self._created_in_txn,
+            get_registry=lambda: self.registry,
+            epoch=resume_point.snapshot_epoch,
+            transactional_ddl=transactional_ddl,
+        )
+        self.spill = SpillBuffer(con)
 
         self._committer = None
         self._lock = threading.Lock()
@@ -212,7 +175,6 @@ class Applier:
         self.fenced_spilled_events = 0
         self.deferred_units = 0
         self.deferred_events = 0
-        self.swaps = 0
         self.table_counts: dict[str, int] = {}
         self.last_commit_id = resume_point.commit_id
         self.error: BaseException | None = None
@@ -257,7 +219,7 @@ class Applier:
             # silently deferring transactions should say so (Opus MINOR-9).
             "deferred_units": self.deferred_units,
             "deferred_events": self.deferred_events,
-            "snapshot_swaps": self.swaps,
+            "snapshot_swaps": self.snapshots.swaps,
             "discarded_tail_events": self.assembler.discarded_tail_events,
             "orphan_end_markers": self.assembler.orphan_end_markers,
             "implicit_txn_opens": self.assembler.implicit_txn_opens,
@@ -405,9 +367,9 @@ class Applier:
         self._group_opened_at = time.monotonic()
         self._group_is_snapshot = False
         self._close_requested = False
-        self._created_in_txn = set()
+        # `.clear()`, not a fresh set: `SnapshotCoordinator` holds the same object.
+        self._created_in_txn.clear()
         self._spill_commit_id = None
-        self._spill_unit_seq = 0
         self._spill_rows = 0
 
     # ------------------------------------------------------------------ #
@@ -453,7 +415,7 @@ class Applier:
                 first_lsn=stats["first_lsn"],
                 last_lsn=stats["last_lsn"],
                 max_source_ts=_epoch_ms(stats["max_source_ts"]),
-                tables_touched=sorted(_live_names(stats["tables"])),
+                tables_touched=sorted(table_work.live_names(stats["tables"])),
             )
             destination.write_resume_point(
                 self.con,
@@ -522,7 +484,7 @@ class Applier:
             self.registry = apply_sql.SchemaRegistry(
                 self.con, self.dataset, constraints=self.cfg.destination_constraints
             )
-            self._created_in_txn = set()
+            self._created_in_txn.clear()
 
     # -- resume point ------------------------------------------------------- #
     def _resume_point_for(self, group: list[CompleteUnit], commit_id: int) -> ResumePoint:
@@ -568,7 +530,7 @@ class Applier:
             # omits it and `read_resume_point` takes it from its own column, so this
             # was dead but looked live (Opus MINOR-16).
             commit_id=commit_id,
-            snapshot_epoch=self._snapshot_epoch,
+            snapshot_epoch=self.snapshots.epoch,
         )
 
     def _run_pending_verification(self) -> None:
@@ -625,7 +587,7 @@ class Applier:
     def _apply_units(self, group: list[CompleteUnit], commit_id: int, *, has_data: bool) -> dict:
         """One ordered pass over the group, whatever each unit's storage mode is.
 
-        This used to be two passes - "write every in-memory `_TableWork`, then
+        This used to be two passes - "write every in-memory `TableWork`, then
         drain `spill_events`" - and that split cannot be correct in either order
         (Opus B-1). A unit that spills keeps accumulating an in-memory **tail**
         after the spill, so its staged rows are *earlier* in source order than its
@@ -638,10 +600,10 @@ class Applier:
 
         So: walk the units in group order, and for each one load its staged prefix
         into the *shared* `work` map before collecting its in-memory tail. One
-        `_write_table` per destination table, source order preserved end to end,
-        and the merge sees the whole group at once.
+        `table_work.write()` per destination table, source order preserved end to
+        end, and the merge sees the whole group at once.
         """
-        work: dict[str, _TableWork] = {}
+        work: dict[str, TableWork] = {}
         stats = {
             "events": 0,
             "tables": set(),
@@ -651,7 +613,7 @@ class Applier:
             "last_lsn": None,
             "max_source_ts": None,
         }
-        swaps: list[_SnapshotTable] = []
+        swaps: list[SnapshotTable] = []
         swap_all = False
         staged_units = any(u.spill_unit_seq is not None for u in group)
 
@@ -670,7 +632,7 @@ class Applier:
                 continue
             if unit.kind == UNIT_SNAPSHOT_CHUNK:
                 self._group_is_snapshot = True
-                state = self._snapshot_state(unit.schema, unit.table)
+                state = self.snapshots.state_for(unit.schema, unit.table)
                 if unit.spill_unit_seq is not None:
                     self._load_staged(unit, work, commit_id, stats)
                 for event in unit.events:
@@ -689,8 +651,10 @@ class Applier:
                 stats["first_txn_id"] = stats["first_txn_id"] or unit.txn_id
                 stats["last_txn_id"] = unit.txn_id
 
-        for index, table_work in enumerate(work.values()):
-            self._write_table(table_work)
+        for index, item in enumerate(work.values()):
+            table_work.write(
+                self.con, self.registry, item, self._created_in_txn
+            )
             if index == 0 and has_data:
                 # The anchor documented as "some tables written, others not". It
                 # used to fire BEFORE this loop, so it could not detect a
@@ -699,240 +663,45 @@ class Applier:
                 # `has_data` now, like every other anchor, because `<nth>` counts
                 # data-carrying groups (Opus MINOR-2).
                 maybe_crash("mid_apply", self.data_commit_groups + 1)
-            if table_work.events:
-                stats["tables"].add(table_work.target)
+            if item.events:
+                stats["tables"].add(item.target)
                 with self._lock:
-                    self.table_counts[table_work.target] = (
-                        self.table_counts.get(table_work.target, 0) + table_work.events
+                    self.table_counts[item.target] = (
+                        self.table_counts.get(item.target, 0) + item.events
                     )
 
         if staged_units:
-            self._clear_staged(commit_id)
+            self.spill.clear(commit_id)
+            self._spill_rows = 0
 
         if swap_all:
-            swaps = list(self._snapshot.values())
+            swaps = self.snapshots.states()
         for state in swaps:
-            self._swap(state, commit_id, stats)
+            if self.snapshots.swap(
+                state, commit_id=commit_id, snapshot_lsn=stats.get("last_lsn")
+            ):
+                stats["tables"].add(state.target)
         return stats
-
-    def _work_for(
-        self, work: dict[str, _TableWork], target: str, event: PendingRecord, snapshot: bool
-    ) -> _TableWork:
-        item = work.get(target)
-        if item is None:
-            item = _TableWork(target=target, keyless=event.key is None, snapshot=snapshot)
-            item.key_columns = (
-                tuple(naming.normalize(k) for k in event.key)
-                if event.key
-                else (CDCF_EVENT_ID,)
-            )
-            work[target] = item
-        return item
 
     def _collect(
         self,
-        work: dict[str, _TableWork],
+        work: dict[str, TableWork],
         event: PendingRecord,
         commit_id: int,
         *,
-        snapshot: _SnapshotTable | None,
+        snapshot: SnapshotTable | None,
         stats: dict,
     ) -> None:
         if not event.schema or not event.table:
             return
         if snapshot is not None:
             target = snapshot.shadow
-            event_id = self._snapshot_event_id(event)
+            event_id = self.snapshots.event_id(event)
         else:
-            target = self._target_table(event.schema, event.table)
+            target = self.snapshots.target_table(event.schema, event.table)
             event_id = _stream_event_id(event)
-        item = self._work_for(work, target, event, snapshot is not None)
+        item = table_work.work_for(work, target, event, snapshot is not None)
         self._collect_prepared(item, event, commit_id, event_id, stats)
-
-    def _snapshot_event_id(self, event: PendingRecord) -> str:
-        """`snap:<epoch>:<schema>.<table>:<arrival ordinal>` (ADR §6, §15/A18).
-
-        The ordinal is assigned by the assembler when the record arrives, so it is
-        arrival order whether the record was later spilled or kept in memory. It
-        used to be assigned at apply time from a counter on `_SnapshotTable`, which
-        the spill path incremented separately and the *first* spilled chunk of a
-        snapshot could not reach at all (Codex 1).
-        """
-        if event.snapshot_ordinal is None:  # pragma: no cover - assembler guarantees it
-            raise ResumePointDrift(
-                f"snapshot record for {event.schema}.{event.table} has no arrival "
-                "ordinal, so it has no stable identity (ADR 0001 §6)"
-            )
-        return (
-            f"snap:{self._snapshot_epoch}:{event.schema}.{event.table}:"
-            f"{event.snapshot_ordinal}"
-        )
-
-    def _row_for(
-        self, event: PendingRecord, commit_id: int, event_id: str, *, snapshot: bool
-    ) -> dict[str, Any]:
-        image = event.after if event.op != "d" else event.before
-        row: dict[str, Any] = {}
-        for column, value in (image or {}).items():
-            row[naming.normalize(column)] = value
-        row[CDCF_COMMIT_ID] = commit_id
-        row[CDCF_EVENT_ID] = event_id
-        # A snapshot record has no transaction, so it has no ordinal. Leaving it
-        # NULL is what tells a consumer "this identity is not txn-derived".
-        row[CDCF_TOTAL_ORDER] = None if snapshot else event.total_order
-        row["dbz_op"] = event.op
-        row["dbz_lsn"] = event.lsn
-        row["dbz_tx_id"] = None if snapshot else _as_int(event.txn_id)
-        row["dbz_schema"] = event.schema
-        row["dbz_table"] = event.table
-        row["dbz_source_ts_ms"] = event.source_ts_ms
-        return row
-
-    def _write_table(self, item: _TableWork) -> None:
-        # A column every event left NULL tells us nothing about its type; VARCHAR
-        # is the honest placeholder and `widen()` upgrades it the moment a real
-        # value shows up (rubric 2.1/2.5 own the better answer).
-        columns = {
-            col: ctype or apply_sql.VARCHAR for col, ctype in item.columns.items()
-        }
-        # The applier's own columns have KNOWN types; they are declared, never
-        # inferred. Widening them against a group in which they all happened to be
-        # NULL is how `cdcf_total_order` silently became VARCHAR.
-        columns.update(APPLIER_COLUMN_TYPES)
-        for column in item.key_columns:
-            columns.setdefault(column, apply_sql.VARCHAR)
-
-        table, created = self.registry.ensure(
-            item.target, columns=columns, key_columns=item.key_columns
-        )
-        if created:
-            self._created_in_txn.add(item.target)
-        # A table this transaction created is empty, so the DELETE half of the
-        # merge cannot match anything: skipping it turns a snapshot into a pure
-        # bulk insert instead of N key probes against a growing table.
-        fresh = item.target in self._created_in_txn
-
-        column_order = [c for c in table.columns if c in columns] + [
-            c for c in columns if c not in table.columns
-        ]
-        column_order = list(dict.fromkeys(column_order))
-
-        if not (fresh or item.snapshot):
-            keys = [
-                tuple(
-                    apply_sql.bind(value, table.columns.get(col, apply_sql.VARCHAR))
-                    for col, value in zip(item.key_columns, key, strict=False)
-                )
-                for key in item.touched
-            ]
-            apply_sql.delete_keys(self.con, table, item.key_columns, keys)
-
-        rows: list[list] = []
-        for row in item.final.values():
-            if row is None:
-                continue
-            rows.append(
-                [
-                    apply_sql.bind(row.get(col), table.columns.get(col, apply_sql.VARCHAR))
-                    for col in column_order
-                ]
-            )
-        apply_sql.insert_rows(self.con, table, column_order, rows)
-        # A no-op when the destination accepted the PRIMARY KEY on the identity
-        # columns (it then rejects a duplicate on the INSERT itself). Where it could
-        # not, this is what keeps "duplication is impossible" enforced by the
-        # destination rather than asserted by us (Opus M-2).
-        apply_sql.assert_identity_is_unique(self.con, table)
-
-    # ------------------------------------------------------------------ #
-    # snapshot phase (ADR §3.5 + D7)
-    # ------------------------------------------------------------------ #
-    def _target_table(self, schema: str, table: str) -> str:
-        key = f"{schema}.{table}"
-        state = self._snapshot.get(key)
-        if state is not None:
-            # CDC that arrives while a table is being backfilled is applied to the
-            # shadow table, so the swap is instantaneous and CDC never stops
-            # (ADR §7 note 2 - this is what makes rubric 3.3 "simple").
-            return state.shadow
-        return naming.destination_table(self.topic_prefix, schema, table)
-
-    def _snapshot_state(self, schema: str | None, table: str | None) -> _SnapshotTable | None:
-        if not schema or not table:
-            return None
-        key = f"{schema}.{table}"
-        state = self._snapshot.get(key)
-        if state is not None:
-            return state
-        if not self._snapshot_session:
-            self._snapshot_session = True
-            self._snapshot_epoch = self.resume_point.snapshot_epoch + 1
-            log.info("snapshot session started, epoch=%s", self._snapshot_epoch)
-        target = naming.destination_table(self.topic_prefix, schema, table)
-        state = _SnapshotTable(
-            schema=schema, table=table, target=target, shadow=naming.shadow_table(target)
-        )
-        # A crash mid-snapshot means Debezium re-snapshots from the beginning
-        # (`InitialSnapshotter.shouldSnapshotData` returns true while the offset
-        # says a snapshot was in progress). Dropping the shadow here is what makes
-        # that idempotent - not event identity (ADR §3.5).
-        self.con.execute(
-            f"DROP TABLE IF EXISTS {quote(self.dataset)}.{quote(state.shadow)}"
-        )
-        self.registry.forget(state.shadow)
-        self._created_in_txn.add(state.shadow)
-        self.con.execute(
-            f"DELETE FROM {CONTROL_SCHEMA}.table_state WHERE pipeline = ? AND "
-            "source_schema = ? AND source_table = ?",
-            [self.pipeline, schema, table],
-        )
-        self.con.execute(
-            f"INSERT INTO {CONTROL_SCHEMA}.table_state "
-            "(pipeline, source_schema, source_table, target_table, snapshot_state, "
-            " snapshot_epoch) VALUES (?,?,?,?,'in_progress',?)",
-            [self.pipeline, schema, table, target, self._snapshot_epoch],
-        )
-        self._snapshot[key] = state
-        return state
-
-    def _swap(self, state: _SnapshotTable, commit_id: int, stats: dict) -> None:
-        key = f"{state.schema}.{state.table}"
-        if key not in self._snapshot:
-            return
-        shadow = f"{quote(self.dataset)}.{quote(state.shadow)}"
-        live = f"{quote(self.dataset)}.{quote(state.target)}"
-        exists = self.con.execute(
-            "SELECT count(*) FROM information_schema.tables "
-            "WHERE table_schema = ? AND table_name = ?",
-            [self.dataset, state.shadow],
-        ).fetchone()[0]
-        if exists:
-            if self.transactional_ddl:
-                self.con.execute(f"DROP TABLE IF EXISTS {live}")
-                self.con.execute(
-                    f"ALTER TABLE {shadow} RENAME TO {quote(state.target)}"
-                )
-            else:
-                # ADR §7's documented fallback; the rubric explicitly allows it
-                # ("BEGIN / COMMIT transactionality fine too").
-                self.con.execute(
-                    f"CREATE OR REPLACE TABLE {live} AS SELECT * FROM {shadow}"
-                )
-                self.con.execute(f"DROP TABLE {shadow}")
-            self.registry.forget(state.shadow)
-            self.registry.forget(state.target)
-            self._created_in_txn.discard(state.shadow)
-            self.swaps += 1
-            stats["tables"].add(state.target)
-        self.con.execute(
-            f"UPDATE {CONTROL_SCHEMA}.table_state SET snapshot_state = 'complete', "
-            "snapshot_lsn = ?, last_commit_id = ? WHERE pipeline = ? AND "
-            "source_schema = ? AND source_table = ?",
-            [stats.get("last_lsn"), commit_id, self.pipeline, state.schema, state.table],
-        )
-        self._snapshot.pop(key, None)
-        if not self._snapshot:
-            self._snapshot_session = False
 
     # ------------------------------------------------------------------ #
     # spill (ADR §3.4)
@@ -944,21 +713,16 @@ class Applier:
         unit_seq: int,
         snapshot: tuple[str | None, str | None] | None = None,
     ) -> int:
-        """Stage one unit's events inside the group's own transaction.
+        """Stage one unit's events inside the group's own transaction (ADR §3.4).
 
-        Because staging and drain are in the *same* transaction, nothing is ever
-        visible early, so rubric 1.3 is not weakened; and a crash rolls the
-        staging rows back with everything else, so there is no orphan cleanup
-        problem (ADR §3.4).
-
-        `unit_seq` and `snapshot` are **inputs**, not inferences. This function used
-        to look the phase up in `self._snapshot`, a mapping that `_apply_units`
+        `unit_seq` and `snapshot` are **inputs**, not inferences. This callback used
+        to look the phase up in the applier's snapshot mapping, which `_apply_units`
         populates only later, so on the first spilled chunk of every snapshot it
         concluded "streaming" and staged the rows into the **live** table with a
-        `<lsn>:None:None` identity; a consumer could then see a partial snapshot,
-        and the swap dropped those rows (Codex 1). Establishing the shadow before
-        anything can be staged is the fix, and `unit_seq` is what lets the drain
-        order and fence per unit (Opus B-1, Codex 5).
+        `<lsn>:None:None` identity; a consumer could then see a partial snapshot, and
+        the swap dropped those rows (Codex 1). Resolving the shadow *here*, through
+        the coordinator, is what makes that impossible; `unit_seq` is what lets the
+        drain order and fence per unit (Opus B-1, Codex 5).
         """
         if not events:
             return 0
@@ -967,128 +731,74 @@ class Applier:
             self._txn_open = True
             self._spill_commit_id = self._next_commit_id
         commit_id = self._spill_commit_id or self._next_commit_id
-        state: _SnapshotTable | None = None
-        if snapshot is not None:
-            # Creates the shadow table, its `table_state` row and the snapshot epoch
-            # BEFORE any record of this table can be staged.
-            state = self._snapshot_state(*snapshot)
-        rows = []
+        # Creates the shadow table, its `table_state` row and the snapshot epoch
+        # BEFORE any record of this table can be staged.
+        state = self.snapshots.state_for(*snapshot) if snapshot is not None else None
+
+        prepared: list[StagedEvent] = []
         for event in events:
             if not event.schema or not event.table:
                 continue
             if state is not None:
-                event_id = self._snapshot_event_id(event)
-                target = state.shadow
-                event_seq = event.snapshot_ordinal
+                prepared.append(
+                    StagedEvent(
+                        event=event,
+                        event_id=self.snapshots.event_id(event),
+                        target=state.shadow,
+                        seq=event.snapshot_ordinal,
+                    )
+                )
             else:
-                event_id = _stream_event_id(event)
-                target = self._target_table(event.schema, event.table)
-                # Mandatory and validated by the assembler, so there is nothing to
-                # substitute a local sequence for: doing that gave a replay a
-                # different identity (Codex 4).
-                event_seq = event.total_order
-            rows.append(
-                [
-                    commit_id, unit_seq, event_seq, target,
-                    event.schema, event.table, event.lsn, event.txn_id,
-                    event.total_order, event_id, event.op, event.source_ts_ms,
-                    json.dumps(event.before, default=str) if event.before else None,
-                    json.dumps(event.after, default=str) if event.after else None,
-                    json.dumps(event.key, default=str) if event.key else None,
-                ]
-            )
-        apply_sql.bulk_insert(
-            self.con,
-            f"{CONTROL_SCHEMA}.spill_events",
-            ["commit_id", "unit_seq", "event_seq", "target_table", "source_schema",
-             "source_table", "lsn", "txn_id", "total_order", "cdcf_event_id", "op",
-             "source_ts_ms", "before_json", "after_json", "key_json"],
-            rows,
-            [apply_sql.BIGINT, apply_sql.BIGINT, apply_sql.BIGINT, apply_sql.VARCHAR,
-             apply_sql.VARCHAR, apply_sql.VARCHAR, apply_sql.BIGINT, apply_sql.VARCHAR,
-             apply_sql.BIGINT, apply_sql.VARCHAR, apply_sql.VARCHAR, apply_sql.BIGINT,
-             apply_sql.VARCHAR, apply_sql.VARCHAR, apply_sql.VARCHAR],
+                prepared.append(
+                    StagedEvent(
+                        event=event,
+                        event_id=_stream_event_id(event),
+                        target=self.snapshots.target_table(event.schema, event.table),
+                        # Mandatory and validated by the assembler, so there is
+                        # nothing to substitute a local sequence for: doing that gave
+                        # a replay a different identity (Codex 4).
+                        seq=event.total_order,
+                    )
+                )
+        staged = self.spill.stage(
+            commit_id=commit_id, unit_seq=unit_seq, prepared=prepared
         )
-        self._spill_rows += len(rows)
-        self.spilled_events += len(rows)
+        self._spill_rows += staged
+        self.spilled_events += staged
         maybe_crash("spill", self.data_commit_groups + 1)
         return len(events)
 
     def _load_staged(
-        self, unit: CompleteUnit, work: dict[str, _TableWork], commit_id: int, stats: dict
+        self, unit: CompleteUnit, work: dict[str, TableWork], commit_id: int, stats: dict
     ) -> None:
-        """Load one unit's staged prefix into the group's shared `work` map.
-
-        `ORDER BY event_seq` inside one unit is source order, and the caller calls
-        this immediately before collecting that unit's in-memory tail, so the whole
-        group is applied in one totally ordered pass.
-        """
-        staged = self.con.execute(
-            f"SELECT target_table, source_schema, source_table, lsn, txn_id, total_order, "
-            "       cdcf_event_id, op, source_ts_ms, before_json, after_json, key_json "
-            f"FROM {CONTROL_SCHEMA}.spill_events WHERE commit_id = ? AND unit_seq = ? "
-            "ORDER BY event_seq",
-            [commit_id, unit.spill_unit_seq],
-        ).fetchall()
-        for row in staged:
-            (
-                target, schema, table, lsn, txn_id, total_order, event_id, op,
-                source_ts_ms, before_json, after_json, key_json,
-            ) = row
-            event = PendingRecord(
-                raw=None, kind="data", topic="", nbytes=0, op=op, schema=schema,
-                table=table, lsn=lsn, txn_id=txn_id, total_order=total_order,
-                source_ts_ms=source_ts_ms,
-                key=json.loads(key_json) if key_json else None,
-                before=json.loads(before_json) if before_json else None,
-                after=json.loads(after_json) if after_json else None,
+        """Load one unit's staged prefix into the group's shared `work` map."""
+        for staged in self.spill.load(commit_id=commit_id, unit_seq=unit.spill_unit_seq):
+            item = table_work.work_for(
+                work,
+                staged.target,
+                staged.event,
+                staged.target.endswith(naming.SHADOW_SUFFIX),
             )
-            item = self._work_for(
-                work, target, event, target.endswith(naming.SHADOW_SUFFIX)
-            )
-            self._collect_prepared(item, event, commit_id, event_id, stats)
-
-    def _clear_staged(self, commit_id: int) -> None:
-        self.con.execute(
-            f"DELETE FROM {CONTROL_SCHEMA}.spill_events WHERE commit_id = ?", [commit_id]
-        )
-        self._spill_rows = 0
+            self._collect_prepared(item, staged.event, commit_id, staged.event_id, stats)
 
     def _collect_prepared(
-        self, item: _TableWork, event: PendingRecord, commit_id: int, event_id: str, stats: dict
+        self, item: TableWork, event: PendingRecord, commit_id: int, event_id: str, stats: dict
     ) -> None:
-        """The one place an event becomes destination work, in either storage mode.
+        """Fold one event into the plan, in either storage mode.
 
-        In-memory collection and staged-row projection used to be two functions
-        that drifted: the drain updated neither `table_counts` nor
-        `stats["max_source_ts"]`, so a spilled group under-reported in
-        `last_run.json` and in `commit_log.max_source_ts` (Opus MINOR-1).
+        In-memory collection and staged-row projection used to be two functions that
+        drifted: the drain updated neither `table_counts` nor `stats["max_source_ts"]`,
+        so a spilled group under-reported in `last_run.json` and in
+        `commit_log.max_source_ts` (Opus MINOR-1). There is one path now.
         """
-        row = self._row_for(event, commit_id, event_id, snapshot=item.snapshot)
-        for column, value in row.items():
-            item.columns[column] = apply_sql.widen(
-                item.columns.get(column), apply_sql.sql_type(value)
-            )
-        item.events += 1
+        row = table_work.row_for(event, commit_id, event_id, snapshot=item.snapshot)
+        table_work.collect(item, event, row, event_id)
         stats["events"] += 1
         if event.lsn:
             stats["first_lsn"] = stats["first_lsn"] or event.lsn
             stats["last_lsn"] = event.lsn
         if event.source_ts_ms:
             stats["max_source_ts"] = max(stats["max_source_ts"] or 0, event.source_ts_ms)
-        if item.keyless:
-            key = (event_id,)
-        else:
-            key = tuple(event.key[k] for k in event.key)
-            # A primary-key UPDATE under REPLICA IDENTITY FULL arrives as one event
-            # whose `before` carries the OLD key. Touching both keys is what makes
-            # "delete old, insert new" fall out of the normal path (rubric 1.4).
-            if event.before and all(k in event.before for k in event.key):
-                old = tuple(event.before[k] for k in event.key)
-                if old != key:
-                    item.touched.setdefault(old, None)
-        item.touched.setdefault(key, None)
-        item.final[key] = None if (event.op == "d" and not item.keyless) else row
 
     # ------------------------------------------------------------------ #
     # shutdown
@@ -1154,14 +864,6 @@ def _stream_event_id(event: PendingRecord) -> str:
     return f"{event.lsn}:{event.txn_id}:{event.total_order}"
 
 
-def _live_names(tables: set[str]) -> set[str]:
-    """Report the table an operator knows about, not the shadow it landed in."""
-    return {
-        t[: -len(naming.SHADOW_SUFFIX)] if t.endswith(naming.SHADOW_SUFFIX) else t
-        for t in tables
-    }
-
-
 def _epoch_ms(value) -> Any:
     """Debezium's `source.ts_ms` as a timestamp, so end-to-end lag is a SQL
     subtraction rather than an arithmetic puzzle for whoever writes rubric 6.1."""
@@ -1170,15 +872,6 @@ def _epoch_ms(value) -> Any:
     from datetime import UTC, datetime
 
     return datetime.fromtimestamp(value / 1000.0, tz=UTC)
-
-
-def _as_int(value) -> int | None:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def _serialise_entries(entries: dict[bytes, bytes]) -> bytes:

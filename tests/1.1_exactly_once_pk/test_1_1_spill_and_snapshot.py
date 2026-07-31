@@ -196,7 +196,7 @@ def test_every_chunk_of_a_spilling_snapshot_survives_the_swap(lab):
     records.append(snap("customers", 50, ident=6, marker="last"))
     box.run(records)
 
-    assert box.applier.swaps == 1, "the shadow table was never swapped in"
+    assert box.applier.snapshots.swaps == 1, "the shadow table was never swapped in"
     assert not box.exists(box.shadow("customers")), "the shadow table outlived the swap"
     rows = box.rows(box.target("customers"), "id", "1")
     assert [r[0] for r in rows] == list(range(1, 7)), (
