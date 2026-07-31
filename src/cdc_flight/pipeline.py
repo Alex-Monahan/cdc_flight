@@ -66,6 +66,8 @@ def run_engine_bounded(
     health: SourceHealth | None = None,
     *,
     engine_terminates_normally: bool = False,
+    catalog=None,
+    catalog_drain_seconds: float = 30.0,
 ) -> dict:
     """Run the Debezium engine until the *source* agrees it is idle, or the deadline hits.
 
@@ -80,9 +82,21 @@ def run_engine_bounded(
       puts it into a restart backoff that is longer than our idle window, so an
       idle timer alone reports success on a partial delivery (Opus B5). `health`
       corroborates "quiet" against `pg_replication_slots`.
+
+    Before a quiet run is allowed to shut down there is one more barrier (Codex 6):
+    a **synchronous final catalog poll**, and then a bounded wait for any destructive
+    change it queued to be fenced and applied. Without it a `DROP TABLE` on a quiet
+    source normally could not be seen until the *next* scheduled run - the watcher
+    polls every 10 s while the idle window is 8 s - which makes "detected in 10
+    seconds" misleading. A change that is still unresolved when the barrier expires
+    makes the run **non-successful**: the destination is knowingly out of step with the
+    source, and reporting `ok: true` on that is not honest.
     """
     started = time.monotonic()
     error_box: list[BaseException] = []
+    final_poll_done = False
+    drain_until = 0.0
+    catalog_unresolved: list[str] = []
 
     def _run():
         try:
@@ -111,6 +125,32 @@ def run_engine_bounded(
             warmed_up = elapsed >= min(run.idle_seconds, 5.0)
             if enough and quiet and warmed_up and not handler.busy:
                 if health is None or health.may_declare_idle(min_seconds=run.idle_seconds):
+                    if catalog is not None and not final_poll_done:
+                        # The synchronous final poll. A DROP that happened after the
+                        # last scheduled poll is seen by THIS run, and it is also the
+                        # poll that completes `CDC_DROP_CONFIRM_POLLS` on a short run.
+                        final_poll_done = True
+                        catalog.poll_quietly()
+                        drain_until = time.monotonic() + catalog_drain_seconds
+                    unresolved = (
+                        [c.qualified for c in catalog.pending_destructive()]
+                        if catalog is not None
+                        else []
+                    )
+                    if unresolved and time.monotonic() < drain_until:
+                        # The drain barrier: the fence marker has been emitted, so a
+                        # WAL record past the detection point is on its way and the
+                        # applier will apply the change on the group that carries it.
+                        if idle_blocked_by_source % 40 == 0:
+                            log.info(
+                                "holding the engine open for %s unresolved destructive "
+                                "catalog change(s): %s",
+                                len(unresolved), ", ".join(sorted(unresolved)),
+                            )
+                        idle_blocked_by_source += 1
+                        time.sleep(0.25)
+                        continue
+                    catalog_unresolved = unresolved
                     stop_reason = "idle"
                     break
                 idle_blocked_by_source += 1
@@ -190,6 +230,27 @@ def run_engine_bounded(
                 "reached --max-seconds while the connector was not streaming for "
                 f"{not_streaming_for:.1f}s ({health.summary()}); the delivery is "
                 "incomplete, so this run is not a success",
+                summary,
+            )
+
+    if catalog is not None:
+        still_pending = [c.qualified for c in catalog.pending_destructive()]
+        if still_pending or catalog_unresolved:
+            names = sorted(set(still_pending) | set(catalog_unresolved))
+            summary["stop_reason"] = "catalog_unresolved"
+            summary["catalog_unresolved_tables"] = names
+            # Codex 6: deferring is the correct *safety* choice - a destructive action
+            # whose fence has not opened must not be guessed past - but it is not
+            # faithful propagation and it is not honest to call the run successful.
+            # The most common cause is a source that cannot be written to (a read-only
+            # replica, a missing privilege), which `catalog_marker_error` names.
+            raise EngineFailure(
+                f"{len(names)} destructive source-catalog change(s) are still "
+                f"unresolved at shutdown ({', '.join(names)}): the destination is "
+                "knowingly out of step with the source. Most often the WAL fence "
+                "marker could not be written to the source (see "
+                f"catalog_marker_error={summary.get('catalog_marker_error')!r}), so no "
+                "LSN past the detection point can be proven to have flowed",
                 summary,
             )
 
@@ -273,8 +334,19 @@ def run(
                 f"DELETE FROM {CONTROL_SCHEMA}.debezium_offsets WHERE pipeline = ?",
                 [dest.pipeline_name],
             )
+            # NOT a DELETE. `table_state` is the canonical source-to-destination
+            # ownership registry (Codex 5), and it is the only thing that tells the
+            # catalog watcher a destination table is ours. Deleting it made
+            # `--reset-state` produce a PERMANENT zombie: a table dropped at the source
+            # produces no events, so `observe_replicated` never re-learns it, and
+            # `_compare` skips a name it has no oid for and does not believe is
+            # replicated - so its stale destination table survives for ever and
+            # detection is disabled for it (Opus MAJOR-4, measured). What "start over"
+            # has to reset is the *snapshot* bookkeeping, which is what this does.
             con.execute(
-                f"DELETE FROM {CONTROL_SCHEMA}.table_state WHERE pipeline = ?",
+                f"UPDATE {CONTROL_SCHEMA}.table_state SET snapshot_state = 'none', "
+                "snapshot_epoch = 0, snapshot_lsn = NULL, last_commit_id = NULL "
+                "WHERE pipeline = ?",
                 [dest.pipeline_name],
             )
             con.execute(
@@ -350,7 +422,19 @@ def run(
                 emit_marker=catalog_cfg.emit_marker,
                 marker_prefix=catalog_cfg.marker_prefix,
                 grace_seconds=catalog_cfg.grace_seconds,
+                confirm_polls=catalog_cfg.confirm_polls,
+                marker_max_writes=catalog_cfg.marker_max_writes or None,
             ).start()
+            if catalog_cfg.grace_seconds:
+                log.warning(
+                    "CDC_CATALOG_GRACE=%.0fs: a destructive catalog action will be "
+                    "applied after that long even though the destination has not "
+                    "reached the LSN at which it was detected. In-flight events for "
+                    "the table can then re-create it as a zombie holding pre-drop "
+                    "rows, so this mode is EXPLICITLY EXCLUDED from the structural "
+                    "correctness guarantee (ADR 0001 §18/A38).",
+                    catalog_cfg.grace_seconds,
+                )
 
         # Imported late: importing pydbzengine boots a JVM.
         from .engine import SupervisedDebeziumEngine
@@ -409,6 +493,8 @@ def run(
             result = run_engine_bounded(
                 engine, applier, run_cfg, health,
                 engine_terminates_normally=props["snapshot.mode"] in terminating_modes,
+                catalog=watcher,
+                catalog_drain_seconds=catalog_cfg.drain_seconds,
             )
             summary_extra["invariant_o_end"] = reconcile_mod.check_invariant_o(
                 con, pipeline=dest.pipeline_name, namespace=namespace,
