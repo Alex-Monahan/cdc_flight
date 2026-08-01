@@ -445,6 +445,28 @@ RECONCILE_DECISIONS = Domain(
 #: `summary`, and the supervisor's own `ever_sampled and unknown_for >= ...` test), and
 #: `unknown_never_sampled` (A51 row 50, the documented fail-open) was the one with no
 #: name at all. One declared domain, one property.
+#: How the run-phase heartbeat sink was given up at teardown (Codex r5 MAJOR-1).
+#:
+#: Deliberately a **domain**, not a machine, by this module's own test: a crash never
+#: leaves durable state in an intermediate configuration here — the heartbeat row is
+#: observability, the cursor dies with the process, and dressing an in-process
+#: ownership hand-off up as a durable machine would assert exactly the recoverable
+#: intermediate state the design does not have. What it needed was an *owner* and a
+#: *bound*, and one named outcome that `last_run.json` carries.
+SINK_RETIREMENT = Domain(
+    "heartbeat_sink_retirement",
+    values=(
+        "never_opened",   # no independent connection was ever obtained
+        "closed",         # the cursor came free within the bound and was closed
+        "abandoned",      # a terminal write still owned it; it was released, not closed
+    ),
+    purpose=(
+        "Who owned the heartbeat cursor when the run tore down, and was it closed or "
+        "abandoned? `close()` on a cursor another thread is executing on BLOCKS behind "
+        "that statement (measured), so 'close it anyway' is the unbounded teardown."
+    ),
+)
+
 SOURCE_HEALTH_STATES = Domain(
     "source_health",
     values=(

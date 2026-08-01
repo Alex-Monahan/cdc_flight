@@ -68,6 +68,7 @@ from .machines import (
     PHASE_STOPPED,
     RUN_OUTCOME,
     RUN_PHASE,
+    SINK_RETIREMENT,
 )
 from .states import IllegalTransition
 
@@ -259,7 +260,38 @@ class RunPhaseWriter:
     cannot give an independent connection or the write fails; the machine's edge check
     happens either way, so an illegal phase order is a test failure even where the row
     is not written.
+
+    ## The sink has ONE owner, and it is retired with a bound
+
+    Codex r5 MAJOR-1, reproduced against a real serialized DuckDB cursor. Round 5 bounded
+    how long `_execute_bounded()` *waits* by moving the database call onto a throwaway
+    thread — and then `pipeline.run()` called `close()` on the very cursor that thread
+    was still executing on. `cursor.close()` blocks behind the statement in flight
+    (measured: it returned only when the query did), so the bound applied to one wait
+    site and the run's teardown was still unbounded. Abandoning a worker while keeping no
+    handle to it is not a bound; it is the same wait one stack frame later, plus a race.
+
+    So ownership of the cursor is explicit and moves in one direction:
+
+    * the writer owns it for every ordinary phase write, on the caller's thread;
+    * for the **terminal** write it hands the cursor to one named worker thread and
+      waits `TERMINAL_WRITE_TIMEOUT`;
+    * `close()` **retires** it: join the worker for `RETIRE_TIMEOUT`, then either close
+      the cursor (the worker is gone, so nobody else holds it) or *release* it —
+      `SINK_RETIREMENT` records which. A released cursor is closed by the worker itself
+      if it ever finishes, and dies with the process if it does not. It is a daemon
+      thread, so it can never hold the process open.
+
+    Losing a heartbeat row is bad. Hanging a run's teardown on a heartbeat is worse, and
+    calling `close()` on a cursor another thread is mid-statement on is worse again.
     """
+
+    #: How long the terminal DATABASE CALL gets before the run stops waiting for it.
+    TERMINAL_WRITE_TIMEOUT = 5.0
+    #: How long `close()` waits for an abandoned terminal write before releasing the
+    #: cursor unclosed. Short on purpose: by here the run has its verdict and the only
+    #: thing left to lose is a timestamp.
+    RETIRE_TIMEOUT = 2.0
 
     def __init__(
         self, con, *, pipeline: str, runner_id: str, outcome: RunOutcome | None = None
@@ -276,6 +308,20 @@ class RunPhaseWriter:
         self.independent = False
         self._sink = None
         self._row = False
+        #: The one worker the terminal write may be handed to, and the lock that makes
+        #: the hand-off and the retirement a single decision rather than a check-then-act.
+        self._terminal_worker: threading.Thread | None = None
+        self._sink_lock = threading.Lock()
+        #: True once the writer has given the cursor up. The worker reads it to decide
+        #: whether IT is now responsible for closing.
+        self._released = False
+        #: A terminal write the run stopped waiting for. Distinct from
+        #: `COMMIT_ACK.ungated_terminal_writes`, which means something else entirely
+        #: ("it was written without the gate") — one attempt used to increment that
+        #: counter twice, once per bound (Codex r5 MAJOR-1, subordinate note).
+        self.terminal_write_abandoned = False
+        #: One value from `machines.SINK_RETIREMENT`, carried into `last_run.json`.
+        self.sink_retirement = "never_opened"
         try:
             self._sink = con.cursor()
             self.independent = True
@@ -379,8 +425,12 @@ class RunPhaseWriter:
         so the terminal statement simply queued behind the stalled writer's statement
         with no timeout at all (Codex r4 MAJOR-1, measured still alive at 8 s). The
         observability sink cannot be given a statement timeout, so the bound goes where
-        it can: the call runs on a throwaway thread and the run stops waiting for it.
-        Losing the terminal row is bad; hanging a run's teardown on a heartbeat is worse.
+        it can: the call runs on ONE NAMED, OWNED worker and the run stops waiting for it.
+
+        The worker is *kept*, not thrown away (Codex r5 MAJOR-1). A thread nobody holds
+        a handle to cannot be joined, cannot be waited on with a bound, and cannot be
+        told that the cursor it is using has been given up — so `close()` closed that
+        cursor underneath it and blocked behind its statement while doing so.
         """
         done = threading.Event()
 
@@ -389,14 +439,35 @@ class RunPhaseWriter:
                 self._execute(phase, insert=insert)
             finally:
                 done.set()
+                # If the run has already retired the sink, this thread is now its only
+                # owner and closing it is this thread's job. Under the lock, so
+                # "has it been released?" and "close it" are one decision.
+                with self._sink_lock:
+                    if self._released and self._sink is not None:
+                        sink, self._sink = self._sink, None
+                    else:
+                        sink = None
+                if sink is not None:
+                    try:
+                        sink.close()
+                    except Exception:  # pragma: no cover - closing a wedged cursor
+                        log.debug("the abandoned heartbeat sink would not close",
+                                  exc_info=True)
 
-        threading.Thread(target=_run, name="cdc-terminal-phase", daemon=True).start()
-        if not done.wait(COMMIT_ACK.GATE_TIMEOUT):
-            COMMIT_ACK.ungated_terminal_writes += 1
+        worker = threading.Thread(target=_run, name="cdc-terminal-phase", daemon=True)
+        with self._sink_lock:
+            self._terminal_worker = worker
+        worker.start()
+        if not done.wait(self.TERMINAL_WRITE_TIMEOUT):
+            # NOT `ungated_terminal_writes`: that counter means "written without the
+            # commit->ack gate", and incrementing it here made one attempt look like two
+            # separate ungated writes. This is a different fact and it gets its own name.
+            self.terminal_write_abandoned = True
             log.error(
-                "the terminal %r phase write did not complete within %.1fs; abandoning "
-                "it rather than blocking this run's teardown on the heartbeat sink",
-                phase, COMMIT_ACK.GATE_TIMEOUT,
+                "the terminal %r phase write did not complete within %.1fs; this run "
+                "stops waiting for it. The heartbeat sink is now owned by the "
+                "'cdc-terminal-phase' worker and will be RELEASED rather than closed",
+                phase, self.TERMINAL_WRITE_TIMEOUT,
             )
 
     def _execute(self, phase: str, *, insert: bool) -> None:
@@ -451,6 +522,13 @@ class RunPhaseWriter:
             # The one bounded escape, and it is on the terminal write only, after the
             # applier has stopped. Must be 0 on a healthy run; reported when it is not.
             out["ungated_terminal_phase_writes"] = COMMIT_ACK.ungated_terminal_writes
+        if self.terminal_write_abandoned:
+            # An abandoned terminal write means the durable heartbeat may never have
+            # reached its terminal phase. `last_run.json` is then the ONLY record that
+            # this run terminalised at all, so it has to say so (Codex r5 MAJOR-1).
+            out["terminal_phase_write_abandoned"] = True
+        if self.independent:
+            out["heartbeat_sink_retirement"] = SINK_RETIREMENT.parse(self.sink_retirement)
         if self.outcome.refusals:
             # A49's guard, as evidence rather than as a comment.
             out["outcome_downgrades_refused"] = [
@@ -459,9 +537,47 @@ class RunPhaseWriter:
         return out
 
     def close(self) -> None:
-        if self.independent and self._sink is not None:
-            try:
-                self._sink.close()
-            except Exception:  # pragma: no cover
-                log.debug("closing the heartbeat connection failed", exc_info=True)
-        self._sink = None
+        """Retire the sink under a bound. Never blocks the process indefinitely.
+
+        The three outcomes are the whole of `machines.SINK_RETIREMENT`:
+
+        * `never_opened` — there was no independent connection to give up;
+        * `closed` — nobody else held the cursor, so it was closed properly;
+        * `abandoned` — a terminal write still owns it. It is **released, not closed**,
+          because `cursor.close()` blocks behind the statement in flight and closing a
+          cursor another thread is executing on is the race, not the fix. The worker
+          closes it if it ever returns; it is a daemon, so it cannot hold the process.
+        """
+        with self._sink_lock:
+            worker = self._terminal_worker
+            if self._sink is None:
+                self.sink_retirement = (
+                    "closed" if self.sink_retirement == "closed"
+                    else ("abandoned" if self._released else self.sink_retirement)
+                )
+                return
+        if worker is not None and worker.is_alive():
+            worker.join(self.RETIRE_TIMEOUT)
+        with self._sink_lock:
+            sink = self._sink
+            if worker is not None and worker.is_alive():
+                # Hand ownership over rather than racing it. `_released` is what tells
+                # the worker that closing is now its job.
+                self._released = True
+                self.sink_retirement = "abandoned"
+                log.error(
+                    "the heartbeat sink is still owned by the terminal-phase write "
+                    "after %.1fs; RELEASING it unclosed rather than blocking this "
+                    "run's teardown behind a statement that has not returned",
+                    self.RETIRE_TIMEOUT,
+                )
+                return
+            self._sink = None
+        if sink is None:  # pragma: no cover - the worker closed it between the checks
+            self.sink_retirement = "abandoned"
+            return
+        try:
+            sink.close()
+        except Exception:  # pragma: no cover
+            log.debug("closing the heartbeat connection failed", exc_info=True)
+        self.sink_retirement = "closed"

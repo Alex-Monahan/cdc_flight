@@ -2928,15 +2928,16 @@ the run that reported success over an unchecked catalog.
 | 56 | catalog_baseline: stale -> valid | — (the discharge) | ≥1 real catalog comparison **and** nothing unrelatable, recomputed after the flush | n/a: this is the healthy transition | `catalog_baseline_pre_valid` — the learned relations are durable and the promotion is not; the next run reaches the same verdict from durable state, so it is idempotent rather than one-shot | AUTO (rev 14) |
 | 57 | catalog_baseline: invalidated -> valid | — (the discharge, after a rebuild was queued) | the relation is now `awaiting_snapshot`, so `table_lifecycle` owes its image and the baseline is no longer protecting it | n/a | as 56 | AUTO (rev 14) |
 | 58 | catalog_baseline: valid -> absent | the recorded source catalog is forgotten (`--reset-state`, a source identity change) | `recovery.begin(forget_catalog=True)` | the claim is deleted in the SAME transaction as `source_relations`: a claim about a registry that no longer exists would suppress the reconciliation of the one replacing it | one transaction, so there is no cut | AUTO (rev 14) |
+| 59 | heartbeat_sink_retirement (domain) | the terminal run-phase write never returns (a wedged observability cursor) | the write is bounded on a named worker; `close()` joins it with a bound and RELEASES the cursor rather than closing it under a live statement | the run tears down within the bound and exits on its own verdict; `last_run.json` carries `terminal_phase_write_abandoned` | n/a — the heartbeat is not load-bearing for any decision | **UNDEFINED** (rev 14 — honest: nothing clears the non-terminal heartbeat row that abandoned runner left behind, so an operator reading `_cdc_flight.heartbeat` alone sees a phase that never terminalised. `last_run.json` is the terminal record. Bounding the teardown was the merge-blocking half; sweeping the stale row is 4.4/6.1's) |
 
-**The counts, parsed from the rows above rather than recalled.** 63 rows, one
+**The counts, parsed from the rows above rather than recalled.** 64 rows, one
 failure and one terminal class each.
 
 | class | count | rows |
 |---|---:|---|
 | `AUTO` | **40** | 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 24b, 32, 35, 36, 40, 43, 44, 45, 46, 47, 53, 54, 55, 56, 57, 58 |
 | `MANUAL` | **15** | 17b, 25, 26, 27, 28, 29, 33, 38, 41, 42, 44b, 49, 51, 51a, 52 |
-| `UNDEFINED` | **8** | 30, 31, 32b, 35b, 37, 39, 48, 50 |
+| `UNDEFINED` | **9** | 30, 31, 32b, 35b, 37, 39, 48, 50, 59 |
 
 **What rev 9 changed, and it is not flattering.** Three rows are new and two of them are
 `MANUAL`: making an undeclared transition (51) and an out-of-domain durable value (52)
@@ -2988,6 +2989,16 @@ consumed only by a test.
   `fresh_start`, `resume`, `file_missing_rebuilt`, `file_missing_no_durable_offset`, `file_missing_repair_disabled`, `file_corrupt_rebuilt`, `file_ahead_rebuilt`, `file_behind_rebuilt`, `file_offset_mismatch_rebuilt`, `orphan_accepted_resnapshot`
 * **`source_health`** (6 values) — What is the source connector doing, as one named value rather than six timers?
   `unsampled`, `streaming`, `not_streaming`, `unknown`, `unknown_never_sampled`, `dark`
+* **`heartbeat_sink_retirement`** (3 values) — Who owned the run-phase heartbeat cursor
+  when the run tore down, and was it closed or abandoned?
+  `never_opened`, `closed`, `abandoned`
+
+  A domain rather than a machine **by this file's own test**: a crash never leaves
+  durable state in an intermediate configuration here — the cursor dies with the
+  process. What the r5 finding actually needed was an *owner* and a *bound*, not a
+  durable machine, and dressing an in-process hand-off up as one would assert exactly
+  the recoverable intermediate state it does not have (rev 14).
+
 
 #### A51.4 — how UNDEFINED is found now
 
@@ -3922,14 +3933,33 @@ than a one-shot, because one failed poll out of six is not the state that matter
 
 Inventory rows 54–58; transition table in §A51.1.
 
-#### A63.3 — the two MINORs were already closed, and are re-checked here
+#### A63.2 — the heartbeat sink has one owner and a bounded retirement (MAJOR)
 
-Round 5's MINOR-1 (`complete_if_ready()` logging "the destination has a resume point
-again" on the path that deliberately has none) and MINOR-2 (`_reset_group`'s docstring
-still claiming a partial reset was unrepresentable) were both fixed in `ed361c0`, the
-commit that also published the reviewer's 3/5 bands — the review was written against the
-state before it. Re-verified rather than re-fixed: the completion log branches on
-`has_resume` and says "every captured relation was PROVEN empty at the source, so there
-is no resume point and none can exist"; `_reset_group` now states the narrow claim, that
-both reset paths are one object replacement so neither can forget a field, and names
-`discard_units()` as the one deliberate partial mutation.
+A61.3 moved the terminal write's database call onto a throwaway thread and stopped
+waiting for it. `pipeline.run()` then called `RunPhaseWriter.close()` on the very cursor
+that thread was still executing on — and `cursor.close()` **queues behind the statement
+in flight** rather than cancelling it (measured directly: a close on a busy DuckDB cursor
+returned only when the query did). So the bound applied to one wait site and the run's
+teardown was still unbounded. Abandoning a worker while keeping no handle to it is not a
+bound; it is the same wait one stack frame later, plus a race against a live cursor.
+
+Ownership is explicit now and moves in one direction: the writer owns the cursor for
+ordinary phase writes, hands it to one named worker for the terminal write, and
+`close()` **retires** it — join the worker for `RETIRE_TIMEOUT`, then either close the
+cursor (nobody else holds it) or *release* it unclosed, in which case the worker closes
+it if it ever returns and the process is unaffected either way because the worker is a
+daemon. The outcome is one value from the `heartbeat_sink_retirement` domain, and
+`pipeline.run()` now samples the summary **after** `close()` rather than before, so an
+abandoned terminal write reaches `last_run.json` — which is then the only record that
+the run terminalised at all.
+
+The subordinate metric confusion goes with it: the database-call bound no longer
+increments `ungated_terminal_writes` (which means "written without the commit→ack
+gate"), so one attempt stops looking like two ungated writes. It sets
+`terminal_phase_write_abandoned`, which is a different fact with a different name.
+
+Row 59 is **UNDEFINED**, and deliberately: bounding the teardown was the merge-blocking
+half, but nothing sweeps the non-terminal heartbeat row an abandoned runner leaves
+behind. An operator reading `_cdc_flight.heartbeat` alone would see a phase that never
+terminalised. `last_run.json` carries the verdict; the sweep belongs to 4.4/6.1.
+

@@ -15,7 +15,10 @@ In-process, DuckDB in a tmp dir, no engine.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import threading
+import time
 from pathlib import Path
 
 import duckdb
@@ -797,3 +800,232 @@ def test_a_pre_engine_failure_agrees_with_the_heartbeat(tmp_path_factory, postgr
     finally:
         box.cleanup()
         box.reseed()
+
+
+# --------------------------------------------------------------------------- #
+# the heartbeat sink has ONE owner, and it is retired with a bound
+# (Codex r5 MAJOR-1, reproduced against a real serialized DuckDB cursor)
+# --------------------------------------------------------------------------- #
+class _WedgedCursor:
+    """A cursor that wedges once armed, and records every call made on it.
+
+    Stands in for the shape the reviewer measured against a real serialized DuckDB
+    connection: once a statement is in flight, the next statement queues behind it with
+    no bound at all — and `close()` queues behind it too rather than cancelling it. Both
+    facts are reproduced, because a `close()` that returned instantly would make the old
+    code look bounded when it was not.
+
+    It is armed rather than born wedged so the run can reach its terminal phase the way
+    a real one does: the ordinary phase writes happen on a healthy sink, and the sink
+    goes bad while the run is tearing down.
+    """
+
+    def __init__(self, release: threading.Event) -> None:
+        self._release = release
+        self._armed = threading.Event()
+        self.closed = False
+        self.close_calls = 0
+        self.statements: list[str] = []
+
+    def arm(self) -> None:
+        self._armed.set()
+
+    def execute(self, sql, *_a, **_k):
+        self.statements.append(str(sql).split()[0].upper())
+        if self._armed.is_set():
+            self._release.wait(30)
+        return self
+
+    def close(self):
+        self.close_calls += 1
+        if self._armed.is_set():
+            self._release.wait(30)
+        self.closed = True
+
+
+class _WedgedConnection:
+    def __init__(self, release):
+        self.cursor_obj = _WedgedCursor(release)
+
+    def cursor(self):
+        return self.cursor_obj
+
+
+@pytest.fixture
+def wedged():
+    """A writer whose sink is healthy until the run starts tearing down."""
+    from cdc_flight.run_state import COMMIT_ACK
+
+    COMMIT_ACK.reset()
+    release = threading.Event()
+    con = _WedgedConnection(release)
+    phases = RunPhaseWriter(con, pipeline=PIPELINE, runner_id=RUNNER)
+    phases.TERMINAL_WRITE_TIMEOUT = 0.3
+    phases.RETIRE_TIMEOUT = 0.2
+    phases.to(m.PHASE_RECONCILING)
+    con.cursor_obj.arm()
+    try:
+        yield phases, con.cursor_obj, release
+    finally:
+        release.set()
+        COMMIT_ACK.reset()
+
+
+def test_the_whole_teardown_is_bounded_not_just_the_terminal_wait(wedged):
+    """`finish()` **and** `close()`, against a sink that never answers.
+
+    Round 5's fix bounded one wait site by moving the database call to a throwaway
+    thread — and then `pipeline.run()` called `close()` on the very cursor that thread
+    was still executing on, which blocked behind it. The bound has to cover the
+    lifecycle, not the call: a run must be able to finish tearing down while a
+    heartbeat statement is still in flight for ever.
+    """
+    phases, _cursor, _release = wedged
+    started = time.monotonic()
+    phases.finish(ok=False)
+    phases.close()
+    elapsed = time.monotonic() - started
+    assert elapsed < 3.0, (
+        f"teardown took {elapsed:.1f}s against a sink that never answers; the bound "
+        "must cover finish() AND close(), not one wait site"
+    )
+
+
+def test_an_abandoned_sink_is_released_rather_than_closed(wedged):
+    """Closing a cursor another thread is mid-statement on is the race, not the fix.
+
+    `close()` on a busy DuckDB cursor blocks behind the statement (measured). So the
+    retirement hands ownership over instead: the worker closes it if it ever returns,
+    and it is a daemon, so it can never hold the process open.
+    """
+    phases, cursor, release = wedged
+    phases.finish(ok=False)
+    phases.close()
+
+    assert phases.sink_retirement == "abandoned"
+    assert cursor.close_calls == 0, (
+        "the teardown called close() on a cursor a live worker still owns"
+    )
+    # ...and the worker takes it over once the statement finally returns.
+    release.set()
+    for _ in range(300):
+        if cursor.closed:
+            break
+        time.sleep(0.02)
+    assert cursor.closed, "nobody ever closed the released cursor"
+
+
+def test_an_abandoned_terminal_write_is_recorded_in_the_summary(wedged):
+    """`last_run.json` is then the ONLY record that this run terminalised at all.
+
+    And it is one fact with one name: the database-call bound used to increment
+    `ungated_terminal_writes`, which means "written without the commit->ack gate", so a
+    single attempt looked like two separate ungated writes (Codex r5, subordinate note).
+    """
+    from cdc_flight.run_state import COMMIT_ACK
+
+    phases, _cursor, _release = wedged
+    phases.finish(ok=False)
+    phases.close()
+
+    summary = phases.summary()
+    assert summary["terminal_phase_write_abandoned"] is True
+    assert summary["heartbeat_sink_retirement"] == "abandoned"
+    assert COMMIT_ACK.ungated_terminal_writes == 0, (
+        "the database-call bound is not an ungated write; one attempt must not "
+        "increment two different counters"
+    )
+
+
+def test_an_ordinary_run_closes_its_sink_and_says_so(con):
+    """The healthy path still closes properly — the retirement is not a leak licence."""
+    from cdc_flight.run_state import COMMIT_ACK
+
+    COMMIT_ACK.reset()
+    phases = RunPhaseWriter(con, pipeline=PIPELINE, runner_id=RUNNER)
+    phases.to(m.PHASE_RECONCILING)
+    phases.to(m.PHASE_STOPPING)
+    phases.finish(ok=True)
+    phases.close()
+    assert phases.sink_retirement == "closed"
+    assert phases.summary()["heartbeat_sink_retirement"] == "closed"
+    assert phases.summary().get("terminal_phase_write_abandoned") is None
+    assert _row(con)[0] == "stopped"
+    COMMIT_ACK.reset()
+
+
+def test_the_pipeline_reports_the_retirement_after_it_has_happened():
+    """Ordering, asserted on the source: `close()` then `summary()`.
+
+    How the sink was retired is only known once it has been retired, and an abandoned
+    terminal write is exactly the case where the summary is the only surviving record.
+    Sampling the summary first would drop the one fact that matters.
+    """
+    source = (
+        Path(__file__).resolve().parents[2] / "src" / "cdc_flight" / "pipeline.py"
+    ).read_text()
+    tail = source[source.index("phases.finish(ok=run_ok)"):]
+    assert tail.index("phases.close()") < tail.index("reported.update(phases.summary())"), (
+        "the summary is sampled before the sink is retired, so an abandoned terminal "
+        "write cannot reach last_run.json"
+    )
+
+
+def test_the_sink_retirement_values_are_a_declared_domain():
+    """One vocabulary, shared with the 4.7 inventory, rather than three loose strings."""
+    assert set(m.SINK_RETIREMENT.values) == {"never_opened", "closed", "abandoned"}
+
+
+@pytest.mark.slow
+def test_a_real_serialized_duckdb_sink_cannot_hang_the_teardown(tmp_path):
+    """The reviewer's own probe, executable: `finish()` THEN `close()`, on a real cursor.
+
+    The fake above proves the ownership protocol; this proves the protocol is aimed at
+    the right thing. DuckDB serialises statements on one connection, so a terminal write
+    issued while another statement is in flight on that cursor queues behind it with no
+    bound — and `cursor.close()` queues behind it too. Round 5 measured `finish()`
+    returning at 10.013 s and `close()` still alive two seconds later, released only by
+    an explicit interrupt.
+
+    Production bounds on purpose (5 s + 2 s): a test that shrank them would prove the
+    arithmetic and not the schedule.
+    """
+    from cdc_flight.run_state import COMMIT_ACK
+
+    COMMIT_ACK.reset()
+    connection = duckdb.connect(str(tmp_path / "dest.duckdb"))
+    connection.execute("PRAGMA threads=1")
+    dest_mod.ensure_control_schema(connection)
+    phases = RunPhaseWriter(connection, pipeline=PIPELINE, runner_id=RUNNER)
+    phases.to(m.PHASE_RECONCILING)
+
+    # Occupy THE SINK — the same cursor the terminal write has to use.
+    occupied = threading.Event()
+
+    def _hog():
+        occupied.set()
+        with contextlib.suppress(Exception):  # the cursor may be released under us
+            phases._sink.execute("SELECT max(md5(i::VARCHAR)) FROM range(60000000) t(i)")
+
+    hog = threading.Thread(target=_hog, daemon=True)
+    hog.start()
+    occupied.wait(5)
+    time.sleep(1.0)
+
+    started = time.monotonic()
+    phases.finish(ok=False)
+    phases.close()
+    elapsed = time.monotonic() - started
+
+    bound = phases.TERMINAL_WRITE_TIMEOUT + phases.RETIRE_TIMEOUT + 3.0
+    assert elapsed < bound, (
+        f"teardown took {elapsed:.2f}s behind a statement in flight on the heartbeat "
+        f"sink (bound {bound:.1f}s). This is the r5 schedule: finish() bounded, "
+        "close() not"
+    )
+    assert phases.sink_retirement == "abandoned"
+    assert phases.summary()["terminal_phase_write_abandoned"] is True
+    hog.join(60)
+    COMMIT_ACK.reset()
+    with contextlib.suppress(Exception):
+        connection.close()

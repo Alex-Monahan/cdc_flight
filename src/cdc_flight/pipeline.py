@@ -730,15 +730,20 @@ def run(
                 phases.finish(ok=run_ok)
             except Exception:  # pragma: no cover
                 log.error("could not record the terminal run phase", exc_info=True)
-            # TERMINALISE FIRST, THEN REPORT (Codex r1 MAJOR-2, open question 6). The
-            # summary used to be sampled before the `stopping`/`stopped` transitions, so
-            # every successful run shipped `run_phase="draining"` while the destination
-            # heartbeat correctly held `stopped`. `reported` is the very dict `main()`
-            # prints and persists, so updating it here makes `last_run.json` and the
-            # heartbeat two projections of one state.
+            # TERMINALISE, RETIRE THE SINK, *THEN* REPORT (Codex r1 MAJOR-2 open
+            # question 6, extended by r5 MAJOR-1). The summary used to be sampled before
+            # the `stopping`/`stopped` transitions, so every successful run shipped
+            # `run_phase="draining"`. It is now also sampled AFTER `close()`, because
+            # how the heartbeat sink was retired — closed, or abandoned to a terminal
+            # write that never returned — is only known once it has been retired, and an
+            # abandoned terminal write means `last_run.json` is the only record that
+            # this run terminalised at all.
+            try:
+                phases.close()
+            except Exception:  # pragma: no cover - retirement is fully guarded already
+                log.error("could not retire the heartbeat sink", exc_info=True)
             if reported is not None:
                 reported.update(phases.summary())
-            phases.close()
         try:
             con.close()
         except Exception:  # pragma: no cover
