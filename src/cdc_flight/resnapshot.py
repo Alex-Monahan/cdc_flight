@@ -107,7 +107,6 @@ trades a rubric-1.6 violation for a rubric-1.2 one.
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import logging
 import shutil
@@ -863,64 +862,3 @@ def finish_empty_tables_after_main_snapshot(
         evidence=evidence,
     )
     return emptied, evidence.wal_lsn
-
-
-def record_empty_handoff(con, *, pipeline: str, namespace: str, fence_lsn: int) -> bool:
-    """The durable handoff point for a capture set that turned out to be entirely empty.
-
-    A recovery clears only over per-relation `complete` **and** a destination resume
-    point, and the resume point is what says "the rebuilt image was handed over to a
-    stream". An all-empty capture set emits zero Debezium records, so the applier commits
-    zero groups and writes no resume point at all — which made a legitimate source shape
-    permanently non-convergent: `--reset-state` failed with `recovery_uncleared`, and so
-    did every run after it, because no new fact could produce a commit group (Codex r3
-    MAJOR-1, reproduced against six truncated tables).
-
-    **The consistency argument, which is the only reason this is allowed to exist.**
-    `fence_lsn` is `pg_current_wal_lsn()` sampled *before* the source counts, on its own
-    statement, and every captured relation then counted **zero** under `REPEATABLE READ`.
-    So no transaction with a commit LSN at or below `fence_lsn` left a row in any
-    captured relation: there is nothing below that position for the destination to be
-    missing, and recording it as the durable position claims nothing that is not true.
-    It is written with an **empty Debezium offset map**, because we have not observed one
-    — reconciliation reads that as "no durable offset" and lets the connector resume from
-    its own flushed `offsets.dat`, which is exactly the honest answer.
-
-    Refuses to write over an existing resume point, and refuses without a fence.
-    Returns True if it wrote one.
-    """
-    if fence_lsn is None:
-        log.error(
-            "an empty capture set was verified but no WAL fence was sampled, so no "
-            "durable handoff point can be recorded; the recovery stays armed"
-        )
-        return False
-    existing = con.execute(
-        f"SELECT 1 FROM {dest_mod.CONTROL_SCHEMA}.debezium_offsets "
-        "WHERE pipeline = ? AND namespace = ?",
-        [pipeline, namespace],
-    ).fetchall()
-    if existing:
-        return False
-    con.execute("BEGIN TRANSACTION")
-    try:
-        dest_mod.write_resume_point(
-            con,
-            pipeline=pipeline,
-            namespace=namespace,
-            point=dest_mod.ResumePoint(last_lsn=int(fence_lsn)),
-            commit_id=0,
-            offset_blob=None,
-            offset_key_blob=None,
-        )
-        con.execute("COMMIT")
-    except BaseException:
-        with contextlib.suppress(Exception):
-            con.execute("ROLLBACK")
-        raise
-    log.warning(
-        "recorded an empty-snapshot handoff point at lsn %s: every captured relation was "
-        "PROVEN to hold zero rows at that position, so nothing below it is owed",
-        fence_lsn,
-    )
-    return True

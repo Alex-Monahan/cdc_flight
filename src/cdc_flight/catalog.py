@@ -335,6 +335,12 @@ class CatalogWatcher:
         #: ever advanced (Codex r1 MAJOR-1). The same object now carries the streak.
         self._unconfirmed: dict[str, CatalogChange] = {}
         self.polls = 0
+        #: Polls that actually READ the source catalog and compared it. `polls` counts
+        #: attempts, including the discarded empty-schema observation, and a run with
+        #: zero successful ones has no baseline at all: it cannot have noticed a drop,
+        #: and it has nothing to persist. The supervisor refuses to call such a run
+        #: successful (Codex r4 BLOCKER-2).
+        self.successful_polls = 0
         self.empty_polls = 0
         self.superseded = 0
         self.last_error: str | None = None
@@ -476,6 +482,8 @@ class CatalogWatcher:
                 log.error("catalog poll: %s", self.last_error)
                 return []
             added = self._compare(observed, lsn)
+            with self._lock:
+                self.successful_polls += 1
             # Emitted while a **destructive** change is pending, not only when one is
             # new: one tiny WAL record per poll interval, which makes the fence
             # self-healing (a marker that was written but not delivered is simply
@@ -856,6 +864,7 @@ class CatalogWatcher:
             pending = self._live()
         return {
             "catalog_polls": self.polls,
+            "catalog_successful_polls": self.successful_polls,
             # An undeclared SM-D edge. `None` on every healthy run; when it is set the
             # supervisor refuses to call the run successful (A51 row 51).
             "catalog_machine_error": self.machine_error,

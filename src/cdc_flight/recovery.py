@@ -505,7 +505,12 @@ def resume(
 
 
 def complete_if_ready(
-    con, *, pipeline: str, namespace: str, record: RecoveryRecord
+    con,
+    *,
+    pipeline: str,
+    namespace: str,
+    record: RecoveryRecord,
+    verified_empty: list[str] | tuple[str, ...] = (),
 ) -> Completion:
     """Has the rebuild this journal demanded actually happened? Clear it if so.
 
@@ -550,7 +555,25 @@ def complete_if_ready(
     # required of EVERY recovery. The first cut exempted `--reset-state` on the grounds
     # that its obligation was only bookkeeping; that exemption is exactly what let a
     # reset clear itself having rebuilt nothing.
-    if still_owed or not has_resume:
+    #
+    # There is ONE case where no such handoff can exist and demanding it is not
+    # conservatism but a permanent stall: a capture set in which every relation was
+    # PROVEN empty at the source on this run. Nothing streamed, so the applier committed
+    # no group and wrote no resume point, and no future run can produce one either
+    # (Codex r3 MAJOR-1). What stands in for it is stronger and per relation: each of
+    # those tables carries the `snapshot_lsn` fence `finish_verified_empty_tables`
+    # sampled BEFORE the counts that proved it empty.
+    #
+    # And it is deliberately NOT patched with a synthetic resume row. The first attempt
+    # wrote one with an empty offset map, which is not an offset the connector can resume
+    # from: the next run started with no offset at all, took an `initial` snapshot
+    # against the SURVIVING slot, and delivered concurrently-written rows twice — once as
+    # `r` and once as `c` (Codex r4 BLOCKER-1, reproduced). With no resume row the next
+    # run is an honest `fresh_start`: the slot check sees an empty destination, arms a
+    # recovery, and that recovery DROPS the slot, so Debezium creates its own and the
+    # snapshot/stream boundary is exact (A45). Noisier, and correct.
+    empty_discharged = bool(obligation) and set(obligation) <= set(verified_empty)
+    if still_owed or not (has_resume or empty_discharged):
         reason = (
             f"{len(still_owed)} captured table(s) are not `complete` "
             f"({', '.join(still_owed)})" if still_owed

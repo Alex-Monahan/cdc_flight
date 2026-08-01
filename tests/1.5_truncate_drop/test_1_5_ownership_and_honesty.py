@@ -355,6 +355,7 @@ def test_a_watcher_that_really_stops_lets_the_verdict_stand():
             self.quiesce_timeout = 2.0
 
         def poll_quietly(self):
+            self.successful_polls += 1
             return []
 
     w = _CleanPoller().start()
@@ -402,3 +403,62 @@ def test_what_the_watcher_learned_is_persisted_even_when_nothing_is_due():
         "the learned relation was not carried into the plan, so nothing will persist "
         "its oid and the next run cannot tell a recreate from a quiet table"
     )
+
+
+def test_a_run_that_never_read_the_catalog_is_not_a_success():
+    """Proving the poller is DEAD is not proving it ever SPOKE (Codex r4 BLOCKER-2).
+
+    `poll_quietly()` catches a query failure into `last_error` and returns nothing, which
+    is right for a transient source. But a run in which EVERY poll failed has no
+    baseline: it cannot have noticed a `DROP TABLE`, and it has nothing to persist — so
+    reporting success says "I checked and everything is fine" when nothing was checked.
+    Measured consequence: with every poll timing out, a quiet run returned `ok=true` and
+    learned zero relations; an offline drop-and-recreate then left the old relation's
+    rows beside the new one's for ever, because the following runs adopted the
+    replacement oid as the baseline they had never had.
+    """
+
+    class _AlwaysFails(CatalogWatcher):
+        def __init__(self):
+            super().__init__(
+                dsn="", publication="pub", schema="app", include=set(), poll_seconds=0.05
+            )
+            self.quiesce_timeout = 2.0
+
+        def poll_quietly(self):
+            self.last_error = "TimeoutError: canceling statement due to statement timeout"
+            return []
+
+    w = _AlwaysFails().start()
+    with pytest.raises(EngineFailure) as excinfo:
+        run_engine_bounded(
+            _Engine(), _Handler(), RunConfig(max_seconds=6, idle_seconds=0.1),
+            catalog=w, catalog_drain_seconds=0.2,
+        )
+    assert "could not be read even once" in str(excinfo.value), str(excinfo.value)
+    assert excinfo.value.summary["stop_reason"] == "engine_error"
+    assert excinfo.value.summary["catalog_successful_polls"] == 0
+    assert excinfo.value.summary.get("ok") is not True
+
+
+def test_one_successful_poll_is_enough_to_have_a_baseline():
+    """The other half: a poll that read the catalog once gives the run something to say."""
+
+    class _OneGoodPoll(CatalogWatcher):
+        def __init__(self):
+            super().__init__(
+                dsn="", publication="pub", schema="app", include=set(), poll_seconds=0.05
+            )
+            self.quiesce_timeout = 2.0
+
+        def poll_quietly(self):
+            self.successful_polls += 1
+            self.last_error = "TimeoutError: a later poll failed, which is transient"
+            return []
+
+    w = _OneGoodPoll().start()
+    summary = run_engine_bounded(
+        _Engine(), _Handler(), RunConfig(max_seconds=6, idle_seconds=0.1),
+        catalog=w, catalog_drain_seconds=0.2,
+    )
+    assert summary["ok"] is True, summary

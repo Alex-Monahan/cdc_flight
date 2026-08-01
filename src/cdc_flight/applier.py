@@ -505,14 +505,20 @@ class Applier:
             # mid-statement when the window opens) and left after the acknowledgement.
             # One attribute assignment, no lock, no allocation - see
             # `run_state._CommitAckWindow` for why that is the only acceptable cost here.
-            with self_heal.commit_watchdog(self.cfg.commit_timeout, commit_id):
+            stage = ["observability_gate"]
+            with self_heal.commit_watchdog(
+                self.cfg.commit_timeout, commit_id, stage=lambda: stage[0]
+            ):
                 # INSIDE the watchdog (Codex r3 MAJOR-2). `enter()` waits, without a
                 # bound of its own, until no independent write is in flight — that is
                 # what makes the exclusion absolute rather than instrumented — and the
                 # watchdog is what stops a wedged observability cursor from stalling the
                 # commit path silently. It turns into the same loud, bounded EX_TEMPFAIL
-                # death a wedged COMMIT produces.
+                # death a wedged COMMIT produces. `stage` tells the watchdog WHICH of the
+                # two it killed, because "the commit never started" and "the commit is
+                # ambiguous" call for different operator responses (Codex r4 MAJOR-1).
                 COMMIT_ACK.enter()
+                stage[0] = "commit"
                 self.con.execute("COMMIT")
             self.group.txn_open = False
             if has_data:

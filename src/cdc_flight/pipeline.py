@@ -587,19 +587,10 @@ def run(
                 )
                 if emptied:
                     summary_extra["verified_empty_after_snapshot"] = emptied
-                    # An entirely empty capture set emits no records, so the applier
-                    # commits no group and writes no resume point — and a recovery that
-                    # correctly demands one would never clear, on any run, for ever
-                    # (Codex r3 MAJOR-1). The handoff point is recorded from the fence
-                    # the emptiness was proven at; see `record_empty_handoff` for why
-                    # that claims nothing untrue.
-                    if resnapshot_mod.record_empty_handoff(
-                        con, pipeline=dest.pipeline_name, namespace=namespace,
-                        fence_lsn=fence,
-                    ):
-                        summary_extra["empty_handoff_lsn"] = fence
+                    summary_extra["verified_empty_fence_lsn"] = fence
                 completion = recovery_mod.complete_if_ready(
                     con, pipeline=dest.pipeline_name, namespace=namespace, record=journal,
+                    verified_empty=emptied,
                 )
                 if completion.cleared:
                     summary_extra["recovery_cleared"] = completion.recovery_id

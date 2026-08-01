@@ -313,8 +313,8 @@ def test_a_reset_of_an_entirely_empty_source_clears_in_one_run(
         assert summary.get("recovery_cleared"), (
             f"an all-empty reset did not converge in one run: {summary}"
         )
-        assert summary.get("empty_handoff_lsn"), (
-            f"no durable handoff point was recorded for the empty capture set: {summary}"
+        assert summary.get("verified_empty_fence_lsn"), (
+            f"no WAL fence was sampled for the empty capture set: {summary}"
         )
         states = dict(
             box.duck_query(
@@ -331,12 +331,54 @@ def test_a_reset_of_an_entirely_empty_source_clears_in_one_run(
         assert again["ok"] is True, again
         assert not again.get("recovery_still_armed"), again
 
-        # ... and CDC works from there.
-        box.sql("INSERT INTO app.customers (name, email) VALUES ('after-empty', 'a@x.com')")
+        # ... and CDC works from there, INCLUDING against a writer racing the next run's
+        # snapshot/stream boundary. This is the shape that caught the first attempt at
+        # this fix (Codex r4 BLOCKER-1): a synthetic resume row with an empty offset map
+        # is not an offset the connector can resume from, so the next run started with no
+        # offset, took an `initial` snapshot against the SURVIVING slot, and delivered
+        # concurrently-committed rows twice — once as `r` and once as `c`. With no
+        # resume row at all the next run is an honest fresh start whose recovery drops
+        # the slot, so Debezium creates its own and the boundary is exact (A45).
+        import threading as _threading
+
+        stop = _threading.Event()
+        written: list[str] = []
+
+        def _write_during_the_run() -> None:
+            i = 0
+            while not stop.is_set() and i < 60:
+                i += 1
+                name = f"eh-{i}"
+                try:
+                    box.sql(
+                        "INSERT INTO app.sensor_readings (sensor_id, value, unit) "
+                        f"VALUES ('{name}', {i}.5, 'C')"
+                    )
+                except Exception:  # pragma: no cover - the source may be busy
+                    break
+                written.append(name)
+                stop.wait(0.15)
+
+        writer = _threading.Thread(target=_write_during_the_run, daemon=True)
+        writer.start()
+        try:
+            assert box.run(max_seconds=180)["ok"] is True
+        finally:
+            stop.set()
+            writer.join(30)
+
+        # Everything that committed at the source is at the destination EXACTLY ONCE.
         assert box.run(max_seconds=180)["ok"] is True
-        assert box.scalar(
-            f"SELECT count(*) FROM {box.table('cdcflight_app_customers')}"
-        ) == 1
+        src = box.pg_query("SELECT count(*) FROM app.sensor_readings")[0][0]
+        dst, distinct = box.duck_query(
+            "SELECT count(*), count(DISTINCT cdcf_event_id) FROM "
+            f"{box.table('cdcflight_app_sensor_readings')}"
+        )[0]
+        assert dst == src, (
+            f"a keyless table has {dst} destination rows for {src} source rows across "
+            "the snapshot/stream boundary of the run after an all-empty rebuild"
+        )
+        assert dst == distinct, f"{dst - distinct} duplicated event identities"
     finally:
         box.cleanup()
         box.reseed()

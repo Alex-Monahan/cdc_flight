@@ -366,7 +366,38 @@ class RunPhaseWriter:
                     "commit->ack window", phase,
                 )
                 return
-            self._execute(phase, insert=insert)
+            if terminal:
+                self._execute_bounded(phase, insert=insert)
+            else:
+                self._execute(phase, insert=insert)
+
+    def _execute_bounded(self, phase: str, *, insert: bool) -> None:
+        """The terminal write, with a bound on the DATABASE call, not just the gate.
+
+        Giving up on the Python gate and then calling `_execute()` anyway put the write
+        straight back into an unbounded wait: DuckDB serialises calls on one connection,
+        so the terminal statement simply queued behind the stalled writer's statement
+        with no timeout at all (Codex r4 MAJOR-1, measured still alive at 8 s). The
+        observability sink cannot be given a statement timeout, so the bound goes where
+        it can: the call runs on a throwaway thread and the run stops waiting for it.
+        Losing the terminal row is bad; hanging a run's teardown on a heartbeat is worse.
+        """
+        done = threading.Event()
+
+        def _run() -> None:
+            try:
+                self._execute(phase, insert=insert)
+            finally:
+                done.set()
+
+        threading.Thread(target=_run, name="cdc-terminal-phase", daemon=True).start()
+        if not done.wait(COMMIT_ACK.GATE_TIMEOUT):
+            COMMIT_ACK.ungated_terminal_writes += 1
+            log.error(
+                "the terminal %r phase write did not complete within %.1fs; abandoning "
+                "it rather than blocking this run's teardown on the heartbeat sink",
+                phase, COMMIT_ACK.GATE_TIMEOUT,
+            )
 
     def _execute(self, phase: str, *, insert: bool) -> None:
         try:

@@ -344,6 +344,31 @@ def run_engine_bounded(
             summary,
         )
 
+    if (
+        catalog is not None
+        and getattr(catalog, "poll_seconds", 0) > 0
+        and not getattr(catalog, "successful_polls", 1)
+    ):
+        # A run that never read the source catalog ONCE has no baseline: it cannot have
+        # noticed a `DROP TABLE`, and it has nothing to persist, so reporting success
+        # says "I checked and everything is fine" when nothing was checked. The
+        # consequence was measured (Codex r4 BLOCKER-2): with every poll timing out, a
+        # quiet run returned `ok=true` and learned zero relations; an offline
+        # drop-and-recreate then left the old relation's rows beside the new one's for
+        # ever, because the following runs adopted the replacement oid as the baseline
+        # they had never had. Proving the poller is DEAD is not the same as proving it
+        # ever SPOKE.
+        outcome.record("engine_error")
+        summary["stop_reason"] = outcome.value
+        summary["catalog_successful_polls"] = 0
+        raise EngineFailure(
+            "the source catalog could not be read even once during this run "
+            f"(last error: {getattr(catalog, 'last_error', None)!r}), so a dropped or "
+            "recreated relation could not have been detected and no relation baseline "
+            "can be persisted. Refusing to report success over an unchecked catalog",
+            summary,
+        )
+
     if catalog is not None and getattr(catalog, "machine_error", None):
         # A51 row 51, as a policy rather than a promise. A catalog change that moved
         # along an edge `machines.CATALOG_CHANGE` does not declare is a destructive DDL

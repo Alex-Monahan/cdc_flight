@@ -3710,3 +3710,67 @@ only thing that makes a drop-and-recreate detectable across a restart, and A60.1
 entirely about who is responsible for making it durable. Current sizes are in
 `RUBRIC_STATUS`, measured; `applier.py` (928) and `resnapshot.py` (926) are the two to
 watch next.
+
+### A61 — rev 13: the fix that reintroduced duplication, and two others
+
+Round 4 confirmed the zero-commit catalog baseline, immediate all-empty reset
+convergence, the removal of the five-second gate escape, real watcher quiescence and the
+corrected `OpenGroup` wording. It also reproduced **duplication** — the thing this whole
+design exists to make impossible — introduced by A60.2, and that is worth stating plainly
+rather than burying: a fix for a convergence stall created an exactly-once defect.
+
+#### A61.1 — a synthetic resume point is not a resumable offset (BLOCKER)
+
+A60.2 wrote a durable resume row for an all-empty capture set: `last_lsn = fence`, with
+an **empty offset map**. The LSN claim was true. The row was still wrong, because the
+resume point is not only a claim about durability — it is the offset the connector is
+handed. An empty map means "no offset", so the next run started Debezium fresh, took an
+`initial` snapshot, and did it **against the slot the previous run had left behind**. That
+is precisely the uncoordinated image/stream boundary A45 measured: with a writer running
+across it, two committed keyless rows landed twice, once as `r` and once as `c`, and the
+run reported success.
+
+The row is gone. What replaces it is the honest state: **no resume point at all**, and a
+completion predicate that accepts its absence only when every journalled relation was
+discharged by *verified-empty evidence on this run*. The next run is then a real
+`fresh_start`: the slot check sees a positioned slot over an empty destination, arms a
+recovery, and that recovery **drops the slot**, so Debezium creates its own and the
+boundary is exact. It costs a recovery per run for as long as the source stays entirely
+empty, which is noisy and correct — and the moment one row exists, an ordinary commit
+group writes a real resume point and the noise stops.
+
+The regression is the reviewer's own shape: an all-empty reset, then a writer inserting
+into a keyless table across the next run's boundary, asserting destination rows equal
+source rows and every `cdcf_event_id` is distinct.
+
+#### A61.2 — a run may not succeed over a catalog it never read (BLOCKER)
+
+A60.4 proved the poller was **dead**. It did not prove the poller had ever **spoken**.
+`poll_quietly()` catches a query failure into `last_error` — right for a transient
+source — and the supervisor reported it and could still return success, while
+`flush_learned_relations()` had nothing to persist. The four-second catalog
+`statement_timeout` A60.4 added makes that a normal production path rather than a curiosity.
+
+Measured: with every poll timing out and source health perfectly healthy, a quiet run
+returned `ok=true` and durably knew zero relations. An offline drop-and-recreate then left
+the old relation's two rows beside the replacement's one, permanently, because the
+following runs adopted the replacement oid as the baseline they had never had.
+
+`CatalogWatcher.successful_polls` counts polls that actually read and compared the
+catalog, and a run with zero of them raises `EngineFailure`. Reporting success on an
+unchecked catalog says "I looked and nothing was dropped" when nothing was looked at.
+
+#### A61.3 — the terminal write is bounded at the DATABASE call (MAJOR)
+
+A60.3 bounded the terminal write's wait for the *Python gate* and then called `_execute()`
+anyway — on the same sink the stalled writer holds. DuckDB serialises calls on one
+connection, so the statement simply queued behind the stalled one with no bound at all,
+and the reviewer watched terminalisation still alive at 8 s. The observability sink cannot
+be given a statement timeout, so the bound goes where it can: the terminal call runs on a
+throwaway thread and the run stops waiting for it. Losing the terminal row is bad;
+hanging a run's teardown on a heartbeat is worse.
+
+The commit watchdog also reported "the commit is AMBIGUOUS" when it fired while the
+applier was still waiting for the observability gate — before `COMMIT` had been issued at
+all. It now names the stage, because "the transaction was never committed and will replay
+in full" and "the commit may or may not be durable" send an operator to different places.
