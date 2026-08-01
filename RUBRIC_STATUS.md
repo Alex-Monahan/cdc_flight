@@ -1594,7 +1594,7 @@ a count. Full table in ADR §20/A55.
 78 tests, well under a second, all in the default lane; the five recovery anchors add 17
 more (four of them a real `os._exit` in a child process) in 0.8 s. That is deliberate: a
 guard that only runs when somebody asks for it is not a guard. Measured after round 2:
-**560 default / 9:08** and **95 slow / 20:53**, both green, against a 10-minute
+**562 default / 9:10** and **95 slow / 22:00**, both green, against a 10-minute
 default budget.
 
 #### Why 5, and what a reviewer should push on
