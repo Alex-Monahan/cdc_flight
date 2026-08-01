@@ -472,3 +472,63 @@ def test_a_torn_write_of_the_mark_cannot_erase_the_obligation():
     assert catalog_baseline.read(con, PIPELINE) == catalog_baseline.VALID, (
         "the torn write left no row at all, which reads as `absent` — a trusted state"
     )
+
+
+# --------------------------------------------------------------------------- #
+# the other door into the same defect: a run with no watcher at all
+# --------------------------------------------------------------------------- #
+def test_a_run_with_no_watcher_also_leaves_the_baseline_unconfirmed():
+    """`CDC_DROP_MODE=ignore` is how the precondition gets built in the first place.
+
+    A run with no catalog watcher plainly did not read the catalog, so it cannot claim
+    the registry still describes the source. Without this the same silent inconsistency
+    is reachable without any failure at all: populate under `ignore`, drop and recreate
+    the relation offline, and the next `replicate` run adopts the replacement oid as
+    history exactly as the round-5 defect did.
+    """
+    con = _destination()
+    check = catalog_baseline.mark_unconfirmed(
+        con, pipeline=PIPELINE, dataset=DATASET, reconcile=False
+    )
+    assert check.state == catalog_baseline.STALE
+    assert catalog_baseline.read(con, PIPELINE) == catalog_baseline.STALE
+
+
+def test_a_run_with_no_watcher_marks_but_does_not_ACT():
+    """It has no way to confirm what it would rebuild, so it must not rebuild.
+
+    An ignore-mode pipeline that re-snapshotted its unrelatable relations on every run
+    would re-snapshot the world for ever, and it could never clear the mark it made.
+    """
+    from cdc_flight.destination import tables_awaiting_snapshot
+
+    con = _destination()
+    catalog_baseline.mark_unconfirmed(
+        con, pipeline=PIPELINE, dataset=DATASET, reconcile=False
+    )
+    check = catalog_baseline.mark_unconfirmed(
+        con, pipeline=PIPELINE, dataset=DATASET, reconcile=False
+    )
+    assert check.unreconciled == []
+    assert tables_awaiting_snapshot(con, PIPELINE) == []
+    assert catalog_baseline.read(con, PIPELINE) == catalog_baseline.STALE
+
+
+def test_a_registry_row_written_under_replicate_survives_the_ignore_detour():
+    """The cost lands only where the hole is, which is the argument for doing this.
+
+    A relation that already has a registry row is not a candidate, so a pipeline that
+    has ever run in `replicate` mode reconciles to nothing after an ignore detour and
+    simply promotes back to `valid`. Only relations first materialised while the catalog
+    was switched off are rebuilt, once.
+    """
+    con = _destination(registry_oid=16400)
+    catalog_baseline.mark_unconfirmed(
+        con, pipeline=PIPELINE, dataset=DATASET, reconcile=False
+    )
+    check = catalog_baseline.mark_unconfirmed(con, pipeline=PIPELINE, dataset=DATASET)
+    assert check.unreconciled == []
+    check = catalog_baseline.confirm(
+        con, pipeline=PIPELINE, dataset=DATASET, check=check, successful_polls=1
+    )
+    assert check.valid

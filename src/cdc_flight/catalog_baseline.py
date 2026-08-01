@@ -261,15 +261,32 @@ def _write(con, *, pipeline: str, frm: str, to: str, reason: str, runner_id: str
 
 
 def mark_unconfirmed(
-    con, *, pipeline: str, dataset: str, runner_id: str | None = None
+    con, *, pipeline: str, dataset: str, runner_id: str | None = None,
+    reconcile: bool = True,
 ) -> BaselineCheck:
     """Record, BEFORE the engine starts, that this run has not confirmed the baseline.
 
-    Unconditional for a catalog-enabled run, and that is the whole mechanism: the
-    obligation exists from the first moment the run can fail, so a `SIGKILL`, an
-    `os._exit` from a fault anchor, an unreadable catalog and a clean refusal all leave
-    the same durable statement. `successful_polls` could only ever describe the process
-    that was already dead.
+    Unconditional for **every** run, and that is the whole mechanism: the obligation
+    exists from the first moment the run can fail, so a `SIGKILL`, an `os._exit` from a
+    fault anchor, an unreadable catalog and a clean refusal all leave the same durable
+    statement. `successful_polls` could only ever describe the process that was already
+    dead.
+
+    `reconcile=False` is for a run with **no catalog watcher at all**
+    (`CDC_DROP_MODE=ignore`, or polling switched off). Such a run marks the baseline
+    unconfirmed — it plainly did not read the catalog, so it cannot claim the registry
+    still describes the source — but it must not *act*: it has no way to confirm what it
+    would rebuild, and an ignore-mode pipeline that rebuilt its unrelatable relations on
+    every run would re-snapshot the world for ever.
+
+    This is not a hypothetical door. `CDC_DROP_MODE=ignore` is how a destination comes to
+    hold rows with no relation registry in the first place — it is how the round-5
+    reviewer *built* the precondition — so a run under it must leave the same statement
+    behind as a run whose polls all failed. The cost is bounded and lands only where the
+    hole was: a relation that already has a registry row is not a candidate, so a
+    pipeline that has ever run in `replicate` mode reconciles to nothing and simply
+    promotes back to `valid`. Only relations first materialised while the catalog was
+    switched off are rebuilt, once.
 
     When the baseline read here is already untrusted, the relations that cannot be
     related are computed **now**, from durable state, and the mark is `invalidated`
@@ -278,7 +295,7 @@ def mark_unconfirmed(
     was = read(con, pipeline)
     owed = (
         unrelatable_tables(con, pipeline=pipeline, dataset=dataset)
-        if not trusted(was)
+        if reconcile and not trusted(was)
         else []
     )
     unreconciled = [f"{schema}.{table}" for schema, table, _t in owed]

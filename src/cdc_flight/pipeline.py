@@ -366,15 +366,20 @@ def run(
         # kill, an unreadable catalog and a clean refusal all leave the same statement:
         # `successful_polls` is process memory and could only ever describe the process
         # that was already dead (Codex r5 BLOCKER-1).
+        # It runs for EVERY run, including one with no watcher at all. A run under
+        # `CDC_DROP_MODE=ignore` plainly did not read the catalog, so it cannot claim
+        # the registry still describes the source — and that mode is exactly how a
+        # destination comes to hold rows with no registry in the first place (it is how
+        # the round-5 reviewer built the precondition). It marks, it does not act:
+        # `reconcile=False`, because a run with no watcher cannot confirm what it would
+        # rebuild, and rebuilding every run would re-snapshot the world for ever.
         catalog_cfg = CatalogConfig()
         catalog_enabled = applier_cfg.drop_mode != "ignore" and catalog_cfg.poll_seconds > 0
-        baseline = baseline_mod.BaselineCheck()
-        if catalog_enabled:
-            baseline = baseline_mod.mark_unconfirmed(
-                con, pipeline=dest.pipeline_name, dataset=dest.dataset_name,
-                runner_id=runner_id,
-            )
-            summary_extra.update(baseline.as_dict())
+        baseline = baseline_mod.mark_unconfirmed(
+            con, pipeline=dest.pipeline_name, dataset=dest.dataset_name,
+            runner_id=runner_id, reconcile=catalog_enabled,
+        )
+        summary_extra.update(baseline.as_dict())
 
         interrupted = dest_mod.promote_interrupted_snapshots(con, dest.pipeline_name)
         if interrupted:

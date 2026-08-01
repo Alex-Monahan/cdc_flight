@@ -551,10 +551,9 @@ class RunPhaseWriter:
         with self._sink_lock:
             worker = self._terminal_worker
             if self._sink is None:
-                self.sink_retirement = (
-                    "closed" if self.sink_retirement == "closed"
-                    else ("abandoned" if self._released else self.sink_retirement)
-                )
+                # Never opened, already closed, or released and since closed by the
+                # worker. Every path that clears `_sink` sets the retirement with it, so
+                # there is nothing to decide here and a second `close()` is a no-op.
                 return
         if worker is not None and worker.is_alive():
             worker.join(self.RETIRE_TIMEOUT)

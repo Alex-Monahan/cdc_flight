@@ -3924,6 +3924,16 @@ works, which is the only shape that survives a hard death:
 evidence of an unchecked window, and treating every one as suspect would rebuild every
 existing destination on upgrade. Only a mark this pipeline wrote forbids adoption.
 
+**A run with no watcher marks too, and does not act.** `CDC_DROP_MODE=ignore` (or
+polling switched off) is the *other* door into this defect and the one the reviewer used
+to build the precondition: it is how a destination comes to hold rows with no registry at
+all. Such a run plainly did not read the catalog, so it leaves the same `stale` statement
+behind — but it reconciles nothing, because it has no way to confirm what it would
+rebuild and an ignore-mode pipeline that rebuilt on every run would re-snapshot the world
+for ever. The cost lands only where the hole is: a relation with a registry row is not a
+candidate, so a pipeline that has ever run in `replicate` mode reconciles to nothing after
+an ignore detour and promotes straight back to `valid`.
+
 Two crash cuts across the new edges are real `os._exit` anchors —
 `catalog_baseline_marked` and `catalog_baseline_pre_valid` — and the promotion is
 idempotent rather than one-shot, so the second cut costs a recomputation and nothing
