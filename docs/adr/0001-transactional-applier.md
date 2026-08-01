@@ -3699,3 +3699,14 @@ every check after that point — the undeclared-transition check, the unresolved
 check, and the caller's flush of learned relations — reads state a live poller can still
 mutate. The shipped test drives a real `CatalogWatcher` thread held at a barrier rather
 than a fake whose `stop()` sets the error synchronously.
+
+#### A60.5 — decomposition, again (the third time this branch)
+
+`destination.py` crossed 1,000 lines when the learned-relation flush landed on it. The
+source-relation registry — three functions, one table, one job — is
+`cdc_flight/source_relations.py`, re-exported from `destination` so no caller changes.
+It is a coherent seam rather than an arbitrary cut: `_cdc_flight.source_relations` is the
+only thing that makes a drop-and-recreate detectable across a restart, and A60.1 is
+entirely about who is responsible for making it durable. Current sizes are in
+`RUBRIC_STATUS`, measured; `applier.py` (928) and `resnapshot.py` (926) are the two to
+watch next.

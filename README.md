@@ -202,8 +202,10 @@ Measured on an M-series Mac. Only executed runs are reported here; see
 
 | suite | result | wall clock | measured |
 |---|---|---|---|
-| `make test` (local only) | **557 passed, 0 xfail** | **532.3 s** (8:52) | 2026-07-31, after the round-3 fixes |
-| `make test-slow` | **93 passed** | **1 210.9 s** (20:10) | 2026-07-31, after the round-3 fixes |
+| `make test` (local only) | **560 passed, 0 xfail** | **548.9 s** (9:08) | 2026-07-31, after the round-4 fixes |
+| `make test-slow` | **95 passed** | **1 253.7 s** (20:53) | 2026-07-31, after the round-4 fixes |
+| `make test` (local only) | 557 passed, 0 xfail | 532.3 s (8:52) | 2026-07-31, after the round-3 fixes |
+| `make test-slow` | 93 passed | 1 210.9 s (20:10) | 2026-07-31, after the round-3 fixes |
 | `make test` (local only) | 544 passed, 0 xfail | 532.0 s (8:52) | 2026-07-31, after the round-2 fixes |
 | `make test` (local only) | 529 passed, 0 xfail | 528 s (8:47) | 2026-07-31, after rubric 1.9 + 1.7's first cut |
 | `make test-slow` | **83 passed** | **1 098 s** (18:18) | 2026-07-31, after rubric 1.9 + 1.7's closure |
@@ -224,13 +226,15 @@ Measured on an M-series Mac. Only executed runs are reported here; see
 | `make test-slow` | 9 passed | 179 s (2:58) | 2026-07-31, after the 1.1-1.3 review round |
 | `make test-md` | 12 passed | 155 s (2:34) | 2026-07-31, after the 1.1-1.3 review round |
 
-The default suite is at **8:52 of a 10-minute budget** with **116 more tests than the
-1.6-1.8 round and six seconds more wall clock** (526.0 s then, 532.3 s now). That is not
-luck: the 1.9 rounds added 107 tests that cost about a second in total, because every one
-of them drives the shipped code in-process — the state machines against a DuckDB file in a
-tmp dir, the recovery anchors against an injectable slot drop, and the hard-death cuts
-against a child process that opens the same file. The expensive end-to-end pairing for each
-of them is in `-m slow`, which is now 93 tests in 20:10.
+The default suite is at **9:08 of a 10-minute budget** with **119 more tests than the
+1.6-1.8 round** (526.0 s then, 548.9 s now). Most of the 1.9 rounds' 110 new default tests
+cost about a second in total, because they drive the shipped code in-process — the state
+machines against a DuckDB file in a tmp dir, the recovery anchors against an injectable
+slot drop, the hard-death cuts against a child process that opens the same file. The
+sixteen seconds that did appear are the two-thread `COMMIT_ACK` barrier probes and the real
+catalog-quiescence test, which are wall-clock by construction: they exist to prove a
+timing property, and a timing property cannot be proved instantly. The expensive
+end-to-end pairing for each item is in `-m slow`, now 95 tests in 20:53.
 
 `make test-slow` is 18:18 for 83 tests (was 17:45 for 78): the five new ones are the
 end-to-end pairing for the recovery anchors — a real `cdc-flight` process killed at
