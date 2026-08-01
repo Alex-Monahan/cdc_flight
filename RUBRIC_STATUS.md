@@ -365,9 +365,9 @@ correct assumptions in the notes below:
 | 1.4 | Primary-key update handled correctly | ~~2~~ → **5** | The `d(old)`/`c(new)` pair is one transaction and a commit group holds whole transactions, so the move is atomic by construction. The fold models **physical rows** rather than keys, so a key worn by two rows inside a transaction (or freed and re-taken across two transactions of one group) is expressible; where the before-image cannot attribute a delete the group is refused rather than folded. Five reproduced silent-loss/duplication orderings are now equality tests. |
 | 1.5 | TRUNCATE / DROP propagate | ~~1~~ → **5** | `skipped.operations=none` brings truncates through; **one** dispatcher applies them in every storage mode and each truncate's audit records what *it* removed. `DROP TABLE` is not in the stream, so the source catalog is polled and the action passes six guards before any DDL. A dropped-and-recreated relation is dropped, marked `awaiting_snapshot` and **re-snapshotted automatically on the next run**. Held at 4 through the 1.6-1.8 review because the rebuild machinery could delete a live destination table it had merely not reached; that is closed with positive-evidence emptiness and multi-table proof (ADR §19/A52). A mass drop still needs an operator, deliberately. |
 | 1.6 | Snapshot/backfill consistent with CDC | ~~3~~ → **5** | Postgres's **exported snapshot** makes the boundary an iff, and the fence is on the transaction's **commit** LSN, so a transaction straddling `C` is applied in full rather than lost. Proven with ~200 transactions committing throughout a snapshot — every row on exactly one side. A re-snapshot is complete only when **every requested table** reaches a terminal state: swapped, or verified empty on three independent facts (Debezium's own end-of-snapshot marker, zero records for that table, and a source count of zero). A disagreement between the two readings of `C` is fatal. Proven against a four-table re-snapshot with a keyless table, a genuinely empty table and a concurrent writer. |
-| 1.7 | Failures do not cause correctness issues | ~~1~~ ~~4~~ → **5** | **Eighteen** anchors: eight protocol, five destination (including `destination_commit_late`, the genuinely ambiguous *committed-then-lost-the-answer* case), **five at the acquisition recovery's durable boundaries**, plus a real **network** blackhole injected from outside the process. The matrix is enumerated **from `faults.ALL_POINTS`**, every anchor writes a machine-readable fired record so the outcome class is *derived* from the run rather than read back out of the table, and the chaos harness injects **during recovery** over a shuffled cover of the anchor set. The 4 was an honest hold on one stated gap — the recovery's crash cuts were proven through a test seam rather than an injected `kill -9` — and that gap is closed with a default-lane guard per anchor (0.3 s) and a slow-lane run that kills a real process at `recovery_armed` against a real slot and then compares the whole destination against the whole source. |
+| 1.7 | Failures do not cause correctness issues | ~~1~~ ~~4~~ → **3** | **Eighteen** anchors: eight protocol, five destination (including `destination_commit_late`, the genuinely ambiguous *committed-then-lost-the-answer* case), **five at the acquisition recovery's durable boundaries**, plus a real **network** blackhole injected from outside the process. The matrix is enumerated **from `faults.ALL_POINTS`**, every anchor writes a machine-readable fired record so the outcome class is *derived* from the run rather than read back out of the table, and the chaos harness injects **during recovery** over a shuffled cover of the anchor set. The 4 was an honest hold on one stated gap — the recovery's crash cuts were proven through a test seam rather than an injected `kill -9` — and that gap is closed with a default-lane guard per anchor (0.3 s) and a slow-lane run that kills a real process at `recovery_armed` against a real slot and then compares the whole destination against the whole source. |
 | 1.8 | Externally-advanced slot detected → backfill | ~~1~~ → **5** | Checked on every slot acquisition. Seven decisions trigger an **automatic** re-snapshot: slot ahead, slot missing, slot recreated, source identity changed, **source timeline forked**, source WAL rewound, and an empty destination with a positioned slot. The recovery is a **journalled state machine**: the intent is durable before any mutation, every step is idempotent and re-entrant after a crash at any phase, and a slot that will not drop fails the recovery rather than being logged and stepped over. A **populated** destination with no resume point refuses instead of being rebuilt. Proven by comparing the whole destination against the whole source after a real `pg_replication_slot_advance` and a real `pg_drop_replication_slot`, and by cutting the recovery at every phase boundary. |
-| 1.9 | Consistency-affecting state managed with state machines | **5** (new item) | Four machines and one precedence, each owning exactly one state, declared in one readable file (`cdc_flight/machines.py`) and enforced by a 293-line `states.py` with no dependencies: `table_lifecycle` (durable, `table_state.snapshot_state`, now with a **single writer** the suite greps for), `run_phase` (durable, `_cdc_flight.heartbeat`, the writer ADR §4.8 has specified since rev 1 and never had), `run_outcome` (a **precedence**, so A49's cause-before-symptom rule stops being two copies of a literal tuple), `acquisition_recovery` (durable, edge-checked on top of rev 8's domain check) and `catalog_change` (memory only). Seven further candidates are declined **with the argument written down** — the commit group stays memory-only because a durable machine there would weaken Invariant O, and its sixteen hand-reset fields become one `OpenGroup` instead, so BOTH reset paths are one object replacement rather than two field lists that diverged (the type is a mutable dataclass, so partial mutation is representable — the guarantee is that reset cannot forget a field, and the one intentional partial mutation is the named `discard_units()`). Four measured past bugs are now edges that do not exist. |
+| 1.9 | Consistency-affecting state managed with state machines | **3** (new item) | Four machines and one precedence, each owning exactly one state, declared in one readable file (`cdc_flight/machines.py`) and enforced by a 293-line `states.py` with no dependencies: `table_lifecycle` (durable, `table_state.snapshot_state`, now with a **single writer** the suite greps for), `run_phase` (durable, `_cdc_flight.heartbeat`, the writer ADR §4.8 has specified since rev 1 and never had), `run_outcome` (a **precedence**, so A49's cause-before-symptom rule stops being two copies of a literal tuple), `acquisition_recovery` (durable, edge-checked on top of rev 8's domain check) and `catalog_change` (memory only). Seven further candidates are declined **with the argument written down** — the commit group stays memory-only because a durable machine there would weaken Invariant O, and its sixteen hand-reset fields become one `OpenGroup` instead, so BOTH reset paths are one object replacement rather than two field lists that diverged (the type is a mutable dataclass, so partial mutation is representable — the guarantee is that reset cannot forget a field, and the one intentional partial mutation is the named `discard_units()`). Four measured past bugs are now edges that do not exist. |
 | 2.1 | Added / dropped columns handled | 2 | Adds work correctly; a dropped column silently lingers and reads NULL, indistinguishable from a real NULL. |
 | 2.2 | Renamed columns handled well | 1 | Rename lands as "new column + old column silently goes NULL". No tombstone, no linkage. |
 | 2.3 | New tables and schemas auto-discovered | 1 | Needs `ALTER PUBLICATION` + config change + restart, and pre-existing rows are silently never snapshotted. |
@@ -1204,7 +1204,13 @@ exactly once. What kept it at 3 was the *failure* path — Debezium restarts a s
 scratch, and with an append-style destination the abandoned partial was already there — and
 the absence of any re-snapshot at all.
 
-### 1.7 Failures do not cause correctness issues — ~~1~~ ~~4~~ **5 / 5**
+### 1.7 Failures do not cause correctness issues — ~~1~~ ~~4~~ **3 / 5**
+
+> **NOT MERGED, and moved DOWN from the interim 4.** The 4 was an honest hold on one
+> stated gap, which is now closed. It moved to 3 rather than to 5 because rounds 4 and 5
+> each reproduced a defect the shipped suite did not: the reviewer's probes found them,
+> and a suite that misses those compositions cannot claim "robust injection". See
+> "Why 3 and NOT 5" below.
 
 `duplication possible due to crash=1, impossible but not well tested=3, robust fault injection=5`
 
@@ -1338,14 +1344,19 @@ this a closure rather than a claim:
    left owing work, and the destination equals the source **exactly** on both a keyed and
    a keyless table.
 
-#### Why 5 and what is still true against it
+#### Why 3 and NOT 5 — the score the review loop settled on
 
-The rubric's 5 is "robust injection of failures in testing". The claim is that the anchor
-set is now **enumerated from the code and complete over the durable state machines**: the
-matrix derives itself from `ALL_POINTS`, the `SILENT` bucket is empty *by derivation from
-the run* rather than by spelling, and every durable multi-step sequence in the tree — the
-commit protocol, the destination, the network, and now the acquisition recovery — has an
-anchor at each of its boundaries.
+**Scored 3, against a claim of 5, and the branch is NOT merged.** The anchor set is
+enumerated from the code, the `SILENT` bucket is empty by derivation from the run rather
+than by spelling, every durable multi-step sequence has an anchor at each boundary, and
+the hard-death cuts are real `os._exit` in child processes. That is a large improvement
+and it is still not "robust injection", because across five rounds the reviewer's own
+adversarial probes — not the suite — found each remaining defect: a duplication across an
+all-empty snapshot boundary, a catalog-failure/offline-DDL composition, a terminal-write
+teardown on a serialized sink. A suite that does not find those compositions cannot claim
+the band. The literal 1-band ("duplication is possible") is no longer the accurate
+description — the reproduced duplication is fixed and no crash/replay duplication was
+found — so 3 is the highest defensible band.
 
 Two residual honesty notes: `RECOVERS` and `SILENT` are both empty in practice — every
 injected fault ends in a non-zero exit — so "two permitted outcome classes" is really one
@@ -1473,7 +1484,14 @@ ours, it runs before the engine starts, and it does not depend on Debezium notic
 ---
 
 
-### 1.9 Consistency-affecting state managed with state machines — **5 / 5**
+### 1.9 Consistency-affecting state managed with state machines — **3 / 5**
+
+> **NOT MERGED.** Five thermo-nuclear review rounds ran against this item
+> (`reviews/1.9_codex_review.md`, `_r2`, `_r3`, `_r4`, `_r5`). Round 5 still returned
+> `SATISFIED: no` with 1 BLOCKER and 1 MAJOR, so `feature/1.9-state-machines` stays
+> unmerged and both scores are published at the reviewer's conservative band rather than
+> the claim. What is open is recorded under "Why 3 and NOT 5" below and in
+> `docs/adr/0001-transactional-applier.md` §A62.
 
 `no state machines=1, only 1 big state machine=3, an appropriate number (over 1)=5`
 
@@ -1597,12 +1615,26 @@ guard that only runs when somebody asks for it is not a guard. Measured after ro
 **562 default / 9:10** and **95 slow / 22:00**, both green, against a 10-minute
 default budget.
 
-#### Why 5, and what a reviewer should push on
+#### Why 3 and NOT 5 — the score the review loop settled on
 
-The rubric's 5 is *an appropriate number of state machines (over 1)*. Five machines, each
-owning exactly one state, no two sharing a durable location (asserted), and seven declined
-candidates each with a written argument. The 3-band ("only 1 big state machine") is
-clearly not this, and the 1-band is clearly not this.
+**Scored 3, against a claim of 5, and the branch is NOT merged.** Five review rounds
+(`reviews/1.9_codex_review.md` and `_r2`…`_r5`) held the item to the rubric's word
+**ANY**, and the fifth still found one consistency-affecting state living outside the
+machines. The 1-band ("no state machines") is plainly wrong — there are five machines,
+each owning one state, no two sharing a durable location, with seven declined candidates
+each carrying a written argument — and the 5-band is not defensible while the gap below
+exists. 3 is the highest publishable band.
+
+**The gap, stated as the reviewer reproduced it.** *Catalog-baseline validity* is
+consistency-affecting and is still implicit, spread across four facts: whether the
+destination already owns rows, whether `source_relations` has ever been populated,
+whether THIS run read the catalog, and whether a PREVIOUS run failed to. A run in which
+every catalog poll fails now fails loudly (round 4's fix) — but that failure leaves no
+durable record, so a later healthy run adopts the currently observed `relation_oid` as
+history. If the relation was dropped and recreated in between, the old rows stay beside
+the new ones and every subsequent run reports success. `successful_polls` is process
+memory; the obligation needs to be durable, and closing it properly means a new durable
+state with its own edges — which is the 1.9 work, not a patch.
 
 #### What the first Codex review rejected, and what round 2 changed
 

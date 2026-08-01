@@ -423,8 +423,14 @@ class Applier:
         list in `_reset_after_rollback()` that had to stay in sync with it. Opus MAJOR-1
         is what the divergence cost: the success path reset the group and the failure
         path did not, so a rolled-back group was folded twice and a key-reuse shape lost
-        a row. A partially-reset group is now unrepresentable - there is no field to
-        forget, because there are no fields.
+        a row.
+
+        The precise claim, and it is narrower than the one this docstring used to make
+        (Codex r5 MINOR-2 found the overclaim still here after the ADR and RUBRIC_STATUS
+        were corrected): BOTH reset paths are this one assignment, so neither can forget
+        a field - which is the defect that was measured. `OpenGroup` is a mutable
+        dataclass with public collections, so a partial *mutation* is representable; the
+        one deliberate one is the named `discard_units()`.
         """
         self.group = OpenGroup()
 

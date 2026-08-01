@@ -591,13 +591,22 @@ def complete_if_ready(
             reason=reason,
         )
     clear(con, pipeline=pipeline, namespace=namespace)
+    handoff = (
+        "the destination has a resume point again" if has_resume
+        else "every captured relation was PROVEN empty at the source, so there is no "
+             "resume point and none can exist: the per-relation snapshot_lsn fence is "
+             "the handoff evidence, and the next run is an honest fresh start"
+    )
     log.warning(
-        "rubric 1.8 recovery %s is COMPLETE: every captured table has a fresh image "
-        "and the destination has a resume point again", record.recovery_id,
+        "rubric 1.8 recovery %s is COMPLETE: every captured table has a fresh image and "
+        "%s", record.recovery_id, handoff,
     )
     return Completion(
         cleared=True, recovery_id=record.recovery_id, has_resume_point=has_resume,
-        reason="every captured table reached a terminal lifecycle state",
+        reason=(
+            "every captured table reached a terminal lifecycle state" if has_resume
+            else "every captured table was verified empty at the source"
+        ),
     )
 
 

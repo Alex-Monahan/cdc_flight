@@ -3774,3 +3774,45 @@ The commit watchdog also reported "the commit is AMBIGUOUS" when it fired while 
 applier was still waiting for the observability gate — before `COMMIT` had been issued at
 all. It now names the stage, because "the transaction was never committed and will replay
 in full" and "the commit may or may not be durable" send an operator to different places.
+
+### A62 — the review loop did not converge, and the branch is not merged
+
+`feature/1.9-state-machines` ran a fix → re-review loop against an independent
+thermo-nuclear reviewer: one initial review and four re-reviews
+(`reviews/1.9_codex_review.md`, `_r2`, `_r3`, `_r4`, `_r5`). Round 5 returned
+`SATISFIED: no` with **1 BLOCKER and 1 MAJOR**, so the loop's stop condition was reached
+and the branch was **not merged**. 1.9 is published at **3/5** and 1.7 at **3/5** — the
+reviewer's conservative bands, not the claims.
+
+What the loop bought is worth stating, because it is the argument for running it: across
+five rounds it found and forced fixes for one destructive-ordering blocker
+(`--accept-orphan-offsets` destroying evidence before journalling it), a reset that
+cleared its own journal over a table it had not rebuilt, a heartbeat that could write
+inside the commit→ack window, a run verdict taken over a live catalog poller, a catalog
+baseline that vanished on a quiet run, and — most instructively — **a duplication that one
+of the fixes itself introduced** (A61.1). Four of those were reproduced against a real
+cluster by the reviewer rather than found by the suite.
+
+#### What is still open
+
+1. **Catalog-baseline validity is not durable (BLOCKER).** A run in which every catalog
+   poll fails now fails loudly, but leaves no durable record that a baseline was never
+   established. A later healthy run therefore adopts the currently observed
+   `relation_oid` as history; if the relation was dropped and recreated in between, the
+   old rows survive beside the new ones and every subsequent run reports success.
+   `successful_polls` is process memory. The fix is a **durable** baseline-valid /
+   baseline-invalid state with its own edges, and a forced rebuild of destination-owned
+   relations when it is invalid — which is 1.9 work, not a patch, and is exactly the
+   "consistency-affecting state outside a machine" the item is scored against.
+2. **The terminal heartbeat write does not bound the whole teardown (MAJOR).** The
+   database call is abandoned on a daemon thread after a bound, but `pipeline.run()` then
+   calls `RunPhaseWriter.close()` on the same sink; against a real serialized DuckDB
+   cursor the reviewer measured `close()` blocking behind the abandoned statement. The
+   worker needs an owner and a retirement policy (close the sink from the worker, or
+   discard the connection rather than closing it), and a test that covers
+   `finish()` → `close()` on a genuinely serialized sink.
+
+Neither is a loss path: Invariant O is untouched, the commit→ack ordering is unchanged,
+and no crash/replay duplication was reproduced in round 5. The first is a *silent
+inconsistency after an unchecked catalog*, the second is a *teardown stall*. Both are
+carried forward with the branch.

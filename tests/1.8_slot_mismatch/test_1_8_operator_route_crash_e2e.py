@@ -293,10 +293,19 @@ def test_a_reset_of_an_entirely_empty_source_clears_in_one_run(
     non-convergent, which is a 4.7 failure even though it fails closed (Codex r3
     MAJOR-1, reproduced against six truncated tables).
 
-    `record_empty_handoff` writes the durable position from the fence the emptiness was
-    proven at. That claims nothing untrue: the fence was sampled before the counts, on
-    its own statement, and every captured relation then counted zero under REPEATABLE
-    READ — so no transaction at or below it left a row anywhere in the capture set.
+    The first fix for that wrote a synthetic resume row at the fence the emptiness was
+    proven at. The LSN claim was true and the row was still wrong: an empty offset map is
+    not an offset the connector can resume from, so the next run started Debezium fresh
+    and snapshotted against the SURVIVING slot, delivering concurrently-committed rows
+    twice (Codex r4 BLOCKER-1). What ships instead is the honest state — no resume point
+    at all — accepted by `complete_if_ready` only when every journalled relation was
+    discharged by verified-empty evidence on this run.
+
+    So the steady state for a source that stays entirely empty is a recovery **per run**:
+    each one drops the slot, lets Debezium create its own, snapshots nothing, verifies
+    empty and clears. That is asserted below, because it is the behaviour rather than an
+    accident, and it is what makes the boundary exact (A45). The moment one row exists,
+    an ordinary commit group writes a real resume point and the churn stops.
     """
     box = Sandbox("reset_all_empty", tmp_path_factory.mktemp("sbx_all_empty"), postgres_cluster)
     try:
@@ -326,10 +335,14 @@ def test_a_reset_of_an_entirely_empty_source_clears_in_one_run(
         for target in ("cdcflight_app_customers", "cdcflight_app_documents"):
             assert box.scalar(f"SELECT count(*) FROM {box.table(target)}") == 0
 
-        # ... and the NEXT ordinary run is a plain success, not a re-armed recovery loop.
+        # ... and the NEXT ordinary run is a plain success. It DOES arm and clear another
+        # recovery — with no resume point there is nothing else it honestly could do —
+        # and what matters is that the recovery terminates within the run and leaves
+        # nothing armed behind it.
         again = box.run(max_seconds=180)
         assert again["ok"] is True, again
         assert not again.get("recovery_still_armed"), again
+        assert box.duck_query("SELECT count(*) FROM _cdc_flight.recovery_state")[0][0] == 0
 
         # ... and CDC works from there, INCLUDING against a writer racing the next run's
         # snapshot/stream boundary. This is the shape that caught the first attempt at
