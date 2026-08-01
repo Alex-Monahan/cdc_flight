@@ -66,6 +66,8 @@ class FakeHandler:
         self.error = None
         self.busy = False
         self.seconds_since_last_batch = 0.0
+        self.lifecycle: list[str] = []
+        self.quiesced = True
 
     def snapshot_counts(self):
         return {}
@@ -73,7 +75,15 @@ class FakeHandler:
     # The applier's surface: the supervisor discards the un-ENDed tail at
     # shutdown (ADR 0001 §3.2) and folds the applier's counters into the summary.
     def drain_on_shutdown(self):
+        self.lifecycle.append("drain")
         return 0
+
+    def shutdown(self, *, reason="supervisor_shutdown"):
+        self.lifecycle.append(f"seal:{reason}")
+
+    def wait_for_quiescence(self, timeout):
+        self.lifecycle.append("wait_for_quiescence")
+        return self.quiesced
 
     def stats(self):
         return {}
@@ -137,6 +147,31 @@ def test_close_is_marked_intentional_on_a_clean_stop():
     summary = run_engine_bounded(engine, handler, _run_cfg())
     assert summary["stop_reason"] == "idle"
     assert engine.closed_intentional is True
+
+
+def test_a_non_quiescent_callback_keeps_ownership_and_is_not_drained():
+    """Round 8 MAJOR-1: a timeout is not permission to share the connection.
+
+    Once callback admission is sealed, an already-admitted callback may still own the
+    destination.  If it cannot be proved gone, the supervisor must leave the entire
+    applier runtime alone for the hard-failure path; rollback/drain on the supervisor
+    thread would race data/state work on the callback thread.
+    """
+    handler = FakeHandler()
+    handler.quiesced = False
+
+    with pytest.raises(EngineFailure) as excinfo:
+        run_engine_bounded(
+            FakeEngine(), handler, _run_cfg(close_timeout=0.01),
+            engine_terminates_normally=True,
+        )
+
+    assert handler.lifecycle == [
+        "seal:supervisor_shutdown",
+        "wait_for_quiescence",
+    ]
+    assert excinfo.value.summary["applier_quiesced"] is False
+    assert excinfo.value.summary["destination_owner"] == "live_applier_callback"
 
 
 # --------------------------------------------------------------------------- #

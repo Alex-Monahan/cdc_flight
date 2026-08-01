@@ -89,6 +89,7 @@ def run_engine_bounded(
     error_box: list[BaseException] = []
     final_poll_done = False
     quiesced = True
+    applier_quiesced = True
     drain_until = 0.0
     catalog_unresolved: list[str] = []
 
@@ -185,26 +186,16 @@ def run_engine_bounded(
         else:
             outcome.record("engine_finished")
     finally:
+        # Seal admission BEFORE shutdown does anything that can touch the destination.
+        # New callbacks are now recorded no-ops. An already-admitted callback still owns
+        # the connection until `wait_for_quiescence()` proves it has left.
+        handler.shutdown(reason="supervisor_shutdown")
         intentional = (
             outcome.value != "engine_error" and handler.error is None and not error_box
         )
         log.info(
             "closing debezium engine (reason=%s, intentional=%s)", outcome.value, intentional
         )
-        if phases is not None:
-            # The one phase transition the supervisor owns: the engine has stopped
-            # producing and is being shut down. Written on the heartbeat's own
-            # connection, never inside a commit group.
-            #
-            # Guarded because this is a `finally`: an exception raised here would
-            # REPLACE whatever failure is already in flight, and an observability write
-            # must never be able to do that. The machine still records the illegal edge
-            # in the log, where a test can find it.
-            try:
-                phases.to(PHASE_DRAINING, detail=f"stop_reason={outcome.value}")
-            except Exception:  # pragma: no cover - the edge is declared
-                log.error("could not record the draining phase", exc_info=True)
-
         closer = threading.Thread(
             target=engine.close,
             kwargs={"intentional": intentional},
@@ -227,6 +218,15 @@ def run_engine_bounded(
             log.error("debezium engine thread did not stop within 60s")
             close_hung = True
             outcome.record("hung")
+        applier_quiesced = handler.wait_for_quiescence(timeout=run.close_timeout)
+        if not applier_quiesced:
+            log.error(
+                "an admitted Debezium callback did not leave within %ss; retaining the "
+                "destination runtime for that callback and refusing teardown",
+                run.close_timeout,
+            )
+            close_hung = True
+            outcome.record("hung")
         if catalog is not None:
             # QUIESCED BEFORE ANY VERDICT IS TAKEN (Codex r2 MAJOR-3), and quiescence is
             # now something we PROVE rather than something `stop()` attempts (Codex r3
@@ -236,12 +236,20 @@ def run_engine_bounded(
             # whether the thread is actually dead, and a false is a failed run — see the
             # `catalog_quiesced` check after the summary is built.
             quiesced = catalog.stop()
+        if applier_quiesced and phases is not None:
+            # This cursor is a child of the applier's parent connection. It is safe to
+            # write `draining` only after the callback boundary is quiescent.
+            try:
+                phases.to(PHASE_DRAINING, detail=f"stop_reason={outcome.value}")
+            except Exception:  # pragma: no cover - the edge is declared
+                log.error("could not record the draining phase", exc_info=True)
         # ADR 0001 §3.2: the un-ENDed tail is DISCARDED, never guessed at. It is
         # safe to discard precisely because Invariant O means the offset store
         # still points before it, so it replays on the next run.
-        discarded = handler.drain_on_shutdown()
-        if discarded:
-            log.info("discarded %s un-committed tail events at shutdown", discarded)
+        if applier_quiesced:
+            discarded = handler.drain_on_shutdown()
+            if discarded:
+                log.info("discarded %s un-committed tail events at shutdown", discarded)
 
     summary = {
         "stop_reason": outcome.value,
@@ -258,6 +266,9 @@ def run_engine_bounded(
         # Recorded even when it is not the reported reason, because "we could not shut
         # the engine down" is operationally interesting whatever caused it.
         summary["close_hung"] = True
+    summary["applier_quiesced"] = applier_quiesced
+    if not applier_quiesced:
+        summary["destination_owner"] = "live_applier_callback"
     if source_dark_after is not None:
         # The number RUBRIC_STATUS's `CDC_SOURCE_DARK_SECONDS` claim rests on, measured
         # at the moment of detection rather than inferred from when the process happened
@@ -270,6 +281,13 @@ def run_engine_bounded(
         summary["suppressed_engine_message"] = engine.suppressed_message
 
     failure = engine.failure
+    if not applier_quiesced:
+        raise EngineFailure(
+            "an admitted Debezium callback did not quiesce after callback admission "
+            "was sealed; the live callback retains exclusive ownership of the destination "
+            "runtime and teardown is refused",
+            summary,
+        )
     if error_box or handler.error is not None or failure is not None:
         cause = error_box[0] if error_box else handler.error
         # OUR exception is the root cause; Debezium's is the consequence. It used to

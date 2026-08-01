@@ -177,7 +177,12 @@ class Applier:
 
         self._committer = None
         self._lock = threading.Lock()
+        self._quiescence = threading.Condition(self._lock)
         self._in_flight = 0
+        self._callback_sealed = False
+        self._callback_seal_reason: str | None = None
+        self._callback_batches_rejected = 0
+        self._callback_records_rejected = 0
         self.last_batch_at = time.monotonic()
 
         # -- counters surfaced in the run summary (rubric 6.1) --------------- #
@@ -223,6 +228,12 @@ class Applier:
             return self._in_flight > 0
 
     @property
+    def callback_quiesced(self) -> bool:
+        """True only when admission is sealed and every admitted callback has left."""
+        with self._lock:
+            return self._callback_sealed and self._in_flight == 0
+
+    @property
     def seconds_since_last_batch(self) -> float:
         with self._lock:
             return time.monotonic() - self.last_batch_at
@@ -263,6 +274,14 @@ class Applier:
             "resnapshot_discarded_events": self.resnapshot_discarded_events,
             "ambiguous_resnapshots_queued": self.ambiguous_resnapshots_queued,
             "snapshot_consistent_lsn": self.last_snapshot_lsn,
+            # Round 8 MAJOR-1: this is the callback/connection ownership proof. A late
+            # callback after the seal is a recorded no-op and can never decode, write,
+            # mutate replay state, or acknowledge Debezium.
+            "callback_boundary": "sealed" if self._callback_sealed else "open",
+            "callback_seal_reason": self._callback_seal_reason,
+            "callback_batches_rejected": self._callback_batches_rejected,
+            "callback_records_rejected": self._callback_records_rejected,
+            "callback_quiesced": self.callback_quiesced,
             **self.catalog_coordinator.summary(),
             **(self.catalog.summary() if self.catalog is not None else {}),
         }
@@ -285,14 +304,46 @@ class Applier:
             ):
                 self.group.close_requested = True
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, reason: str = "supervisor_shutdown") -> None:
+        """Seal callback admission and stop the age timer.
+
+        This is a lifecycle boundary, not merely timer cleanup. Once it returns, a new
+        Debezium callback is a recorded no-op. An already-admitted callback may still be
+        using ``con``; callers must prove :attr:`callback_quiesced` (or call
+        :meth:`wait_for_quiescence`) before drain, lease release, or handle retirement.
+        """
+        with self._quiescence:
+            if not self._callback_sealed:
+                self._callback_sealed = True
+                self._callback_seal_reason = reason
+            self._quiescence.notify_all()
         self._timer_stop.set()
+
+    def wait_for_quiescence(self, timeout: float) -> bool:
+        """Wait at most ``timeout`` for every callback admitted before the seal."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._quiescence:
+            while not (self._callback_sealed and self._in_flight == 0):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._quiescence.wait(remaining)
+            return True
 
     # ------------------------------------------------------------------ #
     # the Debezium callback
     # ------------------------------------------------------------------ #
     def handle_batch(self, records, committer) -> None:
-        with self._lock:
+        with self._quiescence:
+            if self._callback_sealed:
+                self._callback_batches_rejected += 1
+                self._callback_records_rejected += len(records)
+                log.error(
+                    "rejected a Debezium callback containing %s record(s): the callback "
+                    "boundary is sealed (%s)",
+                    len(records), self._callback_seal_reason,
+                )
+                return
             self._in_flight += 1
         try:
             self._handle(records, committer)
@@ -300,9 +351,11 @@ class Applier:
             self.error = exc
             raise
         finally:
-            with self._lock:
+            with self._quiescence:
                 self._in_flight -= 1
                 self.last_batch_at = time.monotonic()
+                if self._in_flight == 0:
+                    self._quiescence.notify_all()
 
     # pydbzengine compatibility, used only if something calls the old shape.
     def handleJsonBatch(self, records):  # pragma: no cover - not the live path
@@ -936,5 +989,4 @@ def _epoch_ms(value) -> Any:
     from datetime import UTC, datetime
 
     return datetime.fromtimestamp(value / 1000.0, tz=UTC)
-
 

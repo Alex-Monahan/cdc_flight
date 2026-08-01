@@ -181,6 +181,12 @@ class _Handler:
     def drain_on_shutdown(self) -> int:
         return 0
 
+    def shutdown(self, *, reason="supervisor_shutdown") -> None:
+        pass
+
+    def wait_for_quiescence(self, timeout: float) -> bool:
+        return True
+
 
 class _Engine:
     failure = None

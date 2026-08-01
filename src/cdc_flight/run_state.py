@@ -323,6 +323,10 @@ class RunPhaseWriter:
         #: The one worker the terminal write may be handed to, and the lock that makes
         #: the hand-off and the retirement a single decision rather than a check-then-act.
         self._terminal_worker: threading.Thread | None = None
+        #: Updated under `_sink_lock`. Thread liveness is not ownership: a worker can
+        #: still be alive after its final release check. Completion and the release
+        #: decision therefore form one atomic handoff.
+        self._terminal_worker_completed = True
         self._sink_lock = threading.Lock()
         #: True once the writer has given the cursor up. The worker reads it to decide
         #: whether IT is now responsible for closing.
@@ -477,7 +481,6 @@ class RunPhaseWriter:
                         return
                     self._execute(phase, insert=insert)
             finally:
-                done.set()
                 # If the run has already retired the sink, this thread is now its only
                 # owner and closing it is this thread's job. Under the lock, so
                 # "has it been released?" and "close it" are one decision.
@@ -486,6 +489,8 @@ class RunPhaseWriter:
                         sink, self._sink = self._sink, None
                     else:
                         sink = None
+                    self._terminal_worker_completed = True
+                done.set()
                 if sink is not None:
                     try:
                         sink.close()
@@ -498,9 +503,10 @@ class RunPhaseWriter:
             # ONE owner at a time. A previous write that never returned still holds the
             # cursor, so a second worker would queue behind it on the same handle and
             # the bound would be a bound on starting a thread rather than on the write.
-            busy = self._terminal_worker is not None and self._terminal_worker.is_alive()
+            busy = self._terminal_worker is not None and not self._terminal_worker_completed
             if not busy:
                 self._terminal_worker = worker
+                self._terminal_worker_completed = False
         if busy:
             self.phase_writes_abandoned += 1
             if terminal:
@@ -625,7 +631,7 @@ class RunPhaseWriter:
             worker.join(self.RETIRE_TIMEOUT)
         with self._sink_lock:
             sink = self._sink
-            if worker is not None and worker.is_alive():
+            if worker is not None and not self._terminal_worker_completed:
                 # Hand ownership over rather than racing it. `_released` is what tells
                 # the worker that closing is now its job.
                 self._released = True

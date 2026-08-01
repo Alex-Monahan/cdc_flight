@@ -133,6 +133,7 @@ def run(
     lease: Lease | None = None
     lease_held = False
     phases: RunPhaseWriter | None = None
+    applier: Applier | None = None
     run_ok = False
     #: The run's ONE outcome, shared by the supervisor, the terminal `RUN_PHASE`
     #: transition and the returned summary (Codex r1 MAJOR-2). `RunOutcome` refuses a
@@ -776,51 +777,71 @@ def run(
             exc.summary = reported
         raise
     finally:
-        # The lease is now acquired much earlier - rubric 1.8's recovery mutates
-        # destination state and must not race a second runner - so releasing it has to
-        # move out here with it. `lease_held` rather than `lease is not None`: a run that
-        # failed to acquire must not delete the incumbent's row.
-        # Guarded, all of it: this is the outermost `finally`, and an observability
-        # write that raises here would replace the run's real failure with a
-        # bookkeeping one.
-        if phases is not None:
-            try:
-                phases.ensure(PHASE_STOPPING)
-            except Exception:  # pragma: no cover - every phase declares `-> stopping`
-                log.error("could not record the stopping phase", exc_info=True)
-        if lease_held and lease is not None:
-            lease.release(con)
-        if phases is not None:
-            try:
-                phases.finish(ok=run_ok)
-            except Exception:  # pragma: no cover
-                log.error("could not record the terminal run phase", exc_info=True)
-            # TERMINALISE, RETIRE THE SINK, *THEN* REPORT (Codex r1 MAJOR-2 open
-            # question 6, extended by r5 MAJOR-1). The summary used to be sampled before
-            # the `stopping`/`stopped` transitions, so every successful run shipped
-            # `run_phase="draining"`. It is now also sampled AFTER `close()`, because
-            # how the heartbeat sink was retired — closed, or abandoned to a terminal
-            # write that never returned — is only known once it has been retired, and an
-            # abandoned terminal write means `last_run.json` is the only record that
-            # this run terminalised at all.
-            try:
-                phases.close()
-            except Exception:  # pragma: no cover - retirement is fully guarded already
-                log.error("could not retire the heartbeat sink", exc_info=True)
+        # A non-quiescent callback retains the whole destination runtime. Touching the
+        # heartbeat cursor, lease, or parent handle here would recreate the Round 8
+        # ownership race. `main()` takes the hard-exit path; library callers receive the
+        # failure while the live owner remains the only thread allowed to use `con`.
+        destination_quiescent = applier is None or applier.callback_quiesced
+        if not destination_quiescent:
             if reported is not None:
-                reported.update(phases.summary())
-        # ...and the PARENT connection is retired the same way, because it is the same
-        # wait one level out (Codex r6 MAJOR-1). The heartbeat cursor is a child of this
-        # handle, so a terminal write nobody could stop also blocks `con.close()` — the
-        # reviewer measured the writer retiring correctly at 7.005 s and the process
-        # still alive with no exit code at 12 s, stuck right here. Bounded, the run gets
-        # to finish tearing down, `main()` gets to write `last_run.json`, and the exit
-        # code the run earned is the exit code it delivers.
-        release = dest_mod.release_connection(con)
-        if reported is not None:
-            reported["destination_connection_release"] = release.state
-            if release.error is not None:
-                reported["destination_connection_close_error"] = release.error
+                if phases is not None:
+                    reported.update(phases.summary())
+                reported["destination_connection_release"] = "abandoned"
+                reported["destination_connection_release_reason"] = (
+                    "live_applier_callback"
+                )
+                reported["heartbeat_sink_retirement"] = "abandoned"
+                reported["heartbeat_sink_retirement_reason"] = "live_applier_callback"
+            log.critical(
+                "destination teardown skipped: a live applier callback retains exclusive "
+                "ownership; the command entrypoint will hard-exit"
+            )
+        else:
+            # The lease is now acquired much earlier - rubric 1.8's recovery mutates
+            # destination state and must not race a second runner - so releasing it has to
+            # move out here with it. `lease_held` rather than `lease is not None`: a run that
+            # failed to acquire must not delete the incumbent's row.
+            # Guarded, all of it: this is the outermost `finally`, and an observability
+            # write that raises here would replace the run's real failure with a
+            # bookkeeping one.
+            if phases is not None:
+                try:
+                    phases.ensure(PHASE_STOPPING)
+                except Exception:  # pragma: no cover - every phase declares `-> stopping`
+                    log.error("could not record the stopping phase", exc_info=True)
+            if lease_held and lease is not None:
+                lease.release(con)
+            if phases is not None:
+                try:
+                    phases.finish(ok=run_ok)
+                except Exception:  # pragma: no cover
+                    log.error("could not record the terminal run phase", exc_info=True)
+                # TERMINALISE, RETIRE THE SINK, *THEN* REPORT (Codex r1 MAJOR-2 open
+                # question 6, extended by r5 MAJOR-1). The summary used to be sampled before
+                # the `stopping`/`stopped` transitions, so every successful run shipped
+                # `run_phase="draining"`. It is now also sampled AFTER `close()`, because
+                # how the heartbeat sink was retired — closed, or abandoned to a terminal
+                # write that never returned — is only known once it has been retired, and an
+                # abandoned terminal write means `last_run.json` is the only record that
+                # this run terminalised at all.
+                try:
+                    phases.close()
+                except Exception:  # pragma: no cover - retirement is fully guarded already
+                    log.error("could not retire the heartbeat sink", exc_info=True)
+                if reported is not None:
+                    reported.update(phases.summary())
+            # ...and the PARENT connection is retired the same way, because it is the same
+            # wait one level out (Codex r6 MAJOR-1). The heartbeat cursor is a child of this
+            # handle, so a terminal write nobody could stop also blocks `con.close()` — the
+            # reviewer measured the writer retiring correctly at 7.005 s and the process
+            # still alive with no exit code at 12 s, stuck right here. Bounded, the run gets
+            # to finish tearing down, `main()` gets to write `last_run.json`, and the exit
+            # code the run earned is the exit code it delivers.
+            release = dest_mod.release_connection(con)
+            if reported is not None:
+                reported["destination_connection_release"] = release.state
+                if release.error is not None:
+                    reported["destination_connection_close_error"] = release.error
 
 
 def shutdown_and_exit(code: int = 0, timeout: float = 15.0) -> None:

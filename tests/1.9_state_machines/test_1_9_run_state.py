@@ -16,6 +16,7 @@ In-process, DuckDB in a tmp dir, no engine.
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 import sys
 import threading
@@ -915,6 +916,66 @@ def test_an_abandoned_sink_is_released_rather_than_closed(wedged):
             break
         time.sleep(0.02)
     assert cursor.closed, "nobody ever closed the released cursor"
+
+
+class _CloseCountingCursor:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def execute(self, *_a, **_k):
+        return self
+
+    def close(self):
+        self.close_calls += 1
+
+
+def test_terminal_worker_cannot_miss_the_release_handoff():
+    """Round 8 MINOR-1: pin the post-check/pre-thread-exit ownership boundary.
+
+    The worker is paused after deciding the cursor was not released but before leaving
+    its function.  Thread liveness still says "busy" at that instant; ownership state
+    must make ``close()`` hand the cursor back in a way the worker cannot miss.
+    """
+    cursor = _CloseCountingCursor()
+    phases = RunPhaseWriter(
+        _CursorConnection(cursor), pipeline=PIPELINE, runner_id=RUNNER
+    )
+    phases.RETIRE_TIMEOUT = 0.02
+    paused = threading.Event()
+    resume = threading.Event()
+    source, first_line = inspect.getsourcelines(RunPhaseWriter._execute_bounded)
+    handoff_line = first_line + next(
+        index for index, line in enumerate(source) if "if sink is not None:" in line
+    )
+
+    def trace(frame, event, _arg):
+        if (
+            event == "line"
+            and frame.f_code.co_filename.endswith("cdc_flight/run_state.py")
+            and frame.f_code.co_name == "_run"
+            and frame.f_lineno == handoff_line
+            and frame.f_locals.get("sink", object()) is None
+        ):
+            paused.set()
+            resume.wait(2)
+        return trace
+
+    threading.settrace(trace)
+    try:
+        phases.finish(ok=False)
+        assert paused.wait(1), "the worker did not reach the terminal ownership handoff"
+        phases.close()
+        assert phases.sink_retirement == "closed"
+    finally:
+        resume.set()
+        threading.settrace(None)
+
+    worker = phases._terminal_worker
+    assert worker is not None
+    worker.join(1)
+    assert not worker.is_alive()
+    assert cursor.close_calls == 1, "neither side closed the cursor at the handoff boundary"
+    assert phases._sink is None
 
 
 def test_an_abandoned_terminal_write_is_recorded_in_the_summary(wedged):
