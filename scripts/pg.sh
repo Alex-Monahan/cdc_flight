@@ -64,6 +64,12 @@ max_replication_slots = 20
 max_wal_senders = 20
 max_logical_replication_workers = 8
 
+# This cluster is disposable test infrastructure. Keep logical decoding enabled,
+# but avoid durability work whose only consumer is a throwaway test database.
+fsync = off
+synchronous_commit = off
+full_page_writes = off
+
 # Keep the dev cluster small & chatty enough to debug
 shared_buffers = 256MB
 logging_collector = off
@@ -119,11 +125,10 @@ cmd_psql() {
 
 cmd_seed() {
   echo "Applying schema + seed data to ${PGDATABASE_NAME}..."
-  for f in "${PROJECT_DIR}"/sql/0*.sql; do
-    echo "  -> $(basename "$f")"
-    "${PGBIN}/psql" -h "${PGDATA}" -p "${PGPORT}" -U "${PGUSER}" -d "${PGDATABASE_NAME}" \
-      -v ON_ERROR_STOP=1 -q -f "$f"
-  done
+  echo "  -> 01_schema.sql + 02_seed.sql (one transaction)"
+  "${PGBIN}/psql" -h "${PGDATA}" -p "${PGPORT}" -U "${PGUSER}" -d "${PGDATABASE_NAME}" \
+    -v ON_ERROR_STOP=1 -q --single-transaction \
+    -f "${PROJECT_DIR}/sql/01_schema.sql" -f "${PROJECT_DIR}/sql/02_seed.sql"
   echo "Seed complete."
 }
 
