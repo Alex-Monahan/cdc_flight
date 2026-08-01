@@ -14,7 +14,6 @@ import json
 import logging
 import os
 import socket
-import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -24,8 +23,9 @@ from typing import Any
 from . import faults, table_lifecycle
 from .control_schema import CONTROL_DDL, ensure_control_schema
 from .errors import LeaseLost
-from .machines import CONNECTION_RETIREMENT, LIFECYCLE_DURABLE_VALUES, SLOT_VERDICTS
+from .machines import LIFECYCLE_DURABLE_VALUES, SLOT_VERDICTS
 from .naming import quote
+from .retirement import RetirementResult, retire_handle
 
 # Re-exported: `source_relations.py` is a split of this module, not a new dependency
 # for its callers (Codex r3 MINOR / the 1,000-line threshold).
@@ -877,8 +877,8 @@ class Lease:
 # --------------------------------------------------------------------------- #
 # ADR §14.1 — is DROP/RENAME transactional at this destination?
 # --------------------------------------------------------------------------- #
-def release_connection(con, *, timeout: float = 5.0) -> str:
-    """Close the destination connection under a BOUND. Returns a `CONNECTION_RETIREMENT`.
+def release_connection(con, *, timeout: float = 5.0) -> RetirementResult:
+    """Close the destination connection under the canonical bounded protocol.
 
     The same protocol `RunPhaseWriter.close()` uses, one level out, and it is here for
     the same measured reason (Codex r6 MAJOR-1). Round 5 found the heartbeat *cursor*
@@ -896,27 +896,12 @@ def release_connection(con, *, timeout: float = 5.0) -> str:
     destination; refusing to *exit* over it turns an observability problem into an
     availability one.
     """
-    if con is None:  # pragma: no cover - defensive
-        return "never_opened"
-    done = threading.Event()
-
-    def _close() -> None:
-        try:
-            con.close()
-        except Exception:  # pragma: no cover - a handle that was already broken
-            log.debug("closing the destination connection failed", exc_info=True)
-        finally:
-            done.set()
-
-    threading.Thread(target=_close, name="cdc-destination-close", daemon=True).start()
-    if done.wait(timeout):
-        return CONNECTION_RETIREMENT.parse("closed")
-    log.error(
-        "the destination connection did not close within %.1fs; RELEASING it and "
-        "finishing this run's teardown rather than blocking the process on a handle "
-        "some other statement still owns", timeout,
+    return retire_handle(
+        con,
+        timeout=timeout,
+        thread_name="cdc-destination-close",
+        description="the destination connection",
     )
-    return CONNECTION_RETIREMENT.parse("abandoned")
 
 
 def probe_transactional_ddl(con) -> bool:

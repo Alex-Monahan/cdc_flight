@@ -818,7 +818,9 @@ def run(
         # code the run earned is the exit code it delivers.
         release = dest_mod.release_connection(con)
         if reported is not None:
-            reported["destination_connection_release"] = release
+            reported["destination_connection_release"] = release.state
+            if release.error is not None:
+                reported["destination_connection_close_error"] = release.error
 
 
 def shutdown_and_exit(code: int = 0, timeout: float = 15.0) -> None:

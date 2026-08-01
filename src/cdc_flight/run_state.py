@@ -70,6 +70,7 @@ from .machines import (
     RUN_OUTCOME,
     RUN_PHASE,
 )
+from .retirement import retire_handle
 from .states import IllegalTransition
 
 log = logging.getLogger("cdc_flight.run_state")
@@ -276,8 +277,8 @@ class RunPhaseWriter:
     * the writer owns it for every ordinary phase write, on the caller's thread;
     * for the **terminal** write it hands the cursor to one named worker thread and
       waits `TERMINAL_WRITE_TIMEOUT`;
-    * `close()` **retires** it: join the worker for `RETIRE_TIMEOUT`, then either close
-      the cursor (the worker is gone, so nobody else holds it) or *release* it —
+    * `close()` **retires** it: join the writer for `RETIRE_TIMEOUT`, then either hand
+      an idle cursor to the canonical bounded close worker or *release* a busy one —
       `CONNECTION_RETIREMENT` records which. A released cursor is closed by the worker
       if it ever finishes, and dies with the process if it does not. It is a daemon
       thread, so it can never hold the process open.
@@ -299,9 +300,9 @@ class RunPhaseWriter:
     #: costs the run. `stopping` is written by `pipeline.run()`'s own `finally`, so an
     #: unbounded write here stalls a teardown before the terminal bound is ever reached.
     PHASE_WRITE_TIMEOUT = 2.0
-    #: How long `close()` waits for an abandoned terminal write before releasing the
-    #: cursor unclosed. Short on purpose: by here the run has its verdict and the only
-    #: thing left to lose is a timestamp.
+    #: How long `close()` waits for either a live write worker or the cursor's own close
+    #: call before releasing the handle. Short on purpose: by here the run has its
+    #: verdict and the only thing left to lose is a timestamp.
     RETIRE_TIMEOUT = 2.0
 
     def __init__(
@@ -335,6 +336,8 @@ class RunPhaseWriter:
         self.terminal_write_abandoned = False
         #: One value from `machines.CONNECTION_RETIREMENT`, carried into `last_run.json`.
         self.sink_retirement = "never_opened"
+        #: Populated only when ``close()`` returned by raising, never on a timeout.
+        self.sink_close_error: str | None = None
         try:
             self._sink = con.cursor()
             self.independent = True
@@ -589,6 +592,8 @@ class RunPhaseWriter:
             out["heartbeat_sink_retirement"] = CONNECTION_RETIREMENT.parse(
                 self.sink_retirement
             )
+            if self.sink_close_error is not None:
+                out["heartbeat_sink_close_error"] = self.sink_close_error
         if self.outcome.refusals:
             # A49's guard, as evidence rather than as a comment.
             out["outcome_downgrades_refused"] = [
@@ -599,10 +604,11 @@ class RunPhaseWriter:
     def close(self) -> None:
         """Retire the sink under a bound. Never blocks the process indefinitely.
 
-        The three outcomes are the whole of `machines.CONNECTION_RETIREMENT`:
+        The four outcomes are the whole of `machines.CONNECTION_RETIREMENT`:
 
         * `never_opened` — there was no independent connection to give up;
         * `closed` — nobody else held the cursor, so it was closed properly;
+        * `failed` — the close returned by raising, with the error in the summary;
         * `abandoned` — a terminal write still owns it. It is **released, not closed**,
           because `cursor.close()` blocks behind the statement in flight and closing a
           cursor another thread is executing on is the race, not the fix. The worker
@@ -635,8 +641,11 @@ class RunPhaseWriter:
         if sink is None:  # pragma: no cover - the worker closed it between the checks
             self.sink_retirement = "abandoned"
             return
-        try:
-            sink.close()
-        except Exception:  # pragma: no cover
-            log.debug("closing the heartbeat connection failed", exc_info=True)
-        self.sink_retirement = "closed"
+        retired = retire_handle(
+            sink,
+            timeout=self.RETIRE_TIMEOUT,
+            thread_name="cdc-heartbeat-close",
+            description="the heartbeat sink",
+        )
+        self.sink_retirement = retired.state
+        self.sink_close_error = retired.error

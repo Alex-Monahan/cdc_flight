@@ -486,6 +486,7 @@ CONNECTION_RETIREMENT = Domain(
     values=(
         "never_opened",   # no such connection was ever obtained
         "closed",         # it came free within the bound and was closed
+        "failed",         # close returned by raising; the error is reported
         "abandoned",      # work still owned it; it was released, not closed
     ),
     purpose=(

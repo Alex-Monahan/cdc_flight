@@ -956,6 +956,87 @@ def test_an_ordinary_run_closes_its_sink_and_says_so(con):
     COMMIT_ACK.reset()
 
 
+class _IdleWedgedCloseCursor:
+    """Every statement returns; only resource retirement wedges."""
+
+    def __init__(self, release: threading.Event) -> None:
+        self.release = release
+        self.close_started = threading.Event()
+
+    def execute(self, *_a, **_k):
+        return self
+
+    def close(self):
+        self.close_started.set()
+        self.release.wait(30)
+
+
+class _CursorConnection:
+    def __init__(self, cursor) -> None:
+        self.cursor_obj = cursor
+
+    def cursor(self):
+        return self.cursor_obj
+
+
+def test_an_idle_cursor_whose_close_wedges_cannot_hang_teardown():
+    """The close call itself is covered by CONNECTION_RETIREMENT's bound.
+
+    A completed heartbeat write leaves no live write worker. That ownership state used
+    to call ``cursor.close()`` synchronously, so a driver-level close that wedged could
+    still hold the pipeline thread forever even though every SQL statement returned.
+    """
+    release = threading.Event()
+    cursor = _IdleWedgedCloseCursor(release)
+    phases = RunPhaseWriter(
+        _CursorConnection(cursor), pipeline=PIPELINE, runner_id=RUNNER
+    )
+    phases.RETIRE_TIMEOUT = 0.05
+    returned = threading.Event()
+
+    closer = threading.Thread(
+        target=lambda: (phases.close(), returned.set()), daemon=True
+    )
+    closer.start()
+    try:
+        assert cursor.close_started.wait(0.5), "the retirement never attempted close()"
+        assert returned.wait(0.5), "an idle cursor's close() held teardown without a bound"
+        assert phases.sink_retirement == "abandoned"
+    finally:
+        release.set()
+        closer.join(1)
+
+
+class _BrokenCloseCursor:
+    def execute(self, *_a, **_k):
+        return self
+
+    def close(self):
+        raise RuntimeError("cursor close exploded")
+
+
+def test_a_heartbeat_close_exception_is_failed_and_reported():
+    phases = RunPhaseWriter(
+        _CursorConnection(_BrokenCloseCursor()), pipeline=PIPELINE, runner_id=RUNNER
+    )
+    phases.close()
+
+    assert phases.sink_retirement == "failed"
+    assert "cursor close exploded" in phases.summary()["heartbeat_sink_close_error"]
+
+
+class _BrokenCloseConnection:
+    def close(self):
+        raise RuntimeError("connection close exploded")
+
+
+def test_a_parent_close_exception_is_failed_and_reported():
+    result = dest_mod.release_connection(_BrokenCloseConnection(), timeout=0.1)
+
+    assert result.state == "failed"
+    assert "connection close exploded" in result.error
+
+
 def test_the_pipeline_reports_the_retirement_after_it_has_happened():
     """Ordering, asserted on the source: `close()` then `summary()`.
 
@@ -979,7 +1060,9 @@ def test_the_retirement_values_are_one_declared_domain_for_both_handles():
     Bounding the child and then closing the parent one statement later is the same
     unbounded wait one level out, so both retirements answer the same question and
     report the same values."""
-    assert set(m.CONNECTION_RETIREMENT.values) == {"never_opened", "closed", "abandoned"}
+    assert set(m.CONNECTION_RETIREMENT.values) == {
+        "never_opened", "closed", "failed", "abandoned",
+    }
 
 
 @pytest.mark.slow

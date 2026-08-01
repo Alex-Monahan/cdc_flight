@@ -79,7 +79,10 @@ def main(argv: list[str]) -> int:
     with contextlib.suppress(Exception):
         phases.close()
     summary.update(phases.summary())
-    summary["destination_connection_release"] = dest_mod.release_connection(con)
+    release = dest_mod.release_connection(con)
+    summary["destination_connection_release"] = release.state
+    if release.error is not None:
+        summary["destination_connection_close_error"] = release.error
     summary["teardown_seconds"] = round(time.monotonic() - started, 3)
     # ---- ...and `main()` persists it and exits ---------------------------- #
     Path(summary_path).write_text(json.dumps(summary, default=str, indent=2))
