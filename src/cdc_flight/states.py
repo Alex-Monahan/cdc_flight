@@ -27,7 +27,7 @@ dependencies:
 Two shapes are supported:
 
 * `Machine` — a state domain plus its legal edges (`TableLifecycle`, `RunPhase`,
-  `AcquisitionRecovery`, `CatalogChangeState`).
+  `AcquisitionRecovery`, `CatalogChangeState`, `CatalogBaseline`).
 * `Domain` — a frozen set of values with **no** transition structure, for decision
   tables whose outputs are classifications rather than states an object moves through
   (`SlotVerdict.decision`, the reconciliation decisions). Freezing them costs nothing

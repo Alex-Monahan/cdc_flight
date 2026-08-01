@@ -1657,6 +1657,15 @@ with **zero** commit groups. `pyarrow` is therefore a hard dependency, and
 §14.2's "measured MotherDuck commit latency for a 200 000-row group" is now
 partly answered: the write path, not the commit, was the cost.
 
+The locked runtime is **PyArrow 25.0.0**. Its default `mimalloc` backend can SIGSEGV
+while an Arrow table is built on Debezium's JPype/JVM callback thread; the native report
+ends in `libarrow.2500`'s allocator rather than a Python exception. Therefore
+`ARROW_DEFAULT_MEMORY_POOL=system` is a **runtime compatibility requirement**, not a test
+workaround. The Makefile exports it for repository launches, pytest establishes it in
+`conftest.py` before DuckDB/PyArrow imports, and the `cdc-flight` entrypoint sets the same
+default before project imports. An explicit operator setting is respected, but any
+alternative allocator must be proved safe on the multi-engine re-snapshot path.
+
 ### A15 — MotherDuck's client caches the catalog per process (affects verification only)
 
 `duckdb.connect()` caches the database instance per DSN inside a process, and
@@ -3250,7 +3259,7 @@ transition table.
 |---|---|---|---|---|
 | `table_lifecycle` | is this destination table a trustworthy image, and who owes the work | 5 | 21 | `_cdc_flight.table_state.snapshot_state` |
 | `run_phase` | where is this run, readable from the destination while it runs | 9 | 23 | `_cdc_flight.heartbeat.phase` |
-| `run_outcome` | why did this run stop — cause before symptom | 9 | 36 (a **precedence**: escalations only) | `heartbeat.terminal_reason`, `last_run.json` |
+| `run_outcome` | why did this run stop — cause before symptom | 10 | 45 (a **precedence**: escalations only) | `heartbeat.terminal_reason`, `last_run.json` |
 | `acquisition_recovery` | what has this destructive recovery already done | 5 | 9 | `_cdc_flight.recovery_state.phase` |
 | `catalog_change` | where is one DDL fact in observe → confirm → fence → apply | 9 | 30 | **memory only** |
 | `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
@@ -3291,7 +3300,7 @@ gain), `machine.check(from, to)` raising `IllegalTransition`, `machine.parse()` 
   `if stop_reason not in ("source_dark", "engine_error")`, written out at
   `supervisor.py:180` **and** `:186`; a tenth outcome had to remember both. The
   precedence is now `max_seconds < idle < work_done < engine_finished < hung <
-  catalog_unresolved < source_dark < engine_error < error`, and `hung` sitting below
+  catalog_unresolved < recovery_uncleared < source_dark < engine_error < error`, and `hung` sitting below
   `source_dark` *is* the rule. `RunOutcome.record()` keeps the most severe value it has
   been given and counts the refusals; the run summary reports them
   (`outcome_downgrades_refused`), because "we nearly reported the symptom" is
@@ -3327,6 +3336,7 @@ Recorded so the "appropriate number" claim is an argument rather than a count.
 ```
 RunPhase (per process, heartbeat row)
  ├── AcquisitionRecovery (per pipeline+namespace, recovery_state row)  [0..1, spans runs]
+ ├── CatalogBaseline (per pipeline, catalog_baseline row)               [1, spans runs]
  ├── TableLifecycle (per pipeline+schema+table, table_state row)       [N, spans runs]
  ├── CatalogChangeState (per relation, memory)                        [N, per run]
  └── OpenGroup (memory, no persistence — Invariant O)                 [1 at a time]
@@ -4111,3 +4121,33 @@ protocol, five destination, seven recovery/baseline and one source-catalog fault
 the external network blackhole. That is substantial injection evidence, but the reviewer
 did not award the rubric's robust-injection 5 band after repeated adversarial
 compositions were first found outside the suite.
+
+### A66 — rev 17: callback quiescence and the Arrow callback runtime
+
+Round 8 found the ownership boundary below A65's bounded handle retirement. A Debezium
+engine thread that missed its join deadline could still issue a callback because
+`Applier.shutdown()` stopped only the age timer. The supervisor then drained and rolled
+back the applier and retired its parent connection while that callback could resume data
+and replay-state SQL on the same handle. A bound on `close()` is not exclusive ownership.
+
+`Applier.shutdown()` now seals callback admission first. A callback admitted after the
+seal is a recorded no-op: it cannot decode, mutate data or state, commit, or acknowledge
+Debezium. Callbacks admitted before the seal are counted under one condition variable;
+the supervisor waits for zero before it writes even the draining heartbeat, discards a
+tail, releases the lease, or retires either destination handle. If quiescence cannot be
+proved, none of those operations runs on the teardown thread: the live callback retains
+the entire destination runtime and the command takes its hard-failure exit path. Thus
+the engine may remain alive only when the sealed boundary plus zero admitted callbacks
+proves it can no longer touch the connection.
+
+The heartbeat worker uses the same rule at smaller scale. Its completed/ownership state
+is updated atomically with its final release decision under `_sink_lock`;
+`Thread.is_alive()` is no longer the ownership predicate. The reproduced
+post-check/pre-thread-exit schedule therefore ends with exactly one side closing the
+cursor.
+
+The same JVM callback thread exposed a separate native compatibility failure: PyArrow
+25.0.0's mimalloc pool crashed in `libarrow.2500` during multi-table re-snapshot. The
+system-pool requirement recorded in A14 applies to production because recovery builds
+Arrow arrays on that path. It is established before imports by every shipped launch
+surface and verified by a clean subprocess with no inherited allocator variable.

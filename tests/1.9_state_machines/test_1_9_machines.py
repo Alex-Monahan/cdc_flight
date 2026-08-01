@@ -14,6 +14,9 @@ guard, and a guard that costs six minutes is not one either.
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 
 from cdc_flight import machines as m
@@ -60,7 +63,7 @@ def test_the_transition_table_is_data_not_prose():
 def test_the_cells_with_no_edge_are_enumerable():
     """The mechanism behind the 4.7 inventory's UNDEFINED bucket.
 
-    Today's eight UNDEFINED failure modes were found by two reviewers reading code for
+    Today's nine UNDEFINED failure modes were found by reviewers reading code for
     a day. A cell of `states x states` with no declared edge is findable by `pytest`.
     """
     machine = Machine("t_cells", states=("a", "b"), edges=(("a", "b"),))
@@ -93,8 +96,8 @@ DECLARED = {
     "run_outcome",
     "acquisition_recovery",
     "catalog_change",
-    # rev 14. The architecture review's four were the four that were *visible*; this
-    # one was found by a reviewer reproducing the inconsistency it allows, which is a
+    # rev 14. The architecture review's initial set covered only the states then
+    # *visible*; this one was found by reproducing the inconsistency it allows, which is a
     # better argument for a machine than any of the original four had (Codex r5
     # BLOCKER-1). "Can an observed relation identity be adopted as history for rows the
     # destination already holds?" was a derived expression over a registry row, a table
@@ -106,7 +109,7 @@ DECLARED = {
 def test_the_declared_machines_are_the_ones_the_review_said_to_build():
     """The consistency-affecting states, plus the outcome precedence. Not one, not ten.
 
-    The architecture review said yes to four machines and no to seven other candidates;
+    The architecture review said yes to five machines and no to seven other candidates;
     `machines.py`'s module docstring carries the argument for each `no`. This asserts
     the *set*, so adding a machine (or quietly dropping one) is a decision somebody has
     to make in this file rather than a diff nobody notices.
@@ -125,6 +128,39 @@ def _declared() -> dict[str, Machine]:
         for value in vars(m).values()
         if isinstance(value, Machine)
     }
+
+
+def _published_inventory(path: Path) -> dict[str, tuple[int, int]]:
+    """Current markdown inventory as ``machine -> (states, edges)``."""
+    rows: dict[str, tuple[int, int]] = {}
+    for line in path.read_text().splitlines():
+        if not line.startswith("| `"):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) < 5:
+            continue
+        name = cells[0].strip("`")
+        if name not in DECLARED:
+            continue
+        edge_count = re.match(r"\d+", cells[3])
+        if cells[2].isdigit() and edge_count is not None:
+            rows[name] = (int(cells[2]), int(edge_count.group()))
+    return rows
+
+
+def test_current_machine_inventories_are_generated_from_the_declarations():
+    """Round 8 MINOR-2: state/edge counts cannot become hand-maintained claims."""
+    root = Path(__file__).resolve().parents[2]
+    expected = {
+        name: (len(machine.states), len(machine.edges))
+        for name, machine in _declared().items()
+    }
+    for relative in ("docs/adr/0001-transactional-applier.md", "RUBRIC_STATUS.md"):
+        published = _published_inventory(root / relative)
+        assert published == expected, (
+            f"{relative}'s current machine inventory differs from machines.py; "
+            "regenerate the state and edge counts from the declarations"
+        )
 
 
 def test_more_than_one_machine_and_each_owns_exactly_one_state():

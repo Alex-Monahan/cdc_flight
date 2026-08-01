@@ -34,6 +34,7 @@ from cdc_flight import machines as machines_mod
 from cdc_flight.states import Domain, Machine
 
 ADR = Path(__file__).resolve().parents[2] / "docs" / "adr" / "0001-transactional-applier.md"
+RUBRIC_STATUS = Path(__file__).resolve().parents[2] / "RUBRIC_STATUS.md"
 CLASSES = ("AUTO", "MANUAL", "UNDEFINED")
 COLUMNS = 7
 
@@ -124,6 +125,21 @@ def test_the_manual_count_is_what_the_rubric_band_is_read_from():
         "if this ever drops to 2 or fewer, rubric 4.7 moves off its 1-band and "
         "RUBRIC_STATUS must be rescored deliberately rather than by this assertion "
         "quietly failing"
+    )
+
+
+def test_rubric_status_uses_the_counts_parsed_from_a51():
+    """Round 8 MINOR-2: the score narrative is another consumer of this data."""
+    actual = defaultdict(int)
+    rows = _rows()
+    for _number, _edge, value in rows:
+        actual[_classify(value)] += 1
+    generated = (
+        f"{len(rows)} rows, {actual['AUTO']} AUTO / {actual['MANUAL']} MANUAL / "
+        f"{actual['UNDEFINED']} UNDEFINED"
+    )
+    assert generated in RUBRIC_STATUS.read_text(), (
+        "RUBRIC_STATUS's current A51 count is not the value parsed from the ADR rows"
     )
 
 

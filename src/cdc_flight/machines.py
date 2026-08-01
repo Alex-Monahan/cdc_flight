@@ -2,11 +2,11 @@
 
 Rubric 1.9 asks that *any state that can affect consistency is managed with a state
 machine approach*, and grades **an appropriate number of machines (more than one)** at
-5. This file is what "appropriate" means here: four machines, each owning one state,
+5. This file is what "appropriate" means here: five machines, each owning one state,
 each with a declared edge set — plus the frozen decision domains, which are
 classifications rather than states and are deliberately **not** dressed up as machines.
-(Five machines since rev 14 added `CatalogBaseline`; the count is not the claim, the
-coverage is — see SM-E for the consistency-affecting state that was still implicit.)
+The count is not the claim; coverage is. See SM-E for `CatalogBaseline`, the fifth
+consistency-affecting state that rev 14 made explicit.
 
 Reading order (the composition, not the file order):
 
