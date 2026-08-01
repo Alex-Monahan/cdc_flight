@@ -145,6 +145,83 @@ def test_resnapshot_quiescence_failure_retains_every_owned_resource(monkeypatch,
     assert raised.value.summary["resnapshot_recovery"] == "armed"
 
 
+def test_failed_quiescence_stays_callback_owned_if_callback_leaves_during_unwind(
+    monkeypatch, tmp_path
+):
+    """Round 10 §3.2: a late callback exit cannot revoke marker recovery.
+
+    The supervisor has already failed its bounded quiescence proof.  The callback then
+    leaves during the exception handler's critical log, before the enclosing ``finally``
+    re-enters ownership cleanup.  That later observation must not delete recovery intent
+    which the handler deliberately chose instead of ``reassert_owed``.
+    """
+    replication = ReplicationConfig(slot_name="round10", state_dir=tmp_path / "state")
+    ownership = DestinationOwnership()
+    drop_calls: list[str] = []
+    reassert_calls: list[object] = []
+    _Applier.instances.clear()
+
+    monkeypatch.setattr(resnapshot_mod, "Applier", _Applier)
+    monkeypatch.setattr(resnapshot_mod, "_SlotWatcher", _StartedResource)
+    monkeypatch.setattr(resnapshot_mod, "SourceHealth", _StartedResource)
+    monkeypatch.setattr(
+        reconcile_mod, "drop_slot", lambda _dsn, slot: drop_calls.append(slot)
+    )
+    monkeypatch.setattr(
+        resnapshot_mod,
+        "reassert_owed",
+        lambda con, **_kwargs: reassert_calls.append(con),
+    )
+
+    import cdc_flight.engine as engine_mod
+
+    monkeypatch.setattr(engine_mod, "SupervisedDebeziumEngine", _Engine)
+
+    def _fail_after_seal(*_args, **_kwargs):
+        offset = replication.state_dir / "resnapshot" / "offsets.dat"
+        offset.write_bytes(b"callback-owned")
+        raise EngineFailure(
+            "callback did not quiesce",
+            {"applier_quiesced": False, "destination_owner": "live_applier_callback"},
+        )
+
+    monkeypatch.setattr(pipeline_mod, "run_engine_bounded", _fail_after_seal)
+
+    def _callback_leaves_during_log(*_args, **_kwargs) -> None:
+        _Applier.instances[-1].callback_quiesced = True
+
+    monkeypatch.setattr(resnapshot_mod.log, "critical", _callback_leaves_during_log)
+
+    with pytest.raises(EngineFailure):
+        resnapshot_mod.run(
+            object(),
+            source=SourceConfig(),
+            replication=replication,
+            pipeline=PIPELINE,
+            dataset="cdc_raw",
+            tables=TABLES,
+            settings=applier_settings(),
+            run_cfg=RunConfig(close_timeout=0.01),
+            lease=object(),
+            runner_id="runner",
+            transactional_ddl=True,
+            epoch_base=0,
+            reason="round-10 unwind regression",
+            namespace="main",
+            ownership=ownership,
+        )
+
+    applier = _Applier.instances[-1]
+    state_dir = replication.state_dir / "resnapshot"
+    assert applier.callback_quiesced is True, "the race configuration did not fire"
+    assert reassert_calls == [], "the handler selected marker recovery"
+    assert drop_calls == ["round10_rs"], "only the pre-start stale-slot sweep is safe"
+    assert applier.alerts.close_calls == 0
+    assert (state_dir / "offsets.dat").read_bytes() == b"callback-owned"
+    assert resnapshot_mod.interruption_marker(state_dir).exists()
+    assert ownership.destination_quiescent is False
+
+
 class _IdleApplier:
     def __init__(self) -> None:
         self.callback_quiesced = False
