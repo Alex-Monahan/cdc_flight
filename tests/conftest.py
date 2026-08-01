@@ -441,14 +441,27 @@ class Sandbox:
         self.drop_slot()
 
     # -- source ------------------------------------------------------------- #
-    def sql(self, statements: str | list[str], *, one_transaction: bool = False) -> None:
+    def sql(
+        self,
+        statements: str | list[str],
+        *,
+        one_transaction: bool = False,
+        report_affected: bool = False,
+    ) -> int | None:
         if isinstance(statements, str):
             statements = [statements]
+        affected = 0
         with psycopg.connect(self.source.dsn, autocommit=not one_transaction) as conn:
             for stmt in statements:
-                conn.execute(stmt)
+                if report_affected:
+                    result = conn.execute(stmt)
+                    if result.rowcount > 0:
+                        affected += result.rowcount
+                else:
+                    conn.execute(stmt)
             if one_transaction:
                 conn.commit()
+        return affected if report_affected else None
 
     def pg_query(self, stmt: str, params: tuple | None = None) -> list[tuple]:
         with psycopg.connect(self.source.dsn, autocommit=True) as conn:

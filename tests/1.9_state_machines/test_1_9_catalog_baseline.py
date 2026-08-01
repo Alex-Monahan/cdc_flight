@@ -36,6 +36,8 @@ real-cluster proof is `test_1_9_catalog_baseline_e2e.py`.
 
 from __future__ import annotations
 
+import ast
+
 import duckdb
 import pytest
 
@@ -653,10 +655,26 @@ def test_the_flush_cannot_persist_an_identity_nothing_has_rebuilt():
     agree with the source and never ask again — the same silent inconsistency one run
     later, reached through a failing run rather than a successful one.
     """
-    source = _pipeline_source()
-    block = source[source.index("learned = dest_mod.flush_learned_relations("):]
-    block = block[: block.index("\n            )")]
-    assert "exclude=" in block and "include_owed=True" in block
+    tree = ast.parse(_pipeline_source())
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "flush_learned_relations"
+    ]
+    assert len(calls) == 1
+    exclude = next(
+        (keyword.value for keyword in calls[0].keywords if keyword.arg == "exclude"),
+        None,
+    )
+    assert exclude is not None, "the flush has no exclusion guard"
+    called = {
+        node.func.attr for node in ast.walk(exclude)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert "unrebuilt_relations" in called, (
+        "the flush exclusion is not derived from durable rebuild work still owed"
+    )
 
 
 def test_a_rebuilt_relation_is_flushed_so_it_can_acquire_an_identity():

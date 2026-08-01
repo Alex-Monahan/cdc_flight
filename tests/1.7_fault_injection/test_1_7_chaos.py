@@ -130,20 +130,25 @@ def _plan(rng: random.Random, iterations: int) -> list[str]:
     return plan[:iterations]
 
 
-def _shape(box: Sandbox, rng: random.Random, tag: str) -> None:
+def _shape(box: Sandbox, rng: random.Random, tag: str) -> int:
     """One randomly chosen unit of source work. Each shape is a different fold."""
     shape = rng.choice(["insert", "update", "delete", "key_update", "multi_table", "keyless"])
     if shape == "insert":
-        box.sql(
+        affected = box.sql(
             "INSERT INTO app.customers (name, email) SELECT "
             f"'{tag}-' || i, '{tag}-' || i || '@example.com' "
             f"FROM generate_series(1, {ROWS}) i",
             one_transaction=True,
+            report_affected=True,
         )
     elif shape == "update":
-        box.sql(
-            f"UPDATE app.customers SET lifetime_value = coalesce(lifetime_value, 0) + 1 "
-            f"WHERE name LIKE '{tag[:-1]}%'"
+        # A prefix from an earlier chaos iteration is not guaranteed to exist — and on
+        # iteration one cannot exist. Target one ordered baseline row instead, so every
+        # update creates a data-carrying commit that can reach the armed anchor.
+        affected = box.sql(
+            "UPDATE app.customers SET lifetime_value = coalesce(lifetime_value, 0) + 1 "
+            "WHERE id = (SELECT id FROM app.customers ORDER BY id LIMIT 1)",
+            report_affected=True,
         )
     elif shape == "delete":
         # It used to be `WHERE name LIKE '%-<random>'`, which after a few iterations of
@@ -156,33 +161,62 @@ def _shape(box: Sandbox, rng: random.Random, tag: str) -> None:
         # run with `applied_events=0` and `data_commit_groups=0`.
         #
         # One row that certainly exists, chosen deterministically from the seed.
-        box.sql(
+        affected = box.sql(
             "DELETE FROM app.customers WHERE id IN ("
-            f"  SELECT id FROM app.customers ORDER BY id DESC LIMIT {rng.randint(1, 3)})"
+            f"  SELECT id FROM app.customers ORDER BY id DESC LIMIT {rng.randint(1, 3)})",
+            report_affected=True,
         )
     elif shape == "key_update":
-        box.sql(
+        affected = box.sql(
             [
                 f"INSERT INTO app.customers (name, email) VALUES ('{tag}-k', '{tag}-k@x.com')",
                 f"UPDATE app.customers SET id = -id WHERE name = '{tag}-k'",
             ],
             one_transaction=True,
+            report_affected=True,
         )
     elif shape == "multi_table":
-        box.sql(
+        affected = box.sql(
             [
                 f"INSERT INTO app.customers (name, email) VALUES ('{tag}-m', '{tag}-m@x.com')",
                 "INSERT INTO app.orders (customer_id, total_amount, status) "
                 "SELECT 1, 5.00, 'pending' FROM generate_series(1, 3) i",
             ],
             one_transaction=True,
+            report_affected=True,
         )
     else:
-        box.sql(
+        affected = box.sql(
             "INSERT INTO app.sensor_readings (sensor_id, value, unit) SELECT "
             f"'{tag}', 1.0, 'C' FROM generate_series(1, {ROWS}) i",
             one_transaction=True,
+            report_affected=True,
         )
+    assert affected is not None
+    return affected
+
+
+def test_the_update_shape_targets_a_row_that_already_exists():
+    """Iteration one cannot depend on a name inserted by an earlier chaos iteration."""
+
+    class UpdateRng:
+        @staticmethod
+        def choice(_items):
+            return "update"
+
+    class RecordingBox:
+        def __init__(self):
+            self.statement = ""
+
+        def sql(self, statement, **_kwargs):
+            self.statement = statement
+            return 1
+
+    box = RecordingBox()
+    affected = _shape(box, UpdateRng(), "chaos1")
+
+    assert "ORDER BY id" in box.statement and "LIMIT 1" in box.statement
+    assert affected == 1
 
 
 def _assert_equal_to_source(box: Sandbox, note: str) -> None:
@@ -229,7 +263,11 @@ def test_random_faults_at_random_anchors_never_break_the_ledger(
         for iteration, point in enumerate(points, start=1):
             nth = 1
             tag = f"chaos{iteration}"
-            _shape(box, rng, tag)
+            affected = _shape(box, rng, tag)
+            assert affected > 0, (
+                f"iteration {iteration}: workload shape affected {affected} source "
+                "rows, so the anchor has no data-carrying commit to fire on"
+            )
 
             box.clear_fired_fault()
             env = {"CDC_FAULT_INJECT": f"{point}:{nth}", **ARMING.get(point, {})}
