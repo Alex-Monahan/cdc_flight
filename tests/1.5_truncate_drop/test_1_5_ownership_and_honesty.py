@@ -21,6 +21,8 @@ cleared `last_error` unconditionally and the alert was raised only when a change
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 from applier_lab import Lab, end, keyed
 
@@ -290,42 +292,80 @@ def test_the_marker_write_budget_is_bounded():
 
 
 def test_a_poll_that_finishes_at_shutdown_still_fails_the_run():
-    """The sampling gap the first cut left (Codex r2 MAJOR-3).
+    """`stop()` must MEAN quiesced, not "we waited a bit" (Codex r3 MAJOR-3).
 
-    `run_engine_bounded` checked `machine_error` once and could return success, while
-    the polling thread was stopped and joined only later in `pipeline.run()`'s
-    `finally`. A poll already in flight could take an undeclared transition *after* the
-    check, and nobody re-read the field — the same "success over an undeclared edge"
-    policy the fix claims is impossible, moved into a timing gap. The watcher is now
-    quiesced by the supervisor itself, before any verdict is taken.
+    Production joins for a bounded time and used to return whatever happened, so a poll
+    that outlived the join could take an undeclared transition — or learn a relation —
+    after the run had already been judged a success. The first cut of this test used a
+    fake whose `stop()` synchronously set `machine_error`, which never exercised the
+    timed join at all. This holds a REAL background poll at a barrier and lets the
+    supervisor's own synchronous final poll answer cleanly.
     """
+    supervisor_thread = threading.current_thread()
 
-    class _LatePoller(CatalogWatcher):
-        """Completes its in-flight poll — and discovers the illegal edge — on `stop()`."""
-
+    class _StuckPoller(CatalogWatcher):
         def __init__(self):
             super().__init__(
-                dsn="", publication="pub", schema="app", include=set(), poll_seconds=0
+                dsn="", publication="pub", schema="app", include=set(), poll_seconds=0.05
             )
+            self.quiesce_timeout = 0.3
+            self.release = threading.Event()
             self.stopped = False
 
-        def poll_quietly(self):  # the supervisor's final synchronous poll: clean
+        def poll_quietly(self):
+            if threading.current_thread() is supervisor_thread:
+                return []          # the synchronous final poll: clean and prompt
+            self.release.wait(30)  # the background poll: wedged on a dead socket
+            self.machine_error = "IllegalTransition: catalog_change: 'due' -> 'marked'"
             return []
 
         def stop(self):
             self.stopped = True
-            self.machine_error = "IllegalTransition: catalog_change: 'due' -> 'marked'"
+            return super().stop()
 
-    w = _LatePoller()
+    w = _StuckPoller()
+    w._thread = threading.Thread(target=w.poll_quietly, daemon=True)
+    w._thread.start()
+    try:
+        with pytest.raises(EngineFailure) as excinfo:
+            run_engine_bounded(
+                _Engine(), _Handler(), RunConfig(max_seconds=6, idle_seconds=0.1),
+                catalog=w, catalog_drain_seconds=0.2,
+            )
+        assert w.stopped, "the supervisor must try to quiesce the watcher"
+        # It could NOT quiesce, and that alone is a failed run: every check after it
+        # reads state the live poller can still mutate, including the relations the
+        # caller is about to persist.
+        assert "did not stop" in str(excinfo.value), str(excinfo.value)
+        assert excinfo.value.summary["stop_reason"] == "engine_error"
+        assert excinfo.value.summary["catalog_quiesced"] is False
+        assert excinfo.value.summary.get("ok") is not True
+    finally:
+        w.release.set()
+
+
+def test_a_watcher_that_really_stops_lets_the_verdict_stand():
+    """The other half: quiescence is proved, so the machine-error check is trustworthy."""
+
+    class _CleanPoller(CatalogWatcher):
+        def __init__(self):
+            super().__init__(
+                dsn="", publication="pub", schema="app", include=set(), poll_seconds=0.05
+            )
+            self.quiesce_timeout = 2.0
+
+        def poll_quietly(self):
+            return []
+
+    w = _CleanPoller().start()
+    w.machine_error = "IllegalTransition: catalog_change: 'due' -> 'marked'"
     with pytest.raises(EngineFailure) as excinfo:
         run_engine_bounded(
             _Engine(), _Handler(), RunConfig(max_seconds=6, idle_seconds=0.1),
             catalog=w, catalog_drain_seconds=0.2,
         )
-    assert w.stopped, "the supervisor must quiesce the watcher before it judges the run"
+    assert w.quiesced is True
     assert "undeclared transition" in str(excinfo.value)
-    assert excinfo.value.summary["stop_reason"] == "engine_error"
-    assert excinfo.value.summary.get("ok") is not True
 
 
 def test_what_the_watcher_learned_is_persisted_even_when_nothing_is_due():

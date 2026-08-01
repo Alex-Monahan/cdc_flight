@@ -23,7 +23,7 @@
 | 7 | 2026-07-31 | **Amendments from 1.6 / 1.7 / 1.8 and the mid-task addition of rubric 4.7** (§19): the re-snapshot mechanism, and why Debezium only pairs a snapshot with an exact LSN on a slot it creates itself (A45); the hand-over fenced per table on the COMMIT LSN, with the changelog cost stated (A46); undecidable folds self-heal instead of failing identically for ever (A47); destination and network fault injection, the commit watchdog and the mis-reported cause (A48); `unknown` source health no longer licenses an idle declaration (A49); rubric 1.8's decision table and the one refusal that survives it (A50); the failure-mode inventory rubric 4.7 needs (A51). |
 | 5 | 2026-07-31 | **Amendments from 1.4 / 1.5** (§17): a key-changing UPDATE is always `d`+`c` for Postgres, so 1.4's atomicity is a corollary of §3.2/§3.3 (A30); the merge cannot collapse a group by key alone when one key is worn by two rows in one transaction (A31); TRUNCATE is a counted, key-less data event and `skipped.operations` was the whole gap (A32); DROP TABLE needs a catalog poller whose WAL fence marker must be **transactional** (A33 — which also constrains D9); what a table-level event means for history (A34). |
 | 8 | 2026-07-31 | **Amendments from the 1.6-1.8 review round** (§19, continued). Re-snapshot completion means *every requested table*, and "empty" needs positive evidence rather than the absence of our own records (A52 — which also corrects A45's `min()` resolution of a disagreeing `C` to a hard failure). The acquisition recovery becomes a journalled, idempotent, crash-re-entrant state machine, and A50's claim that its *order* made every intermediate state recoverable is withdrawn as false (A53). A fault test must name the anchor that fired, and three fault-injection accidents are fixed (A54). A50 gains a timeline decision and a destination-emptiness input. A51 is recounted (the old headline did not add up), split to one failure and one class per row, extended with the modes this branch exposed, and made machine-checked. |
-| 9 | 2026-07-31 | **Rubric 1.9 — explicit state machines** (§20). Four machines and one precedence, each owning exactly one consistency-affecting state, declared in `cdc_flight/machines.py` and enforced by a ~230-line `cdc_flight/states.py` with no dependencies (A55). `table_state.snapshot_state` gets a single writer and a transition table, and the owed queue selects every non-terminal state rather than one literal value; `_cdc_flight.heartbeat` gets the run-phase writer ADR §4.8 has specified since rev 1; `stop_reason` becomes a declared precedence, so A49's cause-before-symptom rule stops being two copies of a literal tuple; `recovery_state.phase` gains edge checks on top of rev 8's domain check; catalog changes get one per-relation state instead of four containers. The commit group deliberately stays memory-only — a durable machine there would weaken Invariant O — and its sixteen hand-reset fields become one `OpenGroup`, which makes Opus MAJOR-1's partial reset unrepresentable (A56). The acquisition recovery gains five fault anchors of its own, closing rubric 1.7's honest hold (A57). A51 is rewritten as states × transitions with generated transition tables. |
+| 9 | 2026-07-31 | **Rubric 1.9 — explicit state machines** (§20). Four machines and one precedence, each owning exactly one consistency-affecting state, declared in `cdc_flight/machines.py` and enforced by a dependency-free `cdc_flight/states.py` with no dependencies (A55). `table_state.snapshot_state` gets a single writer and a transition table, and the owed queue selects every non-terminal state rather than one literal value; `_cdc_flight.heartbeat` gets the run-phase writer ADR §4.8 has specified since rev 1; `stop_reason` becomes a declared precedence, so A49's cause-before-symptom rule stops being two copies of a literal tuple; `recovery_state.phase` gains edge checks on top of rev 8's domain check; catalog changes get one per-relation state instead of four containers. The commit group deliberately stays memory-only — a durable machine there would weaken Invariant O — and its sixteen hand-reset fields become one `OpenGroup`, so neither reset path can forget a field (A56, narrowed at A58.6: the mutable type does not make partial mutation impossible, and does not claim to). The acquisition recovery gains five fault anchors of its own, closing rubric 1.7's honest hold (A57). A51 is rewritten as states × transitions with generated transition tables. |
 
 ---
 
@@ -3293,11 +3293,17 @@ time alongside whatever had arrived since. Idempotent shapes survived, which is 
 fault tests passed; a key-reuse shape did not. The fix at the time was a **second** reset
 function, `_reset_after_rollback()`, which has to stay in sync with the first.
 
-The sixteen fields are now one `applier.OpenGroup` dataclass, created at BEGIN and
-**replaced** at COMMIT and at ROLLBACK. "Reset" is `self.group = OpenGroup()`. A
-partially-reset group is not something anybody can write, because there are no fields to
-forget — and the test asserts the object *identity* changed rather than enumerating the
-fields, which is exactly the enumeration that diverged.
+The sixteen fields are now one `commit_group.OpenGroup` dataclass, created at BEGIN and
+**replaced** at COMMIT and at ROLLBACK. "Reset" is `self.group = OpenGroup()`, on both
+paths, so neither can forget a field — which is the defect that was measured. The test
+asserts the object *identity* changed rather than enumerating the fields, which is exactly
+the enumeration that diverged.
+
+**Narrowed at A58.6, and it stays narrowed** (Codex r3 MINOR-1 found this paragraph still
+overclaiming). `OpenGroup` is a mutable dataclass with public collections: a partial
+*mutation* is representable and one is deliberate — `discard_units()`, which shutdown uses
+to give up a tail Invariant O guarantees will replay. The guarantee is about the reset
+paths, not about the type.
 
 Two consequences worth stating:
 
@@ -3609,3 +3615,87 @@ both well under the dark threshold.
   the registry and `created_in_txn` are untouched by a refused edge.
 * `--reset-state` and `--accept-orphan-offsets` name **every** destructive surface in
   `--help`, including the replication-slot drop.
+
+### A60 — rev 12: what round 3's review found in round 2's fixes
+
+Round 3 confirmed the empty-table reset fix, pre-engine reporting, the migration
+introspection, the coordinator side-effect test, the destructive `--help`, and the
+blackhole determinism (two consecutive green runs). It found one reproduced blocker and
+three majors, all of them the same shape: **a guarantee that held on the path the test
+took and not on the path production takes.**
+
+#### A60.1 — learned catalog state must survive a run that commits nothing (BLOCKER)
+
+A59 removed `CatalogCoordinator.plan()`'s early return so a plan with no due action still
+carries the watcher's learned relations. That only helps if the applier commits a group.
+A quiet stream with **zero records** never reaches the plan/apply path at all, so
+`source_relations` — the only thing that makes a `DROP` or a drop-and-recreate detectable
+across a restart — was still empty at shutdown.
+
+The consequence was measured end to end: a populated destination, a quiet run under the
+default `replicate` mode (`ok=true`, zero records, zero commit groups, zero persisted
+relations), then an offline drop-and-recreate with one replacement row. The next run
+applied the insert, reported `catalog_changes_applied=0`, and persisted the **new** oid as
+though it had always owned that relation — leaving the old relation's two rows beside the
+replacement's one, permanently, because from then on the persisted oid agrees with the
+source. A successful, silent, self-concealing inconsistency.
+
+`destination.flush_learned_relations()` now persists them once per run, in its own
+transaction, with the same `exclude` guard the commit path uses (a row carrying the new
+oid of a relation whose destructive action is still pending would make the next run agree
+with the source and never notice the drop). The order is fixed and it is the order the
+review asked for: **quiesce, validate, flush, report.**
+
+#### A60.2 — an all-empty capture set needs a durable handoff point (MAJOR)
+
+Requiring a resume point of every recovery was right. But an entirely empty capture set
+emits zero Debezium records, so the applier commits zero groups and writes no resume
+point — and `--reset-state` then failed with `recovery_uncleared`, as did every run after
+it, because no new fact could ever produce a commit group. Deterministically
+non-convergent: it fails closed, which is not the old blocker, but it makes the
+destructive recovery unusable for a legitimate source shape and breaks 4.7's convergence
+claim.
+
+`resnapshot.record_empty_handoff()` writes the durable position from the fence the
+emptiness was proven at, and the argument is exact: that fence is `pg_current_wal_lsn()`
+sampled on its own statement **before** the counts, and every captured relation then
+counted zero under `REPEATABLE READ`, so no transaction at or below it left a row
+anywhere in the capture set. There is nothing below that position for the destination to
+be missing. It is written with an **empty offset map**, because we have not observed one:
+reconciliation reads that as "no durable offset" and lets the connector resume from its
+own flushed `offsets.dat`. It refuses to overwrite an existing resume point and refuses
+without a fence.
+
+#### A60.3 — the commit→ack gate has no escape (MAJOR)
+
+A59.2's gate closed the check-then-act race only while the writer finished inside five
+seconds. On timeout it counted an `overlaps` and opened the window anyway — and the
+reviewer duly held `_execute()` past the bound and ran SQL with `COMMIT_ACK.active` true.
+An *instrumented* violation of an absolute principle is still a violation.
+
+`enter()` now waits without a bound of its own, and the applier takes it **inside the
+commit watchdog**. So the exclusion is absolute, and the failure mode it used to hide
+becomes the same loud, bounded `EX_TEMPFAIL` death a wedged `COMMIT` already produces: an
+observability cursor wedged long enough to threaten the commit path kills the run instead
+of quietly overlapping it. The reviewer's other half — terminalisation blocking
+indefinitely on the same gate — is fixed in the opposite direction, because it is the
+opposite trade: the **terminal** write waits `GATE_TIMEOUT` and then writes ungated,
+counting the fact, since by then the applier has stopped and a terminal row that never
+lands is worse than a theoretical overlap.
+
+#### A60.4 — `stop()` must mean quiesced (MAJOR)
+
+A59.4 moved `catalog.stop()` before the verdict, which is the right ordering only if
+`stop()` really stops the thread. It joined for `max(1, poll_seconds)` and returned
+whatever happened, and catalog queries had only a handshake `connect_timeout` — so a poll
+blocked on an established socket outlived the join, and the reviewer watched
+`run_engine_bounded()` return `ok=true` while the thread was alive and then set
+`machine_error`.
+
+Three changes: catalog connections get the same bounds `SourceHealth` got in A59.5
+(`statement_timeout`, keepalives, `tcp_user_timeout`); `stop()` returns whether the thread
+is **actually dead**; and the supervisor raises `EngineFailure` when it is not, because
+every check after that point — the undeclared-transition check, the unresolved-change
+check, and the caller's flush of learned relations — reads state a live poller can still
+mutate. The shipped test drives a real `CatalogWatcher` thread held at a barrier rather
+than a fake whose `stop()` sets the error synchronously.

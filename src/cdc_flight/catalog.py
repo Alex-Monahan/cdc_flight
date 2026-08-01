@@ -303,6 +303,13 @@ class CatalogWatcher:
         self.known: dict[str, SourceRelation] = dict(known or {})
         self.poll_seconds = poll_seconds
         self.connect_timeout = connect_timeout
+        #: Bounds a query on an ALREADY-CONNECTED source socket (Codex r3 MAJOR-3).
+        self.query_timeout_ms = 4000
+        #: How long `stop()` waits for the poll thread to actually die.
+        self.quiesce_timeout = 15.0
+        #: Set by `stop()`. The supervisor refuses to report success while it is False:
+        #: a verdict taken over a thread that is still running is not a verdict.
+        self.quiesced = False
         self.grace_seconds = grace_seconds
         #: How many consecutive polls must agree before a DESTRUCTIVE change is
         #: queued at all (Opus Q5). 1 restores the old behaviour.
@@ -356,10 +363,57 @@ class CatalogWatcher:
         self._thread.start()
         return self
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
+        """Stop polling and report whether the thread is **actually dead**.
+
+        It used to set the event, join for `max(1, poll_seconds)`, and return whatever
+        happened. That is not quiescence, and the difference is load-bearing: the
+        supervisor takes its terminal catalog verdict on the strength of this call, so a
+        poll that outlives the join can take an undeclared transition, or learn a
+        relation, *after* the run has been judged a success (Codex r3 MAJOR-3,
+        reproduced with a real watcher thread held at a barrier).
+
+        The join is generous now — a poll's own queries are bounded (see `_connect`), so
+        a live thread past this point means something is genuinely wrong — and the
+        boolean is what the supervisor refuses to report success without.
+        """
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=max(1.0, self.poll_seconds))
+        if self._thread is None:
+            return True
+        self._thread.join(timeout=self.quiesce_timeout)
+        alive = self._thread.is_alive()
+        if alive:
+            log.error(
+                "the catalog poller did not stop within %.1fs; it may still be holding "
+                "a source connection and may still mutate its own state",
+                self.quiesce_timeout,
+            )
+        self.quiesced = not alive
+        return self.quiesced
+
+    def _connect(self):
+        """A source connection whose queries are BOUNDED, not just its handshake.
+
+        `connect_timeout` covers the handshake and nothing else, so a source that goes
+        dark on an established socket leaves a poll blocked for ever — which is how
+        `stop()` came to return with its thread alive (Codex r3 MAJOR-3). The same two
+        bounds `SourceHealth` uses: the server's `statement_timeout`, and the client's
+        keepalives plus `tcp_user_timeout`, which are what actually fire against a
+        blackhole.
+        """
+        import psycopg
+
+        return psycopg.connect(
+            self.dsn,
+            autocommit=True,
+            connect_timeout=self.connect_timeout,
+            options=f"-c statement_timeout={self.query_timeout_ms}",
+            keepalives=1,
+            keepalives_idle=1,
+            keepalives_interval=1,
+            keepalives_count=2,
+            tcp_user_timeout=self.query_timeout_ms,
+        )
 
     def _loop(self) -> None:
         # Poll once immediately: a table dropped while this pipeline was down must be
@@ -395,11 +449,7 @@ class CatalogWatcher:
     # -- polling ------------------------------------------------------------ #
     def poll(self) -> list[CatalogChange]:
         """One observation. Returns the changes it added to the pending list."""
-        import psycopg
-
-        with psycopg.connect(
-            self.dsn, autocommit=True, connect_timeout=self.connect_timeout
-        ) as conn:
+        with self._connect() as conn:
             rows = conn.execute(_CATALOG_SQL, (self.publication, self.schema)).fetchall()
             lsn = int(conn.execute(_LSN_SQL).fetchone()[0])
             observed = {
@@ -445,17 +495,13 @@ class CatalogWatcher:
         before anything is destroyed. Raises on a source error, because "I could not
         ask" must never be read as "it is gone".
         """
-        import psycopg
-
         if not self.dsn:
             # An empty DSN makes libpq connect to ITS defaults, which is a different
             # cluster on a different port. Refusing is what makes "fail closed" true.
             raise ValueError("this watcher has no DSN, so the source cannot be re-read")
         schemas = [s for s, _ in names]
         tables = [t for _, t in names]
-        with psycopg.connect(
-            self.dsn, autocommit=True, connect_timeout=self.connect_timeout
-        ) as conn:
+        with self._connect() as conn:
             rows = conn.execute(_OID_SQL, (schemas, tables)).fetchall()
         found = {f"{schema}.{table}": int(oid) for schema, table, oid in rows}
         return {f"{s}.{t}": found.get(f"{s}.{t}") for s, t in names}

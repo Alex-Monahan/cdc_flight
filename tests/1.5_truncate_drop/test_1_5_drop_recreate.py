@@ -21,6 +21,7 @@ Four things only a real run can show:
 from __future__ import annotations
 
 import pytest
+from conftest import Sandbox
 
 pytestmark = [pytest.mark.slow, pytest.mark.e2e]
 
@@ -179,3 +180,93 @@ def test_the_recreated_table_lands_with_its_new_shape(drop_scenario):
 def test_every_run_after_the_drop_was_clean(drop_scenario):
     for name in ("dropped", "recreated"):
         assert drop_scenario[name]["ok"] is True, name
+
+
+@pytest.mark.slow
+def test_a_quiet_run_persists_what_it_learned_so_the_next_recreate_is_seen(
+    tmp_path_factory, postgres_cluster
+):
+    """The exact silent inconsistency the round-3 review reproduced (Codex r3 BLOCKER-1).
+
+    `source_relations` is the ONLY thing that makes a drop-and-recreate detectable across
+    a restart, and it was persisted exclusively through `CatalogCoordinator.apply()` —
+    inside a commit group. A run that committed **no groups** therefore persisted
+    nothing, and everything the watcher had learned vanished at shutdown. Then:
+
+    1. a healthy populated destination under `CDC_DROP_MODE=ignore` (no baseline);
+    2. switch to `replicate` and run with no source changes at all: `ok=true`, zero
+       records, zero commit groups — and, before the fix, zero persisted relations;
+    3. offline, drop and recreate the table and insert one replacement row;
+    4. the next run applied the insert, reported no catalog change, and persisted the NEW
+       oid as though it had always owned that relation — leaving the OLD relation's rows
+       beside the new one's, permanently, because from then on the oid agrees.
+
+    The flush now happens once per run, after the watcher is proved quiesced.
+    """
+    table = "quiet_learn"
+    target = f"cdcflight_app_{table}"
+    box = Sandbox("quiet_learn", tmp_path_factory.mktemp("sbx_quiet"), postgres_cluster)
+    box.env["CDC_TABLES"] = f"customers,{table}"
+    try:
+        box.reseed()
+        box.sql(
+            [
+                f"DROP TABLE IF EXISTS app.{table}",
+                f"CREATE TABLE app.{table} (id bigint PRIMARY KEY, label text NOT NULL)",
+                f"ALTER PUBLICATION cdc_flight_pub ADD TABLE app.{table}",
+                f"INSERT INTO app.{table} VALUES (1, 'old-1'), (2, 'old-2')",
+            ]
+        )
+        box.run(reset_state=True, max_seconds=180, extra_env={"CDC_DROP_MODE": "ignore"})
+        assert box.scalar(f"SELECT count(*) FROM {box.table(target)}") == 2
+
+        # A completely quiet run under the default `replicate` mode: nothing to apply.
+        quiet = box.run(max_seconds=120)
+        assert quiet["ok"] is True, quiet
+        assert int(quiet.get("applied_events") or 0) == 0, quiet
+        learned = dict(
+            box.duck_query(
+                "SELECT source_table, relation_oid FROM _cdc_flight.source_relations"
+            )
+        )
+        assert table in learned, (
+            "a run that committed no groups persisted nothing it had learned, so the "
+            f"next recreate is undetectable: {learned}"
+        )
+        old_oid = learned[table]
+
+        # Offline drop + recreate, with a replacement row.
+        box.sql(
+            [
+                f"DROP TABLE app.{table}",
+                f"CREATE TABLE app.{table} (id bigint PRIMARY KEY, label text NOT NULL)",
+                f"ALTER PUBLICATION cdc_flight_pub ADD TABLE app.{table}",
+                f"INSERT INTO app.{table} VALUES (999, 'replacement-only')",
+            ]
+        )
+        # Two runs: the first detects and drops, the second rebuilds from the source.
+        box.run(max_seconds=200, idle_seconds=10)
+        healed = box.run(max_seconds=220, idle_seconds=10)
+        assert healed["ok"] is True, healed
+
+        source = {
+            (int(r[0]), str(r[1]))
+            for r in box.pg_query(f"SELECT id, label FROM app.{table}")
+        }
+        landed = {
+            (int(r[0]), str(r[1]))
+            for r in box.duck_query(f"SELECT id, label FROM {box.table(target)}")
+        }
+        assert landed == source, (
+            f"the old relation's rows survived the recreate: destination={landed} "
+            f"source={source}"
+        )
+        assert dict(
+            box.duck_query(
+                "SELECT source_table, relation_oid FROM _cdc_flight.source_relations"
+            )
+        )[table] != old_oid, "the new oid was never learned"
+    finally:
+        box.cleanup()
+        box.sql(f"DROP TABLE IF EXISTS app.{table}")
+        box.reseed()

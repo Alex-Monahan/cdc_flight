@@ -39,10 +39,13 @@ Two parts of that used to be aspiration rather than mechanism (Codex r1 MAJOR-3)
   writer runs on the *supervisor's* thread, and `max_seconds` / engine error /
   source-dark all break out of the supervision loop and write `draining` without asking
   whether the engine thread happens to be between `COMMIT` and `markBatchFinished()`.
-  `COMMIT_ACK` is entered by the applier around exactly that interval; a phase write
-  that lands inside it is **dropped**, never deferred-with-a-lock and never blocked,
-  because the one thing an observability writer must not do is make the acknowledgement
-  wait. The next transition rewrites the whole row, so nothing is lost but a timestamp.
+  `COMMIT_ACK` is entered by the applier around exactly that interval, through a gate
+  the writer also holds for its check-and-write, so no write can be in flight when the
+  window opens and none can begin while it is open. A phase write that arrives inside it
+  is **dropped**; the next transition rewrites the whole row, so nothing is lost but a
+  timestamp. The gate has no escape hatch — see `_CommitAckWindow`, and Codex r3
+  MAJOR-2, which reproduced SQL running inside the window through the escape the first
+  cut had.
 * **there is no fallback to the primary connection.** `con.cursor()` failing used to set
   `_sink = con`, so a destination without cursors got phase writes on the applier's own
   connection, inside its open transaction, from another thread. The honest degradation
@@ -94,18 +97,26 @@ class _CommitAckWindow:
       finished.
     * `leave()` is a plain assignment, so the acknowledgement path itself takes no lock.
 
-    The wait in `enter()` is **bounded**. An observability connection that has stalled
-    must never be able to stall the commit path, so after `GATE_TIMEOUT` the applier
-    proceeds and records `overlaps`. That counter is the honest edge of the guarantee:
-    it is asserted to be zero, and if it is ever non-zero the claim is measurably false
-    rather than quietly false.
+    **There is no escape.** The first cut let `enter()` give up after five seconds,
+    open the window anyway and merely *count* the overlap — and the reviewer duly held
+    `_execute()` past the bound and ran SQL inside the window (Codex r3 MAJOR-2). An
+    instrumented violation of an absolute principle is still a violation, so the wait is
+    unbounded here and the applier wraps it in the **commit watchdog** instead: an
+    observability connection wedged long enough to threaten the commit path now kills the
+    run loudly, with the same `EX_TEMPFAIL` a wedged `COMMIT` produces, rather than
+    quietly overlapping. A bounded, loud death is an acceptable failure mode; a silent
+    overlap is not.
+
+    The **terminal** phase write is the one place a bounded wait is right: it runs after
+    the applier has been shut down, it has no next transition to restore it, and blocking
+    the run's own teardown on a stalled observability cursor would be the same mistake in
+    the other direction. It waits `GATE_TIMEOUT`, then writes ungated and says so.
     """
 
-    __slots__ = ("_active", "_gate", "dropped_writes", "overlaps")
+    __slots__ = ("_active", "_gate", "dropped_writes", "ungated_terminal_writes")
 
-    #: How long the applier will wait for an in-flight phase write before opening the
-    #: window anyway. Generous relative to a single-row UPDATE on a local cursor, tiny
-    #: relative to `CDC_COMMIT_TIMEOUT`.
+    #: How long the TERMINAL phase write waits for the gate before writing without it.
+    #: Never used by `enter()` — see the class docstring.
     GATE_TIMEOUT = 5.0
 
     def __init__(self) -> None:
@@ -114,32 +125,47 @@ class _CommitAckWindow:
         #: how many observability writes this process declined because of the window.
         #: Surfaced in the run summary, so "we never wrote inside it" is measured.
         self.dropped_writes = 0
-        #: how many times the applier opened the window without proving no write was in
-        #: flight. Must be 0; reported when it is not.
-        self.overlaps = 0
+        #: how many terminal writes went ahead without the gate. Must be 0 on any
+        #: healthy run; reported when it is not.
+        self.ungated_terminal_writes = 0
 
     def enter(self) -> None:
-        if self._gate.acquire(timeout=self.GATE_TIMEOUT):
-            try:
-                self._active = True
-            finally:
-                self._gate.release()
-            return
-        self.overlaps += 1
-        self._active = True
-        log.error(
-            "opened the commit->ack window without acquiring the observability gate "
-            "after %.1fs; an independent write may overlap it", self.GATE_TIMEOUT,
-        )
+        """Open the window. Blocks until no independent write is in flight.
+
+        Called by the applier immediately BEFORE `COMMIT`, inside the commit watchdog,
+        so this wait is bounded by `CDC_COMMIT_TIMEOUT` and a violation of that bound is
+        a loud death rather than a silent overlap.
+        """
+        with self._gate:
+            self._active = True
 
     def leave(self) -> None:
         self._active = False
 
     @contextmanager
-    def excluded(self):
-        """Hold the gate for one independent write. Yields whether it must be dropped."""
-        with self._gate:
-            yield self._active
+    def excluded(self, timeout: float | None = None):
+        """Hold the gate for one independent write. Yields whether it must be dropped.
+
+        `timeout` is for the terminal write only: on expiry the write proceeds WITHOUT
+        the gate and the fact is counted, because a terminal row that never lands is
+        worse than a theoretical overlap after the applier has already stopped.
+        """
+        if timeout is None:
+            with self._gate:
+                yield self._active
+            return
+        if self._gate.acquire(timeout=timeout):
+            try:
+                yield self._active
+            finally:
+                self._gate.release()
+            return
+        self.ungated_terminal_writes += 1
+        log.error(
+            "the observability gate did not come free in %.1fs; writing the terminal "
+            "phase without it rather than losing the terminal row", timeout,
+        )
+        yield False
 
     @property
     def active(self) -> bool:
@@ -162,7 +188,7 @@ class _CommitAckWindow:
         """Test seam."""
         self._active = False
         self.dropped_writes = 0
-        self.overlaps = 0
+        self.ungated_terminal_writes = 0
 
 
 #: Process-global because the applier and the supervisor are different threads of the
@@ -311,7 +337,8 @@ class RunPhaseWriter:
     def _write(self, phase: str, *, insert: bool = False) -> None:
         if self._sink is None:
             return
-        if RUN_PHASE.is_terminal(phase) and not COMMIT_ACK.wait_until_closed():
+        terminal = RUN_PHASE.is_terminal(phase)
+        if terminal and not COMMIT_ACK.wait_until_closed():
             # A terminal row is the one an operator actually needs, and dropping it
             # would leave the heartbeat non-terminal for ever (Codex r2 MAJOR-1).
             # Waiting is safe here: `pipeline.run()` shuts the applier down before it
@@ -325,9 +352,14 @@ class RunPhaseWriter:
         # so the applier could open the window in between and the write landed inside
         # the exact interval the ADR excludes (Codex r2 MAJOR-1, reproduced with a
         # two-thread barrier). Holding it here cannot delay the acknowledgement: the
-        # applier takes the same gate BEFORE `COMMIT`, with a bounded wait.
-        with COMMIT_ACK.excluded() as inside_window:
-            if inside_window and not RUN_PHASE.is_terminal(phase):
+        # applier takes the same gate BEFORE `COMMIT`.
+        #
+        # The terminal write takes it with a BOUND (Codex r3 MAJOR-2): blocking a run's
+        # own teardown on a stalled observability cursor is the same mistake in the
+        # other direction, and by then the applier has already stopped.
+        with COMMIT_ACK.excluded(timeout=COMMIT_ACK.GATE_TIMEOUT if terminal else None) \
+                as inside_window:
+            if inside_window and not terminal:
                 COMMIT_ACK.dropped_writes += 1
                 log.debug(
                     "dropped the %r phase write: the applier is inside the "
@@ -384,11 +416,10 @@ class RunPhaseWriter:
             # Evidence, not decoration: it is the count of times the commit->ack
             # exclusion actually fired.
             out["phase_writes_dropped_in_commit_ack"] = COMMIT_ACK.dropped_writes
-        if COMMIT_ACK.overlaps:
-            # The honest edge of the guarantee: the applier opened the window without
-            # proving no independent write was in flight, because the gate did not come
-            # free inside its bounded wait. Must be 0; reported loudly when it is not.
-            out["commit_ack_gate_overlaps"] = COMMIT_ACK.overlaps
+        if COMMIT_ACK.ungated_terminal_writes:
+            # The one bounded escape, and it is on the terminal write only, after the
+            # applier has stopped. Must be 0 on a healthy run; reported when it is not.
+            out["ungated_terminal_phase_writes"] = COMMIT_ACK.ungated_terminal_writes
         if self.outcome.refusals:
             # A49's guard, as evidence rather than as a comment.
             out["outcome_downgrades_refused"] = [

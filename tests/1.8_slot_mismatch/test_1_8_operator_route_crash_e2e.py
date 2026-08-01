@@ -277,3 +277,66 @@ def test_a_reset_rebuilds_a_table_the_source_has_emptied(tmp_path_factory, postg
     finally:
         box.cleanup()
         box.reseed()
+
+
+@pytest.mark.slow
+def test_a_reset_of_an_entirely_empty_source_clears_in_one_run(
+    tmp_path_factory, postgres_cluster
+):
+    """The other end of the empty-table shape: EVERY captured relation is empty.
+
+    Requiring a resume point of every recovery was right — it is what says the rebuilt
+    image was handed over to a stream — but an entirely empty capture set emits zero
+    Debezium records, so the applier commits zero groups and writes no resume point at
+    all. `--reset-state` then failed with `recovery_uncleared`, and so did every run
+    after it, because no new fact could ever produce a commit group: deterministically
+    non-convergent, which is a 4.7 failure even though it fails closed (Codex r3
+    MAJOR-1, reproduced against six truncated tables).
+
+    `record_empty_handoff` writes the durable position from the fence the emptiness was
+    proven at. That claims nothing untrue: the fence was sampled before the counts, on
+    its own statement, and every captured relation then counted zero under REPEATABLE
+    READ — so no transaction at or below it left a row anywhere in the capture set.
+    """
+    box = Sandbox("reset_all_empty", tmp_path_factory.mktemp("sbx_all_empty"), postgres_cluster)
+    try:
+        box.reseed()
+        box.run(reset_state=True, max_seconds=150)
+        # One statement, because the fixture's tables are FK-linked.
+        box.sql(
+            "TRUNCATE app.customers, app.orders, app.sensor_readings, app.documents, "
+            "app.wide_types, app.audit_log CASCADE"
+        )
+
+        summary = box.run(reset_state=True, max_seconds=200, timeout=280)
+        assert summary["ok"] is True, summary
+        assert summary.get("recovery_cleared"), (
+            f"an all-empty reset did not converge in one run: {summary}"
+        )
+        assert summary.get("empty_handoff_lsn"), (
+            f"no durable handoff point was recorded for the empty capture set: {summary}"
+        )
+        states = dict(
+            box.duck_query(
+                "SELECT source_table, snapshot_state FROM _cdc_flight.table_state"
+            )
+        )
+        assert states and not [t for t, s in states.items() if s != "complete"], states
+        assert box.duck_query("SELECT count(*) FROM _cdc_flight.recovery_state")[0][0] == 0
+        for target in ("cdcflight_app_customers", "cdcflight_app_documents"):
+            assert box.scalar(f"SELECT count(*) FROM {box.table(target)}") == 0
+
+        # ... and the NEXT ordinary run is a plain success, not a re-armed recovery loop.
+        again = box.run(max_seconds=180)
+        assert again["ok"] is True, again
+        assert not again.get("recovery_still_armed"), again
+
+        # ... and CDC works from there.
+        box.sql("INSERT INTO app.customers (name, email) VALUES ('after-empty', 'a@x.com')")
+        assert box.run(max_seconds=180)["ok"] is True
+        assert box.scalar(
+            f"SELECT count(*) FROM {box.table('cdcflight_app_customers')}"
+        ) == 1
+    finally:
+        box.cleanup()
+        box.reseed()

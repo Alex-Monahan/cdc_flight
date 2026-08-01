@@ -950,3 +950,52 @@ def probe_transactional_ddl(con) -> bool:
         for name in (probe_a, probe_b):
             with contextlib.suppress(Exception):  # pragma: no cover
                 con.execute(f"DROP TABLE IF EXISTS {name}")
+
+
+def flush_learned_relations(con, *, pipeline: str, catalog) -> list[str]:
+    """Persist what the catalog watcher learned, in its own transaction. Returns names.
+
+    `source_relations` is the ONLY thing that makes a `DROP TABLE` or a
+    drop-and-recreate detectable across a restart: without the persisted
+    `relation_oid` the next run has nothing to compare against. It was written
+    exclusively through `CatalogCoordinator.apply()`, which runs inside a commit group —
+    so a run that committed **no groups at all** persisted nothing, and everything the
+    watcher had learned vanished at shutdown (Codex r3 BLOCKER-1). The measured
+    consequence: a quiet run, then an offline drop-and-recreate, and the next run
+    accepts the replacement oid as though it had always owned that relation — leaving
+    the old relation's rows beside the new one's, permanently, because from then on the
+    persisted oid agrees with the source.
+
+    Called once per run, **after** the watcher has been quiesced, so a poll cannot add
+    dirty state the flush will not see. The `exclude` guard is the same one the commit
+    path uses and it is not optional: a persisted row carrying the NEW oid of a relation
+    whose destructive action is still pending would make the next run agree with the
+    source and never notice the drop at all.
+    """
+    if catalog is None:
+        return []
+    blocked = {c.qualified for c in catalog.pending_destructive()}
+    relations = catalog.dirty(exclude=blocked)
+    if not relations:
+        return []
+    con.execute("BEGIN TRANSACTION")
+    try:
+        for relation in relations:
+            upsert_source_relation(
+                con,
+                pipeline=pipeline,
+                source_schema=relation.schema,
+                source_table=relation.table,
+                relation_oid=relation.oid,
+                published=relation.published,
+                replica_identity=relation.replica_identity,
+            )
+        con.execute("COMMIT")
+    except BaseException:
+        with contextlib.suppress(Exception):
+            con.execute("ROLLBACK")
+        raise
+    names = [relation.qualified for relation in relations]
+    catalog.clear_dirty(names)
+    log.info("persisted %s learned source relation(s): %s", len(names), ", ".join(names))
+    return names

@@ -547,6 +547,19 @@ def run(
                 dsn=source.dsn, slot_name=replication.slot_name,
                 snapshot_mode=props["snapshot.mode"],
             )
+            # QUIESCE, VALIDATE, FLUSH, REPORT — in that order (Codex r3 BLOCKER-1).
+            # `run_engine_bounded` has stopped the watcher and refused to return at all
+            # unless it proved the thread dead, so nothing can add dirty state now.
+            # Persisting here rather than only through a commit group is the fix: a run
+            # that committed NO groups used to persist nothing, so everything the
+            # watcher learned vanished — and after an offline drop-and-recreate the next
+            # run accepted the replacement oid as though it had always owned that
+            # relation, leaving the old relation's rows beside the new one's for ever.
+            learned = dest_mod.flush_learned_relations(
+                con, pipeline=dest.pipeline_name, catalog=watcher
+            )
+            if learned:
+                summary_extra["source_relations_persisted"] = learned
             # The recovery is over when the work it asked for has actually been done.
             # The PREDICATE LIVES IN `recovery.py` (Codex r1 MAJOR-5): it validates the
             # captured obligation the journal recorded, performs the `armed -> absent`
@@ -563,7 +576,7 @@ def run(
                 # this is the same machinery asked the same question after the MAIN
                 # engine's snapshot, so an operator's reset converges in one run rather
                 # than failing and self-healing on the next.
-                emptied = resnapshot_mod.finish_empty_tables_after_main_snapshot(
+                emptied, fence = resnapshot_mod.finish_empty_tables_after_main_snapshot(
                     con,
                     pipeline=dest.pipeline_name,
                     dataset=dest.dataset_name,
@@ -574,6 +587,17 @@ def run(
                 )
                 if emptied:
                     summary_extra["verified_empty_after_snapshot"] = emptied
+                    # An entirely empty capture set emits no records, so the applier
+                    # commits no group and writes no resume point — and a recovery that
+                    # correctly demands one would never clear, on any run, for ever
+                    # (Codex r3 MAJOR-1). The handoff point is recorded from the fence
+                    # the emptiness was proven at; see `record_empty_handoff` for why
+                    # that claims nothing untrue.
+                    if resnapshot_mod.record_empty_handoff(
+                        con, pipeline=dest.pipeline_name, namespace=namespace,
+                        fence_lsn=fence,
+                    ):
+                        summary_extra["empty_handoff_lsn"] = fence
                 completion = recovery_mod.complete_if_ready(
                     con, pipeline=dest.pipeline_name, namespace=namespace, record=journal,
                 )

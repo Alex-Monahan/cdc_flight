@@ -88,6 +88,7 @@ def run_engine_bounded(
     started = time.monotonic()
     error_box: list[BaseException] = []
     final_poll_done = False
+    quiesced = True
     drain_until = 0.0
     catalog_unresolved: list[str] = []
 
@@ -227,14 +228,14 @@ def run_engine_bounded(
             close_hung = True
             outcome.record("hung")
         if catalog is not None:
-            # QUIESCED BEFORE ANY VERDICT IS TAKEN (Codex r2 MAJOR-3). The catalog
-            # poller runs on its own thread and was stopped only later, in
-            # `pipeline.run()`'s `finally` — so a poll already in flight could take an
-            # undeclared transition, or queue a destructive change, *after* the checks
-            # below had already concluded the run was a success. Nothing re-read the
-            # field. `stop()` sets the event and joins, and it is idempotent, so the
-            # caller's own `stop()` still works.
-            catalog.stop()
+            # QUIESCED BEFORE ANY VERDICT IS TAKEN (Codex r2 MAJOR-3), and quiescence is
+            # now something we PROVE rather than something `stop()` attempts (Codex r3
+            # MAJOR-3). The poller runs on its own thread; a poll that outlives a timed
+            # join can take an undeclared transition, or learn a relation, after the
+            # checks below have already concluded the run was a success. `stop()` returns
+            # whether the thread is actually dead, and a false is a failed run — see the
+            # `catalog_quiesced` check after the summary is built.
+            quiesced = catalog.stop()
         # ADR 0001 §3.2: the un-ENDed tail is DISCARDED, never guessed at. It is
         # safe to discard precisely because Invariant O means the offset store
         # still points before it, so it replays on the next run.
@@ -326,6 +327,22 @@ def run_engine_bounded(
                 f"{health.unknown_for:.1f}s ({health.summary()})",
                 summary,
             )
+
+    if catalog is not None and not quiesced:
+        # A verdict taken over a thread that is still running is not a verdict
+        # (Codex r3 MAJOR-3). Everything below — the machine-error check, the unresolved
+        # destructive changes, and the caller's flush of learned relations — reads state
+        # the live poller can still mutate. Fail closed.
+        outcome.record("engine_error")
+        summary["stop_reason"] = outcome.value
+        summary["catalog_quiesced"] = False
+        raise EngineFailure(
+            "the source-catalog poller did not stop, so its state can still change "
+            "after this run is judged: neither the undeclared-transition check nor the "
+            "pending-change check can be trusted, and the relations it learned must not "
+            "be persisted over a live writer. Refusing to report success",
+            summary,
+        )
 
     if catalog is not None and getattr(catalog, "machine_error", None):
         # A51 row 51, as a policy rather than a promise. A catalog change that moved

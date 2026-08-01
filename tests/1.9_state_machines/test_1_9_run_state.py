@@ -534,8 +534,97 @@ def test_a_write_that_starts_before_the_window_cannot_run_inside_it(con):
         assert active_during_sql == [False], (
             f"SQL executed with the window open: {active_during_sql}"
         )
-        assert COMMIT_ACK.overlaps == 0
     finally:
+        COMMIT_ACK.reset()
+        phases.close()
+
+
+def test_the_gate_has_no_five_second_escape(con):
+    """The escape the first gate shipped with, and the reproduction that killed it.
+
+    `enter()` used to give up after `GATE_TIMEOUT`, open the window anyway and merely
+    COUNT the overlap; holding `_execute()` past the bound then ran SQL with
+    `COMMIT_ACK.active is True` and `dropped_writes == 0` (Codex r3 MAJOR-2). An
+    instrumented violation of an absolute principle is still a violation. `enter()` now
+    waits without a bound of its own, and the applier wraps it in the commit watchdog so
+    a wedged observability cursor is a loud, bounded death instead.
+    """
+    import threading
+
+    from cdc_flight.run_state import COMMIT_ACK
+
+    COMMIT_ACK.reset()
+    phases = RunPhaseWriter(con, pipeline=PIPELINE, runner_id=RUNNER)
+    try:
+        phases.to(m.PHASE_RECONCILING)
+        in_write = threading.Event()
+        release = threading.Event()
+        active_during_sql: list[bool] = []
+        original = phases._execute
+
+        def _very_slow_execute(phase, *, insert):
+            in_write.set()
+            release.wait(30)
+            active_during_sql.append(COMMIT_ACK.active)
+            return original(phase, insert=insert)
+
+        phases._execute = _very_slow_execute
+        writer = threading.Thread(target=lambda: phases.to(m.PHASE_STREAMING))
+        writer.start()
+        assert in_write.wait(5)
+
+        entered = threading.Event()
+        threading.Thread(target=lambda: (COMMIT_ACK.enter(), entered.set())).start()
+        # WELL past the old five-second bound.
+        assert not entered.wait(COMMIT_ACK.GATE_TIMEOUT + 3), (
+            "the window opened while an independent write was still executing; the "
+            "five-second escape is back"
+        )
+        release.set()
+        writer.join(30)
+        assert entered.wait(10)
+        assert active_during_sql == [False], active_during_sql
+    finally:
+        COMMIT_ACK.reset()
+        phases.close()
+
+
+def test_a_stalled_gate_cannot_block_the_terminal_write_for_ever(con):
+    """The other direction, and it is bounded rather than absolute on purpose.
+
+    Blocking a run's own teardown on a stalled observability cursor is the same mistake
+    as overlapping the window (Codex r3 MAJOR-2, which held the writer and watched
+    terminalisation hang). By the time the terminal phase is written the applier has
+    stopped, so the terminal write waits `GATE_TIMEOUT` and then writes WITHOUT the gate,
+    counting the fact.
+    """
+    import threading
+    import time as _time
+
+    from cdc_flight.run_state import COMMIT_ACK
+
+    COMMIT_ACK.reset()
+    phases = RunPhaseWriter(con, pipeline=PIPELINE, runner_id=RUNNER)
+    holder_release = threading.Event()
+    try:
+        phases.to(m.PHASE_RECONCILING)
+
+        def _hold_the_gate():
+            with COMMIT_ACK.excluded():
+                holder_release.wait(30)
+
+        threading.Thread(target=_hold_the_gate, daemon=True).start()
+        _time.sleep(0.2)
+        started = _time.monotonic()
+        phases.finish(ok=False)
+        elapsed = _time.monotonic() - started
+        assert elapsed < COMMIT_ACK.GATE_TIMEOUT + 3, (
+            f"terminalisation blocked for {elapsed:.1f}s on the observability gate"
+        )
+        assert _row(con)[0] == "failed", "the terminal row was lost"
+        assert COMMIT_ACK.ungated_terminal_writes == 1
+    finally:
+        holder_release.set()
         COMMIT_ACK.reset()
         phases.close()
 
