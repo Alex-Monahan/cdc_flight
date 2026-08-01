@@ -657,3 +657,37 @@ def test_the_flush_cannot_persist_an_identity_nothing_has_rebuilt():
     block = source[source.index("learned = dest_mod.flush_learned_relations("):]
     block = block[: block.index("\n            )")]
     assert "exclude=" in block and "include_owed=True" in block
+
+
+def test_a_rebuilt_relation_is_flushed_so_it_can_acquire_an_identity():
+    """The exclusion that excluded the write it depended on. MEASURED as a regression.
+
+    At flush time a relation the re-snapshot has just rebuilt is `complete` and STILL has
+    no registry row, because the flush is what writes it. Keying the flush exclusion on
+    "no identity" therefore excluded the very write that establishes the identity, and
+    the confirmation then refused over a rebuild that had actually happened: a quiet run
+    after an ignore-mode populate rebuilt both relations and failed itself.
+
+    "Not rebuilt" is the honest predicate: no identity, holds rows, AND still owed.
+    """
+    con = _destination()
+    catalog_baseline.mark_unconfirmed(con, pipeline=PIPELINE, dataset=DATASET)
+    assert catalog_baseline.unrebuilt_relations(
+        con, pipeline=PIPELINE, dataset=DATASET
+    ) == [RELATION], "queued and not yet rebuilt"
+
+    # ...the blocking re-snapshot swaps an image in; the registry row comes later.
+    table_lifecycle.transition(
+        con, pipeline=PIPELINE, source_schema="app", source_table="documents",
+        to=table_lifecycle.IN_PROGRESS, reason="re-snapshot", target_table=TARGET,
+    )
+    table_lifecycle.transition(
+        con, pipeline=PIPELINE, source_schema="app", source_table="documents",
+        to=LIFECYCLE_COMPLETE, reason="swapped", target_table=TARGET,
+    )
+    assert catalog_baseline.unrebuilt_relations(
+        con, pipeline=PIPELINE, dataset=DATASET
+    ) == [], "a rebuilt relation must be flushed, or it can never acquire an identity"
+    assert catalog_baseline.unrelatable_relations(
+        con, pipeline=PIPELINE, dataset=DATASET, include_owed=True
+    ) == [RELATION], "...and it is still unidentified until the flush runs"

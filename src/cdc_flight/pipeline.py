@@ -634,49 +634,24 @@ def run(
             # relation, leaving the old relation's rows beside the new one's for ever.
             learned = dest_mod.flush_learned_relations(
                 con, pipeline=dest.pipeline_name, catalog=watcher,
-                # A relation that still holds rows this pipeline cannot relate to any
-                # identity at the source has not been rebuilt, so its observed oid must
-                # not become history: the next run would then agree with the source and
-                # never ask again (Codex r6 BLOCKER-2). Normally empty — by here the
-                # blocking re-snapshot has rebuilt them and they have identities.
+                # A relation NOTHING HAS REBUILT must not have its observed oid become
+                # history: the next run would then agree with the source and never ask
+                # again (Codex r6 BLOCKER-2). Normally empty — by here the blocking
+                # re-snapshot has rebuilt them.
+                #
+                # `unrebuilt_relations`, not `unrelatable_relations(include_owed=True)`:
+                # a relation the re-snapshot has just rebuilt is `complete` and still has
+                # no registry row, because THIS FLUSH is what writes it. Excluding on "no
+                # identity" would exclude the very write that establishes the identity,
+                # and the confirmation would then refuse over a rebuild that happened.
                 exclude=set(
-                    baseline_mod.unrelatable_relations(
+                    baseline_mod.unrebuilt_relations(
                         con, pipeline=dest.pipeline_name, dataset=dest.dataset_name,
-                        include_owed=True,
                     )
                 ),
             )
             if learned:
                 summary_extra["source_relations_persisted"] = learned
-            # ...and the CLAIM about them, which is the durable half (rubric 1.9/SM-E).
-            # Recomputed from durable state after the flush, so the verdict is a
-            # statement about what the destination now holds rather than about what
-            # this process remembers. A relation whose table was dropped and marked
-            # `awaiting_snapshot` is discharged here because `TABLE_LIFECYCLE` owes its
-            # rebuild — the obligation moves to the machine that owns it.
-            if watcher is not None:
-                baseline = baseline_mod.confirm(
-                    con, pipeline=dest.pipeline_name, dataset=dest.dataset_name,
-                    check=baseline, successful_polls=watcher.successful_polls,
-                    runner_id=runner_id,
-                )
-                summary_extra.update(baseline.as_dict())
-                if not baseline.valid:
-                    # No successful run over an unconfirmed baseline. This is the
-                    # nesting invariant the r5 defect slipped through: the *narrow*
-                    # symptom (zero polls) was rejected, but a later healthy run could
-                    # still report success while the destination durably held one
-                    # relation's rows under another relation's identity.
-                    outcome.record("engine_error")
-                    result["stop_reason"] = outcome.value
-                    raise EngineFailure(
-                        "the source-catalog baseline is "
-                        f"{baseline.state!r} at shutdown: {baseline.reason}. Until every "
-                        "relation the destination holds rows for can be related to an "
-                        "identity at the source, adopting what we observe would present "
-                        "one relation's rows as another's. Refusing to report success",
-                        result,
-                    )
             # The recovery is over when the work it asked for has actually been done.
             # The PREDICATE LIVES IN `recovery.py` (Codex r1 MAJOR-5): it validates the
             # captured obligation the journal recorded, performs the `armed -> absent`
@@ -727,6 +702,41 @@ def run(
                         f"recovery {completion.recovery_id} is still armed at shutdown: "
                         f"{completion.reason}. The destination is knowingly mid-rebuild, "
                         "so this run is not a success",
+                        result,
+                    )
+            # ...and the CLAIM about them, which is the durable half (rubric 1.9/SM-E).
+            #
+            # LAST, after every rebuild path has finished — including
+            # `finish_empty_tables_after_main_snapshot`, which is what empties and
+            # fences a relation that is genuinely empty at the source. Asked before
+            # it, this verdict saw six tables still holding their pre-reset rows and
+            # refused an `--reset-state` of an entirely empty source that had in fact
+            # converged (MEASURED). The baseline is the run's last claim, so it is
+            # taken when there is nothing left that could change the answer.
+            #
+            # Recomputed from durable state, so the verdict is a statement about what
+            # the destination now holds rather than about what this process remembers.
+            if watcher is not None:
+                baseline = baseline_mod.confirm(
+                    con, pipeline=dest.pipeline_name, dataset=dest.dataset_name,
+                    check=baseline, successful_polls=watcher.successful_polls,
+                    runner_id=runner_id,
+                )
+                summary_extra.update(baseline.as_dict())
+                if not baseline.valid:
+                    # No successful run over an unconfirmed baseline. This is the
+                    # nesting invariant the r5 defect slipped through: the *narrow*
+                    # symptom (zero polls) was rejected, but a later healthy run could
+                    # still report success while the destination durably held one
+                    # relation's rows under another relation's identity.
+                    outcome.record("engine_error")
+                    result["stop_reason"] = outcome.value
+                    raise EngineFailure(
+                        "the source-catalog baseline is "
+                        f"{baseline.state!r} at shutdown: {baseline.reason}. Until every "
+                        "relation the destination holds rows for can be related to an "
+                        "identity at the source, adopting what we observe would present "
+                        "one relation's rows as another's. Refusing to report success",
                         result,
                     )
             run_ok = bool(result.get("ok"))

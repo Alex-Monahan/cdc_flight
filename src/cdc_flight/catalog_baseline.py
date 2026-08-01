@@ -96,6 +96,7 @@ __all__ = [
     "mark_unconfirmed",
     "read",
     "trusted",
+    "unrebuilt_relations",
     "unrelatable_relations",
     "unrelatable_tables",
 ]
@@ -208,6 +209,30 @@ def unrelatable_relations(
         for schema, table, _target in unrelatable_tables(
             con, pipeline=pipeline, dataset=dataset, include_owed=include_owed
         )
+    ]
+
+
+def unrebuilt_relations(con, *, pipeline: str, dataset: str) -> list[str]:
+    """Unrelatable **and still owed**: the relations nothing has rebuilt yet.
+
+    The third question, and it is not the same as either of the other two. It exists
+    because the flush's exclusion cannot be `include_owed=True`: at flush time a relation
+    the re-snapshot has just rebuilt is `complete` and STILL has no registry row — the
+    flush is what writes it — so excluding on "no identity" would exclude the very write
+    that establishes the identity, and the confirmation would then fail over a rebuild
+    that had actually happened. MEASURED: a quiet run after an ignore-mode populate
+    rebuilt both relations and then refused itself.
+
+    "Not rebuilt" is the honest predicate for that exclusion: no identity, holds rows,
+    **and** `TABLE_LIFECYCLE` still owes the work.
+    """
+    owing = set(table_lifecycle.owing_work(con, pipeline))
+    return [
+        name
+        for name in unrelatable_relations(
+            con, pipeline=pipeline, dataset=dataset, include_owed=True
+        )
+        if name in owing
     ]
 
 
