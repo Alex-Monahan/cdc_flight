@@ -43,6 +43,7 @@ from . import faults as faults_mod
 from . import reconcile as reconcile_mod
 from . import recovery as recovery_mod
 from . import resnapshot as resnapshot_mod
+from . import resnapshot_recovery as resnapshot_recovery_mod
 from .applier import Applier, ApplierConfig
 from .config import (
     CatalogConfig,
@@ -397,7 +398,7 @@ def run(
         )
         summary_extra.update(baseline.as_dict())
 
-        interrupted_resnapshot = resnapshot_mod.requeue_interrupted(
+        interrupted_resnapshot = resnapshot_recovery_mod.requeue_interrupted(
             con,
             pipeline=dest.pipeline_name,
             state_dir=replication.state_dir / "resnapshot",

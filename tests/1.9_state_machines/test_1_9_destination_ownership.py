@@ -20,6 +20,7 @@ from cdc_flight import destination as dest_mod
 from cdc_flight import pipeline as pipeline_mod
 from cdc_flight import reconcile as reconcile_mod
 from cdc_flight import resnapshot as resnapshot_mod
+from cdc_flight import resnapshot_recovery as resnapshot_recovery_mod
 from cdc_flight.config import (
     ReplicationConfig,
     RunConfig,
@@ -165,7 +166,7 @@ def test_resnapshot_quiescence_failure_retains_every_owned_resource(monkeypatch,
     assert reassert_calls == [], "the parent connection is still callback-owned"
     assert drop_calls == ["round9_rs"], "only the pre-start stale-slot sweep is safe"
     assert (state_dir / "offsets.dat").read_bytes() == b"callback-owned"
-    assert resnapshot_mod.interruption_marker(state_dir).exists()
+    assert resnapshot_recovery_mod.interruption_marker(state_dir).exists()
     assert ownership.destination_quiescent is False
     assert ownership.state == "callback_owned"
     assert raised.value.summary["resnapshot_recovery"] == "armed"
@@ -252,7 +253,7 @@ def test_summaryless_baseexception_failed_quiescence_is_fail_closed_end_to_end(
     assert reassert_calls == [], "the contested destination connection was reused"
     assert drop_calls == ["round11_rs"], "only the pre-start stale-slot sweep is safe"
     assert (state_dir / "offsets.dat").read_bytes() == b"callback-owned"
-    assert resnapshot_mod._read_interruption_marker(state_dir)[0] == MARKER_ARMED
+    assert resnapshot_recovery_mod._read_interruption_marker(state_dir)[0] == MARKER_ARMED
 
     class _HardExit(BaseException):
         pass
@@ -354,7 +355,7 @@ def test_failed_quiescence_stays_callback_owned_if_callback_leaves_during_unwind
     assert drop_calls == ["round10_rs"], "only the pre-start stale-slot sweep is safe"
     assert applier.alerts.close_calls == 0
     assert (state_dir / "offsets.dat").read_bytes() == b"callback-owned"
-    assert resnapshot_mod.interruption_marker(state_dir).exists()
+    assert resnapshot_recovery_mod.interruption_marker(state_dir).exists()
     assert ownership.destination_quiescent is False
 
 
@@ -542,16 +543,16 @@ def test_next_run_requeues_an_armed_resnapshot_and_can_complete_it(tmp_path):
         to=table_lifecycle.IN_PROGRESS,
         reason="partial re-snapshot chunk",
     )
-    resnapshot_mod.arm_interruption_marker(
+    resnapshot_recovery_mod.arm_interruption_marker(
         state_dir, pipeline=PIPELINE, tables=TABLES
     )
 
-    requeued = resnapshot_mod.requeue_interrupted(
+    requeued = resnapshot_recovery_mod.requeue_interrupted(
         con, pipeline=PIPELINE, state_dir=state_dir
     )
     assert requeued == ["app.customers"]
     assert dest_mod.tables_awaiting_snapshot(con, PIPELINE) == TABLES
-    assert not resnapshot_mod.interruption_marker(state_dir).exists()
+    assert not resnapshot_recovery_mod.interruption_marker(state_dir).exists()
 
     completed = resnapshot_mod.finish_verified_empty_tables(
         con,
@@ -582,13 +583,13 @@ def test_interruption_marker_recovers_from_every_crash_state(
     state_dir = tmp_path / marker_state
     requests: list[list[tuple[str, str, str]]] = []
     if marker_state != "absent":
-        resnapshot_mod.arm_interruption_marker(
+        resnapshot_recovery_mod.arm_interruption_marker(
             state_dir, pipeline=PIPELINE, tables=TABLES
         )
     if marker_state == MARKER_CONSUMED:
         (state_dir / "offsets.dat").write_bytes(b"terminal offset state")
-        resnapshot_mod.consume_interruption_marker(state_dir)
-        payload = resnapshot_mod._read_interruption_marker(state_dir)
+        resnapshot_recovery_mod.consume_interruption_marker(state_dir)
+        payload = resnapshot_recovery_mod._read_interruption_marker(state_dir)
         assert payload[0] == MARKER_CONSUMED, "the consumed crash cut was not durable"
 
     monkeypatch.setattr(
@@ -596,13 +597,13 @@ def test_interruption_marker_recovers_from_every_crash_state(
         "request_snapshot",
         lambda _con, *, tables, **_kwargs: requests.append(tables),
     )
-    recovered = resnapshot_mod.requeue_interrupted(
+    recovered = resnapshot_recovery_mod.requeue_interrupted(
         object(), pipeline=PIPELINE, state_dir=state_dir
     )
 
     assert len(requests) == expected_requests
     assert recovered == (["app.customers"] if expected_requests else [])
-    assert not resnapshot_mod.interruption_marker(state_dir).exists()
+    assert not resnapshot_recovery_mod.interruption_marker(state_dir).exists()
     assert not state_dir.exists(), "terminal recovery left its offset directory behind"
 
 
@@ -612,7 +613,7 @@ def test_crash_before_marker_consumption_repeats_the_idempotent_discharge(
     """Destination write first, marker transition second: a crash repeats safely."""
     state_dir = tmp_path / "armed"
     requests: list[list[tuple[str, str, str]]] = []
-    resnapshot_mod.arm_interruption_marker(
+    resnapshot_recovery_mod.arm_interruption_marker(
         state_dir, pipeline=PIPELINE, tables=TABLES
     )
     monkeypatch.setattr(
@@ -620,20 +621,24 @@ def test_crash_before_marker_consumption_repeats_the_idempotent_discharge(
         "request_snapshot",
         lambda _con, *, tables, **_kwargs: requests.append(tables),
     )
-    real_consume = resnapshot_mod.consume_interruption_marker
+    real_consume = resnapshot_recovery_mod.consume_interruption_marker
 
     def _crash(_state_dir):
         raise KeyboardInterrupt("crash after destination discharge")
 
-    monkeypatch.setattr(resnapshot_mod, "consume_interruption_marker", _crash)
+    monkeypatch.setattr(
+        resnapshot_recovery_mod, "consume_interruption_marker", _crash
+    )
     with pytest.raises(KeyboardInterrupt, match="destination discharge"):
-        resnapshot_mod.requeue_interrupted(
+        resnapshot_recovery_mod.requeue_interrupted(
             object(), pipeline=PIPELINE, state_dir=state_dir
         )
-    assert resnapshot_mod._read_interruption_marker(state_dir)[0] == MARKER_ARMED
+    assert resnapshot_recovery_mod._read_interruption_marker(state_dir)[0] == MARKER_ARMED
 
-    monkeypatch.setattr(resnapshot_mod, "consume_interruption_marker", real_consume)
-    assert resnapshot_mod.requeue_interrupted(
+    monkeypatch.setattr(
+        resnapshot_recovery_mod, "consume_interruption_marker", real_consume
+    )
+    assert resnapshot_recovery_mod.requeue_interrupted(
         object(), pipeline=PIPELINE, state_dir=state_dir
     ) == ["app.customers"]
     assert len(requests) == 2

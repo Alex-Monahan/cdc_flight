@@ -109,13 +109,9 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-import json
 import logging
-import os
-import shutil
 import threading
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from . import destination as dest_mod
 from . import reconcile as reconcile_mod
@@ -125,10 +121,9 @@ from .config import ReplicationConfig, RunConfig, SourceConfig
 from .debezium_props import build_properties
 from .destination import CONTROL_SCHEMA, ResumePoint
 from .errors import EngineFailure
-from .machines import INTERRUPTION_MARKER as INTERRUPTION_MARKER_MACHINE
-from .machines import MARKER_ABSENT, MARKER_ARMED, MARKER_CONSUMED
 from .naming import quote
 from .ownership import DestinationOwnership
+from .resnapshot_recovery import InterruptionRecovery
 from .source_health import SourceHealth
 
 log = logging.getLogger("cdc_flight.resnapshot")
@@ -136,149 +131,6 @@ log = logging.getLogger("cdc_flight.resnapshot")
 #: Suffix for the throwaway slot. Kept short: Postgres slot names are limited to 63
 #: characters and the base name is already operator-chosen.
 SLOT_SUFFIX = "_rs"
-INTERRUPTION_MARKER = "interrupted.json"
-
-
-def interruption_marker(state_dir) -> Path:
-    return Path(state_dir) / INTERRUPTION_MARKER
-
-
-def _write_interruption_marker(marker: Path, payload: dict) -> None:
-    """Atomically replace and fsync one durable marker state."""
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    temporary = marker.with_suffix(".tmp")
-    with temporary.open("w", encoding="utf-8") as sink:
-        json.dump(payload, sink, sort_keys=True)
-        sink.flush()
-        os.fsync(sink.fileno())
-    os.replace(temporary, marker)
-    directory_fd = os.open(marker.parent, os.O_RDONLY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
-
-
-def _read_interruption_marker(state_dir) -> tuple[str, dict | None]:
-    marker = interruption_marker(state_dir)
-    if not marker.exists():
-        return MARKER_ABSENT, None
-    try:
-        payload = json.loads(marker.read_text(encoding="utf-8"))
-        # Markers written by rev 18 had no explicit state and were always armed.
-        state = INTERRUPTION_MARKER_MACHINE.parse(payload.get("state", MARKER_ARMED))
-    except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise EngineFailure(
-            f"invalid interrupted re-snapshot recovery marker {marker}: {exc}"
-        ) from exc
-    if state == MARKER_ABSENT:
-        raise EngineFailure(
-            f"invalid interrupted re-snapshot recovery marker {marker}: an existing "
-            "marker cannot declare the absent state"
-        )
-    return state, payload
-
-
-def arm_interruption_marker(
-    state_dir, *, pipeline: str, tables: list[tuple[str, str, str]]
-) -> Path:
-    """Durably arm next-run owed-state repair before a callback can start.
-
-    The marker is local filesystem state on purpose.  A failed quiescence proof means
-    the current destination connection — including its child cursors — has one owner,
-    the callback.  Pre-arming lets the next process repair the durable table lifecycle
-    without this process opening a second writer or touching the contested handle.
-    """
-    state, _payload = _read_interruption_marker(state_dir)
-    INTERRUPTION_MARKER_MACHINE.check(state, MARKER_ARMED)
-    marker = interruption_marker(state_dir)
-    payload = {
-        "state": MARKER_ARMED,
-        "pipeline": pipeline,
-        "tables": [list(table) for table in tables],
-    }
-    _write_interruption_marker(marker, payload)
-    return marker
-
-
-def consume_interruption_marker(state_dir) -> Path:
-    """Publish that a safe owner discharged the armed destination obligation."""
-    state, payload = _read_interruption_marker(state_dir)
-    INTERRUPTION_MARKER_MACHINE.check(state, MARKER_CONSUMED)
-    assert payload is not None
-    payload["state"] = MARKER_CONSUMED
-    marker = interruption_marker(state_dir)
-    _write_interruption_marker(marker, payload)
-    return marker
-
-
-def discard_consumed_interruption_marker(state_dir) -> None:
-    """Retire terminal marker and offset state through the declared machine edge."""
-    state, _payload = _read_interruption_marker(state_dir)
-    if state == MARKER_ABSENT:
-        return
-    if state != MARKER_CONSUMED:
-        raise EngineFailure(
-            f"refusing to delete armed interrupted re-snapshot recovery marker "
-            f"{interruption_marker(state_dir)}"
-        )
-    INTERRUPTION_MARKER_MACHINE.check(state, MARKER_ABSENT)
-    marker = interruption_marker(state_dir)
-    retired_dir = marker.parent
-    parent = retired_dir.parent
-    shutil.rmtree(retired_dir)
-    directory_fd = os.open(parent, os.O_RDONLY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
-
-
-def requeue_interrupted(con, *, pipeline: str, state_dir) -> list[str]:
-    """Consume a prior hard-exit marker and re-assert its snapshot obligation."""
-    marker = interruption_marker(state_dir)
-    state, payload = _read_interruption_marker(state_dir)
-    if state == MARKER_ABSENT:
-        return []
-    try:
-        assert payload is not None
-        recorded_pipeline = str(payload["pipeline"])
-        tables = [tuple(str(value) for value in row) for row in payload["tables"]]
-    except (KeyError, TypeError, ValueError) as exc:
-        raise EngineFailure(
-            f"invalid interrupted re-snapshot recovery marker {marker}: {exc}"
-        ) from exc
-    if recorded_pipeline != pipeline or any(len(table) != 3 for table in tables):
-        raise EngineFailure(
-            f"interrupted re-snapshot marker {marker} belongs to pipeline "
-            f"{recorded_pipeline!r} or has an invalid table identity; refusing to "
-            "discard recovery intent"
-        )
-    typed_tables = [(schema, table, target) for schema, table, target in tables]
-    if state == MARKER_ARMED:
-        dest_mod.request_snapshot(
-            con,
-            pipeline=pipeline,
-            tables=typed_tables,
-            detail=(
-                "a previous re-snapshot could not prove callback quiescence; its "
-                "durable image is requeued before this run starts"
-            ),
-        )
-        consume_interruption_marker(state_dir)
-    discard_consumed_interruption_marker(state_dir)
-    names = sorted(f"{schema}.{table}" for schema, table, _target in typed_tables)
-    if state == MARKER_CONSUMED:
-        log.warning(
-            "retired a consumed interrupted re-snapshot marker for %s table(s)",
-            len(names),
-        )
-        return []
-    log.warning(
-        "requeued %s table(s) from interrupted re-snapshot recovery: %s",
-        len(names), ", ".join(names),
-    )
-    return names
 
 
 @dataclass
@@ -481,9 +333,9 @@ def run(
     include = sorted({f"{schema}.{table}" for schema, table, _ in tables})
     slot = slot_name_for(replication.slot_name)
     state_dir = replication.state_dir / "resnapshot"
-    shutil.rmtree(state_dir, ignore_errors=True)
-    state_dir.mkdir(parents=True, exist_ok=True)
-    arm_interruption_marker(state_dir, pipeline=pipeline, tables=tables)
+    recovery = InterruptionRecovery.prepare(
+        state_dir, pipeline=pipeline, tables=tables
+    )
     # A leftover slot from an interrupted re-snapshot would make Debezium take the
     # pre-existing-slot path, which is exactly the path that does not export a snapshot.
     reconcile_mod.drop_slot(source.dsn, slot)
@@ -617,7 +469,7 @@ def run(
                 outcome.as_dict(),
             )
         assert_every_requested_table_completed(outcome)
-        consume_interruption_marker(state_dir)
+        recovery.consume()
         log.warning(
             "RE-SNAPSHOT complete at consistent point %s: swapped %s, emptied %s",
             outcome.consistent_lsn, outcome.swapped or "-", outcome.emptied or "-",
@@ -641,19 +493,17 @@ def run(
             )
         failed_quiescence = not destination_safe
         if failed_quiescence:
-            summary["resnapshot_recovery"] = "armed"
-            summary["resnapshot_recovery_marker"] = str(interruption_marker(state_dir))
-            summary["destination_owner"] = "live_resnapshot_callback"
+            recovery.retain_in(summary)
             with contextlib.suppress(Exception):
                 exc.summary = summary
             log.critical(
                 "re-snapshot callback did not quiesce; retaining its destination "
                 "runtime, throwaway slot and offset state. Recovery is armed at %s",
-                interruption_marker(state_dir),
+                recovery.marker,
             )
         else:
             reassert_owed(con, pipeline=pipeline, tables=tables, terminal=outcome)
-            consume_interruption_marker(state_dir)
+            recovery.consume()
         raise
     finally:
         if not source_stopped:
@@ -662,24 +512,14 @@ def run(
             watcher.stop()
         if applier is not None and ownership.owns(applier):
             ownership.retire_if_quiescent(reason="resnapshot_teardown")
-        marker_state, _payload = _read_interruption_marker(state_dir)
         if (
             (applier is None or not ownership.owns(applier))
-            and marker_state == MARKER_CONSUMED
+            and recovery.consumed
         ):
             # Named by us, created by Debezium, ours to reclaim only after the callback
             # ownership token proves every destination user has left AND a safe owner
             # has discharged the durable recovery obligation.
-            try:
-                reconcile_mod.drop_slot(source.dsn, slot)
-            except Exception:  # pragma: no cover - the source may be unreachable
-                log.error(
-                    "could not drop the throwaway re-snapshot slot %r; it is holding "
-                    "WAL on the source and the next run of this pipeline will sweep it",
-                    slot, exc_info=True,
-                )
-            discard_consumed_interruption_marker(state_dir)
-            shutil.rmtree(state_dir, ignore_errors=True)
+            recovery.retire_terminal_resources(dsn=source.dsn, slot=slot)
 
 
 def snapshot_phase_ended(applier, stop_reason: str) -> bool:
