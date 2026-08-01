@@ -60,9 +60,11 @@ unix_socket_directories = '${PGDATA}'
 
 # Logical replication (required by Debezium / pgoutput)
 wal_level = logical
-max_replication_slots = 20
-max_wal_senders = 20
-max_logical_replication_workers = 8
+# Twelve xdist workers need at most one active slot/sender each; leave four
+# spare slots/senders for throwaway resnapshot/recovery connections.
+max_replication_slots = 16
+max_wal_senders = 16
+max_logical_replication_workers = 4
 
 # This cluster is disposable test infrastructure. Keep logical decoding enabled,
 # but avoid durability work whose only consumer is a throwaway test database.
