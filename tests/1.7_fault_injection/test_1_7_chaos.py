@@ -146,7 +146,20 @@ def _shape(box: Sandbox, rng: random.Random, tag: str) -> None:
             f"WHERE name LIKE '{tag[:-1]}%'"
         )
     elif shape == "delete":
-        box.sql(f"DELETE FROM app.customers WHERE name LIKE '%-{rng.randint(1, ROWS)}'")
+        # It used to be `WHERE name LIKE '%-<random>'`, which after a few iterations of
+        # deletes matches NOTHING — and an iteration that produced no source change has
+        # no data-carrying commit group, so the anchor it armed cannot fire and the
+        # harness fails with "the plan armed X and it did not fire". That is the same
+        # vacuous-iteration defect the module docstring is about, one layer down: the
+        # anchor was fine, the *workload* was empty. MEASURED when rev 14 added an
+        # anchor and re-shuffled the cover: iteration 6 armed `destination_write` over a
+        # run with `applied_events=0` and `data_commit_groups=0`.
+        #
+        # One row that certainly exists, chosen deterministically from the seed.
+        box.sql(
+            "DELETE FROM app.customers WHERE id IN ("
+            f"  SELECT id FROM app.customers ORDER BY id DESC LIMIT {rng.randint(1, 3)})"
+        )
     elif shape == "key_update":
         box.sql(
             [
