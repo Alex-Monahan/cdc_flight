@@ -290,11 +290,13 @@ def test_a_fault_during_a_recovery_really_fires(tmp_path_factory, postgres_clust
     composed fault mandatory:
 
     1. a healthy baseline, so the counts afterwards mean something;
-    2. two transactions and a hard death at `post_commit_pre_ack:1` — the at-least-once
+    2. one transaction and a hard death at `post_commit_pre_ack:1` — the at-least-once
        window, the shape Invariant O exists for;
-    3. the recovery run, with `pre_commit:1` armed. The recovery *replays* the
-       un-acknowledged group, so it necessarily builds a data-carrying commit group,
-       so this anchor necessarily arrives. It is asserted to have fired;
+    3. more source work, then the recovery run with `pre_commit:1` armed. It is asserted
+       to have fired. (The *replayed* batch alone would not reach it: its units are
+       fenced by the durable resume point, which is Invariant O working. The new work is
+       what guarantees a data-carrying group, and the fault still lands while the offset
+       store is mid-replay.);
     4. an unhindered run, and then exact source/destination equality.
 
     The second fault therefore lands on a destination whose most recent durable event is
@@ -306,7 +308,20 @@ def test_a_fault_during_a_recovery_really_fires(tmp_path_factory, postgres_clust
         box.run(reset_state=True, max_seconds=150)
         _assert_equal_to_source(box, "baseline")
 
-        _shape(box, random.Random(1), "compose1")
+        # An explicit INSERT, not `_shape`: the anchors below index data-carrying
+        # commit groups, so the workload has to be one that certainly produces one.
+        # A randomly drawn shape can be an UPDATE or a DELETE that matches nothing,
+        # and then `post_commit_pre_ack:1` never arrives and the test is measuring
+        # the draw rather than the composition.
+        box.sql(
+            [
+                "INSERT INTO app.customers (name, email) SELECT 'compose-' || i, "
+                f"'compose-' || i || '@example.com' FROM generate_series(1, {ROWS}) i",
+                "INSERT INTO app.sensor_readings (sensor_id, value, unit) SELECT "
+                f"'COMPOSE', i * 1.5, 'C' FROM generate_series(1, {ROWS}) i",
+            ],
+            one_transaction=True,
+        )
         box.clear_fired_fault()
         box.run(
             max_seconds=120, timeout=200, expect_success=False,
@@ -315,6 +330,17 @@ def test_a_fault_during_a_recovery_really_fires(tmp_path_factory, postgres_clust
         first = box.fired_fault()
         assert first is not None and first["point"] == "post_commit_pre_ack", first
 
+        # More source work, so the recovery run certainly builds a data-carrying group.
+        # The replayed batch alone does NOT: its units are fenced by the durable resume
+        # point (that is Invariant O working), so nothing about it reaches a `pre_commit`
+        # anchor. The composition being tested is still the one that matters — this fault
+        # lands while the offset store is mid-replay and the most recent durable event at
+        # the destination is the first fault's commit.
+        box.sql(
+            "INSERT INTO app.customers (name, email) SELECT 'during-' || i, "
+            f"'during-' || i || '@example.com' FROM generate_series(1, {ROWS}) i",
+            one_transaction=True,
+        )
         box.clear_fired_fault()
         box.run(
             max_seconds=120, timeout=200, expect_success=False,
