@@ -160,9 +160,17 @@ class CatalogCoordinator:
         if not self.enabled:
             return CatalogPlan()
         due = self.catalog.due(durable_lsn)
-        if not due:
-            return CatalogPlan()
-
+        # NO EARLY RETURN WHEN NOTHING IS DUE. `source_relations` is the only thing that
+        # makes a DROP or a drop-and-recreate detectable across a restart — without the
+        # persisted `relation_oid` the next run has nothing to compare against — and it
+        # was written only as a side effect of a plan that had at least one due change.
+        # A pipeline whose catalog is simply quiet therefore never persisted what it had
+        # learned, and the first run after `--reset-state` (which discards
+        # `source_relations` deliberately, because the oids are about to be re-read) left
+        # the destination permanently unable to notice the next recreate. MEASURED: the
+        # rubric-1.5 recreated-relation E2E stopped detecting anything the moment
+        # `--reset-state` began registering every captured table, because a registered
+        # table produces no `new` change and nothing else was due.
         actions: list[CatalogAction] = []
         refused: list[tuple[CatalogChange, str]] = []
         alerts: list[dict] = []

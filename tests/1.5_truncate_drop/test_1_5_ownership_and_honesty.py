@@ -326,3 +326,39 @@ def test_a_poll_that_finishes_at_shutdown_still_fails_the_run():
     assert "undeclared transition" in str(excinfo.value)
     assert excinfo.value.summary["stop_reason"] == "engine_error"
     assert excinfo.value.summary.get("ok") is not True
+
+
+def test_what_the_watcher_learned_is_persisted_even_when_nothing_is_due():
+    """`source_relations` is what makes a drop detectable ACROSS a restart.
+
+    It was written only as a side effect of a `CatalogPlan` that had at least one *due*
+    change, because `plan()` returned an empty plan the moment `due` was empty. A
+    pipeline whose catalog is simply quiet therefore never persisted the `relation_oid`
+    it had learned — and the first run after `--reset-state`, which discards
+    `source_relations` deliberately, left the destination permanently unable to notice
+    the next drop-and-recreate. MEASURED: the 1.5 recreated-relation E2E stopped
+    detecting anything the moment reset began registering every captured table, because
+    a registered table produces no `new` change and nothing else was due.
+    """
+    from cdc_flight.catalog import SourceRelation
+    from cdc_flight.catalog_apply import CatalogCoordinator
+
+    w = CatalogWatcher(
+        dsn="", publication="pub", schema="app", include={"app.customers"},
+        replicated={"app.customers"}, poll_seconds=0,
+    )
+    relation = SourceRelation(
+        schema="app", table="customers", oid=16384, published=True, replica_identity="d"
+    )
+    w._dirty["app.customers"] = relation
+
+    coordinator = CatalogCoordinator(
+        catalog=w, pipeline="p", topic_prefix="cdcflight", drop_mode="replicate",
+        registry_of=lambda: None,
+    )
+    plan = coordinator.plan(durable_lsn=0)
+    assert plan.actions == (), "nothing was due, so nothing may be applied"
+    assert plan.relations == (relation,), (
+        "the learned relation was not carried into the plan, so nothing will persist "
+        "its oid and the next run cannot tell a recreate from a quiet table"
+    )
