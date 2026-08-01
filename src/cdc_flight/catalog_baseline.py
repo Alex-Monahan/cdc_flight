@@ -304,11 +304,11 @@ def _write(con, *, pipeline: str, frm: str, to: str, reason: str, runner_id: str
     stamp = now()
     # ONE TRANSACTION for the DELETE and the INSERT, and it is not decoration. The
     # control schema's idiom for "replace this row" is DELETE+INSERT, and a crash
-    # between the two would leave NO ROW — which reads as `absent`, and `absent` is the
-    # one untrusted-adjacent state that is deliberately *trusted*. A torn write of the
-    # `valid -> stale` mark would therefore erase the obligation instead of recording
-    # it: the exact failure this machine exists to make impossible, arriving through
-    # the writer rather than through the design.
+    # between the two would leave NO ROW, which reads as `absent`. `absent` is
+    # deliberately UNTRUSTED — only `valid` permits adoption — so a torn replacement
+    # cannot erase the safety obligation. The transaction is still required: it keeps
+    # the exact state, reason and unreconciled relation set together instead of degrading
+    # every interrupted transition into the less-informative `absent` pseudo-state.
     con.execute("BEGIN TRANSACTION")
     try:
         con.execute(
@@ -468,10 +468,9 @@ def confirm(
     * the watcher **read and compared** the source catalog at least once. A run that
       never did cannot have noticed a drop and has nothing to persist;
     * recomputed from durable state *after* the learned relations were flushed, nothing
-      is unrelatable any more. Note what discharges an obligation: a relation whose
-      destination table was dropped and marked `awaiting_snapshot` is no longer
-      protected, because `TABLE_LIFECYCLE` now owes its rebuild — the obligation moved
-      to the machine that owns it rather than being counted twice.
+      is unrelatable any more, including relations that still owe a rebuild. Merely
+      reaching `awaiting_snapshot` does not discharge the obligation; the lifecycle must
+      reach positive completion and the registry identity must be eligible for flush.
 
     Called after the catalog poller is proved quiesced, so nothing can add state this
     verdict has not seen.

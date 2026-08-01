@@ -382,7 +382,7 @@ applier *declares* rather than one inferred from the SQL. The fault the process 
 inject at all — a source whose packets stop arriving with the sockets left open — is
 injected from outside by `tests/tcp_relay.py`.
 
-The five `recovery_*` points (rubric 1.9's round, which closed 1.7 at 5) sit at the
+The five `recovery_*` points added in rubric 1.9's round sit at the
 boundaries of the one durable sequence nothing can make atomic — the to-do list,
 `offsets.dat`, the resume point and the replication slot. Their `<nth>` counts
 **boundary arrivals**, not commit groups: a recovery boundary is not a commit group, and

@@ -365,9 +365,9 @@ correct assumptions in the notes below:
 | 1.4 | Primary-key update handled correctly | ~~2~~ → **5** | The `d(old)`/`c(new)` pair is one transaction and a commit group holds whole transactions, so the move is atomic by construction. The fold models **physical rows** rather than keys, so a key worn by two rows inside a transaction (or freed and re-taken across two transactions of one group) is expressible; where the before-image cannot attribute a delete the group is refused rather than folded. Five reproduced silent-loss/duplication orderings are now equality tests. |
 | 1.5 | TRUNCATE / DROP propagate | ~~1~~ → **5** | `skipped.operations=none` brings truncates through; **one** dispatcher applies them in every storage mode and each truncate's audit records what *it* removed. `DROP TABLE` is not in the stream, so the source catalog is polled and the action passes six guards before any DDL. A dropped-and-recreated relation is dropped, marked `awaiting_snapshot` and **re-snapshotted automatically on the next run**. Held at 4 through the 1.6-1.8 review because the rebuild machinery could delete a live destination table it had merely not reached; that is closed with positive-evidence emptiness and multi-table proof (ADR §19/A52). A mass drop still needs an operator, deliberately. |
 | 1.6 | Snapshot/backfill consistent with CDC | ~~3~~ → **5** | Postgres's **exported snapshot** makes the boundary an iff, and the fence is on the transaction's **commit** LSN, so a transaction straddling `C` is applied in full rather than lost. Proven with ~200 transactions committing throughout a snapshot — every row on exactly one side. A re-snapshot is complete only when **every requested table** reaches a terminal state: swapped, or verified empty on three independent facts (Debezium's own end-of-snapshot marker, zero records for that table, and a source count of zero). A disagreement between the two readings of `C` is fatal. Proven against a four-table re-snapshot with a keyless table, a genuinely empty table and a concurrent writer. |
-| 1.7 | Failures do not cause correctness issues | ~~1~~ ~~4~~ → **3** | **Eighteen** anchors: eight protocol, five destination (including `destination_commit_late`, the genuinely ambiguous *committed-then-lost-the-answer* case), **five at the acquisition recovery's durable boundaries**, plus a real **network** blackhole injected from outside the process. The matrix is enumerated **from `faults.ALL_POINTS`**, every anchor writes a machine-readable fired record so the outcome class is *derived* from the run rather than read back out of the table, and the chaos harness injects **during recovery** over a shuffled cover of the anchor set. The 4 was an honest hold on one stated gap — the recovery's crash cuts were proven through a test seam rather than an injected `kill -9` — and that gap is closed with a default-lane guard per anchor (0.3 s) and a slow-lane run that kills a real process at `recovery_armed` against a real slot and then compares the whole destination against the whole source. |
+| 1.7 | Failures do not cause correctness issues | ~~1~~ ~~4~~ → **3** | **Twenty-one in-process anchors**: eight protocol, five destination (including the genuinely ambiguous `destination_commit_late`), seven recovery/catalog-baseline, and one source-catalog fault, plus a real network blackhole injected from outside the process. The matrix is enumerated from `faults.ALL_POINTS`, every anchor writes a machine-readable fired record, and the chaos harness asserts each workload affected source rows before arming. Round 7 still scores this 3/5: substantial evidence, but repeated adversarial compositions were found outside the suite, so the 5-band's “robust injection” is not yet the reviewer's verdict. |
 | 1.8 | Externally-advanced slot detected → backfill | ~~1~~ → **5** | Checked on every slot acquisition. Seven decisions trigger an **automatic** re-snapshot: slot ahead, slot missing, slot recreated, source identity changed, **source timeline forked**, source WAL rewound, and an empty destination with a positioned slot. The recovery is a **journalled state machine**: the intent is durable before any mutation, every step is idempotent and re-entrant after a crash at any phase, and a slot that will not drop fails the recovery rather than being logged and stepped over. A **populated** destination with no resume point refuses instead of being rebuilt. Proven by comparing the whole destination against the whole source after a real `pg_replication_slot_advance` and a real `pg_drop_replication_slot`, and by cutting the recovery at every phase boundary. |
-| 1.9 | Consistency-affecting state managed with state machines | **3** (new item) | Four machines and one precedence, each owning exactly one state, declared in one readable file (`cdc_flight/machines.py`) and enforced by a 293-line `states.py` with no dependencies: `table_lifecycle` (durable, `table_state.snapshot_state`, now with a **single writer** the suite greps for), `run_phase` (durable, `_cdc_flight.heartbeat`, the writer ADR §4.8 has specified since rev 1 and never had), `run_outcome` (a **precedence**, so A49's cause-before-symptom rule stops being two copies of a literal tuple), `acquisition_recovery` (durable, edge-checked on top of rev 8's domain check) and `catalog_change` (memory only). Seven further candidates are declined **with the argument written down** — the commit group stays memory-only because a durable machine there would weaken Invariant O, and its sixteen hand-reset fields become one `OpenGroup` instead, so BOTH reset paths are one object replacement rather than two field lists that diverged (the type is a mutable dataclass, so partial mutation is representable — the guarantee is that reset cannot forget a field, and the one intentional partial mutation is the named `discard_units()`). Four measured past bugs are now edges that do not exist. |
+| 1.9 | Consistency-affecting state managed with state machines | **5** (new item) | Five focused machines plus one precedence, declared together in `cdc_flight/machines.py`: `table_lifecycle`, `run_phase`, `acquisition_recovery`, `catalog_change`, and the durable `catalog_baseline`, plus `run_outcome` as cause-before-symptom precedence. Only a confirmed `valid` catalog baseline permits relation-identity adoption, and a queued rebuild remains unconfirmed until durable positive completion. Round 7 awards the literal 5 band (“an appropriate number of state machines, over 1”); its remaining teardown finding concerns non-load-bearing observability handles, not consistency state. |
 | 2.1 | Added / dropped columns handled | 2 | Adds work correctly; a dropped column silently lingers and reads NULL, indistinguishable from a real NULL. |
 | 2.2 | Renamed columns handled well | 1 | Rename lands as "new column + old column silently goes NULL". No tombstone, no linkage. |
 | 2.3 | New tables and schemas auto-discovered | 1 | Needs `ALTER PUBLICATION` + config change + restart, and pre-existing rows are silently never snapshotted. |
@@ -405,9 +405,9 @@ correct assumptions in the notes below:
 **Baseline average: 66 / 40 = 1.65 out of 5.** Items at 5 in the baseline:
 **1 of 40** (7.1).
 
-**Current average (this branch): 99 / 42 = 2.36 out of 5.** Items at 5: **10 of 42**
-(1.1-1.9 and 7.1) — **all of §1 is now at 5**. Distribution: 22 at 1, 3 at 2, 7 at 3,
-0 at 4, 10 at 5. Distance to target: **111 rubric points**.
+**Current average (this branch): 97 / 42 = 2.31 out of 5.** Items at 5: **9 of 42**.
+Rubric 1.7 remains 3 while 1.9 is 5. Distribution: 22 at 1, 3 at 2, 8 at 3,
+0 at 4, 9 at 5. Distance to target: **113 rubric points**.
 
 **Correction (2026-07-31).** This paragraph previously read `100 / 41 = 2.44` with a
 distribution of `21/3/8/0/9`, and neither matched the summary table above it — the block
@@ -421,8 +421,9 @@ The denominator is 42, not 40: the user added rubric **4.7** ("the Flight should
 able to self-heal without human intervention") and rubric **1.9** ("any state that can
 affect consistency is managed with a state machine approach") on 2026-07-31.
 
-The delta over the baseline is +33 points across eleven items: 1.1 (3 -> 5), 1.2 (3 -> 5),
-1.3 (1 -> 5), 1.4 (2 -> 5), 1.5 (1 -> 5), 1.6 (3 -> 5), 1.7 (1 -> 5), 1.8 (1 -> 5),
+The delta over the prior published branch total is +2 points: rubric 1.9 moved from the
+round-5 3-band to the round-7 reviewer verdict of 5. The broader historical delta includes
+1.1 (3 -> 5), 1.2 (3 -> 5), 1.3 (1 -> 5), 1.4 (2 -> 5), 1.5 (1 -> 5), 1.6 (3 -> 5), 1.7 (1 -> 3), 1.8 (1 -> 5),
 4.6 (1 -> 3), plus 4.7 as a new item scored **1** and 1.9 as a new item scored **5**.
 Every other row is still the baseline score, and the detail sections say so.
 
@@ -443,23 +444,19 @@ dropped and recreated **with rows that produce no change events at all** is
 detected, marked `awaiting_snapshot`, and rebuilt automatically on the next run,
 with the destination proven equal to the source afterwards.
 
-**Conservative-scoring notes for this round.** 1.6 and 1.8 are claimed at 5 on
-whole-table content comparisons against the source, not on counts. 1.7's 5 rests on
-the anchor set being enumerated *from the code*, so it cannot silently fall behind.
+**Conservative-scoring notes for round 7.** 1.6 and 1.8 are claimed at 5 on
+whole-table content comparisons against the source, not on counts. Rubric 1.7 is **3/5**
+despite 21 in-process anchors because the reviewer did not find the evidence robust
+enough for 5. Rubric 1.9 is **5/5** on the literal state-machine band.
 4.7 is **1**, rescored down from a claimed 3 after both reviewers pointed at the same
 thing: the band is a literal count of manual-intervention cases, the corrected
 inventory has twelve of them, and twelve is more than two. Scoring the remainder after
 setting the manual rows aside as "exceptions" is scoring a hand-selected subset.
-**1.7 goes from 4 to 5** (2026-07-31, with 1.9). It was held at 4 with one stated
-condition — the acquisition recovery had no fault anchors of its own, so its crash cuts
-rested on a test seam rather than an injected `kill -9` — and that condition is met: five
-anchors at the recovery's durable boundaries, each with a declared outcome in the
-enumerated matrix, a default-lane guard, and a slow-lane run that kills a real process at
-`recovery_armed` against a real Postgres slot and then compares the whole destination
-against the whole source. **1.9 is claimed at 5** on the rubric's own text (*an
-appropriate number of state machines, over 1*): four machines plus one precedence, each
-owning one state, with the seven declined candidates argued individually rather than
-omitted. 4.6 is 3, not 5, because
+The acquisition-recovery anchors closed the earlier stated 4-band gap, but subsequent
+reviews still found compositions outside the suite; the round-7 published verdict is
+therefore 1.7 **3/5**, not the interim claim of 5. **1.9 is 5/5** on the rubric's own
+text (*an appropriate number of state machines, over 1*): five machines plus one
+precedence, including the durable catalog-baseline machine. 4.6 is 3, not 5, because
 the detection that closed TODO 4.6(b) is ours (a 0.5 s slot sampler), not the
 connection's — 4.4's heartbeat and 4.6(c)'s socket timeouts are still absent.
 
@@ -1216,19 +1213,19 @@ the absence of any re-snapshot at all.
 
 #### The anchor set
 
-**Rescored 2026-07-31 from 4 to 5, after the one stated gap was closed** (rubric 1.9's
-task). The history: Codex scored this **1/5** and Opus **4/5** in the 1.6-1.8 round; all
-of that is closed. It was then held at **4** by this project rather than by a reviewer,
-for one reason written down in advance — the acquisition recovery had no fault anchors of
-its own — and that is what changed.
+**Round-7 reviewer verdict: 3/5.** The earlier acquisition-recovery hold was closed, but
+later rounds repeatedly found adversarial compositions outside the suite. The evidence is
+substantial; the reviewer still does not classify it as the rubric's “robust injection”
+5 band.
 
-**Eighteen anchors**, in three mechanisms plus one that cannot live in the process at all:
+**Twenty-one in-process anchors**, in four mechanisms, plus one external network fault:
 
 | mechanism | anchors |
 |---|---|
 | `faults.maybe_crash` — the process dies at an exact protocol point | `decode`, `begin`, `spill`, `mid_apply`, `swap`, `pre_commit`, `post_commit_pre_ack`, `post_ack` |
 | `faults.FaultyConnection` — the destination misbehaves | `destination_write`, `destination_commit`, `destination_commit_late` (the genuinely ambiguous one), `destination_hang`, `destination_close` |
-| `faults.maybe_crash` at a **durable recovery boundary** (new) | `recovery_requested`, `recovery_offsets_file_deleted`, `recovery_resume_point_deleted`, `recovery_armed`, `table_rebuild_queued` |
+| `faults.maybe_crash` at a durable recovery/baseline boundary | `recovery_requested`, `recovery_offsets_file_deleted`, `recovery_resume_point_deleted`, `recovery_armed`, `table_rebuild_queued`, `catalog_baseline_marked`, `catalog_baseline_pre_valid` |
+| source-side injected fault | `catalog_poll` |
 | `tests/tcp_relay.py` — the source stops answering with the sockets left open | the network blackhole |
 
 The destination anchors fire at the data group the **applier declares**
@@ -1249,8 +1246,9 @@ is a statement:
 
 The ledger is the **source's own counts**, per keyed and keyless table, plus
 `count(*) = count(DISTINCT cdcf_event_id)`. `test_1_7_chaos.py` composes the anchors: a
-seeded random anchor at a random workload shape, 8 iterations, with that invariant checked
-after each; `CDC_CHAOS_SEED` replays a failing sequence verbatim.
+seeded random anchor at a random workload shape, with that invariant checked after each.
+Every shape asserts it affected at least one source row before arming; `CDC_CHAOS_SEEDS`
+replays a failing sequence verbatim.
 
 #### Three defects the injection found
 
@@ -1346,17 +1344,18 @@ this a closure rather than a claim:
 
 #### Why 3 and NOT 5 — the score the review loop settled on
 
-**Scored 3, against a claim of 5, and the branch is NOT merged.** The anchor set is
+**Scored 3, against a claim of 5, in round 7.** The anchor set is
 enumerated from the code, the `SILENT` bucket is empty by derivation from the run rather
 than by spelling, every durable multi-step sequence has an anchor at each boundary, and
 the hard-death cuts are real `os._exit` in child processes. That is a large improvement
-and it is still not "robust injection", because across five rounds the reviewer's own
+and it is still not "robust injection", because across seven rounds the reviewer's own
 adversarial probes — not the suite — found each remaining defect: a duplication across an
 all-empty snapshot boundary, a catalog-failure/offline-DDL composition, a terminal-write
-teardown on a serialized sink. A suite that does not find those compositions cannot claim
-the band. The literal 1-band ("duplication is possible") is no longer the accurate
-description — the reproduced duplication is fixed and no crash/replay duplication was
-found — so 3 is the highest defensible band.
+teardown on a serialized sink, a comment-sensitive flush guard, and an empty chaos update
+shape. The round-7 fixes make the flush guard structural and require positive affected-row
+evidence, but the published verdict remains the reviewer's 3 rather than self-promoting
+to 5. The literal 1-band ("duplication is possible") is no longer accurate — the
+reproduced duplication is fixed and no crash/replay duplication was found.
 
 Two residual honesty notes: `RECOVERS` and `SILENT` are both empty in practice — every
 injected fault ends in a non-zero exit — so "two permitted outcome classes" is really one
@@ -1484,14 +1483,12 @@ ours, it runs before the engine starts, and it does not depend on Debezium notic
 ---
 
 
-### 1.9 Consistency-affecting state managed with state machines — **3 / 5**
+### 1.9 Consistency-affecting state managed with state machines — **5 / 5**
 
-> **NOT MERGED.** Five thermo-nuclear review rounds ran against this item
-> (`reviews/1.9_codex_review.md`, `_r2`, `_r3`, `_r4`, `_r5`). Round 5 still returned
-> `SATISFIED: no` with 1 BLOCKER and 1 MAJOR, so `feature/1.9-state-machines` stays
-> unmerged and both scores are published at the reviewer's conservative band rather than
-> the claim. What is open is recorded under "Why 3 and NOT 5" below and in
-> `docs/adr/0001-transactional-applier.md` §A62.
+> **Round-7 reviewer verdict: 5/5.** Round 7 still returned `SATISFIED: no` because an
+> idle observability cursor could hang teardown, but explicitly held that finding outside
+> rubric 1.9: it is a non-load-bearing handle, not consistency state. The fifth focused
+> machine, durable `catalog_baseline`, closes the state gap that held earlier rounds to 3.
 
 `no state machines=1, only 1 big state machine=3, an appropriate number (over 1)=5`
 
@@ -1514,7 +1511,7 @@ therefore mutated by a path the design did not enumerate.**
 Explicit machines do not make the system correct. They make the **unenumerated path** a
 run-time error instead of a review finding.
 
-#### What was built — four machines and one precedence
+#### What was built — five machines and one precedence
 
 | machine | owns | states | edges | persistence |
 |---|---|---|---|---|
@@ -1523,6 +1520,7 @@ run-time error instead of a review finding.
 | `run_outcome` | why did this run stop — cause before symptom | 9 | 36 (escalations only) | `heartbeat.terminal_reason`, `last_run.json` |
 | `acquisition_recovery` | what has this destructive recovery already done | 5 | 9 | `_cdc_flight.recovery_state.phase` |
 | `catalog_change` | where is one DDL fact in observe → confirm → fence → apply | 9 | 30 | **memory only** |
+| `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
 
 Style, deliberately minimal: `cdc_flight/states.py` is 293 lines with **no dependencies**
 — plain-`str` states (they are already durable strings in `VARCHAR` columns, in
@@ -1606,35 +1604,30 @@ a count. Full table in ADR §20/A55.
 | one writer, the `in_progress` residue, the owed queue, `--reset-state`, alerts | `tests/1.9_state_machines/test_1_9_table_lifecycle.py` | ms |
 | the durable phase row, the precedence, the migration, the independent connection | `tests/1.9_state_machines/test_1_9_run_state.py` | ms |
 | the per-relation state and the fence | `tests/1.9_state_machines/test_1_9_catalog_change.py` | ms |
+| the durable identity-adoption baseline and rebuild discharge | `tests/1.9_state_machines/test_1_9_catalog_baseline.py` | ms |
 | `OpenGroup` — the object is replaced, not edited | `tests/1.3_atomic_batches/test_1_3_rollback_resets_the_group.py` | ms |
 | the ADR's transition tables are generated from `machine.table()` | `tests/4.7_self_healing/test_4_7_inventory.py` | ms |
 
-78 tests, well under a second, all in the default lane; the five recovery anchors add 17
-more (four of them a real `os._exit` in a child process) in 0.8 s. That is deliberate: a
-guard that only runs when somebody asks for it is not a guard. Measured after round 2:
-**562 default / 9:10** and **95 slow / 22:00**, both green, against a 10-minute
-default budget.
+The default lane includes the state-machine guards and all seven recovery/baseline anchor
+guards. The round-7 fixes measure **608 passed / 9:14** (9:15 wall), under the 10-minute
+default budget; the real-cluster catalog and teardown compositions remain explicit
+slow-lane tests.
 
-#### Why 3 and NOT 5 — the score the review loop settled on
+#### Why 5 — the round-7 score
 
-**Scored 3, against a claim of 5, and the branch is NOT merged.** Five review rounds
-(`reviews/1.9_codex_review.md` and `_r2`…`_r5`) held the item to the rubric's word
-**ANY**, and the fifth still found one consistency-affecting state living outside the
-machines. The 1-band ("no state machines") is plainly wrong — there are five machines,
-each owning one state, no two sharing a durable location, with seven declined candidates
-each carrying a written argument — and the 5-band is not defensible while the gap below
-exists. 3 is the highest publishable band.
+Round 7 applies the rubric's literal 5 band: “an appropriate number of state machines
+(over 1).” Five focused machines own five concepts, and `run_outcome` is separately a
+precedence rather than being forced into a graph. The consistency-affecting state earlier
+reviews found outside the model now has a durable owner: `CATALOG_BASELINE`, with four
+states, twelve declared edges and one writer.
 
-**The gap, stated as the reviewer reproduced it.** *Catalog-baseline validity* is
-consistency-affecting and is still implicit, spread across four facts: whether the
-destination already owns rows, whether `source_relations` has ever been populated,
-whether THIS run read the catalog, and whether a PREVIOUS run failed to. A run in which
-every catalog poll fails now fails loudly (round 4's fix) — but that failure leaves no
-durable record, so a later healthy run adopts the currently observed `relation_oid` as
-history. If the relation was dropped and recreated in between, the old rows stay beside
-the new ones and every subsequent run reports success. `successful_polls` is process
-memory; the obligation needs to be durable, and closing it properly means a new durable
-state with its own edges — which is the 1.9 work, not a patch.
+Its safety partition is explicit and conservative. Every state except `valid`, including
+the no-row pseudo-state `absent`, is untrusted; only a confirmed baseline permits an
+observed relation identity to become history. Reconciliation marks lifecycle
+`awaiting_snapshot` without destructive DDL, and confirmation stays `invalidated` while
+durable state says any rebuild remains owed. The round-7 teardown MAJOR does not lower
+1.9 because heartbeat cursor and connection retirement are observability ownership, not
+state that can advance the slot or certify destination data.
 
 #### What the first Codex review rejected, and what round 2 changed
 

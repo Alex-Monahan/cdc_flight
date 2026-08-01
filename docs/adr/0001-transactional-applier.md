@@ -1,6 +1,6 @@
 # ADR 0001 — The transactional applier
 
-* **Status:** accepted (revision 8, 2026-07-31 — implemented; §15 records the amendments the implementation forced, §16 those the 1.1–1.3 review round forced, §17 those 1.4/1.5 forced, §18 the 1.4/1.5 review round, §19 the 1.6-1.8 work and its review round)
+* **Status:** accepted (revision 16, 2026-08-01 — implemented through the rubric 1.9 round-7 state model)
 * **Date:** 2026-07-30
 * **Task:** TODO 1.0(a); revised under TODO 1.0(feedback)
 * **Decides rubric items:** 1.1, 1.2, 1.3, 1.7 (directly), and 1.4, 1.6, 1.8, 3.2,
@@ -24,6 +24,7 @@
 | 5 | 2026-07-31 | **Amendments from 1.4 / 1.5** (§17): a key-changing UPDATE is always `d`+`c` for Postgres, so 1.4's atomicity is a corollary of §3.2/§3.3 (A30); the merge cannot collapse a group by key alone when one key is worn by two rows in one transaction (A31); TRUNCATE is a counted, key-less data event and `skipped.operations` was the whole gap (A32); DROP TABLE needs a catalog poller whose WAL fence marker must be **transactional** (A33 — which also constrains D9); what a table-level event means for history (A34). |
 | 8 | 2026-07-31 | **Amendments from the 1.6-1.8 review round** (§19, continued). Re-snapshot completion means *every requested table*, and "empty" needs positive evidence rather than the absence of our own records (A52 — which also corrects A45's `min()` resolution of a disagreeing `C` to a hard failure). The acquisition recovery becomes a journalled, idempotent, crash-re-entrant state machine, and A50's claim that its *order* made every intermediate state recoverable is withdrawn as false (A53). A fault test must name the anchor that fired, and three fault-injection accidents are fixed (A54). A50 gains a timeline decision and a destination-emptiness input. A51 is recounted (the old headline did not add up), split to one failure and one class per row, extended with the modes this branch exposed, and made machine-checked. |
 | 9 | 2026-07-31 | **Rubric 1.9 — explicit state machines** (§20). Four machines and one precedence, each owning exactly one consistency-affecting state, declared in `cdc_flight/machines.py` and enforced by a dependency-free `cdc_flight/states.py` with no dependencies (A55). `table_state.snapshot_state` gets a single writer and a transition table, and the owed queue selects every non-terminal state rather than one literal value; `_cdc_flight.heartbeat` gets the run-phase writer ADR §4.8 has specified since rev 1; `stop_reason` becomes a declared precedence, so A49's cause-before-symptom rule stops being two copies of a literal tuple; `recovery_state.phase` gains edge checks on top of rev 8's domain check; catalog changes get one per-relation state instead of four containers. The commit group deliberately stays memory-only — a durable machine there would weaken Invariant O — and its sixteen hand-reset fields become one `OpenGroup`, so neither reset path can forget a field (A56, narrowed at A58.6: the mutable type does not make partial mutation impossible, and does not claim to). The acquisition recovery gains five fault anchors of its own, closing rubric 1.7's honest hold (A57). A51 is rewritten as states × transitions with generated transition tables. |
+| 16 | 2026-08-01 | **Round-7 reconciliation.** The current inventory has five focused machines plus one outcome precedence: `catalog_baseline` is the fifth machine. Only `valid` permits identity adoption; a queued `awaiting_snapshot` rebuild is not complete. A51 rows 55/57 and the published 1.9 score now state those partitions. `CONNECTION_RETIREMENT` uses one bounded daemon-worker close protocol for cursor and parent handles and distinguishes `failed` from `closed` (A65). Rubric 1.9 is 5/5 and 1.7 remains the reviewer's 3/5. |
 
 ---
 
@@ -2930,11 +2931,11 @@ made no claim — see A63.4.
 | 52 | — | a durable state value **outside its frozen domain** is read (`table_state.snapshot_state`, `recovery_state.phase`) | `Machine.parse()` on every read | refused; the run does not start. A value in no domain belongs to no queue and no recovery path | n/a — reading is not a mutation | **MANUAL** (new at rev 9 — same trade as 51: it was silent before) |
 | 53 | run_phase: starting -> reconciling | the run-phase heartbeat row cannot be written (the table is missing, the independent connection is refused) | the write raises and is caught | the phase is tracked in memory, the machine still checks every edge, and the run is unaffected: observability must never fail a run that is otherwise correct | the row is not load-bearing for any decision | AUTO (new at rev 9) |
 | 54 | catalog_baseline: valid -> stale | a run cannot be assumed to have confirmed the source-catalog baseline | it has not finished; the mark is written BEFORE the engine starts, unconditionally | the next run reconciles from the durable mark instead of trusting an observation | `catalog_baseline_marked` — the mark is durable, nothing else has happened; the next run reconciles | AUTO (rev 14) |
-| 55 | catalog_baseline: stale -> invalidated | a relation holds destination rows, has no recorded source identity, and the baseline was never confirmed | `catalog_baseline.unrelatable_relations`, from durable state alone | the observed identity is NOT adopted; the relation is queued as `recreated`, fenced, and left `awaiting_snapshot` for rubric 1.6's rebuild | as 54 — the names are in the row, so the obligation survives the process that found it | AUTO (rev 14 — this is the r5 BLOCKER, and it used to be silent adoption) |
+| 55 | catalog_baseline: stale -> invalidated | a relation holds destination rows, has no recorded source identity, and only a confirmed `valid` baseline permits adoption (`absent` takes its separately declared `absent -> invalidated` edge) | `catalog_baseline.unrelatable_relations`, from durable state alone | the observed identity is NOT adopted; table lifecycle is marked `awaiting_snapshot` directly, without destructive DDL or a catalog fence, and rubric 1.6 rebuilds it before streaming | `catalog_baseline_marked` falls between the durable named obligation and lifecycle marking; the next run recomputes the same set and idempotently queues it | AUTO (rev 16 — covers both the r5 missing baseline and r6 legacy `absent` partition) |
 | 56 | catalog_baseline: stale -> valid | — (the discharge) | ≥1 real catalog comparison **and** nothing unrelatable, recomputed after the flush | n/a: this is the healthy transition | `catalog_baseline_pre_valid` — the learned relations are durable and the promotion is not; the next run reaches the same verdict from durable state, so it is idempotent rather than one-shot | AUTO (rev 14) |
-| 57 | catalog_baseline: invalidated -> valid | — (the discharge, after a rebuild was queued) | the relation is now `awaiting_snapshot`, so `table_lifecycle` owes its image and the baseline is no longer protecting it | n/a | as 56 | AUTO (rev 14) |
+| 57 | catalog_baseline: invalidated -> valid | — (the discharge, after rebuild completion) | a durable `include_owed=True` query finds no relation that still holds rows without an identity: every queued rebuild positively completed and the learned identity was eligible for flush | n/a; merely reaching `awaiting_snapshot` keeps the baseline `invalidated` and a disabled/skipped repair refuses before streaming | as 56 | AUTO (rev 16 — a queued rebuild is not a finished one) |
 | 58 | catalog_baseline: valid -> absent | the recorded source catalog is forgotten (`--reset-state`, a source identity change) | `recovery.begin(forget_catalog=True)` | the claim is deleted in the SAME transaction as `source_relations`: a claim about a registry that no longer exists would suppress the reconciliation of the one replacing it | one transaction, so there is no cut | AUTO (rev 14) |
-| 59 | connection_retirement (domain) | the terminal run-phase write never returns (a wedged observability cursor) | the write is bounded on a named worker; `close()` joins it with a bound and RELEASES the cursor rather than closing it under a live statement, and `release_connection()` does the same for the PARENT handle | the run tears down within the bound, `main()` writes `last_run.json` carrying `terminal_phase_write_abandoned` and `destination_connection_release`, and the process exits on its own verdict | n/a — the heartbeat is not load-bearing for any decision | **UNDEFINED** (rev 14 — honest: nothing clears the non-terminal heartbeat row that abandoned runner left behind, so an operator reading `_cdc_flight.heartbeat` alone sees a phase that never terminalised. `last_run.json` is the terminal record. Bounding the teardown was the merge-blocking half; sweeping the stale row is 4.4/6.1's) |
+| 59 | connection_retirement (domain) | a heartbeat write, cursor close, or parent connection close never returns; or close raises | one canonical daemon-worker close protocol bounds both idle cursor and parent close calls; a live writer retains cursor ownership until it returns | the run tears down within the bound and reports `closed`, `failed` (with the close error), or `abandoned` for each handle before process exit | n/a — the heartbeat is not load-bearing for any decision | **UNDEFINED** (rev 16 — honest: nothing clears the non-terminal heartbeat row an abandoned runner left behind; `last_run.json` is the terminal record and stale-row sweeping belongs to 4.4/6.1) |
 
 **The counts, parsed from the rows above rather than recalled.** 64 rows, one
 failure and one terminal class each.
@@ -2995,9 +2996,9 @@ consumed only by a test.
   `fresh_start`, `resume`, `file_missing_rebuilt`, `file_missing_no_durable_offset`, `file_missing_repair_disabled`, `file_corrupt_rebuilt`, `file_ahead_rebuilt`, `file_behind_rebuilt`, `file_offset_mismatch_rebuilt`, `orphan_accepted_resnapshot`
 * **`source_health`** (6 values) — What is the source connector doing, as one named value rather than six timers?
   `unsampled`, `streaming`, `not_streaming`, `unknown`, `unknown_never_sampled`, `dark`
-* **`connection_retirement`** (3 values) — Who owned this destination handle when the
-  run tore down, and was it closed or released?
-  `never_opened`, `closed`, `abandoned`
+* **`connection_retirement`** (4 values) — Who owned this destination handle when the
+  run tore down, and did close succeed within the bound?
+  `never_opened`, `closed`, `failed`, `abandoned`
 
   ONE vocabulary for the heartbeat cursor **and its parent connection**, since rev 15.
   Round 5's finding was that the cursor was closed under a live statement; round 6's was
@@ -3214,7 +3215,7 @@ Three more corrections came with it:
 
 ## 20. Rubric 1.9 — explicit state machines
 
-### A55 — four machines, one precedence, and the seven candidates that are not
+### A55 — five machines, one precedence, and the seven candidates that are not
 
 Rubric 1.9 (added 2026-07-31) asks that *any state that can affect consistency is managed
 with a state machine approach*: **no state machines = 1, only one big state machine = 3,
@@ -3243,7 +3244,7 @@ machine is ceremony — worse than ceremony, because it advertises recoverable i
 states that do not exist. If yes, the state needs a name, a persisted value and a
 transition table.
 
-#### What was built (four machines + one precedence)
+#### What was built (five machines + one precedence)
 
 | machine | owns | states | edges | persistence |
 |---|---|---|---|---|
@@ -3252,6 +3253,7 @@ transition table.
 | `run_outcome` | why did this run stop — cause before symptom | 9 | 36 (a **precedence**: escalations only) | `heartbeat.terminal_reason`, `last_run.json` |
 | `acquisition_recovery` | what has this destructive recovery already done | 5 | 9 | `_cdc_flight.recovery_state.phase` |
 | `catalog_change` | where is one DDL fact in observe → confirm → fence → apply | 9 | 30 | **memory only** |
+| `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
 
 Generated transition tables: §A51.1. Declarations: `cdc_flight/machines.py`, which is one
 file an operator or a reviewer can read to see every consistency-affecting state in the
@@ -3365,9 +3367,9 @@ Two consequences worth stating:
   Adding one would suggest the group has recoverable intermediate states; the entire
   correctness argument is that it does not.
 
-### A57 — the acquisition recovery gets fault anchors of its own (rubric 1.7 → 5)
+### A57 — the acquisition recovery gets fault anchors of its own (1.7 evidence)
 
-Rubric 1.7 was held at 4 for one stated reason: the acquisition-recovery crash cuts were
+Rubric 1.7 was held at 4 for one stated reason at this revision: the acquisition-recovery crash cuts were
 proven through a **test seam** (`recovery.resume(on_phase=...)`), not through injected
 faults. A raised Python exception is not a crash. It unwinds `finally` blocks, closes the
 destination connection and flushes the JVM; `os._exit` does none of that, and the claim
@@ -3394,6 +3396,10 @@ from `ALL_POINTS` and requires a declared outcome for each; the default-suite gu
 **real** `cdc-flight` process at `recovery_armed` against a real Postgres slot and then
 compares the whole destination against the whole source
 (`test_1_8_recovery_crash_e2e.py`).
+
+This closed that stated gap, but it did not establish the final 5 band. Later reviews
+continued to find compositions outside the suite; round 7 therefore publishes 1.7 at
+**3/5**, not the interim claimed 5.
 
 ### A58 — rev 10: the operator routes are journalled too, and one owner per fact
 
@@ -3832,8 +3838,9 @@ in full" and "the commit may or may not be durable" send an operator to differen
 thermo-nuclear reviewer: one initial review and four re-reviews
 (`reviews/1.9_codex_review.md`, `_r2`, `_r3`, `_r4`, `_r5`). Round 5 returned
 `SATISFIED: no` with **1 BLOCKER and 1 MAJOR**, so the loop's stop condition was reached
-and the branch was **not merged**. 1.9 is published at **3/5** and 1.7 at **3/5** — the
-reviewer's conservative bands, not the claims.
+and the branch was **not merged**. At that historical round, 1.9 was published at
+**3/5** and 1.7 at **3/5** — the reviewer's conservative bands, not the claims. A65
+records the current round-7 verdicts: 1.9 **5/5**, 1.7 **3/5**.
 
 What the loop bought is worth stating, because it is the argument for running it: across
 five rounds it found and forced fixes for one destructive-ordering blocker
@@ -4083,3 +4090,24 @@ state before it. Re-verified rather than re-fixed: the completion log branches o
 is no resume point and none can exist"; `_reset_group` now states the narrow claim, that
 both reset paths are one object replacement so neither can forget a field, and names
 `discard_units()` as the one deliberate partial mutation.
+
+### A65 — rev 16: round-7 retirement completion and final score bands
+
+Round 7 confirmed the catalog-baseline partition and all four binding principles. It
+scored rubric 1.9 **5/5**: the current design has five focused machines — table
+lifecycle, run phase, acquisition recovery, catalog change and catalog baseline — plus
+the separate run-outcome precedence. The remaining merge stop was not consistency state;
+it was an idle heartbeat cursor whose `close()` could wedge teardown.
+
+Handle retirement now has one canonical primitive. Every actual `close()` runs on a
+named daemon worker under a deadline, for both the heartbeat cursor and its parent
+connection. A live phase-write worker retains cursor ownership and is released rather
+than raced. The result domain distinguishes `closed`, `failed` and `abandoned`; a raised
+close is `failed` and its exception text reaches `last_run.json`. Thus a handle can no
+longer hold process exit merely because SQL finished before the driver close wedged.
+
+The round-7 rubric 1.7 verdict remains **3/5**. There are 21 in-process points — eight
+protocol, five destination, seven recovery/baseline and one source-catalog fault — plus
+the external network blackhole. That is substantial injection evidence, but the reviewer
+did not award the rubric's robust-injection 5 band after repeated adversarial
+compositions were first found outside the suite.
