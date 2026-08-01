@@ -33,7 +33,7 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 PG_SH = PROJECT_DIR / "scripts" / "pg.sh"
 VENV_BIN = PROJECT_DIR / ".venv" / "bin"
 TEST_PGPORT = 15432
-TEMPLATE_DATABASE = "cdc_flight_test_template"
+TEMPLATE_DATABASE_PREFIX = "cdc_flight_test_template_"
 WORKER_DATABASE_PREFIX = "cdc_flight_test_"
 
 #: Tables the pipeline replicates. Used to fingerprint the shared source so a
@@ -124,6 +124,12 @@ def _worker_database_name() -> str:
     return f"{WORKER_DATABASE_PREFIX}{worker}"[:63]
 
 
+def _template_database_name() -> str:
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
+    worker = re.sub(r"[^a-z0-9_]", "_", worker.lower())
+    return f"{TEMPLATE_DATABASE_PREFIX}{worker}"[:63]
+
+
 def _isolated_source(dbname: str) -> SourceConfig:
     source = SourceConfig(dbname=dbname)
     if source.port != TEST_PGPORT:
@@ -165,7 +171,7 @@ def _create_database(admin: SourceConfig, dbname: str, template: str) -> None:
 def _reset_test_database(source: SourceConfig) -> None:
     admin = replace(source, dbname="postgres")
     _drop_database(admin, source.dbname)
-    _create_database(admin, source.dbname, TEMPLATE_DATABASE)
+    _create_database(admin, source.dbname, _template_database_name())
 
 
 def _source_environment(source: SourceConfig) -> dict[str, str]:
@@ -193,10 +199,11 @@ def postgres_cluster(exclusive_source: Path) -> Iterator[SourceConfig]:
         _pg("start")
         _pg("seed")
         _sweep_stale_test_slots(source)
-        _drop_database(admin, TEMPLATE_DATABASE)
-        _create_database(admin, TEMPLATE_DATABASE, source.dbname)
+        template_database = _template_database_name()
+        _drop_database(admin, template_database)
+        _create_database(admin, template_database, source.dbname)
         _drop_database(admin, worker_source.dbname)
-        _create_database(admin, worker_source.dbname, TEMPLATE_DATABASE)
+        _create_database(admin, worker_source.dbname, template_database)
 
     _sweep_stale_test_slots(worker_source)
     try:
@@ -217,9 +224,8 @@ def _sweep_stale_test_slots(source: SourceConfig) -> None:
     failed once while the fix was being written, and how two independent review sessions
     degraded the shared cluster in a single day.
 
-    Safe to do unconditionally at session start: `exclusive_source` holds the whole-session
-    lock, so no other session owns a `t_...` slot right now, and an ACTIVE slot is never
-    touched.
+    Safe to do unconditionally at worker start: the query is restricted to this
+    worker's database, and an ACTIVE slot is never touched.
     """
     try:
         with psycopg.connect(source.dsn, autocommit=True, connect_timeout=10) as conn:
@@ -227,7 +233,9 @@ def _sweep_stale_test_slots(source: SourceConfig) -> None:
                 row[0]
                 for row in conn.execute(
                     "SELECT slot_name FROM pg_replication_slots "
-                    "WHERE NOT active AND (slot_name LIKE 't\\_%' OR slot_name LIKE '%\\_rs')"
+                    "WHERE NOT active AND database = %s "
+                    "AND (slot_name LIKE 't\\_%' OR slot_name LIKE '%\\_rs')",
+                    (source.dbname,),
                 ).fetchall()
             ]
             for name in stale:
