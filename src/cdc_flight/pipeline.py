@@ -64,6 +64,7 @@ from .machines import (
     PHASE_STOPPING,
     PHASE_STREAMING,
 )
+from .ownership import DestinationOwnership
 from .run_state import RunOutcome, RunPhaseWriter
 from .source_health import SourceHealth
 from .supervisor import run_engine_bounded
@@ -140,6 +141,7 @@ def run(
     lease_held = False
     phases: RunPhaseWriter | None = None
     applier: Applier | None = None
+    ownership = DestinationOwnership()
     run_ok = False
     #: The run's ONE outcome, shared by the supervisor, the terminal `RUN_PHASE`
     #: transition and the returned summary (Codex r1 MAJOR-2). `RunOutcome` refuses a
@@ -388,6 +390,13 @@ def run(
         )
         summary_extra.update(baseline.as_dict())
 
+        interrupted_resnapshot = resnapshot_mod.requeue_interrupted(
+            con,
+            pipeline=dest.pipeline_name,
+            state_dir=replication.state_dir / "resnapshot",
+        )
+        if interrupted_resnapshot:
+            summary_extra["interrupted_resnapshot_requeued"] = interrupted_resnapshot
         interrupted = dest_mod.promote_interrupted_snapshots(con, dest.pipeline_name)
         if interrupted:
             summary_extra["interrupted_snapshots_requeued"] = interrupted
@@ -443,6 +452,7 @@ def run(
                 epoch_base=reconciliation.resume_point.snapshot_epoch,
                 reason=f"{len(owed)} table(s) marked awaiting_snapshot",
                 namespace=namespace,
+                ownership=ownership,
             )
             summary_extra.update(resnap.as_dict())
             # The main applier's snapshot identities must stay disjoint from the ones the
@@ -575,6 +585,7 @@ def run(
             catalog=watcher,
             watermarks=watermarks,
         )
+        ownership.attach(applier)
         engine = SupervisedDebeziumEngine(
             properties=props,
             handler=applier,
@@ -613,6 +624,7 @@ def run(
         terminating_modes = {"initial_only", "recovery_only"}
         try:
             phases.to(PHASE_STREAMING)
+            ownership.activate(applier)
             result = run_engine_bounded(
                 engine, applier, run_cfg, health,
                 engine_terminates_normally=props["snapshot.mode"] in terminating_modes,
@@ -783,71 +795,68 @@ def run(
             exc.summary = reported
         raise
     finally:
-        # A non-quiescent callback retains the whole destination runtime. Touching the
-        # heartbeat cursor, lease, or parent handle here would recreate the Round 8
-        # ownership race. `main()` takes the hard-exit path; library callers receive the
-        # failure while the live owner remains the only thread allowed to use `con`.
-        destination_quiescent = applier is None or applier.callback_quiesced
-        if not destination_quiescent:
-            if reported is not None:
-                if phases is not None:
-                    reported.update(phases.summary())
-                reported["destination_connection_release"] = "abandoned"
-                reported["destination_connection_release_reason"] = (
-                    "live_applier_callback"
-                )
-                reported["heartbeat_sink_retirement"] = "abandoned"
-                reported["heartbeat_sink_retirement_reason"] = "live_applier_callback"
-            log.critical(
-                "destination teardown skipped: a live applier callback retains exclusive "
-                "ownership; the command entrypoint will hard-exit"
-            )
-        else:
-            # The lease is now acquired much earlier - rubric 1.8's recovery mutates
-            # destination state and must not race a second runner - so releasing it has to
-            # move out here with it. `lease_held` rather than `lease is not None`: a run that
-            # failed to acquire must not delete the incumbent's row.
-            # Guarded, all of it: this is the outermost `finally`, and an observability
-            # write that raises here would replace the run's real failure with a
-            # bookkeeping one.
+        _teardown_destination(
+            con=con,
+            ownership=ownership,
+            reported=reported,
+            phases=phases,
+            lease=lease,
+            lease_held=lease_held,
+            run_ok=run_ok,
+        )
+
+
+def _teardown_destination(
+    *, con, ownership: DestinationOwnership, reported: dict | None,
+    phases: RunPhaseWriter | None, lease: Lease | None, lease_held: bool, run_ok: bool,
+) -> None:
+    """Make the one terminal ownership decision for every destination handle."""
+    # This also seals and retires a constructed-but-never-activated applier. Consumer
+    # construction failures have no callback owner and must not leak an idle timer,
+    # alert cursor, lease and parent connection.
+    destination_quiescent = ownership.retire_if_quiescent(
+        reason="pipeline_teardown"
+    )
+    if not destination_quiescent:
+        if reported is not None:
             if phases is not None:
-                try:
-                    phases.ensure(PHASE_STOPPING)
-                except Exception:  # pragma: no cover - every phase declares `-> stopping`
-                    log.error("could not record the stopping phase", exc_info=True)
-            if lease_held and lease is not None:
-                lease.release(con)
-            if phases is not None:
-                try:
-                    phases.finish(ok=run_ok)
-                except Exception:  # pragma: no cover
-                    log.error("could not record the terminal run phase", exc_info=True)
-                # TERMINALISE, RETIRE THE SINK, *THEN* REPORT (Codex r1 MAJOR-2 open
-                # question 6, extended by r5 MAJOR-1). The summary used to be sampled before
-                # the `stopping`/`stopped` transitions, so every successful run shipped
-                # `run_phase="draining"`. It is now also sampled AFTER `close()`, because
-                # how the heartbeat sink was retired — closed, or abandoned to a terminal
-                # write that never returned — is only known once it has been retired, and an
-                # abandoned terminal write means `last_run.json` is the only record that
-                # this run terminalised at all.
-                try:
-                    phases.close()
-                except Exception:  # pragma: no cover - retirement is fully guarded already
-                    log.error("could not retire the heartbeat sink", exc_info=True)
-                if reported is not None:
-                    reported.update(phases.summary())
-            # ...and the PARENT connection is retired the same way, because it is the same
-            # wait one level out (Codex r6 MAJOR-1). The heartbeat cursor is a child of this
-            # handle, so a terminal write nobody could stop also blocks `con.close()` — the
-            # reviewer measured the writer retiring correctly at 7.005 s and the process
-            # still alive with no exit code at 12 s, stuck right here. Bounded, the run gets
-            # to finish tearing down, `main()` gets to write `last_run.json`, and the exit
-            # code the run earned is the exit code it delivers.
-            release = dest_mod.release_connection(con)
-            if reported is not None:
-                reported["destination_connection_release"] = release.state
-                if release.error is not None:
-                    reported["destination_connection_close_error"] = release.error
+                reported.update(phases.summary())
+            reported["destination_connection_release"] = "abandoned"
+            reported["destination_connection_release_reason"] = "live_applier_callback"
+            reported["heartbeat_sink_retirement"] = "abandoned"
+            reported["heartbeat_sink_retirement_reason"] = "live_applier_callback"
+        log.critical(
+            "destination teardown skipped: a live applier callback retains exclusive "
+            "ownership; the command entrypoint will hard-exit"
+        )
+        return
+
+    # The lease is acquired before recovery mutates state. `lease_held` rather than
+    # `lease is not None` prevents a failed acquisition from deleting the incumbent.
+    if phases is not None:
+        try:
+            phases.ensure(PHASE_STOPPING)
+        except Exception:  # pragma: no cover - every phase declares `-> stopping`
+            log.error("could not record the stopping phase", exc_info=True)
+    if lease_held and lease is not None:
+        lease.release(con)
+    if phases is not None:
+        try:
+            phases.finish(ok=run_ok)
+        except Exception:  # pragma: no cover
+            log.error("could not record the terminal run phase", exc_info=True)
+        # Terminalise and retire the heartbeat child before retiring its parent.
+        try:
+            phases.close()
+        except Exception:  # pragma: no cover - retirement is internally guarded
+            log.error("could not retire the heartbeat sink", exc_info=True)
+        if reported is not None:
+            reported.update(phases.summary())
+    release = dest_mod.release_connection(con)
+    if reported is not None:
+        reported["destination_connection_release"] = release.state
+        if release.error is not None:
+            reported["destination_connection_close_error"] = release.error
 
 
 def shutdown_and_exit(code: int = 0, timeout: float = 15.0) -> None:
