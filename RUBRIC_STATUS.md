@@ -101,7 +101,7 @@ implementation.
 | **Codex B4 = Opus MAJOR-2/Q4a** — a failed drop of the load-bearing slot was logged and stepped over, and the LSN baseline was cleared as if it had succeeded; failed re-snapshots leaked `_rs` slots | **fixed.** `RecoveryFailed` with the journal intact, in both the automatic path and `--accept-orphan-offsets`; `try/finally` around the whole engine section plus an unconditional start-up sweep; the shared cluster's leaked slots were dropped and the suite now sweeps stale slots at session start |
 | **Opus BLOCKER-2** — `no_durable_destination_row` rebuilt a healthy populated destination; a safety regression against `main` | **fixed.** `check_slot` takes the destination's actual contents; a populated destination refuses with the orphan cell's own justification |
 | **Codex B5** — the persisted timeline never participated in the decision | **fixed.** `source_timeline_changed`, ordered after identity and before LSN regression, with the catalog discarded (which also closes **Codex M1**) |
-| **Codex B6** — the four giant modules regrew | **fixed.** `applier.py` 1,062 -> 923 and back to the commit protocol (`applier_config.py`, `self_heal.py`); `pipeline.py` 929 -> 814 (`supervisor.py`); `destination.py` 996 -> 835 (`control_schema.py`); `reconcile.py`'s destructive half is `recovery.py`. `reconcile.py` itself is 784 (was 713): the growth is `check_slot`'s two new inputs and is a **carry-forward** |
+| **Codex B6** — the four giant modules regrew | **fixed, and re-fixed at Codex r1 MINOR-5.** The 1.6-1.8 round split `applier_config.py`, `self_heal.py`, `supervisor.py` and `control_schema.py` out; the 1.9 rounds put the growth back, so `OpenGroup` is now `commit_group.py` and the four pre-engine decisions are `acquisition.py`. Measured after round 2: `applier.py` 917, `pipeline.py` 730, `destination.py` 952, `reconcile.py` 611, `catalog.py` 829, `recovery.py` 596. `destination.py` is the one to watch and is a **carry-forward** |
 | **Codex M2 / M3, Opus MAJOR-5 / MAJOR-6, MINOR-1** — the fault matrix proved declared labels, not outcomes; four tautologies; the hung-commit test accepted any death; `hang_seconds` was the exit code; the chaos harness did not compose | **fixed.** Every anchor writes a fsynced `fault_fired.json`; the outcome class is derived from the run; exact exit codes; `CDC_FAULT_HANG_SECONDS`; `destination_commit_late` for genuine ambiguity; chaos injects during recovery over a shuffled cover with a per-iteration fired assertion. ADR §19/A54 |
 | **Codex M5, Opus MAJOR-3** — the A51 counts were arithmetically false and the inventory incomplete | **fixed.** 54 rows, one failure and one class each, **34/12/8**, with `tests/4.7_self_healing/test_4_7_inventory.py` parsing the table so the headline cannot drift again. The missing modes (`CDC_RESNAPSHOT=0`, the unqueueable folds, drop-failure, `C` disagreement, the startup-dark fail-open, and more) are rows |
 | **Codex M6, Opus MINOR-7** — `write_slot_state` was a non-atomic DELETE+INSERT | **fixed.** One transaction. "Typed record" is a **carry-forward**: it is still a dict |
@@ -1353,6 +1353,25 @@ class plus two that must stay empty; and `swap` is exercised end to end only in 
 lane, with a deterministic default-suite guard standing in for it
 (`test_1_7_anchor_guards.py`).
 
+#### What the first Codex review rejected here, and what round 2 changed
+
+The first submission was told to **retain the interim 4/5 hold**, on four specific
+grounds. Each is now closed by a test rather than by an argument (ADR §A58.7):
+
+| finding | what it was | what it is now |
+|---|---|---|
+| the four cuts used **exception unwinding**, not hard death | `test_1_7_recovery_anchors.py` armed `:raise`, so `recovery_requested`, offsets-file-deleted and resume-row-deleted were proven by a Python exception that unwinds `finally`, closes the connection and lets the interpreter tidy up. Only `recovery_armed` had an `os._exit` pairing, in the slow lane | all four are cut by a real `os._exit` in a **child process** (`tests/recovery_crash_driver.py`) against the same DuckDB file and the same offsets file — milliseconds, no JVM, no Postgres, and the fired record's `pid` is asserted not to be the test runner's. The `:raise` variants remain as the *error-teardown* lifecycle, which is a different path (§1.2) |
+| `table_rebuild_queued` fired **before the first table write** despite being documented "mid-write" | it proved a pre-write rollback | it fires after the FIRST captured table has taken its `-> awaiting_snapshot` edge and before the second has, so the queue really is torn when the process dies |
+| the composed chaos fault was **allowed not to fire** | armed at `<nth>=2` so the random walk terminates, and the shuffled-cover assertion could be satisfied entirely by the first faults — so "the anchors compose" rested on nothing that had to happen | the seeded harness keeps its terminating draw, and a **bounded** scenario now requires one: a hard death at `post_commit_pre_ack`, then `pre_commit:1` during the recovery run, which the replay of the un-acknowledged group necessarily reaches |
+| the two **operator routes** had no anchors at all | `--accept-orphan-offsets` and `--reset-state` were durable multi-step sequences absent from the enumeration, so `ALL_POINTS` could not prove completeness | both are journalled recoveries and therefore reach the same five anchors. `test_1_8_operator_route_crash_e2e.py` kills a real process mid-sequence on each, restarts **without repeating the flag** under `--snapshot-mode no_data`, and asserts exact source/destination equality. `no_data` is load-bearing: a run that forgot the obligation would stream instead of rebuild |
+
+And the nondeterministic assertion the review asked to remove is removed:
+`close_hung is True` was a race the test happened to win most of the time — the repository
+had already recorded it flaking while every correctness assertion passed. What the
+blackhole test asserts now is the contract: non-zero exit, `source_dark` **by name**, a
+measured detection bound, and — if a hang is reported at all — that the symptom did not
+replace the diagnosis, which is the only thing A49 needs from it.
+
 #### Baseline (historical)
 
 `p13` case B `kill -9`'d the process mid-load and the restart left **2 048 duplicate rows**
@@ -1570,10 +1589,10 @@ a count. Full table in ADR §20/A55.
 | `OpenGroup` — the object is replaced, not edited | `tests/1.3_atomic_batches/test_1_3_rollback_resets_the_group.py` | ms |
 | the ADR's transition tables are generated from `machine.table()` | `tests/4.7_self_healing/test_4_7_inventory.py` | ms |
 
-63 tests, **0.5 s**, all in the default lane; the five recovery anchors add 13 more in
-0.3 s. That is deliberate: a guard that only runs when somebody asks for it is not a
-guard, and the suite is at 8:47 against a 10-minute budget. Measured for this round:
-**529 default / 8:47**, **83 slow / 18:18**, **22 MotherDuck / 5:01**, all green.
+78 tests, well under a second, all in the default lane; the five recovery anchors add 17
+more (four of them a real `os._exit` in a child process) in 0.8 s. That is deliberate: a
+guard that only runs when somebody asks for it is not a guard. Measured after round 2:
+**544 default / 8:51**, against a 10-minute budget.
 
 #### Why 5, and what a reviewer should push on
 

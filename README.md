@@ -202,7 +202,8 @@ Measured on an M-series Mac. Only executed runs are reported here; see
 
 | suite | result | wall clock | measured |
 |---|---|---|---|
-| `make test` (local only) | **529 passed, 0 xfail** | **528 s** (8:47) | 2026-07-31, after rubric 1.9 + 1.7's closure |
+| `make test` (local only) | **544 passed, 0 xfail** | **532 s** (8:51) | 2026-07-31, after the round-2 fixes |
+| `make test` (local only) | 529 passed, 0 xfail | 528 s (8:47) | 2026-07-31, after rubric 1.9 + 1.7's first cut |
 | `make test-slow` | **83 passed** | **1 098 s** (18:18) | 2026-07-31, after rubric 1.9 + 1.7's closure |
 | `make test-md` | **22 passed** | **301 s** (5:01) | 2026-07-31, after rubric 1.9 + 1.7's closure |
 | `make test` (local only) | 441 passed, 0 xfail | 526 s (8:46) | 2026-07-31, after the 1.6-1.8 review round |
@@ -221,12 +222,13 @@ Measured on an M-series Mac. Only executed runs are reported here; see
 | `make test-slow` | 9 passed | 179 s (2:58) | 2026-07-31, after the 1.1-1.3 review round |
 | `make test-md` | 12 passed | 155 s (2:34) | 2026-07-31, after the 1.1-1.3 review round |
 
-The default suite is at **8:47 of a 10-minute budget** with **88 more tests than the
-previous measurement and the same wall clock** (526 s then, 528 s now). That is not luck: the
-1.9 round added 79 tests that cost **0.8 s in total**, because every one of them drives
-the shipped code in-process — the state machines against a DuckDB file in a tmp dir, the
-recovery anchors against an injectable slot drop — rather than through a `cdc-flight`
-subprocess. The expensive end-to-end pairing for each of them is in `-m slow`.
+The default suite is at **8:51 of a 10-minute budget** with **103 more tests than the
+1.6-1.8 round and four seconds more wall clock** (526 s then, 532 s now). That is not luck:
+the 1.9 rounds added 94 tests that cost about a second in total, because every one of them
+drives the shipped code in-process — the state machines against a DuckDB file in a tmp dir,
+the recovery anchors against an injectable slot drop, and the hard-death cuts against a
+child process that opens the same file. The expensive end-to-end pairing for each of them
+is in `-m slow`.
 
 `make test-slow` is 18:18 for 83 tests (was 17:45 for 78): the five new ones are the
 end-to-end pairing for the recovery anchors — a real `cdc-flight` process killed at
