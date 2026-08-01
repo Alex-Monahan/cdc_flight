@@ -48,6 +48,7 @@ confirm — forbids adoption.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from dataclasses import dataclass, field
@@ -252,8 +253,6 @@ def _write(con, *, pipeline: str, frm: str, to: str, reason: str, runner_id: str
         )
         con.execute("COMMIT")
     except BaseException:
-        import contextlib
-
         with contextlib.suppress(Exception):
             con.execute("ROLLBACK")
         raise
