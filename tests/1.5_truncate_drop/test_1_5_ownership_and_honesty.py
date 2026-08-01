@@ -287,3 +287,42 @@ def test_the_marker_write_budget_is_bounded():
     assert marker.writes == 3
     assert marker.suppressed == 2
     assert "budget exhausted" in marker.last_error
+
+
+def test_a_poll_that_finishes_at_shutdown_still_fails_the_run():
+    """The sampling gap the first cut left (Codex r2 MAJOR-3).
+
+    `run_engine_bounded` checked `machine_error` once and could return success, while
+    the polling thread was stopped and joined only later in `pipeline.run()`'s
+    `finally`. A poll already in flight could take an undeclared transition *after* the
+    check, and nobody re-read the field — the same "success over an undeclared edge"
+    policy the fix claims is impossible, moved into a timing gap. The watcher is now
+    quiesced by the supervisor itself, before any verdict is taken.
+    """
+
+    class _LatePoller(CatalogWatcher):
+        """Completes its in-flight poll — and discovers the illegal edge — on `stop()`."""
+
+        def __init__(self):
+            super().__init__(
+                dsn="", publication="pub", schema="app", include=set(), poll_seconds=0
+            )
+            self.stopped = False
+
+        def poll_quietly(self):  # the supervisor's final synchronous poll: clean
+            return []
+
+        def stop(self):
+            self.stopped = True
+            self.machine_error = "IllegalTransition: catalog_change: 'due' -> 'marked'"
+
+    w = _LatePoller()
+    with pytest.raises(EngineFailure) as excinfo:
+        run_engine_bounded(
+            _Engine(), _Handler(), RunConfig(max_seconds=6, idle_seconds=0.1),
+            catalog=w, catalog_drain_seconds=0.2,
+        )
+    assert w.stopped, "the supervisor must quiesce the watcher before it judges the run"
+    assert "undeclared transition" in str(excinfo.value)
+    assert excinfo.value.summary["stop_reason"] == "engine_error"
+    assert excinfo.value.summary.get("ok") is not True

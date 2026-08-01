@@ -806,3 +806,55 @@ def read_watermarks(con, pipeline: str) -> dict[str, int]:
         [pipeline],
     ).fetchall()
     return {f"{schema}.{table}": int(lsn) for schema, table, lsn in rows}
+
+
+def finish_empty_tables_after_main_snapshot(
+    con,
+    *,
+    pipeline: str,
+    dataset: str,
+    dsn: str,
+    owed: list[tuple[str, str, str]],
+    applier,
+    stop_reason: str,
+) -> list[str]:
+    """Close out the tables a MAIN-engine snapshot left owed because they are empty.
+
+    A source relation with zero rows emits no snapshot records at all, so
+    `SnapshotCoordinator` never opens a shadow for it and never swaps one in — and the
+    destination table keeps whatever it held before. For an ordinary run that is fine:
+    nothing claimed the table had been rebuilt. For a run carrying a **journalled
+    obligation** it is not, and the first cut of the journalled `--reset-state` proved
+    how badly: it recorded the rebuild as complete and left the destination holding rows
+    the source had truncated away (Codex r2 BLOCKER-1).
+
+    The blocking re-snapshot path has always handled this correctly, through
+    `EmptinessEvidence` and `finish_verified_empty_tables`. This is the same machinery,
+    applied to the same question after the main engine's own snapshot — the three
+    independent facts are unchanged, and so is the rule that a table failing any of them
+    is left completely untouched and stays owed:
+
+    1. Debezium emitted its own end-of-snapshot marker (or produced nothing at all and
+       the connector reached streaming), so the engine saw the whole capture set;
+    2. this table produced **zero** snapshot records;
+    3. a source count taken after the engine stopped says the relation holds no rows,
+       fenced at a WAL position sampled before that count.
+
+    Returns the tables it emptied and completed.
+    """
+    if not owed:
+        return []
+    evidence = _gather_emptiness_evidence(
+        dsn,
+        pending=owed,
+        snapshot_phase_ended=snapshot_phase_ended(applier, stop_reason),
+        tables_seen=set(applier.snapshot_tables_seen),
+    )
+    return finish_verified_empty_tables(
+        con,
+        pipeline=pipeline,
+        dataset=dataset,
+        tables=owed,
+        done=set(),
+        evidence=evidence,
+    )

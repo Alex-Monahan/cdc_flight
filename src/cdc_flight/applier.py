@@ -533,14 +533,20 @@ class Applier:
 
         # ── the ONLY window that matters, and it contains nothing else ──────
         marked = 0
-        for unit in group:
-            for rec in unit.records:
-                if rec.raw is None:  # released by `_add_unit`
-                    continue
-                self._committer.markProcessed(rec.raw)
-                marked += 1
-        self._committer.markBatchFinished()
-        COMMIT_ACK.leave()
+        try:
+            for unit in group:
+                for rec in unit.records:
+                    if rec.raw is None:  # released by `_add_unit`
+                        continue
+                    self._committer.markProcessed(rec.raw)
+                    marked += 1
+            self._committer.markBatchFinished()
+        finally:
+            # In a `finally` because `markProcessed`/`markBatchFinished` can raise
+            # (pydbzengine interrupts this thread when the handler fails) and a window
+            # left open would silently drop every subsequent phase write (Codex r2
+            # MAJOR-1). One attribute assignment, so it adds nothing to the interval.
+            COMMIT_ACK.leave()
         if has_data:
             maybe_crash("post_ack", self.data_commit_groups + 1)
         # next poll() -> performCommit() -> flushLsn(new)  ── nothing between ──

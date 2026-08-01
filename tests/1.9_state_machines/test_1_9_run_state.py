@@ -371,7 +371,7 @@ def test_the_applier_really_holds_that_window_around_commit_to_ack():
     assert source.rindex("COMMIT_ACK.enter()", 0, commit) > commit - 800, (
         "the window must be entered immediately before COMMIT"
     )
-    assert source.index("COMMIT_ACK.leave()", ack) - ack < 200, (
+    assert source.index("COMMIT_ACK.leave()", ack) - ack < 700, (
         "the window must be left immediately after the acknowledgement"
     )
 
@@ -475,3 +475,236 @@ def test_a_migration_that_lost_the_race_is_accepted_after_re_reading(tmp_path):
         assert {"phase_since", "terminal_reason", "phase_history"} <= columns
     finally:
         fresh.close()
+
+
+# --------------------------------------------------------------------------- #
+# Codex r2 MAJOR-1 — the commit->ack window as a gate, not an observation
+# --------------------------------------------------------------------------- #
+def test_a_write_that_starts_before_the_window_cannot_run_inside_it(con):
+    """The adversarial interleaving, as the regression it should always have been.
+
+    The first cut read `COMMIT_ACK.active`, then built a timestamp, then executed SQL.
+    A database call releases the GIL, so the applier could open the window in between
+    and the write landed inside the exact interval the ADR excludes; a two-thread
+    barrier reproduced it (Codex r2 MAJOR-1). The gate is now held for the check AND
+    the write, so the applier's `enter()` — which happens BEFORE `COMMIT` — waits for an
+    in-flight write instead of racing it.
+    """
+    import threading
+
+    from cdc_flight.run_state import COMMIT_ACK
+
+    COMMIT_ACK.reset()
+    phases = RunPhaseWriter(con, pipeline=PIPELINE, runner_id=RUNNER)
+    try:
+        phases.to(m.PHASE_RECONCILING)
+        in_write = threading.Event()
+        release = threading.Event()
+        active_during_sql: list[bool] = []
+
+        original = phases._execute
+
+        def _slow_execute(phase, *, insert):
+            in_write.set()
+            release.wait(5)
+            active_during_sql.append(COMMIT_ACK.active)
+            return original(phase, insert=insert)
+
+        phases._execute = _slow_execute
+        writer = threading.Thread(target=lambda: phases.to(m.PHASE_STREAMING))
+        writer.start()
+        assert in_write.wait(5), "the phase write never started"
+
+        entered = threading.Event()
+
+        def _enter():
+            COMMIT_ACK.enter()
+            entered.set()
+
+        applier_thread = threading.Thread(target=_enter)
+        applier_thread.start()
+        # The applier must NOT be able to open the window while the write is in flight.
+        assert not entered.wait(0.5), (
+            "COMMIT_ACK.enter() opened the window while an independent write was "
+            "already executing: that is the check-then-act race"
+        )
+        release.set()
+        writer.join(10)
+        applier_thread.join(10)
+        assert active_during_sql == [False], (
+            f"SQL executed with the window open: {active_during_sql}"
+        )
+        assert COMMIT_ACK.overlaps == 0
+    finally:
+        COMMIT_ACK.reset()
+        phases.close()
+
+
+def test_the_terminal_phase_write_is_never_dropped(con):
+    """A dropped `stopped`/`failed` write leaves the heartbeat non-terminal for ever.
+
+    Every other phase write can be dropped because the next transition rewrites the
+    whole row; the terminal one has no next transition (Codex r2 MAJOR-1). It waits for
+    the window instead, which is safe because the applier is shut down before
+    `pipeline.run()` terminalises.
+    """
+    import threading
+
+    from cdc_flight.run_state import COMMIT_ACK
+
+    COMMIT_ACK.reset()
+    phases = RunPhaseWriter(con, pipeline=PIPELINE, runner_id=RUNNER)
+    try:
+        phases.to(m.PHASE_RECONCILING)
+        COMMIT_ACK.enter()
+        threading.Timer(0.3, COMMIT_ACK.leave).start()
+        phases.finish(ok=False)
+        assert _row(con)[0] == "failed", "the terminal row was dropped"
+    finally:
+        COMMIT_ACK.reset()
+        phases.close()
+
+
+def test_the_window_is_left_even_when_the_acknowledgement_raises():
+    """`markProcessed`/`markBatchFinished` can raise; a window left open would drop
+    every later phase write silently (Codex r2 MAJOR-1)."""
+    source = (
+        Path(__file__).resolve().parents[2] / "src" / "cdc_flight" / "applier.py"
+    ).read_text()
+    ack = source.index("self._committer.markBatchFinished()")
+    tail = source[ack : ack + 600]
+    assert "finally:" in tail and "COMMIT_ACK.leave()" in tail, (
+        "the acknowledgement block must leave the window in a `finally`"
+    )
+
+
+def test_metadata_that_cannot_be_read_is_loud_rather_than_skipped(tmp_path):
+    """"I could not read the metadata" is not "the table is fine" (Codex r2 MINOR-1)."""
+    from cdc_flight import control_schema
+
+    class _NoIntrospection:
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, *a, **k):
+            if "information_schema.columns" in str(sql):
+                raise RuntimeError("catalog unavailable")
+            return self._real.execute(sql, *a, **k)
+
+    fresh = duckdb.connect(str(tmp_path / "blind.duckdb"))
+    try:
+        with pytest.raises(control_schema.ControlSchemaFailed):
+            dest_mod.ensure_control_schema(_NoIntrospection(fresh))
+    finally:
+        fresh.close()
+
+
+def test_an_old_heartbeat_with_a_key_and_data_keeps_both_through_the_migration(tmp_path):
+    """The exact prior DDL, with its constraint and its rows (Codex r2 MINOR-1)."""
+    path = str(tmp_path / "prior.duckdb")
+    old = duckdb.connect(path)
+    old.execute("CREATE SCHEMA _cdc_flight")
+    old.execute(
+        "CREATE TABLE _cdc_flight.heartbeat ("
+        " pipeline VARCHAR NOT NULL, runner_id VARCHAR NOT NULL,"
+        " beat_at TIMESTAMPTZ NOT NULL, phase VARCHAR NOT NULL,"
+        " last_event_at TIMESTAMPTZ, last_commit_id BIGINT, lag_seconds DOUBLE,"
+        " PRIMARY KEY (pipeline, runner_id, beat_at))"
+    )
+    old.execute(
+        "INSERT INTO _cdc_flight.heartbeat (pipeline, runner_id, beat_at, phase, "
+        "last_commit_id) VALUES ('p', 'r', now(), 'streaming', 7)"
+    )
+    old.close()
+
+    fresh = duckdb.connect(path)
+    try:
+        dest_mod.ensure_control_schema(fresh)
+        columns = {
+            str(row[0])
+            for row in fresh.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = '_cdc_flight' AND table_name = 'heartbeat'"
+            ).fetchall()
+        }
+        assert {"phase_since", "terminal_reason", "phase_history"} <= columns
+        kept = fresh.execute(
+            "SELECT phase, last_commit_id FROM _cdc_flight.heartbeat WHERE pipeline = 'p'"
+        ).fetchall()
+        assert kept == [("streaming", 7)], "the migration lost the existing row"
+        # The key survives too: the migration adds columns, it does not rebuild.
+        keys = fresh.execute(
+            "SELECT constraint_column_names FROM duckdb_constraints() "
+            "WHERE schema_name = '_cdc_flight' AND table_name = 'heartbeat' "
+            "AND constraint_type = 'PRIMARY KEY'"
+        ).fetchall()
+        assert keys and set(keys[0][0]) == {"pipeline", "runner_id", "beat_at"}
+    finally:
+        fresh.close()
+
+
+# --------------------------------------------------------------------------- #
+# Codex r2 MAJOR-2 — a PRE-ENGINE failure projects the same phase and outcome
+# --------------------------------------------------------------------------- #
+@pytest.mark.slow
+def test_a_pre_engine_failure_agrees_with_the_heartbeat(tmp_path_factory, postgres_cluster):
+    """`last_run.json` and the destination heartbeat, on a route that never reaches
+    the engine at all.
+
+    Fixing the *normal* path left this one behind: `reported` was populated only on the
+    inner engine success/`EngineFailure` paths, so a lease refusal wrote heartbeat
+    `failed/error` while `main()` built its summary from the exception and shipped no
+    `run_phase` and no `run_outcome` at all (Codex r2 MAJOR-2). The escaping exception
+    now carries the one projection, and the outer `finally` fills it in after the
+    terminal transitions.
+    """
+    import json
+    import uuid as _uuid
+
+    from conftest import Sandbox
+
+    box = Sandbox("pre_engine", tmp_path_factory.mktemp("sbx_pre_engine"), postgres_cluster)
+    try:
+        box.reseed()
+        box.run(reset_state=True, max_seconds=150)
+
+        # A live incumbent lease held by a runner whose pid is this (very much alive)
+        # test process, so `Lease.acquire` cannot reclaim it.
+        pipeline = box.env["CDC_PIPELINE_NAME"]
+        con = duckdb.connect(str(box.duckdb_path))
+        try:
+            con.execute("DELETE FROM _cdc_flight.lease WHERE pipeline = ?", [pipeline])
+            con.execute(
+                "INSERT INTO _cdc_flight.lease (pipeline, owner_id, host, pid, "
+                "acquired_at, renewed_at, expires_at) VALUES (?,?,?,?, now(), now(), "
+                "now() + INTERVAL 1 HOUR)",
+                [pipeline, _uuid.uuid4().hex, "not-this-host", 1],
+            )
+        finally:
+            con.close()
+
+        refused = box.run(max_seconds=60, timeout=120, expect_success=False)
+        assert refused["returncode"] != 0, refused
+        summary = json.loads((box.state_dir / "last_run.json").read_text())
+        assert summary["ok"] is False
+        assert summary["error_type"] == "LeaseLost", summary
+        # The two projections agree, which is the whole point.
+        assert summary["run_outcome"] == "error", summary
+        assert summary["run_phase"] == "failed", summary
+        assert summary["stop_reason"] == "error", summary
+
+        con = duckdb.connect(str(box.duckdb_path))
+        try:
+            row = con.execute(
+                "SELECT phase, terminal_reason FROM _cdc_flight.heartbeat "
+                "WHERE pipeline = ? ORDER BY beat_at DESC LIMIT 1", [pipeline],
+            ).fetchone()
+        finally:
+            con.close()
+        assert row == (summary["run_phase"], summary["run_outcome"]), (
+            f"the heartbeat says {row} and last_run.json says "
+            f"{(summary['run_phase'], summary['run_outcome'])}"
+        )
+    finally:
+        box.cleanup()
+        box.reseed()

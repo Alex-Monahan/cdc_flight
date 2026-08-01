@@ -306,7 +306,16 @@ def ensure_control_schema(con) -> None:
         _migrate_added_columns(con, table, columns)
 
 
-def _table_columns(con, table: str) -> set[str] | None:
+def _table_columns(con, table: str) -> set[str]:
+    """The columns `table` currently has. Raises if the question cannot be answered.
+
+    "I could not read the metadata" is NOT "the table is fine" (Codex r2 MINOR-1). The
+    first cut caught every exception here, returned `None`, and `_migrate_added_columns`
+    then returned silently — which recreates the exact silent-writer-failure the loud
+    `ALTER` branch exists to prevent, one step earlier. The `CREATE TABLE IF NOT EXISTS`
+    statements have already run by the time this is called, so an empty result means the
+    table genuinely has no columns we can see, and that is worth failing on too.
+    """
     try:
         return {
             str(row[0])
@@ -316,9 +325,13 @@ def _table_columns(con, table: str) -> set[str] | None:
                 [CONTROL_SCHEMA, table],
             ).fetchall()
         }
-    except Exception:  # pragma: no cover - a destination without information_schema
-        log.debug("could not read %s columns", table, exc_info=True)
-        return None
+    except Exception as exc:
+        raise ControlSchemaFailed(
+            f"could not read the columns of {CONTROL_SCHEMA}.{table} ({exc}), so the "
+            "late-added columns cannot be shown to exist. Refusing to continue: every "
+            "write naming one of them would fail silently for the life of this "
+            "destination."
+        ) from exc
 
 
 def _migrate_added_columns(con, table: str, columns: tuple[tuple[str, str], ...]) -> None:
@@ -330,8 +343,6 @@ def _migrate_added_columns(con, table: str, columns: tuple[tuple[str, str], ...]
     silently fails on every statement for the life of the destination (Codex r1 MINOR-1).
     """
     existing = _table_columns(con, table)
-    if not existing:
-        return
     for column, sql_type in columns:
         if column in existing:
             continue
@@ -342,7 +353,7 @@ def _migrate_added_columns(con, table: str, columns: tuple[tuple[str, str], ...]
             )
         except Exception as exc:
             after = _table_columns(con, table)
-            if after is not None and column in after:
+            if column in after:
                 # The only benign reading: a concurrent runner added it between our
                 # read and our ALTER. Verified rather than assumed.
                 log.info(

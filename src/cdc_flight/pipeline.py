@@ -20,6 +20,7 @@ this migration.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -552,6 +553,27 @@ def run(
             # edge itself, and returns a typed result. Clearing any earlier would throw
             # away the forced snapshot mode the rest of the rebuild depends on.
             if journal is not None:
+                # A captured relation that is EMPTY at the source emits no snapshot
+                # records, so the coordinator never opens a shadow and never swaps one
+                # in — and the destination table keeps whatever it held. Under a
+                # journalled obligation that is stale data certified as a rebuild
+                # (Codex r2 BLOCKER-1, measured: a `--reset-state` reported `ok: true`
+                # over two rows the source had truncated away). The blocking
+                # re-snapshot has always closed this with three independent facts;
+                # this is the same machinery asked the same question after the MAIN
+                # engine's snapshot, so an operator's reset converges in one run rather
+                # than failing and self-healing on the next.
+                emptied = resnapshot_mod.finish_empty_tables_after_main_snapshot(
+                    con,
+                    pipeline=dest.pipeline_name,
+                    dataset=dest.dataset_name,
+                    dsn=source.dsn,
+                    owed=dest_mod.tables_awaiting_snapshot(con, dest.pipeline_name),
+                    applier=applier,
+                    stop_reason=str(result.get("stop_reason")),
+                )
+                if emptied:
+                    summary_extra["verified_empty_after_snapshot"] = emptied
                 completion = recovery_mod.complete_if_ready(
                     con, pipeline=dest.pipeline_name, namespace=namespace, record=journal,
                 )
@@ -588,7 +610,7 @@ def run(
             if watcher is not None:
                 watcher.stop()
             applier.shutdown()
-    except BaseException:
+    except BaseException as exc:
         # Anything that unwound before (or around) the engine: a refusal, a lease loss,
         # a control-schema failure. It used to leave `terminal_reason=None`, so the
         # heartbeat's terminal row said nothing while `main()` recorded `error`
@@ -597,6 +619,19 @@ def run(
         # precedence and would otherwise bury `engine_error` or `source_dark`.
         if not outcome.failed:
             outcome.record("error")
+        # ...and the run's ONE phase/outcome projection is attached to the escaping
+        # exception, so `last_run.json` carries it too. Fixing the *normal* path left
+        # this one behind: a lease refusal wrote heartbeat `failed/error` while
+        # `last_run.json` carried no `run_phase` and no `run_outcome` at all, because
+        # `main()` built its summary from the exception and `reported` was still None
+        # (Codex r2 MAJOR-2). The outer `finally` below updates this very dict AFTER the
+        # terminal transitions, and `main()` reads it after that, so the two agree.
+        reported = reported if reported is not None else {}
+        reported.update(dict(getattr(exc, "summary", {}) or {}))
+        reported.update(summary_extra)
+        reported.setdefault("stop_reason", outcome.value)
+        with contextlib.suppress(Exception):  # a BaseException without a __dict__
+            exc.summary = reported
         raise
     finally:
         # The lease is now acquired much earlier - rubric 1.8's recovery mutates
@@ -665,17 +700,34 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Debezium snapshot.mode (initial, no_data, initial_only, always, when_needed, ...)",
     )
+    # The two DESTRUCTIVE flags, and the help says every surface they touch. The old
+    # text named two of five for `--reset-state` and one of four for the orphan hatch,
+    # which is not an operator-facing contract (Codex r2 MINOR-3). Both are journalled
+    # recoveries: the intent is durable before the first mutation, and a crash part-way
+    # through is finished by the next run WITHOUT repeating the flag.
     parser.add_argument(
         "--reset-state",
         action="store_true",
-        help="delete the Debezium offsets file AND the destination's resume point",
+        help=(
+            "start over. DESTRUCTIVE: removes the whole Debezium state directory "
+            "(including offsets.dat), deletes the destination's resume point, resets "
+            "every table's snapshot bookkeeping and marks every captured table for a "
+            "fresh image, discards the recorded source catalog, deletes the pipeline "
+            "lease, and DROPS THE REPLICATION SLOT (Debezium only pairs a snapshot "
+            "with an exact WAL position when it creates the slot itself, ADR 0001 "
+            "§19/A45). Destination tables keep their rows until each one's fresh image "
+            "is swapped in. Journalled, so an interrupted reset is resumed."
+        ),
     )
     parser.add_argument(
         "--accept-orphan-offsets",
         action="store_true",
         help=(
-            "delete an offsets.dat that has no matching destination row and force a "
-            "re-snapshot (ADR 0001 §4.5). Without this the run REFUSES to start."
+            "authorise a rebuild when offsets.dat has no matching destination row "
+            "(ADR 0001 §4.5); without this the run REFUSES to start. DESTRUCTIVE: "
+            "deletes that offsets file, DROPS THE REPLICATION SLOT, and forces a "
+            "data-reading snapshot of every captured table. Journalled first, so the "
+            "obligation survives a crash mid-sequence."
         ),
     )
     parser.add_argument("--log-level", default="INFO")

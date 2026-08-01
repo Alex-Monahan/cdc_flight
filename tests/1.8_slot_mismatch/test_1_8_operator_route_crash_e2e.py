@@ -220,3 +220,60 @@ def test_cdc_works_again_after_both_operator_routes(reset_crash):
         f"SELECT count(*) FROM {box.table('cdcflight_app_customers')} "
         "WHERE name = 'after-reset'"
     ) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Codex r2 BLOCKER-1 — the exact empty-source-table reproduction
+# --------------------------------------------------------------------------- #
+@pytest.mark.slow
+def test_a_reset_rebuilds_a_table_the_source_has_emptied(tmp_path_factory, postgres_cluster):
+    """The shape that made the first journalled reset certify stale rows as success.
+
+    A source relation with **zero rows** emits no Debezium snapshot records, so
+    `SnapshotCoordinator` never opens a shadow for it and never swaps one in — the
+    destination table keeps exactly what it had. The first cut put every captured table
+    at lifecycle `none`, recorded `tables_marked=0`, and accepted both `none` and a
+    missing row as finished, so `--reset-state` cleared its own journal, exited
+    `ok: true`, and left rows the source had truncated away (Codex r2 BLOCKER-1,
+    reproduced against this cluster).
+
+    The obligation is now real (`awaiting_snapshot` for every captured table) and
+    completion demands `complete` for each of them; a table proven empty at the source
+    reaches `complete` through the same three-fact `EmptinessEvidence` check the
+    blocking re-snapshot has always used, so the reset still converges in ONE run.
+    """
+    box = Sandbox("reset_empty", tmp_path_factory.mktemp("sbx_reset_empty"), postgres_cluster)
+    try:
+        box.reseed()
+        box.run(reset_state=True, max_seconds=150)
+        before = box.scalar(f"SELECT count(*) FROM {box.table('cdcflight_app_documents')}")
+        assert before > 0, "the fixture must start with rows to make the test meaningful"
+
+        # Emptied at the source WITHOUT the pipeline running, so no truncate/delete
+        # event ever reaches the destination: only a rebuild can notice.
+        box.sql("TRUNCATE app.documents")
+        assert box.pg_query("SELECT count(*) FROM app.documents")[0][0] == 0
+
+        summary = box.run(reset_state=True, max_seconds=200, timeout=280)
+        assert summary["ok"] is True, summary
+        assert summary.get("recovery_cleared"), (
+            f"the reset did not finish its own journal: {summary}"
+        )
+        assert box.scalar(
+            f"SELECT count(*) FROM {box.table('cdcflight_app_documents')}"
+        ) == 0, "the reset certified stale rows as a fresh image"
+        assert "app.documents" in (summary.get("verified_empty_after_snapshot") or []), (
+            "the table must be completed through POSITIVE verified-empty evidence, not "
+            f"by a predicate that accepts `none`: {summary}"
+        )
+        states = dict(
+            box.duck_query(
+                "SELECT source_table, snapshot_state FROM _cdc_flight.table_state"
+            )
+        )
+        assert states.get("documents") == "complete", states
+        assert not [t for t, s in states.items() if s != "complete"], states
+        _equal_to_source(box, "after a reset over an emptied source table")
+    finally:
+        box.cleanup()
+        box.reseed()

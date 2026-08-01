@@ -102,6 +102,11 @@ class SourceHealth:
     max_lag_bytes: int = DEFAULT_MAX_IDLE_LAG_BYTES
     interval: float = 0.5
     connect_timeout: int = 5
+    #: Bounds a query on an ALREADY-CONNECTED socket. `connect_timeout` does not:
+    #: it covers the handshake, and a source that goes dark mid-connection leaves the
+    #: sampler blocked for ever, which is how "the source is dark" stopped being
+    #: observable at all (Codex r2 MAJOR-4).
+    query_timeout_ms: int = 4000
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _stop: threading.Event = field(default_factory=threading.Event, repr=False)
     _thread: threading.Thread | None = field(default=None, repr=False)
@@ -181,8 +186,31 @@ class SourceHealth:
         try:
             import psycopg
 
+            # `connect_timeout` bounds the HANDSHAKE and nothing else. A relay that
+            # blackholes packets *after* the socket is established leaves the query
+            # blocked on a recv that will never return, so this sampler stops
+            # publishing entirely: `unknown` is never recorded, `unknown_for` never
+            # reaches `CDC_SOURCE_DARK_SECONDS`, and the run dies of the shutdown
+            # symptom (`hung`) with the diagnosis (`source_dark`) never formed. That
+            # made the network-blackhole proof itself timing-dependent, which is
+            # exactly the kind of evidence rubric 1.7 is not allowed to rest on
+            # (Codex r2 MAJOR-4).
+            #
+            # Two bounds, because they cover different halves: `statement_timeout` is
+            # the server's, and a server we cannot reach cannot enforce it;
+            # `tcp_user_timeout` plus keepalives are the client's, and they are what
+            # actually fires against a blackhole. Both are well under
+            # `CDC_SOURCE_DARK_SECONDS`.
             with psycopg.connect(
-                self.dsn, autocommit=True, connect_timeout=self.connect_timeout
+                self.dsn,
+                autocommit=True,
+                connect_timeout=self.connect_timeout,
+                options=f"-c statement_timeout={self.query_timeout_ms}",
+                keepalives=1,
+                keepalives_idle=1,
+                keepalives_interval=1,
+                keepalives_count=2,
+                tcp_user_timeout=self.query_timeout_ms,
             ) as conn:
                 row = conn.execute(_SLOT_SQL, (self.slot_name,)).fetchone()
         except Exception as exc:

@@ -78,7 +78,6 @@ from .errors import RecoveryFailed
 from .faults import arrival, maybe_crash
 from .machines import (
     ACQUISITION_RECOVERY,
-    LIFECYCLE_OWING_WORK,
     RECOVERY_ABSENT,
     RECOVERY_ARMED,
     RECOVERY_FILE_DELETED,
@@ -103,11 +102,11 @@ ORPHAN_DECISION = "orphan_offsets_accepted"
 #: that slot. Journalled, it is one idempotent sequence that finishes without the flag.
 RESET_DECISION = "operator_reset"
 
-#: Decisions whose table obligation is "put the snapshot bookkeeping back to `none`"
-#: rather than "every captured table owes a fresh image". `--reset-state` means start
-#: over, and the run's own forced `initial` snapshot re-reads everything; marking the
-#: tables `awaiting_snapshot` instead would additionally demand a *throwaway*
-#: re-snapshot of tables the main engine is about to rebuild anyway.
+#: Decisions that ALSO clear the per-table snapshot bookkeeping (epoch, `snapshot_lsn`,
+#: `last_commit_id`) before recording the obligation. "Start over" means those columns
+#: go back to nothing; it does **not** mean the obligation is weaker, and the first cut
+#: made exactly that mistake (Codex r2 BLOCKER-1). Every captured table is marked
+#: `awaiting_snapshot` here as it is for every other recovery.
 RESET_TABLE_DECISIONS = (RESET_DECISION,)
 
 #: In the order they happen. `armed` is terminal for the *mutation* sequence and is
@@ -321,18 +320,26 @@ def begin(
     con.execute("BEGIN TRANSACTION")
     try:
         if decision in RESET_TABLE_DECISIONS:
-            # `--reset-state`: the bookkeeping goes back to `none`, not to
-            # `awaiting_snapshot`. Still through `TableLifecycle`, still inside this
-            # transaction, so "a reset is owed" and "the tables were reset" are one fact.
+            # `--reset-state` first puts the per-table snapshot bookkeeping (epoch,
+            # `snapshot_lsn`, `last_commit_id`) back to nothing, which is what "start
+            # over" means for those columns.
             table_lifecycle.reset_all(con, pipeline=pipeline, reason=f"{decision}: {message}")
-            marked = 0
-        else:
-            marked = request_snapshot(
-                con,
-                pipeline=pipeline,
-                tables=captured_tables,
-                detail=f"{decision}: {message}",
-            )
+        # ...and then EVERY captured table is owed a fresh image, reset included.
+        #
+        # The first cut of the journalled reset stopped at `reset_all()` and recorded
+        # `tables_marked=0`, which made its obligation vacuous: `none` is not an owing
+        # state, a captured table with no row at all was accepted too, and completion
+        # skipped the resume-point requirement entirely. A source table that is EMPTY
+        # emits no snapshot records, so nothing rebuilt it — and the reset cleared its
+        # own journal, reported `ok: true`, and left the destination holding stale rows
+        # the source no longer had (Codex r2 BLOCKER-1, reproduced end to end). An
+        # obligation that any outcome satisfies is not an obligation.
+        marked = request_snapshot(
+            con,
+            pipeline=pipeline,
+            tables=captured_tables,
+            detail=f"{decision}: {message}",
+        )
         record.tables_marked = marked
         if forget_catalog:
             # A different cluster's oids are not our relations' oids, and comparing them
@@ -522,8 +529,15 @@ def complete_if_ready(
     #: The captured set the JOURNAL recorded, falling back to everything the pipeline
     #: currently knows about for journals written before the column existed.
     obligation = list(record.captured) or sorted(states)
+    # POSITIVE terminal evidence, per relation. `not in LIFECYCLE_OWING_WORK` was the
+    # wrong test in both directions (Codex r2 BLOCKER-1): `none` means "registered,
+    # never snapshotted", and a captured relation with no row at all means "nothing was
+    # ever written for it" - and both passed. `complete` is the ONE state that says the
+    # destination table holds a trustworthy image, and it is what a rebuild has to
+    # produce; `finish_verified_empty_tables` is how a table that is genuinely empty at
+    # the source reaches it.
     still_owed = tuple(
-        name for name in obligation if states.get(name) in LIFECYCLE_OWING_WORK
+        name for name in obligation if states.get(name) != table_lifecycle.COMPLETE
     )
     has_resume = bool(
         con.execute(
@@ -532,14 +546,13 @@ def complete_if_ready(
             [pipeline, namespace],
         ).fetchall()
     )
-    # A resume point proves the rebuilt image was handed over to a stream. A recovery
-    # that marked no table (`--reset-state`, whose obligation is "put the bookkeeping
-    # back", not "rebuild these N tables") has nothing to hand over, so requiring one
-    # would leave every reset of an idle source permanently armed.
-    needs_resume = record.tables_marked > 0
-    if still_owed or (needs_resume and not has_resume):
+    # A resume point proves the rebuilt image was handed over to a stream, and it is
+    # required of EVERY recovery. The first cut exempted `--reset-state` on the grounds
+    # that its obligation was only bookkeeping; that exemption is exactly what let a
+    # reset clear itself having rebuilt nothing.
+    if still_owed or not has_resume:
         reason = (
-            f"{len(still_owed)} captured table(s) still owe work "
+            f"{len(still_owed)} captured table(s) are not `complete` "
             f"({', '.join(still_owed)})" if still_owed
             else "the destination has no resume point, so the rebuilt image was never "
                  "handed over to a stream"

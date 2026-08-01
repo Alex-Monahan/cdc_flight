@@ -220,3 +220,61 @@ def test_register_table_does_not_overwrite_a_rebuild_that_is_owed(con):
     assert tl.read(
         con, pipeline=PIPELINE, source_schema="app", source_table="c"
     ) == tl.AWAITING
+
+
+def test_the_real_coordinator_refuses_the_residue_before_it_touches_anything(con):
+    """The coordinator-level regression the review asked for (Codex r2 MINOR-2).
+
+    `test_a_second_snapshot_over_a_durable_half_finished_one_is_refused` drives the
+    lifecycle *writer* directly, and would stay green if `SnapshotCoordinator.state_for`
+    went back to dropping the shadow, forgetting it in the registry and adding it to
+    `created_in_txn` **before** asking whether the edge is legal — which is exactly what
+    it used to do. This drives the real coordinator and asserts that none of those three
+    side effects happened.
+    """
+    from cdc_flight.snapshot import SnapshotCoordinator
+
+    con.execute("CREATE SCHEMA IF NOT EXISTS cdc_raw")
+    con.execute("CREATE TABLE cdc_raw.cdcflight_app_c__cdcf_tmp (id BIGINT)")
+    _to(con, "c", tl.IN_PROGRESS)  # a process died inside this table's snapshot
+
+    created: set[str] = set()
+    coordinator = SnapshotCoordinator(
+        con,
+        dataset="cdc_raw",
+        pipeline=PIPELINE,
+        topic_prefix="cdcflight",
+        created_in_txn=lambda: created,
+        get_registry=lambda: _Registry(),
+        epoch=0,
+        transactional_ddl=True,
+    )
+    with pytest.raises(IllegalTransition):
+        coordinator.state_for("app", "c")
+
+    assert created == set(), "created_in_txn was mutated for a refused snapshot"
+    assert coordinator._tables == {}, "the coordinator recorded a table it refused"
+    survived = con.execute(
+        "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'cdc_raw' "
+        "AND table_name = 'cdcflight_app_c__cdcf_tmp'"
+    ).fetchone()[0]
+    assert survived == 1, (
+        "the shadow table was dropped before the edge was checked; the refusal then "
+        "leaves the coordinator's view and the destination disagreeing"
+    )
+    # ... and the declared route still works, through the real coordinator.
+    dest_mod.promote_interrupted_snapshots(con, PIPELINE)
+    assert coordinator.state_for("app", "c") is not None
+
+
+class _Registry:
+    """The two calls `state_for` makes on the registry, recorded rather than performed."""
+
+    def __init__(self) -> None:
+        self.forgotten: list[str] = []
+
+    def forget(self, name: str) -> None:
+        self.forgotten.append(name)
+
+    def drop(self, name: str) -> None:  # pragma: no cover - not reached here
+        self.forgotten.append(name)

@@ -226,6 +226,15 @@ def run_engine_bounded(
             log.error("debezium engine thread did not stop within 60s")
             close_hung = True
             outcome.record("hung")
+        if catalog is not None:
+            # QUIESCED BEFORE ANY VERDICT IS TAKEN (Codex r2 MAJOR-3). The catalog
+            # poller runs on its own thread and was stopped only later, in
+            # `pipeline.run()`'s `finally` — so a poll already in flight could take an
+            # undeclared transition, or queue a destructive change, *after* the checks
+            # below had already concluded the run was a success. Nothing re-read the
+            # field. `stop()` sets the event and joins, and it is idempotent, so the
+            # caller's own `stop()` still works.
+            catalog.stop()
         # ADR 0001 §3.2: the un-ENDed tail is DISCARDED, never guessed at. It is
         # safe to discard precisely because Invariant O means the offset store
         # still points before it, so it replays on the next run.

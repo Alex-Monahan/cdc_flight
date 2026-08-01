@@ -3494,9 +3494,118 @@ split, with 51a stating the policy this machine actually has.
 
 #### A58.8 — decomposition, again
 
-`applier.py` (996), `pipeline.py` (992) and `destination.py` (952) were back at the
-1,000-line threshold. `OpenGroup` moves to `cdc_flight/commit_group.py` and the four
-pre-engine decisions move to `cdc_flight/acquisition.py`, taking `applier.py` to 917 and
-`pipeline.py` to 730. Both seams are argued rather than arbitrary: `OpenGroup` has no
-dependency on the applier, and the acquisition decisions are testable against a DuckDB
-file with no JVM.
+`applier.py` and `pipeline.py` were back within a hundred lines of the 1,000-line
+threshold once this round's changes landed on top of `b7f7cb7`'s 967 and 953.
+`OpenGroup` moves to `cdc_flight/commit_group.py` and the four pre-engine decisions move
+to `cdc_flight/acquisition.py`. Both seams are argued rather than arbitrary: `OpenGroup`
+has no dependency on the applier, and the acquisition decisions are testable against a
+DuckDB file with no JVM. Sizes after rev 11 are in `RUBRIC_STATUS`, measured rather than
+recalled; no file crosses the threshold.
+
+### A59 — rev 11: what round 2's review found in round 1's fixes
+
+The re-review confirmed the orphan-route ordering, the `due -> marked` catalog edge, the
+hard-death anchors, the composed-fault evidence and the `OpenGroup` narrowing, and found
+that four of the round-1 fixes were incomplete and one was actively wrong. Everything
+below is a reproduction the reviewer ran, not a reading.
+
+#### A59.1 — a journal may only clear over POSITIVE terminal evidence (BLOCKER)
+
+Journalling `--reset-state` introduced a worse defect than the one it closed. Reset's
+table action was `reset_all()` — every captured table to `none` — and it recorded
+`tables_marked = 0`. Completion then asked only whether a captured state was in
+`LIFECYCLE_OWING_WORK`, and `none` is not; nor is a **missing** lifecycle row. The
+`tables_marked > 0` guard also exempted every reset from the resume-point requirement.
+The obligation was therefore satisfied by doing nothing at all.
+
+That is reachable, and the reviewer reached it. A source relation with **zero rows**
+emits no Debezium snapshot records, so `SnapshotCoordinator` never opens a shadow for it
+and never swaps one in: the destination table keeps exactly what it had. Truncate
+`app.documents` at the source without running CDC, then `--reset-state`, and the run
+returned `ok=true / idle`, cleared its own journal, and left two rows the source no
+longer had. The operator action whose entire purpose is a clean baseline certified stale
+data as success.
+
+Three changes, and all three are needed:
+
+1. **the obligation is real.** `recovery.begin()` still resets the per-table snapshot
+   bookkeeping for `operator_reset` — that is what "start over" means for `snapshot_epoch`,
+   `snapshot_lsn` and `last_commit_id` — and then marks **every captured table
+   `awaiting_snapshot`**, exactly as every other recovery does, with a truthful
+   `tables_marked`;
+2. **completion demands `complete`.** `not in LIFECYCLE_OWING_WORK` was wrong in both
+   directions; `complete` is the one state that says the destination table holds a
+   trustworthy image. A resume point is required of every recovery, reset included;
+3. **an empty source table reaches `complete` positively.** The blocking re-snapshot has
+   always closed this with `EmptinessEvidence` — end-of-snapshot marker, zero records for
+   this table, a source count of zero, fenced at a WAL position sampled before the count.
+   `resnapshot.finish_empty_tables_after_main_snapshot()` asks the same three questions
+   after the **main** engine's snapshot, so a reset over an emptied table converges in one
+   run instead of failing and self-healing on the next. A table that fails any of the
+   three is left untouched and stays owed, which fails the run — the conservative half is
+   unchanged.
+
+#### A59.2 — the commit→ack window is a gate, not an observation (MAJOR)
+
+A58.4 replaced a false claim with a weaker false claim. `RunPhaseWriter._write()` read
+`COMMIT_ACK.active`, then built a timestamp, then executed SQL — and a database call
+releases the GIL, so the applier could open the window in between. A two-thread barrier
+reproduced the `UPDATE` running with the flag true and `dropped_writes == 0`.
+
+The protocol that carries the claim is one mutex used asymmetrically. An independent
+writer holds it for **the check and the write together**. The applier takes it in
+`enter()`, which happens **before `COMMIT`** — so waiting there costs nothing the
+principle protects; it only delays *opening* the window until an in-flight write has
+finished. `leave()` is a plain assignment, so the acknowledgement path itself takes no
+lock, and it is in a `finally` because `markProcessed`/`markBatchFinished` can raise.
+
+Two honest edges, both measured rather than asserted: the wait in `enter()` is bounded at
+5 s so a stalled observability connection can never stall the commit path, and the
+`overlaps` counter records every time that bound is hit; and the **terminal** phase write
+waits for the window rather than being dropped, because a dropped `stopped`/`failed` row
+leaves the heartbeat non-terminal for ever and there is no next transition to restore it.
+
+#### A59.3 — a pre-engine failure carries the same projection (MAJOR)
+
+Fixing the normal path left the failure path behind: `reported` was populated only on the
+inner engine success and `EngineFailure` routes, so a lease refusal wrote heartbeat
+`failed/error` while `main()` built its summary from the exception and shipped no
+`run_phase` and no `run_outcome` at all. The escaping exception now carries the one
+projection, and the outer `finally` fills it in after the terminal transitions — so
+`last_run.json` and the heartbeat agree on a route that never reaches the engine.
+
+#### A59.4 — the catalog verdict is taken on a quiesced watcher (MAJOR)
+
+`run_engine_bounded()` checked `catalog.machine_error` once and could return success
+while the polling thread was stopped only later, in `pipeline.run()`'s `finally`. A poll
+already in flight could take an undeclared transition after the check, and nobody re-read
+the field: the same "success over an undeclared edge" policy A58.5 claims is impossible,
+moved into a timing gap. The supervisor now calls `catalog.stop()` — which sets the event
+and joins — before any verdict is taken.
+
+#### A59.5 — `connect_timeout` does not bound a query on a live socket (MAJOR)
+
+The mandated network-blackhole proof was timing-dependent: it failed on `stop_reason ==
+'source_dark'` in one run and passed in the next. The cause is that `SourceHealth`'s
+sampler bounded only the **handshake**. A relay that blackholes packets after the socket
+is established leaves the query blocked on a recv that never returns, so the sampler
+stops publishing entirely — `unknown` is never recorded, `unknown_for` never reaches
+`CDC_SOURCE_DARK_SECONDS`, and the run dies of the shutdown symptom with the diagnosis
+never formed. The precedence cannot preserve a diagnosis nothing recorded.
+
+The sampler now sets `statement_timeout` (the server's bound) plus keepalives and
+`tcp_user_timeout` (the client's, and the one that actually fires against a blackhole),
+both well under the dark threshold.
+
+#### A59.6 — the minors
+
+* `_table_columns()` caught an introspection failure and returned `None`, and the caller
+  silently returned — which recreates the silent-writer-failure the new
+  `ControlSchemaFailed` exists to prevent, one step earlier. It raises. The migration test
+  now uses the exact prior DDL, with its primary key and a row in it.
+* The `in_progress -> in_progress` regression test drove the lifecycle writer directly, so
+  it would have stayed green if `SnapshotCoordinator.state_for()` regressed to
+  side-effect-first ordering. It drives the real coordinator now and asserts the shadow,
+  the registry and `created_in_txn` are untouched by a refused edge.
+* `--reset-state` and `--accept-orphan-offsets` name **every** destructive surface in
+  `--help`, including the replication-slot drop.
