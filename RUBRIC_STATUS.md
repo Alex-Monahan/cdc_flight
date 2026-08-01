@@ -367,7 +367,7 @@ correct assumptions in the notes below:
 | 1.6 | Snapshot/backfill consistent with CDC | ~~3~~ → **5** | Postgres's **exported snapshot** makes the boundary an iff, and the fence is on the transaction's **commit** LSN, so a transaction straddling `C` is applied in full rather than lost. Proven with ~200 transactions committing throughout a snapshot — every row on exactly one side. A re-snapshot is complete only when **every requested table** reaches a terminal state: swapped, or verified empty on three independent facts (Debezium's own end-of-snapshot marker, zero records for that table, and a source count of zero). A disagreement between the two readings of `C` is fatal. Proven against a four-table re-snapshot with a keyless table, a genuinely empty table and a concurrent writer. |
 | 1.7 | Failures do not cause correctness issues | ~~1~~ ~~4~~ → **3** | **Twenty-one in-process anchors**: eight protocol, five destination (including the genuinely ambiguous `destination_commit_late`), seven recovery/catalog-baseline, and one source-catalog fault, plus a real network blackhole injected from outside the process. The matrix is enumerated from `faults.ALL_POINTS`, every anchor writes a machine-readable fired record, and the chaos harness asserts each workload affected source rows before arming. Round 7 still scores this 3/5: substantial evidence, but repeated adversarial compositions were found outside the suite, so the 5-band's “robust injection” is not yet the reviewer's verdict. |
 | 1.8 | Externally-advanced slot detected → backfill | ~~1~~ → **5** | Checked on every slot acquisition. Seven decisions trigger an **automatic** re-snapshot: slot ahead, slot missing, slot recreated, source identity changed, **source timeline forked**, source WAL rewound, and an empty destination with a positioned slot. The recovery is a **journalled state machine**: the intent is durable before any mutation, every step is idempotent and re-entrant after a crash at any phase, and a slot that will not drop fails the recovery rather than being logged and stepped over. A **populated** destination with no resume point refuses instead of being rebuilt. Proven by comparing the whole destination against the whole source after a real `pg_replication_slot_advance` and a real `pg_drop_replication_slot`, and by cutting the recovery at every phase boundary. |
-| 1.9 | Consistency-affecting state managed with state machines | **5** (new item) | Five focused machines plus one precedence, declared together in `cdc_flight/machines.py`: `table_lifecycle`, `run_phase`, `acquisition_recovery`, `catalog_change`, and the durable `catalog_baseline`, plus `run_outcome` as cause-before-symptom precedence. Only a confirmed `valid` catalog baseline permits relation-identity adoption, and a queued rebuild remains unconfirmed until durable positive completion. Round 7 awards the literal 5 band (“an appropriate number of state machines, over 1”); its remaining teardown finding concerns non-load-bearing observability handles, not consistency state. |
+| 1.9 | Consistency-affecting state managed with state machines | **5** (new item) | Seven focused machines plus one precedence are declared together in `cdc_flight/machines.py`: `table_lifecycle`, `run_phase`, `acquisition_recovery`, `interruption_marker`, `destination_ownership`, `catalog_change`, and `catalog_baseline`, plus `run_outcome` as cause-before-symptom precedence. The inventories are generated from those declarations. Failed quiescence is published inside the supervisor's `finally`, and marker retirement is a declared edge, so neither state depends on exception-summary shape. This satisfies the literal 5 band (“an appropriate number of state machines, over 1”). |
 | 2.1 | Added / dropped columns handled | 2 | Adds work correctly; a dropped column silently lingers and reads NULL, indistinguishable from a real NULL. |
 | 2.2 | Renamed columns handled well | 1 | Rename lands as "new column + old column silently goes NULL". No tombstone, no linkage. |
 | 2.3 | New tables and schemas auto-discovered | 1 | Needs `ALTER PUBLICATION` + config change + restart, and pre-existing rows are silently never snapshotted. |
@@ -1485,10 +1485,10 @@ ours, it runs before the engine starts, and it does not depend on Debezium notic
 
 ### 1.9 Consistency-affecting state managed with state machines — **5 / 5**
 
-> **Round-7 reviewer verdict: 5/5.** Round 7 still returned `SATISFIED: no` because an
-> idle observability cursor could hang teardown, but explicitly held that finding outside
-> rubric 1.9: it is a non-load-bearing handle, not consistency state. The fifth focused
-> machine, durable `catalog_baseline`, closes the state gap that held earlier rounds to 3.
+> **Current inventory: seven machines plus one precedence; score 5/5.** Round 7 awarded
+> 5/5 on the then-current five-machine inventory. Later reviews correctly identified
+> callback ownership and filesystem interruption recovery as two more
+> consistency-affecting states; both are now declared and mechanically inventoried.
 
 `no state machines=1, only 1 big state machine=3, an appropriate number (over 1)=5`
 
@@ -1615,13 +1615,15 @@ guards. The round-7 fixes measure **608 passed / 9:14** (9:15 wall), under the 1
 default budget; the real-cluster catalog and teardown compositions remain explicit
 slow-lane tests.
 
-#### Why 5 — the round-7 score
+#### Why 5 — the current inventory
 
-Round 7 applies the rubric's literal 5 band: “an appropriate number of state machines
-(over 1).” Five focused machines own five concepts, and `run_outcome` is separately a
-precedence rather than being forced into a graph. The consistency-affecting state earlier
-reviews found outside the model now has a durable owner: `CATALOG_BASELINE`, with four
-states, twelve declared edges and one writer.
+The current implementation applies the rubric's literal 5 band: “an appropriate number
+of state machines (over 1).” Seven focused machines own seven concepts, and
+`run_outcome` is separately a precedence rather than being forced into a graph.
+`catalog_baseline` owns identity adoption, `interruption_marker` owns the durable
+cross-process recovery obligation, and `destination_ownership` owns the terminal
+failed-quiescence handoff. Their state and edge counts in this document and the ADR are
+mechanically compared with `machines.py`.
 
 Its safety partition is explicit and conservative. Every state except `valid`, including
 the no-row pseudo-state `absent`, is untrusted; only a confirmed baseline permits an

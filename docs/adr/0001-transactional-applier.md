@@ -1,6 +1,6 @@
 # ADR 0001 — The transactional applier
 
-* **Status:** accepted (revision 19, 2026-08-01 — implemented through the rubric 1.9 round-10 sticky recovery handoff)
+* **Status:** accepted (revision 20, 2026-08-01 — implemented through the rubric 1.9 round-11 fail-closed proof publication)
 * **Date:** 2026-07-30
 * **Task:** TODO 1.0(a); revised under TODO 1.0(feedback)
 * **Decides rubric items:** 1.1, 1.2, 1.3, 1.7 (directly), and 1.4, 1.6, 1.8, 3.2,
@@ -27,7 +27,8 @@
 | 16 | 2026-08-01 | **Round-7 reconciliation.** The current inventory has five focused machines plus one outcome precedence: `catalog_baseline` is the fifth machine. Only `valid` permits identity adoption; a queued `awaiting_snapshot` rebuild is not complete. A51 rows 55/57 and the published 1.9 score now state those partitions. `CONNECTION_RETIREMENT` uses one bounded daemon-worker close protocol for cursor and parent handles and distinguishes `failed` from `closed` (A65). Rubric 1.9 is 5/5 and 1.7 remains the reviewer's 3/5. |
 | 17 | 2026-08-01 | **Round-8 callback seal.** Callback admission and the in-flight count share one condition lock; shutdown seals before waiting, a post-seal batch is unacknowledged, and a failed quiescence proof transfers the destination runtime to the admitted callback rather than racing it. PyArrow uses its system allocator on the JVM callback thread (A66). |
 | 18 | 2026-08-01 | **Round-9 ownership composition.** One `DestinationOwnership` token spans the blocking re-snapshot and main stream. The token is attached before consumer construction and activated only when callbacks may enter; outer teardown no longer infers quiescence from a caller-local `applier is None`. A failed re-snapshot quiescence proof retains its alert cursor, parent, lease, heartbeat sink, throwaway slot and offset state, while a pre-armed filesystem marker makes next-run owed-state repair durable without writing through the contested connection. An inactive main-applier construction failure is sealed and retired normally (A67). |
-| 19 | 2026-08-01 | **Round-10 sticky recovery handoff.** Failed callback quiescence is now the terminal `destination_ownership: active -> callback_owned` transition; a later callback exit cannot let an enclosing finalizer revoke it. The filesystem recovery marker is the durable `absent -> armed -> consumed` machine, and cleanup requires `consumed`, not a fresh quiescence read. Crash configurations at every marker state and the exact live-at-catch/quiescent-at-finally race are pinned. `pipeline.run()` enforces a process-terminal exit after transfer, so an in-process caller cannot outlive the lease and start beside retained ownership (A68). |
+| 19 | 2026-08-01 | **Round-10 sticky recovery handoff.** Failed callback quiescence is now the terminal `destination_ownership: active -> callback_owned` transition; a later callback exit cannot let an enclosing finalizer revoke it. The filesystem recovery marker is the durable `absent -> armed -> consumed` machine, and cleanup requires `consumed`, not a fresh quiescence read. In-process simulations cover all three durable marker configurations and the exact live-at-catch/quiescent-at-finally race. `pipeline.run()` enforces a process-terminal exit after transfer, so an in-process caller cannot outlive the lease and start beside retained ownership (A68). |
+| 20 | 2026-08-01 | **Round-11 fail-closed publication and recovery boundary.** The supervisor now publishes one typed quiescence proof from inside its `finally`, so a pending `KeyboardInterrupt`, `SystemExit`, or other `BaseException` cannot bypass `active -> callback_owned` by skipping later summary construction. Ownership retirement independently transfers any unretired active callback fail-closed. Marker retirement declares `consumed -> absent`, removes the sibling offset directory, and lives with restart discharge and slot cleanup in `resnapshot_recovery.py`; the summaryless interrupt composition and process-terminal outer teardown are pinned (A69). |
 
 ---
 
@@ -2820,6 +2821,7 @@ persistence: `<state_dir>/resnapshot/interrupted.json.state` · initial: `absent
 |---|---|---|
 | `absent` | `armed` | no |
 | `armed` | `consumed` | yes |
+| `consumed` | `absent` | no |
 
 **`destination_ownership`** — Who exclusively owns the destination connection after callback admission, including a failed-quiescence handoff which enclosing finalizers cannot undo?
 
@@ -2969,8 +2971,8 @@ made no claim — see A63.4.
 | 57 | catalog_baseline: invalidated -> valid | — (the discharge, after rebuild completion) | a durable `include_owed=True` query finds no relation that still holds rows without an identity: every queued rebuild positively completed and the learned identity was eligible for flush | n/a; merely reaching `awaiting_snapshot` keeps the baseline `invalidated` and a disabled/skipped repair refuses before streaming | as 56 | AUTO (rev 16 — a queued rebuild is not a finished one) |
 | 58 | catalog_baseline: valid -> absent | the recorded source catalog is forgotten (`--reset-state`, a source identity change) | `recovery.begin(forget_catalog=True)` | the claim is deleted in the SAME transaction as `source_relations`: a claim about a registry that no longer exists would suppress the reconciliation of the one replacing it | one transaction, so there is no cut | AUTO (rev 14) |
 | 59 | connection_retirement (domain) | a heartbeat write, cursor close, or parent connection close never returns; or close raises | one canonical daemon-worker close protocol bounds both idle cursor and parent close calls; a live writer retains cursor ownership until it returns | the run tears down within the bound and reports `closed`, `failed` (with the close error), or `abandoned` for each handle before process exit | n/a — the heartbeat is not load-bearing for any decision | **UNDEFINED** (rev 16 — honest: nothing clears the non-terminal heartbeat row an abandoned runner left behind; `last_run.json` is the terminal record and stale-row sweeping belongs to 4.4/6.1) |
-| 60 | interruption_marker: armed -> consumed | crash at any interruption-marker state, including after destination requeue but before marker retirement | the marker's declared `state`, with legacy state-less markers parsed as `armed` | `absent` does nothing; `armed` idempotently reasserts owed work before becoming `consumed`; `consumed` is garbage-collected without repeating the destination write | **INJECTED at all three durable configurations**, plus the post-write/pre-consume cut which remains `armed` and repeats safely | AUTO (rev 19) |
-| 61 | destination_ownership: active -> callback_owned | callback leaves after the supervisor fails quiescence but before enclosing finalizers run | the supervisor's completed `applier_quiesced=false` verdict, not a later mutable callback read | terminal ownership preserves marker/slot/offset/alert/lease/heartbeat/parent state; `run()` writes the failure summary and hard-exits | exact live-at-catch/quiescent-at-finally schedule injected; marker remains `armed` and `reassert_owed` remains skipped | AUTO (rev 19) |
+| 60 | interruption_marker: armed -> consumed | restart at any interruption-marker state, including after destination requeue but before marker retirement | the marker's declared `state`, with legacy state-less markers parsed as `armed` | `absent` does nothing; `armed` idempotently reasserts owed work before becoming `consumed`; the separately declared `consumed -> absent` edge retires the whole marker/offset instance without repeating the destination write | **STATE-SIMULATED IN PROCESS** at all three durable configurations; the post-write/pre-consume cut raises a monkeypatched `KeyboardInterrupt`, remains `armed`, and repeats safely. These tests do not claim process-crash timing | AUTO (rev 20) |
+| 61 | destination_ownership: active -> callback_owned | callback leaves after failed quiescence, or a pending `BaseException` skips post-`finally` summary construction | the supervisor publishes a typed proof inside its `finally`; unretired active ownership also transfers fail-closed | terminal ownership preserves marker/slot/offset/alert/lease/heartbeat/parent state; outer teardown writes the failure summary and takes the hard-exit path | exact late-exit schedule plus a summaryless `KeyboardInterrupt` through the real supervisor boundary; marker remains `armed`, `reassert_owed` is skipped, resources survive, and the in-process outer teardown is process-terminal | AUTO (rev 20) |
 
 **The counts, parsed from the rows above rather than recalled.** 66 rows, one
 failure and one terminal class each.
@@ -3340,8 +3342,9 @@ gain), `machine.check(from, to)` raising `IllegalTransition`, `machine.parse()` 
   only from `armed`, so a clear cannot discard a half-done destructive sequence.
 * **`interruption_marker`.** Filesystem recovery intent is durable consistency state:
   `absent -> armed` is fsynced before callback activation, and only a safe destination
-  owner may take `armed -> consumed` after reasserting the rebuild obligation. Terminal
-  `consumed` may be garbage-collected; `armed` never may.
+  owner may take `armed -> consumed` after reasserting the rebuild obligation.
+  `consumed -> absent` is the declared retirement of that marker instance together with
+  its sibling offset directory; `armed` never may be retired.
 * **`destination_ownership`.** `available -> attached -> active` names callback
   admission. A bounded failed-quiescence verdict takes the terminal
   `active -> callback_owned` edge, so a later callback exit cannot be reinterpreted by
@@ -4246,12 +4249,12 @@ that state even if the callback leaves one instruction later. Every enclosing fi
 sees the same handoff decision.
 
 The filesystem marker independently implements durable
-`absent -> armed -> consumed`. Arming atomically replaces and fsyncs the marker before
+`absent -> armed -> consumed -> absent`. Arming atomically replaces and fsyncs the marker before
 callback activation. A safe destination owner first reasserts the table-lifecycle
 obligation, then atomically publishes `consumed`; only a consumed terminal record may be
-unlinked or have its slot/offset directory removed. On restart, `absent` is a no-op,
+retired through the declared `consumed -> absent` edge with its slot/offset directory. On restart, `absent` is a no-op,
 `armed` repeats the idempotent destination request before consumption, and `consumed`
-only garbage-collects the terminal record. A crash after the destination write but
+only retires the terminal recovery instance. A crash after the destination write but
 before consumption remains `armed` and repeats conservatively.
 
 The supported `pipeline.run()` contract is explicitly process-terminal for this one
@@ -4259,3 +4262,36 @@ handoff. After recording the abandonment summary it calls the same hard-exit pat
 CLI. Thus a library caller cannot catch failed quiescence, retain an owner beyond the
 lease TTL, and start a second invocation beside it; process death preserves the armed
 marker for the next run and releases local handles without racing the callback.
+
+### A69 — rev 20: failed quiescence is published before any unwind can skip it
+
+Round 11 found the remaining exception-shaped hole in A68. The supervisor sealed
+callback admission and completed `wait_for_quiescence() == false` inside a `finally`, but
+constructed the summary carrying that verdict only after the block. A pending
+`KeyboardInterrupt`, `SystemExit`, or other `BaseException` resumed unwinding immediately
+after the `finally`, so both callers saw no summary, left ownership `active`, and could
+write recovery state through a connection still owned by the callback.
+
+The supervisor now constructs a typed `QuiescenceProof` immediately after the bounded
+wait and publishes it from inside the same `finally`. Both production engine paths bind
+that publication directly to their shared `DestinationOwnership` token, so a failed
+proof takes terminal `active -> callback_owned` before any pending exception can resume.
+Summary construction remains reporting only; it is no longer the transport for
+exclusive ownership.
+
+The callers also fail closed independently. `retire_if_quiescent()` transfers an active,
+unretired callback to `callback_owned` instead of returning a revocable `active` token,
+and the re-snapshot exception path branches on whether ownership was actually retired,
+not on `exception.summary`. Thus an absent observer, a summaryless exception, or a test
+double cannot select the contested-connection `reassert_owed()` branch. The regression
+drives a summaryless `KeyboardInterrupt` through the real supervisor boundary while
+quiescence fails and proves the marker stays armed, the slot/offset/alert resources stay
+retained, no destination recovery write occurs, ownership is terminal, and the outer
+in-process teardown selects the hard-exit path.
+
+The cohesive interruption lifecycle now lives in `resnapshot_recovery.py` behind one
+typed `InterruptionRecovery`: marker persistence/validation, all three declared edges,
+restart discharge, and terminal slot/offset/marker cleanup. `resnapshot.py` is again an
+orchestrator below 1,000 lines. The marker-state tests construct `absent`, `armed`, and
+`consumed` in process and monkeypatch the post-write/pre-consume cut; they are deliberately
+described as durable-state simulations, not as process-crash timing tests.
