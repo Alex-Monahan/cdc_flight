@@ -9,6 +9,7 @@ consumer failed to construct before any callback could start.
 from __future__ import annotations
 
 import inspect
+import threading
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -63,6 +64,29 @@ class _Applier:
 class _Engine:
     def __init__(self, **_kwargs) -> None:
         self.consumer = object()
+
+
+class _SupervisorApplier(_Applier):
+    """The full applier surface needed to cross the real supervisor boundary."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.error = None
+        self.batch_count = 0
+        self.data_batch_count = 0
+        self.skipped_count = 0
+
+    def wait_for_quiescence(self, timeout) -> bool:
+        return False
+
+    def snapshot_counts(self) -> dict:
+        return {}
+
+    def stats(self) -> dict:
+        return {}
+
+    def drain_on_shutdown(self) -> int:
+        pytest.fail("a non-quiescent callback must not be drained")
 
 
 class _StartedResource:
@@ -145,6 +169,116 @@ def test_resnapshot_quiescence_failure_retains_every_owned_resource(monkeypatch,
     assert ownership.destination_quiescent is False
     assert ownership.state == "callback_owned"
     assert raised.value.summary["resnapshot_recovery"] == "armed"
+
+
+def test_summaryless_baseexception_failed_quiescence_is_fail_closed_end_to_end(
+    monkeypatch, tmp_path
+):
+    """Round 11: pending ``BaseException`` cannot skip proof publication.
+
+    ``KeyboardInterrupt`` leaves the supervisor body while its ``finally`` proves the
+    callback non-quiescent. The original exception has no summary, so the published
+    proof itself must retain the marker/resources and make outer teardown terminal.
+    """
+    replication = ReplicationConfig(slot_name="round11", state_dir=tmp_path / "state")
+    ownership = DestinationOwnership()
+    drop_calls: list[str] = []
+    reassert_calls: list[object] = []
+    written: list[dict] = []
+    _Applier.instances.clear()
+
+    monkeypatch.setattr(resnapshot_mod, "Applier", _SupervisorApplier)
+    monkeypatch.setattr(resnapshot_mod, "_SlotWatcher", _StartedResource)
+    monkeypatch.setattr(resnapshot_mod, "SourceHealth", _StartedResource)
+    monkeypatch.setattr(
+        reconcile_mod, "drop_slot", lambda _dsn, slot: drop_calls.append(slot)
+    )
+    monkeypatch.setattr(
+        resnapshot_mod,
+        "reassert_owed",
+        lambda con, **_kwargs: reassert_calls.append(con),
+    )
+
+    import cdc_flight.engine as engine_mod
+
+    class _InterruptingEngine:
+        completed_success = False
+        suppressed_message = None
+        offset_flushes_verified = 0
+
+        def __init__(self, **_kwargs) -> None:
+            self.consumer = object()
+            self._closed = threading.Event()
+
+        @property
+        def failure(self):
+            raise KeyboardInterrupt("interrupt while supervisor body is active")
+
+        def run(self) -> None:
+            offset = replication.state_dir / "resnapshot" / "offsets.dat"
+            offset.write_bytes(b"callback-owned")
+            self._closed.wait(5)
+
+        def close(self, *, intentional: bool) -> None:
+            self._closed.set()
+
+    monkeypatch.setattr(engine_mod, "SupervisedDebeziumEngine", _InterruptingEngine)
+
+    with pytest.raises(KeyboardInterrupt, match="supervisor body") as raised:
+        resnapshot_mod.run(
+            object(),
+            source=SourceConfig(),
+            replication=replication,
+            pipeline=PIPELINE,
+            dataset="cdc_raw",
+            tables=TABLES,
+            settings=applier_settings(),
+            run_cfg=RunConfig(close_timeout=0.01),
+            lease=object(),
+            runner_id="runner",
+            transactional_ddl=True,
+            epoch_base=0,
+            reason="round-11 summaryless unwind regression",
+            namespace="main",
+            ownership=ownership,
+        )
+
+    applier = _Applier.instances[-1]
+    state_dir = replication.state_dir / "resnapshot"
+    assert raised.value.summary["resnapshot_recovery"] == "armed"
+    assert ownership.state == "callback_owned"
+    assert ownership.destination_quiescent is False
+    assert applier.alerts.close_calls == 0
+    assert reassert_calls == [], "the contested destination connection was reused"
+    assert drop_calls == ["round11_rs"], "only the pre-start stale-slot sweep is safe"
+    assert (state_dir / "offsets.dat").read_bytes() == b"callback-owned"
+    assert resnapshot_mod._read_interruption_marker(state_dir)[0] == MARKER_ARMED
+
+    class _HardExit(BaseException):
+        pass
+
+    monkeypatch.setattr(
+        pipeline_mod, "_write_summary", lambda summary: written.append(dict(summary))
+    )
+
+    def _exit(code: int) -> None:
+        assert code == 1
+        raise _HardExit
+
+    monkeypatch.setattr(pipeline_mod, "shutdown_and_exit", _exit)
+    with pytest.raises(_HardExit):
+        pipeline_mod._teardown_destination(
+            con=object(),
+            ownership=ownership,
+            reported={},
+            phases=None,
+            lease=None,
+            lease_held=True,
+            run_ok=False,
+            hard_exit_on_transfer=True,
+        )
+    assert written[0]["destination_ownership_state"] == "callback_owned"
+    assert written[0]["ok"] is False
 
 
 def test_failed_quiescence_stays_callback_owned_if_callback_leaves_during_unwind(
@@ -452,6 +586,7 @@ def test_interruption_marker_recovers_from_every_crash_state(
             state_dir, pipeline=PIPELINE, tables=TABLES
         )
     if marker_state == MARKER_CONSUMED:
+        (state_dir / "offsets.dat").write_bytes(b"terminal offset state")
         resnapshot_mod.consume_interruption_marker(state_dir)
         payload = resnapshot_mod._read_interruption_marker(state_dir)
         assert payload[0] == MARKER_CONSUMED, "the consumed crash cut was not durable"
@@ -468,6 +603,7 @@ def test_interruption_marker_recovers_from_every_crash_state(
     assert len(requests) == expected_requests
     assert recovered == (["app.customers"] if expected_requests else [])
     assert not resnapshot_mod.interruption_marker(state_dir).exists()
+    assert not state_dir.exists(), "terminal recovery left its offset directory behind"
 
 
 def test_crash_before_marker_consumption_repeats_the_idempotent_discharge(

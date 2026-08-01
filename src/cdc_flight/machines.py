@@ -281,8 +281,11 @@ INTERRUPTION_MARKER = Machine(
         # The marker is fsynced before callback activation.
         (MARKER_ABSENT, MARKER_ARMED),
         # The destination obligation is written first; only then may the marker become
-        # consumed. The terminal record may subsequently be garbage-collected.
+        # consumed.
         (MARKER_ARMED, MARKER_CONSUMED),
+        # Retirement is a declared transition too: the terminal marker instance and
+        # its sibling Debezium offset state are destroyed together on restart.
+        (MARKER_CONSUMED, MARKER_ABSENT),
     ),
     terminal=(MARKER_CONSUMED,),
     initial=MARKER_ABSENT,

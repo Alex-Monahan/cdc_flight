@@ -213,7 +213,7 @@ def consume_interruption_marker(state_dir) -> Path:
 
 
 def discard_consumed_interruption_marker(state_dir) -> None:
-    """Garbage-collect a terminal marker, never an armed recovery obligation."""
+    """Retire terminal marker and offset state through the declared machine edge."""
     state, _payload = _read_interruption_marker(state_dir)
     if state == MARKER_ABSENT:
         return
@@ -222,9 +222,12 @@ def discard_consumed_interruption_marker(state_dir) -> None:
             f"refusing to delete armed interrupted re-snapshot recovery marker "
             f"{interruption_marker(state_dir)}"
         )
+    INTERRUPTION_MARKER_MACHINE.check(state, MARKER_ABSENT)
     marker = interruption_marker(state_dir)
-    marker.unlink()
-    directory_fd = os.open(marker.parent, os.O_RDONLY)
+    retired_dir = marker.parent
+    parent = retired_dir.parent
+    shutil.rmtree(retired_dir)
+    directory_fd = os.open(parent, os.O_RDONLY)
     try:
         os.fsync(directory_fd)
     finally:
@@ -563,6 +566,7 @@ def run(
                 ),
                 health,
                 stop_when=lambda: applier.snapshot_completed,
+                quiescence_observer=ownership.quiescence_observer(applier),
             )
         finally:
             health.stop()
@@ -630,13 +634,13 @@ def run(
         # filesystem recovery marker instead; the next process consumes it before
         # reading the owed queue.
         summary = dict(getattr(exc, "summary", {}) or {})
-        failed_quiescence = (
-            applier is not None
-            and ownership.owns(applier)
-            and summary.get("applier_quiesced") is False
-        )
+        destination_safe = True
+        if applier is not None and ownership.owns(applier):
+            destination_safe = ownership.retire_if_quiescent(
+                reason="resnapshot_setup_failed"
+            )
+        failed_quiescence = not destination_safe
         if failed_quiescence:
-            ownership.transfer_to_callback(applier)
             summary["resnapshot_recovery"] = "armed"
             summary["resnapshot_recovery_marker"] = str(interruption_marker(state_dir))
             summary["destination_owner"] = "live_resnapshot_callback"
@@ -648,8 +652,6 @@ def run(
                 interruption_marker(state_dir),
             )
         else:
-            if applier is not None and ownership.owns(applier):
-                ownership.retire_if_quiescent(reason="resnapshot_setup_failed")
             reassert_owed(con, pipeline=pipeline, tables=tables, terminal=outcome)
             consume_interruption_marker(state_dir)
         raise

@@ -8,6 +8,8 @@ pipeline's ownership decision.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from .machines import (
     DESTINATION_OWNERSHIP,
     OWNERSHIP_ACTIVE,
@@ -15,6 +17,9 @@ from .machines import (
     OWNERSHIP_AVAILABLE,
     OWNERSHIP_CALLBACK_OWNED,
 )
+
+if TYPE_CHECKING:
+    from .supervisor import QuiescenceProof
 
 
 class DestinationOwnership:
@@ -50,6 +55,16 @@ class DestinationOwnership:
             return
         DESTINATION_OWNERSHIP.check(self._state, OWNERSHIP_CALLBACK_OWNED)
         self._state = OWNERSHIP_CALLBACK_OWNED
+
+    def quiescence_observer(self, applier):
+        """Bind this token to the supervisor's in-``finally`` proof publication."""
+        self._assert_owner(applier)
+
+        def _publish(proof: QuiescenceProof) -> None:
+            if not proof.applier_quiesced:
+                self.transfer_to_callback(applier)
+
+        return _publish
 
     def owns(self, applier) -> bool:
         return self._applier is applier
@@ -93,6 +108,11 @@ class DestinationOwnership:
         if self._state == OWNERSHIP_ATTACHED:
             applier.shutdown(reason=reason)
         if not bool(applier.callback_quiesced):
+            # Absence of a published proof must fail closed too. This is the final
+            # structural guard for a caller which unwinds around the supervisor or a
+            # test double which raises without a summary: an active callback is never
+            # left in the revocable `active` state for the caller to ignore.
+            self.transfer_to_callback(applier)
             return False
         DESTINATION_OWNERSHIP.check(self._state, OWNERSHIP_AVAILABLE)
         applier.alerts.close()

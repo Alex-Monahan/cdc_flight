@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from .applier import Applier
@@ -30,6 +31,18 @@ if TYPE_CHECKING:  # `engine` imports pydbzengine, which boots a JVM on import.
 log = logging.getLogger("cdc_flight.supervisor")
 
 
+@dataclass(frozen=True)
+class QuiescenceProof:
+    """The supervisor's completed callback-boundary verdict.
+
+    It is published from the shutdown ``finally`` itself so a pending
+    ``BaseException`` cannot skip the ownership transition by bypassing summary
+    construction below that block.
+    """
+
+    applier_quiesced: bool
+
+
 def run_engine_bounded(
     engine: SupervisedDebeziumEngine,
     handler: Applier,
@@ -42,6 +55,7 @@ def run_engine_bounded(
     stop_when=None,
     phases=None,
     outcome: RunOutcome | None = None,
+    quiescence_observer=None,
 ) -> dict:
     """Run the Debezium engine until the *source* agrees it is idle, or the deadline hits.
 
@@ -219,6 +233,12 @@ def run_engine_bounded(
             close_hung = True
             outcome.record("hung")
         applier_quiesced = handler.wait_for_quiescence(timeout=run.close_timeout)
+        proof = QuiescenceProof(applier_quiesced=applier_quiesced)
+        if quiescence_observer is not None:
+            # Publish immediately after the bounded proof. In particular, keep this
+            # inside the `finally`: KeyboardInterrupt/SystemExit pending from the main
+            # body resume unwinding as soon as this block ends and skip the summary.
+            quiescence_observer(proof)
         if not applier_quiesced:
             log.error(
                 "an admitted Debezium callback did not leave within %ss; retaining the "

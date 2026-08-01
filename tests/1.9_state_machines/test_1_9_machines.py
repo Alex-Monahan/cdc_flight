@@ -246,10 +246,9 @@ def test_a_recovery_can_only_be_cleared_once_it_is_armed():
 def test_interruption_marker_can_only_be_consumed_after_it_is_armed():
     m.INTERRUPTION_MARKER.check("absent", "armed")
     m.INTERRUPTION_MARKER.check("armed", "consumed")
+    m.INTERRUPTION_MARKER.check("consumed", "absent")
     with pytest.raises(IllegalTransition):
         m.INTERRUPTION_MARKER.check("absent", "consumed")
-    with pytest.raises(IllegalTransition):
-        m.INTERRUPTION_MARKER.check("consumed", "absent")
 
 
 def test_failed_quiescence_is_a_terminal_ownership_handoff():

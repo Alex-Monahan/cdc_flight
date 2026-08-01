@@ -644,6 +644,7 @@ def run(
                 # ordinary run and a severe result could be published as the mild
                 # default.
                 outcome=outcome,
+                quiescence_observer=ownership.quiescence_observer(applier),
             )
             summary_extra["invariant_o_end"] = reconcile_mod.check_invariant_o(
                 con, pipeline=dest.pipeline_name, namespace=namespace,
@@ -770,11 +771,6 @@ def run(
             reported = _decorate(result)
             return reported
         except EngineFailure as failure:
-            if (
-                failure.summary.get("applier_quiesced") is False
-                and ownership.owns(applier)
-            ):
-                ownership.transfer_to_callback(applier)
             outcome.record(failure.summary.get("stop_reason") or "engine_error")
             reported = _decorate(failure.summary)
             raise
