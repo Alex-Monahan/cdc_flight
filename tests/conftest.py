@@ -20,6 +20,10 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+# Must precede DuckDB/PyArrow imports. PyArrow 25.0.0's default mimalloc backend can
+# SIGSEGV on the JPype JVM callback thread used by the live recovery path (ADR A14/A66).
+os.environ.setdefault("ARROW_DEFAULT_MEMORY_POOL", "system")
+
 import duckdb
 import psycopg
 import pytest

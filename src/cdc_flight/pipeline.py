@@ -29,6 +29,12 @@ import threading
 import uuid
 from pathlib import Path
 
+# Runtime compatibility, not a test workaround. This must run before any project import
+# can load PyArrow: 25.0.0's mimalloc backend has reproducibly crashed while an Arrow
+# table was built on Debezium's JPype callback thread. Operators may explicitly select a
+# different proven-safe pool; the production default is the Arrow system allocator.
+os.environ.setdefault("ARROW_DEFAULT_MEMORY_POOL", "system")
+
 from . import acquisition
 from . import catalog as catalog_mod
 from . import catalog_baseline as baseline_mod
