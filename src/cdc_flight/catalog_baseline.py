@@ -36,14 +36,33 @@ recovery uses — **write the intent before you can fail to discharge it**:
   relation exists at the source, so the honest action is "rebuild this from it", and
   the destructive route trips the mass-drop circuit breaker the moment more than one
   relation is unrelatable (measured — see A63.1);
-* only a run that read the catalog at least once and left nothing unrelatable promotes
+* only a run that read the catalog at least once, left nothing unrelatable, and saw
+  every relation it could not relate reach a **trustworthy** lifecycle state promotes
   the baseline back to `valid`. `pipeline.run()` refuses to report success otherwise.
 
-**`absent` is trusted, and that is deliberate.** A destination that has never made a
-claim carries no evidence of an unchecked window; treating it as suspect would rebuild
-every existing destination on upgrade. Only an explicit durable `stale`/`invalidated` —
-which only this pipeline writes, and only when a run is in flight or has failed to
-confirm — forbids adoption.
+**Only `valid` permits adoption.** Rev 14's first cut also trusted `absent`, reasoning
+that a destination which has never made a claim carries no evidence of an unchecked
+window and that treating every one as suspect would rebuild the world on upgrade. The
+reviewer reproduced why that is a migration-cost argument wearing a consistency
+argument's clothes (Codex r6 BLOCKER-1): a destination that predates this table reads
+`absent`, and a *populated* one with no recorded identity is exactly the shape for which
+adoption is unsafe — the first upgraded run adopted a replacement relation's oid and
+reported success over `[1, 2, 999]` against a source holding `[999]`.
+
+The cost argument does not survive contact with the predicate it was defending against.
+`unrelatable_tables()` already asks whether the destination *holds rows it has no
+identity for*: a genuinely fresh destination answers "none" and adopts normally, and
+only a populated unregistered destination pays a one-time rebuild. One partition, one
+meaning.
+
+**A queued rebuild is not a finished one.** `unrelatable_tables()` excludes relations
+that already owe work, because `TABLE_LIFECYCLE` owns that obligation and counting it
+twice is bookkeeping rather than safety. That is right for *finding* them and wrong for
+*discharging* them: with `CDC_RESNAPSHOT=0` the rebuild is queued, skipped and logged as
+unhandled, and the relation then looks discharged precisely because it is still owed
+(Codex r6 BLOCKER-2). `confirm()` requires positive completion, and `pipeline.run()`
+refuses to start the engine at all when automatic repair is switched off and a relation
+this baseline cannot relate is in the skipped queue.
 """
 
 from __future__ import annotations
@@ -115,28 +134,39 @@ def trusted(state: str) -> bool:
     return CATALOG_BASELINE.parse(state) not in BASELINE_UNTRUSTED
 
 
-def unrelatable_tables(con, *, pipeline: str, dataset: str) -> list[tuple[str, str, str]]:
+def unrelatable_tables(
+    con, *, pipeline: str, dataset: str, include_owed: bool = False
+) -> list[tuple[str, str, str]]:
     """`(source_schema, source_table, target_table)` for every unrelatable relation.
 
     The tuple shape `request_snapshot` takes, because marking them is what happens next.
     `unrelatable_relations` is the same answer as qualified names.
 
     Computed from **durable state only**, so it is the same answer for any process that
-    asks it, and three conditions must all hold:
+    asks it, and two conditions always hold:
 
-    1. the destination claims a trustworthy image — a `table_state` row in a lifecycle
-       state that is *not* owing work. A table already `awaiting_snapshot` (or
-       `in_progress`) is owed a rebuild by `TABLE_LIFECYCLE` already; adding a second
-       obligation for it would be bookkeeping, not safety;
-    2. there is **no** `source_relations` row. With one, a drop-and-recreate is visible
+    1. there is **no** `source_relations` row. With one, a drop-and-recreate is visible
        the ordinary way: the oids disagree and `CatalogWatcher._compare` queues a
        `recreated`. This function is only about the case with nothing to compare;
-    3. the destination table actually **holds rows**. An empty table cannot present one
+    2. the destination table actually **holds rows**. An empty table cannot present one
        relation's rows as another's, and rebuilding it would be noise.
+
+    `include_owed` is the third, and it is the difference between the two questions this
+    predicate answers (Codex r6 BLOCKER-2):
+
+    * **False — "who needs marking?"** A table already `awaiting_snapshot` or
+      `in_progress` is owed a rebuild by `TABLE_LIFECYCLE`; queueing it again would be
+      bookkeeping, not safety.
+    * **True — "may this baseline be confirmed?"** Here "owed" is the opposite of
+      discharged. `CDC_RESNAPSHOT=0` queues the rebuild, skips it and logs it as
+      unhandled, and the relation then looked *finished* to the confirmation precisely
+      because it was still owed — which is how a successful run came to persist a
+      replacement oid over another relation's rows.
     """
     states = table_lifecycle.read_all(con, pipeline)
     protected = {
-        name for name, state in states.items() if state not in table_lifecycle.OWING_WORK
+        name for name, state in states.items()
+        if include_owed or state not in table_lifecycle.OWING_WORK
     }
     if not protected:
         return []
@@ -169,10 +199,16 @@ def unrelatable_tables(con, *, pipeline: str, dataset: str) -> list[tuple[str, s
     return [targets[name] for name in sorted(held)]
 
 
-def unrelatable_relations(con, *, pipeline: str, dataset: str) -> list[str]:
+def unrelatable_relations(
+    con, *, pipeline: str, dataset: str, include_owed: bool = False
+) -> list[str]:
     """The qualified names of `unrelatable_tables`."""
-    return [f"{schema}.{table}" for schema, table, _target in
-            unrelatable_tables(con, pipeline=pipeline, dataset=dataset)]
+    return [
+        f"{schema}.{table}"
+        for schema, table, _target in unrelatable_tables(
+            con, pipeline=pipeline, dataset=dataset, include_owed=include_owed
+        )
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -186,6 +222,8 @@ class BaselineCheck:
     was: str = ABSENT
     #: the state now
     state: str = ABSENT
+    #: what start-up found unrelatable, kept separately from what is left at shutdown
+    detected: list[str] = field(default_factory=list)
     unreconciled: list[str] = field(default_factory=list)
     #: Unrelatable relations this run could NOT put in the owed queue. Normally empty —
     #: `request_snapshot` marks every one of them — and it is what the watcher's
@@ -205,7 +243,17 @@ class BaselineCheck:
 
     def as_dict(self) -> dict:
         out = {"catalog_baseline": self.state, "catalog_baseline_was": self.was}
-        if self.unreconciled:
+        if self.detected:
+            # What start-up found, kept under its own name. The two facts are different
+            # and used to share one key: the run summary is built by `update()`, and
+            # `as_dict()` omitted empty lists, so a successful reconciliation left the
+            # STARTING list sitting beside `catalog_baseline='valid'` — two terminally
+            # contradictory statements in one summary (Codex r6 MINOR-1).
+            out["catalog_baseline_unreconciled_at_start"] = list(self.detected)
+        if self.reconciling:
+            # ...and what is left at shutdown, ALWAYS emitted for a run that had
+            # something to reconcile, so the empty list overwrites rather than the key
+            # simply not being written.
             out["catalog_baseline_unreconciled"] = list(self.unreconciled)
         if self.unmarked:
             # Must be empty. When it is not, a relation whose rows cannot be trusted is
@@ -370,10 +418,13 @@ def mark_unconfirmed(
                 ", ".join(unmarked),
             )
         return BaselineCheck(
-            was=was, state=state, unreconciled=unreconciled, unmarked=unmarked,
-            reason=reason,
+            was=was, state=state, detected=list(unreconciled),
+            unreconciled=unreconciled, unmarked=unmarked, reason=reason,
         )
-    return BaselineCheck(was=was, state=state, unreconciled=unreconciled, reason=reason)
+    return BaselineCheck(
+        was=was, state=state, detected=list(unreconciled), unreconciled=unreconciled,
+        reason=reason,
+    )
 
 
 def confirm(
@@ -406,20 +457,38 @@ def confirm(
             "confirm the baseline"
         )
         return check
-    # Recomputed only for a run that had something to reconcile. A run that started on
-    # `absent` or `valid` had no obligation, and asking the question anyway would cost a
-    # row count per captured table on every ordinary run — and, worse, could invent an
-    # obligation out of a table that is simply no longer in the include list.
+    # POSITIVE COMPLETION, not the existence of a to-do row (Codex r6 BLOCKER-2).
+    #
+    # `unrelatable_tables()` excludes every relation that owes work, because
+    # `TABLE_LIFECYCLE` owns that obligation and counting it twice is bookkeeping rather
+    # than safety. That is right for *finding* the relations and wrong for *discharging*
+    # them: with `CDC_RESNAPSHOT=0` the rebuild is queued, skipped, and logged as
+    # unhandled — and the relation then looked discharged to this function precisely
+    # because it was still owed. Measured: a successful run left the source at `[999]`,
+    # the destination at `[1, 2, 999]`, the lifecycle at `awaiting_snapshot`, the
+    # registry at the replacement oid, and this baseline at `valid`.
+    #
+    # So every relation this run said it could not relate must have REACHED a
+    # trustworthy lifecycle state, and "owed" is the opposite of that.
+    # Asked of DURABLE STATE, not of what this run happens to remember. Keying it on
+    # `check.unreconciled` would make the guarantee last exactly one run: the run that
+    # found the relation would refuse, and the *next* one — which finds it already owed
+    # and therefore not a marking candidate — would carry an empty list and promote over
+    # the same unrebuilt rows. `include_owed=True` asks the question the destination can
+    # answer on its own: does anything hold rows with no recorded identity, whoever
+    # queued it and whenever.
     remaining = (
-        unrelatable_relations(con, pipeline=pipeline, dataset=dataset)
+        unrelatable_relations(
+            con, pipeline=pipeline, dataset=dataset, include_owed=True
+        )
         if check.reconciling
         else []
     )
     if remaining:
         check.unreconciled = remaining
         check.reason = (
-            f"{len(remaining)} relation(s) still have destination rows and no recorded "
-            "source identity: " + ", ".join(remaining)
+            f"{len(remaining)} relation(s) still hold destination rows with no recorded "
+            "source identity, so nothing has yet rebuilt them: " + ", ".join(remaining)
         )
         if check.state != INVALIDATED:
             check.state = _write(

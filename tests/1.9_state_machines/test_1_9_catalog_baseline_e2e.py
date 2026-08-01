@@ -149,8 +149,15 @@ def test_the_retry_rebuilds_the_unrelatable_relations_in_ITS_OWN_run(unchecked_c
     (measured: a destination built without a registry has ALL of them unrelatable).
     """
     summary = unchecked_catalog["retry"]
-    unreconciled = summary.get("catalog_baseline_unreconciled") or []
-    assert f"app.{TABLE}" in unreconciled, json.dumps(summary, default=str)[:1500]
+    # ...what START-UP found. The shutdown key is the other fact, and on a converged run
+    # it is the empty list — two names, because one key carrying both was terminally
+    # contradictory (Codex r6 MINOR-1).
+    detected = summary.get("catalog_baseline_unreconciled_at_start") or []
+    assert f"app.{TABLE}" in detected, json.dumps(summary, default=str)[:1500]
+    assert summary.get("catalog_baseline_unreconciled") == [], (
+        "a converged run still reported relations it could not reconcile"
+    )
+    assert summary.get("catalog_baseline") == "valid"
     rebuilt = set(summary.get("resnapshot_swapped") or []) | set(
         summary.get("resnapshot_emptied") or []
     )
@@ -178,3 +185,138 @@ def test_the_baseline_is_confirmed_once_the_destination_is_related(unchecked_cat
     assert [r[0] for r in unchecked_catalog["baseline_after_healed"]] == ["valid"]
     summary = unchecked_catalog["healed"]
     assert summary.get("catalog_baseline") == "valid", json.dumps(summary, default=str)[:800]
+
+
+# --------------------------------------------------------------------------- #
+# the two round-6 compositions, against the real cluster
+# --------------------------------------------------------------------------- #
+@pytest.mark.slow
+def test_a_destination_that_predates_the_control_table_is_rebuilt_not_adopted(
+    tmp_path_factory, postgres_cluster
+):
+    """Codex r6 BLOCKER-1, reproduced: the legacy-migration shape.
+
+    A populated destination with no relation registry, and then the
+    `_cdc_flight.catalog_baseline` table **dropped** — which is exactly what a
+    destination that predates this migration looks like to the first upgraded run. Under
+    rev 14 that run read `absent`, trusted it, adopted the replacement oid and reported
+    `catalog_baseline='valid'` over `[1, 2, 999]` against a source holding `[999]`.
+    Twice.
+    """
+    table = "r6_absent"
+    target = f"cdcflight_app_{table}"
+    box = Sandbox("r6absent", tmp_path_factory.mktemp("sbx_r6absent"), postgres_cluster)
+    box.env["CDC_TABLES"] = f"customers,{table}"
+    box.env["CDC_CATALOG_POLL_SECONDS"] = "1"
+    try:
+        box.reseed()
+        box.sql(
+            [
+                f"DROP TABLE IF EXISTS app.{table}",
+                f"CREATE TABLE app.{table} (id bigint PRIMARY KEY, label text NOT NULL)",
+                f"ALTER PUBLICATION cdc_flight_pub ADD TABLE app.{table}",
+                f"INSERT INTO app.{table} VALUES (1, 'old-1'), (2, 'old-2')",
+            ]
+        )
+        box.run(reset_state=True, max_seconds=180, extra_env={"CDC_DROP_MODE": "ignore"})
+        assert box.scalar(f"SELECT count(*) FROM {box.table(target)}") == 2
+
+        # THE PRE-MIGRATION SHAPE: rows, no registry, and no baseline table at all.
+        box.duck_write("DROP TABLE IF EXISTS _cdc_flight.catalog_baseline")
+        assert box.duck_query(
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema = "
+            "'_cdc_flight' AND table_name = 'catalog_baseline'"
+        )[0][0] == 0
+
+        box.sql(
+            [
+                f"DROP TABLE app.{table}",
+                f"CREATE TABLE app.{table} (id bigint PRIMARY KEY, label text NOT NULL)",
+                f"ALTER PUBLICATION cdc_flight_pub ADD TABLE app.{table}",
+                f"INSERT INTO app.{table} VALUES (999, 'replacement-only')",
+            ]
+        )
+
+        upgraded = box.run(max_seconds=260, idle_seconds=10)
+        assert upgraded.get("catalog_baseline_was") == "absent", upgraded
+        landed = {int(r[0]) for r in box.duck_query(f"SELECT id FROM {box.table(target)}")}
+        assert not ({1, 2} & landed), (
+            f"the first upgraded run adopted a replacement relation: {sorted(landed)}"
+        )
+        settled = box.run(max_seconds=220, idle_seconds=10)
+        assert settled["ok"] is True, settled
+        source = {(int(a), str(b)) for a, b in box.pg_query(
+            f"SELECT id, label FROM app.{table}"
+        )}
+        final = {(int(a), str(b)) for a, b in box.duck_query(
+            f"SELECT id, label FROM {box.table(target)}"
+        )}
+        assert final == source, f"source={sorted(source)} destination={sorted(final)}"
+    finally:
+        box.reseed()
+
+
+@pytest.mark.slow
+def test_a_skipped_rebuild_cannot_be_reported_as_a_successful_run(
+    tmp_path_factory, postgres_cluster
+):
+    """Codex r6 BLOCKER-2, reproduced: `CDC_RESNAPSHOT=0` over an unrelatable relation.
+
+    Under rev 14 the run marked the relation `awaiting_snapshot`, skipped the rebuild,
+    logged it as unhandled, streamed replacement row 999 beside old rows 1 and 2,
+    persisted the replacement oid, promoted the baseline to `valid` and returned 0.
+
+    `CDC_RESNAPSHOT=0`'s own contract is detect, alert, exit non-zero, mutate nothing —
+    and that is what it must do here, before the engine can adopt anything.
+    """
+    table = "r6_noresnap"
+    target = f"cdcflight_app_{table}"
+    box = Sandbox("r6noresnap", tmp_path_factory.mktemp("sbx_r6nr"), postgres_cluster)
+    box.env["CDC_TABLES"] = f"customers,{table}"
+    box.env["CDC_CATALOG_POLL_SECONDS"] = "1"
+    try:
+        box.reseed()
+        box.sql(
+            [
+                f"DROP TABLE IF EXISTS app.{table}",
+                f"CREATE TABLE app.{table} (id bigint PRIMARY KEY, label text NOT NULL)",
+                f"ALTER PUBLICATION cdc_flight_pub ADD TABLE app.{table}",
+                f"INSERT INTO app.{table} VALUES (1, 'old-1'), (2, 'old-2')",
+            ]
+        )
+        box.run(reset_state=True, max_seconds=180, extra_env={"CDC_DROP_MODE": "ignore"})
+        box.sql(
+            [
+                f"DROP TABLE app.{table}",
+                f"CREATE TABLE app.{table} (id bigint PRIMARY KEY, label text NOT NULL)",
+                f"ALTER PUBLICATION cdc_flight_pub ADD TABLE app.{table}",
+                f"INSERT INTO app.{table} VALUES (999, 'replacement-only')",
+            ]
+        )
+
+        refused = box.run(
+            max_seconds=200, expect_success=False, extra_env={"CDC_RESNAPSHOT": "0"}
+        )
+        assert refused.get("ok") is not True, refused
+        landed = {int(r[0]) for r in box.duck_query(f"SELECT id FROM {box.table(target)}")}
+        assert landed == {1, 2}, (
+            f"the refusal mutated the destination it was protecting: {sorted(landed)}"
+        )
+        assert box.duck_query(
+            "SELECT count(*) FROM _cdc_flight.source_relations WHERE source_table = ?",
+            [table],
+        )[0][0] == 0, "the replacement identity was persisted by a run that refused"
+
+        # ...and with repair enabled again it heals, which is what makes the refusal a
+        # gate rather than a wedge.
+        healed = box.run(max_seconds=260, idle_seconds=10)
+        assert healed["ok"] is True, healed
+        source = {(int(a), str(b)) for a, b in box.pg_query(
+            f"SELECT id, label FROM app.{table}"
+        )}
+        final = {(int(a), str(b)) for a, b in box.duck_query(
+            f"SELECT id, label FROM {box.table(target)}"
+        )}
+        assert final == source, f"source={sorted(source)} destination={sorted(final)}"
+    finally:
+        box.reseed()

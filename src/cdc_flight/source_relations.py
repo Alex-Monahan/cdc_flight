@@ -77,7 +77,9 @@ def forget_source_relation(con, *, pipeline: str, source_schema: str, source_tab
     )
 
 
-def flush_learned_relations(con, *, pipeline: str, catalog) -> list[str]:
+def flush_learned_relations(
+    con, *, pipeline: str, catalog, exclude: set[str] | None = None
+) -> list[str]:
     """Persist what the catalog watcher learned, in its own transaction. Returns names.
 
     `source_relations` is the ONLY thing that makes a `DROP TABLE` or a
@@ -99,7 +101,16 @@ def flush_learned_relations(con, *, pipeline: str, catalog) -> list[str]:
     """
     if catalog is None:
         return []
-    blocked = {c.qualified for c in catalog.pending_destructive()}
+    # Two independent reasons a learned oid must not become history yet, and they are
+    # the same rule: **persisted state may not run ahead of the action it implies.**
+    #
+    # 1. a destructive action for this relation is still pending (the original guard);
+    # 2. the catalog baseline could not relate this relation's destination rows to any
+    #    identity at the source and nothing has rebuilt it yet (Codex r6 BLOCKER-2).
+    #    Writing the observed oid here would make the NEXT run agree with the source and
+    #    never ask again — the same silent inconsistency one run later, reached through
+    #    a failing run rather than a successful one.
+    blocked = {c.qualified for c in catalog.pending_destructive()} | set(exclude or ())
     relations = catalog.dirty(exclude=blocked)
     if not relations:
         return []

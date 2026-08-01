@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import socket
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -23,7 +24,7 @@ from typing import Any
 from . import faults, table_lifecycle
 from .control_schema import CONTROL_DDL, ensure_control_schema
 from .errors import LeaseLost
-from .machines import LIFECYCLE_DURABLE_VALUES, SLOT_VERDICTS
+from .machines import CONNECTION_RETIREMENT, LIFECYCLE_DURABLE_VALUES, SLOT_VERDICTS
 from .naming import quote
 
 # Re-exported: `source_relations.py` is a split of this module, not a new dependency
@@ -876,6 +877,48 @@ class Lease:
 # --------------------------------------------------------------------------- #
 # ADR §14.1 — is DROP/RENAME transactional at this destination?
 # --------------------------------------------------------------------------- #
+def release_connection(con, *, timeout: float = 5.0) -> str:
+    """Close the destination connection under a BOUND. Returns a `CONNECTION_RETIREMENT`.
+
+    The same protocol `RunPhaseWriter.close()` uses, one level out, and it is here for
+    the same measured reason (Codex r6 MAJOR-1). Round 5 found the heartbeat *cursor*
+    being closed under a live statement; round 6 found that bounding the cursor and then
+    closing its **parent** one statement later is the identical unbounded wait — the
+    reviewer drove the production ordering against a real serialized DuckDB sink and
+    watched `RunPhaseWriter` retire correctly at 7.005 s while the process was still
+    alive with no exit code at 12 s, stuck in this call. A bound on a child resource is
+    not a bound on the process that closes its parent.
+
+    So the close runs on a daemon thread and the run stops waiting for it. `abandoned`
+    is a real outcome, not a failure: the handle dies with the process, `main()` gets to
+    write `last_run.json`, and `shutdown_and_exit()` gets to deliver the exit code the
+    run actually earned. A destination connection nobody can close is a wedged
+    destination; refusing to *exit* over it turns an observability problem into an
+    availability one.
+    """
+    if con is None:  # pragma: no cover - defensive
+        return "never_opened"
+    done = threading.Event()
+
+    def _close() -> None:
+        try:
+            con.close()
+        except Exception:  # pragma: no cover - a handle that was already broken
+            log.debug("closing the destination connection failed", exc_info=True)
+        finally:
+            done.set()
+
+    threading.Thread(target=_close, name="cdc-destination-close", daemon=True).start()
+    if done.wait(timeout):
+        return CONNECTION_RETIREMENT.parse("closed")
+    log.error(
+        "the destination connection did not close within %.1fs; RELEASING it and "
+        "finishing this run's teardown rather than blocking the process on a handle "
+        "some other statement still owns", timeout,
+    )
+    return CONNECTION_RETIREMENT.parse("abandoned")
+
+
 def probe_transactional_ddl(con) -> bool:
     """Answer ADR 0001's biggest open question empirically, once per run.
 

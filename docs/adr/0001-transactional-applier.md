@@ -2842,6 +2842,7 @@ persistence: `_cdc_flight.catalog_baseline.state` · initial: `absent` · termin
 
 | from | to | terminal |
 |---|---|---|
+| `absent` | `invalidated` | no |
 | `absent` | `stale` | no |
 | `invalidated` | `absent` | no |
 | `invalidated` | `invalidated` | no |
@@ -2854,12 +2855,17 @@ persistence: `_cdc_flight.catalog_baseline.state` · initial: `absent` · termin
 | `valid` | `absent` | no |
 | `valid` | `stale` | no |
 
-There is deliberately **no `absent -> valid`** and no `valid -> valid`. Every
-catalog-enabled run marks the baseline unconfirmed *before the engine starts*, so
-`valid` is only ever reachable from a mark this run has to discharge with evidence: a
-catalog it actually read, and no relation left holding rows under an identity it cannot
-relate. A run that could assert `valid` without passing through the mark is precisely
-the run that reported success over an unchecked catalog.
+There is deliberately **no `absent -> valid`** and no `valid -> valid`. Every run marks
+the baseline unconfirmed *before the engine starts*, so `valid` is only ever reachable
+from a mark this run has to discharge with evidence: a catalog it actually read, and no
+relation left holding rows under an identity it cannot relate. A run that could assert
+`valid` without passing through the mark is precisely the run that reported success over
+an unchecked catalog.
+
+`absent -> invalidated` is the **legacy-migration** edge (rev 15). A destination that
+predates this table reads `absent` and may already hold rows it has no identity for, so
+it reconciles like any other unconfirmed baseline rather than being trusted for having
+made no claim — see A63.4.
 
 #### A51.2 — the inventory, anchored to those edges
 
@@ -2928,7 +2934,7 @@ the run that reported success over an unchecked catalog.
 | 56 | catalog_baseline: stale -> valid | — (the discharge) | ≥1 real catalog comparison **and** nothing unrelatable, recomputed after the flush | n/a: this is the healthy transition | `catalog_baseline_pre_valid` — the learned relations are durable and the promotion is not; the next run reaches the same verdict from durable state, so it is idempotent rather than one-shot | AUTO (rev 14) |
 | 57 | catalog_baseline: invalidated -> valid | — (the discharge, after a rebuild was queued) | the relation is now `awaiting_snapshot`, so `table_lifecycle` owes its image and the baseline is no longer protecting it | n/a | as 56 | AUTO (rev 14) |
 | 58 | catalog_baseline: valid -> absent | the recorded source catalog is forgotten (`--reset-state`, a source identity change) | `recovery.begin(forget_catalog=True)` | the claim is deleted in the SAME transaction as `source_relations`: a claim about a registry that no longer exists would suppress the reconciliation of the one replacing it | one transaction, so there is no cut | AUTO (rev 14) |
-| 59 | heartbeat_sink_retirement (domain) | the terminal run-phase write never returns (a wedged observability cursor) | the write is bounded on a named worker; `close()` joins it with a bound and RELEASES the cursor rather than closing it under a live statement | the run tears down within the bound and exits on its own verdict; `last_run.json` carries `terminal_phase_write_abandoned` | n/a — the heartbeat is not load-bearing for any decision | **UNDEFINED** (rev 14 — honest: nothing clears the non-terminal heartbeat row that abandoned runner left behind, so an operator reading `_cdc_flight.heartbeat` alone sees a phase that never terminalised. `last_run.json` is the terminal record. Bounding the teardown was the merge-blocking half; sweeping the stale row is 4.4/6.1's) |
+| 59 | connection_retirement (domain) | the terminal run-phase write never returns (a wedged observability cursor) | the write is bounded on a named worker; `close()` joins it with a bound and RELEASES the cursor rather than closing it under a live statement, and `release_connection()` does the same for the PARENT handle | the run tears down within the bound, `main()` writes `last_run.json` carrying `terminal_phase_write_abandoned` and `destination_connection_release`, and the process exits on its own verdict | n/a — the heartbeat is not load-bearing for any decision | **UNDEFINED** (rev 14 — honest: nothing clears the non-terminal heartbeat row that abandoned runner left behind, so an operator reading `_cdc_flight.heartbeat` alone sees a phase that never terminalised. `last_run.json` is the terminal record. Bounding the teardown was the merge-blocking half; sweeping the stale row is 4.4/6.1's) |
 
 **The counts, parsed from the rows above rather than recalled.** 64 rows, one
 failure and one terminal class each.
@@ -2989,9 +2995,14 @@ consumed only by a test.
   `fresh_start`, `resume`, `file_missing_rebuilt`, `file_missing_no_durable_offset`, `file_missing_repair_disabled`, `file_corrupt_rebuilt`, `file_ahead_rebuilt`, `file_behind_rebuilt`, `file_offset_mismatch_rebuilt`, `orphan_accepted_resnapshot`
 * **`source_health`** (6 values) — What is the source connector doing, as one named value rather than six timers?
   `unsampled`, `streaming`, `not_streaming`, `unknown`, `unknown_never_sampled`, `dark`
-* **`heartbeat_sink_retirement`** (3 values) — Who owned the run-phase heartbeat cursor
-  when the run tore down, and was it closed or abandoned?
+* **`connection_retirement`** (3 values) — Who owned this destination handle when the
+  run tore down, and was it closed or released?
   `never_opened`, `closed`, `abandoned`
+
+  ONE vocabulary for the heartbeat cursor **and its parent connection**, since rev 15.
+  Round 5's finding was that the cursor was closed under a live statement; round 6's was
+  that bounding the cursor and then closing its parent one statement later is the same
+  unbounded wait one level out.
 
   A domain rather than a machine **by this file's own test**: a crash never leaves
   durable state in an intermediate configuration here — the cursor dies with the
@@ -3973,3 +3984,102 @@ half, but nothing sweeps the non-terminal heartbeat row an abandoned runner leav
 behind. An operator reading `_cdc_flight.heartbeat` alone would see a phase that never
 terminalised. `last_run.json` carries the verdict; the sweep belongs to 4.4/6.1.
 
+### A64 — rev 15: three partition errors, found by reproducing them
+
+Round 6 (`reviews/1.9_codex_review_r6.md`) confirmed the round-5 composition was repaired
+and then reproduced **two more successful paths to the same inconsistent destination**,
+plus the round-5 teardown finding one stack frame further out. None of the three needed
+new machinery. All three were the *partition* being wrong — which is the sharpest
+possible form of a 1.9 finding, because the item is about representing state, not about
+having more of it.
+
+#### A64.1 — `absent` is not trust, it is the absence of a claim (BLOCKER)
+
+A63.1 trusted `absent` deliberately, and wrote down the reason: a destination that has
+never made a claim carries no evidence of an unchecked window, and treating every one as
+suspect would rebuild the world on upgrade.
+
+That is a migration-cost argument wearing a consistency argument's clothes, and the
+reviewer took it apart by executing it. A destination that predates
+`_cdc_flight.catalog_baseline` reads `absent`; drop the table (the exact pre-migration
+shape), recreate the source relation offline, and the first upgraded run adopts the
+replacement oid and reports `catalog_baseline='valid'` over `[1, 2, 999]` against a
+source holding `[999]`. Twice.
+
+The cost argument does not survive contact with the predicate it was defending against.
+`unrelatable_tables()` already asks whether the destination *holds rows it has no
+identity for*: a genuinely fresh destination answers "none" and adopts normally on its
+first run, and only a **populated unregistered** destination pays a one-time rebuild —
+which is precisely the destination for which adoption is unsafe. So `BASELINE_UNTRUSTED`
+is now every state except `valid`, derived from the machine, and `absent -> invalidated`
+is a declared edge. One partition, one meaning: **only a confirmed baseline permits
+adoption.**
+
+#### A64.2 — a queued rebuild is not a finished one (BLOCKER)
+
+`unrelatable_tables()` excluded every relation that owes work, and A63.1 argued that
+`TABLE_LIFECYCLE` owns that obligation so counting it twice would be bookkeeping rather
+than safety. True for *finding* the relations; false for *discharging* them.
+
+With `CDC_RESNAPSHOT=0` the rebuild is queued, skipped, and logged as
+`tables_awaiting_snapshot_unhandled` — and the relation then looked **finished** to the
+confirmation precisely because it was still owed. Measured: source `[999]`, destination
+`[1, 2, 999]`, lifecycle `awaiting_snapshot`, registry at the replacement oid, baseline
+`valid`, exit 0. A successful run, over data it had itself flagged as untrustworthy.
+
+Three changes, and the third is the one that matters most:
+
+1. `unrelatable_tables(include_owed=...)` — one flag, two questions. `False` asks "who
+   needs marking?", `True` asks "may this baseline be confirmed?", and for the second
+   "owed" is the opposite of discharged.
+2. `pipeline.run()` **refuses to start the engine** when automatic repair is off and a
+   relation this baseline cannot relate is in the skipped queue. That is what
+   `CDC_RESNAPSHOT=0` already promises for its own contract — detect, alert, exit
+   non-zero, mutate nothing — and it fires before anything can be adopted.
+3. every one of these questions is asked of **durable state**, never of
+   `check.unreconciled`. Keyed on this run's memory the guarantee would last exactly one
+   run: the run that discovers the relation refuses, and the next one finds it already
+   owed, carries an empty list, and promotes over the very same unrebuilt rows. The
+   flush's `exclude` is durable-state-keyed for the same reason — a failing run must not
+   leave the replacement oid behind for a successful one to trust.
+
+#### A64.3 — a bound on a child is not a bound on its parent (MAJOR)
+
+A63.2 gave the heartbeat cursor an owner and a bounded retirement, and the reviewer
+confirmed that part: `close()` no longer closes a cursor a live worker is executing on.
+Then `pipeline.run()` closed the **parent** connection one statement later, and DuckDB
+serialisation blocked *that* behind the same live statement. Measured: the writer retired
+correctly at 7.005 s and the process was still alive with no exit code at 12 s.
+
+Two consequences, and the second is worse than the stall. `main()` writes
+`last_run.json` only after `run()` returns, so the abandonment fields A63.2 added never
+reached the file they were added for; and the exit code the run had earned was never
+delivered.
+
+`destination.release_connection()` is the same protocol one level out — a daemon thread,
+a bound, and a named outcome — and `machines.SINK_RETIREMENT` is now
+`machines.CONNECTION_RETIREMENT`, one vocabulary for both handles, because they are the
+same question about two resources. `abandoned` is a real outcome rather than a failure:
+the handle dies with the process, and refusing to *exit* over a wedged destination would
+turn an observability problem into an availability one.
+
+#### A64.4 — two facts, two names (MINOR)
+
+A successful reconciliation reported `catalog_baseline='valid'` beside the
+`catalog_baseline_unreconciled` list start-up had found, because the summary is built by
+`update()` and `as_dict()` omitted empty lists. `catalog_baseline_unreconciled_at_start`
+is what start-up found; `catalog_baseline_unreconciled` is what is left at shutdown and
+is now always emitted for a run that had anything to reconcile, so the empty list
+overwrites rather than the key simply not being written.
+
+#### A63.3 — the two MINORs were already closed, and are re-checked here
+
+Round 5's MINOR-1 (`complete_if_ready()` logging "the destination has a resume point
+again" on the path that deliberately has none) and MINOR-2 (`_reset_group`'s docstring
+still claiming a partial reset was unrepresentable) were both fixed in `ed361c0`, the
+commit that also published the reviewer's 3/5 bands — the review was written against the
+state before it. Re-verified rather than re-fixed: the completion log branches on
+`has_resume` and says "every captured relation was PROVEN empty at the source, so there
+is no resume point and none can exist"; `_reset_group` now states the narrow claim, that
+both reset paths are one object replacement so neither can forget a field, and names
+`discard_units()` as the one deliberate partial mutation.

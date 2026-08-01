@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import sys
 import threading
 import time
 from pathlib import Path
@@ -860,6 +861,7 @@ def wedged():
     release = threading.Event()
     con = _WedgedConnection(release)
     phases = RunPhaseWriter(con, pipeline=PIPELINE, runner_id=RUNNER)
+    phases.TERMINAL_GATE_TIMEOUT = 0.2
     phases.TERMINAL_WRITE_TIMEOUT = 0.3
     phases.RETIRE_TIMEOUT = 0.2
     phases.to(m.PHASE_RECONCILING)
@@ -971,9 +973,13 @@ def test_the_pipeline_reports_the_retirement_after_it_has_happened():
     )
 
 
-def test_the_sink_retirement_values_are_a_declared_domain():
-    """One vocabulary, shared with the 4.7 inventory, rather than three loose strings."""
-    assert set(m.SINK_RETIREMENT.values) == {"never_opened", "closed", "abandoned"}
+def test_the_retirement_values_are_one_declared_domain_for_both_handles():
+    """One vocabulary for the cursor AND its parent connection (Codex r6 MAJOR-1).
+
+    Bounding the child and then closing the parent one statement later is the same
+    unbounded wait one level out, so both retirements answer the same question and
+    report the same values."""
+    assert set(m.CONNECTION_RETIREMENT.values) == {"never_opened", "closed", "abandoned"}
 
 
 @pytest.mark.slow
@@ -1005,7 +1011,7 @@ def test_a_real_serialized_duckdb_sink_cannot_hang_the_teardown(tmp_path):
     def _hog():
         occupied.set()
         with contextlib.suppress(Exception):  # the cursor may be released under us
-            phases._sink.execute("SELECT max(md5(i::VARCHAR)) FROM range(60000000) t(i)")
+            phases._sink.execute("SELECT max(md5(i::VARCHAR)) FROM range(400000000) t(i)")
 
     hog = threading.Thread(target=_hog, daemon=True)
     hog.start()
@@ -1017,7 +1023,10 @@ def test_a_real_serialized_duckdb_sink_cannot_hang_the_teardown(tmp_path):
     phases.close()
     elapsed = time.monotonic() - started
 
-    bound = phases.TERMINAL_WRITE_TIMEOUT + phases.RETIRE_TIMEOUT + 3.0
+    bound = (
+        phases.TERMINAL_GATE_TIMEOUT + phases.TERMINAL_WRITE_TIMEOUT
+        + phases.RETIRE_TIMEOUT + 3.0
+    )
     assert elapsed < bound, (
         f"teardown took {elapsed:.2f}s behind a statement in flight on the heartbeat "
         f"sink (bound {bound:.1f}s). This is the r5 schedule: finish() bounded, "
@@ -1029,3 +1038,85 @@ def test_a_real_serialized_duckdb_sink_cannot_hang_the_teardown(tmp_path):
     COMMIT_ACK.reset()
     with contextlib.suppress(Exception):
         connection.close()
+
+
+# --------------------------------------------------------------------------- #
+# the WHOLE teardown, in a real process, in production order (Codex r6 MAJOR-1)
+# --------------------------------------------------------------------------- #
+TEARDOWN_DRIVER = Path(__file__).resolve().parents[1] / "teardown_order_driver.py"
+
+
+def _teardown_child(tmp_path, outcome: str):
+    """Run the driver and return `(returncode, elapsed, summary)`. Never hangs the suite."""
+    import os
+    import subprocess
+
+    summary_path = tmp_path / f"summary_{outcome}.json"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(Path(__file__).resolve().parents[2] / "src"), env.get("PYTHONPATH", "")]
+    )
+    started = time.monotonic()
+    proc = subprocess.run(
+        [
+            sys.executable, str(TEARDOWN_DRIVER), str(tmp_path / f"{outcome}.duckdb"),
+            str(summary_path), outcome,
+        ],
+        env=env, capture_output=True, text=True, timeout=90, check=False,
+    )
+    elapsed = time.monotonic() - started
+    summary = json.loads(summary_path.read_text()) if summary_path.exists() else None
+    return proc, elapsed, summary
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("outcome", ["ok", "fail"])
+def test_the_whole_teardown_exits_behind_a_wedged_sink(tmp_path, outcome):
+    """The assertion neither earlier test could make: **the process exits**.
+
+    Round 5 bounded `finish()` and production then called `close()`. Round 6 bounded
+    `close()` and production then called `con.close()` on the parent handle — and the
+    reviewer measured the writer retiring correctly at 7.005 s while the process was
+    still alive with no exit code at 12 s. Each test stopped at the boundary it was
+    written for; this one runs `pipeline.run()`'s whole `finally` block, in order, in a
+    real process, against a real serialized DuckDB sink that never answers.
+
+    Both outcomes are parametrised because the exit code has to be the one the RUN
+    earned. A heartbeat that could not be written must not turn a successful run into a
+    failure, and must not turn a failing one into a success.
+    """
+    proc, elapsed, _summary = _teardown_child(tmp_path, outcome)
+
+    assert proc.returncode == (0 if outcome == "ok" else 1), (
+        f"exit {proc.returncode} for an otherwise-{outcome} run\n"
+        f"stdout={proc.stdout[-1500:]}\nstderr={proc.stderr[-1500:]}"
+    )
+    bound = (
+        RunPhaseWriter.PHASE_WRITE_TIMEOUT            # the `stopping` write
+        + RunPhaseWriter.TERMINAL_GATE_TIMEOUT
+        + RunPhaseWriter.TERMINAL_WRITE_TIMEOUT       # the terminal write
+        + RunPhaseWriter.RETIRE_TIMEOUT               # the cursor
+        + 5.0                                         # the parent connection
+        + 15.0                                        # interpreter start-up and slack
+    )
+    assert elapsed < bound, f"the process took {elapsed:.1f}s to exit (bound {bound:.0f}s)"
+
+
+@pytest.mark.slow
+def test_the_persisted_summary_records_what_happened_to_BOTH_handles(tmp_path):
+    """`last_run.json` is the only surviving record when the heartbeat could not be written.
+
+    It is written after `run()` returns, so a teardown that never returns cannot produce
+    it — which is why the round-5 abandonment fields never reached the file they were
+    added for until the parent handle was bounded too.
+    """
+    _proc, _elapsed, summary = _teardown_child(tmp_path, "ok")
+
+    assert summary is not None, "the summary was never written, so nothing recorded this run"
+    assert summary["terminal_phase_write_abandoned"] is True
+    assert summary["heartbeat_sink_retirement"] == "abandoned"
+    assert summary["destination_connection_release"] == "abandoned", (
+        "the parent connection closed cleanly behind a live statement, which means the "
+        "sink was not actually wedged and this test proved nothing"
+    )
+    assert summary["run_phase"] == "stopped"

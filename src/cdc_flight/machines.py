@@ -359,6 +359,11 @@ CATALOG_BASELINE = Machine(
         #    `valid -> valid`: a run may only reach `valid` by passing through the
         #    mark it has to discharge.
         (BASELINE_ABSENT, BASELINE_STALE),
+        # A destination that predates this table reads `absent` AND may already hold
+        # rows it has no identity for — the legacy-migration shape (Codex r6
+        # BLOCKER-1). It reconciles like any other unconfirmed baseline, so the
+        # first mark can land straight on `invalidated`.
+        (BASELINE_ABSENT, BASELINE_INVALIDATED),
         (BASELINE_VALID, BASELINE_STALE),
         (BASELINE_STALE, BASELINE_STALE),
         (BASELINE_INVALIDATED, BASELINE_STALE),
@@ -391,11 +396,27 @@ CATALOG_BASELINE = Machine(
 )
 
 #: The states in which an observed relation identity may NOT be adopted as history for
-#: a relation the destination already holds trustworthy rows for. Derived from the
-#: machine rather than restated: `absent` is trusted on purpose — a destination that has
-#: never made a claim has no evidence of an unchecked window, and treating it as
-#: suspect would rebuild every legacy destination on upgrade.
-BASELINE_UNTRUSTED = frozenset((BASELINE_STALE, BASELINE_INVALIDATED))
+#: a relation the destination already holds trustworthy rows for. **Everything except
+#: `valid`**, derived from the machine rather than restated.
+#:
+#: Rev 14's first cut trusted `absent` as well, reasoning that a destination which has
+#: never made a claim carries no evidence of an unchecked window and that treating every
+#: one as suspect would rebuild the world on upgrade. The reviewer reproduced why that is
+#: a migration-cost argument wearing a consistency argument's clothes (Codex r6
+#: BLOCKER-1): a destination that predates this table reads `absent`, and if it holds
+#: rows with no recorded identity — which is exactly what a pre-migration destination
+#: looks like — the first upgraded run adopts a replacement relation's oid and reports
+#: success over mixed rows.
+#:
+#: The cost argument does not survive contact with the predicate it was defending
+#: against. `unrelatable_tables()` already asks whether the destination *holds rows it
+#: has no identity for*: a genuinely fresh destination answers "none" and adopts
+#: normally, and only a populated unregistered destination pays a one-time rebuild —
+#: which is precisely the destination for which adoption is unsafe. One partition, one
+#: meaning: **only a confirmed baseline permits adoption.**
+BASELINE_UNTRUSTED = frozenset(
+    s for s in CATALOG_BASELINE.states if s != BASELINE_VALID
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -445,25 +466,33 @@ RECONCILE_DECISIONS = Domain(
 #: `summary`, and the supervisor's own `ever_sampled and unknown_for >= ...` test), and
 #: `unknown_never_sampled` (A51 row 50, the documented fail-open) was the one with no
 #: name at all. One declared domain, one property.
-#: How the run-phase heartbeat sink was given up at teardown (Codex r5 MAJOR-1).
+#: How a destination connection was given up at teardown (Codex r5 MAJOR-1, widened by
+#: r6 MAJOR-1 to the connection the heartbeat cursor is a child of).
 #:
 #: Deliberately a **domain**, not a machine, by this module's own test: a crash never
 #: leaves durable state in an intermediate configuration here — the heartbeat row is
-#: observability, the cursor dies with the process, and dressing an in-process
-#: ownership hand-off up as a durable machine would assert exactly the recoverable
-#: intermediate state the design does not have. What it needed was an *owner* and a
-#: *bound*, and one named outcome that `last_run.json` carries.
-SINK_RETIREMENT = Domain(
-    "heartbeat_sink_retirement",
+#: observability, the handles die with the process, and dressing an in-process ownership
+#: hand-off up as a durable machine would assert exactly the recoverable intermediate
+#: state the design does not have. What it needed was an *owner* and a *bound*, and one
+#: named outcome that `last_run.json` carries.
+#:
+#: It is ONE vocabulary for both handles on purpose. Round 5's finding was that the
+#: heartbeat *cursor* was closed under a live statement; round 6's was that bounding the
+#: cursor and then closing its *parent* one statement later is the same unbounded wait
+#: one level out. A bound on a child resource is not a bound on the process that closes
+#: its parent, so both retirements answer the same question and report the same values.
+CONNECTION_RETIREMENT = Domain(
+    "connection_retirement",
     values=(
-        "never_opened",   # no independent connection was ever obtained
-        "closed",         # the cursor came free within the bound and was closed
-        "abandoned",      # a terminal write still owned it; it was released, not closed
+        "never_opened",   # no such connection was ever obtained
+        "closed",         # it came free within the bound and was closed
+        "abandoned",      # work still owned it; it was released, not closed
     ),
     purpose=(
-        "Who owned the heartbeat cursor when the run tore down, and was it closed or "
-        "abandoned? `close()` on a cursor another thread is executing on BLOCKS behind "
-        "that statement (measured), so 'close it anyway' is the unbounded teardown."
+        "Who owned this destination handle when the run tore down, and was it closed or "
+        "released? `close()` on a handle another thread is executing on BLOCKS behind "
+        "that statement (measured, for both the cursor and its parent connection), so "
+        "'close it anyway' IS the unbounded teardown rather than the fix for it."
     ),
 )
 

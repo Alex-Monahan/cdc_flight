@@ -62,13 +62,13 @@ from contextlib import contextmanager
 
 from .control_schema import CONTROL_SCHEMA
 from .machines import (
+    CONNECTION_RETIREMENT,
     OUTCOME_FAILURES,
     PHASE_FAILED,
     PHASE_STARTING,
     PHASE_STOPPED,
     RUN_OUTCOME,
     RUN_PHASE,
-    SINK_RETIREMENT,
 )
 from .states import IllegalTransition
 
@@ -278,7 +278,7 @@ class RunPhaseWriter:
       waits `TERMINAL_WRITE_TIMEOUT`;
     * `close()` **retires** it: join the worker for `RETIRE_TIMEOUT`, then either close
       the cursor (the worker is gone, so nobody else holds it) or *release* it —
-      `SINK_RETIREMENT` records which. A released cursor is closed by the worker itself
+      `CONNECTION_RETIREMENT` records which. A released cursor is closed by the worker
       if it ever finishes, and dies with the process if it does not. It is a daemon
       thread, so it can never hold the process open.
 
@@ -286,8 +286,19 @@ class RunPhaseWriter:
     calling `close()` on a cursor another thread is mid-statement on is worse again.
     """
 
+    #: How long the terminal write's worker waits for the commit->ack exclusion
+    #: before writing without it. The one bounded escape, and it is on the terminal
+    #: write only, after the applier has already stopped.
+    TERMINAL_GATE_TIMEOUT = _CommitAckWindow.GATE_TIMEOUT
     #: How long the terminal DATABASE CALL gets before the run stops waiting for it.
+    #: The caller waits this PLUS `TERMINAL_GATE_TIMEOUT`, because the worker may spend
+    #: the latter waiting for the exclusion before it issues any SQL at all.
     TERMINAL_WRITE_TIMEOUT = 5.0
+    #: ...and how long an ORDINARY phase write gets. Shorter, because losing one costs
+    #: a timestamp — the next transition rewrites the whole row — while blocking on one
+    #: costs the run. `stopping` is written by `pipeline.run()`'s own `finally`, so an
+    #: unbounded write here stalls a teardown before the terminal bound is ever reached.
+    PHASE_WRITE_TIMEOUT = 2.0
     #: How long `close()` waits for an abandoned terminal write before releasing the
     #: cursor unclosed. Short on purpose: by here the run has its verdict and the only
     #: thing left to lose is a timestamp.
@@ -315,12 +326,14 @@ class RunPhaseWriter:
         #: True once the writer has given the cursor up. The worker reads it to decide
         #: whether IT is now responsible for closing.
         self._released = False
+        #: Phase writes this run stopped waiting for, terminal or not.
+        self.phase_writes_abandoned = 0
         #: A terminal write the run stopped waiting for. Distinct from
         #: `COMMIT_ACK.ungated_terminal_writes`, which means something else entirely
         #: ("it was written without the gate") — one attempt used to increment that
         #: counter twice, once per bound (Codex r5 MAJOR-1, subordinate note).
         self.terminal_write_abandoned = False
-        #: One value from `machines.SINK_RETIREMENT`, carried into `last_run.json`.
+        #: One value from `machines.CONNECTION_RETIREMENT`, carried into `last_run.json`.
         self.sink_retirement = "never_opened"
         try:
             self._sink = con.cursor()
@@ -393,32 +406,39 @@ class RunPhaseWriter:
                 "the commit->ack window was still open when the terminal phase was "
                 "recorded; writing anyway rather than losing the terminal row"
             )
-        # The gate is held for the CHECK AND THE WRITE TOGETHER. Reading a flag and
-        # then executing SQL is a check-then-act, and a database call releases the GIL,
-        # so the applier could open the window in between and the write landed inside
-        # the exact interval the ADR excludes (Codex r2 MAJOR-1, reproduced with a
-        # two-thread barrier). Holding it here cannot delay the acknowledgement: the
-        # applier takes the same gate BEFORE `COMMIT`.
+        # EVERY write is bounded, not only the terminal one. `pipeline.run()`'s `finally`
+        # writes `stopping` *before* it terminalises, and that write went straight down
+        # the unbounded path — so against a wedged sink the teardown blocked one
+        # statement EARLIER than either the round-5 or the round-6 finding, before the
+        # bounded terminal write was ever reached. Found by driving the whole `finally`
+        # block in a real process rather than the one call each finding had named.
         #
-        # The terminal write takes it with a BOUND (Codex r3 MAJOR-2): blocking a run's
-        # own teardown on a stalled observability cursor is the same mistake in the
-        # other direction, and by then the applier has already stopped.
-        with COMMIT_ACK.excluded(timeout=COMMIT_ACK.GATE_TIMEOUT if terminal else None) \
-                as inside_window:
-            if inside_window and not terminal:
-                COMMIT_ACK.dropped_writes += 1
-                log.debug(
-                    "dropped the %r phase write: the applier is inside the "
-                    "commit->ack window", phase,
-                )
-                return
-            if terminal:
-                self._execute_bounded(phase, insert=insert)
-            else:
-                self._execute(phase, insert=insert)
+        # Dropping a non-terminal write costs a timestamp: the next transition rewrites
+        # the whole row. Blocking a run on one costs the run.
+        #
+        # **The bound is on the WAIT, never on the exclusion.** The gate is acquired
+        # inside the worker and held across its SQL, so the caller giving up cannot let
+        # a statement run inside the commit->ack window (Codex r2 MAJOR-1 / r3 MAJOR-2 —
+        # an instrumented violation of an absolute principle is still a violation). A
+        # worker that cannot get the gate simply never writes; a worker that holds it
+        # past the applier's patience is what the commit watchdog exists to kill.
+        self._execute_bounded(
+            phase,
+            insert=insert,
+            terminal=terminal,
+            # The terminal worker may spend up to `GATE_TIMEOUT` waiting for the
+            # exclusion before it even issues SQL, so the caller has to allow for
+            # both or a contended gate abandons every terminal write by arithmetic.
+            timeout=(
+                self.TERMINAL_GATE_TIMEOUT + self.TERMINAL_WRITE_TIMEOUT if terminal
+                else self.PHASE_WRITE_TIMEOUT
+            ),
+        )
 
-    def _execute_bounded(self, phase: str, *, insert: bool) -> None:
-        """The terminal write, with a bound on the DATABASE call, not just the gate.
+    def _execute_bounded(
+        self, phase: str, *, insert: bool, terminal: bool, timeout: float
+    ) -> None:
+        """One phase write, with a bound on the DATABASE call, not just the gate.
 
         Giving up on the Python gate and then calling `_execute()` anyway put the write
         straight back into an unbounded wait: DuckDB serialises calls on one connection,
@@ -436,7 +456,23 @@ class RunPhaseWriter:
 
         def _run() -> None:
             try:
-                self._execute(phase, insert=insert)
+                # The gate is held for the CHECK AND THE WRITE TOGETHER, on the thread
+                # that does both. Reading a flag and then executing SQL is a
+                # check-then-act, and a database call releases the GIL, so the applier
+                # could open the window in between (Codex r2 MAJOR-1, reproduced with a
+                # two-thread barrier). Holding it here cannot delay the acknowledgement:
+                # the applier takes the same gate BEFORE `COMMIT`.
+                with COMMIT_ACK.excluded(
+                    timeout=self.TERMINAL_GATE_TIMEOUT if terminal else None
+                ) as inside_window:
+                    if inside_window and not terminal:
+                        COMMIT_ACK.dropped_writes += 1
+                        log.debug(
+                            "dropped the %r phase write: the applier is inside the "
+                            "commit->ack window", phase,
+                        )
+                        return
+                    self._execute(phase, insert=insert)
             finally:
                 done.set()
                 # If the run has already retired the sink, this thread is now its only
@@ -454,20 +490,40 @@ class RunPhaseWriter:
                         log.debug("the abandoned heartbeat sink would not close",
                                   exc_info=True)
 
-        worker = threading.Thread(target=_run, name="cdc-terminal-phase", daemon=True)
+        worker = threading.Thread(target=_run, name="cdc-phase-write", daemon=True)
         with self._sink_lock:
-            self._terminal_worker = worker
+            # ONE owner at a time. A previous write that never returned still holds the
+            # cursor, so a second worker would queue behind it on the same handle and
+            # the bound would be a bound on starting a thread rather than on the write.
+            busy = self._terminal_worker is not None and self._terminal_worker.is_alive()
+            if not busy:
+                self._terminal_worker = worker
+        if busy:
+            self.phase_writes_abandoned += 1
+            if terminal:
+                # The terminal row is the one an operator needs, so "an earlier write
+                # still owns the sink" is exactly as bad as "this one did not return":
+                # either way the durable heartbeat never terminalises and
+                # `last_run.json` is the only record. One fact, one name.
+                self.terminal_write_abandoned = True
+            log.error(
+                "dropped the %r phase write: an earlier one still owns the heartbeat "
+                "sink and has not returned", phase,
+            )
+            return
         worker.start()
-        if not done.wait(self.TERMINAL_WRITE_TIMEOUT):
+        if not done.wait(timeout):
             # NOT `ungated_terminal_writes`: that counter means "written without the
             # commit->ack gate", and incrementing it here made one attempt look like two
             # separate ungated writes. This is a different fact and it gets its own name.
-            self.terminal_write_abandoned = True
+            self.phase_writes_abandoned += 1
+            if RUN_PHASE.is_terminal(phase):
+                self.terminal_write_abandoned = True
             log.error(
-                "the terminal %r phase write did not complete within %.1fs; this run "
-                "stops waiting for it. The heartbeat sink is now owned by the "
-                "'cdc-terminal-phase' worker and will be RELEASED rather than closed",
-                phase, self.TERMINAL_WRITE_TIMEOUT,
+                "the %r phase write did not complete within %.1fs; this run stops "
+                "waiting for it. The heartbeat sink is now owned by the "
+                "'cdc-phase-write' worker and will be RELEASED rather than closed",
+                phase, timeout,
             )
 
     def _execute(self, phase: str, *, insert: bool) -> None:
@@ -522,13 +578,17 @@ class RunPhaseWriter:
             # The one bounded escape, and it is on the terminal write only, after the
             # applier has stopped. Must be 0 on a healthy run; reported when it is not.
             out["ungated_terminal_phase_writes"] = COMMIT_ACK.ungated_terminal_writes
+        if self.phase_writes_abandoned:
+            out["phase_writes_abandoned"] = self.phase_writes_abandoned
         if self.terminal_write_abandoned:
             # An abandoned terminal write means the durable heartbeat may never have
             # reached its terminal phase. `last_run.json` is then the ONLY record that
             # this run terminalised at all, so it has to say so (Codex r5 MAJOR-1).
             out["terminal_phase_write_abandoned"] = True
         if self.independent:
-            out["heartbeat_sink_retirement"] = SINK_RETIREMENT.parse(self.sink_retirement)
+            out["heartbeat_sink_retirement"] = CONNECTION_RETIREMENT.parse(
+                self.sink_retirement
+            )
         if self.outcome.refusals:
             # A49's guard, as evidence rather than as a comment.
             out["outcome_downgrades_refused"] = [
@@ -539,7 +599,7 @@ class RunPhaseWriter:
     def close(self) -> None:
         """Retire the sink under a bound. Never blocks the process indefinitely.
 
-        The three outcomes are the whole of `machines.SINK_RETIREMENT`:
+        The three outcomes are the whole of `machines.CONNECTION_RETIREMENT`:
 
         * `never_opened` — there was no independent connection to give up;
         * `closed` — nobody else held the cursor, so it was closed properly;

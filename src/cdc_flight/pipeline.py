@@ -459,9 +459,48 @@ def run(
                 else "CDC_RESNAPSHOT=0",
                 ", ".join(f"{s}.{t}" for s, t, _ in owed),
             )
-            summary_extra["tables_awaiting_snapshot_unhandled"] = [
-                f"{s}.{t}" for s, t, _ in owed
-            ]
+            unhandled = [f"{s}.{t}" for s, t, _ in owed]
+            summary_extra["tables_awaiting_snapshot_unhandled"] = unhandled
+            # Asked of DURABLE STATE (`include_owed=True`), not of what this run
+            # remembers marking: the run that discovers a relation refuses, and so does
+            # every later one, until something actually rebuilds it. Keyed on
+            # `baseline.unreconciled` the guarantee would last exactly one run.
+            skipped_baseline = sorted(
+                set(unhandled)
+                & set(
+                    baseline_mod.unrelatable_relations(
+                        con, pipeline=dest.pipeline_name, dataset=dest.dataset_name,
+                        include_owed=True,
+                    )
+                )
+            )
+            if skipped_baseline and not will_snapshot_everything:
+                # A QUEUED REBUILD IS NOT A FINISHED ONE (Codex r6 BLOCKER-2, reproduced).
+                #
+                # `CDC_RESNAPSHOT=0` is an explicit operator opt-out of automatic repair,
+                # and for an ordinary owed table it means what it says: the data stays
+                # stale, flagged and queryable. It cannot mean that here. These relations
+                # are owed a rebuild *because this run could not relate the rows they
+                # hold to any identity at the source*, so continuing would stream the
+                # replacement relation's events onto the old relation's rows and — worse
+                # — let the watcher adopt the replacement oid, after which nothing can
+                # ever detect it again. Measured: source `[999]`, destination
+                # `[1, 2, 999]`, lifecycle `awaiting_snapshot`, registry at the new oid,
+                # baseline `valid`, exit 0.
+                #
+                # Raised HERE, before the engine starts and before anything is adopted,
+                # which is what the opt-out's own contract promises: detect, alert, exit
+                # non-zero, mutate nothing.
+                raise EngineFailure(
+                    f"{len(skipped_baseline)} relation(s) hold destination rows this "
+                    "pipeline cannot relate to any identity at the source "
+                    f"({', '.join(skipped_baseline)}), and automatic re-snapshot is "
+                    "switched off (CDC_RESNAPSHOT=0), so nothing will rebuild them. "
+                    "Continuing would let this run adopt the observed identity over rows "
+                    "that may belong to a different relation. Re-enable CDC_RESNAPSHOT, "
+                    "or rebuild those tables by hand",
+                    dict(summary_extra),
+                )
 
         # rubric 1.6: the per-table snapshot watermark, read AFTER any re-snapshot so it
         # carries the image the main stream now has to hand over from.
@@ -594,7 +633,18 @@ def run(
             # run accepted the replacement oid as though it had always owned that
             # relation, leaving the old relation's rows beside the new one's for ever.
             learned = dest_mod.flush_learned_relations(
-                con, pipeline=dest.pipeline_name, catalog=watcher
+                con, pipeline=dest.pipeline_name, catalog=watcher,
+                # A relation that still holds rows this pipeline cannot relate to any
+                # identity at the source has not been rebuilt, so its observed oid must
+                # not become history: the next run would then agree with the source and
+                # never ask again (Codex r6 BLOCKER-2). Normally empty — by here the
+                # blocking re-snapshot has rebuilt them and they have identities.
+                exclude=set(
+                    baseline_mod.unrelatable_relations(
+                        con, pipeline=dest.pipeline_name, dataset=dest.dataset_name,
+                        include_owed=True,
+                    )
+                ),
             )
             if learned:
                 summary_extra["source_relations_persisted"] = learned
@@ -749,10 +799,16 @@ def run(
                 log.error("could not retire the heartbeat sink", exc_info=True)
             if reported is not None:
                 reported.update(phases.summary())
-        try:
-            con.close()
-        except Exception:  # pragma: no cover
-            log.debug("closing the destination connection failed", exc_info=True)
+        # ...and the PARENT connection is retired the same way, because it is the same
+        # wait one level out (Codex r6 MAJOR-1). The heartbeat cursor is a child of this
+        # handle, so a terminal write nobody could stop also blocks `con.close()` — the
+        # reviewer measured the writer retiring correctly at 7.005 s and the process
+        # still alive with no exit code at 12 s, stuck right here. Bounded, the run gets
+        # to finish tearing down, `main()` gets to write `last_run.json`, and the exit
+        # code the run earned is the exit code it delivers.
+        release = dest_mod.release_connection(con)
+        if reported is not None:
+            reported["destination_connection_release"] = release
 
 
 def shutdown_and_exit(code: int = 0, timeout: float = 15.0) -> None:
