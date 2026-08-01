@@ -1,6 +1,6 @@
 # ADR 0001 — The transactional applier
 
-* **Status:** accepted (revision 16, 2026-08-01 — implemented through the rubric 1.9 round-7 state model)
+* **Status:** accepted (revision 18, 2026-08-01 — implemented through the rubric 1.9 round-9 ownership composition)
 * **Date:** 2026-07-30
 * **Task:** TODO 1.0(a); revised under TODO 1.0(feedback)
 * **Decides rubric items:** 1.1, 1.2, 1.3, 1.7 (directly), and 1.4, 1.6, 1.8, 3.2,
@@ -25,6 +25,8 @@
 | 8 | 2026-07-31 | **Amendments from the 1.6-1.8 review round** (§19, continued). Re-snapshot completion means *every requested table*, and "empty" needs positive evidence rather than the absence of our own records (A52 — which also corrects A45's `min()` resolution of a disagreeing `C` to a hard failure). The acquisition recovery becomes a journalled, idempotent, crash-re-entrant state machine, and A50's claim that its *order* made every intermediate state recoverable is withdrawn as false (A53). A fault test must name the anchor that fired, and three fault-injection accidents are fixed (A54). A50 gains a timeline decision and a destination-emptiness input. A51 is recounted (the old headline did not add up), split to one failure and one class per row, extended with the modes this branch exposed, and made machine-checked. |
 | 9 | 2026-07-31 | **Rubric 1.9 — explicit state machines** (§20). Four machines and one precedence, each owning exactly one consistency-affecting state, declared in `cdc_flight/machines.py` and enforced by a dependency-free `cdc_flight/states.py` with no dependencies (A55). `table_state.snapshot_state` gets a single writer and a transition table, and the owed queue selects every non-terminal state rather than one literal value; `_cdc_flight.heartbeat` gets the run-phase writer ADR §4.8 has specified since rev 1; `stop_reason` becomes a declared precedence, so A49's cause-before-symptom rule stops being two copies of a literal tuple; `recovery_state.phase` gains edge checks on top of rev 8's domain check; catalog changes get one per-relation state instead of four containers. The commit group deliberately stays memory-only — a durable machine there would weaken Invariant O — and its sixteen hand-reset fields become one `OpenGroup`, so neither reset path can forget a field (A56, narrowed at A58.6: the mutable type does not make partial mutation impossible, and does not claim to). The acquisition recovery gains five fault anchors of its own, closing rubric 1.7's honest hold (A57). A51 is rewritten as states × transitions with generated transition tables. |
 | 16 | 2026-08-01 | **Round-7 reconciliation.** The current inventory has five focused machines plus one outcome precedence: `catalog_baseline` is the fifth machine. Only `valid` permits identity adoption; a queued `awaiting_snapshot` rebuild is not complete. A51 rows 55/57 and the published 1.9 score now state those partitions. `CONNECTION_RETIREMENT` uses one bounded daemon-worker close protocol for cursor and parent handles and distinguishes `failed` from `closed` (A65). Rubric 1.9 is 5/5 and 1.7 remains the reviewer's 3/5. |
+| 17 | 2026-08-01 | **Round-8 callback seal.** Callback admission and the in-flight count share one condition lock; shutdown seals before waiting, a post-seal batch is unacknowledged, and a failed quiescence proof transfers the destination runtime to the admitted callback rather than racing it. PyArrow uses its system allocator on the JVM callback thread (A66). |
+| 18 | 2026-08-01 | **Round-9 ownership composition.** One `DestinationOwnership` token spans the blocking re-snapshot and main stream. The token is attached before consumer construction and activated only when callbacks may enter; outer teardown no longer infers quiescence from a caller-local `applier is None`. A failed re-snapshot quiescence proof retains its alert cursor, parent, lease, heartbeat sink, throwaway slot and offset state, while a pre-armed filesystem marker makes next-run owed-state repair durable without writing through the contested connection. An inactive main-applier construction failure is sealed and retired normally (A67). |
 
 ---
 
@@ -4151,3 +4153,41 @@ The same JVM callback thread exposed a separate native compatibility failure: Py
 system-pool requirement recorded in A14 applies to production because recovery builds
 Arrow arrays on that path. It is established before imports by every shipped launch
 surface and verified by a clean subprocess with no inherited allocator variable.
+
+### A67 — rev 18: re-snapshot ownership composes through pipeline teardown
+
+A66's seal was correct inside the shared supervisor but its ownership result was stored
+only in each caller's local `applier` variable. The blocking re-snapshot could therefore
+retain a live callback while its own `finally` closed the callback's alert cursor,
+repaired lifecycle state through the callback-owned parent, dropped the throwaway slot
+and removed its offsets. The outer pipeline then saw that its *main* applier had not yet
+been constructed and retired the same parent, lease and heartbeat sink. Local
+quiescence was not compositional quiescence.
+
+`DestinationOwnership` is now the one process-local token for that parent connection.
+Every applier attaches before consumer construction and activates immediately before
+the supervisor can admit callbacks. A completed or otherwise quiescent re-snapshot
+retires itself from the token before the main applier attaches. A non-quiescent one
+stays attached, so the outermost teardown sees the retained owner even though the main
+applier variable is still `None`. The terminal decision covers every child and parent
+operation: either the token retires a proved-quiescent applier and cleanup proceeds, or
+the callback keeps exclusive ownership and no destination teardown runs on the pipeline
+thread.
+
+Recovery intent is armed on the local filesystem before re-snapshot callback activation.
+On an ordinary failure, the quiescent caller reasserts the table lifecycle through the
+parent and removes the marker with the temporary slot state. On failed quiescence it
+does neither: the marker, slot and offsets remain with the live runtime. The next process
+first acquires the lease and sweeps the stale slot, then consumes the marker and moves
+every named relation to `awaiting_snapshot` before reading the owed queue. This is the
+durable cross-process handoff; it requires no second destination writer while the first
+process's commit/ack path may still be running. Repeating a completed image is safe, so
+the conservative marker also covers a callback that committed immediately before the
+hard exit.
+
+The token also distinguishes *attached* from *active*. If main consumer or source-health
+construction fails after `Applier` construction but before callback activation, teardown
+seals the idle applier, proves its zero-callback state, closes its alert cursor and
+retires the lease, heartbeat sink and parent normally. "Unsealed" is no longer
+misreported as "live callback", and "no main applier" is no longer treated as proof
+that a nested re-snapshot released the destination.
