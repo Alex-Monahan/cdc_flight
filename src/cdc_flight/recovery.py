@@ -72,7 +72,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import table_lifecycle
+from . import catalog_baseline, table_lifecycle
 from .destination import CONTROL_SCHEMA, now, raise_alert, request_snapshot
 from .errors import RecoveryFailed
 from .faults import arrival, maybe_crash
@@ -354,6 +354,12 @@ def begin(
                 f"DELETE FROM {CONTROL_SCHEMA}.source_relations WHERE pipeline = ?",
                 [pipeline],
             )
+            # The CLAIM about that registry goes with it, in the same transaction
+            # (rubric 1.9/SM-E). Keeping a `stale`/`invalidated` mark about a catalog
+            # that no longer exists would be worse than no mark: it would make the next
+            # run reconcile the *replacement* registry against relations this recovery
+            # has already marked for rebuild.
+            catalog_baseline.forget(con, pipeline)
         con.execute(
             f"DELETE FROM {CONTROL_SCHEMA}.recovery_state WHERE pipeline = ? "
             "AND namespace = ?",

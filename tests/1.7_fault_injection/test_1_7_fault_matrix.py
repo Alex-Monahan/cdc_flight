@@ -90,6 +90,22 @@ MATRIX: dict[str, tuple[str, str]] = {
     "table_rebuild_queued": (
         LOUD, "the process dies while the durable to-do list is being written"
     ),
+    # rev 14, rubric 1.9's catalog-baseline machine. The first two are crash cuts
+    # across its new edges; `catalog_poll` is not a crash at all but a *degraded
+    # dependency*, and it is here because round 5 had to monkeypatch it to reproduce
+    # a consistency defect the suite could not express (Codex r5 BLOCKER-1).
+    "catalog_baseline_marked": (
+        LOUD, "the process dies with the baseline durably unconfirmed and nothing else done"
+    ),
+    "catalog_baseline_pre_valid": (
+        LOUD, "the process dies with the learned relations flushed and the promotion unwritten"
+    ),
+    "catalog_poll": (
+        LOUD,
+        "EVERY source-catalog poll fails, so the run reads the catalog zero times: it "
+        "must not report success, and it must leave a durable record that no baseline "
+        "was established",
+    ),
 }
 
 #: Anchors whose scenario is owned by another module, with the module named. Absent
@@ -107,6 +123,15 @@ ELSEWHERE = {
         "tests/1.8_slot_mismatch/test_1_8_recovery_crash_e2e.py (slow, real process)"
     ),
     "table_rebuild_queued": "tests/1.7_fault_injection/test_1_7_recovery_anchors.py",
+    "catalog_baseline_marked": "tests/1.7_fault_injection/test_1_7_recovery_anchors.py",
+    "catalog_baseline_pre_valid": "tests/1.7_fault_injection/test_1_7_recovery_anchors.py",
+    # A repeating fault, not a crash: the generic matrix asserts a process death and
+    # this one asserts a whole run's worth of unreadable catalog, plus what the NEXT
+    # run does with the record it left. Both halves live where the composition does.
+    "catalog_poll": (
+        "tests/1.9_state_machines/test_1_9_catalog_baseline.py (default, in process) + "
+        "tests/1.9_state_machines/test_1_9_catalog_baseline_e2e.py (slow, real cluster)"
+    ),
 }
 
 #: What the default suite guards. One per *behaviour class*, not one per mechanism

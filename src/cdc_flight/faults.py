@@ -186,9 +186,32 @@ RECOVERY_POINTS = (
     "recovery_resume_point_deleted",
     "recovery_armed",
     "table_rebuild_queued",
+    #: rubric 1.9's catalog-baseline machine (`machines.CATALOG_BASELINE`). The two
+    #: cuts across its edges, so A53's crash table covers the state that decides
+    #: whether an observed relation identity may be adopted as history:
+    #:
+    #: * `catalog_baseline_marked`   - the durable `stale`/`invalidated` mark is
+    #:   written and the engine has NOT started. The next run must reconcile from
+    #:   this row rather than re-diagnose from nothing.
+    #: * `catalog_baseline_pre_valid` - the learned relations are flushed and the
+    #:   promotion to `valid` has not been written. The next run must reach the same
+    #:   verdict from durable state alone; the promotion is idempotent, not one-shot.
+    "catalog_baseline_marked",
+    "catalog_baseline_pre_valid",
 )
 
-ALL_POINTS = POINTS + DESTINATION_POINTS + RECOVERY_POINTS
+#: Faults injected on the SOURCE side, which is neither a place we stand in the commit
+#: protocol nor something the destination does to us.
+#:
+#: * `catalog_poll` - every `CatalogWatcher.poll()` from the nth arrival onwards raises.
+#:   This is the composition round 5 reproduced by monkeypatching and the suite could
+#:   not express (Codex r5, 1.7): a run that reads the source catalog **zero** times,
+#:   followed by destructive DDL while the pipeline is down. It is a repeating fault
+#:   rather than a one-shot precisely because "the catalog was unreadable for a whole
+#:   run" is the state that matters, and one failed poll out of six is not that state.
+SOURCE_POINTS = ("catalog_poll",)
+
+ALL_POINTS = POINTS + DESTINATION_POINTS + RECOVERY_POINTS + SOURCE_POINTS
 
 #: Names kept working from the first fault-injection cut.
 ALIASES = {"before_load": "pre_commit", "after_load": "post_commit_pre_ack"}
@@ -504,6 +527,32 @@ def read_fired_record(state_dir) -> dict | None:
             return json.load(handle)
     except (OSError, ValueError):
         return None
+
+
+def maybe_fail_repeatedly(point: str) -> None:
+    """Raise `InjectedFault` on the nth arrival at `point` **and every one after it**.
+
+    `maybe_crash` fires once, at an exact index, which is right for a crash: a process
+    dies once. It is wrong for a *degraded dependency*. The state round 5 reproduced by
+    hand — "this run never managed to read the source catalog at all" — is not one
+    failed poll, it is every poll, and a one-shot anchor would leave the run with a
+    perfectly good baseline and prove nothing.
+
+    Counts its own arrivals: a poll is not a commit group, and an index that is a
+    function of the workload is one that silently stops firing (Opus M7).
+    """
+    spec = _spec()
+    if spec is None:
+        return
+    want_point, want_nth, _action = spec
+    if want_point != point:
+        return
+    nth = arrival(point)
+    if nth < want_nth:
+        return
+    log.error("FAULT INJECTION: %s fails (arrival %s, and every one after it)", point, nth)
+    record_fired(point, nth, RAISE)
+    raise InjectedFault(f"injected {point} failure (arrival {nth})")
 
 
 def maybe_crash(point: str, nth: int) -> None:

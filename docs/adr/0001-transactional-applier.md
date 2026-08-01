@@ -2836,6 +2836,31 @@ persistence: **memory only** · initial: `observed` · terminal: `applied`, `sup
 | `unconfirmed` | `superseded` | yes |
 | `unconfirmed` | `unconfirmed` | no |
 
+**`catalog_baseline`** — Can the relation identities this run observes be related to the rows the destination already holds, or must they be reconciled before they are adopted?
+
+persistence: `_cdc_flight.catalog_baseline.state` · initial: `absent` · terminal: *none — a confirmed baseline becomes unconfirmed again the moment the next run starts, which is why `valid` is not terminal*
+
+| from | to | terminal |
+|---|---|---|
+| `absent` | `stale` | no |
+| `invalidated` | `absent` | no |
+| `invalidated` | `invalidated` | no |
+| `invalidated` | `stale` | no |
+| `invalidated` | `valid` | no |
+| `stale` | `absent` | no |
+| `stale` | `invalidated` | no |
+| `stale` | `stale` | no |
+| `stale` | `valid` | no |
+| `valid` | `absent` | no |
+| `valid` | `stale` | no |
+
+There is deliberately **no `absent -> valid`** and no `valid -> valid`. Every
+catalog-enabled run marks the baseline unconfirmed *before the engine starts*, so
+`valid` is only ever reachable from a mark this run has to discharge with evidence: a
+catalog it actually read, and no relation left holding rows under an identity it cannot
+relate. A run that could assert `valid` without passing through the mark is precisely
+the run that reported success over an unchecked catalog.
+
 #### A51.2 — the inventory, anchored to those edges
 
 | # | machine · edge | failure mode | detection | recovery | crash cut | class |
@@ -2898,13 +2923,18 @@ persistence: **memory only** · initial: `observed` · terminal: `applied`, `sup
 | 51a | — | an undeclared transition in the MEMORY-ONLY catalog machine, on the polling thread | `CatalogChange.to()` raises; `CatalogWatcher.poll_quietly` records it in `machine_error` rather than in the transient `last_error` | the poll returns nothing, the destructive action is not applied, and `run_engine_bounded` raises `EngineFailure` at shutdown: **the run is not successful** | the polling thread owns no destination state, so nothing is half-written | **MANUAL** (rev 10 — corrected. Rev 9's row 51 promised a loud failure for *any* machine; the polling thread caught the exception, wrote it to `last_error` and let the run report success, and a live `due -> marked` event reached it. Codex r1 MAJOR-1.) |
 | 52 | — | a durable state value **outside its frozen domain** is read (`table_state.snapshot_state`, `recovery_state.phase`) | `Machine.parse()` on every read | refused; the run does not start. A value in no domain belongs to no queue and no recovery path | n/a — reading is not a mutation | **MANUAL** (new at rev 9 — same trade as 51: it was silent before) |
 | 53 | run_phase: starting -> reconciling | the run-phase heartbeat row cannot be written (the table is missing, the independent connection is refused) | the write raises and is caught | the phase is tracked in memory, the machine still checks every edge, and the run is unaffected: observability must never fail a run that is otherwise correct | the row is not load-bearing for any decision | AUTO (new at rev 9) |
+| 54 | catalog_baseline: valid -> stale | a run cannot be assumed to have confirmed the source-catalog baseline | it has not finished; the mark is written BEFORE the engine starts, unconditionally | the next run reconciles from the durable mark instead of trusting an observation | `catalog_baseline_marked` — the mark is durable, nothing else has happened; the next run reconciles | AUTO (rev 14) |
+| 55 | catalog_baseline: stale -> invalidated | a relation holds destination rows, has no recorded source identity, and the baseline was never confirmed | `catalog_baseline.unrelatable_relations`, from durable state alone | the observed identity is NOT adopted; the relation is queued as `recreated`, fenced, and left `awaiting_snapshot` for rubric 1.6's rebuild | as 54 — the names are in the row, so the obligation survives the process that found it | AUTO (rev 14 — this is the r5 BLOCKER, and it used to be silent adoption) |
+| 56 | catalog_baseline: stale -> valid | — (the discharge) | ≥1 real catalog comparison **and** nothing unrelatable, recomputed after the flush | n/a: this is the healthy transition | `catalog_baseline_pre_valid` — the learned relations are durable and the promotion is not; the next run reaches the same verdict from durable state, so it is idempotent rather than one-shot | AUTO (rev 14) |
+| 57 | catalog_baseline: invalidated -> valid | — (the discharge, after a rebuild was queued) | the relation is now `awaiting_snapshot`, so `table_lifecycle` owes its image and the baseline is no longer protecting it | n/a | as 56 | AUTO (rev 14) |
+| 58 | catalog_baseline: valid -> absent | the recorded source catalog is forgotten (`--reset-state`, a source identity change) | `recovery.begin(forget_catalog=True)` | the claim is deleted in the SAME transaction as `source_relations`: a claim about a registry that no longer exists would suppress the reconciliation of the one replacing it | one transaction, so there is no cut | AUTO (rev 14) |
 
-**The counts, parsed from the rows above rather than recalled.** 58 rows, one
+**The counts, parsed from the rows above rather than recalled.** 63 rows, one
 failure and one terminal class each.
 
 | class | count | rows |
 |---|---:|---|
-| `AUTO` | **35** | 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 24b, 32, 35, 36, 40, 43, 44, 45, 46, 47, 53 |
+| `AUTO` | **40** | 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 24b, 32, 35, 36, 40, 43, 44, 45, 46, 47, 53, 54, 55, 56, 57, 58 |
 | `MANUAL` | **15** | 17b, 25, 26, 27, 28, 29, 33, 38, 41, 42, 44b, 49, 51, 51a, 52 |
 | `UNDEFINED` | **8** | 30, 31, 32b, 35b, 37, 39, 48, 50 |
 
@@ -2958,7 +2988,6 @@ consumed only by a test.
   `fresh_start`, `resume`, `file_missing_rebuilt`, `file_missing_no_durable_offset`, `file_missing_repair_disabled`, `file_corrupt_rebuilt`, `file_ahead_rebuilt`, `file_behind_rebuilt`, `file_offset_mismatch_rebuilt`, `orphan_accepted_resnapshot`
 * **`source_health`** (6 values) — What is the source connector doing, as one named value rather than six timers?
   `unsampled`, `streaming`, `not_streaming`, `unknown`, `unknown_never_sampled`, `dark`
-
 
 #### A51.4 — how UNDEFINED is found now
 
@@ -3816,3 +3845,91 @@ Neither is a loss path: Invariant O is untouched, the commit→ack ordering is u
 and no crash/replay duplication was reproduced in round 5. The first is a *silent
 inconsistency after an unchecked catalog*, the second is a *teardown stall*. Both are
 carried forward with the branch.
+
+### A63 — rev 14: the two findings the loop stopped on, closed
+
+Round 5 (`reviews/1.9_codex_review_r5.md`) returned `SATISFIED: no` with 1 BLOCKER and
+1 MAJOR, and A62 recorded both as carried forward. They are not carried forward any
+more. Neither was a patch: the first added a machine, the second added an owner.
+
+#### A63.1 — catalog-baseline validity is durable state with declared edges (BLOCKER)
+
+The reviewer's sequence, reproduced against a real cluster: a destination populated with
+no relation registry, a run in which **every** catalog poll failed, a drop-and-recreate
+while the pipeline was down, and then two healthy runs that both reported `ok=true`
+while the destination permanently held the old relation's rows *beside* the new one's.
+
+A61.2's fix was real and insufficient. `CatalogWatcher.successful_polls` proves the
+poller spoke; it is **process memory**, so it can reject the run that failed and it
+cannot carry that run's *obligation* across the failure into the next one. The next run
+sees a relation it has no oid for, and "first sight, record the oid" is indistinguishable
+from "adopt a replacement as though we had always owned it".
+
+The state that was missing has a name now — `machines.CATALOG_BASELINE`, SM-E,
+`_cdc_flight.catalog_baseline.state`, four states and eleven declared edges — and one
+writer (`cdc_flight/catalog_baseline.py`). It works the way the acquisition recovery
+works, which is the only shape that survives a hard death:
+
+1. **the mark comes first.** Every catalog-enabled run writes `-> stale` *before the
+   engine starts*, unconditionally, in one transaction. A `SIGKILL`, an `os._exit` from a
+   fault anchor, an unreadable catalog and a clean refusal therefore all leave the same
+   durable statement. There is deliberately no `absent -> valid` edge and no
+   `valid -> valid`: `valid` is reachable only from a mark this run has to discharge.
+2. **an untrusted baseline reconciles instead of adopting.** `unrelatable_tables()` asks
+   three questions of durable state alone — does `table_state` claim a trustworthy
+   image, is there no `source_relations` row, and does the destination table actually
+   hold rows — and every relation that answers yes to all three is *unrelatable*. Each
+   one is marked `awaiting_snapshot`, **before the owed queue is read**, so rubric 1.6's
+   blocking re-snapshot rebuilds it from the source in this same run, before the main
+   stream, and swaps a complete fenced image over it in one transaction.
+
+   **Marked, not dropped, and that is a correction the first cut earned.** The first cut
+   queued a `recreated` change per unrelatable relation — the destructive route the
+   round-5 work order named. Measured against the real cluster: a destination built
+   without a registry has *every* captured relation unrelatable at once, so the mass-drop
+   circuit breaker (`CDC_DROP_MAX_PER_POLL=1`, and it is right to be there) refused all
+   of them and the pipeline wedged on `catalog_unresolved` until a human intervened.
+   Destroying is also the wrong action for the fact: the relation **exists** at the
+   source; what cannot be done is relating the rows we hold to it. `awaiting_snapshot`
+   says exactly that, the data stays queryable-stale-and-flagged until a complete image
+   replaces it, and there is no DDL nobody asked for, no fence to wait on and no breaker
+   to trip. The destructive route survives as a **fail-safe** on the watcher, and it is
+   keyed on `BaselineCheck.unmarked` — the unrelatable relations this run could not put
+   in the owed queue, read back from `table_lifecycle.owing_work()` rather than from an
+   affected-row count. Not on a recomputation: by the time the watcher is built the
+   blocking re-snapshot has already rebuilt those relations from the *current* source
+   relation, so adopting their oid is now the correct thing to do, while the question
+   "is this relation unrelatable?" would still answer yes for the wrong reason — the
+   registry row is written by the flush at the end of this very run. Measured: the first
+   attempt at the fail-safe sent freshly rebuilt tables down the destructive path and
+   wedged the pipeline on the breaker a second time.
+3. **the promotion is evidence, and the run cannot succeed without it.** `-> valid`
+   requires at least one real catalog comparison and nothing unrelatable, recomputed
+   after the learned relations are flushed; `pipeline.run()` raises `EngineFailure`
+   otherwise. So "eventual source/destination equality **or** a persistent non-success
+   verdict" is structural rather than hoped for.
+
+**`absent` is trusted, on purpose.** A destination that has never made a claim carries no
+evidence of an unchecked window, and treating every one as suspect would rebuild every
+existing destination on upgrade. Only a mark this pipeline wrote forbids adoption.
+
+Two crash cuts across the new edges are real `os._exit` anchors —
+`catalog_baseline_marked` and `catalog_baseline_pre_valid` — and the promotion is
+idempotent rather than one-shot, so the second cut costs a recomputation and nothing
+else. A third anchor, `catalog_poll`, makes "this run read the source catalog zero
+times" an *executable* state instead of a monkeypatch: it is a repeating fault rather
+than a one-shot, because one failed poll out of six is not the state that matters.
+
+Inventory rows 54–58; transition table in §A51.1.
+
+#### A63.3 — the two MINORs were already closed, and are re-checked here
+
+Round 5's MINOR-1 (`complete_if_ready()` logging "the destination has a resume point
+again" on the path that deliberately has none) and MINOR-2 (`_reset_group`'s docstring
+still claiming a partial reset was unrepresentable) were both fixed in `ed361c0`, the
+commit that also published the reviewer's 3/5 bands — the review was written against the
+state before it. Re-verified rather than re-fixed: the completion log branches on
+`has_resume` and says "every captured relation was PROVEN empty at the source, so there
+is no resume point and none can exist"; `_reset_group` now states the narrow claim, that
+both reset paths are one object replacement so neither can forget a field, and names
+`discard_units()` as the one deliberate partial mutation.

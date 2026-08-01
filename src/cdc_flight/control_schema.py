@@ -140,6 +140,31 @@ CONTROL_DDL = [
             last_seen_at      TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (pipeline, source_schema, source_table)
         )""",
+    # rubric 1.9 / 1.5. Whether the pipeline can RELATE what it observes at the source
+    # to the rows the destination already holds — `machines.CATALOG_BASELINE`.
+    #
+    # `source_relations` above records *what* we last saw. This records whether that
+    # record can be trusted as history, and it exists because the answer was previously
+    # process memory (`CatalogWatcher.successful_polls`). A run whose every catalog poll
+    # failed died loudly and left nothing behind, so the next healthy run adopted the
+    # currently observed oid as though it had always owned that relation — and a
+    # drop-and-recreate in the gap left the old relation's rows beside the new one's
+    # for ever, with every run reporting success (Codex r5 BLOCKER-1, reproduced).
+    #
+    # Written OUTSIDE the commit group, before the engine starts and again after the
+    # watcher is proved quiesced: it is a claim about an observation, not a fact about
+    # the data, and it must be durable before anything can fail to establish it.
+    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.catalog_baseline (
+            pipeline          VARCHAR     PRIMARY KEY,
+            state             VARCHAR     NOT NULL,
+            reason            VARCHAR,
+            -- The relations this pipeline could not relate, as JSON. Evidence: the
+            -- `invalidated` state without the names is a state nobody can act on.
+            unreconciled_json VARCHAR,
+            runner_id         VARCHAR,
+            marked_at         TIMESTAMPTZ NOT NULL,
+            updated_at        TIMESTAMPTZ NOT NULL
+        )""",
     # rubric 1.8. What the *slot and the source cluster* looked like the last time we
     # acquired them. Three of the four cases 1.8 has to detect are invisible from a
     # single observation: a slot that was dropped and recreated at the same name has a

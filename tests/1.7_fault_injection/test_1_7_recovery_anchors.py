@@ -331,3 +331,54 @@ def test_an_unarmed_recovery_runs_straight_through(world):
     world.begin()
     assert world.resume()["phase"] == PHASE_ARMED
     assert world.journal().phase == PHASE_ARMED
+
+
+# --------------------------------------------------------------------------- #
+# rubric 1.9's catalog-baseline machine has crash cuts too (rev 14)
+# --------------------------------------------------------------------------- #
+def _baseline_row(world):
+    return world.con.execute(
+        "SELECT state FROM _cdc_flight.catalog_baseline WHERE pipeline = ?", [PIPELINE]
+    ).fetchall()
+
+
+def test_a_death_at_the_baseline_mark_leaves_the_obligation_durable(world):
+    """The cut the whole machine exists for.
+
+    The mark is written BEFORE the engine starts precisely so that a process which
+    dies anywhere after it still says "this run did not confirm the catalog baseline".
+    A hard death here is the strongest form of that claim: `os._exit` runs no `except`,
+    no `finally` and no `atexit` hook, so nothing tidied up on the way out.
+    """
+    proc = world.crash_at("catalog_baseline_marked", "baseline")
+    record = faults.read_fired_record(world.root / "state")
+    assert record and record["point"] == "catalog_baseline_marked", (proc.stdout, record)
+    assert [r[0] for r in _baseline_row(world)] == ["stale"], (
+        "a hard-killed run left NO durable statement that the baseline was unconfirmed, "
+        "which is exactly the state a later healthy run then adopts an oid over"
+    )
+
+
+def test_a_death_before_the_promotion_leaves_it_unconfirmed_and_repeatable(world):
+    """The other cut: the learned relations are durable and the promotion is not.
+
+    The promotion has to be idempotent rather than one-shot — the next run recomputes
+    the same verdict from durable state — so re-running it after the crash must reach
+    `valid` with no special handling.
+    """
+    from cdc_flight import catalog_baseline
+
+    proc = world.crash_at("catalog_baseline_pre_valid", "baseline")
+    record = faults.read_fired_record(world.root / "state")
+    assert record and record["point"] == "catalog_baseline_pre_valid", (proc.stdout, record)
+    assert [r[0] for r in _baseline_row(world)] == ["stale"]
+
+    check = catalog_baseline.mark_unconfirmed(
+        world.con, pipeline=PIPELINE, dataset=DATASET, runner_id="retry"
+    )
+    check = catalog_baseline.confirm(
+        world.con, pipeline=PIPELINE, dataset=DATASET, check=check, successful_polls=1,
+        runner_id="retry",
+    )
+    assert check.valid
+    assert [r[0] for r in _baseline_row(world)] == ["valid"]

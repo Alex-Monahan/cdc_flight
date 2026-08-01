@@ -93,11 +93,18 @@ DECLARED = {
     "run_outcome",
     "acquisition_recovery",
     "catalog_change",
+    # rev 14. The architecture review's four were the four that were *visible*; this
+    # one was found by a reviewer reproducing the inconsistency it allows, which is a
+    # better argument for a machine than any of the original four had (Codex r5
+    # BLOCKER-1). "Can an observed relation identity be adopted as history for rows the
+    # destination already holds?" was a derived expression over a registry row, a table
+    # lifecycle, a destination row count and an in-process poll counter.
+    "catalog_baseline",
 }
 
 
 def test_the_declared_machines_are_the_ones_the_review_said_to_build():
-    """Four consistency-affecting states plus the outcome precedence. Not one, not ten.
+    """The consistency-affecting states, plus the outcome precedence. Not one, not ten.
 
     The architecture review said yes to four machines and no to seven other candidates;
     `machines.py`'s module docstring carries the argument for each `no`. This asserts

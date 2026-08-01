@@ -54,6 +54,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+from . import faults as faults_mod
 from . import source_marker as marker_mod
 from .destination import CONTROL_SCHEMA
 from .machines import (
@@ -285,6 +286,7 @@ class CatalogWatcher:
         include: set[str],
         known: dict[str, SourceRelation] | None = None,
         replicated: set[str] | None = None,
+        unrelatable: set[str] | None = None,
         poll_seconds: float = 10.0,
         connect_timeout: int = 5,
         emit_marker: bool = True,
@@ -300,6 +302,17 @@ class CatalogWatcher:
         self.include = set(include)
         #: qualified names we have a destination table for
         self.replicated = set(replicated or ())
+        #: Relations the destination holds rows for whose observed identity may NOT be
+        #: adopted as history (rubric 1.9, `machines.CATALOG_BASELINE`). Computed once
+        #: per run from durable state by `catalog_baseline.unrelatable_relations` and
+        #: handed in, so the *decision* is a pure function of what the destination
+        #: durably says and the *observation* stays this class's only job.
+        #:
+        #: Empty on every ordinary run. Non-empty only when a previous run left the
+        #: baseline unconfirmed — and then adopting the currently observed oid would be
+        #: the r5 BLOCKER: the old relation's rows beside the new relation's, for ever,
+        #: with every run reporting success.
+        self.unrelatable = set(unrelatable or ())
         self.known: dict[str, SourceRelation] = dict(known or {})
         self.poll_seconds = poll_seconds
         self.connect_timeout = connect_timeout
@@ -455,6 +468,13 @@ class CatalogWatcher:
     # -- polling ------------------------------------------------------------ #
     def poll(self) -> list[CatalogChange]:
         """One observation. Returns the changes it added to the pending list."""
+        # rubric 1.7: "this run never managed to read the source catalog at all" is a
+        # real production state (a four-second statement bound against a loaded source,
+        # a network partition to the primary) and the suite could not express it, so
+        # round 5 had to monkeypatch it. `CDC_FAULT_INJECT=catalog_poll:1` makes the
+        # whole composition — zero successful polls, then destructive DDL while the
+        # pipeline is down, then a healthy retry — an executable test.
+        faults_mod.maybe_fail_repeatedly("catalog_poll")
         with self._connect() as conn:
             rows = conn.execute(_CATALOG_SQL, (self.publication, self.schema)).fetchall()
             lsn = int(conn.execute(_LSN_SQL).fetchone()[0])
@@ -585,6 +605,40 @@ class CatalogWatcher:
                         )
                         if change is not None:
                             added.append(change)
+                        continue
+                    if name in self.unrelatable:
+                        # RECONCILE, DO NOT ADOPT (rubric 1.9, Codex r5 BLOCKER-1).
+                        #
+                        # The destination holds rows for this relation, the durable
+                        # baseline says a run failed to confirm it, and there is no
+                        # recorded oid to compare against. "First sight" would write
+                        # the currently observed oid down as history — and from then on
+                        # the registry agrees with the source, so a drop-and-recreate
+                        # that happened in the unchecked window is undetectable for
+                        # ever. Measured: old rows beside new, every run successful.
+                        #
+                        # It is queued as `recreated` because that is exactly what it
+                        # may be, and because `recreated` is the existing machinery for
+                        # "the destination table holds a different relation's rows":
+                        # confirmed over `confirm_polls`, fenced on the WAL, revalidated
+                        # immediately before the DDL, and it leaves the table
+                        # `awaiting_snapshot` so the rebuild is owed durably by
+                        # `TABLE_LIFECYCLE` rather than by this run's memory.
+                        change = self._confirm(
+                            name,
+                            self._change(
+                                CHANGE_RECREATED, current, lsn,
+                                old_oid=None, new_oid=current.oid,
+                            ),
+                        )
+                        if change is not None:
+                            added.append(change)
+                            # Recorded only now, and `dirty()` excludes it while the
+                            # destructive action is still pending, so the oid becomes
+                            # history in the SAME transaction that drops the table and
+                            # marks it owed - never before.
+                            self.known[name] = current
+                            self._dirty[name] = current
                         continue
                     if name in self.replicated or name in self.include:
                         # First sight. Record the oid; report `new` only for something
@@ -865,6 +919,9 @@ class CatalogWatcher:
         return {
             "catalog_polls": self.polls,
             "catalog_successful_polls": self.successful_polls,
+            # Relations this run refused to adopt an identity for. Empty on every
+            # ordinary run; when it is not, each one is being routed to a rebuild.
+            "catalog_unrelatable": sorted(self.unrelatable),
             # An undeclared SM-D edge. `None` on every healthy run; when it is set the
             # supervisor refuses to call the run successful (A51 row 51).
             "catalog_machine_error": self.machine_error,

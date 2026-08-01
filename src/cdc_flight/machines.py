@@ -5,12 +5,15 @@ machine approach*, and grades **an appropriate number of machines (more than one
 5. This file is what "appropriate" means here: four machines, each owning one state,
 each with a declared edge set — plus the frozen decision domains, which are
 classifications rather than states and are deliberately **not** dressed up as machines.
+(Five machines since rev 14 added `CatalogBaseline`; the count is not the claim, the
+coverage is — see SM-E for the consistency-affecting state that was still implicit.)
 
 Reading order (the composition, not the file order):
 
 ```
 RunPhase                (per process,   _cdc_flight.heartbeat.phase)
  ├── AcquisitionRecovery(per pipeline,  _cdc_flight.recovery_state.phase)   [0..1, spans runs]
+ ├── CatalogBaseline    (per pipeline,  _cdc_flight.catalog_baseline.state) [1, spans runs]
  ├── TableLifecycle     (per table,     _cdc_flight.table_state.snapshot_state) [N, spans runs]
  ├── CatalogChangeState (per relation,  memory only)                        [N, per run]
  └── CommitGroup        (memory only, NO machine — see below)               [1 at a time]
@@ -317,6 +320,82 @@ CATALOG_CHANGE = Machine(
         "is correct, so persisting it would buy nothing."
     ),
 )
+
+
+# --------------------------------------------------------------------------- #
+# SM-E · CatalogBaseline — durable, `_cdc_flight.catalog_baseline.state`
+# --------------------------------------------------------------------------- #
+#: THE STATE THIS MACHINE EXISTS FOR (Codex r5 BLOCKER-1, reproduced end to end).
+#:
+#: "Can this pipeline relate the relation identities it observes at the source to the
+#: rows its destination already holds?" was, until rev 14, a *derived* expression over
+#: four things nobody had named together: whether `source_relations` happened to have a
+#: row, whether the destination happened to hold rows, whether the previous run happened
+#: to read the catalog at all, and one **in-memory** counter
+#: (`CatalogWatcher.successful_polls`) that dies with the process.
+#:
+#: The measured consequence: a run whose every catalog poll failed left no durable
+#: record that a baseline had never been established. A drop-and-recreate while the
+#: pipeline was down then had nothing to be compared against, the next healthy run
+#: **adopted** the replacement oid as history, and the old relation's rows stayed beside
+#: the new relation's for ever while every run reported success. Process memory can
+#: reject the unchecked run; it cannot carry the missing-baseline obligation across it.
+#:
+#: So the obligation is written down **before** the run can fail to discharge it — the
+#: same "journal the intent, then act" shape as `AcquisitionRecovery` — and it is only
+#: promoted back by evidence.
+BASELINE_ABSENT = "absent"          # no row (the pseudo-state): nothing has been claimed
+BASELINE_STALE = "stale"            # a run has not (yet) confirmed the baseline
+BASELINE_INVALIDATED = "invalidated"  # reconciled, and relations were found unrelatable
+BASELINE_VALID = "valid"            # every protected relation is related to a source oid
+
+CATALOG_BASELINE = Machine(
+    "catalog_baseline",
+    states=(BASELINE_ABSENT, BASELINE_STALE, BASELINE_INVALIDATED, BASELINE_VALID),
+    edges=(
+        # -- the pre-mark: EVERY catalog-enabled run marks the baseline unconfirmed
+        #    before the engine starts, so any death anywhere leaves the obligation
+        #    durable. There is deliberately NO `absent -> valid` and no
+        #    `valid -> valid`: a run may only reach `valid` by passing through the
+        #    mark it has to discharge.
+        (BASELINE_ABSENT, BASELINE_STALE),
+        (BASELINE_VALID, BASELINE_STALE),
+        (BASELINE_STALE, BASELINE_STALE),
+        (BASELINE_INVALIDATED, BASELINE_STALE),
+        # -- reconciliation found relations whose observed identity cannot be related
+        #    to the rows the destination holds. They are routed to the existing
+        #    `recreated` / `awaiting_snapshot` machinery; this records that it happened.
+        (BASELINE_STALE, BASELINE_INVALIDATED),
+        (BASELINE_INVALIDATED, BASELINE_INVALIDATED),
+        # -- discharge: a run that read the catalog at least once AND left no
+        #    protected relation unrelatable.
+        (BASELINE_STALE, BASELINE_VALID),
+        (BASELINE_INVALIDATED, BASELINE_VALID),
+        # -- `--reset-state` / a source identity change: the recorded catalog is
+        #    forgotten, and the claim about it goes with it, in the same transaction.
+        (BASELINE_VALID, BASELINE_ABSENT),
+        (BASELINE_STALE, BASELINE_ABSENT),
+        (BASELINE_INVALIDATED, BASELINE_ABSENT),
+    ),
+    # NOT terminal. `valid` is the healthy resting state and every run leaves it again
+    # on its way through `stale`; calling it terminal would say a confirmed baseline
+    # can never become unconfirmed, which is the exact false claim this machine exists
+    # to stop anyone making.
+    terminal=(),
+    initial=BASELINE_ABSENT,
+    durable="_cdc_flight.catalog_baseline.state",
+    purpose=(
+        "Can the relation identities this run observes be related to the rows the "
+        "destination already holds, or must they be reconciled before they are adopted?"
+    ),
+)
+
+#: The states in which an observed relation identity may NOT be adopted as history for
+#: a relation the destination already holds trustworthy rows for. Derived from the
+#: machine rather than restated: `absent` is trusted on purpose — a destination that has
+#: never made a claim has no evidence of an unchecked window, and treating it as
+#: suspect would rebuild every legacy destination on upgrade.
+BASELINE_UNTRUSTED = frozenset((BASELINE_STALE, BASELINE_INVALIDATED))
 
 
 # --------------------------------------------------------------------------- #

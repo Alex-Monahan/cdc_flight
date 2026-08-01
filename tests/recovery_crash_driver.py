@@ -10,7 +10,7 @@ tidy up — none of which a `SIGKILL` does (Codex r1 MAJOR-6).
 a child process, against the same DuckDB file and the same offsets file the parent owns.
 It costs milliseconds: no JVM, no Postgres, and the slot drop is a JSON file.
 
-    python tests/recovery_crash_driver.py <duckdb> <offsets> <slots.json> begin|resume
+    python tests/recovery_crash_driver.py <duckdb> <offsets> <slots.json> begin|resume|baseline
 
 with `CDC_FAULT_INJECT` and `CDC_STATE_DIR` set by the caller. Exits 0 when the step
 completed, or with the fault's exit code when the anchor fired.
@@ -59,6 +59,21 @@ def main(argv: list[str]) -> int:
                 offset_path=Path(offsets_path),
                 captured_tables=TABLES,
                 forget_catalog=False,
+            )
+        elif step == "baseline":
+            # rubric 1.9's catalog-baseline machine has two crash cuts of its own, and
+            # they are cut the same way as the recovery's: in a child process that
+            # really dies. `mark_unconfirmed` then `confirm` is the whole of a run's
+            # interaction with the machine, so one step reaches both anchors and
+            # `CDC_FAULT_INJECT` decides which one fires.
+            from cdc_flight import catalog_baseline
+
+            check = catalog_baseline.mark_unconfirmed(
+                con, pipeline=PIPELINE, dataset="cdc_raw", runner_id="crash-driver"
+            )
+            catalog_baseline.confirm(
+                con, pipeline=PIPELINE, dataset="cdc_raw", check=check,
+                successful_polls=1, runner_id="crash-driver",
             )
         else:
             record = recovery_mod.read(con, pipeline=PIPELINE, namespace=NAMESPACE)

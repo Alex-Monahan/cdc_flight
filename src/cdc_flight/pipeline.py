@@ -31,6 +31,7 @@ from pathlib import Path
 
 from . import acquisition
 from . import catalog as catalog_mod
+from . import catalog_baseline as baseline_mod
 from . import destination as dest_mod
 from . import faults as faults_mod
 from . import reconcile as reconcile_mod
@@ -354,6 +355,27 @@ def run(
         # definition, so `in_progress` here means exactly that, and promoting it is what
         # makes it discoverable from durable state after ANY crash - including the ones
         # `except BaseException` never sees.
+        # rubric 1.9 / SM-E, and it has to happen HERE — before the owed queue is read,
+        # because marking a relation owed is how an unrelatable one gets rebuilt in THIS
+        # run rather than in the next.
+        #
+        # `mark_unconfirmed` reads the durable baseline, computes (from durable state
+        # alone) which relations hold rows this pipeline cannot relate to any identity
+        # at the source, writes the obligation down, and marks those relations
+        # `awaiting_snapshot`. The write comes first and is unconditional, so a crash, a
+        # kill, an unreadable catalog and a clean refusal all leave the same statement:
+        # `successful_polls` is process memory and could only ever describe the process
+        # that was already dead (Codex r5 BLOCKER-1).
+        catalog_cfg = CatalogConfig()
+        catalog_enabled = applier_cfg.drop_mode != "ignore" and catalog_cfg.poll_seconds > 0
+        baseline = baseline_mod.BaselineCheck()
+        if catalog_enabled:
+            baseline = baseline_mod.mark_unconfirmed(
+                con, pipeline=dest.pipeline_name, dataset=dest.dataset_name,
+                runner_id=runner_id,
+            )
+            summary_extra.update(baseline.as_dict())
+
         interrupted = dest_mod.promote_interrupted_snapshots(con, dest.pipeline_name)
         if interrupted:
             summary_extra["interrupted_snapshots_requeued"] = interrupted
@@ -445,9 +467,8 @@ def run(
         # catalog is polled on its own connection. Started BEFORE the engine, so a
         # table dropped while this pipeline was down is detected on this run rather
         # than one poll interval into it.
-        catalog_cfg = CatalogConfig()
         watcher = None
-        if applier_cfg.drop_mode != "ignore" and catalog_cfg.poll_seconds > 0:
+        if catalog_enabled:
             watcher = catalog_mod.CatalogWatcher(
                 dsn=source.dsn,
                 publication=replication.publication_name,
@@ -455,6 +476,18 @@ def run(
                 include={t if "." in t else f"{source.schema}.{t}" for t in source.tables},
                 known=catalog_mod.read_known_relations(con, dest.pipeline_name),
                 replicated=catalog_mod.seed_from_table_state(con, dest.pipeline_name),
+                # `unmarked`, NOT a recomputation. By here the marking above has put
+                # every unrelatable relation in the owed queue and the blocking
+                # re-snapshot has already rebuilt it from the current source relation —
+                # so adopting that relation's oid is now the *correct* thing to do, and
+                # re-asking "is it unrelatable?" would say yes for the wrong reason (the
+                # registry row is written by the flush at the end of this very run) and
+                # send a freshly rebuilt table down the destructive path. MEASURED: it
+                # did, and the mass-drop breaker then wedged the pipeline.
+                #
+                # A fail-safe, not the mechanism: this is non-empty only when a relation
+                # could not be put in the owed queue at all.
+                unrelatable=set(baseline.unmarked),
                 poll_seconds=catalog_cfg.poll_seconds,
                 emit_marker=catalog_cfg.emit_marker,
                 marker_prefix=catalog_cfg.marker_prefix,
@@ -560,6 +593,35 @@ def run(
             )
             if learned:
                 summary_extra["source_relations_persisted"] = learned
+            # ...and the CLAIM about them, which is the durable half (rubric 1.9/SM-E).
+            # Recomputed from durable state after the flush, so the verdict is a
+            # statement about what the destination now holds rather than about what
+            # this process remembers. A relation whose table was dropped and marked
+            # `awaiting_snapshot` is discharged here because `TABLE_LIFECYCLE` owes its
+            # rebuild — the obligation moves to the machine that owns it.
+            if watcher is not None:
+                baseline = baseline_mod.confirm(
+                    con, pipeline=dest.pipeline_name, dataset=dest.dataset_name,
+                    check=baseline, successful_polls=watcher.successful_polls,
+                    runner_id=runner_id,
+                )
+                summary_extra.update(baseline.as_dict())
+                if not baseline.valid:
+                    # No successful run over an unconfirmed baseline. This is the
+                    # nesting invariant the r5 defect slipped through: the *narrow*
+                    # symptom (zero polls) was rejected, but a later healthy run could
+                    # still report success while the destination durably held one
+                    # relation's rows under another relation's identity.
+                    outcome.record("engine_error")
+                    result["stop_reason"] = outcome.value
+                    raise EngineFailure(
+                        "the source-catalog baseline is "
+                        f"{baseline.state!r} at shutdown: {baseline.reason}. Until every "
+                        "relation the destination holds rows for can be related to an "
+                        "identity at the source, adopting what we observe would present "
+                        "one relation's rows as another's. Refusing to report success",
+                        result,
+                    )
             # The recovery is over when the work it asked for has actually been done.
             # The PREDICATE LIVES IN `recovery.py` (Codex r1 MAJOR-5): it validates the
             # captured obligation the journal recorded, performs the `armed -> absent`
