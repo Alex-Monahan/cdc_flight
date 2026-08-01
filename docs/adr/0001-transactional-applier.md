@@ -1,6 +1,6 @@
 # ADR 0001 — The transactional applier
 
-* **Status:** accepted (revision 18, 2026-08-01 — implemented through the rubric 1.9 round-9 ownership composition)
+* **Status:** accepted (revision 19, 2026-08-01 — implemented through the rubric 1.9 round-10 sticky recovery handoff)
 * **Date:** 2026-07-30
 * **Task:** TODO 1.0(a); revised under TODO 1.0(feedback)
 * **Decides rubric items:** 1.1, 1.2, 1.3, 1.7 (directly), and 1.4, 1.6, 1.8, 3.2,
@@ -27,6 +27,7 @@
 | 16 | 2026-08-01 | **Round-7 reconciliation.** The current inventory has five focused machines plus one outcome precedence: `catalog_baseline` is the fifth machine. Only `valid` permits identity adoption; a queued `awaiting_snapshot` rebuild is not complete. A51 rows 55/57 and the published 1.9 score now state those partitions. `CONNECTION_RETIREMENT` uses one bounded daemon-worker close protocol for cursor and parent handles and distinguishes `failed` from `closed` (A65). Rubric 1.9 is 5/5 and 1.7 remains the reviewer's 3/5. |
 | 17 | 2026-08-01 | **Round-8 callback seal.** Callback admission and the in-flight count share one condition lock; shutdown seals before waiting, a post-seal batch is unacknowledged, and a failed quiescence proof transfers the destination runtime to the admitted callback rather than racing it. PyArrow uses its system allocator on the JVM callback thread (A66). |
 | 18 | 2026-08-01 | **Round-9 ownership composition.** One `DestinationOwnership` token spans the blocking re-snapshot and main stream. The token is attached before consumer construction and activated only when callbacks may enter; outer teardown no longer infers quiescence from a caller-local `applier is None`. A failed re-snapshot quiescence proof retains its alert cursor, parent, lease, heartbeat sink, throwaway slot and offset state, while a pre-armed filesystem marker makes next-run owed-state repair durable without writing through the contested connection. An inactive main-applier construction failure is sealed and retired normally (A67). |
+| 19 | 2026-08-01 | **Round-10 sticky recovery handoff.** Failed callback quiescence is now the terminal `destination_ownership: active -> callback_owned` transition; a later callback exit cannot let an enclosing finalizer revoke it. The filesystem recovery marker is the durable `absent -> armed -> consumed` machine, and cleanup requires `consumed`, not a fresh quiescence read. Crash configurations at every marker state and the exact live-at-catch/quiescent-at-finally race are pinned. `pipeline.run()` enforces a process-terminal exit after transfer, so an in-process caller cannot outlive the lease and start beside retained ownership (A68). |
 
 ---
 
@@ -2811,6 +2812,27 @@ persistence: `_cdc_flight.recovery_state.phase` · initial: `absent` · terminal
 | `resume_point_deleted` | `armed` | no |
 | `resume_point_deleted` | `requested` | no |
 
+**`interruption_marker`** — Has an interrupted re-snapshot's durable rebuild obligation been armed, and has one safe destination owner discharged it?
+
+persistence: `<state_dir>/resnapshot/interrupted.json.state` · initial: `absent` · terminal: `consumed`
+
+| from | to | terminal |
+|---|---|---|
+| `absent` | `armed` | no |
+| `armed` | `consumed` | yes |
+
+**`destination_ownership`** — Who exclusively owns the destination connection after callback admission, including a failed-quiescence handoff which enclosing finalizers cannot undo?
+
+persistence: **memory only** · initial: `available` · terminal: `callback_owned`
+
+| from | to | terminal |
+|---|---|---|
+| `active` | `available` | no |
+| `active` | `callback_owned` | yes |
+| `attached` | `active` | no |
+| `attached` | `available` | no |
+| `available` | `attached` | no |
+
 **`catalog_change`** — Where in the observe -> confirm -> fence -> apply pipeline is one DDL fact about one relation? Memory only: a lost pending change is re-detected, which is correct, so persisting it would buy nothing.
 
 persistence: **memory only** · initial: `observed` · terminal: `applied`, `superseded`
@@ -2947,13 +2969,15 @@ made no claim — see A63.4.
 | 57 | catalog_baseline: invalidated -> valid | — (the discharge, after rebuild completion) | a durable `include_owed=True` query finds no relation that still holds rows without an identity: every queued rebuild positively completed and the learned identity was eligible for flush | n/a; merely reaching `awaiting_snapshot` keeps the baseline `invalidated` and a disabled/skipped repair refuses before streaming | as 56 | AUTO (rev 16 — a queued rebuild is not a finished one) |
 | 58 | catalog_baseline: valid -> absent | the recorded source catalog is forgotten (`--reset-state`, a source identity change) | `recovery.begin(forget_catalog=True)` | the claim is deleted in the SAME transaction as `source_relations`: a claim about a registry that no longer exists would suppress the reconciliation of the one replacing it | one transaction, so there is no cut | AUTO (rev 14) |
 | 59 | connection_retirement (domain) | a heartbeat write, cursor close, or parent connection close never returns; or close raises | one canonical daemon-worker close protocol bounds both idle cursor and parent close calls; a live writer retains cursor ownership until it returns | the run tears down within the bound and reports `closed`, `failed` (with the close error), or `abandoned` for each handle before process exit | n/a — the heartbeat is not load-bearing for any decision | **UNDEFINED** (rev 16 — honest: nothing clears the non-terminal heartbeat row an abandoned runner left behind; `last_run.json` is the terminal record and stale-row sweeping belongs to 4.4/6.1) |
+| 60 | interruption_marker: armed -> consumed | crash at any interruption-marker state, including after destination requeue but before marker retirement | the marker's declared `state`, with legacy state-less markers parsed as `armed` | `absent` does nothing; `armed` idempotently reasserts owed work before becoming `consumed`; `consumed` is garbage-collected without repeating the destination write | **INJECTED at all three durable configurations**, plus the post-write/pre-consume cut which remains `armed` and repeats safely | AUTO (rev 19) |
+| 61 | destination_ownership: active -> callback_owned | callback leaves after the supervisor fails quiescence but before enclosing finalizers run | the supervisor's completed `applier_quiesced=false` verdict, not a later mutable callback read | terminal ownership preserves marker/slot/offset/alert/lease/heartbeat/parent state; `run()` writes the failure summary and hard-exits | exact live-at-catch/quiescent-at-finally schedule injected; marker remains `armed` and `reassert_owed` remains skipped | AUTO (rev 19) |
 
-**The counts, parsed from the rows above rather than recalled.** 64 rows, one
+**The counts, parsed from the rows above rather than recalled.** 66 rows, one
 failure and one terminal class each.
 
 | class | count | rows |
 |---|---:|---|
-| `AUTO` | **40** | 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 24b, 32, 35, 36, 40, 43, 44, 45, 46, 47, 53, 54, 55, 56, 57, 58 |
+| `AUTO` | **42** | 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 24b, 32, 35, 36, 40, 43, 44, 45, 46, 47, 53, 54, 55, 56, 57, 58, 60, 61 |
 | `MANUAL` | **15** | 17b, 25, 26, 27, 28, 29, 33, 38, 41, 42, 44b, 49, 51, 51a, 52 |
 | `UNDEFINED` | **9** | 30, 31, 32b, 35b, 37, 39, 48, 50, 59 |
 
@@ -3016,11 +3040,10 @@ consumed only by a test.
   that bounding the cursor and then closing its parent one statement later is the same
   unbounded wait one level out.
 
-  A domain rather than a machine **by this file's own test**: a crash never leaves
-  durable state in an intermediate configuration here — the cursor dies with the
-  process. What the r5 finding actually needed was an *owner* and a *bound*, not a
-  durable machine, and dressing an in-process hand-off up as one would assert exactly
-  the recoverable intermediate state it does not have (rev 14).
+  This remains a result domain rather than duplicating the ownership machine: a crash
+  leaves no durable close-result state. `destination_ownership` separately owns the
+  live in-process handoff, including rev 19's terminal `callback_owned` state; this
+  domain records what bounded retirement did only after ownership permits it.
 
 
 #### A51.4 — how UNDEFINED is found now
@@ -3226,7 +3249,7 @@ Three more corrections came with it:
 
 ## 20. Rubric 1.9 — explicit state machines
 
-### A55 — five machines, one precedence, and the seven candidates that are not
+### A55 — seven machines, one precedence, and the remaining candidates
 
 Rubric 1.9 (added 2026-07-31) asks that *any state that can affect consistency is managed
 with a state machine approach*: **no state machines = 1, only one big state machine = 3,
@@ -3255,7 +3278,7 @@ machine is ceremony — worse than ceremony, because it advertises recoverable i
 states that do not exist. If yes, the state needs a name, a persisted value and a
 transition table.
 
-#### What was built (five machines + one precedence)
+#### What was built (seven machines + one precedence)
 
 | machine | owns | states | edges | persistence |
 |---|---|---|---|---|
@@ -3263,6 +3286,8 @@ transition table.
 | `run_phase` | where is this run, readable from the destination while it runs | 9 | 23 | `_cdc_flight.heartbeat.phase` |
 | `run_outcome` | why did this run stop — cause before symptom | 10 | 45 (a **precedence**: escalations only) | `heartbeat.terminal_reason`, `last_run.json` |
 | `acquisition_recovery` | what has this destructive recovery already done | 5 | 9 | `_cdc_flight.recovery_state.phase` |
+| `interruption_marker` | has filesystem recovery intent been armed and safely discharged | 3 | 2 | `<state_dir>/resnapshot/interrupted.json.state` |
+| `destination_ownership` | who owns the destination after callback admission or failed quiescence | 4 | 5 | **memory only** |
 | `catalog_change` | where is one DDL fact in observe → confirm → fence → apply | 9 | 30 | **memory only** |
 | `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
 
@@ -3313,6 +3338,14 @@ gain), `machine.check(from, to)` raising `IllegalTransition`, `machine.parse()` 
   **edges**: `requested -> armed` is not a transition, so no future caller can claim a
   slot was dropped that never was, and `-> absent` (clearing the journal) is reachable
   only from `armed`, so a clear cannot discard a half-done destructive sequence.
+* **`interruption_marker`.** Filesystem recovery intent is durable consistency state:
+  `absent -> armed` is fsynced before callback activation, and only a safe destination
+  owner may take `armed -> consumed` after reasserting the rebuild obligation. Terminal
+  `consumed` may be garbage-collected; `armed` never may.
+* **`destination_ownership`.** `available -> attached -> active` names callback
+  admission. A bounded failed-quiescence verdict takes the terminal
+  `active -> callback_owned` edge, so a later callback exit cannot be reinterpreted by
+  an enclosing finalizer as authority to discard marker recovery.
 * **`catalog_change`.** Seven per-relation states were spread over four containers and
   three counters, which is how `fenced` came to be documented as gating an action it never
   gated (Opus MINOR-2). One `state` field, memory only — a lost pending change is
@@ -3340,7 +3373,9 @@ RunPhase (per process, heartbeat row)
  ├── AcquisitionRecovery (per pipeline+namespace, recovery_state row)  [0..1, spans runs]
  ├── CatalogBaseline (per pipeline, catalog_baseline row)               [1, spans runs]
  ├── TableLifecycle (per pipeline+schema+table, table_state row)       [N, spans runs]
+ ├── InterruptionMarker (per blocking re-snapshot, interrupted.json)    [0..1, spans runs]
  ├── CatalogChangeState (per relation, memory)                        [N, per run]
+ ├── DestinationOwnership (per destination connection, memory)         [1, per run]
  └── OpenGroup (memory, no persistence — Invariant O)                 [1 at a time]
 ```
 
@@ -4106,10 +4141,10 @@ both reset paths are one object replacement so neither can forget a field, and n
 ### A65 — rev 16: round-7 retirement completion and final score bands
 
 Round 7 confirmed the catalog-baseline partition and all four binding principles. It
-scored rubric 1.9 **5/5**: the current design has five focused machines — table
-lifecycle, run phase, acquisition recovery, catalog change and catalog baseline — plus
-the separate run-outcome precedence. The remaining merge stop was not consistency state;
-it was an idle heartbeat cursor whose `close()` could wedge teardown.
+scored rubric 1.9 **5/5** on the then-current five focused machines plus the separate
+run-outcome precedence. Rev 19 adds the interruption-marker and destination-ownership
+machines after Round 10 proved those states consistency-affecting. The round-7 merge
+stop itself was an idle heartbeat cursor whose `close()` could wedge teardown.
 
 Handle retirement now has one canonical primitive. Every actual `close()` runs on a
 named daemon worker under a deadline, for both the heartbeat cursor and its parent
@@ -4168,8 +4203,9 @@ quiescence was not compositional quiescence.
 Every applier attaches before consumer construction and activates immediately before
 the supervisor can admit callbacks. A completed or otherwise quiescent re-snapshot
 retires itself from the token before the main applier attaches. A non-quiescent one
-stays attached, so the outermost teardown sees the retained owner even though the main
-applier variable is still `None`. The terminal decision covers every child and parent
+takes terminal `callback_owned`, so the outermost teardown sees the retained owner even
+though the main applier variable is still `None`. The terminal decision covers every
+child and parent
 operation: either the token retires a proved-quiescent applier and cleanup proceeds, or
 the callback keeps exclusive ownership and no destination teardown runs on the pipeline
 thread.
@@ -4191,3 +4227,35 @@ seals the idle applier, proves its zero-callback state, closes its alert cursor 
 retires the lease, heartbeat sink and parent normally. "Unsealed" is no longer
 misreported as "live callback", and "no main applier" is no longer treated as proof
 that a nested re-snapshot released the destination.
+
+### A68 — rev 19: failed quiescence and marker recovery are sticky machines
+
+Round 10 reproduced a narrower unwind inside A67. The supervisor failed its bounded
+quiescence proof, the re-snapshot handler selected the pre-armed marker instead of
+writing through the callback-owned connection, and then the callback left during the
+handler's log call. The immediately enclosing `finally` re-read mutable quiescence,
+detached the applier, dropped the throwaway slot and removed `interrupted.json` without
+ever calling `reassert_owed`. Two individually reasonable reads composed into an
+undeclared recovery cancellation.
+
+`DestinationOwnership` now implements the declared memory machine
+`available -> attached -> active -> callback_owned`. The last edge is selected from the
+supervisor's completed `applier_quiesced=false` verdict, not by sampling the callback
+again, and `callback_owned` is terminal. `retire_if_quiescent()` therefore refuses in
+that state even if the callback leaves one instruction later. Every enclosing finalizer
+sees the same handoff decision.
+
+The filesystem marker independently implements durable
+`absent -> armed -> consumed`. Arming atomically replaces and fsyncs the marker before
+callback activation. A safe destination owner first reasserts the table-lifecycle
+obligation, then atomically publishes `consumed`; only a consumed terminal record may be
+unlinked or have its slot/offset directory removed. On restart, `absent` is a no-op,
+`armed` repeats the idempotent destination request before consumption, and `consumed`
+only garbage-collects the terminal record. A crash after the destination write but
+before consumption remains `armed` and repeats conservatively.
+
+The supported `pipeline.run()` contract is explicitly process-terminal for this one
+handoff. After recording the abandonment summary it calls the same hard-exit path as the
+CLI. Thus a library caller cannot catch failed quiescence, retain an owner beyond the
+lease TTL, and start a second invocation beside it; process death preserves the armed
+marker for the next run and releases local handles without racing the callback.

@@ -103,7 +103,7 @@ implementation.
 | **Codex B5** — the persisted timeline never participated in the decision | **fixed.** `source_timeline_changed`, ordered after identity and before LSN regression, with the catalog discarded (which also closes **Codex M1**) |
 | **Codex B6** — the four giant modules regrew | **fixed, and re-fixed at Codex r1 MINOR-5.** The 1.6-1.8 round split `applier_config.py`, `self_heal.py`, `supervisor.py` and `control_schema.py` out; the 1.9 rounds put the growth back, so `OpenGroup` is now `commit_group.py` and the four pre-engine decisions are `acquisition.py`. Measured after round 4: `applier.py` 928, `resnapshot.py` 926, `destination.py` 914, `catalog.py` 875, `pipeline.py` 806, `reconcile.py` 611, `recovery.py` 609. `destination.py` crossed 1,000 in round 4 and the source-relation registry became `source_relations.py`; `applier.py` and `resnapshot.py` are the ones to watch and are a **carry-forward** |
 | **Codex M2 / M3, Opus MAJOR-5 / MAJOR-6, MINOR-1** — the fault matrix proved declared labels, not outcomes; four tautologies; the hung-commit test accepted any death; `hang_seconds` was the exit code; the chaos harness did not compose | **fixed.** Every anchor writes a fsynced `fault_fired.json`; the outcome class is derived from the run; exact exit codes; `CDC_FAULT_HANG_SECONDS`; `destination_commit_late` for genuine ambiguity; chaos injects during recovery over a shuffled cover with a per-iteration fired assertion. ADR §19/A54 |
-| **Codex M5, Opus MAJOR-3** — the A51 counts were arithmetically false and the inventory incomplete | **fixed.** 64 rows, one failure and one class each, **40/15/9**, with `tests/4.7_self_healing/test_4_7_inventory.py` parsing the table so the headline cannot drift again. The missing modes (`CDC_RESNAPSHOT=0`, the unqueueable folds, drop-failure, `C` disagreement, the startup-dark fail-open, and more) are rows |
+| **Codex M5, Opus MAJOR-3** — the A51 counts were arithmetically false and the inventory incomplete | **fixed.** 66 rows, one failure and one class each, **42/15/9**, with `tests/4.7_self_healing/test_4_7_inventory.py` parsing the table so the headline cannot drift again. The missing modes (`CDC_RESNAPSHOT=0`, the unqueueable folds, drop-failure, `C` disagreement, the startup-dark fail-open, and more) are rows |
 | **Codex M6, Opus MINOR-7** — `write_slot_state` was a non-atomic DELETE+INSERT | **fixed.** One transaction. "Typed record" is a **carry-forward**: it is still a dict |
 | **Opus MAJOR-4** — `RUBRIC_STATUS` contradicted itself on 1.5 and 4.6 and had no 4.7 detail | **fixed.** Headings reconciled, 1.5's stale falsifier struck through with what replaced it, 4.6's "no test exists" replaced by what the test measures, 4.7 has a detail section |
 | **Opus Q5, Codex m3** — 57 of 91 new tests and 10 of 12 fault anchors were slow-only | **fixed.** Every anchor and every reconciliation cell now has a default-suite guard; see "Suite partition" below |
@@ -387,7 +387,7 @@ correct assumptions in the notes below:
 | 4.4 | Idle-slot heartbeat | 1 | `heartbeat.interval.ms` unset, no `heartbeat.action.query`. |
 | 4.5 | Errors must not hang or lock | 2 | Bounded runner + JVM watchdog make hangs survivable (one observed in p09), but nothing systematic prevents them. |
 | 4.6 | Detect silently-dead Postgres connection | ~~1~~ → **3** | TODO 4.6(b) closed: a blackholed Postgres used to exit `ok: true` on a partial delivery, because `unknown` slot health licensed an idle declaration *and* reset the not-streaming clock. A source that was answering and goes dark now fails the run within `CDC_SOURCE_DARK_SECONDS` (45 s), proven against a real TCP blackhole. Not 5: there is still no heartbeat (4.4) and no bounded JDBC socket timeout (4.6(c)), so detection depends on our 0.5 s sampler rather than on the connection itself. |
-| 4.7 | Self-heal without human intervention | **1** (new item; claimed 3, rescored 1) | The rubric's 1-band is a **count**: "more than 2 cases that cause manual human intervention". The corrected inventory (ADR §19/A51, 64 rows, parsed by `tests/4.7_self_healing/test_4_7_inventory.py`) is **40 AUTO / 15 MANUAL / 9 UNDEFINED**. Fifteen is more than two, so it is a 1 under every defensible reading. The direction is right — automatic recovery now covers forty enumerated cases, including the Flight's own half-finished recovery — while the mechanical inventory keeps the remaining exceptions explicit. See the detail section. |
+| 4.7 | Self-heal without human intervention | **1** (new item; claimed 3, rescored 1) | The rubric's 1-band is a **count**: "more than 2 cases that cause manual human intervention". The corrected inventory (ADR §19/A51, 66 rows, parsed by `tests/4.7_self_healing/test_4_7_inventory.py`) is **42 AUTO / 15 MANUAL / 9 UNDEFINED**. Fifteen is more than two, so it is a 1 under every defensible reading. The direction is right — automatic recovery now covers forty-two enumerated cases, including the Flight's own half-finished recovery — while the mechanical inventory keeps the remaining exceptions explicit. See the detail section. |
 | 5.1 | CDC fast on large changes | 3 | 50 k-row transaction absorbed at ~3.5 k rows/s into local DuckDB; no failure, but a full `dlt.run()` per 2048-row batch is the ceiling. |
 | 5.2 | Low latency on small changes | 1 | Capture latency is 83 ms, but the deliverable is a bounded batch job with no defined cadence — end-to-end latency is the schedule interval. |
 | 5.3 | Keep up with high Postgres TPS | 2 | ~1 k events/s inside the engine, but ~17 s of per-run JVM/connect overhead drops the shipped bounded job to ~157 events/s to MotherDuck. |
@@ -455,7 +455,7 @@ setting the manual rows aside as "exceptions" is scoring a hand-selected subset.
 The acquisition-recovery anchors closed the earlier stated 4-band gap, but subsequent
 reviews still found compositions outside the suite; the round-7 published verdict is
 therefore 1.7 **3/5**, not the interim claim of 5. **1.9 is 5/5** on the rubric's own
-text (*an appropriate number of state machines, over 1*): five machines plus one
+text (*an appropriate number of state machines, over 1*): seven machines plus one
 precedence, including the durable catalog-baseline machine. 4.6 is 3, not 5, because
 the detection that closed TODO 4.6(b) is ours (a 0.5 s slot sampler), not the
 connection's — 4.4's heartbeat and 4.6(c)'s socket timeouts are still absent.
@@ -1511,7 +1511,7 @@ therefore mutated by a path the design did not enumerate.**
 Explicit machines do not make the system correct. They make the **unenumerated path** a
 run-time error instead of a review finding.
 
-#### What was built — five machines and one precedence
+#### What was built — seven machines and one precedence
 
 | machine | owns | states | edges | persistence |
 |---|---|---|---|---|
@@ -1519,6 +1519,8 @@ run-time error instead of a review finding.
 | `run_phase` | where is this run, readable from the destination *while it runs* | 9 | 23 | `_cdc_flight.heartbeat.phase` |
 | `run_outcome` | why did this run stop — cause before symptom | 10 | 45 (escalations only) | `heartbeat.terminal_reason`, `last_run.json` |
 | `acquisition_recovery` | what has this destructive recovery already done | 5 | 9 | `_cdc_flight.recovery_state.phase` |
+| `interruption_marker` | has filesystem recovery intent been armed and safely discharged | 3 | 2 | `<state_dir>/resnapshot/interrupted.json.state` |
+| `destination_ownership` | who owns the destination after callback admission or failed quiescence | 4 | 5 | **memory only** |
 | `catalog_change` | where is one DDL fact in observe → confirm → fence → apply | 9 | 30 | **memory only** |
 | `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
 
@@ -2118,7 +2120,7 @@ literal count rather than a judgement. That is why it is scored the way it is.*
 #### The number, and where it comes from
 
 ADR §19/A51 enumerates every raise site, fatal log, refusal and `stop_reason` in the
-tree: **64 rows, 40 AUTO / 15 MANUAL / 9 UNDEFINED**. Fifteen manual cases is more than
+tree: **66 rows, 42 AUTO / 15 MANUAL / 9 UNDEFINED**. Fifteen manual cases is more than
 two, so the 1-band's test is met on our own evidence.
 
 The count is not recalled: `tests/4.7_self_healing/test_4_7_inventory.py` re-parses the
