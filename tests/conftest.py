@@ -33,6 +33,8 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 PG_SH = PROJECT_DIR / "scripts" / "pg.sh"
 VENV_BIN = PROJECT_DIR / ".venv" / "bin"
 TEST_PGPORT = 15432
+SANDBOX_IDLE_SECONDS = 2
+ROOT_E2E_IDLE_SECONDS = 1
 TEMPLATE_DATABASE_PREFIX = "cdc_flight_test_template_"
 WORKER_DATABASE_PREFIX = "cdc_flight_test_"
 
@@ -234,7 +236,8 @@ def _sweep_stale_test_slots(source: SourceConfig) -> None:
                 for row in conn.execute(
                     "SELECT slot_name FROM pg_replication_slots "
                     "WHERE NOT active AND database = %s "
-                    "AND (slot_name LIKE 't\\_%' OR slot_name LIKE '%\\_rs')",
+                    "AND (slot_name LIKE 't\\_' || chr(37) "
+                    "OR slot_name LIKE chr(37) || '\\_rs')",
                     (source.dbname,),
                 ).fetchall()
             ]
@@ -348,6 +351,10 @@ def run_pipeline(cdc_env: dict[str, str]):
         expect_success: bool = True,
         accept_orphan_offsets: bool = False,
     ) -> dict:
+        # The root e2e tests use the historical six-second quiet window for a
+        # shared cluster. Worker databases are local and the source rows are
+        # already committed, so a one-second quiet window is sufficient here.
+        idle_seconds = min(idle_seconds, ROOT_E2E_IDLE_SECONDS)
         return _invoke_pipeline(
             {**cdc_env, **(extra_env or {})},
             destination=destination,
@@ -544,7 +551,7 @@ class Sandbox:
     # -- pipeline ----------------------------------------------------------- #
     def run(self, *, extra_env: dict[str, str] | None = None, **kwargs) -> dict:
         kwargs.setdefault("max_seconds", 120)
-        kwargs.setdefault("idle_seconds", 6)
+        kwargs.setdefault("idle_seconds", SANDBOX_IDLE_SECONDS)
         return _invoke_pipeline({**self.env, **(extra_env or {})}, **kwargs)
 
     def spawn(
