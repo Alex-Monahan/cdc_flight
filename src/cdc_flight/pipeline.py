@@ -85,6 +85,13 @@ def run(
     reset_state: bool = False,
     accept_orphan_offsets: bool = False,
 ) -> dict:
+    """Run one Flight invocation.
+
+    This API is process-terminal after a failed callback-quiescence proof. In that one
+    state it writes the failure summary and hard-exits instead of returning or raising
+    to an in-process caller, because the callback owns resources which must not outlive
+    the lease and overlap another invocation in the same interpreter.
+    """
     # Parse CDC_FAULT_INJECT once, here, so a typo fails the run instead of
     # leaving a fault test vacuously green (Codex 9).
     fault_spec = validate_fault_env()
@@ -763,6 +770,11 @@ def run(
             reported = _decorate(result)
             return reported
         except EngineFailure as failure:
+            if (
+                failure.summary.get("applier_quiesced") is False
+                and ownership.owns(applier)
+            ):
+                ownership.transfer_to_callback(applier)
             outcome.record(failure.summary.get("stop_reason") or "engine_error")
             reported = _decorate(failure.summary)
             raise
@@ -803,12 +815,14 @@ def run(
             lease=lease,
             lease_held=lease_held,
             run_ok=run_ok,
+            hard_exit_on_transfer=True,
         )
 
 
 def _teardown_destination(
     *, con, ownership: DestinationOwnership, reported: dict | None,
     phases: RunPhaseWriter | None, lease: Lease | None, lease_held: bool, run_ok: bool,
+    hard_exit_on_transfer: bool = False,
 ) -> None:
     """Make the one terminal ownership decision for every destination handle."""
     # This also seals and retires a constructed-but-never-activated applier. Consumer
@@ -825,10 +839,23 @@ def _teardown_destination(
             reported["destination_connection_release_reason"] = "live_applier_callback"
             reported["heartbeat_sink_retirement"] = "abandoned"
             reported["heartbeat_sink_retirement_reason"] = "live_applier_callback"
+            reported["destination_ownership_state"] = ownership.state
         log.critical(
             "destination teardown skipped: a live applier callback retains exclusive "
-            "ownership; the command entrypoint will hard-exit"
+            "ownership"
         )
+        if ownership.callback_owned and hard_exit_on_transfer:
+            terminal = reported if reported is not None else {}
+            terminal.setdefault("ok", False)
+            terminal.setdefault("stop_reason", "hung")
+            terminal.setdefault(
+                "error",
+                "an admitted callback retained terminal ownership after failed "
+                "quiescence",
+            )
+            terminal.setdefault("error_type", "EngineFailure")
+            _write_summary(terminal)
+            shutdown_and_exit(1)
         return
 
     # The lease is acquired before recovery mutates state. `lease_held` rather than

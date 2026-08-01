@@ -1,4 +1,4 @@
-"""Round 9: destination ownership must compose across blocking re-snapshot.
+"""Rounds 9-10: destination ownership must compose across blocking re-snapshot.
 
 The supervisor's callback seal is only useful if every caller preserves its result.
 These tests pin the two compositions that escaped the round-8 tests: a live
@@ -26,6 +26,7 @@ from cdc_flight.config import (
     applier_settings,
 )
 from cdc_flight.errors import EngineFailure
+from cdc_flight.machines import MARKER_ARMED, MARKER_CONSUMED
 from cdc_flight.ownership import DestinationOwnership
 
 PIPELINE = "destination_ownership"
@@ -142,6 +143,7 @@ def test_resnapshot_quiescence_failure_retains_every_owned_resource(monkeypatch,
     assert (state_dir / "offsets.dat").read_bytes() == b"callback-owned"
     assert resnapshot_mod.interruption_marker(state_dir).exists()
     assert ownership.destination_quiescent is False
+    assert ownership.state == "callback_owned"
     assert raised.value.summary["resnapshot_recovery"] == "armed"
 
 
@@ -338,6 +340,54 @@ def test_live_resnapshot_owner_blocks_the_whole_pipeline_teardown(monkeypatch):
     assert reported["heartbeat_sink_retirement"] == "abandoned"
 
 
+def test_callback_owned_run_is_process_terminal(monkeypatch):
+    """MINOR-1: ``run()`` cannot return a retained owner to an in-process caller."""
+    ownership = DestinationOwnership()
+    applier = _Applier()
+    ownership.attach(applier)
+    ownership.activate(applier)
+    ownership.transfer_to_callback(applier)
+    lease = _Lease()
+    phases = _Phases()
+    reported: dict = {}
+    written: list[dict] = []
+
+    class _HardExit(BaseException):
+        pass
+
+    monkeypatch.setattr(
+        pipeline_mod, "_write_summary", lambda summary: written.append(dict(summary))
+    )
+
+    def _exit(code: int) -> None:
+        assert code == 1
+        raise _HardExit
+
+    monkeypatch.setattr(pipeline_mod, "shutdown_and_exit", _exit)
+    monkeypatch.setattr(
+        dest_mod,
+        "release_connection",
+        lambda _con: pytest.fail("terminal callback ownership released its parent"),
+    )
+
+    with pytest.raises(_HardExit):
+        pipeline_mod._teardown_destination(
+            con=object(),
+            ownership=ownership,
+            reported=reported,
+            phases=phases,
+            lease=lease,
+            lease_held=True,
+            run_ok=False,
+            hard_exit_on_transfer=True,
+        )
+
+    assert phases.calls == []
+    assert lease.release_calls == 0
+    assert written[0]["destination_ownership_state"] == "callback_owned"
+    assert written[0]["ok"] is False
+
+
 def test_next_run_requeues_an_armed_resnapshot_and_can_complete_it(tmp_path):
     """Durable filesystem intent bridges the hard-exit boundary without using `con`."""
     state_dir = tmp_path / "state" / "resnapshot"
@@ -385,3 +435,69 @@ def test_next_run_requeues_an_armed_resnapshot_and_can_complete_it(tmp_path):
     assert completed == ["app.customers"]
     assert dest_mod.tables_awaiting_snapshot(con, PIPELINE) == []
     con.close()
+
+
+@pytest.mark.parametrize(
+    ("marker_state", "expected_requests"),
+    [("absent", 0), (MARKER_ARMED, 1), (MARKER_CONSUMED, 0)],
+)
+def test_interruption_marker_recovers_from_every_crash_state(
+    monkeypatch, tmp_path, marker_state, expected_requests
+):
+    """A restart is conservative at every durable marker-machine state."""
+    state_dir = tmp_path / marker_state
+    requests: list[list[tuple[str, str, str]]] = []
+    if marker_state != "absent":
+        resnapshot_mod.arm_interruption_marker(
+            state_dir, pipeline=PIPELINE, tables=TABLES
+        )
+    if marker_state == MARKER_CONSUMED:
+        resnapshot_mod.consume_interruption_marker(state_dir)
+        payload = resnapshot_mod._read_interruption_marker(state_dir)
+        assert payload[0] == MARKER_CONSUMED, "the consumed crash cut was not durable"
+
+    monkeypatch.setattr(
+        dest_mod,
+        "request_snapshot",
+        lambda _con, *, tables, **_kwargs: requests.append(tables),
+    )
+    recovered = resnapshot_mod.requeue_interrupted(
+        object(), pipeline=PIPELINE, state_dir=state_dir
+    )
+
+    assert len(requests) == expected_requests
+    assert recovered == (["app.customers"] if expected_requests else [])
+    assert not resnapshot_mod.interruption_marker(state_dir).exists()
+
+
+def test_crash_before_marker_consumption_repeats_the_idempotent_discharge(
+    monkeypatch, tmp_path
+):
+    """Destination write first, marker transition second: a crash repeats safely."""
+    state_dir = tmp_path / "armed"
+    requests: list[list[tuple[str, str, str]]] = []
+    resnapshot_mod.arm_interruption_marker(
+        state_dir, pipeline=PIPELINE, tables=TABLES
+    )
+    monkeypatch.setattr(
+        dest_mod,
+        "request_snapshot",
+        lambda _con, *, tables, **_kwargs: requests.append(tables),
+    )
+    real_consume = resnapshot_mod.consume_interruption_marker
+
+    def _crash(_state_dir):
+        raise KeyboardInterrupt("crash after destination discharge")
+
+    monkeypatch.setattr(resnapshot_mod, "consume_interruption_marker", _crash)
+    with pytest.raises(KeyboardInterrupt, match="destination discharge"):
+        resnapshot_mod.requeue_interrupted(
+            object(), pipeline=PIPELINE, state_dir=state_dir
+        )
+    assert resnapshot_mod._read_interruption_marker(state_dir)[0] == MARKER_ARMED
+
+    monkeypatch.setattr(resnapshot_mod, "consume_interruption_marker", real_consume)
+    assert resnapshot_mod.requeue_interrupted(
+        object(), pipeline=PIPELINE, state_dir=state_dir
+    ) == ["app.customers"]
+    assert len(requests) == 2

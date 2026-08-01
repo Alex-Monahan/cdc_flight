@@ -8,28 +8,59 @@ pipeline's ownership decision.
 
 from __future__ import annotations
 
+from .machines import (
+    DESTINATION_OWNERSHIP,
+    OWNERSHIP_ACTIVE,
+    OWNERSHIP_ATTACHED,
+    OWNERSHIP_AVAILABLE,
+    OWNERSHIP_CALLBACK_OWNED,
+)
+
 
 class DestinationOwnership:
     """Track the applier which may own the destination and its child cursors."""
 
     def __init__(self) -> None:
         self._applier = None
-        self._active = False
+        self._state = OWNERSHIP_AVAILABLE
 
     def attach(self, applier) -> None:
         """Attach a constructed applier before consumer construction can fail."""
-        if self._applier is not None:
+        if self._applier is not None or self._state != OWNERSHIP_AVAILABLE:
             raise RuntimeError("a destination applier is already attached")
+        DESTINATION_OWNERSHIP.check(self._state, OWNERSHIP_ATTACHED)
         self._applier = applier
-        self._active = False
+        self._state = OWNERSHIP_ATTACHED
 
     def activate(self, applier) -> None:
         """Publish that engine callbacks may now enter this applier."""
         self._assert_owner(applier)
-        self._active = True
+        DESTINATION_OWNERSHIP.check(self._state, OWNERSHIP_ACTIVE)
+        self._state = OWNERSHIP_ACTIVE
+
+    def transfer_to_callback(self, applier) -> None:
+        """Record the supervisor's failed-quiescence verdict as a terminal handoff.
+
+        This transition is deliberately based on the supervisor's completed bounded
+        proof, not on another read of ``callback_quiesced``. Once transferred, no
+        enclosing finalizer may retire the runtime even if the callback leaves later.
+        """
+        self._assert_owner(applier)
+        if self._state == OWNERSHIP_CALLBACK_OWNED:
+            return
+        DESTINATION_OWNERSHIP.check(self._state, OWNERSHIP_CALLBACK_OWNED)
+        self._state = OWNERSHIP_CALLBACK_OWNED
 
     def owns(self, applier) -> bool:
         return self._applier is applier
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @property
+    def callback_owned(self) -> bool:
+        return self._state == OWNERSHIP_CALLBACK_OWNED
 
     @property
     def destination_quiescent(self) -> bool:
@@ -39,16 +70,12 @@ class DestinationOwnership:
         :meth:`retire_if_quiescent` seals it.  This prevents an unsealed construction
         failure from being mistaken for proof that no callback can enter.
         """
-        if self._applier is None:
+        if self._state == OWNERSHIP_AVAILABLE:
             return True
-        return self._active and bool(self._applier.callback_quiesced)
-
-    @property
-    def live_callback_owner(self) -> bool:
-        return (
-            self._applier is not None
-            and self._active
-            and not bool(self._applier.callback_quiesced)
+        if self._state == OWNERSHIP_CALLBACK_OWNED:
+            return False
+        return self._state == OWNERSHIP_ACTIVE and bool(
+            self._applier.callback_quiesced
         )
 
     def retire_if_quiescent(self, *, reason: str) -> bool:
@@ -59,15 +86,18 @@ class DestinationOwnership:
         decision as parent retirement; it is never a caller-local ``finally`` action.
         """
         applier = self._applier
-        if applier is None:
+        if self._state == OWNERSHIP_AVAILABLE:
             return True
-        if not self._active:
+        if self._state == OWNERSHIP_CALLBACK_OWNED:
+            return False
+        if self._state == OWNERSHIP_ATTACHED:
             applier.shutdown(reason=reason)
         if not bool(applier.callback_quiesced):
             return False
+        DESTINATION_OWNERSHIP.check(self._state, OWNERSHIP_AVAILABLE)
         applier.alerts.close()
         self._applier = None
-        self._active = False
+        self._state = OWNERSHIP_AVAILABLE
         return True
 
     def _assert_owner(self, applier) -> None:

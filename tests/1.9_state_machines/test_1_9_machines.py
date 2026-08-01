@@ -103,11 +103,13 @@ DECLARED = {
     # destination already holds?" was a derived expression over a registry row, a table
     # lifecycle, a destination row count and an in-process poll counter.
     "catalog_baseline",
+    "interruption_marker",
+    "destination_ownership",
 }
 
 
 def test_the_declared_machines_are_the_ones_the_review_said_to_build():
-    """The consistency-affecting states, plus the outcome precedence. Not one, not ten.
+    """The consistency-affecting states plus the outcome precedence.
 
     The architecture review said yes to five machines and no to seven other candidates;
     `machines.py`'s module docstring carries the argument for each `no`. This asserts
@@ -239,6 +241,24 @@ def test_a_recovery_can_only_be_cleared_once_it_is_armed():
     for phase in ("requested", "offsets_file_deleted", "resume_point_deleted"):
         with pytest.raises(IllegalTransition):
             m.ACQUISITION_RECOVERY.check(phase, "absent")
+
+
+def test_interruption_marker_can_only_be_consumed_after_it_is_armed():
+    m.INTERRUPTION_MARKER.check("absent", "armed")
+    m.INTERRUPTION_MARKER.check("armed", "consumed")
+    with pytest.raises(IllegalTransition):
+        m.INTERRUPTION_MARKER.check("absent", "consumed")
+    with pytest.raises(IllegalTransition):
+        m.INTERRUPTION_MARKER.check("consumed", "absent")
+
+
+def test_failed_quiescence_is_a_terminal_ownership_handoff():
+    m.DESTINATION_OWNERSHIP.check("available", "attached")
+    m.DESTINATION_OWNERSHIP.check("attached", "active")
+    m.DESTINATION_OWNERSHIP.check("active", "callback_owned")
+    assert m.DESTINATION_OWNERSHIP.is_terminal("callback_owned")
+    with pytest.raises(IllegalTransition):
+        m.DESTINATION_OWNERSHIP.check("callback_owned", "available")
 
 
 def test_a_table_cannot_become_complete_without_having_been_owed_or_snapshotted():
