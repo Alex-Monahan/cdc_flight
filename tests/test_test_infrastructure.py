@@ -129,6 +129,13 @@ def test_namespaced_base_and_resnapshot_slots_share_the_sweep_prefix():
     assert f"{base}_rs".startswith(conftest.TEST_SLOT_PREFIX)
 
 
+def test_probe_output_roots_are_disjoint_per_instance(monkeypatch):
+    monkeypatch.syspath_prepend(str(conftest.PROJECT_DIR))
+    from probes._common import probe_output_root
+
+    assert probe_output_root("pg15432") != probe_output_root("pg15436")
+
+
 @pytest.mark.parametrize("requested", [6, 10])
 def test_root_runner_preserves_explicit_proof_windows(monkeypatch, requested):
     observed: list[float] = []

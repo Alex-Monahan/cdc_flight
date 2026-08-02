@@ -6,8 +6,9 @@ they are evidence-gathering scripts for `RUBRIC_STATUS.md`, not regression tests
 and several of them deliberately break the source schema.
 
 Every probe gets its own replication slot, Debezium offset file, dlt state
-directory and DuckDB file under `probes/.out/<name>/`, so probes never collide
-with `make pipeline` or with the pytest suite.
+directory and DuckDB file under `probes/.out/<instance>/<name>/`, so probes on
+different Postgres instances never collide with each other, `make pipeline`, or
+the pytest suite.
 
 Usage:
 
@@ -33,7 +34,6 @@ import psycopg
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 PG_SH = PROJECT_DIR / "scripts" / "pg.sh"
 VENV_BIN = PROJECT_DIR / ".venv" / "bin"
-OUT_DIR = PROJECT_DIR / "probes" / ".out"
 
 
 def _instance_id() -> str:
@@ -45,6 +45,13 @@ def _instance_id() -> str:
 
 
 INSTANCE_ID = _instance_id()
+
+
+def probe_output_root(instance_id: str) -> Path:
+    return PROJECT_DIR / "probes" / ".out" / instance_id
+
+
+OUT_DIR = probe_output_root(INSTANCE_ID)
 
 sys.path.insert(0, str(PROJECT_DIR / "src"))
 
@@ -147,7 +154,7 @@ class Probe:
             "CDC_PIPELINES_DIR": str(self.dir / "cdc_state" / "dlt_pipelines"),
             "CDC_DUCKDB_PATH": str(self.duckdb_path),
             "CDC_SLOT_NAME": self.slot,
-            "CDC_PIPELINE_NAME": f"probe_{name}",
+            "CDC_PIPELINE_NAME": f"probe_{INSTANCE_ID}_{name}",
             "RUNTIME__DLTHUB_TELEMETRY": "false",
         }
         if tables:

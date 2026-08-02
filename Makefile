@@ -17,6 +17,11 @@ CDC_TEST_PGDATABASE ?= cdc_source
 CDC_TEST_TEMPLATE_DATABASE_PREFIX ?= cdc_flight_test_template_$(CDC_TEST_INSTANCE_ID)_
 CDC_TEST_WORKER_DATABASE_PREFIX ?= cdc_flight_test_$(CDC_TEST_INSTANCE_ID)_
 CDC_TEST_SLOT_PREFIX ?= test_slot_$(CDC_TEST_INSTANCE_ID)_
+CDC_INSTANCE_RUNTIME_ROOT ?= $(PROJECT_DIR)/.cdc_instances/$(CDC_TEST_INSTANCE_ID)
+CDC_STATE_DIR ?= $(CDC_INSTANCE_RUNTIME_ROOT)/cdc_state
+CDC_PIPELINES_DIR ?= $(CDC_STATE_DIR)/dlt_pipelines
+CDC_DUCKDB_PATH ?= $(CDC_INSTANCE_RUNTIME_ROOT)/cdc_flight.duckdb
+CDC_PIPELINE_NAME ?= cdc_flight_$(CDC_TEST_INSTANCE_ID)
 
 # Everything (Postgres, the JVM, DuckDB) runs natively on the host: no Docker.
 export PGHOST ?= 127.0.0.1
@@ -31,6 +36,11 @@ export CDC_TEST_PGDATABASE
 export CDC_TEST_TEMPLATE_DATABASE_PREFIX
 export CDC_TEST_WORKER_DATABASE_PREFIX
 export CDC_TEST_SLOT_PREFIX
+export CDC_INSTANCE_RUNTIME_ROOT
+export CDC_STATE_DIR
+export CDC_PIPELINES_DIR
+export CDC_DUCKDB_PATH
+export CDC_PIPELINE_NAME
 export PGPORT = $(CDC_TEST_PGPORT)
 export PGDATA = $(CDC_TEST_PGDATA)
 export PGUSER ?= postgres
@@ -147,8 +157,7 @@ lint: ## ruff
 
 .PHONY: clean-state
 clean-state: ## drop Debezium offsets, dlt pipeline state and the local DuckDB file
-	rm -rf $(PROJECT_DIR)/.cdc_state $(PROJECT_DIR)/logs
-	rm -f $(PROJECT_DIR)/cdc_flight.duckdb $(PROJECT_DIR)/cdc_flight.duckdb.wal
+	rm -rf $(CDC_INSTANCE_RUNTIME_ROOT)
 
 .PHONY: clean
 clean: clean-state ## clean-state plus caches

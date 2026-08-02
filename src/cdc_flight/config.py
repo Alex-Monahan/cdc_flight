@@ -34,6 +34,11 @@ def _default_slot_name() -> str:
     return f"{prefix}{_instance_id()}"[:63]
 
 
+def _instance_runtime_root() -> Path:
+    """Keep normal pipeline artifacts disjoint across selected instances."""
+    return PROJECT_DIR / ".cdc_instances" / _instance_id()
+
+
 @dataclass(frozen=True)
 class SourceConfig:
     """Connection details for the project-local Postgres cluster."""
@@ -77,7 +82,9 @@ class ReplicationConfig:
     topic_prefix: str = field(default_factory=lambda: _env("CDC_TOPIC_PREFIX", "cdcflight"))
     snapshot_mode: str = field(default_factory=lambda: _env("CDC_SNAPSHOT_MODE", "initial"))
     state_dir: Path = field(
-        default_factory=lambda: Path(_env("CDC_STATE_DIR", str(PROJECT_DIR / ".cdc_state")))
+        default_factory=lambda: Path(
+            _env("CDC_STATE_DIR", str(_instance_runtime_root() / "cdc_state"))
+        )
     )
 
     @property
@@ -90,11 +97,13 @@ class DestinationConfig:
     """Where dlt writes the change events."""
 
     kind: str = field(default_factory=lambda: _env("CDC_DESTINATION", "duckdb"))
-    pipeline_name: str = field(default_factory=lambda: _env("CDC_PIPELINE_NAME", "cdc_flight"))
+    pipeline_name: str = field(
+        default_factory=lambda: _env("CDC_PIPELINE_NAME", f"cdc_flight_{_instance_id()}")
+    )
     dataset_name: str = field(default_factory=lambda: _env("CDC_DATASET", "cdc_raw"))
     duckdb_path: Path = field(
         default_factory=lambda: Path(
-            _env("CDC_DUCKDB_PATH", str(PROJECT_DIR / "cdc_flight.duckdb"))
+            _env("CDC_DUCKDB_PATH", str(_instance_runtime_root() / "cdc_flight.duckdb"))
         )
     )
     motherduck_database: str = field(
@@ -102,7 +111,10 @@ class DestinationConfig:
     )
     pipelines_dir: Path = field(
         default_factory=lambda: Path(
-            _env("CDC_PIPELINES_DIR", str(PROJECT_DIR / ".cdc_state" / "dlt_pipelines"))
+            _env(
+                "CDC_PIPELINES_DIR",
+                str(_instance_runtime_root() / "cdc_state" / "dlt_pipelines"),
+            )
         )
     )
 

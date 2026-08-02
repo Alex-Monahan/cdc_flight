@@ -72,7 +72,7 @@ port 15432 and `./.pgdata_<port>` for another test port.
 make install       # uv venv + editable install (pulls the ~340 MB pydbzengine repo once)
 make up            # initdb (first time) + start Postgres on CDC_TEST_PGPORT, create cdc_source
 make seed          # apply sql/01_schema.sql and sql/02_seed.sql
-make pipeline      # Debezium snapshot + stream → ./cdc_flight.duckdb
+make pipeline      # Debezium snapshot + stream → ./.cdc_instances/pg15432/cdc_flight.duckdb
 make changes       # generate inserts/updates/deletes in Postgres
 make pipeline      # run again → the new change events land in DuckDB
 make query         # show row counts + a sample of what landed
@@ -88,13 +88,13 @@ make reset
 ### What each step actually does
 
 * **`make up`** → `scripts/pg.sh start`. First run does `initdb` into the disposable
-  derived `CDC_TEST_PGDATA` test cluster and appends `wal_level=logical`, replication capacities
+  derived `CDC_TEST_PGDATA` test cluster and configures `wal_level=logical`, replication capacities
   and test-only durability settings only after creating a disposable-cluster sentinel.
   A legacy canonical test directory can be recreated once with
   `CDC_TEST_RECREATE_UNMARKED_DISPOSABLE=1 make pg-reset`; non-derived data paths
   are always refused.
-  `16/16/4` (slots/senders/logical workers), `port=CDC_TEST_PGPORT`, and
-  `unix_socket_directories=CDC_TEST_PGSOCKET` to `postgresql.conf`. It also disables `fsync`,
+  `28/28/4` (slots/senders/logical workers), `port=CDC_TEST_PGPORT`, and
+  `unix_socket_directories=CDC_TEST_PGSOCKET`. A sentinel-gated test-only include disables `fsync`,
   `synchronous_commit`, and `full_page_writes` **only in this disposable cluster**;
   never copy those durability settings to production or a durable development database.
   Then it runs `pg_ctl start` and creates `cdc_source`.
@@ -102,9 +102,11 @@ make reset
   table with `REPLICA IDENTITY FULL`, a **TOAST**-heavy `documents` table, a `wide_types`
   table covering ~34 Postgres types, and a **partitioned** `audit_log`) and creates
   `PUBLICATION cdc_flight_pub`. `sql/02_seed.sql` inserts deterministic starting rows.
-* **`make pipeline`** → `cdc-flight`. Builds Debezium properties (see
+* **`make pipeline`** → `cdc-flight`. Its state, dlt pipeline metadata, and DuckDB
+  file live under `.cdc_instances/<instance>/`, and `make clean-state` removes only
+  that selected instance root. It builds Debezium properties (see
   `src/cdc_flight/debezium_props.py`), starts the embedded engine on a background thread,
-  and loads every batch through `dlt` into `cdc_flight.duckdb`, dataset `cdc_raw`.
+  and loads every batch through `dlt` into the instance DuckDB file, dataset `cdc_raw`.
   The run is **bounded**: it stops once the stream has been quiet for `--idle-seconds`
   (default 8) or after `--max-seconds` (default 90) — the shape a scheduled Flight needs.
 * **`make changes`** → `cdc-datagen changes`. One deterministic wave of ~25 DML statements
@@ -474,7 +476,8 @@ the 40-item Postgres-CDC decision matrix, with the evidence for each score.
 **On this branch: 2.05 / 5, five items at 5 (1.1, 1.2, 1.3, 1.4, 7.1) and 1.5 at 4.**
 
 The evidence comes from [`probes/`](probes/) — small, reproducible experiments
-(`uv run python probes/p01_dml_edge_cases.py`, output in `probes/.out/`). They
+(`uv run python probes/p01_dml_edge_cases.py`, output in
+`probes/.out/<instance>/`). They
 are *not* tests: several deliberately break the source schema, and each reseeds
 it first and uses its own replication slot, offset file and DuckDB file.
 
