@@ -96,8 +96,7 @@ os.environ.setdefault("CDC_TEST_PGLOG", str(TEST_PGLOG))
 os.environ.setdefault("CDC_TEST_PGDATABASE", TEST_PGDATABASE)
 os.environ.setdefault("CDC_TEST_INSTANCE_ID", TEST_INSTANCE_ID)
 os.environ.setdefault("CDC_TEST_SLOT_PREFIX", TEST_SLOT_PREFIX)
-SANDBOX_IDLE_SECONDS = 2
-ROOT_E2E_IDLE_SECONDS = 1
+SANDBOX_IDLE_SECONDS = 6
 
 #: Tables the pipeline replicates. Used to fingerprint the shared source so a
 #: concurrent writer produces a diagnostic instead of a mystery assertion.
@@ -425,10 +424,6 @@ def run_pipeline(cdc_env: dict[str, str]):
         expect_success: bool = True,
         accept_orphan_offsets: bool = False,
     ) -> dict:
-        # The root e2e tests use the historical six-second quiet window for a
-        # shared cluster. Worker databases are local and the source rows are
-        # already committed, so a one-second quiet window is sufficient here.
-        idle_seconds = min(idle_seconds, ROOT_E2E_IDLE_SECONDS)
         return _invoke_pipeline(
             {**cdc_env, **(extra_env or {})},
             destination=destination,
