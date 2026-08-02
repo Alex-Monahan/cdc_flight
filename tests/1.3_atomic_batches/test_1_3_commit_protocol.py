@@ -631,16 +631,33 @@ def test_resnapshot_fences_streaming_unit_after_open_snapshot_group(lab):
     assert box.applier.snapshot_completion.state == "callbacks_started"
 
 
-def test_resnapshot_overlap_during_age_and_size_trigger_stays_fenced(lab):
+@pytest.mark.parametrize("trigger_kind", ["size", "age"])
+def test_resnapshot_overlap_during_age_and_size_trigger_stays_fenced(
+    lab, trigger_kind
+):
     """A pending soft close cannot turn the overlap into live streaming."""
-    box = lab(
-        full_snapshot=True,
-        resnapshot=True,
-        commit_max_events=1,
-        snapshot_chunk_events=1,
-    )
+    if trigger_kind == "size":
+        box = lab(
+            full_snapshot=True,
+            resnapshot=True,
+            commit_max_events=1,
+            commit_max_age=60.0,
+            snapshot_chunk_events=1,
+        )
+    else:
+        box = lab(
+            full_snapshot=True,
+            resnapshot=True,
+            commit_max_events=1000,
+            commit_max_age=1.0,
+            snapshot_chunk_events=1,
+        )
     box.feed([snap("customers", 100, ident=1, marker="true")])
-    assert box.applier.group.events >= box.config.commit_max_events
+    if trigger_kind == "size":
+        assert box.applier.group.events >= box.config.commit_max_events
+    else:
+        box.applier.group.opened_at -= 2.0
+        assert box.applier._soft_trigger_hit() is True
     # This is the timer's exact request flag; the overlap is delivered before the
     # poll thread gets to honor it, which is the composition under test.
     box.applier.group.close_requested = True
