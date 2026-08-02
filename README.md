@@ -104,14 +104,16 @@ make reset
   `PUBLICATION cdc_flight_pub`. `sql/02_seed.sql` inserts deterministic starting rows.
 * **`make pipeline`** → `cdc-flight`. Its state, dlt pipeline metadata, and DuckDB
   file live under `.cdc_instances/<instance>/`. The make target first marks that exact
-  newly created project-local child as disposable. An existing child must already have
-  its exact instance sentinel. All prepare/clean writers serialize on a kernel lock for
+  newly created project-local child as disposable. An existing child is never adopted;
+  clean requires its exact instance sentinel. All prepare/clean writers serialize on a kernel lock for
   the helper's physical project directory; runtime subtrees must be mutated through
-  those writers. `make clean-state` atomically quarantines the sentinel-verified instance
-  inode beneath its verified parent, revalidates the tree, and removes entries only
-  relative to no-follow directory descriptors. It refuses cleanup if any component is a
-  symlink, leaves the verified parent/name binding, lacks its exact sentinel, or comes
-  from the removed `CDC_INSTANCE_RUNTIME_ROOT` override. It builds Debezium properties (see
+  those writers. `prepare-state` provisions one fresh sentinel-marked instance root and
+  refuses to adopt an existing or replaced directory. `make clean-state` records an
+  in-root `quarantining` state, revalidates the tree, and removes entries only relative
+  to the retained no-follow directory descriptor; a later clean resumes that state or
+  refuses loudly. It refuses cleanup if any component is a symlink, leaves the verified
+  parent/name binding, lacks its exact sentinel, or comes from the removed
+  `CDC_INSTANCE_RUNTIME_ROOT` override. It builds Debezium properties (see
   `src/cdc_flight/debezium_props.py`), starts the embedded engine on a background thread,
   and loads every batch through `dlt` into the instance DuckDB file, dataset `cdc_raw`.
   The run is **bounded**: it stops once the stream has been quiet for `--idle-seconds`
