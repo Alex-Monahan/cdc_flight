@@ -106,6 +106,7 @@ DECLARED = {
     "interruption_marker",
     "destination_ownership",
     "snapshot_completion",
+    "runtime_root_lifecycle",
 }
 
 
@@ -234,6 +235,23 @@ def test_a_recovery_cannot_skip_a_destructive_step():
         m.ACQUISITION_RECOVERY.check("requested", "armed")
     with pytest.raises(IllegalTransition):
         m.ACQUISITION_RECOVERY.check("offsets_file_deleted", "armed")
+
+
+def test_runtime_root_reactivation_is_only_legal_from_healthy_states():
+    assert m.RUNTIME_ROOT_LIFECYCLE.states == (
+        "absent",
+        "provisioning",
+        "active",
+        "quarantining",
+        "completion_recorded",
+        "deleted_recorded",
+    )
+    m.RUNTIME_ROOT_LIFECYCLE.check("absent", "provisioning")
+    m.RUNTIME_ROOT_LIFECYCLE.check("provisioning", "active")
+    m.RUNTIME_ROOT_LIFECYCLE.check("active", "active")
+    for destructive in ("quarantining", "completion_recorded", "deleted_recorded"):
+        with pytest.raises(IllegalTransition):
+            m.RUNTIME_ROOT_LIFECYCLE.check(destructive, "active")
 
 
 def test_a_recovery_can_only_be_cleared_once_it_is_armed():

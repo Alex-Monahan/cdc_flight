@@ -12,223 +12,91 @@ under a directory after the last check and before a syscall. The binding checks 
 fail-closed diagnostics; the enforceable boundary is the inherited lock.
 """
 
+# ruff: noqa: E402, I001 -- standalone helper adds sibling and project src roots.
+
 from __future__ import annotations
 
 import argparse
-import ctypes
 import fcntl
 import os
 import re
 import secrets
-import stat
 import subprocess
 import sys
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-RUNTIME_PARENT_NAME = ".cdc_instances"
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+sys.path.insert(0, str(SCRIPT_DIR))
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from runtime_state_fs import (
+    DIR_FLAGS,
+    RUNTIME_PARENT_NAME,
+    Identity,
+    Authority as _Authority,
+    close_root as _close_root,
+    delete_tree as _delete_tree_impl,
+    identity as _identity,
+    read as _read,
+    read_at as _read_at,
+    rename_root as _rename_root,
+    root_fd as _root_fd,
+    scan as _scan,
+    set_root as _set_root,
+    validate_tree as _validate_tree_impl,
+    write as _write,
+    write_exclusive as _write_exclusive,
+)
+from runtime_state_publish import rename_noreplace
+
+from cdc_flight.machines import (
+    ROOT_ABSENT,
+    ROOT_ACTIVE,
+    ROOT_COMPLETION_RECORDED,
+    ROOT_DELETED_RECORDED,
+    ROOT_PROVISIONING,
+    ROOT_QUARANTINING,
+    RUNTIME_ROOT_LIFECYCLE,
+)
+
 SENTINEL_NAME = ".cdc_flight_disposable_runtime"
 QUARANTINE_NAME = ".cdc_flight_runtime_quarantining"
 COMPLETION_PREFIX = ".cdc_flight_runtime_completion."
-DIR_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_DIRECTORY | os.O_NOFOLLOW
-READ_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
 META = {SENTINEL_NAME, QUARANTINE_NAME}
 Refusal = RuntimeError
-Identity = tuple[int, int]
-RENAME_NOREPLACE = 1
-RENAME_EXCL = 4
 
 
 @dataclass
-class _Authority:
-    """The one retained authority for a project, parent and selected instance."""
+class _Lifecycle:
+    """The sole writer of one classified runtime-root lifecycle state."""
 
-    project_fd: int
-    parent_fd: int
-    parent_identity: Identity
-    parent_display: Path
-    root_name: str | None = None
-    root_fd: int | None = None
-    root_identity: Identity | None = None
-    root_display: Path | None = None
+    state: str
 
-    def check(self, phase: str) -> None:
-        """Check the retained bindings while the authority lock is held."""
-        _check_binding(
-            self.project_fd,
-            RUNTIME_PARENT_NAME,
-            self.parent_fd,
-            self.parent_identity,
-            self.parent_display,
-            phase,
-        )
-        if self.root_fd is None or self.root_name is None or self.root_identity is None:
-            return
-        if self.root_display is None:  # pragma: no cover - internal construction guard
-            raise Refusal("runtime authority has no root display path")
-        _check_binding(
-            self.parent_fd,
-            self.root_name,
-            self.root_fd,
-            self.root_identity,
-            self.root_display,
-            phase,
-        )
+    def __post_init__(self) -> None:
+        self.state = RUNTIME_ROOT_LIFECYCLE.parse(self.state)
+
+    def to(self, target: str) -> None:
+        RUNTIME_ROOT_LIFECYCLE.check(self.state, target)
+        self.state = target
 
 
 def _checkpoint(name: str, path: Path) -> None:
     pass
 
 
-def _identity(fd: int) -> Identity:
-    info = os.fstat(fd)
-    return info.st_dev, info.st_ino
-
-
-def _check_binding(
-    parent_fd: int,
-    name: str,
-    fd: int,
-    expected: Identity,
-    display: Path,
-    phase: str,
-) -> None:
-    try:
-        path_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        held = _identity(fd)
-    except OSError as exc:
-        raise Refusal(
-            f"runtime directory left its verified parent {phase}: {display}: {exc}"
-        ) from exc
-    path_identity = path_info.st_dev, path_info.st_ino
-    if held != expected or path_identity != expected:
-        raise Refusal(f"runtime directory changed {phase}: {display}")
-
-
-def _root_fd(authority: _Authority) -> int:
-    if authority.root_fd is None:
-        raise Refusal("runtime authority has no selected instance root")
-    return authority.root_fd
-
-
-def _close_root(authority: _Authority) -> None:
-    if authority.root_fd is not None:
-        with suppress(OSError):
-            os.close(authority.root_fd)
-    authority.root_name = None
-    authority.root_fd = None
-    authority.root_identity = None
-    authority.root_display = None
-
-
-def _set_root(
-    authority: _Authority,
-    name: str,
-    fd: int,
-    identity: Identity,
-    display: Path,
-) -> None:
-    _close_root(authority)
-    authority.root_name = name
-    authority.root_fd = fd
-    authority.root_identity = identity
-    authority.root_display = display
-
-
-def _read_at(fd: int, name: str, limit: int, *, missing: bool = False) -> bytes | None:
-    try:
-        with os.fdopen(os.open(name, READ_FLAGS, dir_fd=fd), "rb") as stream:
-            return stream.read(limit)
-    except FileNotFoundError:
-        if missing:
-            return None
-        raise
-
-
-def _read(authority: _Authority, name: str, limit: int, *, missing: bool = False) -> bytes | None:
-    try:
-        return _read_at(_root_fd(authority), name, limit, missing=missing)
-    except FileNotFoundError as exc:
-        display = authority.root_display or authority.parent_display
-        raise Refusal(f"missing runtime metadata {display / name}") from exc
-
-
-def _write_exclusive(fd: int, name: str, data: bytes) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
-    flags |= os.O_NOFOLLOW
-    try:
-        with os.fdopen(os.open(name, flags, 0o600, dir_fd=fd), "wb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-    except BaseException:
-        with suppress(FileNotFoundError):
-            os.unlink(name, dir_fd=fd)
-        raise
-
-
-def _write(authority: _Authority, name: str, data: bytes) -> None:
-    _write_exclusive(_root_fd(authority), name, data)
-
-
-def _scan(fd: int) -> list[str]:
-    with os.scandir(fd) as entries:
-        return [entry.name for entry in entries]
-
-
 def _validate_tree(fd: int, display: Path, authority: _Authority) -> None:
-    for name in _scan(fd):
-        if fd == authority.root_fd and name in META:
-            continue
-        path = display / name
-        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
-        if stat.S_ISLNK(info.st_mode):
-            raise Refusal(f"runtime path is a symlink: {path}")
-        if not stat.S_ISDIR(info.st_mode):
-            continue
-        _checkpoint("before_child_open", path)
-        child_fd = os.open(name, DIR_FLAGS, dir_fd=fd)
-        try:
-            _checkpoint("after_child_open", path)
-            _check_binding(
-                fd,
-                name,
-                child_fd,
-                (info.st_dev, info.st_ino),
-                path,
-                "while opening",
-            )
-            _validate_tree(child_fd, path, authority)
-        finally:
-            os.close(child_fd)
+    _validate_tree_impl(
+        fd, display, authority, metadata=META, checkpoint=_checkpoint
+    )
 
 
 def _delete_tree(fd: int, display: Path, authority: _Authority) -> None:
-    for name in _scan(fd):
-        if fd == authority.root_fd and name in META:
-            continue
-        authority.check("before deletion")
-        path = display / name
-        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
-        if stat.S_ISLNK(info.st_mode):
-            raise Refusal(f"runtime path is a symlink: {path}")
-        if not stat.S_ISDIR(info.st_mode):
-            os.unlink(name, dir_fd=fd)
-            continue
-        _checkpoint("before_delete_child_open", path)
-        child_fd = os.open(name, DIR_FLAGS, dir_fd=fd)
-        try:
-            _checkpoint("after_delete_child_open", path)
-            child_identity = info.st_dev, info.st_ino
-            _check_binding(fd, name, child_fd, child_identity, path, "while opening")
-            _checkpoint("after_delete_child_verify", path)
-            _check_binding(fd, name, child_fd, child_identity, path, "before deletion")
-            _delete_tree(child_fd, path, authority)
-            _check_binding(fd, name, child_fd, child_identity, path, "before removal")
-        finally:
-            os.close(child_fd)
-        os.rmdir(name, dir_fd=fd)
+    _delete_tree_impl(
+        fd, display, authority, metadata=META, checkpoint=_checkpoint
+    )
 
 
 def _sentinel(instance_id: str) -> bytes:
@@ -237,44 +105,12 @@ def _sentinel(instance_id: str) -> bytes:
     ).encode()
 
 
-def _rename_noreplace(parent_fd: int, source: str, target: str) -> None:
-    """Atomically publish ``source`` without ever replacing ``target``."""
-    libc = ctypes.CDLL(None, use_errno=True)
-    source_bytes = os.fsencode(source)
-    target_bytes = os.fsencode(target)
-    if sys.platform == "darwin":
-        rename = libc.renameatx_np
-        rename.argtypes = [
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        ]
-        result = rename(parent_fd, source_bytes, parent_fd, target_bytes, RENAME_EXCL)
-    elif sys.platform.startswith("linux"):
-        try:
-            rename = libc.renameat2
-        except AttributeError as exc:  # pragma: no cover - old libc fails closed
-            raise Refusal("atomic no-replace directory publication is unavailable") from exc
-        rename.argtypes = [
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        ]
-        result = rename(
-            parent_fd, source_bytes, parent_fd, target_bytes, RENAME_NOREPLACE
-        )
-    else:  # pragma: no cover - unsupported platforms fail closed
-        raise Refusal("atomic no-replace directory publication is unavailable")
-    if result != 0:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error), target)
-
-
-def _provision(authority: _Authority, instance_id: str, display: Path) -> None:
+def _provision(
+    authority: _Authority,
+    lifecycle: _Lifecycle,
+    instance_id: str,
+    display: Path,
+) -> None:
     authority.check("before provisioning")
     _checkpoint("before_target_mkdir", display)
     private_name = (
@@ -284,6 +120,7 @@ def _provision(authority: _Authority, instance_id: str, display: Path) -> None:
         os.mkdir(private_name, 0o700, dir_fd=authority.parent_fd)
     except FileExistsError as exc:
         raise Refusal(f"cannot allocate private runtime directory for {display}") from exc
+    lifecycle.to(ROOT_PROVISIONING)
 
     # mkdir has no portable fd-returning form. The retained project lock makes the
     # mkdir -> open -> fstat sequence one authority critical section for cooperating
@@ -303,16 +140,17 @@ def _provision(authority: _Authority, instance_id: str, display: Path) -> None:
         os.fsync(_root_fd(authority))
         _checkpoint("before_target_publish", display)
         try:
-            _rename_noreplace(authority.parent_fd, private_name, instance_id)
+            rename_noreplace(authority.parent_fd, private_name, instance_id)
         except FileExistsError as exc:
             raise Refusal(
                 f"cannot provision {display}: existing root is not adopted; "
                 "verify its sentinel"
             ) from exc
-        authority.root_name = instance_id
+        _rename_root(authority, instance_id, display)
         os.fsync(authority.parent_fd)
         _checkpoint("after_target_mkdir", display)
         authority.check("after publication")
+        lifecycle.to(ROOT_ACTIVE)
     except BaseException as original:
         try:
             authority.check("during rollback")
@@ -324,6 +162,8 @@ def _provision(authority: _Authority, instance_id: str, display: Path) -> None:
                 os.unlink(metadata, dir_fd=_root_fd(authority))
         with suppress(OSError):
             os.rmdir(authority.root_name, dir_fd=authority.parent_fd)
+        if lifecycle.state == ROOT_PROVISIONING:
+            lifecycle.to(ROOT_ABSENT)
         _close_root(authority)
         raise
 
@@ -369,7 +209,9 @@ def _ensure_completion_record(authority: _Authority) -> str:
     return name
 
 
-def _finish_recorded(authority: _Authority, record_name: str) -> None:
+def _finish_recorded(
+    authority: _Authority, lifecycle: _Lifecycle, record_name: str
+) -> None:
     if authority.root_name is None or authority.root_display is None:
         raise Refusal("cannot finish an unselected runtime root")
     _checkpoint("before_target_rmdir", authority.root_display)
@@ -388,20 +230,26 @@ def _finish_recorded(authority: _Authority, record_name: str) -> None:
     authority.check("before removal")
     os.rmdir(authority.root_name, dir_fd=authority.parent_fd)
     os.fsync(authority.parent_fd)
+    lifecycle.to(ROOT_DELETED_RECORDED)
+    _checkpoint("after_target_rmdir", authority.root_display)
     os.unlink(record_name, dir_fd=authority.parent_fd)
     os.fsync(authority.parent_fd)
+    lifecycle.to(ROOT_ABSENT)
 
 
-def _finish(authority: _Authority) -> None:
+def _finish(authority: _Authority, lifecycle: _Lifecycle) -> None:
     record_name = _ensure_completion_record(authority)
+    lifecycle.to(ROOT_COMPLETION_RECORDED)
     display = authority.root_display or authority.parent_display
     _checkpoint("after_parent_completion", display)
-    _finish_recorded(authority, record_name)
+    _finish_recorded(authority, lifecycle, record_name)
 
 
-def _clean(authority: _Authority, instance_id: str) -> None:
+def _clean(
+    authority: _Authority, lifecycle: _Lifecycle, instance_id: str
+) -> None:
     expected = _sentinel(instance_id)
-    quarantining = _read(authority, QUARANTINE_NAME, 1, missing=True) is not None
+    quarantining = lifecycle.state == ROOT_QUARANTINING
     if _read(authority, SENTINEL_NAME, len(expected) + 1) != expected:
         display = authority.root_display or authority.parent_display
         raise Refusal(f"invalid sentinel {display / SENTINEL_NAME}")
@@ -412,12 +260,15 @@ def _clean(authority: _Authority, instance_id: str) -> None:
         authority.check("before quarantine")
         _write(authority, QUARANTINE_NAME, b"")
         os.fsync(_root_fd(authority))
+        lifecycle.to(ROOT_QUARANTINING)
         _checkpoint("after_quarantine", display)
+    else:
+        RUNTIME_ROOT_LIFECYCLE.check(ROOT_QUARANTINING, ROOT_QUARANTINING)
     _checkpoint("before_delete_tree", display)
     authority.check("before deletion")
     _validate_tree(_root_fd(authority), display, authority)
     _delete_tree(_root_fd(authority), display, authority)
-    _finish(authority)
+    _finish(authority, lifecycle)
 
 
 def _open_root(authority: _Authority, instance_id: str, display: Path) -> bool:
@@ -448,26 +299,116 @@ def _open_owned_root(authority: _Authority, instance_id: str, display: Path) -> 
         raise
 
 
-def _reconcile_completion(
+def _private_pattern(instance_id: str) -> re.Pattern[str]:
+    return re.compile(
+        rf"\.{re.escape(instance_id)}\.provision\.[0-9]+\.[0-9a-f]{{16}}"
+    )
+
+
+def _classify_lifecycle(
     authority: _Authority, instance_id: str, display: Path
-) -> bool:
+) -> _Lifecycle:
+    """Classify every durable marker combination or refuse it loudly."""
+    _close_root(authority)
+    names = set(_scan(authority.parent_fd))
+    record_name = _record_name(instance_id)
+    private_prefix = f".{instance_id}.provision."
+    private_observations = sorted(
+        name for name in names if name.startswith(private_prefix)
+    )
+    staged = [
+        name
+        for name in private_observations
+        if _private_pattern(instance_id).fullmatch(name)
+    ]
+    malformed = sorted(set(private_observations) - set(staged))
+    public_present = instance_id in names
+    record_data = _read_at(authority.parent_fd, record_name, 256, missing=True)
+
+    if malformed:
+        raise Refusal(
+            f"malformed private provisioning observations exist for {display}: "
+            f"{malformed}; refusing an unenumerated lifecycle observation"
+        )
+    if len(staged) > 1:
+        raise Refusal(
+            f"multiple private provisioning roots exist for {display}: {staged}; "
+            "refusing an unenumerated lifecycle observation"
+        )
+    if staged:
+        if public_present or record_data is not None:
+            raise Refusal(
+                f"private provisioning root {staged[0]} coexists with public or "
+                f"completion state for {display}; refusing an unenumerated lifecycle"
+            )
+        name = staged[0]
+        staged_display = authority.parent_display / name
+        fd = os.open(name, DIR_FLAGS, dir_fd=authority.parent_fd)
+        _set_root(authority, name, fd, _identity(fd), staged_display)
+        authority.check("while reconciling private provisioning")
+        entries = set(_scan(fd))
+        sentinel = _read_at(fd, SENTINEL_NAME, len(_sentinel(instance_id)) + 1, missing=True)
+        if entries == set():
+            return _Lifecycle(ROOT_PROVISIONING)
+        if entries == {SENTINEL_NAME} and sentinel == _sentinel(instance_id):
+            return _Lifecycle(ROOT_PROVISIONING)
+        raise Refusal(
+            f"private provisioning root {staged_display} has unexpected content "
+            f"{sorted(entries)}; recovery only owns an empty or exact sentinel root"
+        )
+
+    if public_present:
+        if record_data is not None:
+            _open_root(authority, instance_id, display)
+            expected_identity = _parse_record(record_data, instance_id, display)
+            if authority.root_identity != expected_identity:
+                raise Refusal(f"completion record no longer owns {display}")
+            return _Lifecycle(ROOT_COMPLETION_RECORDED)
+        _open_owned_root(authority, instance_id, display)
+        if _read(authority, QUARANTINE_NAME, 1, missing=True) is not None:
+            return _Lifecycle(ROOT_QUARANTINING)
+        return _Lifecycle(ROOT_ACTIVE)
+
+    if record_data is not None:
+        _parse_record(record_data, instance_id, display)
+        return _Lifecycle(ROOT_DELETED_RECORDED)
+    return _Lifecycle(ROOT_ABSENT)
+
+
+def _reconcile_private(authority: _Authority, lifecycle: _Lifecycle) -> None:
+    if lifecycle.state != ROOT_PROVISIONING or authority.root is None:
+        raise Refusal("private-root reconciliation requires provisioning state")
+    name = authority.root.name
+    with suppress(FileNotFoundError):
+        os.unlink(SENTINEL_NAME, dir_fd=authority.root.fd)
+    os.fsync(authority.root.fd)
+    authority.check("before private-root removal")
+    os.rmdir(name, dir_fd=authority.parent_fd)
+    os.fsync(authority.parent_fd)
+    lifecycle.to(ROOT_ABSENT)
+    _close_root(authority)
+
+
+def _reconcile_completion(
+    authority: _Authority,
+    lifecycle: _Lifecycle,
+    instance_id: str,
+) -> None:
     name = _record_name(instance_id)
-    data = _read_at(authority.parent_fd, name, 256, missing=True)
-    if data is None:
-        return False
-    expected_identity = _parse_record(data, instance_id, display)
-    if not _open_root(authority, instance_id, display):
-        authority.check("before completion-record removal")
-        os.unlink(name, dir_fd=authority.parent_fd)
-        os.fsync(authority.parent_fd)
-        return True
-    try:
-        if authority.root_identity != expected_identity:
-            raise Refusal(f"completion record no longer owns {display}")
-        _finish_recorded(authority, name)
-        return True
-    finally:
-        _close_root(authority)
+    if lifecycle.state == ROOT_COMPLETION_RECORDED:
+        try:
+            _finish_recorded(authority, lifecycle, name)
+        finally:
+            _close_root(authority)
+        return
+    if lifecycle.state != ROOT_DELETED_RECORDED:
+        raise Refusal(
+            f"completion reconciliation cannot consume {lifecycle.state!r} state"
+        )
+    authority.check("before completion-record removal")
+    os.unlink(name, dir_fd=authority.parent_fd)
+    os.fsync(authority.parent_fd)
+    lifecycle.to(ROOT_ABSENT)
 
 
 def _open_authority(project_fd: int, project: Path, command: str) -> _Authority | None:
@@ -508,15 +449,39 @@ def _run(command: str, instance_id: str, child_command: list[str] | None = None)
         display = authority.parent_display / instance_id
         if command == "run" and not child_command:
             raise Refusal("run requires a command after --")
-        completed = _reconcile_completion(authority, instance_id, display)
-        if command == "clean" and completed:
-            return 0
+        lifecycle = _classify_lifecycle(authority, instance_id, display)
+        if lifecycle.state == ROOT_PROVISIONING:
+            _reconcile_private(authority, lifecycle)
         if command in {"prepare", "run"}:
-            if not _open_owned_root(authority, instance_id, display):
-                _provision(authority, instance_id, display)
-        elif _open_owned_root(authority, instance_id, display):
-            _clean(authority, instance_id)
+            if lifecycle.state in {
+                ROOT_QUARANTINING,
+                ROOT_COMPLETION_RECORDED,
+                ROOT_DELETED_RECORDED,
+            }:
+                raise Refusal(
+                    f"runtime root {display} is {lifecycle.state} and cannot be "
+                    f"reactivated by {command}; run `scripts/runtime_state.sh clean` "
+                    "to complete destructive recovery, then retry"
+                )
+            if lifecycle.state == ROOT_ABSENT:
+                _provision(authority, lifecycle, instance_id, display)
+            elif lifecycle.state == ROOT_ACTIVE:
+                lifecycle.to(ROOT_ACTIVE)
+            else:  # every other state was handled above
+                raise Refusal(
+                    f"persistent command observed unhandled lifecycle {lifecycle.state!r}"
+                )
+        elif lifecycle.state in {ROOT_ACTIVE, ROOT_QUARANTINING}:
+            _clean(authority, lifecycle, instance_id)
+        elif lifecycle.state in {ROOT_COMPLETION_RECORDED, ROOT_DELETED_RECORDED}:
+            _reconcile_completion(authority, lifecycle, instance_id)
+        elif lifecycle.state != ROOT_ABSENT:
+            raise Refusal(f"clean observed unhandled lifecycle {lifecycle.state!r}")
         if command == "run":
+            if lifecycle.state != ROOT_ACTIVE:
+                raise Refusal(
+                    f"child launch requires active runtime root, got {lifecycle.state!r}"
+                )
             return subprocess.run(
                 child_command,
                 cwd=project,

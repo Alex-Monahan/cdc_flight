@@ -170,12 +170,6 @@ def run_engine_bounded(
                     health is None
                     or health.may_declare_idle(min_seconds=run.idle_seconds)
                 )
-                if source_idle and health is not None:
-                    # A full snapshot with no rows has no terminal record. The same
-                    # source gate that proves stream idleness now supplies the one
-                    # positive empty-phase edge; a snapshot with records remains
-                    # pending until its committed Debezium marker arrives.
-                    completion.observe_source_streaming()
                 if source_idle and completion.phase_ended:
                     if catalog is not None and not final_poll_done:
                         # The synchronous final poll. A DROP that happened after the

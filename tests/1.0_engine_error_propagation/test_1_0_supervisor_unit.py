@@ -106,6 +106,36 @@ class EmptySnapshotHealth:
         return {"slot_health": "streaming"}
 
 
+class UnknownNeverSampledHealth(EmptySnapshotHealth):
+    ever_sampled = False
+
+    def summary(self):
+        return {"slot_health": "unknown_never_sampled", "slot_ever_sampled": False}
+
+
+class DelayedSnapshotCallbackEngine(FakeEngine):
+    """Debezium has reached streaming while snapshot callbacks wait under load."""
+
+    def __init__(self, completion, *, delay=0.2):
+        super().__init__(run_seconds=1.0)
+        self.completion = completion
+        self.delay = delay
+
+    def run(self):
+        time.sleep(self.delay)
+        self.completion.observe_notification("STARTED", {})
+        self.completion.observe_notification(
+            "TABLE_SCAN_COMPLETED",
+            {
+                "scanned_collection": "app.customers",
+                "status": "SUCCEEDED",
+                "total_rows_scanned": "0",
+            },
+        )
+        self.completion.observe_notification("COMPLETED", {})
+        time.sleep(self._run_seconds)
+
+
 def _run_cfg(**kwargs) -> RunConfig:
     return RunConfig(**{"max_seconds": 5, "idle_seconds": 1, "min_records": 0, **kwargs})
 
@@ -191,20 +221,39 @@ def test_initial_snapshot_cannot_declare_idle_with_zero_records():
     assert "snapshot did not complete" in str(excinfo.value)
 
 
-def test_all_empty_snapshot_completes_from_source_streaming_evidence():
+def test_streaming_observation_waits_for_load_delayed_snapshot_callbacks():
+    completion = SnapshotCompletion.full_snapshot({"app.customers"})
     handler = FakeHandler(snapshot_completion_required=True)
     handler.seconds_since_last_batch = 99
     summary = run_engine_bounded(
-        FakeEngine(run_seconds=1),
+        DelayedSnapshotCallbackEngine(completion),
         handler,
-        _run_cfg(max_seconds=2, idle_seconds=0.01, close_timeout=1),
+        _run_cfg(max_seconds=2, idle_seconds=0.01, close_timeout=2),
         health=EmptySnapshotHealth(),
-        completion=SnapshotCompletion.full_snapshot(),
+        completion=completion,
     )
 
     assert summary["stop_reason"] == "idle"
-    assert summary["snapshot_completion_state"] == "empty_complete"
+    assert summary["elapsed_sec"] >= 0.15
+    assert summary["snapshot_completion_state"] == "callbacks_complete"
     assert summary["snapshot_completed"] is True
+
+
+def test_unknown_never_sampled_cannot_complete_a_required_snapshot():
+    handler = FakeHandler(snapshot_completion_required=True)
+    handler.seconds_since_last_batch = 99
+
+    with pytest.raises(EngineFailure) as excinfo:
+        run_engine_bounded(
+            FakeEngine(run_seconds=1),
+            handler,
+            _run_cfg(max_seconds=0.3, idle_seconds=0.01, close_timeout=1),
+            health=UnknownNeverSampledHealth(),
+            completion=SnapshotCompletion.full_snapshot({"app.customers"}),
+        )
+
+    assert excinfo.value.summary["snapshot_completion_state"] == "awaiting_callbacks"
+    assert excinfo.value.summary["stop_reason"] == "max_seconds"
 
 
 def test_a_non_quiescent_callback_keeps_ownership_and_is_not_drained():

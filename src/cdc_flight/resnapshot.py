@@ -374,7 +374,7 @@ def run(
     health = None
     applier = None
     source_stopped = False
-    completion = SnapshotCompletion.full_snapshot()
+    completion = SnapshotCompletion.full_snapshot(include)
     try:
         applier = Applier(
             con,

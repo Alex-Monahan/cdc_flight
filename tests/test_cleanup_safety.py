@@ -23,8 +23,12 @@ def isolated_project(tmp_path: Path) -> Path:
     project = tmp_path / "project"
     scripts = project / "scripts"
     scripts.mkdir(parents=True)
-    for source in RUNTIME_STATE.parent.glob("runtime_state.*"):
+    for source in RUNTIME_STATE.parent.glob("runtime_state*"):
         shutil.copy2(source, scripts / source.name)
+    package = project / "src" / "cdc_flight"
+    package.mkdir(parents=True)
+    for name in ("__init__.py", "states.py", "machines.py"):
+        shutil.copy2(PROJECT_DIR / "src" / "cdc_flight" / name, package / name)
     shutil.copy2(PROJECT_DIR / "Makefile", project / "Makefile")
     return project
 
@@ -602,13 +606,11 @@ def test_clean_binds_runtime_parent_to_physical_project(
     assert (escaped / instance / marker.name).read_text() == "preserved\n"
 
 
-@pytest.mark.parametrize("retry_command", ["clean", "prepare"])
 def test_parent_completion_record_recovers_after_final_marker_removal(
     isolated_project: Path,
     monkeypatch: pytest.MonkeyPatch,
-    retry_command: str,
 ):
-    instance = f"cleanup_terminal_recovery_{retry_command}"
+    instance = "cleanup_terminal_recovery_clean"
     parent = isolated_project / ".cdc_instances"
     target = parent / instance
     prepared = _runtime_state(
@@ -632,12 +634,48 @@ def test_parent_completion_record_recovers_after_final_marker_removal(
     assert completion.exists()
 
     monkeypatch.undo()
-    module._run(retry_command, instance)
+    module._run("clean", instance)
     assert not completion.exists()
-    if retry_command == "prepare":
-        assert (target / module.SENTINEL_NAME).exists()
-    else:
-        assert not target.exists()
+    assert not target.exists()
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "expected_state"),
+    [
+        ("after_terminal_markers_removed", "completion_recorded"),
+        ("after_target_rmdir", "deleted_recorded"),
+    ],
+)
+@pytest.mark.parametrize("command", ["prepare", "run"])
+def test_persistent_commands_refuse_recorded_destructive_states(
+    isolated_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint: str,
+    expected_state: str,
+    command: str,
+):
+    instance = f"cleanup_recorded_refusal_{expected_state}_{command}"
+    target = isolated_project / ".cdc_instances" / instance
+    prepared = _runtime_state(
+        isolated_project, "prepare", CDC_TEST_INSTANCE_ID=instance
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    (target / "payload").write_text("delete me\n")
+    module = _load_runtime_state(isolated_project)
+
+    def interrupt(event: str, _path: Path) -> None:
+        if event == checkpoint:
+            raise OSError("injected recorded-state interruption")
+
+    monkeypatch.setattr(module, "_checkpoint", interrupt)
+    with pytest.raises(OSError, match="recorded-state interruption"):
+        module._run("clean", instance)
+    monkeypatch.undo()
+
+    child = [sys.executable, "-c", "raise SystemExit('child must not run')"]
+    with pytest.raises(module.Refusal, match=expected_state) as raised:
+        module._run(command, instance, child if command == "run" else None)
+    assert "runtime_state.sh clean" in str(raised.value)
 
 
 def test_run_holds_project_lock_for_pipeline_mutation_lifetime(
@@ -823,3 +861,87 @@ def test_clean_recovers_an_interrupted_quarantine(
     monkeypatch.undo()
     module._run("clean", instance)
     assert not target.exists()
+
+
+@pytest.mark.parametrize("command", ["prepare", "run"])
+@pytest.mark.parametrize("partially_swept", [False, True])
+def test_persistent_commands_refuse_a_destructive_quarantine(
+    isolated_project: Path,
+    command: str,
+    partially_swept: bool,
+):
+    instance = f"cleanup_quarantine_refusal_{command}_{int(partially_swept)}"
+    target = isolated_project / ".cdc_instances" / instance
+    prepared = _runtime_state(
+        isolated_project, "prepare", CDC_TEST_INSTANCE_ID=instance
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    old_payload = target / "old-payload"
+    old_payload.write_text("old\n")
+    (target / ".cdc_flight_runtime_quarantining").write_bytes(b"")
+    if partially_swept:
+        old_payload.unlink()
+    child_marker = target / "child-ran"
+    child = [
+        sys.executable,
+        "-c",
+        f"from pathlib import Path; Path({str(child_marker)!r}).touch()",
+    ]
+
+    proc = _runtime_state(
+        isolated_project,
+        command,
+        child if command == "run" else None,
+        CDC_TEST_INSTANCE_ID=instance,
+    )
+
+    assert proc.returncode == 2
+    assert not child_marker.exists()
+    assert "quarantining" in proc.stderr
+    assert "clean" in proc.stderr
+
+
+def test_hard_exit_private_root_is_reconciled_by_the_next_invocation(
+    isolated_project: Path,
+):
+    instance = "cleanup_private_hard_exit"
+    helper = isolated_project / "scripts" / "runtime_state.py"
+    code = (
+        "import importlib.util, os, sys; "
+        f"p={str(helper)!r}; "
+        "s=importlib.util.spec_from_file_location('hard_exit_runtime', p); "
+        "m=importlib.util.module_from_spec(s); sys.modules[s.name]=m; s.loader.exec_module(m); "
+        "m._checkpoint=lambda event, path: os._exit(99) "
+        "if event == 'before_target_publish' else None; "
+        f"m._run('prepare', {instance!r})"
+    )
+    cut = subprocess.run([sys.executable, "-c", code], cwd=isolated_project)
+    assert cut.returncode == 99
+    parent = isolated_project / ".cdc_instances"
+    assert len(list(parent.glob(f".{instance}.provision.*"))) == 1
+
+    recovered = _runtime_state(
+        isolated_project, "prepare", CDC_TEST_INSTANCE_ID=instance
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not list(parent.glob(f".{instance}.provision.*"))
+    assert (parent / instance / ".cdc_flight_disposable_runtime").exists()
+
+
+def test_malformed_private_root_is_an_unenumerated_loud_refusal(
+    isolated_project: Path,
+):
+    instance = "cleanup_malformed_private"
+    parent = isolated_project / ".cdc_instances"
+    parent.mkdir()
+    malformed = parent / f".{instance}.provision.not-a-declared-shape"
+    malformed.mkdir()
+
+    refused = _runtime_state(
+        isolated_project, "prepare", CDC_TEST_INSTANCE_ID=instance
+    )
+
+    assert refused.returncode == 2
+    assert "unenumerated lifecycle observation" in refused.stderr
+    assert malformed.exists()

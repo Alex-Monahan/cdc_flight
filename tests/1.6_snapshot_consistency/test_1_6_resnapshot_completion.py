@@ -7,8 +7,8 @@ Opus BLOCKER-1). Two independent halves of the same claim:
    one swap happened and no table is currently mid-snapshot". At a Debezium batch
    boundary that lands between table A's last record and table B's first, *no* table is
    mid-snapshot and A has swapped — so the supervisor stopped a two-table re-snapshot
-   after one table. The authoritative signal (Debezium's own `snapshot='last'` marker)
-   was already decoded into `CompleteUnit.snapshot_last` and simply was not used.
+   after one table. The authoritative signal is Debezium's ordered Initial Snapshot
+   `COMPLETED` callback after every per-table terminal callback.
 
 2. **The classification.** `resnapshot._finish_empty_tables` treated *every* requested
    table that had not swapped as "the source relation held no rows", and ran
@@ -50,6 +50,10 @@ def test_one_table_finishing_is_not_the_snapshot_finishing(tmp_path):
     coordinator yet. `snapshot_completed` used to flip here.
     """
     lab = Lab(tmp_path / "stop.duckdb")
+    lab.applier.snapshot_completion = SnapshotCompletion.full_snapshot(
+        {"app.customers", "app.orders"}
+    )
+    lab.applier.snapshot_completion.observe_notification("STARTED", {})
     try:
         # Table A's whole image, closed as "last for this table" but NOT as
         # "last of the snapshot" — exactly what Debezium emits when another table
@@ -59,6 +63,14 @@ def test_one_table_finishing_is_not_the_snapshot_finishing(tmp_path):
                 snap("customers", 100, ident=1, value="a"),
                 snap("customers", 100, ident=2, value="b", marker="last_in_data_collection"),
             ]
+        )
+        lab.applier.snapshot_completion.observe_notification(
+            "TABLE_SCAN_COMPLETED",
+            {
+                "scanned_collection": "app.customers",
+                "status": "SUCCEEDED",
+                "total_rows_scanned": "2",
+            },
         )
         assert lab.applier.snapshots.swaps == 1, "table A should have swapped"
         assert not lab.applier.snapshots.active, "no table is mid-snapshot here"
@@ -75,8 +87,17 @@ def test_one_table_finishing_is_not_the_snapshot_finishing(tmp_path):
                 snap("orders", 100, ident=2, value="y", marker="last"),
             ]
         )
+        lab.applier.snapshot_completion.observe_notification(
+            "TABLE_SCAN_COMPLETED",
+            {
+                "scanned_collection": "app.orders",
+                "status": "SUCCEEDED",
+                "total_rows_scanned": "2",
+            },
+        )
+        lab.applier.snapshot_completion.observe_notification("COMPLETED", {})
         assert lab.applier.snapshot_completed is True, (
-            "Debezium's own end-of-snapshot marker is the authoritative signal"
+            "Debezium's ordered end-of-snapshot callback is the authoritative signal"
         )
     finally:
         lab.close()
@@ -258,6 +279,7 @@ class _FakeApplier:
                 table=qualified.split(".")[1],
                 snapshot_last=final_seen,
                 fenced=False,
+                event_count=1,
             )
             for qualified in seen
         ]
@@ -269,27 +291,41 @@ class _FakeApplier:
                     table="customers",
                     snapshot_last=True,
                     fenced=False,
+                    event_count=1,
                 )
             ]
         self.completion.observe_committed_group(units, snapshot_active=not final_seen)
 
 
-def test_debeziums_own_marker_ends_the_snapshot_phase():
+def test_debeziums_ordered_callback_ends_the_snapshot_phase():
     applier = _FakeApplier(True, {"app.customers"})
+    applier.completion = SnapshotCompletion.full_snapshot({"app.customers"})
+    applier.completion.observe_notification("STARTED", {})
+    applier.completion.observe_notification(
+        "TABLE_SCAN_COMPLETED",
+        {
+            "scanned_collection": "app.customers",
+            "status": "SUCCEEDED",
+            "total_rows_scanned": "0",
+        },
+    )
+    applier.completion.observe_notification("COMPLETED", {})
     assert resnapshot_mod.snapshot_phase_ended(applier.completion) is True
 
 
-def test_an_entirely_empty_capture_set_ends_when_the_connector_reaches_streaming():
-    """Otherwise a genuinely empty table could never complete, on any run, for ever.
-
-    An empty capture set emits no records, so there is no record for `snapshot='last'`
-    to ride on. `stop_reason == 'idle'` is the positive evidence that the phase ended:
-    `SourceHealth.may_declare_idle()` requires the slot to have been *streaming*, and
-    the connector only streams once its snapshot is over.
-    """
-    applier = _FakeApplier(False, set())
-    applier.completion.observe_source_streaming()
-    assert resnapshot_mod.snapshot_phase_ended(applier.completion) is True
+def test_an_empty_table_ends_from_its_terminal_callback_not_streaming():
+    completion = SnapshotCompletion.full_snapshot({"app.customers"})
+    completion.observe_notification("STARTED", {})
+    completion.observe_notification(
+        "TABLE_SCAN_COMPLETED",
+        {
+            "scanned_collection": "app.customers",
+            "status": "SUCCEEDED",
+            "total_rows_scanned": "0",
+        },
+    )
+    completion.observe_notification("COMPLETED", {})
+    assert resnapshot_mod.snapshot_phase_ended(completion) is True
 
 
 def test_an_interrupted_engine_never_counts_as_an_ended_snapshot_phase():

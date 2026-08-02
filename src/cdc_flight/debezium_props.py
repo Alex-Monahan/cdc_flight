@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from .config import ReplicationConfig, SourceConfig
 from .errors import UnsafeDebeziumProperty
+from .snapshot_notifications import notification_topic
 
 # Debezium's marker for a TOASTed column whose value was not present in the WAL.
 UNAVAILABLE_VALUE_PLACEHOLDER = "__debezium_unavailable_value"
@@ -215,6 +216,12 @@ def build_properties(
         # marker and therefore no way to prove a Postgres transaction whole, so
         # the applier cannot form a commit group at all.
         "provide.transaction.metadata": "true",
+        # Debezium's sink notification is enqueued in the same ChangeEventQueue as
+        # snapshot rows. Its Initial Snapshot COMPLETED record is therefore the direct
+        # post-callback barrier used by SnapshotCompletion; source slot streaming is
+        # deliberately not completion evidence.
+        "notification.enabled.channels": "sink",
+        "notification.sink.topic.name": notification_topic(replication.topic_prefix),
         # A tombstone is a (key, null value) record; with the envelope there is
         # nothing to gain from one and a null payload must never be mistaken for
         # a data event.

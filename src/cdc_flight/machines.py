@@ -2,7 +2,7 @@
 
 Rubric 1.9 asks that *any state that can affect consistency is managed with a state
 machine approach*, and grades **an appropriate number of machines (more than one)** at
-5. This file is what "appropriate" means here: eight machines, each owning one state,
+5. This file is what "appropriate" means here: nine focused machines, each owning one state,
 each with a declared edge set — plus the frozen decision domains, which are
 classifications rather than states and are deliberately **not** dressed up as machines.
 The count is not the claim; coverage is. See SM-G for `CatalogBaseline`, the fifth
@@ -232,36 +232,104 @@ OUTCOME_FAILURES = frozenset(OUTCOME_ORDER[OUTCOME_ORDER.index("hung"):])
 # --------------------------------------------------------------------------- #
 # SM-B(iii) · SnapshotCompletion — memory only, per engine invocation
 # --------------------------------------------------------------------------- #
-SNAPSHOT_PENDING = "pending"
-SNAPSHOT_RECORD_COMPLETE = "record_complete"
-SNAPSHOT_EMPTY_COMPLETE = "empty_complete"
+SNAPSHOT_AWAITING_CALLBACKS = "awaiting_callbacks"
+SNAPSHOT_CALLBACKS_STARTED = "callbacks_started"
+SNAPSHOT_COMPLETION_NOTIFIED = "completion_notified"
+SNAPSHOT_CALLBACKS_COMPLETE = "callbacks_complete"
 SNAPSHOT_NOT_REQUIRED = "not_required"
 
 SNAPSHOT_COMPLETION = Machine(
     "snapshot_completion",
     states=(
-        SNAPSHOT_PENDING,
-        SNAPSHOT_RECORD_COMPLETE,
-        SNAPSHOT_EMPTY_COMPLETE,
+        SNAPSHOT_AWAITING_CALLBACKS,
+        SNAPSHOT_CALLBACKS_STARTED,
+        SNAPSHOT_COMPLETION_NOTIFIED,
+        SNAPSHOT_CALLBACKS_COMPLETE,
         SNAPSHOT_NOT_REQUIRED,
     ),
     edges=(
-        (SNAPSHOT_PENDING, SNAPSHOT_RECORD_COMPLETE),
-        (SNAPSHOT_PENDING, SNAPSHOT_EMPTY_COMPLETE),
-        (SNAPSHOT_RECORD_COMPLETE, SNAPSHOT_RECORD_COMPLETE),
-        (SNAPSHOT_EMPTY_COMPLETE, SNAPSHOT_EMPTY_COMPLETE),
+        (SNAPSHOT_AWAITING_CALLBACKS, SNAPSHOT_CALLBACKS_STARTED),
+        (SNAPSHOT_AWAITING_CALLBACKS, SNAPSHOT_AWAITING_CALLBACKS),
+        (SNAPSHOT_CALLBACKS_STARTED, SNAPSHOT_CALLBACKS_STARTED),
+        (SNAPSHOT_CALLBACKS_STARTED, SNAPSHOT_COMPLETION_NOTIFIED),
+        (SNAPSHOT_CALLBACKS_STARTED, SNAPSHOT_CALLBACKS_COMPLETE),
+        (SNAPSHOT_COMPLETION_NOTIFIED, SNAPSHOT_COMPLETION_NOTIFIED),
+        (SNAPSHOT_COMPLETION_NOTIFIED, SNAPSHOT_CALLBACKS_COMPLETE),
         (SNAPSHOT_NOT_REQUIRED, SNAPSHOT_NOT_REQUIRED),
     ),
     terminal=(
-        SNAPSHOT_RECORD_COMPLETE,
-        SNAPSHOT_EMPTY_COMPLETE,
+        SNAPSHOT_CALLBACKS_COMPLETE,
         SNAPSHOT_NOT_REQUIRED,
     ),
-    initial=SNAPSHOT_PENDING,
+    initial=SNAPSHOT_AWAITING_CALLBACKS,
     durable=None,
     purpose=(
-        "Has this engine invocation's snapshot phase ended, proven either by a "
-        "committed Debezium terminal record or by a source-confirmed empty phase?"
+        "Has Debezium's ordered callback queue delivered every per-table terminal "
+        "mark and the initial-snapshot COMPLETED notification, with every declared "
+        "row callback committed?"
+    ),
+)
+
+SNAPSHOT_CALLBACK_OBSERVATIONS = Domain(
+    "snapshot_callback_observations",
+    values=(
+        "STARTED",
+        "IN_PROGRESS",
+        "TABLE_SCAN_COMPLETED",
+        "TABLE_CHUNK_IN_PROGRESS",
+        "TABLE_CHUNK_COMPLETED",
+        "COMPLETED",
+        "SKIPPED",
+        "ABORTED",
+    ),
+    purpose=(
+        "The complete Debezium Initial Snapshot notification vocabulary accepted at "
+        "the Python callback boundary; an unknown callback is a loud protocol error."
+    ),
+)
+
+
+# --------------------------------------------------------------------------- #
+# SM-B(iv) · RuntimeRootLifecycle — durable, project-local filesystem markers
+# --------------------------------------------------------------------------- #
+ROOT_ABSENT = "absent"
+ROOT_PROVISIONING = "provisioning"
+ROOT_ACTIVE = "active"
+ROOT_QUARANTINING = "quarantining"
+ROOT_COMPLETION_RECORDED = "completion_recorded"
+ROOT_DELETED_RECORDED = "deleted_recorded"
+
+RUNTIME_ROOT_LIFECYCLE = Machine(
+    "runtime_root_lifecycle",
+    states=(
+        ROOT_ABSENT,
+        ROOT_PROVISIONING,
+        ROOT_ACTIVE,
+        ROOT_QUARANTINING,
+        ROOT_COMPLETION_RECORDED,
+        ROOT_DELETED_RECORDED,
+    ),
+    edges=(
+        (ROOT_ABSENT, ROOT_PROVISIONING),
+        (ROOT_PROVISIONING, ROOT_ACTIVE),
+        (ROOT_PROVISIONING, ROOT_ABSENT),
+        (ROOT_ACTIVE, ROOT_ACTIVE),
+        (ROOT_ACTIVE, ROOT_QUARANTINING),
+        (ROOT_QUARANTINING, ROOT_QUARANTINING),
+        (ROOT_QUARANTINING, ROOT_COMPLETION_RECORDED),
+        (ROOT_COMPLETION_RECORDED, ROOT_COMPLETION_RECORDED),
+        (ROOT_COMPLETION_RECORDED, ROOT_DELETED_RECORDED),
+        (ROOT_DELETED_RECORDED, ROOT_ABSENT),
+    ),
+    terminal=(),
+    initial=ROOT_ABSENT,
+    durable=(
+        ".cdc_instances/{instance}: sentinel/quarantine/private root plus parent "
+        "completion record"
+    ),
+    purpose=(
+        "Whether a disposable runtime root is healthy and reusable, being privately "
+        "published, or irreversibly committed to destructive cleanup."
     ),
 )
 

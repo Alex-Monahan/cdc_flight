@@ -55,13 +55,14 @@ from .assembler import (
 from .catalog_apply import CatalogCoordinator
 from .commit_group import OpenGroup
 from .destination import AlertSink, Lease, ResumePoint
-from .envelope import PendingRecord, decode
+from .envelope import KIND_UNKNOWN, PendingRecord, decode
 from .errors import AmbiguousDelete, DestinationIdentityCollision
 from .faults import arm_group, maybe_crash
 from .planner import GroupPlan, stream_event_id
 from .run_state import COMMIT_ACK
 from .snapshot import SnapshotCoordinator
-from .snapshot_completion import SnapshotCompletion
+from .snapshot_completion import SnapshotCompletion, SnapshotObservationError
+from .snapshot_notifications import decode_notification
 from .spill import SpillBuffer, StagedEvent
 
 log = logging.getLogger("cdc_flight.applier")
@@ -182,6 +183,8 @@ class Applier:
         self.batch_count = 0
         self.data_batch_count = 0
         self.skipped_count = 0
+        self.snapshot_notification_count = 0
+        self._pending_snapshot_notifications: list[Any] = []
         self.commit_groups = 0
         self.data_commit_groups = 0
         self.applied_events = 0
@@ -282,6 +285,10 @@ class Applier:
             "resnapshot_discarded_events": self.resnapshot_discarded_events,
             "ambiguous_resnapshots_queued": self.ambiguous_resnapshots_queued,
             "snapshot_consistent_lsn": self.last_snapshot_lsn,
+            "snapshot_notifications": self.snapshot_notification_count,
+            "snapshot_notifications_pending": len(
+                self._pending_snapshot_notifications
+            ),
             **self.snapshot_completion.as_dict(),
             # Round 8 MAJOR-1: this is the callback/connection ownership proof. A late
             # callback after the seal is a recorded no-op and can never decode, write,
@@ -376,9 +383,35 @@ class Applier:
         # commit->ack window, now that Debezium has polled at least once since it
         # (Codex 7).
         self._run_pending_verification()
-        n = len(records)
+        source_records = 0
         data_in_batch = 0
         for raw in records:
+            notification = decode_notification(raw, topic_prefix=self.topic_prefix)
+            if notification is not None and self.assembler.open_transaction_id is not None:
+                raise SnapshotObservationError(
+                    "snapshot notification arrived inside an open streaming transaction; "
+                    "its callback order cannot be acknowledged safely"
+                )
+            if notification is not None:
+                self.snapshot_notification_count += 1
+                self._pending_snapshot_notifications.append(raw)
+                if notification.observation == "COMPLETED":
+                    # The ordered terminal callback is the boundary after the last row
+                    # callback. Feed only this boundary through the assembler: progress
+                    # callbacks must never fragment snapshot chunks or swap shadows.
+                    rec = decode(raw, topic_prefix=self.topic_prefix)
+                    rec.kind = KIND_UNKNOWN
+                    for unit in self.assembler.feed(rec):
+                        self._add_unit(unit)
+                    self.commit_group("snapshot_callback_completed")
+                self.snapshot_completion.observe_notification(
+                    notification.observation, notification.data
+                )
+                if self.snapshot_completion.completed:
+                    self._ack_snapshot_notifications()
+                continue
+
+            source_records += 1
             rec = decode(raw, topic_prefix=self.topic_prefix)
             if rec.is_data:
                 data_in_batch += 1
@@ -389,7 +422,7 @@ class Applier:
 
         with self._lock:
             self.batch_count += 1
-            self.record_count += n
+            self.record_count += source_records
             if data_in_batch:
                 self.data_batch_count += 1
 
@@ -404,7 +437,7 @@ class Applier:
         # stream goes quiet would never commit. A batch smaller than
         # `max.batch.size` means the queue drained, so commit now; a full batch
         # means more is already queued, so keep accumulating up to the triggers.
-        drained = n < self.cfg.max_batch_size
+        drained = source_records < self.cfg.max_batch_size
         if self.assembler.open_unit_has_spilled:
             # Invariant B: the rows staged for the still-open unit live in this
             # group's transaction, so committing now would drain a PARTIAL Postgres
@@ -646,6 +679,8 @@ class Applier:
         self.snapshot_completion.observe_committed_group(
             group, snapshot_active=self.snapshots.active
         )
+        if self.snapshot_completion.completed:
+            self._ack_snapshot_notifications()
         self.commit_groups += 1
         if has_data:
             self.data_commit_groups += 1
@@ -658,6 +693,16 @@ class Applier:
                 resume.capture_offset_file(self.offset_path, new_point)
             )
         self._reset_group()
+
+    def _ack_snapshot_notifications(self) -> None:
+        """Acknowledge control callbacks only after all preceding rows are durable."""
+        pending = list(self._pending_snapshot_notifications)
+        if not pending:
+            return
+        for raw in pending:
+            self._committer.markProcessed(raw)
+        self._committer.markBatchFinished()
+        del self._pending_snapshot_notifications[: len(pending)]
 
     def _request_resnapshot_for(
         self, ambiguous: AmbiguousDelete | DestinationIdentityCollision

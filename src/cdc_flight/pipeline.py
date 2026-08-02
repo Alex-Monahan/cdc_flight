@@ -27,6 +27,7 @@ import os
 import sys
 import threading
 import uuid
+from functools import partial
 from pathlib import Path
 
 # Runtime compatibility, not a test workaround. This must run before any project import
@@ -67,6 +68,7 @@ from .machines import (
 )
 from .ownership import DestinationOwnership
 from .run_state import RunOutcome, RunPhaseWriter
+from .run_summary import decorate as decorate_run_summary
 from .snapshot_completion import SnapshotCompletion
 from .source_health import SourceHealth
 from .supervisor import run_engine_bounded
@@ -582,11 +584,8 @@ def run(
         # Imported late: importing pydbzengine boots a JVM.
         from .engine import SupervisedDebeziumEngine
 
-        snapshot_completion = (
-            SnapshotCompletion.full_snapshot()
-            if will_snapshot_everything
-            else SnapshotCompletion.streaming_only()
-        )
+        snapshot_completion = SnapshotCompletion.for_capture(
+            will_snapshot_everything, schema=source.schema, tables=source.tables)
         applier = Applier(
             con,
             pipeline=dest.pipeline_name,
@@ -628,24 +627,17 @@ def run(
             max_lag_bytes=run_cfg.idle_max_lag_bytes,
         ).start()
 
-        def _decorate(result: dict) -> dict:
-            result.update(summary_extra)
-            result["destination"] = dest.kind
-            result["dataset"] = dest.dataset_name
-            result["runner_id"] = runner_id
-            if dest.kind == "duckdb":
-                result["duckdb_path"] = str(dest.duckdb_path)
-            else:
-                result["motherduck_database"] = dest.motherduck_database
-            return result
+        decorate = partial(decorate_run_summary, extra=summary_extra,
+                           destination=dest, runner_id=runner_id)
 
-        terminating_modes = {"initial_only", "recovery_only"}
         try:
             phases.to(PHASE_STREAMING)
             ownership.activate(applier)
             result = run_engine_bounded(
                 engine, applier, run_cfg, health,
-                engine_terminates_normally=props["snapshot.mode"] in terminating_modes,
+                engine_terminates_normally=(
+                    props["snapshot.mode"] in {"initial_only", "recovery_only"}
+                ),
                 catalog=watcher,
                 catalog_drain_seconds=catalog_cfg.drain_seconds,
                 phases=phases,
@@ -779,11 +771,11 @@ def run(
                     )
             run_ok = bool(result.get("ok"))
             outcome.record(result.get("stop_reason") or outcome.value)
-            reported = _decorate(result)
+            reported = decorate(result)
             return reported
         except EngineFailure as failure:
             outcome.record(failure.summary.get("stop_reason") or "engine_error")
-            reported = _decorate(failure.summary)
+            reported = decorate(failure.summary)
             raise
         finally:
             health.stop()
