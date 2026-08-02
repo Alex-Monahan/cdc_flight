@@ -20,6 +20,10 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+# Must precede DuckDB/PyArrow imports. PyArrow 25.0.0's default mimalloc backend can
+# SIGSEGV on the JPype JVM callback thread used by the live recovery path (ADR A14/A66).
+os.environ.setdefault("ARROW_DEFAULT_MEMORY_POOL", "system")
+
 import duckdb
 import psycopg
 import pytest
@@ -74,8 +78,10 @@ def _reset_fault_spec():
     from cdc_flight import faults
 
     faults.refresh()
+    faults.reset_arrivals()
     yield
     faults.refresh()
+    faults.reset_arrivals()
 
 
 # --------------------------------------------------------------------------- #
@@ -439,14 +445,27 @@ class Sandbox:
         self.drop_slot()
 
     # -- source ------------------------------------------------------------- #
-    def sql(self, statements: str | list[str], *, one_transaction: bool = False) -> None:
+    def sql(
+        self,
+        statements: str | list[str],
+        *,
+        one_transaction: bool = False,
+        report_affected: bool = False,
+    ) -> int | None:
         if isinstance(statements, str):
             statements = [statements]
+        affected = 0
         with psycopg.connect(self.source.dsn, autocommit=not one_transaction) as conn:
             for stmt in statements:
-                conn.execute(stmt)
+                if report_affected:
+                    result = conn.execute(stmt)
+                    if result.rowcount > 0:
+                        affected += result.rowcount
+                else:
+                    conn.execute(stmt)
             if one_transaction:
                 conn.commit()
+        return affected if report_affected else None
 
     def pg_query(self, stmt: str, params: tuple | None = None) -> list[tuple]:
         with psycopg.connect(self.source.dsn, autocommit=True) as conn:

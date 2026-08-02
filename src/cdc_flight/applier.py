@@ -53,11 +53,13 @@ from .assembler import (
     TransactionAssembler,
 )
 from .catalog_apply import CatalogCoordinator
+from .commit_group import OpenGroup
 from .destination import AlertSink, Lease, ResumePoint
 from .envelope import PendingRecord, decode
 from .errors import AmbiguousDelete, DestinationIdentityCollision
 from .faults import arm_group, maybe_crash
 from .planner import GroupPlan, stream_event_id
+from .run_state import COMMIT_ACK
 from .snapshot import SnapshotCoordinator
 from .spill import SpillBuffer, StagedEvent
 
@@ -136,17 +138,13 @@ class Applier:
             keep_all_records=config.ack_every_record,
         )
 
-        self._group: list[CompleteUnit] = []
-        self._group_events = 0
-        self._group_bytes = 0
-        self._group_opened_at = time.monotonic()
-        self._group_is_snapshot = False
-        self._close_requested = False
-        self._txn_open = False
-        self._spill_commit_id: int | None = None
+        #: The open commit group, as ONE object. Replaced wholesale at COMMIT and at
+        #: ROLLBACK; there is deliberately no way to reset part of it.
+        self.group = OpenGroup()
+        #: NOT part of the group: the offset-flush check is deliberately deferred to the
+        #: NEXT batch, so it outlives the group it belongs to (Codex 7).
         self._pending_verification: tuple | None = None
 
-        self._created_in_txn: set[str] = set()
         # ADR §3.5 / D7, §3.4, the fold and the catalog policy all live in their own
         # modules (ADR §15/A29, §18/A37): every blocker of the last two review rounds
         # was a consequence of two paths doing one job inside one file.
@@ -155,13 +153,17 @@ class Applier:
             dataset=dataset,
             pipeline=pipeline,
             topic_prefix=topic_prefix,
-            created_in_txn=self._created_in_txn,
+            # a CALLABLE: the group object is replaced at every COMMIT/ROLLBACK
+            created_in_txn=lambda: self.group.created_in_txn,
             get_registry=lambda: self.registry,
             epoch=resume_point.snapshot_epoch,
             transactional_ddl=transactional_ddl,
         )
         self.spill = SpillBuffer(con)
         self.alerts = AlertSink(con, pipeline=pipeline)
+        # rubric 1.9: an illegal table-lifecycle transition must reach an operator, and
+        # the only connection that survives this group's rollback is the sink's.
+        self.snapshots.alerts = self.alerts
         self.catalog_coordinator = CatalogCoordinator(
             catalog=catalog,
             pipeline=pipeline,
@@ -175,7 +177,12 @@ class Applier:
 
         self._committer = None
         self._lock = threading.Lock()
+        self._quiescence = threading.Condition(self._lock)
         self._in_flight = 0
+        self._callback_sealed = False
+        self._callback_seal_reason: str | None = None
+        self._callback_batches_rejected = 0
+        self._callback_records_rejected = 0
         self.last_batch_at = time.monotonic()
 
         # -- counters surfaced in the run summary (rubric 6.1) --------------- #
@@ -199,16 +206,6 @@ class Applier:
         self.ambiguous_resnapshots_queued = 0
         #: events dropped because their transaction is already inside a table's image
         self.watermark_fenced_events = 0
-        #: `_cdc_flight.table_events` rows collected while applying THIS group, all
-        #: written inside its transaction.
-        self._table_events: list[dict] = []
-        self._table_event_seq = 0
-        #: the catalog plan this group is committing, settled only after COMMIT
-        self._catalog_plan = None
-        #: alerts raised only once the transaction has settled (Codex 7)
-        self._pending_alerts: list[dict] = []
-        #: source tables this group actually wrote, handed to the watcher after COMMIT
-        self._group_source_tables: set[str] = set()
         self.table_counts: dict[str, int] = {}
         self.last_commit_id = resume_point.commit_id
         self.error: BaseException | None = None
@@ -229,6 +226,12 @@ class Applier:
     def busy(self) -> bool:
         with self._lock:
             return self._in_flight > 0
+
+    @property
+    def callback_quiesced(self) -> bool:
+        """True only when admission is sealed and every admitted callback has left."""
+        with self._lock:
+            return self._callback_sealed and self._in_flight == 0
 
     @property
     def seconds_since_last_batch(self) -> float:
@@ -271,6 +274,14 @@ class Applier:
             "resnapshot_discarded_events": self.resnapshot_discarded_events,
             "ambiguous_resnapshots_queued": self.ambiguous_resnapshots_queued,
             "snapshot_consistent_lsn": self.last_snapshot_lsn,
+            # Round 8 MAJOR-1: this is the callback/connection ownership proof. A late
+            # callback after the seal is a recorded no-op and can never decode, write,
+            # mutate replay state, or acknowledge Debezium.
+            "callback_boundary": "sealed" if self._callback_sealed else "open",
+            "callback_seal_reason": self._callback_seal_reason,
+            "callback_batches_rejected": self._callback_batches_rejected,
+            "callback_records_rejected": self._callback_records_rejected,
+            "callback_quiesced": self.callback_quiesced,
             **self.catalog_coordinator.summary(),
             **(self.catalog.summary() if self.catalog is not None else {}),
         }
@@ -288,19 +299,51 @@ class Applier:
         itself must happen on the poll thread, because `RecordCommitter` is
         explicitly not thread safe (`AsyncEmbeddedEngine.java:1341`)."""
         while not self._timer_stop.wait(0.5):
-            if self._group and (
-                time.monotonic() - self._group_opened_at >= self.cfg.commit_max_age
+            if self.group.units and (
+                time.monotonic() - self.group.opened_at >= self.cfg.commit_max_age
             ):
-                self._close_requested = True
+                self.group.close_requested = True
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, reason: str = "supervisor_shutdown") -> None:
+        """Seal callback admission and stop the age timer.
+
+        This is a lifecycle boundary, not merely timer cleanup. Once it returns, a new
+        Debezium callback is a recorded no-op. An already-admitted callback may still be
+        using ``con``; callers must prove :attr:`callback_quiesced` (or call
+        :meth:`wait_for_quiescence`) before drain, lease release, or handle retirement.
+        """
+        with self._quiescence:
+            if not self._callback_sealed:
+                self._callback_sealed = True
+                self._callback_seal_reason = reason
+            self._quiescence.notify_all()
         self._timer_stop.set()
+
+    def wait_for_quiescence(self, timeout: float) -> bool:
+        """Wait at most ``timeout`` for every callback admitted before the seal."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._quiescence:
+            while not (self._callback_sealed and self._in_flight == 0):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._quiescence.wait(remaining)
+            return True
 
     # ------------------------------------------------------------------ #
     # the Debezium callback
     # ------------------------------------------------------------------ #
     def handle_batch(self, records, committer) -> None:
-        with self._lock:
+        with self._quiescence:
+            if self._callback_sealed:
+                self._callback_batches_rejected += 1
+                self._callback_records_rejected += len(records)
+                log.error(
+                    "rejected a Debezium callback containing %s record(s): the callback "
+                    "boundary is sealed (%s)",
+                    len(records), self._callback_seal_reason,
+                )
+                return
             self._in_flight += 1
         try:
             self._handle(records, committer)
@@ -308,9 +351,11 @@ class Applier:
             self.error = exc
             raise
         finally:
-            with self._lock:
+            with self._quiescence:
                 self._in_flight -= 1
                 self.last_batch_at = time.monotonic()
+                if self._in_flight == 0:
+                    self._quiescence.notify_all()
 
     # pydbzengine compatibility, used only if something calls the old shape.
     def handleJsonBatch(self, records):  # pragma: no cover - not the live path
@@ -342,7 +387,7 @@ class Applier:
         if data_in_batch:
             maybe_crash("decode", self.data_batch_count)
 
-        if not self._group:
+        if not self.group.units:
             return
         # ADR §3.3 soft triggers, plus one pragmatic rule the ADR's pseudocode
         # needs and does not state: Debezium calls `markBatchFinished()` itself on
@@ -356,24 +401,24 @@ class Applier:
             # group's transaction, so committing now would drain a PARTIAL Postgres
             # transaction into the destination. Wait for its END.
             return
-        if self._close_requested or drained or self._soft_trigger_hit():
+        if self.group.close_requested or drained or self._soft_trigger_hit():
             self.commit_group(self._trigger_name(drained))
 
     def _soft_trigger_hit(self) -> bool:
         return (
-            self._group_events >= self.cfg.commit_max_events
-            or self._group_bytes >= self.cfg.commit_max_bytes
-            or time.monotonic() - self._group_opened_at >= self.cfg.commit_max_age
+            self.group.events >= self.cfg.commit_max_events
+            or self.group.nbytes >= self.cfg.commit_max_bytes
+            or time.monotonic() - self.group.opened_at >= self.cfg.commit_max_age
         )
 
     def _trigger_name(self, drained: bool) -> str:
-        if self._group_is_snapshot:
+        if self.group.is_snapshot:
             return "snapshot_chunk"
-        if self._group_events >= self.cfg.commit_max_events:
+        if self.group.events >= self.cfg.commit_max_events:
             return "events"
-        if self._group_bytes >= self.cfg.commit_max_bytes:
+        if self.group.nbytes >= self.cfg.commit_max_bytes:
             return "bytes"
-        if self._close_requested:
+        if self.group.close_requested:
             return "time"
         return "drained" if drained else "time"
 
@@ -384,11 +429,11 @@ class Applier:
         is_snapshot = unit.kind == UNIT_SNAPSHOT_CHUNK
         # ADR §3.5: snapshot units are never mixed with streaming units, so a
         # commit_log row unambiguously says which phase it belongs to.
-        if self._group and is_snapshot != self._group_is_snapshot:
-            self.commit_group("snapshot_chunk" if self._group_is_snapshot else "phase")
-        if not self._group:
-            self._group_is_snapshot = is_snapshot
-            self._group_opened_at = time.monotonic()
+        if self.group.units and is_snapshot != self.group.is_snapshot:
+            self.commit_group("snapshot_chunk" if self.group.is_snapshot else "phase")
+        if not self.group.units:
+            self.group.is_snapshot = is_snapshot
+            self.group.opened_at = time.monotonic()
 
         if self.cfg.resnapshot and unit.kind == UNIT_TXN:
             # A re-snapshot engine streams for as long as it takes us to notice the
@@ -420,34 +465,36 @@ class Applier:
                 record.raw = None
             unit.records = [unit.records[-1]]
 
-        self._group.append(unit)
-        self._group_events += unit.event_count
-        self._group_bytes += unit.nbytes
+        self.group.units.append(unit)
+        self.group.events += unit.event_count
+        self.group.nbytes += unit.nbytes
 
     def _reset_group(self) -> None:
-        self._group = []
-        self._group_events = 0
-        self._group_bytes = 0
-        self._group_opened_at = time.monotonic()
-        self._group_is_snapshot = False
-        self._close_requested = False
-        # `.clear()`, not a fresh set: `SnapshotCoordinator` holds the same object.
-        self._created_in_txn.clear()
-        self._spill_commit_id = None
-        self._table_events = []
-        self._table_event_seq = 0
-        self._catalog_plan = None
-        self._pending_alerts = []
-        self._group_source_tables = set()
+        """One assignment, and that is the whole point (rubric 1.9).
+
+        This used to be fourteen assignments by name, with a SECOND copy of the same
+        list in `_reset_after_rollback()` that had to stay in sync with it. Opus MAJOR-1
+        is what the divergence cost: the success path reset the group and the failure
+        path did not, so a rolled-back group was folded twice and a key-reuse shape lost
+        a row.
+
+        The precise claim, and it is narrower than the one this docstring used to make
+        (Codex r5 MINOR-2 found the overclaim still here after the ADR and RUBRIC_STATUS
+        were corrected): BOTH reset paths are this one assignment, so neither can forget
+        a field - which is the defect that was measured. `OpenGroup` is a mutable
+        dataclass with public collections, so a partial *mutation* is representable; the
+        one deliberate one is the named `discard_units()`.
+        """
+        self.group = OpenGroup()
 
     # ------------------------------------------------------------------ #
     # the transaction
     # ------------------------------------------------------------------ #
     def commit_group(self, trigger: str) -> None:
-        group = self._group
+        group = self.group.units
         if not group:
             return
-        commit_id = self._spill_commit_id or self._next_commit_id
+        commit_id = self.group.spill_commit_id or self._next_commit_id
         opened_at = destination.now()
         # Tell the destination-fault wrapper which data group this is, so a
         # `destination_*` fault fires at the group the spec names rather than at one
@@ -461,9 +508,9 @@ class Applier:
             not u.fenced and (u.events or u.spilled_events) for u in group
         )
 
-        if not self._txn_open:
+        if not self.group.txn_open:
             self.con.execute("BEGIN TRANSACTION")
-            self._txn_open = True
+            self.group.txn_open = True
         try:
             if has_data:
                 maybe_crash("begin", self.data_commit_groups + 1)
@@ -512,9 +559,27 @@ class Applier:
             # HERE, before the commit, because it is only a *forensic* baseline -
             # it does not need to lengthen the commit->ack path (Codex 7).
             offset_fingerprint = self.verifier.before() if self.verifier else None
-            with self_heal.commit_watchdog(self.cfg.commit_timeout, commit_id):
+            # rubric 1.9 / ADR §20: the commit->ack exclusion, as a flag other threads
+            # can read. Entered BEFORE the COMMIT (so no observability write can be
+            # mid-statement when the window opens) and left after the acknowledgement.
+            # One attribute assignment, no lock, no allocation - see
+            # `run_state._CommitAckWindow` for why that is the only acceptable cost here.
+            stage = ["observability_gate"]
+            with self_heal.commit_watchdog(
+                self.cfg.commit_timeout, commit_id, stage=lambda: stage[0]
+            ):
+                # INSIDE the watchdog (Codex r3 MAJOR-2). `enter()` waits, without a
+                # bound of its own, until no independent write is in flight — that is
+                # what makes the exclusion absolute rather than instrumented — and the
+                # watchdog is what stops a wedged observability cursor from stalling the
+                # commit path silently. It turns into the same loud, bounded EX_TEMPFAIL
+                # death a wedged COMMIT produces. `stage` tells the watchdog WHICH of the
+                # two it killed, because "the commit never started" and "the commit is
+                # ambiguous" call for different operator responses (Codex r4 MAJOR-1).
+                COMMIT_ACK.enter()
+                stage[0] = "commit"
                 self.con.execute("COMMIT")
-            self._txn_open = False
+            self.group.txn_open = False
             if has_data:
                 maybe_crash("post_commit_pre_ack", self.data_commit_groups + 1)
         except (AmbiguousDelete, DestinationIdentityCollision) as ambiguous:
@@ -528,22 +593,31 @@ class Applier:
             # already in WAL), so the per-table watermark fences the transaction that
             # cannot be folded and the loop terminates after exactly one re-snapshot
             # (ADR 0001 §19/A47).
+            COMMIT_ACK.leave()
             self._request_resnapshot_for(ambiguous)
             self._rollback_quietly()
             raise
         except BaseException:
+            COMMIT_ACK.leave()
             self._rollback_quietly()
             raise
 
         # ── the ONLY window that matters, and it contains nothing else ──────
         marked = 0
-        for unit in group:
-            for rec in unit.records:
-                if rec.raw is None:  # released by `_add_unit`
-                    continue
-                self._committer.markProcessed(rec.raw)
-                marked += 1
-        self._committer.markBatchFinished()
+        try:
+            for unit in group:
+                for rec in unit.records:
+                    if rec.raw is None:  # released by `_add_unit`
+                        continue
+                    self._committer.markProcessed(rec.raw)
+                    marked += 1
+            self._committer.markBatchFinished()
+        finally:
+            # In a `finally` because `markProcessed`/`markBatchFinished` can raise
+            # (pydbzengine interrupts this thread when the handler fails) and a window
+            # left open would silently drop every subsequent phase write (Codex r2
+            # MAJOR-1). One attribute assignment, so it adds nothing to the interval.
+            COMMIT_ACK.leave()
         if has_data:
             maybe_crash("post_ack", self.data_commit_groups + 1)
         # next poll() -> performCommit() -> flushLsn(new)  ── nothing between ──
@@ -602,11 +676,11 @@ class Applier:
             enabled=self.cfg.resnapshot_on_ambiguity,
         )
         if alert is not None:
-            self._pending_alerts.append(alert)
+            self.group.pending_alerts.append(alert)
         self.ambiguous_resnapshots_queued += int(recorded)
 
     def _rollback_quietly(self) -> None:
-        if not self._txn_open:
+        if not self.group.txn_open:
             self._reset_after_rollback()
             return
         try:
@@ -614,7 +688,7 @@ class Applier:
         except Exception:  # pragma: no cover - never mask the original error
             log.debug("rollback failed", exc_info=True)
         finally:
-            self._txn_open = False
+            self.group.txn_open = False
             self._reset_after_rollback()
 
     def _reset_after_rollback(self) -> None:
@@ -631,14 +705,14 @@ class Applier:
         # Markers describe an apply that did not happen, and the catalog work of a
         # rolled-back group must stay pending so it is applied (or re-detected)
         # rather than silently forgotten.
-        alerts = [a for a in self._pending_alerts if a.get("on_rollback")]  # Codex 7
+        alerts = [a for a in self.group.pending_alerts if a.get("on_rollback")]  # Codex 7
         # Every CREATE / ALTER we issued is gone with the transaction, so the
         # cached destination shape is now a lie. Rebuilding it is cheap and
         # not doing it is how a rolled-back run corrupts the next one.
         self.registry = apply_sql.SchemaRegistry(
             self.con, self.dataset, constraints=self.cfg.destination_constraints
         )
-        failed = list(self._group)
+        failed = list(self.group.units)
         self._reset_group()
         if failed:
             self.deferred_units += len(failed)
@@ -681,7 +755,7 @@ class Applier:
             snapshots=self.snapshots,
             spill=self.spill,
             truncate_mode=self.cfg.truncate_mode,
-            created_in_txn=self._created_in_txn,
+            created_in_txn=self.group.created_in_txn,
             watermarks=self.watermarks,
         )
         for unit in group:
@@ -697,7 +771,7 @@ class Applier:
                     plan.staged_units = True
                 continue
             if unit.kind == UNIT_SNAPSHOT_CHUNK:
-                self._group_is_snapshot = True
+                self.group.is_snapshot = True
             plan.add_unit(unit)
 
         # The `mid_apply` anchor is documented as "some tables written, others not".
@@ -724,12 +798,12 @@ class Applier:
         self.truncates_applied += plan.truncates_applied
         self.truncates_logged += plan.truncates_logged
         self.watermark_fenced_events += plan.watermark_fenced_events
-        if self._group_is_snapshot and stats.get("last_lsn"):
+        if self.group.is_snapshot and stats.get("last_lsn"):
             # Every snapshot record of one snapshot carries the exported snapshot's
             # consistent point, so this is `C` (rubric 1.6, `cdc_flight.resnapshot`).
             self.last_snapshot_lsn = stats["last_lsn"]
-        self._group_source_tables |= plan.source_tables
-        self._table_events.extend(plan.markers())
+        self.group.source_tables |= plan.source_tables
+        self.group.table_events.extend(plan.markers())
         self._flush_table_events(commit_id)
         return stats
 
@@ -744,19 +818,15 @@ class Applier:
         the audit trail can outlive a rolled-back apply and describe something that
         never happened.
         """
-        for marker in self._table_events:
+        for marker in self.group.table_events:
             destination.write_table_event(
                 self.con,
                 pipeline=self.pipeline,
                 commit_id=commit_id,
-                seq=self._next_table_event_seq(),
+                seq=self.group.next_table_event_seq(),
                 **marker,
             )
-        self._table_events = []
-
-    def _next_table_event_seq(self) -> int:
-        self._table_event_seq += 1
-        return self._table_event_seq
+        self.group.table_events = []
 
     def _apply_catalog_changes(self, commit_id: int, durable_lsn: int, stats: dict) -> None:
         """Apply the source-catalog changes whose fence has opened (rubric 1.5).
@@ -773,30 +843,30 @@ class Applier:
         plan = coordinator.plan(durable_lsn)
         if not plan.actions and not plan.relations and not plan.alerts:
             return
-        self._catalog_plan = plan
-        self._table_events.extend(coordinator.apply(self.con, plan, stats))
+        self.group.catalog_plan = plan
+        self.group.table_events.extend(coordinator.apply(self.con, plan, stats))
         # A destructive action that could not be applied is exactly the signal an
         # operator must still get when the group rolls back; one that describes an
         # applied action must NOT outlive the rollback that undid it (Codex 7).
-        self._pending_alerts.extend(plan.alerts)
-        if self._table_events:
+        self.group.pending_alerts.extend(plan.alerts)
+        if self.group.table_events:
             self._flush_table_events(commit_id)
 
     def _settle_catalog(self) -> None:
         """Forget the catalog work this group made durable. Runs after COMMIT."""
         if self.catalog is None:
             return
-        plan = self._catalog_plan
+        plan = self.group.catalog_plan
         if plan is not None:
-            self.catalog_coordinator.settle(plan, self._group_source_tables)
-            self._catalog_plan = None
-        elif self._group_source_tables:
-            self.catalog.observe_replicated(self._group_source_tables)
+            self.catalog_coordinator.settle(plan, self.group.source_tables)
+            self.group.catalog_plan = None
+        elif self.group.source_tables:
+            self.catalog.observe_replicated(self.group.source_tables)
 
     def _flush_alerts(self) -> None:
-        for alert in self._pending_alerts:
+        for alert in self.group.pending_alerts:
             self._raise_alert(alert)
-        self._pending_alerts = []
+        self.group.pending_alerts = []
 
     def _raise_alert(self, alert: dict) -> None:
         self.alerts.raise_alert(
@@ -829,11 +899,11 @@ class Applier:
         """
         if not events:
             return 0
-        if not self._txn_open:
+        if not self.group.txn_open:
             self.con.execute("BEGIN TRANSACTION")
-            self._txn_open = True
-            self._spill_commit_id = self._next_commit_id
-        commit_id = self._spill_commit_id or self._next_commit_id
+            self.group.txn_open = True
+            self.group.spill_commit_id = self._next_commit_id
+        commit_id = self.group.spill_commit_id or self._next_commit_id
         # Creates the shadow table, its `table_state` row and the snapshot epoch
         # BEFORE any record of this table can be staged.
         state = self.snapshots.state_for(*snapshot) if snapshot is not None else None
@@ -884,15 +954,15 @@ class Applier:
         (Opus MINOR-9). They are counted into the summary now.
         """
         self.shutdown()
-        if self._group:
-            self.deferred_units += len(self._group)
-            self.deferred_events += sum(u.event_count for u in self._group)
+        if self.group.units:
+            self.deferred_units += len(self.group.units)
+            self.deferred_events += sum(u.event_count for u in self.group.units)
             log.info(
                 "deferring %s whole unit(s) / %s events buffered at shutdown; they "
                 "replay on the next run (Invariant O)",
-                len(self._group), self.deferred_events,
+                len(self.group.units), self.deferred_events,
             )
-            self._group = []
+            self.group.discard_units()
         # A staging transaction may still be open (a large unit was spilling when the
         # engine stopped). Roll it back explicitly, or the lease DELETE that follows
         # in `pipeline.run`'s `finally` joins that transaction and is discarded by
@@ -919,5 +989,4 @@ def _epoch_ms(value) -> Any:
     from datetime import UTC, datetime
 
     return datetime.fromtimestamp(value / 1000.0, tz=UTC)
-
 

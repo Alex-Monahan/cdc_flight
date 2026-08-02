@@ -50,8 +50,6 @@ SILENT = "silent"
 
 #: anchor -> (outcome class, what the fault means, `<nth>` to use)
 #:
-#: `swap` is absent on purpose and asserted separately: it needs a re-snapshot to have a
-#: shadow to swap, so its scenario is in `tests/1.6_snapshot_consistency/`.
 MATRIX: dict[str, tuple[str, str]] = {
     "decode": (LOUD, "the process dies after decoding a batch, before any transaction"),
     "begin": (LOUD, "the process dies with BEGIN issued and nothing applied"),
@@ -70,6 +68,70 @@ MATRIX: dict[str, tuple[str, str]] = {
     ),
     "destination_hang": (LOUD, "COMMIT never returns - bounded by CDC_COMMIT_TIMEOUT"),
     "destination_close": (LOUD, "the destination connection is severed mid-transaction"),
+    # The acquisition-recovery anchors (rubric 1.7's closure, landed with 1.9's state
+    # machines). Like `swap` they need a *scenario* the generic one cannot produce - a
+    # slot the check declares unusable - so they are declared here and asserted
+    # elsewhere: `tests/1.7_fault_injection/test_1_7_recovery_anchors.py` guards all
+    # five in the DEFAULT lane in milliseconds, and
+    # `tests/1.8_slot_mismatch/test_1_8_recovery_crash_e2e.py` kills a real process at
+    # `recovery_armed` against a real Postgres slot under `-m slow`.
+    "recovery_requested": (
+        LOUD, "the process dies with the journal and the to-do list durable and nothing destroyed"
+    ),
+    "recovery_offsets_file_deleted": (
+        LOUD, "the process dies with offsets.dat gone and the journal still at `requested`"
+    ),
+    "recovery_resume_point_deleted": (
+        LOUD, "the process dies with the durable resume point gone and the slot still there"
+    ),
+    "recovery_armed": (
+        LOUD, "the process dies with the slot dropped and the journal not yet recording it"
+    ),
+    "table_rebuild_queued": (
+        LOUD, "the process dies while the durable to-do list is being written"
+    ),
+    # rev 14, rubric 1.9's catalog-baseline machine. The first two are crash cuts
+    # across its new edges; `catalog_poll` is not a crash at all but a *degraded
+    # dependency*, and it is here because round 5 had to monkeypatch it to reproduce
+    # a consistency defect the suite could not express (Codex r5 BLOCKER-1).
+    "catalog_baseline_marked": (
+        LOUD, "the process dies with the baseline durably unconfirmed and nothing else done"
+    ),
+    "catalog_baseline_pre_valid": (
+        LOUD, "the process dies with the learned relations flushed and the promotion unwritten"
+    ),
+    "catalog_poll": (
+        LOUD,
+        "EVERY source-catalog poll fails, so the run reads the catalog zero times: it "
+        "must not report success, and it must leave a durable record that no baseline "
+        "was established",
+    ),
+}
+
+#: Anchors whose scenario is owned by another module, with the module named. Absent
+#: from the generic parametrisation below and NOT absent from `MATRIX`: an anchor with
+#: no declared outcome is what `test_every_anchor_has_a_declared_outcome` exists to
+#: catch, and quietly dropping one from the table would be the same hole through a
+#: different door.
+ELSEWHERE = {
+    "swap": "tests/1.6_snapshot_consistency/ (needs a shadow table to swap)",
+    "recovery_requested": "tests/1.7_fault_injection/test_1_7_recovery_anchors.py",
+    "recovery_offsets_file_deleted": "tests/1.7_fault_injection/test_1_7_recovery_anchors.py",
+    "recovery_resume_point_deleted": "tests/1.7_fault_injection/test_1_7_recovery_anchors.py",
+    "recovery_armed": (
+        "tests/1.7_fault_injection/test_1_7_recovery_anchors.py (default) + "
+        "tests/1.8_slot_mismatch/test_1_8_recovery_crash_e2e.py (slow, real process)"
+    ),
+    "table_rebuild_queued": "tests/1.7_fault_injection/test_1_7_recovery_anchors.py",
+    "catalog_baseline_marked": "tests/1.7_fault_injection/test_1_7_recovery_anchors.py",
+    "catalog_baseline_pre_valid": "tests/1.7_fault_injection/test_1_7_recovery_anchors.py",
+    # A repeating fault, not a crash: the generic matrix asserts a process death and
+    # this one asserts a whole run's worth of unreadable catalog, plus what the NEXT
+    # run does with the record it left. Both halves live where the composition does.
+    "catalog_poll": (
+        "tests/1.9_state_machines/test_1_9_catalog_baseline.py (default, in process) + "
+        "tests/1.9_state_machines/test_1_9_catalog_baseline_e2e.py (slow, real cluster)"
+    ),
 }
 
 #: What the default suite guards. One per *behaviour class*, not one per mechanism
@@ -118,6 +180,22 @@ def test_every_anchor_has_a_declared_outcome():
     assert not extra, f"MATRIX names anchor(s) that do not exist: {extra}"
 
 
+def test_every_anchor_this_file_does_not_run_names_where_it_is_run():
+    """An anchor excluded from the generic scenario must say who proves it.
+
+    `swap` was excluded with a comment; the recovery anchors would have been excluded
+    the same way. A comment is not a guard: if the module it names is deleted or
+    renamed, nothing fails. The path is asserted to exist.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    for point, where in ELSEWHERE.items():
+        assert point in MATRIX, point
+        first = where.split(" ")[0]
+        assert (root / first).exists(), f"{point} points at {first}, which does not exist"
+
+
 def test_the_declared_outcome_classes_are_the_ones_this_file_can_observe():
     """A declared class nothing can observe is a class nothing is proving.
 
@@ -147,8 +225,8 @@ def matrix_box(tmp_path_factory, postgres_cluster):
 def _params():
     out = []
     for point, (outcome, description) in sorted(MATRIX.items()):
-        if point == "swap":
-            continue  # needs a shadow table; owned by tests/1.6_snapshot_consistency/
+        if point in ELSEWHERE:
+            continue  # asserted by the module named in ELSEWHERE
         marks = [] if point in DEFAULT_SUITE else [pytest.mark.slow]
         out.append(pytest.param(point, outcome, description, marks=marks, id=point))
     return out

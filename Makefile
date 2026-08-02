@@ -9,6 +9,10 @@ export PGPORT ?= 15432
 export PGUSER ?= postgres
 export PGPASSWORD ?= postgres
 export PGDATABASE ?= cdc_source
+# PyArrow 25.0.0's mimalloc pool can SIGSEGV when Arrow arrays are built on the
+# JPype/JVM callback thread. This is a production compatibility requirement too;
+# keep every repository launch safe while respecting an explicit operator choice.
+export ARROW_DEFAULT_MEMORY_POOL ?= system
 
 .DEFAULT_GOAL := help
 

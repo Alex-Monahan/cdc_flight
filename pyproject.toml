@@ -21,7 +21,8 @@ dependencies = [
     # rows x 19 columns take 1.37 s that way and 410 s via `executemany`, and
     # against MotherDuck `executemany` costs a network round trip per row. This
     # is a hard dependency, not an optimisation.
-    "pyarrow>=15.0.0",
+    # Keep the runtime matched to the allocator compatibility decision in ADR A14/A66.
+    "pyarrow==25.0.0",
 ]
 
 [project.optional-dependencies]

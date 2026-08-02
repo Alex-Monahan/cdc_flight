@@ -37,6 +37,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+from .machines import SOURCE_HEALTH_STATES
+
 log = logging.getLogger("cdc_flight.source_health")
 
 #: How far `confirmed_flush_lsn` may trail `pg_current_wal_lsn()` and still count
@@ -100,6 +102,11 @@ class SourceHealth:
     max_lag_bytes: int = DEFAULT_MAX_IDLE_LAG_BYTES
     interval: float = 0.5
     connect_timeout: int = 5
+    #: Bounds a query on an ALREADY-CONNECTED socket. `connect_timeout` does not:
+    #: it covers the handshake, and a source that goes dark mid-connection leaves the
+    #: sampler blocked for ever, which is how "the source is dark" stopped being
+    #: observable at all (Codex r2 MAJOR-4).
+    query_timeout_ms: int = 4000
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _stop: threading.Event = field(default_factory=threading.Event, repr=False)
     _thread: threading.Thread | None = field(default=None, repr=False)
@@ -179,8 +186,31 @@ class SourceHealth:
         try:
             import psycopg
 
+            # `connect_timeout` bounds the HANDSHAKE and nothing else. A relay that
+            # blackholes packets *after* the socket is established leaves the query
+            # blocked on a recv that will never return, so this sampler stops
+            # publishing entirely: `unknown` is never recorded, `unknown_for` never
+            # reaches `CDC_SOURCE_DARK_SECONDS`, and the run dies of the shutdown
+            # symptom (`hung`) with the diagnosis (`source_dark`) never formed. That
+            # made the network-blackhole proof itself timing-dependent, which is
+            # exactly the kind of evidence rubric 1.7 is not allowed to rest on
+            # (Codex r2 MAJOR-4).
+            #
+            # Two bounds, because they cover different halves: `statement_timeout` is
+            # the server's, and a server we cannot reach cannot enforce it;
+            # `tcp_user_timeout` plus keepalives are the client's, and they are what
+            # actually fires against a blackhole. Both are well under
+            # `CDC_SOURCE_DARK_SECONDS`.
             with psycopg.connect(
-                self.dsn, autocommit=True, connect_timeout=self.connect_timeout
+                self.dsn,
+                autocommit=True,
+                connect_timeout=self.connect_timeout,
+                options=f"-c statement_timeout={self.query_timeout_ms}",
+                keepalives=1,
+                keepalives_idle=1,
+                keepalives_interval=1,
+                keepalives_count=2,
+                tcp_user_timeout=self.query_timeout_ms,
             ) as conn:
                 row = conn.execute(_SLOT_SQL, (self.slot_name,)).fetchone()
         except Exception as exc:
@@ -248,6 +278,35 @@ class SourceHealth:
                 return 0.0
             return time.monotonic() - self._lag_decreased_at
 
+    def state(self, *, dark_after: float = 0.0) -> str:
+        """The fold's classification, as ONE declared value (rubric 1.9).
+
+        `SourceHealth` is a **fold over observations**, not a state machine, and it
+        should stay one: there is no durable state and no transition anybody can cut. But
+        the *classification* of the fold was written out three separate times — in
+        `may_declare_idle()`, in `summary()`, and again in the supervisor's
+        `ever_sampled and unknown_for >= ...` test — and the value that mattered most had
+        no name at all. `unknown_never_sampled` is A51 row 50: the documented fail-open
+        where a source that was dark before we ever looked degrades the run to the
+        timer-only path and can report success on a delivery that never started.
+
+        The domain is `machines.SOURCE_HEALTH_STATES`. `dark_after` (the run's
+        `CDC_SOURCE_DARK_SECONDS`) separates `unknown` from `dark`; passing 0 means "do
+        not make that distinction", which is what a caller with no threshold wants.
+        """
+        sample = self.last
+        if sample is None:
+            return SOURCE_HEALTH_STATES.parse("unsampled")
+        if sample.unknown:
+            if not self.ever_sampled:
+                return SOURCE_HEALTH_STATES.parse("unknown_never_sampled")
+            if dark_after > 0 and self.unknown_for >= dark_after:
+                return SOURCE_HEALTH_STATES.parse("dark")
+            return SOURCE_HEALTH_STATES.parse("unknown")
+        return SOURCE_HEALTH_STATES.parse(
+            "streaming" if sample.streaming else "not_streaming"
+        )
+
     def may_declare_idle(self, *, min_seconds: float) -> bool:
         """Corroborate a quiet timer against the source.
 
@@ -291,17 +350,20 @@ class SourceHealth:
     def summary(self) -> dict:
         sample = self.last
         if sample is None:
-            return {"slot_health": "unsampled"}
+            return {"slot_health": self.state()}
         if sample.unknown:
             return {
-                "slot_health": "unknown",
+                # The declared classification, so `unknown_never_sampled` - the
+                # fail-open A51 row 50 is about - finally appears in the run summary
+                # instead of being inferred from `slot_ever_sampled` next to it.
+                "slot_health": self.state(),
                 "slot_error": sample.error,
                 "slot_unknown_for_sec": round(self.unknown_for, 1),
                 "slot_ever_sampled": self.ever_sampled,
                 "slot_not_streaming_for_sec": round(self.not_streaming_for, 1),
             }
         return {
-            "slot_health": "streaming" if sample.streaming else "not_streaming",
+            "slot_health": self.state(),
             "slot_exists": sample.exists,
             "slot_active": sample.active,
             "slot_lag_bytes": sample.lag_bytes,

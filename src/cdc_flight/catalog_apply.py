@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from . import destination, naming
 from .catalog import CHANGE_DROPPED, CHANGE_RECREATED, DESTRUCTIVE, CatalogChange
 from .config import DROP_IGNORE, DROP_REPLICATE
+from .machines import CHANGE_APPLIED, CHANGE_REFUSED
 
 log = logging.getLogger("cdc_flight.catalog_apply")
 
@@ -159,9 +160,17 @@ class CatalogCoordinator:
         if not self.enabled:
             return CatalogPlan()
         due = self.catalog.due(durable_lsn)
-        if not due:
-            return CatalogPlan()
-
+        # NO EARLY RETURN WHEN NOTHING IS DUE. `source_relations` is the only thing that
+        # makes a DROP or a drop-and-recreate detectable across a restart — without the
+        # persisted `relation_oid` the next run has nothing to compare against — and it
+        # was written only as a side effect of a plan that had at least one due change.
+        # A pipeline whose catalog is simply quiet therefore never persisted what it had
+        # learned, and the first run after `--reset-state` (which discards
+        # `source_relations` deliberately, because the oids are about to be re-read) left
+        # the destination permanently unable to notice the next recreate. MEASURED: the
+        # rubric-1.5 recreated-relation E2E stopped detecting anything the moment
+        # `--reset-state` began registering every captured table, because a registered
+        # table produces no `new` change and nothing else was due.
         actions: list[CatalogAction] = []
         refused: list[tuple[CatalogChange, str]] = []
         alerts: list[dict] = []
@@ -190,6 +199,7 @@ class CatalogCoordinator:
             )
             for change in destructive_changes:
                 blocked.add(id(change))
+                change.to(CHANGE_REFUSED)  # rubric 1.9 (SM-D)
                 refused.append((change, reason))
             alerts.append(
                 {
@@ -230,6 +240,7 @@ class CatalogCoordinator:
                     # separated by the fence, and the fence can be arbitrarily wide on
                     # a quiet source; a fact that is no longer true must not destroy a
                     # live relation's destination table (Codex 4).
+                    change.to(CHANGE_REFUSED)  # rubric 1.9 (SM-D)
                     refused.append((change, reason))
                     log.warning(
                         "not dropping %s: %s (the change stays pending)",
@@ -406,6 +417,12 @@ class CatalogCoordinator:
             return
         changes = [action.change for action in plan.actions]
         if changes:
+            # rubric 1.9 (SM-D): `due -> applied` is terminal, and it is recorded only
+            # AFTER the COMMIT for the same reason `resolve()` is - a change marked
+            # applied over a rolled-back DDL is a destructive action nothing will
+            # re-detect.
+            for change in changes:
+                change.to(CHANGE_APPLIED)
             self.catalog.resolve(changes)
             for action in plan.actions:
                 if action.change.kind == CHANGE_DROPPED and action.destructive:

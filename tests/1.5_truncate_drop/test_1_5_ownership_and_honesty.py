@@ -21,6 +21,8 @@ cleared `last_error` unconditionally and the alert was raised only when a change
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 from applier_lab import Lab, end, keyed
 
@@ -179,6 +181,12 @@ class _Handler:
     def drain_on_shutdown(self) -> int:
         return 0
 
+    def shutdown(self, *, reason="supervisor_shutdown") -> None:
+        pass
+
+    def wait_for_quiescence(self, timeout: float) -> bool:
+        return True
+
 
 class _Engine:
     failure = None
@@ -199,7 +207,7 @@ def _watcher_with_pending(polls: list) -> CatalogWatcher:
     w = CatalogWatcher(
         dsn="", publication="pub", schema="app", include=set(), poll_seconds=0
     )
-    w._pending.append(
+    w.queue(
         CatalogChange(kind=CHANGE_DROPPED, schema="app", table="gone", detected_lsn=10**9)
     )
     w.poll_quietly = lambda: polls.append(1) or []  # type: ignore[method-assign]
@@ -254,7 +262,7 @@ def test_a_marker_failure_is_preserved_in_the_summary():
     w = CatalogWatcher(
         dsn="", publication="pub", schema="app", include=set(), poll_seconds=0
     )
-    w._pending.append(
+    w.queue(
         CatalogChange(kind=CHANGE_DROPPED, schema="app", table="gone", detected_lsn=1)
     )
 
@@ -262,7 +270,7 @@ def test_a_marker_failure_is_preserved_in_the_summary():
         def execute(self, *_args):
             raise RuntimeError("cannot write to a read-only source")
 
-    w._emit_marker(Broken(), w._pending)
+    w._emit_marker(Broken(), w.pending())
     summary = w.summary()
     assert summary["catalog_marker_error"]
     assert summary["catalog_marker_capable"] is False
@@ -287,3 +295,176 @@ def test_the_marker_write_budget_is_bounded():
     assert marker.writes == 3
     assert marker.suppressed == 2
     assert "budget exhausted" in marker.last_error
+
+
+def test_a_poll_that_finishes_at_shutdown_still_fails_the_run():
+    """`stop()` must MEAN quiesced, not "we waited a bit" (Codex r3 MAJOR-3).
+
+    Production joins for a bounded time and used to return whatever happened, so a poll
+    that outlived the join could take an undeclared transition — or learn a relation —
+    after the run had already been judged a success. The first cut of this test used a
+    fake whose `stop()` synchronously set `machine_error`, which never exercised the
+    timed join at all. This holds a REAL background poll at a barrier and lets the
+    supervisor's own synchronous final poll answer cleanly.
+    """
+    supervisor_thread = threading.current_thread()
+
+    class _StuckPoller(CatalogWatcher):
+        def __init__(self):
+            super().__init__(
+                dsn="", publication="pub", schema="app", include=set(), poll_seconds=0.05
+            )
+            self.quiesce_timeout = 0.3
+            self.release = threading.Event()
+            self.stopped = False
+
+        def poll_quietly(self):
+            if threading.current_thread() is supervisor_thread:
+                return []          # the synchronous final poll: clean and prompt
+            self.release.wait(30)  # the background poll: wedged on a dead socket
+            self.machine_error = "IllegalTransition: catalog_change: 'due' -> 'marked'"
+            return []
+
+        def stop(self):
+            self.stopped = True
+            return super().stop()
+
+    w = _StuckPoller()
+    w._thread = threading.Thread(target=w.poll_quietly, daemon=True)
+    w._thread.start()
+    try:
+        with pytest.raises(EngineFailure) as excinfo:
+            run_engine_bounded(
+                _Engine(), _Handler(), RunConfig(max_seconds=6, idle_seconds=0.1),
+                catalog=w, catalog_drain_seconds=0.2,
+            )
+        assert w.stopped, "the supervisor must try to quiesce the watcher"
+        # It could NOT quiesce, and that alone is a failed run: every check after it
+        # reads state the live poller can still mutate, including the relations the
+        # caller is about to persist.
+        assert "did not stop" in str(excinfo.value), str(excinfo.value)
+        assert excinfo.value.summary["stop_reason"] == "engine_error"
+        assert excinfo.value.summary["catalog_quiesced"] is False
+        assert excinfo.value.summary.get("ok") is not True
+    finally:
+        w.release.set()
+
+
+def test_a_watcher_that_really_stops_lets_the_verdict_stand():
+    """The other half: quiescence is proved, so the machine-error check is trustworthy."""
+
+    class _CleanPoller(CatalogWatcher):
+        def __init__(self):
+            super().__init__(
+                dsn="", publication="pub", schema="app", include=set(), poll_seconds=0.05
+            )
+            self.quiesce_timeout = 2.0
+
+        def poll_quietly(self):
+            self.successful_polls += 1
+            return []
+
+    w = _CleanPoller().start()
+    w.machine_error = "IllegalTransition: catalog_change: 'due' -> 'marked'"
+    with pytest.raises(EngineFailure) as excinfo:
+        run_engine_bounded(
+            _Engine(), _Handler(), RunConfig(max_seconds=6, idle_seconds=0.1),
+            catalog=w, catalog_drain_seconds=0.2,
+        )
+    assert w.quiesced is True
+    assert "undeclared transition" in str(excinfo.value)
+
+
+def test_what_the_watcher_learned_is_persisted_even_when_nothing_is_due():
+    """`source_relations` is what makes a drop detectable ACROSS a restart.
+
+    It was written only as a side effect of a `CatalogPlan` that had at least one *due*
+    change, because `plan()` returned an empty plan the moment `due` was empty. A
+    pipeline whose catalog is simply quiet therefore never persisted the `relation_oid`
+    it had learned — and the first run after `--reset-state`, which discards
+    `source_relations` deliberately, left the destination permanently unable to notice
+    the next drop-and-recreate. MEASURED: the 1.5 recreated-relation E2E stopped
+    detecting anything the moment reset began registering every captured table, because
+    a registered table produces no `new` change and nothing else was due.
+    """
+    from cdc_flight.catalog import SourceRelation
+    from cdc_flight.catalog_apply import CatalogCoordinator
+
+    w = CatalogWatcher(
+        dsn="", publication="pub", schema="app", include={"app.customers"},
+        replicated={"app.customers"}, poll_seconds=0,
+    )
+    relation = SourceRelation(
+        schema="app", table="customers", oid=16384, published=True, replica_identity="d"
+    )
+    w._dirty["app.customers"] = relation
+
+    coordinator = CatalogCoordinator(
+        catalog=w, pipeline="p", topic_prefix="cdcflight", drop_mode="replicate",
+        registry_of=lambda: None,
+    )
+    plan = coordinator.plan(durable_lsn=0)
+    assert plan.actions == (), "nothing was due, so nothing may be applied"
+    assert plan.relations == (relation,), (
+        "the learned relation was not carried into the plan, so nothing will persist "
+        "its oid and the next run cannot tell a recreate from a quiet table"
+    )
+
+
+def test_a_run_that_never_read_the_catalog_is_not_a_success():
+    """Proving the poller is DEAD is not proving it ever SPOKE (Codex r4 BLOCKER-2).
+
+    `poll_quietly()` catches a query failure into `last_error` and returns nothing, which
+    is right for a transient source. But a run in which EVERY poll failed has no
+    baseline: it cannot have noticed a `DROP TABLE`, and it has nothing to persist — so
+    reporting success says "I checked and everything is fine" when nothing was checked.
+    Measured consequence: with every poll timing out, a quiet run returned `ok=true` and
+    learned zero relations; an offline drop-and-recreate then left the old relation's
+    rows beside the new one's for ever, because the following runs adopted the
+    replacement oid as the baseline they had never had.
+    """
+
+    class _AlwaysFails(CatalogWatcher):
+        def __init__(self):
+            super().__init__(
+                dsn="", publication="pub", schema="app", include=set(), poll_seconds=0.05
+            )
+            self.quiesce_timeout = 2.0
+
+        def poll_quietly(self):
+            self.last_error = "TimeoutError: canceling statement due to statement timeout"
+            return []
+
+    w = _AlwaysFails().start()
+    with pytest.raises(EngineFailure) as excinfo:
+        run_engine_bounded(
+            _Engine(), _Handler(), RunConfig(max_seconds=6, idle_seconds=0.1),
+            catalog=w, catalog_drain_seconds=0.2,
+        )
+    assert "could not be read even once" in str(excinfo.value), str(excinfo.value)
+    assert excinfo.value.summary["stop_reason"] == "engine_error"
+    assert excinfo.value.summary["catalog_successful_polls"] == 0
+    assert excinfo.value.summary.get("ok") is not True
+
+
+def test_one_successful_poll_is_enough_to_have_a_baseline():
+    """The other half: a poll that read the catalog once gives the run something to say."""
+
+    class _OneGoodPoll(CatalogWatcher):
+        def __init__(self):
+            super().__init__(
+                dsn="", publication="pub", schema="app", include=set(), poll_seconds=0.05
+            )
+            self.quiesce_timeout = 2.0
+
+        def poll_quietly(self):
+            self.successful_polls += 1
+            self.last_error = "TimeoutError: a later poll failed, which is transient"
+            return []
+
+    w = _OneGoodPoll().start()
+    summary = run_engine_bounded(
+        _Engine(), _Handler(), RunConfig(max_seconds=6, idle_seconds=0.1),
+        catalog=w, catalog_drain_seconds=0.2,
+    )
+    assert summary["ok"] is True, summary

@@ -37,6 +37,7 @@ from cdc_flight.catalog import (
     CatalogWatcher,
     SourceRelation,
 )
+from cdc_flight.machines import CHANGE_MARKED
 
 CUSTOMERS = "cdcflight_app_customers"
 ORDERS = "cdcflight_app_orders"
@@ -80,9 +81,9 @@ def watcher(*, present=None, fail_revalidation: bool = False, **kw) -> CatalogWa
 def queue(w: CatalogWatcher, table: str, *, kind: str = CHANGE_DROPPED, **kw) -> CatalogChange:
     change = CatalogChange(
         kind=kind, schema="app", table=table, detected_lsn=kw.pop("lsn", 100),
-        fenced=True, **kw,
+        state=CHANGE_MARKED, **kw,
     )
-    w._pending.append(change)
+    w.queue(change)
     return change
 
 

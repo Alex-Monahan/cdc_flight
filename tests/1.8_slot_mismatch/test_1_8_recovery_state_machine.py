@@ -357,13 +357,22 @@ def test_a_table_left_mid_snapshot_is_owed_work_after_ANY_crash(world):
     The consequence was concrete: the recovery journal's "no table owes a snapshot any
     more" test could pass, and the run could log "recovery COMPLETE: every captured
     table has a fresh image", over a table that was half built.
+
+    Rubric 1.9 closed the *class* as well as the case: `tables_awaiting_snapshot()` now
+    selects every NON-TERMINAL `TableLifecycle` state rather than the one literal value,
+    so the queue is complete even for a run that never called the promotion. The
+    promotion still runs at start-up, because "owed and mid-snapshot" and "owed" should
+    not be two different durable answers to the same question.
     """
     world.con.execute(
         "UPDATE _cdc_flight.table_state SET snapshot_state = 'in_progress' "
         "WHERE pipeline = ? AND source_table = 'orders'",
         [PIPELINE],
     )
-    assert world.owed == [], "this is the gap: no durable queue selected it"
+    assert world.owed == ["app.orders"], (
+        "the queue selects every non-terminal lifecycle state; it used to select only "
+        "`awaiting_snapshot`, which is how a half-snapshotted table belonged to no queue"
+    )
 
     promoted = dest_mod.promote_interrupted_snapshots(world.con, PIPELINE)
     assert promoted == ["app.orders"]
@@ -425,3 +434,111 @@ def test_the_heartbeat_table_declared_by_the_adr_actually_exists(world):
         ).fetchall()
     }
     assert {"pipeline", "runner_id", "beat_at", "phase", "lag_seconds"} <= columns
+
+
+# --------------------------------------------------------------------------- #
+# Codex r2 BLOCKER-1 — a journal may only clear over POSITIVE terminal evidence
+# --------------------------------------------------------------------------- #
+def _armed_journal(world, *, decision: str, captured: list[tuple[str, str, str]]):
+    record = recovery_mod.begin(
+        world.con,
+        pipeline=PIPELINE,
+        namespace=NAMESPACE,
+        decision=decision,
+        message="a test",
+        slot_name="cdc_slot",
+        offset_path=Path("/tmp/does-not-matter"),
+        captured_tables=captured,
+        forget_catalog=False,
+    )
+    world.con.execute(
+        "UPDATE _cdc_flight.recovery_state SET phase = 'armed' WHERE pipeline = ?",
+        [PIPELINE],
+    )
+    record.phase = "armed"
+    return record
+
+
+def _completion(world, record):
+    return recovery_mod.complete_if_ready(
+        world.con, pipeline=PIPELINE, namespace=NAMESPACE, record=record
+    )
+
+
+def test_a_reset_journal_marks_every_captured_table_as_owing_a_fresh_image(world):
+    """`--reset-state`'s obligation has to BE an obligation (Codex r2 BLOCKER-1).
+
+    The first cut of the journalled reset stopped at `reset_all()`, so every captured
+    table ended at `none` and `tables_marked` was 0 — and `none` is not an owing state.
+    The obligation was therefore satisfied by doing nothing at all.
+    """
+    tables = [("app", "customers", "cdcflight_app_customers"),
+              ("app", "orders", "cdcflight_app_orders")]
+    record = _armed_journal(world, decision=recovery_mod.RESET_DECISION, captured=tables)
+    assert record.tables_marked == 2
+    assert sorted(record.captured) == ["app.customers", "app.orders"]
+    owed = sorted(f"{s}.{t}" for s, t, _ in dest_mod.tables_awaiting_snapshot(world.con, PIPELINE))
+    assert owed == ["app.customers", "app.orders"]
+
+
+@pytest.mark.parametrize("decision", ["operator_reset", "slot_ahead_of_destination"])
+def test_none_and_a_missing_row_cannot_clear_a_journal(world, decision):
+    """The exact predicate reproduction from the review, for BOTH decisions.
+
+    `none` means "registered, never snapshotted" and a missing row means "nothing was
+    ever written for it". Neither is evidence that a rebuild happened, and both used to
+    pass because the test was `not in LIFECYCLE_OWING_WORK` rather than "is `complete`".
+    """
+    tables = [("app", "existing", "cdcflight_app_existing"),
+              ("app", "missing", "cdcflight_app_missing")]
+    record = _armed_journal(world, decision=decision, captured=tables)
+    # Walk one table back to `none` and delete the other's row entirely, which is the
+    # durable shape an empty source table leaves behind.
+    world.con.execute(
+        "UPDATE _cdc_flight.table_state SET snapshot_state = 'none' "
+        "WHERE pipeline = ? AND source_table = 'existing'", [PIPELINE],
+    )
+    world.con.execute(
+        "DELETE FROM _cdc_flight.table_state WHERE pipeline = ? AND source_table = 'missing'",
+        [PIPELINE],
+    )
+    completion = _completion(world, record)
+    assert completion.cleared is False
+    assert sorted(completion.still_owed) == ["app.existing", "app.missing"]
+    assert recovery_mod.read(world.con, pipeline=PIPELINE, namespace=NAMESPACE) is not None
+
+
+def test_no_resume_point_cannot_clear_a_reset_journal(world):
+    """Every recovery needs the handoff evidence, reset included.
+
+    `needs_resume = tables_marked > 0` exempted reset, and reset recorded 0.
+    """
+    tables = [("app", "customers", "cdcflight_app_customers")]
+    record = _armed_journal(world, decision=recovery_mod.RESET_DECISION, captured=tables)
+    world.con.execute(
+        "UPDATE _cdc_flight.table_state SET snapshot_state = 'complete' WHERE pipeline = ?",
+        [PIPELINE],
+    )
+    world.con.execute("DELETE FROM _cdc_flight.debezium_offsets WHERE pipeline = ?", [PIPELINE])
+    completion = _completion(world, record)
+    assert completion.cleared is False
+    assert completion.has_resume_point is False
+    assert "resume point" in completion.reason
+
+
+def test_a_journal_clears_only_when_every_captured_table_is_complete(world):
+    tables = [("app", "customers", "cdcflight_app_customers"),
+              ("app", "orders", "cdcflight_app_orders")]
+    record = _armed_journal(world, decision=recovery_mod.RESET_DECISION, captured=tables)
+    world.con.execute(
+        "UPDATE _cdc_flight.table_state SET snapshot_state = 'complete' "
+        "WHERE pipeline = ? AND source_table = 'customers'", [PIPELINE],
+    )
+    assert _completion(world, record).cleared is False
+    world.con.execute(
+        "UPDATE _cdc_flight.table_state SET snapshot_state = 'complete' WHERE pipeline = ?",
+        [PIPELINE],
+    )
+    completion = _completion(world, record)
+    assert completion.cleared is True
+    assert recovery_mod.read(world.con, pipeline=PIPELINE, namespace=NAMESPACE) is None

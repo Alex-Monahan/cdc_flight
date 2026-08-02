@@ -107,20 +107,23 @@ trades a rubric-1.6 violation for a rubric-1.2 one.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import logging
-import shutil
 import threading
 from dataclasses import dataclass, field
 
 from . import destination as dest_mod
 from . import reconcile as reconcile_mod
+from . import table_lifecycle
 from .applier import Applier, ApplierConfig
 from .config import ReplicationConfig, RunConfig, SourceConfig
 from .debezium_props import build_properties
 from .destination import CONTROL_SCHEMA, ResumePoint
 from .errors import EngineFailure
 from .naming import quote
+from .ownership import DestinationOwnership
+from .resnapshot_recovery import InterruptionRecovery
 from .source_health import SourceHealth
 
 log = logging.getLogger("cdc_flight.resnapshot")
@@ -313,6 +316,7 @@ def run(
     epoch_base: int,
     reason: str,
     namespace: str,
+    ownership: DestinationOwnership,
 ) -> ResnapshotOutcome:
     """Re-snapshot `tables` into shadow tables and swap them in, then return.
 
@@ -329,8 +333,9 @@ def run(
     include = sorted({f"{schema}.{table}" for schema, table, _ in tables})
     slot = slot_name_for(replication.slot_name)
     state_dir = replication.state_dir / "resnapshot"
-    shutil.rmtree(state_dir, ignore_errors=True)
-    state_dir.mkdir(parents=True, exist_ok=True)
+    recovery = InterruptionRecovery.prepare(
+        state_dir, pipeline=pipeline, tables=tables
+    )
     # A leftover slot from an interrupted re-snapshot would make Debezium take the
     # pre-existing-slot path, which is exactly the path that does not export a snapshot.
     reconcile_mod.drop_slot(source.dsn, slot)
@@ -365,39 +370,40 @@ def run(
         ", ".join(include), reason, slot,
     )
     watcher = _SlotWatcher(source.dsn, slot).start()
-    applier = Applier(
-        con,
-        pipeline=pipeline,
-        namespace=f"{namespace}::resnapshot",
-        dataset=dataset,
-        topic_prefix=replication.topic_prefix,
-        offset_path=resnap_replication.offset_file,
-        resume_point=ResumePoint(snapshot_epoch=epoch_base),
-        config=cfg,
-        lease=lease,
-        runner_id=runner_id,
-        transactional_ddl=transactional_ddl,
-        catalog=None,
-    )
-    from .engine import SupervisedDebeziumEngine
-    from .pipeline import run_engine_bounded
-
-    engine = SupervisedDebeziumEngine(
-        properties=props,
-        handler=applier,
-        offset_file=resnap_replication.offset_file,
-        always_commit_offsets=props.get("offset.flush.interval.ms") == "0",
-    )
-    applier.verifier = None
-    engine.consumer  # noqa: B018 - builds the consumer and attaches the verifier
-    health = SourceHealth(
-        dsn=source.dsn, slot_name=slot, max_lag_bytes=run_cfg.idle_max_lag_bytes
-    ).start()
-    # try/finally around the WHOLE engine section, including everything that follows
-    # it: every failure route out of here used to leak the throwaway slot, which then
-    # held WAL on the source until somebody noticed `max_replication_slots` was
-    # exhausted (Opus MAJOR-2, observed twice on the shared cluster in one day).
+    health = None
+    applier = None
+    source_stopped = False
     try:
+        applier = Applier(
+            con,
+            pipeline=pipeline,
+            namespace=f"{namespace}::resnapshot",
+            dataset=dataset,
+            topic_prefix=replication.topic_prefix,
+            offset_path=resnap_replication.offset_file,
+            resume_point=ResumePoint(snapshot_epoch=epoch_base),
+            config=cfg,
+            lease=lease,
+            runner_id=runner_id,
+            transactional_ddl=transactional_ddl,
+            catalog=None,
+        )
+        ownership.attach(applier)
+        from .engine import SupervisedDebeziumEngine
+        from .pipeline import run_engine_bounded
+
+        engine = SupervisedDebeziumEngine(
+            properties=props,
+            handler=applier,
+            offset_file=resnap_replication.offset_file,
+            always_commit_offsets=props.get("offset.flush.interval.ms") == "0",
+        )
+        applier.verifier = None
+        engine.consumer  # noqa: B018 - builds the consumer and attaches the verifier
+        health = SourceHealth(
+            dsn=source.dsn, slot_name=slot, max_lag_bytes=run_cfg.idle_max_lag_bytes
+        ).start()
+        ownership.activate(applier)
         try:
             summary = run_engine_bounded(
                 engine,
@@ -412,16 +418,16 @@ def run(
                 ),
                 health,
                 stop_when=lambda: applier.snapshot_completed,
+                quiescence_observer=ownership.quiescence_observer(applier),
             )
-            outcome.engine_stop_reason = str(summary.get("stop_reason"))
-            outcome.events = int(summary.get("applied_events") or 0)
         finally:
             health.stop()
             watcher.stop()
+            source_stopped = True
             outcome.snapshot_phase_ended = applier.snapshot_final_seen
             outcome.tables_scanned = sorted(applier.snapshot_tables_seen)
-            applier.shutdown()
-            applier.alerts.close()
+        outcome.engine_stop_reason = str(summary.get("stop_reason"))
+        outcome.events = int(summary.get("applied_events") or 0)
 
         outcome.slot_consistent_lsn = watcher.first_confirmed
         outcome.snapshot_record_lsn = applier.last_snapshot_lsn
@@ -451,47 +457,69 @@ def run(
             done=set(outcome.swapped),
             evidence=evidence,
         )
-    except BaseException:
+        if outcome.consistent_lsn is None and sorted(outcome.requested) != sorted(
+            outcome.emptied
+        ):
+            raise EngineFailure(
+                "the re-snapshot produced no consistent point: neither a snapshot "
+                f"record nor the throwaway slot {slot!r} yielded an LSN, so the "
+                "hand-over between the image and the stream cannot be fenced (rubric "
+                "1.6). Nothing was swapped and the tables stay marked for a "
+                "re-snapshot.",
+                outcome.as_dict(),
+            )
+        assert_every_requested_table_completed(outcome)
+        recovery.consume()
+        log.warning(
+            "RE-SNAPSHOT complete at consistent point %s: swapped %s, emptied %s",
+            outcome.consistent_lsn, outcome.swapped or "-", outcome.emptied or "-",
+        )
+        return outcome
+    except BaseException as exc:
         # Anything that escapes leaves the requested tables in whatever state the
         # engine got them to. `SnapshotCoordinator` writes `in_progress` the moment a
         # table's first record arrives, and `in_progress` is NOT in the
         # `tables_awaiting_snapshot` queue - so a partial re-snapshot that simply
         # raised would drop the table off the durable to-do list and the next run
-        # would stream CDC onto a half-built image. Re-assert the to-do list first.
-        reassert_owed(con, pipeline=pipeline, tables=tables, terminal=outcome)
+        # would stream CDC onto a half-built image. Re-assert the to-do list only when
+        # this thread still owns the connection. A live callback gets the pre-armed
+        # filesystem recovery marker instead; the next process consumes it before
+        # reading the owed queue.
+        summary = dict(getattr(exc, "summary", {}) or {})
+        destination_safe = True
+        if applier is not None and ownership.owns(applier):
+            destination_safe = ownership.retire_if_quiescent(
+                reason="resnapshot_setup_failed"
+            )
+        failed_quiescence = not destination_safe
+        if failed_quiescence:
+            recovery.retain_in(summary)
+            with contextlib.suppress(Exception):
+                exc.summary = summary
+            log.critical(
+                "re-snapshot callback did not quiesce; retaining its destination "
+                "runtime, throwaway slot and offset state. Recovery is armed at %s",
+                recovery.marker,
+            )
+        else:
+            reassert_owed(con, pipeline=pipeline, tables=tables, terminal=outcome)
+            recovery.consume()
         raise
     finally:
-        # Named by us, created by Debezium, ours to reclaim on EVERY exit.
-        try:
-            reconcile_mod.drop_slot(source.dsn, slot)
-        except Exception:  # pragma: no cover - the source may be unreachable
-            log.error(
-                "could not drop the throwaway re-snapshot slot %r; it is holding WAL "
-                "on the source and the next run of this pipeline will sweep it",
-                slot, exc_info=True,
-            )
-        shutil.rmtree(state_dir, ignore_errors=True)
-
-    if outcome.consistent_lsn is None and sorted(outcome.requested) != sorted(
-        outcome.emptied
-    ):
-        reassert_owed(con, pipeline=pipeline, tables=tables, terminal=outcome)
-        raise EngineFailure(
-            "the re-snapshot produced no consistent point: neither a snapshot record "
-            f"nor the throwaway slot {slot!r} yielded an LSN, so the hand-over between "
-            "the image and the stream cannot be fenced (rubric 1.6). Nothing was "
-            "swapped and the tables stay marked for a re-snapshot.",
-            outcome.as_dict(),
-        )
-
-    if outcome.still_owed:
-        reassert_owed(con, pipeline=pipeline, tables=tables, terminal=outcome)
-    assert_every_requested_table_completed(outcome)
-    log.warning(
-        "RE-SNAPSHOT complete at consistent point %s: swapped %s, emptied %s",
-        outcome.consistent_lsn, outcome.swapped or "-", outcome.emptied or "-",
-    )
-    return outcome
+        if not source_stopped:
+            if health is not None:
+                health.stop()
+            watcher.stop()
+        if applier is not None and ownership.owns(applier):
+            ownership.retire_if_quiescent(reason="resnapshot_teardown")
+        if (
+            (applier is None or not ownership.owns(applier))
+            and recovery.consumed
+        ):
+            # Named by us, created by Debezium, ours to reclaim only after the callback
+            # ownership token proves every destination user has left AND a safe owner
+            # has discharged the durable recovery obligation.
+            recovery.retire_terminal_resources(dsn=source.dsn, slot=slot)
 
 
 def snapshot_phase_ended(applier, stop_reason: str) -> bool:
@@ -660,12 +688,10 @@ def _completed_tables(
     """
     done: list[str] = []
     for schema, table, target in tables:
-        rows = con.execute(
-            f"SELECT snapshot_state FROM {CONTROL_SCHEMA}.table_state "
-            "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
-            [pipeline, schema, table],
-        ).fetchall()
-        if rows and str(rows[0][0]) == "complete":
+        state = table_lifecycle.read(
+            con, pipeline=pipeline, source_schema=schema, source_table=table
+        )
+        if state == table_lifecycle.COMPLETE:
             con.execute(
                 f"UPDATE {CONTROL_SCHEMA}.table_state SET snapshot_lsn = ? "
                 "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
@@ -751,11 +777,18 @@ def finish_verified_empty_tables(
                     f"SELECT count(*) FROM {quote(dataset)}.{quote(target)}"
                 ).fetchone()[0]
                 con.execute(f"DELETE FROM {quote(dataset)}.{quote(target)}")
-            con.execute(
-                f"UPDATE {CONTROL_SCHEMA}.table_state SET snapshot_state = 'complete', "
-                "snapshot_lsn = ? WHERE pipeline = ? AND source_schema = ? "
-                "AND source_table = ?",
-                [consistent_lsn, pipeline, schema, table],
+            # rubric 1.9: `awaiting_snapshot -> complete` with no shadow to swap. It is
+            # a declared edge precisely because a table can be proven empty at the
+            # source; `none -> complete` is NOT declared, which is what keeps this path
+            # reachable only from the owed queue.
+            table_lifecycle.transition(
+                con,
+                pipeline=pipeline,
+                source_schema=schema,
+                source_table=table,
+                to=table_lifecycle.COMPLETE,
+                reason="verified empty at the source; the destination table was emptied",
+                snapshot_lsn=consistent_lsn,
             )
             dest_mod.write_table_event(
                 con,
@@ -800,3 +833,59 @@ def read_watermarks(con, pipeline: str) -> dict[str, int]:
         [pipeline],
     ).fetchall()
     return {f"{schema}.{table}": int(lsn) for schema, table, lsn in rows}
+
+
+def finish_empty_tables_after_main_snapshot(
+    con,
+    *,
+    pipeline: str,
+    dataset: str,
+    dsn: str,
+    owed: list[tuple[str, str, str]],
+    applier,
+    stop_reason: str,
+) -> list[str]:
+    """Close out the tables a MAIN-engine snapshot left owed because they are empty.
+
+    A source relation with zero rows emits no snapshot records at all, so
+    `SnapshotCoordinator` never opens a shadow for it and never swaps one in — and the
+    destination table keeps whatever it held before. For an ordinary run that is fine:
+    nothing claimed the table had been rebuilt. For a run carrying a **journalled
+    obligation** it is not, and the first cut of the journalled `--reset-state` proved
+    how badly: it recorded the rebuild as complete and left the destination holding rows
+    the source had truncated away (Codex r2 BLOCKER-1).
+
+    The blocking re-snapshot path has always handled this correctly, through
+    `EmptinessEvidence` and `finish_verified_empty_tables`. This is the same machinery,
+    applied to the same question after the main engine's own snapshot — the three
+    independent facts are unchanged, and so is the rule that a table failing any of them
+    is left completely untouched and stays owed:
+
+    1. Debezium emitted its own end-of-snapshot marker (or produced nothing at all and
+       the connector reached streaming), so the engine saw the whole capture set;
+    2. this table produced **zero** snapshot records;
+    3. a source count taken after the engine stopped says the relation holds no rows,
+       fenced at a WAL position sampled before that count.
+
+    Returns `(emptied_tables, fence_lsn)`. The fence is the WAL position the emptiness
+    was proven at, and the caller needs it: an entirely empty capture set produces no
+    Debezium records, so the applier commits no group and writes no resume point, and a
+    recovery that (correctly) demands one would never clear (Codex r3 MAJOR-1).
+    """
+    if not owed:
+        return [], None
+    evidence = _gather_emptiness_evidence(
+        dsn,
+        pending=owed,
+        snapshot_phase_ended=snapshot_phase_ended(applier, stop_reason),
+        tables_seen=set(applier.snapshot_tables_seen),
+    )
+    emptied = finish_verified_empty_tables(
+        con,
+        pipeline=pipeline,
+        dataset=dataset,
+        tables=owed,
+        done=set(),
+        evidence=evidence,
+    )
+    return emptied, evidence.wal_lsn

@@ -156,7 +156,62 @@ DESTINATION_POINTS = (
     "destination_close",
 )
 
-ALL_POINTS = POINTS + DESTINATION_POINTS
+#: **Recovery anchors** (rubric 1.7's route from 4 to 5, added with rubric 1.9's state
+#: machines). The acquisition recovery is the one durable sequence in the tree that
+#: cannot be made atomic — it mutates the to-do list, `offsets.dat`, the durable resume
+#: point and the replication slot, in that order, and a crash between any two of them
+#: used to leave a state the Flight diagnosed as an operator error and refused to start
+#: on, for ever (Codex B3 / Opus MAJOR-1). The 1.6—1.8 round proved those cuts through a
+#: **test seam** (`recovery.resume(on_phase=...)`), which proves the *logic* resumes and
+#: not that a hard-killed process does: `os._exit` skips every `except`, every `finally`
+#: and every atexit hook, and the seam runs on none of those paths. These anchors put a
+#: real `os._exit` at each boundary, so the crash-cut table in A53 is measured rather
+#: than modelled — which is the difference the 1.7 hold was about.
+#:
+#: * `recovery_requested`             - the journal row and the to-do list are durable
+#:   and NOTHING has been destroyed. The next run must resume, not re-diagnose.
+#: * `recovery_offsets_file_deleted`  - `offsets.dat` is gone, the journal still says
+#:   `requested`. A53's benign cut: `file absent / row present` -> rebuilt.
+#: * `recovery_resume_point_deleted`  - the durable resume point is gone, the slot is
+#:   not. The next run re-runs the drop from `offsets_file_deleted`.
+#: * `recovery_armed`                 - the slot is dropped and the journal has not
+#:   recorded it. The dangerous one: the forced `snapshot.mode` lives only in the row.
+#: * `table_rebuild_queued`           - the durable to-do list is genuinely MID-WRITE:
+#:   the first captured table has taken its `-> awaiting_snapshot` edge inside
+#:   `recovery.begin()`'s transaction and the rest have not. It used to fire before the
+#:   loop, which proved a pre-write rollback and not a torn queue (Codex r1 MAJOR-6).
+RECOVERY_POINTS = (
+    "recovery_requested",
+    "recovery_offsets_file_deleted",
+    "recovery_resume_point_deleted",
+    "recovery_armed",
+    "table_rebuild_queued",
+    #: rubric 1.9's catalog-baseline machine (`machines.CATALOG_BASELINE`). The two
+    #: cuts across its edges, so A53's crash table covers the state that decides
+    #: whether an observed relation identity may be adopted as history:
+    #:
+    #: * `catalog_baseline_marked`   - the durable `stale`/`invalidated` mark is
+    #:   written and the engine has NOT started. The next run must reconcile from
+    #:   this row rather than re-diagnose from nothing.
+    #: * `catalog_baseline_pre_valid` - the learned relations are flushed and the
+    #:   promotion to `valid` has not been written. The next run must reach the same
+    #:   verdict from durable state alone; the promotion is idempotent, not one-shot.
+    "catalog_baseline_marked",
+    "catalog_baseline_pre_valid",
+)
+
+#: Faults injected on the SOURCE side, which is neither a place we stand in the commit
+#: protocol nor something the destination does to us.
+#:
+#: * `catalog_poll` - every `CatalogWatcher.poll()` from the nth arrival onwards raises.
+#:   This is the composition round 5 reproduced by monkeypatching and the suite could
+#:   not express (Codex r5, 1.7): a run that reads the source catalog **zero** times,
+#:   followed by destructive DDL while the pipeline is down. It is a repeating fault
+#:   rather than a one-shot precisely because "the catalog was unreadable for a whole
+#:   run" is the state that matters, and one failed poll out of six is not that state.
+SOURCE_POINTS = ("catalog_poll",)
+
+ALL_POINTS = POINTS + DESTINATION_POINTS + RECOVERY_POINTS + SOURCE_POINTS
 
 #: Names kept working from the first fault-injection cut.
 ALIASES = {"before_load": "pre_commit", "after_load": "post_commit_pre_ack"}
@@ -259,6 +314,25 @@ def _spec() -> tuple[str, int, int | str] | None:
 #: connection wrapper to *infer* the group index from the SQL it sees, and an
 #: inferred index is exactly how a fault test goes vacuously green (Opus M7).
 _current_group = 0
+
+
+#: How many times this process has reached each NON-group anchor, 1-based. The
+#: protocol anchors index by commit group, which is the right `<nth>` for them; a
+#: recovery phase boundary is not a commit group, and an index that is a function of the
+#: workload is one that silently stops firing (Opus M7). `arrival()` is the counter for
+#: anchors that happen once (or twice) per RUN rather than once per group.
+_arrivals: dict[str, int] = {}
+
+
+def arrival(point: str) -> int:
+    """The 1-based count of times this process has reached `point`."""
+    _arrivals[point] = _arrivals.get(point, 0) + 1
+    return _arrivals[point]
+
+
+def reset_arrivals() -> None:
+    """Test seam: forget how many times each non-group anchor has been reached."""
+    _arrivals.clear()
 
 
 def arm_group(nth: int) -> None:
@@ -453,6 +527,32 @@ def read_fired_record(state_dir) -> dict | None:
             return json.load(handle)
     except (OSError, ValueError):
         return None
+
+
+def maybe_fail_repeatedly(point: str) -> None:
+    """Raise `InjectedFault` on the nth arrival at `point` **and every one after it**.
+
+    `maybe_crash` fires once, at an exact index, which is right for a crash: a process
+    dies once. It is wrong for a *degraded dependency*. The state round 5 reproduced by
+    hand — "this run never managed to read the source catalog at all" — is not one
+    failed poll, it is every poll, and a one-shot anchor would leave the run with a
+    perfectly good baseline and prove nothing.
+
+    Counts its own arrivals: a poll is not a commit group, and an index that is a
+    function of the workload is one that silently stops firing (Opus M7).
+    """
+    spec = _spec()
+    if spec is None:
+        return
+    want_point, want_nth, _action = spec
+    if want_point != point:
+        return
+    nth = arrival(point)
+    if nth < want_nth:
+        return
+    log.error("FAULT INJECTION: %s fails (arrival %s, and every one after it)", point, nth)
+    record_fired(point, nth, RAISE)
+    raise InjectedFault(f"injected {point} failure (arrival {nth})")
 
 
 def maybe_crash(point: str, nth: int) -> None:

@@ -30,6 +30,32 @@ def lab(tmp_path):
         box.close()
 
 
+def test_shutdown_seals_callback_admission_and_records_late_batches(lab, monkeypatch):
+    """Round 8 MAJOR-1: shutdown is a callback boundary, not only a timer stop.
+
+    A Debezium callback which arrives after the seal must do no decode, destination SQL,
+    state mutation, or acknowledgement.  The rejection is retained in the run stats so
+    a late engine is observable rather than silently mistaken for an empty batch.
+    """
+    box = lab()
+    handled: list[object] = []
+    monkeypatch.setattr(
+        box.applier,
+        "_handle",
+        lambda records, committer: handled.append((records, committer)),
+    )
+
+    box.applier.shutdown(reason="test_retirement")
+    box.applier.handle_batch([object(), object()], box.committer)
+
+    assert handled == []
+    stats = box.applier.stats()
+    assert stats["callback_boundary"] == "sealed"
+    assert stats["callback_seal_reason"] == "test_retirement"
+    assert stats["callback_batches_rejected"] == 1
+    assert stats["callback_records_rejected"] == 2
+
+
 class _RecordingVerifier:
     """Stands in for `OffsetFlushVerifier` and records *when* it was consulted."""
 

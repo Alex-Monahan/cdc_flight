@@ -20,21 +20,30 @@ this migration.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
-import shutil
 import sys
 import threading
 import uuid
 from pathlib import Path
 
+# Runtime compatibility, not a test workaround. This must run before any project import
+# can load PyArrow: 25.0.0's mimalloc backend has reproducibly crashed while an Arrow
+# table was built on Debezium's JPype callback thread. Operators may explicitly select a
+# different proven-safe pool; the production default is the Arrow system allocator.
+os.environ.setdefault("ARROW_DEFAULT_MEMORY_POOL", "system")
+
+from . import acquisition
 from . import catalog as catalog_mod
+from . import catalog_baseline as baseline_mod
 from . import destination as dest_mod
 from . import faults as faults_mod
 from . import reconcile as reconcile_mod
 from . import recovery as recovery_mod
 from . import resnapshot as resnapshot_mod
+from . import resnapshot_recovery as resnapshot_recovery_mod
 from .applier import Applier, ApplierConfig
 from .config import (
     CatalogConfig,
@@ -49,208 +58,19 @@ from .debezium_props import assert_no_internal_topic_collision, build_properties
 from .destination import CONTROL_SCHEMA, Lease
 from .errors import EngineFailure
 from .faults import validate_env as validate_fault_env
+from .machines import (
+    PHASE_RECONCILING,
+    PHASE_RECOVERING,
+    PHASE_SNAPSHOTTING,
+    PHASE_STOPPING,
+    PHASE_STREAMING,
+)
+from .ownership import DestinationOwnership
+from .run_state import RunOutcome, RunPhaseWriter
 from .source_health import SourceHealth
 from .supervisor import run_engine_bounded
 
 log = logging.getLogger("cdc_flight.pipeline")
-
-
-# --------------------------------------------------------------------------- #
-# rubric 1.8 — the slot check and its automatic recovery
-# --------------------------------------------------------------------------- #
-def resnapshot_enabled() -> bool:
-    """`CDC_RESNAPSHOT=0` turns the automatic re-snapshot off.
-
-    Not a switch anyone should need, and it exists for exactly one reason: the rubric
-    grades "any potential data loss from slot advancement triggers a backfill
-    automatically" at 5 and "triggers the process to exit" at 4, and an operator who
-    wants to be told rather than repaired should be able to have the 4 deliberately
-    rather than by accident.
-    """
-    return os.environ.get("CDC_RESNAPSHOT", "1").strip().lower() not in (
-        "0", "false", "no", "off"
-    )
-
-
-def _captured_tables(con, pipeline: str, source, replication) -> list[tuple[str, str, str]]:
-    """`(schema, table, target)` for every table this pipeline captures.
-
-    Built from the *configuration*, not from `table_state`: a recovery has to be able to
-    mark a table that has no destination row yet, and the include list is the definition
-    of "captured". `table_state` supplies the target name where it knows one so a
-    re-snapshot lands on the table an existing consumer is already reading.
-    """
-    from . import naming
-
-    known = {
-        f"{schema}.{table}": target
-        for schema, table, target in con.execute(
-            f"SELECT source_schema, source_table, target_table FROM "
-            f"{CONTROL_SCHEMA}.table_state WHERE pipeline = ?",
-            [pipeline],
-        ).fetchall()
-    }
-    out: list[tuple[str, str, str]] = []
-    for qualified in source.tables:
-        schema, _, table = qualified.partition(".")
-        if not table:
-            schema, table = source.schema, qualified
-        target = known.get(f"{schema}.{table}") or naming.destination_table(
-            replication.topic_prefix, schema, table
-        )
-        out.append((schema, table, target))
-    return out
-
-
-def _resume_any_journalled_recovery(
-    con, *, source, replication, dest, namespace: str
-) -> tuple:
-    """Finish a recovery an earlier process left half-done, BEFORE anything else looks.
-
-    Returns `(record_or_None, result_or_None)`. This is what makes rubric 1.8's recovery
-    crash-recoverable rather than crash-fatal: the journal says which phase was reached,
-    every step is idempotent, and the run resumes from there instead of diagnosing its
-    own intermediate state as an operator error (Codex B3 / Opus MAJOR-1). It runs
-    before `_check_the_slot` because a half-finished recovery has, by construction, the
-    exact durable shape - no resume row, maybe no slot - that the slot check reads as a
-    brand-new problem.
-    """
-    record = recovery_mod.read(con, pipeline=dest.pipeline_name, namespace=namespace)
-    if record is None:
-        return None, None
-    if record.phase == recovery_mod.PHASE_ARMED:
-        log.warning(
-            "resuming rubric 1.8 recovery %s (%s): the destructive phase is complete "
-            "and %s table(s) still owe a snapshot",
-            record.recovery_id, record.decision, record.tables_marked,
-        )
-        return record, {
-            "recovery_id": record.recovery_id,
-            "decision": record.decision,
-            "resumed_from": record.phase,
-            "phase": record.phase,
-            "tables_marked": record.tables_marked,
-            "message": record.message,
-        }
-    log.warning(
-        "resuming rubric 1.8 recovery %s (%s) from phase %r: an earlier run did not "
-        "finish it", record.recovery_id, record.decision, record.phase,
-    )
-    result = recovery_mod.resume(
-        con,
-        pipeline=dest.pipeline_name,
-        namespace=namespace,
-        record=record,
-        dsn=source.dsn,
-    )
-    return record, result
-
-
-def _check_the_slot(
-    con, *, source, replication, dest, namespace: str, captured, orphan_file: bool
-) -> tuple:
-    """Run rubric 1.8's check and, if it says so, arm the automatic re-snapshot.
-
-    Returns `(verdict, recovery_or_None)`. The observation is recorded either way -
-    that is what makes "the slot was recreated" and "the cluster was restored"
-    detectable at all on the *next* run (`_cdc_flight.slot_state`).
-    """
-    durable = con.execute(
-        f"SELECT last_lsn FROM {CONTROL_SCHEMA}.debezium_offsets "
-        "WHERE pipeline = ? AND namespace = ?",
-        [dest.pipeline_name, namespace],
-    ).fetchall()
-    durable_lsn = int(durable[0][0]) if durable else None
-    observation = reconcile_mod.observe_slot(source.dsn, replication.slot_name)
-    previous = dest_mod.read_slot_state(con, dest.pipeline_name, replication.slot_name)
-    # What the destination actually holds, not what a control row says about it. The
-    # `no_durable_destination_row` cell is defined as "destination EMPTY, slot
-    # positioned" and used to be decided without ever looking (Opus BLOCKER-2). Only
-    # read when there is no resume point, because that is the only cell it decides and
-    # counting every captured table on every start-up is not free.
-    destination_rows = (
-        dest_mod.destination_holds_rows(con, dataset=dest.dataset_name, tables=captured)
-        if durable_lsn is None
-        else None
-    )
-    verdict = reconcile_mod.check_slot(
-        durable_lsn=durable_lsn,
-        observation=observation,
-        previous=previous,
-        destination_rows=destination_rows,
-    )
-    log.info("slot check: %s (%s)", verdict.decision, verdict.message or "healthy")
-
-    recovery = None
-    if verdict.refuse and verdict.decision == "no_durable_destination_row":
-        log.error(
-            "%s: %s", verdict.decision, verdict.message,
-        )
-        dest_mod.raise_alert(
-            con, pipeline=dest.pipeline_name, severity="critical",
-            code=verdict.decision, message=verdict.message, context=verdict.as_dict(),
-        )
-    if verdict.resnapshot and orphan_file and verdict.decision == "no_durable_destination_row":
-        # The one place a re-snapshot is NOT the right automatic answer, and the reason
-        # the refusal in ADR 0001 §4.5 survives this whole feature: an `offsets.dat` with
-        # no destination row usually means the DSN is pointed at the wrong database. A
-        # re-snapshot would then DROP that database's live tables and replace them with
-        # another source's data, which is destruction, not repair. Reconciliation refuses
-        # a few lines later, and `--accept-orphan-offsets` is the operator's way to say
-        # "yes, re-snapshot into this destination".
-        log.error(
-            "%s, but an orphan %s is present: refusing rather than re-snapshotting, "
-            "because a re-snapshot would replace this destination's tables with data "
-            "from a source it may not belong to (ADR 0001 §4.5)",
-            verdict.decision, replication.offset_file,
-        )
-        verdict = reconcile_mod.SlotVerdict(
-            verdict.decision,
-            ok=False,
-            resnapshot=False,
-            refuse=True,
-            message=f"{verdict.message}; deferred to the orphan-offsets refusal",
-            context=verdict.context,
-        )
-    if verdict.resnapshot:
-        if not resnapshot_enabled():
-            # The rubric's 4 rather than its 5, chosen explicitly.
-            dest_mod.raise_alert(
-                con, pipeline=dest.pipeline_name, severity="critical",
-                code=verdict.decision, message=verdict.message,
-                context=verdict.as_dict(),
-            )
-            raise reconcile_mod.SlotAheadOfDestination(
-                f"{verdict.decision}: {verdict.message}. CDC_RESNAPSHOT=0, so the "
-                "automatic re-snapshot that would repair this is disabled."
-            )
-        recovery = reconcile_mod.recover_by_full_resnapshot(
-            con,
-            pipeline=dest.pipeline_name,
-            namespace=namespace,
-            dsn=source.dsn,
-            slot_name=replication.slot_name,
-            offset_path=replication.offset_file,
-            verdict=verdict,
-            captured_tables=captured,
-            forget_catalog=verdict.decision in reconcile_mod.FORGET_CATALOG_DECISIONS,
-        )
-    if observation.observable:
-        recorded = observation.as_dict() | {"durable_lsn": durable_lsn}
-        if recovery is not None:
-            # The recovery dropped this slot. Keeping its LSNs as the baseline would make
-            # the next run compare a brand-new slot against a slot that no longer exists;
-            # the cluster's identity is the part that stays meaningful.
-            recorded |= {
-                "restart_lsn": None, "confirmed_flush_lsn": None, "durable_lsn": None
-            }
-        dest_mod.write_slot_state(
-            con,
-            pipeline=dest.pipeline_name,
-            slot_name=replication.slot_name,
-            observation=recorded,
-        )
-    return verdict, recovery
 
 
 # --------------------------------------------------------------------------- #
@@ -266,6 +86,13 @@ def run(
     reset_state: bool = False,
     accept_orphan_offsets: bool = False,
 ) -> dict:
+    """Run one Flight invocation.
+
+    This API is process-terminal after a failed callback-quiescence proof. In that one
+    state it writes the failure summary and hard-exits instead of returning or raising
+    to an in-process caller, because the callback owns resources which must not outlive
+    the lease and overlap another invocation in the same interpreter.
+    """
     # Parse CDC_FAULT_INJECT once, here, so a typo fails the run instead of
     # leaving a fault test vacuously green (Codex 9).
     fault_spec = validate_fault_env()
@@ -320,75 +147,38 @@ def run(
     summary_extra: dict = {}
     lease: Lease | None = None
     lease_held = False
+    phases: RunPhaseWriter | None = None
+    applier: Applier | None = None
+    ownership = DestinationOwnership()
+    run_ok = False
+    #: The run's ONE outcome, shared by the supervisor, the terminal `RUN_PHASE`
+    #: transition and the returned summary (Codex r1 MAJOR-2). `RunOutcome` refuses a
+    #: downgrade, so a later, less severe reason cannot overwrite an earlier diagnosis.
+    outcome = RunOutcome()
+    #: The dict `main()` will print and persist. Held so the outer `finally` can update
+    #: it AFTER the terminal phase transitions, rather than shipping a summary sampled
+    #: while the run was still `draining`.
+    reported: dict | None = None
     try:
         dest_mod.ensure_control_schema(con)
         dest_mod.ensure_dataset(con, dest.dataset_name)
+        # rubric 1.9 / ADR §4.8: one `_cdc_flight.heartbeat` row per run, moved through
+        # the `RUN_PHASE` machine on its OWN connection. "Where is this run" stops being
+        # a source-line position in a 470-line function and becomes a query. The
+        # periodic liveness/lag writer is still 4.4/6.1's.
+        phases = RunPhaseWriter(
+            con, pipeline=dest.pipeline_name, runner_id=runner_id, outcome=outcome
+        )
 
         if reset_state:
-            # WHY THIS ONE IS NOT JOURNALLED (architecture review, finding 4). It is the
-            # same shape as the acquisition recovery - several independent durable
-            # mutations with no transaction spanning them - and the reason it does not
-            # need a journal is that **every** intermediate state converges on the same
-            # outcome rather than on a refusal:
-            #
-            #   * state dir gone, resume row present -> `file_missing_rebuilt`; the run
-            #     resumes and the *next* `--reset-state` finishes the job;
-            #   * resume row gone, table_state not yet reset -> no durable offset, so
-            #     `will_snapshot_everything` is true and the snapshot overwrites the
-            #     stale rows anyway;
-            #   * everything gone -> a fresh start, which is what was asked for.
-            #
-            # There is exactly one hole, and it is closed two lines below rather than
-            # journalled: a non-data `snapshot.mode` would turn "start over" into "stream
-            # onto tables we just declared empty". An operator running `--reset-state` is
-            # also present, unlike the crash-recovery case, which is the other half of
-            # why a durable intent buys less here.
-            if props["snapshot.mode"] not in reconcile_mod.SNAPSHOT_MODES_WITH_DATA:
-                log.warning(
-                    "--reset-state asks to start over but snapshot.mode=%s does not read "
-                    "table data; using 'initial'", props["snapshot.mode"],
-                )
-                props["snapshot.mode"] = "initial"
-            # "Start over" has to mean start over at *both* ends, or the file is
-            # deleted while the destination still claims a resume point and
-            # reconciliation correctly refuses to re-snapshot.
-            log.info("resetting CDC state at %s and in %s", replication.state_dir, CONTROL_SCHEMA)
-            shutil.rmtree(replication.state_dir, ignore_errors=True)
-            replication.state_dir.mkdir(parents=True, exist_ok=True)
-            con.execute(
-                f"DELETE FROM {CONTROL_SCHEMA}.debezium_offsets WHERE pipeline = ?",
-                [dest.pipeline_name],
-            )
-            # NOT a DELETE. `table_state` is the canonical source-to-destination
-            # ownership registry (Codex 5), and it is the only thing that tells the
-            # catalog watcher a destination table is ours. Deleting it made
-            # `--reset-state` produce a PERMANENT zombie: a table dropped at the source
-            # produces no events, so `observe_replicated` never re-learns it, and
-            # `_compare` skips a name it has no oid for and does not believe is
-            # replicated - so its stale destination table survives for ever and
-            # detection is disabled for it (Opus MAJOR-4, measured). What "start over"
-            # has to reset is the *snapshot* bookkeeping, which is what this does.
-            con.execute(
-                f"UPDATE {CONTROL_SCHEMA}.table_state SET snapshot_state = 'none', "
-                "snapshot_epoch = 0, snapshot_lsn = NULL, last_commit_id = NULL "
-                "WHERE pipeline = ?",
-                [dest.pipeline_name],
-            )
+            # The one part of `--reset-state` that is NOT journalled, and the one part
+            # that does not need to be: a lease row destroys no data and records no
+            # obligation. It is cleared before the lease is acquired because an operator
+            # saying "start over" is also saying "break whatever claims to hold this
+            # pipeline"; `Lease.acquire` reclaims a dead owner on its own, so this only
+            # covers an owner whose host we cannot check.
             con.execute(
                 f"DELETE FROM {CONTROL_SCHEMA}.lease WHERE pipeline = ?",
-                [dest.pipeline_name],
-            )
-            # And what we last saw of the source catalog (rubric 1.5). MEASURED: a
-            # stale `source_relations` row makes the next run compare the *new*
-            # relation oids against the old ones and correctly conclude that every
-            # table was dropped and recreated - which is exactly right for a rebuilt
-            # source and exactly wrong for "start over", where the re-snapshot is
-            # about to rebuild the destination anyway. Without this,
-            # `tests/1.1_exactly_once_pk/test_1_1_fault_interleavings.py::
-            # test_a_crash_during_the_snapshot_phase_leaves_no_partial_table` lost its
-            # tables to a `recreated` action mid-run.
-            con.execute(
-                f"DELETE FROM {CONTROL_SCHEMA}.source_relations WHERE pipeline = ?",
                 [dest.pipeline_name],
             )
 
@@ -418,18 +208,29 @@ def run(
             source.dsn, replication.slot_name
         )
 
+        captured_tables = acquisition.captured_tables(con, dest.pipeline_name, source, replication)
+
+        if reset_state:
+            # Journalled BEFORE the first destructive step, and before the generic
+            # resume below picks it up (Codex r1 MAJOR-4).
+            summary_extra["reset_state"] = acquisition.journal_the_reset(
+                con, source=source, replication=replication, dest=dest,
+                namespace=namespace, captured=captured_tables, phases=phases,
+            )
+
         # A recovery an earlier process did not finish is resumed BEFORE the slot check
         # looks at anything: its intermediate state is, by construction, indistinguish-
         # able from a fresh problem, and the Flight used to diagnose its own half-done
         # work as an operator error and refuse for ever (Codex B3 / Opus MAJOR-1).
-        journal, resumed = _resume_any_journalled_recovery(
-            con, source=source, replication=replication, dest=dest, namespace=namespace
+        journal, resumed = acquisition.resume_any_journalled_recovery(
+            con, source=source, replication=replication, dest=dest, namespace=namespace,
+            phases=phases,
         )
         if resumed is not None:
             summary_extra["recovery_resumed"] = resumed
 
-        captured_tables = _captured_tables(con, dest.pipeline_name, source, replication)
-        verdict, recovery = _check_the_slot(
+        phases.ensure(PHASE_RECONCILING)
+        verdict, recovery = acquisition.check_the_slot(
             con,
             source=source,
             replication=replication,
@@ -446,6 +247,7 @@ def run(
         )
         summary_extra["slot_check"] = verdict.as_dict()
         if recovery is not None:
+            phases.to(PHASE_RECOVERING, detail=verdict.decision)
             summary_extra["slot_recovery"] = recovery
             journal = recovery_mod.read(
                 con, pipeline=dest.pipeline_name, namespace=namespace
@@ -471,7 +273,8 @@ def run(
                 )
             summary_extra["recovery_journal"] = journal.as_dict()
 
-        outcome = reconcile_mod.reconcile(
+        phases.ensure(PHASE_RECONCILING)
+        reconciliation = reconcile_mod.reconcile(
             con,
             pipeline=dest.pipeline_name,
             namespace=namespace,
@@ -481,50 +284,48 @@ def run(
             dsn=source.dsn,
             slot_name=replication.slot_name,
         )
-        summary_extra["reconciliation"] = outcome.decision
-        summary_extra["reconciliation_detail"] = outcome.message
-        log.info("start-up reconciliation: %s (%s)", outcome.decision, outcome.message)
+        summary_extra["reconciliation"] = reconciliation.decision
+        summary_extra["reconciliation_detail"] = reconciliation.message
+        log.info("start-up reconciliation: %s (%s)", reconciliation.decision, reconciliation.message)
 
-        # rubric 4.7: an operator who passed `--accept-orphan-offsets` has asked for a
-        # re-snapshot, so a `snapshot.mode` that does not read table data would turn
-        # their request into a refusal three lines later.
+        # rubric 4.7 / Codex r1 BLOCKER-1: an operator who passed
+        # `--accept-orphan-offsets` has authorised a rebuild, and the rebuild is now a
+        # journalled recovery like every other one — **journal first, destroy second**.
         #
-        # JOURNALLED, for the same reason the slot-check recovery is (architecture
-        # review, finding 4): this is a multi-step durable mutation - drop the slot,
-        # delete the file, force a data-reading snapshot - and the forced mode used to
-        # live only in this local variable. A crash after the file was deleted would
-        # lose it exactly the way Codex B3 described, and the next run would call the
-        # leftovers an ordinary fresh start. The journal is written *after* the
-        # destructive steps here rather than before, because reconciliation has already
-        # proven the slot gone and the file deleted; what has to survive is the
-        # obligation to rebuild.
-        if outcome.decision == "orphan_accepted_resnapshot" and journal is None:
+        # It used to be the other way round. `offset_reconcile` dropped the slot and
+        # unlinked the file and only then did this block record why, which put a crash
+        # window between destroying the evidence and writing the obligation: a hard exit
+        # there left no row, no file, no slot and no journal, the next run called that an
+        # ordinary `fresh_start`, and a configured non-data `snapshot.mode` streamed onto
+        # a destination nobody had rebuilt. `reconcile()` now classifies and nothing
+        # more; `begin()` makes the intent and the table obligation durable together;
+        # `resume()` performs the file / row / slot ladder, idempotently, from whatever
+        # phase survives.
+        if reconciliation.decision == "orphan_accepted_resnapshot" and journal is None:
             journal = recovery_mod.begin(
                 con,
                 pipeline=dest.pipeline_name,
                 namespace=namespace,
-                decision="orphan_offsets_accepted",
+                decision=recovery_mod.ORPHAN_DECISION,
                 message=(
-                    "an operator passed --accept-orphan-offsets: the untrusted file and "
-                    "the unaccounted slot are gone and every captured table is owed a "
-                    "fresh image"
+                    "an operator passed --accept-orphan-offsets: the untrusted "
+                    "offsets file and the unaccounted slot are to be removed and every "
+                    "captured table is owed a fresh image"
                 ),
                 slot_name=replication.slot_name,
                 offset_path=replication.offset_file,
                 captured_tables=captured_tables,
                 forget_catalog=False,
+                context={"file_lsn": reconciliation.file_lsn},
             )
-            # The destructive steps already happened inside reconciliation, so the
-            # journal goes straight to its terminal phase; what it carries forward is
-            # the forced snapshot mode and the durable to-do list.
-            recovery_mod.resume(
+            summary_extra["recovery_journal"] = journal.as_dict()
+            summary_extra["orphan_recovery"] = recovery_mod.resume(
                 con,
                 pipeline=dest.pipeline_name,
                 namespace=namespace,
                 record=journal,
                 dsn=source.dsn,
             )
-            summary_extra["recovery_journal"] = journal.as_dict()
         if (
             journal is not None
             and props["snapshot.mode"] not in reconcile_mod.SNAPSHOT_MODES_WITH_DATA
@@ -571,19 +372,52 @@ def run(
         # definition, so `in_progress` here means exactly that, and promoting it is what
         # makes it discoverable from durable state after ANY crash - including the ones
         # `except BaseException` never sees.
+        # rubric 1.9 / SM-E, and it has to happen HERE — before the owed queue is read,
+        # because marking a relation owed is how an unrelatable one gets rebuilt in THIS
+        # run rather than in the next.
+        #
+        # `mark_unconfirmed` reads the durable baseline, computes (from durable state
+        # alone) which relations hold rows this pipeline cannot relate to any identity
+        # at the source, writes the obligation down, and marks those relations
+        # `awaiting_snapshot`. The write comes first and is unconditional, so a crash, a
+        # kill, an unreadable catalog and a clean refusal all leave the same statement:
+        # `successful_polls` is process memory and could only ever describe the process
+        # that was already dead (Codex r5 BLOCKER-1).
+        # It runs for EVERY run, including one with no watcher at all. A run under
+        # `CDC_DROP_MODE=ignore` plainly did not read the catalog, so it cannot claim
+        # the registry still describes the source — and that mode is exactly how a
+        # destination comes to hold rows with no registry in the first place (it is how
+        # the round-5 reviewer built the precondition). It marks, it does not act:
+        # `reconcile=False`, because a run with no watcher cannot confirm what it would
+        # rebuild, and rebuilding every run would re-snapshot the world for ever.
+        catalog_cfg = CatalogConfig()
+        catalog_enabled = applier_cfg.drop_mode != "ignore" and catalog_cfg.poll_seconds > 0
+        baseline = baseline_mod.mark_unconfirmed(
+            con, pipeline=dest.pipeline_name, dataset=dest.dataset_name,
+            runner_id=runner_id, reconcile=catalog_enabled,
+        )
+        summary_extra.update(baseline.as_dict())
+
+        interrupted_resnapshot = resnapshot_recovery_mod.requeue_interrupted(
+            con,
+            pipeline=dest.pipeline_name,
+            state_dir=replication.state_dir / "resnapshot",
+        )
+        if interrupted_resnapshot:
+            summary_extra["interrupted_resnapshot_requeued"] = interrupted_resnapshot
         interrupted = dest_mod.promote_interrupted_snapshots(con, dest.pipeline_name)
         if interrupted:
             summary_extra["interrupted_snapshots_requeued"] = interrupted
         owed = dest_mod.tables_awaiting_snapshot(con, dest.pipeline_name)
         will_snapshot_everything = (
-            outcome.resume_point.last_lsn == 0
+            reconciliation.resume_point.last_lsn == 0
             and props["snapshot.mode"] in reconcile_mod.SNAPSHOT_MODES_WITH_DATA
         )
         if (
             owed
             and not will_snapshot_everything
-            and resnapshot_enabled()
-            and outcome.resume_point.last_lsn == 0
+            and acquisition.resnapshot_enabled()
+            and reconciliation.resume_point.last_lsn == 0
         ):
             # A47/A53: the throwaway re-snapshot is only safe because the MAIN slot is
             # retaining WAL continuously from the durable resume point throughout — the
@@ -609,7 +443,8 @@ def run(
                 ),
                 dict(summary_extra),
             )
-        if owed and not will_snapshot_everything and resnapshot_enabled():
+        if owed and not will_snapshot_everything and acquisition.resnapshot_enabled():
+            phases.to(PHASE_SNAPSHOTTING, detail=f"{len(owed)} table(s) owed")
             resnap = resnapshot_mod.run(
                 con,
                 source=source,
@@ -622,9 +457,10 @@ def run(
                 lease=lease,
                 runner_id=runner_id,
                 transactional_ddl=transactional_ddl,
-                epoch_base=outcome.resume_point.snapshot_epoch,
+                epoch_base=reconciliation.resume_point.snapshot_epoch,
                 reason=f"{len(owed)} table(s) marked awaiting_snapshot",
                 namespace=namespace,
+                ownership=ownership,
             )
             summary_extra.update(resnap.as_dict())
             # The main applier's snapshot identities must stay disjoint from the ones the
@@ -633,12 +469,12 @@ def run(
                 f"UPDATE {CONTROL_SCHEMA}.debezium_offsets SET snapshot_epoch = "
                 "greatest(snapshot_epoch, ?) WHERE pipeline = ? AND namespace = ?",
                 [
-                    outcome.resume_point.snapshot_epoch + len(owed) + 1,
+                    reconciliation.resume_point.snapshot_epoch + len(owed) + 1,
                     dest.pipeline_name,
                     namespace,
                 ],
             )
-            outcome.resume_point.snapshot_epoch += len(owed) + 1
+            reconciliation.resume_point.snapshot_epoch += len(owed) + 1
         elif owed:
             log.warning(
                 "%s table(s) are marked awaiting_snapshot and are NOT being "
@@ -648,9 +484,48 @@ def run(
                 else "CDC_RESNAPSHOT=0",
                 ", ".join(f"{s}.{t}" for s, t, _ in owed),
             )
-            summary_extra["tables_awaiting_snapshot_unhandled"] = [
-                f"{s}.{t}" for s, t, _ in owed
-            ]
+            unhandled = [f"{s}.{t}" for s, t, _ in owed]
+            summary_extra["tables_awaiting_snapshot_unhandled"] = unhandled
+            # Asked of DURABLE STATE (`include_owed=True`), not of what this run
+            # remembers marking: the run that discovers a relation refuses, and so does
+            # every later one, until something actually rebuilds it. Keyed on
+            # `baseline.unreconciled` the guarantee would last exactly one run.
+            skipped_baseline = sorted(
+                set(unhandled)
+                & set(
+                    baseline_mod.unrelatable_relations(
+                        con, pipeline=dest.pipeline_name, dataset=dest.dataset_name,
+                        include_owed=True,
+                    )
+                )
+            )
+            if skipped_baseline and not will_snapshot_everything:
+                # A QUEUED REBUILD IS NOT A FINISHED ONE (Codex r6 BLOCKER-2, reproduced).
+                #
+                # `CDC_RESNAPSHOT=0` is an explicit operator opt-out of automatic repair,
+                # and for an ordinary owed table it means what it says: the data stays
+                # stale, flagged and queryable. It cannot mean that here. These relations
+                # are owed a rebuild *because this run could not relate the rows they
+                # hold to any identity at the source*, so continuing would stream the
+                # replacement relation's events onto the old relation's rows and — worse
+                # — let the watcher adopt the replacement oid, after which nothing can
+                # ever detect it again. Measured: source `[999]`, destination
+                # `[1, 2, 999]`, lifecycle `awaiting_snapshot`, registry at the new oid,
+                # baseline `valid`, exit 0.
+                #
+                # Raised HERE, before the engine starts and before anything is adopted,
+                # which is what the opt-out's own contract promises: detect, alert, exit
+                # non-zero, mutate nothing.
+                raise EngineFailure(
+                    f"{len(skipped_baseline)} relation(s) hold destination rows this "
+                    "pipeline cannot relate to any identity at the source "
+                    f"({', '.join(skipped_baseline)}), and automatic re-snapshot is "
+                    "switched off (CDC_RESNAPSHOT=0), so nothing will rebuild them. "
+                    "Continuing would let this run adopt the observed identity over rows "
+                    "that may belong to a different relation. Re-enable CDC_RESNAPSHOT, "
+                    "or rebuild those tables by hand",
+                    dict(summary_extra),
+                )
 
         # rubric 1.6: the per-table snapshot watermark, read AFTER any re-snapshot so it
         # carries the image the main stream now has to hand over from.
@@ -661,9 +536,8 @@ def run(
         # catalog is polled on its own connection. Started BEFORE the engine, so a
         # table dropped while this pipeline was down is detected on this run rather
         # than one poll interval into it.
-        catalog_cfg = CatalogConfig()
         watcher = None
-        if applier_cfg.drop_mode != "ignore" and catalog_cfg.poll_seconds > 0:
+        if catalog_enabled:
             watcher = catalog_mod.CatalogWatcher(
                 dsn=source.dsn,
                 publication=replication.publication_name,
@@ -671,6 +545,18 @@ def run(
                 include={t if "." in t else f"{source.schema}.{t}" for t in source.tables},
                 known=catalog_mod.read_known_relations(con, dest.pipeline_name),
                 replicated=catalog_mod.seed_from_table_state(con, dest.pipeline_name),
+                # `unmarked`, NOT a recomputation. By here the marking above has put
+                # every unrelatable relation in the owed queue and the blocking
+                # re-snapshot has already rebuilt it from the current source relation —
+                # so adopting that relation's oid is now the *correct* thing to do, and
+                # re-asking "is it unrelatable?" would say yes for the wrong reason (the
+                # registry row is written by the flush at the end of this very run) and
+                # send a freshly rebuilt table down the destructive path. MEASURED: it
+                # did, and the mass-drop breaker then wedged the pipeline.
+                #
+                # A fail-safe, not the mechanism: this is non-empty only when a relation
+                # could not be put in the owed queue at all.
+                unrelatable=set(baseline.unmarked),
                 poll_seconds=catalog_cfg.poll_seconds,
                 emit_marker=catalog_cfg.emit_marker,
                 marker_prefix=catalog_cfg.marker_prefix,
@@ -699,7 +585,7 @@ def run(
             dataset=dest.dataset_name,
             topic_prefix=replication.topic_prefix,
             offset_path=replication.offset_file,
-            resume_point=outcome.resume_point,
+            resume_point=reconciliation.resume_point,
             config=applier_cfg,
             lease=lease,
             runner_id=runner_id,
@@ -707,6 +593,7 @@ def run(
             catalog=watcher,
             watermarks=watermarks,
         )
+        ownership.attach(applier)
         engine = SupervisedDebeziumEngine(
             properties=props,
             handler=applier,
@@ -744,70 +631,256 @@ def run(
 
         terminating_modes = {"initial_only", "recovery_only"}
         try:
+            phases.to(PHASE_STREAMING)
+            ownership.activate(applier)
             result = run_engine_bounded(
                 engine, applier, run_cfg, health,
                 engine_terminates_normally=props["snapshot.mode"] in terminating_modes,
                 catalog=watcher,
                 catalog_drain_seconds=catalog_cfg.drain_seconds,
+                phases=phases,
+                # ONE outcome per run (Codex r1 MAJOR-2). The supervisor used to build
+                # its own and the phase writer another, so `last_run.json` shipped
+                # `stop_reason="idle"` beside `run_outcome="max_seconds"` on every
+                # ordinary run and a severe result could be published as the mild
+                # default.
+                outcome=outcome,
+                quiescence_observer=ownership.quiescence_observer(applier),
             )
             summary_extra["invariant_o_end"] = reconcile_mod.check_invariant_o(
                 con, pipeline=dest.pipeline_name, namespace=namespace,
                 dsn=source.dsn, slot_name=replication.slot_name,
                 snapshot_mode=props["snapshot.mode"],
             )
-            # The recovery is over when the work it asked for has actually been done:
-            # nothing owes a snapshot any more, and the destination has a resume point
-            # again. Clearing it any earlier would throw away the forced snapshot mode
-            # that the rest of the rebuild depends on.
+            # QUIESCE, VALIDATE, FLUSH, REPORT — in that order (Codex r3 BLOCKER-1).
+            # `run_engine_bounded` has stopped the watcher and refused to return at all
+            # unless it proved the thread dead, so nothing can add dirty state now.
+            # Persisting here rather than only through a commit group is the fix: a run
+            # that committed NO groups used to persist nothing, so everything the
+            # watcher learned vanished — and after an offline drop-and-recreate the next
+            # run accepted the replacement oid as though it had always owned that
+            # relation, leaving the old relation's rows beside the new one's for ever.
+            learned = dest_mod.flush_learned_relations(
+                con, pipeline=dest.pipeline_name, catalog=watcher,
+                # A relation NOTHING HAS REBUILT must not have its observed oid become
+                # history: the next run would then agree with the source and never ask
+                # again (Codex r6 BLOCKER-2). Normally empty — by here the blocking
+                # re-snapshot has rebuilt them.
+                #
+                # `unrebuilt_relations`, not `unrelatable_relations(include_owed=True)`:
+                # a relation the re-snapshot has just rebuilt is `complete` and still has
+                # no registry row, because THIS FLUSH is what writes it. Excluding on "no
+                # identity" would exclude the very write that establishes the identity,
+                # and the confirmation would then refuse over a rebuild that happened.
+                exclude=set(
+                    baseline_mod.unrebuilt_relations(
+                        con, pipeline=dest.pipeline_name, dataset=dest.dataset_name,
+                    )
+                ),
+            )
+            if learned:
+                summary_extra["source_relations_persisted"] = learned
+            # The recovery is over when the work it asked for has actually been done.
+            # The PREDICATE LIVES IN `recovery.py` (Codex r1 MAJOR-5): it validates the
+            # captured obligation the journal recorded, performs the `armed -> absent`
+            # edge itself, and returns a typed result. Clearing any earlier would throw
+            # away the forced snapshot mode the rest of the rebuild depends on.
             if journal is not None:
-                # The SAME definition of "owes work" the queue uses, including the
-                # `in_progress` rows a crash can leave behind: clearing the journal is
-                # the claim that the rebuild finished, and it may not be made over a
-                # table that is still mid-snapshot.
-                states = dest_mod.read_snapshot_states(con, dest.pipeline_name)
-                still_owed = [
-                    name for name, state in states.items()
-                    if state in dest_mod.SNAPSHOT_STATES_OWING_WORK
-                ]
-                has_resume = bool(
-                    con.execute(
-                        f"SELECT 1 FROM {CONTROL_SCHEMA}.debezium_offsets "
-                        "WHERE pipeline = ? AND namespace = ?",
-                        [dest.pipeline_name, namespace],
-                    ).fetchall()
+                # A captured relation that is EMPTY at the source emits no snapshot
+                # records, so the coordinator never opens a shadow and never swaps one
+                # in — and the destination table keeps whatever it held. Under a
+                # journalled obligation that is stale data certified as a rebuild
+                # (Codex r2 BLOCKER-1, measured: a `--reset-state` reported `ok: true`
+                # over two rows the source had truncated away). The blocking
+                # re-snapshot has always closed this with three independent facts;
+                # this is the same machinery asked the same question after the MAIN
+                # engine's snapshot, so an operator's reset converges in one run rather
+                # than failing and self-healing on the next.
+                emptied, fence = resnapshot_mod.finish_empty_tables_after_main_snapshot(
+                    con,
+                    pipeline=dest.pipeline_name,
+                    dataset=dest.dataset_name,
+                    dsn=source.dsn,
+                    owed=dest_mod.tables_awaiting_snapshot(con, dest.pipeline_name),
+                    applier=applier,
+                    stop_reason=str(result.get("stop_reason")),
                 )
-                if not still_owed and has_resume:
-                    recovery_mod.clear(
-                        con, pipeline=dest.pipeline_name, namespace=namespace
-                    )
-                    summary_extra["recovery_cleared"] = journal.recovery_id
-                    log.warning(
-                        "rubric 1.8 recovery %s is COMPLETE: every captured table has a "
-                        "fresh image and the destination has a resume point again",
-                        journal.recovery_id,
-                    )
+                if emptied:
+                    summary_extra["verified_empty_after_snapshot"] = emptied
+                    summary_extra["verified_empty_fence_lsn"] = fence
+                completion = recovery_mod.complete_if_ready(
+                    con, pipeline=dest.pipeline_name, namespace=namespace, record=journal,
+                    verified_empty=emptied,
+                )
+                if completion.cleared:
+                    summary_extra["recovery_cleared"] = completion.recovery_id
                 else:
-                    summary_extra["recovery_still_armed"] = journal.recovery_id
-            return _decorate(result)
+                    # The blueprint's nesting invariant: no successful stopped run while
+                    # a destructive recovery is uncleared. It used to add a summary key
+                    # and let the run report `ok: true` over a half-finished rebuild —
+                    # `run_ok` came from the supervisor result and nothing else looked
+                    # (Codex r1 MAJOR-5). Raised rather than flagged, because a summary
+                    # that says `ok: false` behind a zero exit code is the same defect
+                    # one layer out.
+                    summary_extra["recovery_still_armed"] = completion.recovery_id
+                    summary_extra["recovery_still_owed"] = list(completion.still_owed)
+                    outcome.record("recovery_uncleared")
+                    result["stop_reason"] = outcome.value
+                    raise EngineFailure(
+                        f"recovery {completion.recovery_id} is still armed at shutdown: "
+                        f"{completion.reason}. The destination is knowingly mid-rebuild, "
+                        "so this run is not a success",
+                        result,
+                    )
+            # ...and the CLAIM about them, which is the durable half (rubric 1.9/SM-E).
+            #
+            # LAST, after every rebuild path has finished — including
+            # `finish_empty_tables_after_main_snapshot`, which is what empties and
+            # fences a relation that is genuinely empty at the source. Asked before
+            # it, this verdict saw six tables still holding their pre-reset rows and
+            # refused an `--reset-state` of an entirely empty source that had in fact
+            # converged (MEASURED). The baseline is the run's last claim, so it is
+            # taken when there is nothing left that could change the answer.
+            #
+            # Recomputed from durable state, so the verdict is a statement about what
+            # the destination now holds rather than about what this process remembers.
+            if watcher is not None:
+                baseline = baseline_mod.confirm(
+                    con, pipeline=dest.pipeline_name, dataset=dest.dataset_name,
+                    check=baseline, successful_polls=watcher.successful_polls,
+                    runner_id=runner_id,
+                )
+                summary_extra.update(baseline.as_dict())
+                if not baseline.valid:
+                    # No successful run over an unconfirmed baseline. This is the
+                    # nesting invariant the r5 defect slipped through: the *narrow*
+                    # symptom (zero polls) was rejected, but a later healthy run could
+                    # still report success while the destination durably held one
+                    # relation's rows under another relation's identity.
+                    outcome.record("engine_error")
+                    result["stop_reason"] = outcome.value
+                    raise EngineFailure(
+                        "the source-catalog baseline is "
+                        f"{baseline.state!r} at shutdown: {baseline.reason}. Until every "
+                        "relation the destination holds rows for can be related to an "
+                        "identity at the source, adopting what we observe would present "
+                        "one relation's rows as another's. Refusing to report success",
+                        result,
+                    )
+            run_ok = bool(result.get("ok"))
+            outcome.record(result.get("stop_reason") or outcome.value)
+            reported = _decorate(result)
+            return reported
         except EngineFailure as failure:
-            _decorate(failure.summary)
+            outcome.record(failure.summary.get("stop_reason") or "engine_error")
+            reported = _decorate(failure.summary)
             raise
         finally:
             health.stop()
             if watcher is not None:
                 watcher.stop()
             applier.shutdown()
+    except BaseException as exc:
+        # Anything that unwound before (or around) the engine: a refusal, a lease loss,
+        # a control-schema failure. It used to leave `terminal_reason=None`, so the
+        # heartbeat's terminal row said nothing while `main()` recorded `error`
+        # (Codex r1 MAJOR-2). Recorded on the SAME outcome, and only when nothing more
+        # specific has been diagnosed - `error` is the most severe value in the
+        # precedence and would otherwise bury `engine_error` or `source_dark`.
+        if not outcome.failed:
+            outcome.record("error")
+        # ...and the run's ONE phase/outcome projection is attached to the escaping
+        # exception, so `last_run.json` carries it too. Fixing the *normal* path left
+        # this one behind: a lease refusal wrote heartbeat `failed/error` while
+        # `last_run.json` carried no `run_phase` and no `run_outcome` at all, because
+        # `main()` built its summary from the exception and `reported` was still None
+        # (Codex r2 MAJOR-2). The outer `finally` below updates this very dict AFTER the
+        # terminal transitions, and `main()` reads it after that, so the two agree.
+        reported = reported if reported is not None else {}
+        reported.update(dict(getattr(exc, "summary", {}) or {}))
+        reported.update(summary_extra)
+        reported.setdefault("stop_reason", outcome.value)
+        with contextlib.suppress(Exception):  # a BaseException without a __dict__
+            exc.summary = reported
+        raise
     finally:
-        # The lease is now acquired much earlier - rubric 1.8's recovery mutates
-        # destination state and must not race a second runner - so releasing it has to
-        # move out here with it. `lease_held` rather than `lease is not None`: a run that
-        # failed to acquire must not delete the incumbent's row.
-        if lease_held and lease is not None:
-            lease.release(con)
+        _teardown_destination(
+            con=con,
+            ownership=ownership,
+            reported=reported,
+            phases=phases,
+            lease=lease,
+            lease_held=lease_held,
+            run_ok=run_ok,
+            hard_exit_on_transfer=True,
+        )
+
+
+def _teardown_destination(
+    *, con, ownership: DestinationOwnership, reported: dict | None,
+    phases: RunPhaseWriter | None, lease: Lease | None, lease_held: bool, run_ok: bool,
+    hard_exit_on_transfer: bool = False,
+) -> None:
+    """Make the one terminal ownership decision for every destination handle."""
+    # This also seals and retires a constructed-but-never-activated applier. Consumer
+    # construction failures have no callback owner and must not leak an idle timer,
+    # alert cursor, lease and parent connection.
+    destination_quiescent = ownership.retire_if_quiescent(
+        reason="pipeline_teardown"
+    )
+    if not destination_quiescent:
+        if reported is not None:
+            if phases is not None:
+                reported.update(phases.summary())
+            reported["destination_connection_release"] = "abandoned"
+            reported["destination_connection_release_reason"] = "live_applier_callback"
+            reported["heartbeat_sink_retirement"] = "abandoned"
+            reported["heartbeat_sink_retirement_reason"] = "live_applier_callback"
+            reported["destination_ownership_state"] = ownership.state
+        log.critical(
+            "destination teardown skipped: a live applier callback retains exclusive "
+            "ownership"
+        )
+        if ownership.callback_owned and hard_exit_on_transfer:
+            terminal = reported if reported is not None else {}
+            terminal.setdefault("ok", False)
+            terminal.setdefault("stop_reason", "hung")
+            terminal.setdefault(
+                "error",
+                "an admitted callback retained terminal ownership after failed "
+                "quiescence",
+            )
+            terminal.setdefault("error_type", "EngineFailure")
+            _write_summary(terminal)
+            shutdown_and_exit(1)
+        return
+
+    # The lease is acquired before recovery mutates state. `lease_held` rather than
+    # `lease is not None` prevents a failed acquisition from deleting the incumbent.
+    if phases is not None:
         try:
-            con.close()
+            phases.ensure(PHASE_STOPPING)
+        except Exception:  # pragma: no cover - every phase declares `-> stopping`
+            log.error("could not record the stopping phase", exc_info=True)
+    if lease_held and lease is not None:
+        lease.release(con)
+    if phases is not None:
+        try:
+            phases.finish(ok=run_ok)
         except Exception:  # pragma: no cover
-            log.debug("closing the destination connection failed", exc_info=True)
+            log.error("could not record the terminal run phase", exc_info=True)
+        # Terminalise and retire the heartbeat child before retiring its parent.
+        try:
+            phases.close()
+        except Exception:  # pragma: no cover - retirement is internally guarded
+            log.error("could not retire the heartbeat sink", exc_info=True)
+        if reported is not None:
+            reported.update(phases.summary())
+    release = dest_mod.release_connection(con)
+    if reported is not None:
+        reported["destination_connection_release"] = release.state
+        if release.error is not None:
+            reported["destination_connection_close_error"] = release.error
 
 
 def shutdown_and_exit(code: int = 0, timeout: float = 15.0) -> None:
@@ -842,17 +915,34 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Debezium snapshot.mode (initial, no_data, initial_only, always, when_needed, ...)",
     )
+    # The two DESTRUCTIVE flags, and the help says every surface they touch. The old
+    # text named two of five for `--reset-state` and one of four for the orphan hatch,
+    # which is not an operator-facing contract (Codex r2 MINOR-3). Both are journalled
+    # recoveries: the intent is durable before the first mutation, and a crash part-way
+    # through is finished by the next run WITHOUT repeating the flag.
     parser.add_argument(
         "--reset-state",
         action="store_true",
-        help="delete the Debezium offsets file AND the destination's resume point",
+        help=(
+            "start over. DESTRUCTIVE: removes the whole Debezium state directory "
+            "(including offsets.dat), deletes the destination's resume point, resets "
+            "every table's snapshot bookkeeping and marks every captured table for a "
+            "fresh image, discards the recorded source catalog, deletes the pipeline "
+            "lease, and DROPS THE REPLICATION SLOT (Debezium only pairs a snapshot "
+            "with an exact WAL position when it creates the slot itself, ADR 0001 "
+            "§19/A45). Destination tables keep their rows until each one's fresh image "
+            "is swapped in. Journalled, so an interrupted reset is resumed."
+        ),
     )
     parser.add_argument(
         "--accept-orphan-offsets",
         action="store_true",
         help=(
-            "delete an offsets.dat that has no matching destination row and force a "
-            "re-snapshot (ADR 0001 §4.5). Without this the run REFUSES to start."
+            "authorise a rebuild when offsets.dat has no matching destination row "
+            "(ADR 0001 §4.5); without this the run REFUSES to start. DESTRUCTIVE: "
+            "deletes that offsets file, DROPS THE REPLICATION SLOT, and forces a "
+            "data-reading snapshot of every captured table. Journalled first, so the "
+            "obligation survives a crash mid-sequence."
         ),
     )
     parser.add_argument("--log-level", default="INFO")

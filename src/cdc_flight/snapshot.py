@@ -23,8 +23,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from . import naming
-from .destination import CONTROL_SCHEMA
+from . import naming, table_lifecycle
 from .envelope import PendingRecord
 from .errors import ResumePointDrift
 from .faults import maybe_crash
@@ -55,18 +54,27 @@ class SnapshotCoordinator:
         dataset: str,
         pipeline: str,
         topic_prefix: str,
-        created_in_txn: set[str],
+        created_in_txn,
         get_registry,
         epoch: int,
         transactional_ddl: bool,
+        alerts=None,
     ):
         self.con = con
+        #: an `AlertSink`, or None. Only used to make an illegal lifecycle transition
+        #: reach an operator on the independent connection; assigned by the applier
+        #: after the sink exists, so `None` is a normal state in tests and in `Lab`.
+        self.alerts = alerts
         self.dataset = dataset
         self.pipeline = pipeline
         self.topic_prefix = topic_prefix
-        #: shared with the applier: a table created inside the open transaction is
-        #: empty, so the DELETE half of a merge against it cannot match anything.
-        self.created_in_txn = created_in_txn
+        #: A CALLABLE returning the open group's `created_in_txn` set, not the set
+        #: itself: the group is one object now (`applier.OpenGroup`) and is REPLACED at
+        #: every COMMIT or ROLLBACK, so a coordinator that had captured the set would
+        #: keep writing into the discarded group's copy - which is the shape of bug the
+        #: `OpenGroup` refactor exists to make unrepresentable, arriving through a
+        #: captured reference instead of a missed reset.
+        self._created_in_txn = created_in_txn
         #: a callable, because `_rollback_quietly` rebuilds the registry (a
         #: rolled-back CREATE would otherwise leave the cached shape lying).
         self._get_registry = get_registry
@@ -77,6 +85,10 @@ class SnapshotCoordinator:
         self._session = False
 
     # -- introspection ------------------------------------------------------ #
+    @property
+    def created_in_txn(self) -> set[str]:
+        return self._created_in_txn()
+
     @property
     def active(self) -> bool:
         return bool(self._tables)
@@ -124,6 +136,22 @@ class SnapshotCoordinator:
         state = SnapshotTable(
             schema=schema, table=table, target=target, shadow=naming.shadow_table(target)
         )
+        # THE EDGE IS CHECKED BEFORE THE FIRST SIDE EFFECT (Codex r1 MINOR-3). The
+        # three statements below drop the shadow, forget it in the registry and add it
+        # to `created_in_txn`; all three are only correct if opening a snapshot for this
+        # table is legal, and `in_progress -> in_progress` is deliberately NOT legal -
+        # it means a durable half-snapshot from a previous process was never promoted to
+        # owed work. Refusing after mutating left the coordinator's view of the shadow
+        # and the transaction disagreeing with the destination.
+        table_lifecycle.check_transition(
+            self.con,
+            pipeline=self.pipeline,
+            source_schema=schema,
+            source_table=table,
+            to=table_lifecycle.IN_PROGRESS,
+            reason=f"a snapshot shadow is about to be opened for {key}",
+            alerts=self.alerts,
+        )
         # A crash mid-snapshot means Debezium re-snapshots from the beginning
         # (`InitialSnapshotter.shouldSnapshotData` returns true while the offset
         # says a snapshot was in progress). Dropping the shadow here is what makes
@@ -133,16 +161,22 @@ class SnapshotCoordinator:
         )
         self.registry.forget(state.shadow)
         self.created_in_txn.add(state.shadow)
-        self.con.execute(
-            f"DELETE FROM {CONTROL_SCHEMA}.table_state WHERE pipeline = ? AND "
-            "source_schema = ? AND source_table = ?",
-            [self.pipeline, schema, table],
-        )
-        self.con.execute(
-            f"INSERT INTO {CONTROL_SCHEMA}.table_state "
-            "(pipeline, source_schema, source_table, target_table, snapshot_state, "
-            " snapshot_epoch) VALUES (?,?,?,?,'in_progress',?)",
-            [self.pipeline, schema, table, target, self.epoch],
+        # rubric 1.9: `-> in_progress` goes through `TableLifecycle`, which is the ONE
+        # writer of this column. `in_progress -> in_progress` is deliberately NOT a
+        # declared edge: reaching it means a durable half-snapshot from a previous
+        # process was never promoted to owed work, and silently starting a second
+        # snapshot over it is how that residue stayed invisible.
+        table_lifecycle.transition(
+            self.con,
+            pipeline=self.pipeline,
+            source_schema=schema,
+            source_table=table,
+            to=table_lifecycle.IN_PROGRESS,
+            reason=f"a snapshot shadow was opened for {key} (epoch {self.epoch})",
+            target_table=target,
+            epoch=self.epoch,
+            replace=True,
+            alerts=self.alerts,
         )
         self._tables[key] = state
         return state
@@ -226,11 +260,16 @@ class SnapshotCoordinator:
             self.created_in_txn.discard(state.shadow)
             self.swaps += 1
             swapped = True
-        self.con.execute(
-            f"UPDATE {CONTROL_SCHEMA}.table_state SET snapshot_state = 'complete', "
-            "snapshot_lsn = ?, last_commit_id = ? WHERE pipeline = ? AND "
-            "source_schema = ? AND source_table = ?",
-            [snapshot_lsn, commit_id, self.pipeline, state.schema, state.table],
+        table_lifecycle.transition(
+            self.con,
+            pipeline=self.pipeline,
+            source_schema=state.schema,
+            source_table=state.table,
+            to=table_lifecycle.COMPLETE,
+            reason=f"the shadow for {key} was swapped in at commit {commit_id}",
+            snapshot_lsn=snapshot_lsn,
+            last_commit_id=commit_id,
+            alerts=self.alerts,
         )
         self._tables.pop(key, None)
         if not self._tables:

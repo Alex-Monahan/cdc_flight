@@ -140,6 +140,31 @@ CONTROL_DDL = [
             last_seen_at      TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (pipeline, source_schema, source_table)
         )""",
+    # rubric 1.9 / 1.5. Whether the pipeline can RELATE what it observes at the source
+    # to the rows the destination already holds — `machines.CATALOG_BASELINE`.
+    #
+    # `source_relations` above records *what* we last saw. This records whether that
+    # record can be trusted as history, and it exists because the answer was previously
+    # process memory (`CatalogWatcher.successful_polls`). A run whose every catalog poll
+    # failed died loudly and left nothing behind, so the next healthy run adopted the
+    # currently observed oid as though it had always owned that relation — and a
+    # drop-and-recreate in the gap left the old relation's rows beside the new one's
+    # for ever, with every run reporting success (Codex r5 BLOCKER-1, reproduced).
+    #
+    # Written OUTSIDE the commit group, before the engine starts and again after the
+    # watcher is proved quiesced: it is a claim about an observation, not a fact about
+    # the data, and it must be durable before anything can fail to establish it.
+    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.catalog_baseline (
+            pipeline          VARCHAR     PRIMARY KEY,
+            state             VARCHAR     NOT NULL,
+            reason            VARCHAR,
+            -- The relations this pipeline could not relate, as JSON. Evidence: the
+            -- `invalidated` state without the names is a state nobody can act on.
+            unreconciled_json VARCHAR,
+            runner_id         VARCHAR,
+            marked_at         TIMESTAMPTZ NOT NULL,
+            updated_at        TIMESTAMPTZ NOT NULL
+        )""",
     # rubric 1.8. What the *slot and the source cluster* looked like the last time we
     # acquired them. Three of the four cases 1.8 has to detect are invisible from a
     # single observation: a slot that was dropped and recreated at the same name has a
@@ -163,6 +188,16 @@ CONTROL_DDL = [
             current_wal_lsn    BIGINT,
             durable_lsn        BIGINT,
             observed_at        TIMESTAMPTZ NOT NULL,
+            -- The VERDICT, written atomically with the observation it was computed
+            -- from (Codex r1 MAJOR-5 / open question 3). It used to exist only in
+            -- `last_run.json`, so a destination could not explain why a rebuild had
+            -- started - and the answer to "why is this table being re-snapshotted"
+            -- lived on the filesystem of whichever host happened to run it. Validated
+            -- through `machines.SLOT_VERDICTS` at construction; a typed classification,
+            -- not a state machine, because nothing moves through these values.
+            verdict            VARCHAR,
+            verdict_message    VARCHAR,
+            verdict_at         TIMESTAMPTZ,
             PRIMARY KEY (pipeline, slot_name)
         )""",
     # rubric 1.8 / 4.7. The durable journal of an acquisition recovery in progress.
@@ -191,22 +226,37 @@ CONTROL_DDL = [
             forget_catalog    BOOLEAN     NOT NULL DEFAULT false,
             tables_marked     BIGINT      NOT NULL DEFAULT 0,
             message           VARCHAR,
+            -- The captured set this recovery took responsibility for, as JSON. Its
+            -- completion predicate is a statement about THIS obligation, not about
+            -- whatever the destination happens to hold when the run ends (Codex r1
+            -- MAJOR-5).
+            captured_json     VARCHAR,
+            -- `--reset-state` only: the Debezium scratch directory the reset clears.
+            state_dir         VARCHAR,
             requested_at      TIMESTAMPTZ NOT NULL,
             updated_at        TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (pipeline, namespace)
         )""",
     # ADR §4.8 / D9.1 declared this table and nothing ever created it, so the
     # observability surface rubrics 4.5/4.6/6.1/6.2 are scored against did not exist
-    # (architecture review, finding 5). The run-phase writer belongs to 4.4/6.1 and is
-    # not here; creating the table now means that task lands a writer rather than a
-    # migration, and an operator querying for it gets an empty table rather than an
-    # error. Written on a SEPARATE connection when it is written, deliberately outside
-    # the commit group: an observability signal must survive a rolled-back apply.
+    # (architecture review, finding 5). Rubric 1.9 adds the **run-phase** writer
+    # (`cdc_flight.run_state`), which moves one row per run through the `RUN_PHASE`
+    # machine; the periodic liveness/lag writer and the source-side WAL heartbeat are
+    # still 4.4/6.1's, with their own cadence. Written on a SEPARATE connection,
+    # deliberately outside the commit group: an observability signal must survive a
+    # rolled-back apply, and it must never lengthen the commit->ack window.
+    #
+    # `phase` is validated against `machines.RUN_PHASE`; `terminal_reason` against
+    # `machines.RUN_OUTCOME`, whose precedence is why a symptom cannot overwrite a
+    # diagnosis (A49).
     f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.heartbeat (
             pipeline                 VARCHAR     NOT NULL,
             runner_id                VARCHAR     NOT NULL,
             beat_at                  TIMESTAMPTZ NOT NULL,
             phase                    VARCHAR     NOT NULL,
+            phase_since              TIMESTAMPTZ,
+            terminal_reason          VARCHAR,
+            phase_history            VARCHAR,
             last_event_at            TIMESTAMPTZ,
             last_commit_id           BIGINT,
             last_commit_at           TIMESTAMPTZ,
@@ -241,10 +291,107 @@ _COMMIT_LOG_COLUMNS = (
 )
 
 
+class ControlSchemaFailed(RuntimeError):
+    """A control-schema migration could not be shown to have happened.
+
+    Loud on purpose (Codex r1 MINOR-1). Every `ALTER` exception used to be read as "a
+    concurrent runner won the race", with no re-check: a permission failure, an
+    unsupported DDL, a network error or a real MotherDuck error all looked like success,
+    and the writer that depends on the column then failed silently on every write.
+    """
+
+
+#: Columns added to control tables after they first shipped. `CREATE TABLE IF NOT
+#: EXISTS` cannot add a column, and these tables already exist on destinations that
+#: have run an earlier version - including the shared MotherDuck development database -
+#: so without this every write naming a new column would fail with "column not found".
+_ADDED_COLUMNS = {
+    "heartbeat": (
+        ("phase_since", "TIMESTAMPTZ"),
+        ("terminal_reason", "VARCHAR"),
+        ("phase_history", "VARCHAR"),
+    ),
+    "recovery_state": (
+        ("captured_json", "VARCHAR"),
+        ("state_dir", "VARCHAR"),
+    ),
+    "slot_state": (
+        ("verdict", "VARCHAR"),
+        ("verdict_message", "VARCHAR"),
+        ("verdict_at", "TIMESTAMPTZ"),
+    ),
+}
+
+
 def ensure_control_schema(con) -> None:
     _migrate_commit_log_key(con)
     for statement in CONTROL_DDL:
         con.execute(statement)
+    for table, columns in _ADDED_COLUMNS.items():
+        _migrate_added_columns(con, table, columns)
+
+
+def _table_columns(con, table: str) -> set[str]:
+    """The columns `table` currently has. Raises if the question cannot be answered.
+
+    "I could not read the metadata" is NOT "the table is fine" (Codex r2 MINOR-1). The
+    first cut caught every exception here, returned `None`, and `_migrate_added_columns`
+    then returned silently — which recreates the exact silent-writer-failure the loud
+    `ALTER` branch exists to prevent, one step earlier. The `CREATE TABLE IF NOT EXISTS`
+    statements have already run by the time this is called, so an empty result means the
+    table genuinely has no columns we can see, and that is worth failing on too.
+    """
+    try:
+        return {
+            str(row[0])
+            for row in con.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = ? AND table_name = ?",
+                [CONTROL_SCHEMA, table],
+            ).fetchall()
+        }
+    except Exception as exc:
+        raise ControlSchemaFailed(
+            f"could not read the columns of {CONTROL_SCHEMA}.{table} ({exc}), so the "
+            "late-added columns cannot be shown to exist. Refusing to continue: every "
+            "write naming one of them would fail silently for the life of this "
+            "destination."
+        ) from exc
+
+
+def _migrate_added_columns(con, table: str, columns: tuple[tuple[str, str], ...]) -> None:
+    """Add late-arriving columns to an already-created control table. Idempotent.
+
+    A failed `ALTER` is **re-checked, not assumed benign**: the only reading of the
+    exception that is safe to step over is "the column is there now", and the way to
+    know that is to look. Anything else raises, because the alternative is a writer that
+    silently fails on every statement for the life of the destination (Codex r1 MINOR-1).
+    """
+    existing = _table_columns(con, table)
+    for column, sql_type in columns:
+        if column in existing:
+            continue
+        log.warning("adding %s.%s.%s", CONTROL_SCHEMA, table, column)
+        try:
+            con.execute(
+                f"ALTER TABLE {CONTROL_SCHEMA}.{table} ADD COLUMN {column} {sql_type}"
+            )
+        except Exception as exc:
+            after = _table_columns(con, table)
+            if column in after:
+                # The only benign reading: a concurrent runner added it between our
+                # read and our ALTER. Verified rather than assumed.
+                log.info(
+                    "%s.%s.%s already existed by the time the ALTER ran (a concurrent "
+                    "runner won the race)", CONTROL_SCHEMA, table, column,
+                )
+                continue
+            raise ControlSchemaFailed(
+                f"could not add {CONTROL_SCHEMA}.{table}.{column} ({exc}), and it is "
+                "still absent. Refusing to continue: every write naming that column "
+                "would fail silently for the life of this destination. Grant the DDL "
+                f"privilege, or drop {CONTROL_SCHEMA}.{table} if it is empty."
+            ) from exc
 
 
 def _commit_log_primary_key(con) -> tuple[str, ...] | None:

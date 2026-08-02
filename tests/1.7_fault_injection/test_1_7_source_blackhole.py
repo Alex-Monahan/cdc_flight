@@ -129,9 +129,19 @@ def test_a_blackholed_source_never_reports_ok(tmp_path, postgres_cluster, relay)
         "CDC_SOURCE_DARK_SECONDS is 45 s; anything near --max-seconds=70 would mean the "
         "deadline ended this run rather than the detector"
     )
-    # The engine cannot be closed cleanly against a dead socket, and that is expected -
-    # what must not happen is the shutdown symptom replacing the diagnosis.
-    assert summary.get("close_hung") is True, summary
+    # The engine usually cannot be closed cleanly against a dead socket, and that is
+    # expected — but whether the JVM happens to finish `close()` inside
+    # `--close-timeout` is a race, not a correctness property, and this assertion was
+    # recorded flaking while every correctness assertion passed (Codex r1 MINOR-4).
+    #
+    # The contract is: a non-zero exit, `source_dark` by name, a bounded detection time,
+    # and NO downgrade of the diagnosis to the shutdown symptom. That last part is what
+    # A49 is about, and it is the only thing `close_hung` is evidence for here.
+    if summary.get("close_hung"):
+        assert summary.get("stop_reason") == "source_dark", (
+            "engine.close() hung AND the run reported the hang: the symptom replaced "
+            f"the diagnosis, which is exactly A49 ({summary})"
+        )
 
 
 def _drop(dsn: str, slot: str) -> None:
@@ -165,7 +175,10 @@ def test_unknown_after_a_working_sampler_forbids_idle():
         "an unreachable source that was reachable a moment ago is a source outage, "
         "not a reason to declare the stream idle (TODO 4.6(b))"
     )
+    # A source that WAS answering and stopped: still `unknown`, and distinct from the
+    # never-sampled case below — which is the whole point of the declared domain.
     assert health.summary()["slot_health"] == "unknown"
+    assert health.state() == "unknown"
 
 
 def test_a_sampler_that_never_worked_stays_fail_soft():
@@ -180,7 +193,14 @@ def test_a_sampler_that_never_worked_stays_fail_soft():
         "a source that could never be consulted must degrade to timer-only idle "
         "detection rather than turning every run into a --max-seconds wait"
     )
-    assert health.summary()["slot_health"] == "unknown"
+    # rubric 1.9: the summary now carries the DECLARED classification, and this is the
+    # state that never had a name — A51 row 50's fail-open. It used to read `unknown`,
+    # which is the same word for "the source stopped answering" (a failure) and "we
+    # could never ask" (a degradation), and an operator had to read `slot_ever_sampled`
+    # in the next key to tell them apart.
+    assert health.summary()["slot_health"] == "unknown_never_sampled"
+    assert health.summary()["slot_ever_sampled"] is False
+    assert health.state() == "unknown_never_sampled"
 
 
 def test_unknown_is_reported_as_time_not_streaming():
