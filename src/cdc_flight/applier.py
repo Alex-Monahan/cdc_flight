@@ -485,6 +485,19 @@ class Applier:
         resnapshot_fenced = self._fence_resnapshot_unit(unit)
         is_snapshot = self._is_snapshot_unit(unit)
         was_snapshot = self.group.is_snapshot
+        if (
+            resnapshot_fenced
+            and self.group.units
+            and self.group.is_snapshot
+            and self._has_snapshot_boundary(self.group.units)
+        ):
+            # A fenced overlap is not a live-stream admission. If the terminal
+            # snapshot group is still under-counted, keep that group intact and
+            # discard the overlap in its own group instead.
+            result = self.commit_group("snapshot_chunk")
+            if result is CommitResult.BLOCKED:
+                self._commit_fenced_resnapshot_unit(unit)
+                return
         if not is_snapshot and not resnapshot_fenced:
             # This must happen before an open snapshot group is committed or the
             # incoming streaming unit is appended. The completion machine, not the
@@ -530,6 +543,24 @@ class Applier:
             # committed. For an empty group it is the admission edge that used to be
             # skipped entirely.
             self.snapshot_completion.enter_streaming()
+        self._append_unit(unit, is_snapshot=is_snapshot)
+
+    def _commit_fenced_resnapshot_unit(self, unit: CompleteUnit) -> None:
+        """Commit a fenced overlap without taking ownership of snapshot completion."""
+        snapshot_group = self.group
+        self.group = OpenGroup()
+        try:
+            self._append_unit(unit, is_snapshot=False)
+            result = self.commit_group("resnapshot_overlap")
+            if result is not CommitResult.COMMITTED:
+                raise SnapshotObservationError(
+                    "cannot discard fenced re-snapshot overlap with commit result "
+                    f"{result.value}"
+                )
+        finally:
+            self.group = snapshot_group
+
+    def _append_unit(self, unit: CompleteUnit, *, is_snapshot: bool) -> None:
         if not self.group.units:
             self.group.is_snapshot = is_snapshot
             self.group.opened_at = time.monotonic()

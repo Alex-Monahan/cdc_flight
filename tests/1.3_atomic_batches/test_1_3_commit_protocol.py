@@ -258,6 +258,50 @@ def test_not_ready_terminal_boundary_refuses_streaming_phase_transition(lab):
     assert box.applier.snapshot_completed is True
 
 
+def test_resnapshot_fenced_overlap_survives_not_ready_terminal_boundary(lab):
+    """A fenced overlap cannot force an under-counted snapshot boundary to commit."""
+    box = lab(resnapshot=True, snapshot_chunk_events=1)
+    box.applier.snapshot_completion = SnapshotCompletion.full_snapshot({"app.customers"})
+    box.applier.snapshot_completion.observe_notification("STARTED", {})
+
+    box.feed([snap("customers", 100, ident=1, marker="true")])
+    box.applier._handle(
+        [
+            _SnapshotNotification(
+                "TABLE_SCAN_COMPLETED",
+                200,
+                {
+                    "scanned_collection": "app.customers",
+                    "status": "SUCCEEDED",
+                    "total_rows_scanned": "2",
+                },
+            ),
+            _SnapshotNotification("COMPLETED", 201),
+        ],
+        box.committer,
+    )
+    assert box.applier.snapshot_completion.state == "completion_notified"
+    assert [unit.kind for unit in box.applier.group.units] == [
+        "snapshot_chunk",
+        "control",
+    ]
+
+    box.feed(_streaming_transaction())
+
+    assert box.applier.snapshot_completion.state == "completion_notified"
+    assert [unit.kind for unit in box.applier.group.units] == [
+        "snapshot_chunk",
+        "control",
+    ]
+    assert box.applier.fenced_units == 1
+    assert box.applier.resnapshot_discarded_events == 1
+
+    box.feed([snap("customers", 200, ident=2, marker="last")])
+    box.commit()
+    assert box.applier.snapshot_completed is True
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 2
+
+
 def _complete_empty_snapshot(box):
     completion = SnapshotCompletion.full_snapshot({"app.customers"})
     completion.observe_notification("STARTED", {})
