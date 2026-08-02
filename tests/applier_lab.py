@@ -241,7 +241,15 @@ def heartbeat(lsn: int) -> PendingRecord:
 class Lab:
     """One `Applier` over one DuckDB file, driven record by record."""
 
-    def __init__(self, path: Path, *, resume_lsn: int = 0, catalog=None, **cfg: Any) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        resume_lsn: int = 0,
+        catalog=None,
+        full_snapshot: bool = False,
+        **cfg: Any,
+    ) -> None:
         self.path = Path(path)
         self.con = duckdb.connect(str(self.path))
         dest_mod.ensure_control_schema(self.con)
@@ -249,11 +257,14 @@ class Lab:
         self.committer = FakeCommitter()
         cfg.setdefault("verify_offset_file", False)
         self.config = ApplierConfig(**cfg)
-        # Direct snapshot-driving tests do not have a Debezium notification stream,
-        # so begin the lab's synthetic full-snapshot protocol explicitly. Production
-        # callers supply the policy and its real ordered callbacks.
-        completion = SnapshotCompletion.full_snapshot(SNAPSHOT_TABLES)
-        completion.observe_notification("STARTED", {})
+        # Most lab scenarios are streaming-only. Snapshot scenarios opt into the
+        # synthetic callback protocol explicitly because the lab has no Debezium
+        # notification stream; production callers supply the real ordered callbacks.
+        if full_snapshot:
+            completion = SnapshotCompletion.full_snapshot(SNAPSHOT_TABLES)
+            completion.observe_notification("STARTED", {})
+        else:
+            completion = SnapshotCompletion.streaming_only()
         self.lease = Lease("lab", ttl_seconds=600)
         self.lease.acquire(self.con)
         self.applier = Applier(

@@ -171,7 +171,7 @@ def test_a_spilled_snapshot_chunk_stages_into_the_shadow_table(lab):
     snapshot was routed to the live table with a `<lsn>:None:None` identity. A
     consumer could then see a partial snapshot, and the swap dropped those rows.
     """
-    box = lab(unit_spill_events=2)
+    box = lab(full_snapshot=True, unit_spill_events=2)
     box.feed([snap("customers", 50, ident=i) for i in range(1, 5)])
 
     staged = box.q(
@@ -191,7 +191,7 @@ def test_a_spilled_snapshot_chunk_stages_into_the_shadow_table(lab):
 
 def test_every_chunk_of_a_spilling_snapshot_survives_the_swap(lab):
     """Multi-chunk, multi-spill, keyed: the live table holds every snapshot row."""
-    box = lab(unit_spill_events=2, snapshot_chunk_events=3)
+    box = lab(full_snapshot=True, unit_spill_events=2, snapshot_chunk_events=3)
     records = [snap("customers", 50, ident=i) for i in range(1, 6)]
     records.append(snap("customers", 50, ident=6, marker="last"))
     box.run(records)
@@ -209,7 +209,7 @@ def test_every_chunk_of_a_spilling_snapshot_survives_the_swap(lab):
 
 def test_every_chunk_of_a_spilling_keyless_snapshot_survives_the_swap(lab):
     """The keyless shape: identity is `cdcf_event_id`, so a collision loses a row."""
-    box = lab(unit_spill_events=2, snapshot_chunk_events=3)
+    box = lab(full_snapshot=True, unit_spill_events=2, snapshot_chunk_events=3)
     records = [
         snap("sensor_readings", 50, value=f"v{i}", key=None) for i in range(1, 6)
     ]

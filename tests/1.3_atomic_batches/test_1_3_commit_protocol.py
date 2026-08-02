@@ -15,6 +15,7 @@ import json
 import pytest
 from applier_lab import DATASET, Lab, begin, data, end, keyed, snap
 
+from cdc_flight.envelope import KIND_SNAPSHOT_BOUNDARY, PendingRecord
 from cdc_flight.errors import OffsetFlushFailed
 from cdc_flight.run_state import COMMIT_ACK
 from cdc_flight.snapshot_completion import SnapshotCompletion, SnapshotObservationError
@@ -257,6 +258,107 @@ def test_not_ready_terminal_boundary_refuses_streaming_phase_transition(lab):
     assert box.applier.snapshot_completed is True
 
 
+def _complete_empty_snapshot(box):
+    completion = SnapshotCompletion.full_snapshot({"app.customers"})
+    completion.observe_notification("STARTED", {})
+    completion.observe_notification(
+        "TABLE_SCAN_COMPLETED",
+        {
+            "scanned_collection": "app.customers",
+            "status": "SUCCEEDED",
+            "total_rows_scanned": "0",
+        },
+    )
+    completion.observe_notification("COMPLETED", {})
+    box.applier.snapshot_completion = completion
+
+
+def _snapshot_boundary(lsn: int = 100) -> PendingRecord:
+    return PendingRecord(
+        raw=None,
+        kind=KIND_SNAPSHOT_BOUNDARY,
+        topic="cdcflight.cdc_flight_snapshot_notifications",
+        nbytes=0,
+        lsn=lsn,
+        source_partition={"server": "cdcflight"},
+        source_offset={"lsn": lsn, "lsn_proc": lsn, "ts_usec": lsn * 1000},
+    )
+
+
+def _add_snapshot_boundary(box, lsn: int = 100) -> None:
+    for unit in box.applier.assembler.feed_snapshot_boundary(_snapshot_boundary(lsn)):
+        box.applier._add_unit(unit)
+
+
+def _streaming_transaction():
+    return [
+        begin("stream-1", 300),
+        data(
+            "stream-1",
+            1,
+            301,
+            key={"id": 2},
+            after={"id": 2, "name": "c"},
+        ),
+        end("stream-1", 1, 302, {"app.customers": 1}),
+    ]
+
+
+def test_boundary_only_group_is_classified_as_snapshot_phase(lab):
+    box = lab()
+    _complete_empty_snapshot(box)
+
+    _add_snapshot_boundary(box)
+
+    assert len(box.applier.group.units) == 1
+    assert box.applier.group.is_snapshot is True
+
+
+def test_empty_group_cannot_admit_streaming_before_snapshot_completed(lab):
+    box = lab(full_snapshot=True)
+
+    with pytest.raises(SnapshotObservationError, match="streaming"):
+        box.run(_streaming_transaction())
+
+    assert box.applier.commit_groups == 0
+    assert box.applier.resume_point.last_lsn == 0
+    assert box.applier.snapshot_completion.state == "callbacks_started"
+    assert box.applier.group.units == []
+
+
+def test_boundary_and_first_streaming_unit_are_committed_separately(lab):
+    box = lab()
+    _complete_empty_snapshot(box)
+    _add_snapshot_boundary(box)
+
+    box.feed(_streaming_transaction())
+
+    assert box.applier.commit_groups == 1
+    assert [unit.kind for unit in box.applier.group.units] == ["txn"]
+    assert box.applier.snapshot_completion.state == "streaming"
+    assert box.applier.resume_point.last_lsn == 100
+
+    box.commit()
+    assert box.applier.commit_groups == 2
+    assert box.applier.resume_point.last_lsn == 302
+
+
+def test_streaming_refusal_precedes_commit_of_open_snapshot_group(lab):
+    box = lab(full_snapshot=True, snapshot_chunk_events=1)
+
+    box.feed([snap("customers", 100, ident=1, marker="true")])
+    assert [unit.kind for unit in box.applier.group.units] == ["snapshot_chunk"]
+
+    with pytest.raises(SnapshotObservationError, match="streaming"):
+        box.feed(_streaming_transaction())
+
+    assert box.applier.commit_groups == 0
+    assert box.applier.resume_point.last_lsn == 0
+    assert box.committer.marked == 0
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 0
+    assert [unit.kind for unit in box.applier.group.units] == ["snapshot_chunk"]
+
+
 class _RecordingVerifier:
     """Stands in for `OffsetFlushVerifier` and records *when* it was consulted."""
 
@@ -413,6 +515,7 @@ def test_two_pipelines_on_one_destination_do_not_contend_for_commit_ids(tmp_path
             config=ApplierConfig(verify_offset_file=False),
             lease=lease,
             runner_id=f"{name}-runner",
+            completion=SnapshotCompletion.streaming_only(),
         )
         applier._committer = type(
             "C", (), {"markProcessed": lambda s, r: None, "markBatchFinished": lambda s: None}

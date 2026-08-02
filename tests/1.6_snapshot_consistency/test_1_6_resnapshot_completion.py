@@ -105,7 +105,7 @@ def test_one_table_finishing_is_not_the_snapshot_finishing(tmp_path):
 
 def test_the_completion_flag_records_which_tables_the_engine_reached(tmp_path):
     """`snapshot_tables_seen` is the positive evidence the empty check needs."""
-    lab = Lab(tmp_path / "seen.duckdb")
+    lab = Lab(tmp_path / "seen.duckdb", full_snapshot=True)
     try:
         lab.run([snap("customers", 100, ident=1, value="a", marker="last_in_data_collection")])
         assert lab.applier.snapshot_tables_seen == {"app.customers"}
