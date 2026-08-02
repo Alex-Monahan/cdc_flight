@@ -226,9 +226,10 @@ Measured on an M-series Mac. Only executed runs are reported here; see
 
 | suite | result | wall clock | measured |
 |---|---|---|---|
-| `make test` on 15432 (12 workers) | **649 passed, 130 deselected** | **136.36 s** | 2026-08-01, T-1 concurrent acceptance |
-| `make test` on 15436 (12 workers) | **649 passed, 130 deselected** | **130.23 s** | 2026-08-01, concurrent with 15432 |
-| `make test-serial` | **632 passed, 130 deselected** | **365.43 s** (6:05) | 2026-08-01, T-1 same-HEAD baseline |
+| `make test` on 15432 (12 workers) | **660 passed** | **102.75 s** | 2026-08-01, round-2 current-HEAD standalone acceptance |
+| `make test` on 15432 (12 workers) | **660 passed** | **133.36 s** | 2026-08-01, round-2 current-HEAD concurrent acceptance |
+| `make test` on 15436 (12 workers) | **660 passed** | **130.68 s** | 2026-08-01, concurrent with 15432 |
+| `make test-serial` | **660 passed, 130 deselected** | **549.87 s** (9:09) | 2026-08-01, round-2 current-HEAD baseline |
 | `make test` (local only) | **562 passed, 0 xfail** | **550.0 s** (9:10) | 2026-08-01, after the round-5 fixes |
 | `make test-slow` | **95 passed** | **1 320.7 s** (22:00) | 2026-08-01, after the round-5 fixes |
 | `make test` (local only) | 560 passed, 0 xfail | 548.9 s (9:08) | 2026-07-31, after the round-4 fixes |
@@ -255,8 +256,8 @@ Measured on an M-series Mac. Only executed runs are reported here; see
 | `make test-slow` | 9 passed | 179 s (2:58) | 2026-07-31, after the 1.1-1.3 review round |
 | `make test-md` | 12 passed | 155 s (2:34) | 2026-07-31, after the 1.1-1.3 review round |
 
-The default lane is now about **1:10** on the measured host, versus **6:05** for the same
-632 selected tests in serial. Most state-machine tests are inexpensive; the remaining
+The default lane is now about **1:43** on the measured host, versus **9:09** for the same
+660 selected tests in serial. Most state-machine tests are inexpensive; the remaining
 wall time is dominated by correctness-sensitive JVM startup, crash/restart, fault, and
 snapshot scenarios. Parallelism changes only orchestration and isolation—the selector,
 assertions, and scenario logic are identical to `make test-serial`. The expensive
