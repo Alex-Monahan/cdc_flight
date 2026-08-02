@@ -543,38 +543,34 @@ def test_prepare_refuses_foreign_replacement_after_mkdir(
 
     monkeypatch.setattr(module, "_checkpoint", replace_root)
 
-    with pytest.raises(module.Refusal, match="changed while opening"):
+    with pytest.raises(module.Refusal, match="changed after publication"):
         module._run("prepare", instance)
 
     assert (target / "must-survive.txt").read_text() == "foreign\n"
     assert not (target / ".cdc_flight_disposable_runtime").exists()
 
 
-def test_prepare_refuses_replacement_inside_successful_mkdir(
-    isolated_project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_prepare_refuses_foreign_directory_at_atomic_publish(
+    isolated_project: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """The created fd/identity is acquired before any post-mkdir checkpoint."""
+    """A public-name competitor can never receive the private root's sentinel."""
     instance = "cleanup_mkdir_return_replacement"
     target = isolated_project / ".cdc_instances" / instance
-    escaped = tmp_path / "created-root"
     module = _load_runtime_state(isolated_project)
-    real_mkdir = module.os.mkdir
 
-    def mkdir_then_replace(name, mode=0o777, *, dir_fd=None):
-        real_mkdir(name, mode, dir_fd=dir_fd)
-        if name == instance:
-            target.rename(escaped)
-            real_mkdir(name, mode, dir_fd=dir_fd)
+    def install_foreign(event: str, _path: Path) -> None:
+        if event == "before_target_publish":
+            target.mkdir()
             (target / "must-survive.txt").write_text("foreign\n")
 
-    monkeypatch.setattr(module.os, "mkdir", mkdir_then_replace)
+    monkeypatch.setattr(module, "_checkpoint", install_foreign)
 
-    with pytest.raises(module.Refusal, match="replaced before marking"):
+    with pytest.raises(module.Refusal, match="existing root is not adopted"):
         module._run("prepare", instance)
 
     assert (target / "must-survive.txt").read_text() == "foreign\n"
     assert not (target / module.SENTINEL_NAME).exists()
-    assert not (escaped / module.SENTINEL_NAME).exists()
+    assert not list(target.parent.glob(f".{instance}.provision.*"))
 
 
 def test_clean_binds_runtime_parent_to_physical_project(

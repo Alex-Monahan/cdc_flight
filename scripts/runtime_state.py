@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import fcntl
 import os
 import re
+import secrets
 import stat
 import subprocess
 import sys
@@ -22,6 +24,8 @@ READ_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
 META = {SENTINEL_NAME, QUARANTINE_NAME}
 Refusal = RuntimeError
 Identity = tuple[int, int]
+RENAME_NOREPLACE = 1
+RENAME_EXCL = 4
 
 
 @dataclass(frozen=True)
@@ -200,29 +204,77 @@ def _sentinel(instance_id: str) -> bytes:
     ).encode()
 
 
+def _rename_noreplace(parent_fd: int, source: str, target: str) -> None:
+    """Atomically publish ``source`` without ever replacing ``target``."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    target_bytes = os.fsencode(target)
+    if sys.platform == "darwin":
+        rename = libc.renameatx_np
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        result = rename(
+            parent_fd, source_bytes, parent_fd, target_bytes, RENAME_EXCL
+        )
+    elif sys.platform.startswith("linux"):
+        try:
+            rename = libc.renameat2
+        except AttributeError as exc:  # pragma: no cover - old libc fails closed
+            raise Refusal("atomic no-replace directory publication is unavailable") from exc
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        result = rename(
+            parent_fd, source_bytes, parent_fd, target_bytes, RENAME_NOREPLACE
+        )
+    else:  # pragma: no cover - unsupported platforms fail closed
+        raise Refusal("atomic no-replace directory publication is unavailable")
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), target)
+
+
 def _provision(parent: _Parent, name: str, display: Path) -> _Root:
     _check_parent(parent, "before provisioning")
     _checkpoint("before_target_mkdir", display)
+    private_name = f".{name}.provision.{os.getpid()}.{secrets.token_hex(8)}"
     try:
-        os.mkdir(name, 0o700, dir_fd=parent.fd)
+        os.mkdir(private_name, 0o700, dir_fd=parent.fd)
     except FileExistsError as exc:
-        raise Refusal(
-            f"cannot provision {display}: existing root is not adopted; verify its sentinel"
-        ) from exc
+        raise Refusal(f"cannot allocate private runtime directory for {display}") from exc
 
-    # Verification takes its identity from the descriptor opened immediately after
-    # successful creation.  There is no public-name stat in between and no checkpoint
-    # at which one of our cooperating writers can replace the directory.  This exact fd
-    # remains the authority for sentinel creation and the caller's whole operation.
-    fd = os.open(name, DIR_FLAGS, dir_fd=parent.fd)
-    root = _Root(parent, name, fd, _identity(fd), display)
+    # Build and sentinel-mark the retained created inode under an unpredictable private
+    # name.  Only an atomic no-replace rename publishes it at the public instance name,
+    # so a foreign directory can make publication fail but can never receive a marker.
+    fd = os.open(private_name, DIR_FLAGS, dir_fd=parent.fd)
+    root = _Root(parent, private_name, fd, _identity(fd), display)
     try:
-        _checkpoint("after_target_mkdir", display)
         _check_root(root, "while opening")
         if _scan(root.fd):
             raise Refusal(f"created runtime directory was replaced before marking: {display}")
         _write(root, SENTINEL_NAME, _sentinel(name))
         os.fsync(root.fd)
+        _checkpoint("before_target_publish", display)
+        try:
+            _rename_noreplace(parent.fd, private_name, name)
+        except FileExistsError as exc:
+            raise Refusal(
+                f"cannot provision {display}: existing root is not adopted; "
+                "verify its sentinel"
+            ) from exc
+        root = _Root(parent, name, fd, root.identity, display)
+        os.fsync(parent.fd)
+        _checkpoint("after_target_mkdir", display)
+        _check_root(root, "after publication")
         return root
     except BaseException as original:
         try:
@@ -234,7 +286,7 @@ def _provision(parent: _Parent, name: str, display: Path) -> _Root:
             with suppress(FileNotFoundError):
                 os.unlink(metadata, dir_fd=root.fd)
         with suppress(OSError):
-            os.rmdir(name, dir_fd=parent.fd)
+            os.rmdir(root.name, dir_fd=parent.fd)
         os.close(root.fd)
         raise
 

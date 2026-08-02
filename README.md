@@ -108,8 +108,9 @@ make reset
   project/runtime-parent/instance descriptors while the pipeline mutates it. An existing
   child is never adopted; clean requires its exact instance sentinel. All repository
   runtime writers serialize on that same kernel lock. `prepare-state` provisions one
-  fresh sentinel-marked instance root and refuses to adopt an existing or replaced
-  directory. `make clean-state` records an in-root `quarantining` state, revalidates the
+  private sentinel-marked instance root and atomically publishes it without replacement,
+  so an existing or swapped public directory is never adopted or marked. `make
+  clean-state` records an in-root `quarantining` state, revalidates the
   tree, and removes entries only relative to retained no-follow descriptors. Its terminal
   state is a parent-held record bound to the instance device/inode, so interruption after
   the final in-root marker is removed is recoverable by either prepare or clean. It
