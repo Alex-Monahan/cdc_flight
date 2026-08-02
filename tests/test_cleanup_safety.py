@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import ModuleType
 
@@ -48,11 +49,11 @@ def _runtime_state(
 
 def _load_runtime_state(project: Path) -> ModuleType:
     helper = project / "scripts" / "runtime_state.py"
-    spec = importlib.util.spec_from_file_location(
-        f"runtime_state_{project.parent.name}", helper
-    )
+    module_name = f"runtime_state_{project.parent.name}"
+    spec = importlib.util.spec_from_file_location(module_name, helper)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -493,7 +494,7 @@ def test_clean_refuses_when_retained_root_leaves_parent_before_sweep(
 
     monkeypatch.setattr(module, "_checkpoint", move_root)
 
-    with pytest.raises(module.Refusal, match="changed before deletion"):
+    with pytest.raises(module.Refusal, match="left its verified parent before deletion"):
         module._run("clean", instance)
 
     assert (escaped / marker.name).read_text() == "preserved\n"
@@ -547,6 +548,135 @@ def test_prepare_refuses_foreign_replacement_after_mkdir(
 
     assert (target / "must-survive.txt").read_text() == "foreign\n"
     assert not (target / ".cdc_flight_disposable_runtime").exists()
+
+
+def test_prepare_refuses_replacement_inside_successful_mkdir(
+    isolated_project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The created fd/identity is acquired before any post-mkdir checkpoint."""
+    instance = "cleanup_mkdir_return_replacement"
+    target = isolated_project / ".cdc_instances" / instance
+    escaped = tmp_path / "created-root"
+    module = _load_runtime_state(isolated_project)
+    real_mkdir = module.os.mkdir
+
+    def mkdir_then_replace(name, mode=0o777, *, dir_fd=None):
+        real_mkdir(name, mode, dir_fd=dir_fd)
+        if name == instance:
+            target.rename(escaped)
+            real_mkdir(name, mode, dir_fd=dir_fd)
+            (target / "must-survive.txt").write_text("foreign\n")
+
+    monkeypatch.setattr(module.os, "mkdir", mkdir_then_replace)
+
+    with pytest.raises(module.Refusal, match="replaced before marking"):
+        module._run("prepare", instance)
+
+    assert (target / "must-survive.txt").read_text() == "foreign\n"
+    assert not (target / module.SENTINEL_NAME).exists()
+    assert not (escaped / module.SENTINEL_NAME).exists()
+
+
+def test_clean_binds_runtime_parent_to_physical_project(
+    isolated_project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    instance = "cleanup_parent_binding"
+    parent = isolated_project / ".cdc_instances"
+    escaped = tmp_path / "escaped-runtime-parent"
+    prepared = _runtime_state(
+        isolated_project, "prepare", CDC_TEST_INSTANCE_ID=instance
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    marker = parent / instance / "must-survive.txt"
+    marker.write_text("preserved\n")
+    module = _load_runtime_state(isolated_project)
+
+    def move_parent(event: str, _path: Path) -> None:
+        if event == "after_runtime_parent_open":
+            parent.rename(escaped)
+
+    monkeypatch.setattr(module, "_checkpoint", move_parent)
+
+    with pytest.raises(module.Refusal, match="runtime parent"):
+        module._run("clean", instance)
+
+    assert (escaped / instance / marker.name).read_text() == "preserved\n"
+
+
+@pytest.mark.parametrize("retry_command", ["clean", "prepare"])
+def test_parent_completion_record_recovers_after_final_marker_removal(
+    isolated_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    retry_command: str,
+):
+    instance = f"cleanup_terminal_recovery_{retry_command}"
+    parent = isolated_project / ".cdc_instances"
+    target = parent / instance
+    prepared = _runtime_state(
+        isolated_project, "prepare", CDC_TEST_INSTANCE_ID=instance
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    (target / "must-delete.txt").write_text("disposable\n")
+    module = _load_runtime_state(isolated_project)
+
+    def interrupt(event: str, _path: Path) -> None:
+        if event == "after_terminal_markers_removed":
+            raise OSError("injected terminal interruption")
+
+    monkeypatch.setattr(module, "_checkpoint", interrupt)
+    with pytest.raises(OSError, match="injected terminal interruption"):
+        module._run("clean", instance)
+
+    completion = parent / module._record_name(instance)
+    assert target.exists()
+    assert list(target.iterdir()) == []
+    assert completion.exists()
+
+    monkeypatch.undo()
+    module._run(retry_command, instance)
+    assert not completion.exists()
+    if retry_command == "prepare":
+        assert (target / module.SENTINEL_NAME).exists()
+    else:
+        assert not target.exists()
+
+
+def test_run_holds_project_lock_for_pipeline_mutation_lifetime(
+    isolated_project: Path,
+):
+    instance = "cleanup_full_lifetime_lock"
+    target = isolated_project / ".cdc_instances" / instance
+    env = os.environ.copy()
+    env.pop("CDC_INSTANCE_RUNTIME_ROOT", None)
+    env["CDC_TEST_INSTANCE_ID"] = instance
+    running = subprocess.Popen(
+        [
+            str(isolated_project / "scripts" / "runtime_state.sh"),
+            "run",
+            "--",
+            sys.executable,
+            "-c",
+            "import time; time.sleep(1.5)",
+        ],
+        cwd=isolated_project,
+        env=env,
+    )
+    deadline = time.monotonic() + 5
+    while not (target / ".cdc_flight_disposable_runtime").exists():
+        assert running.poll() is None
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+
+    cleaning = subprocess.Popen(
+        [str(isolated_project / "scripts" / "runtime_state.sh"), "clean"],
+        cwd=isolated_project,
+        env=env,
+    )
+    time.sleep(0.25)
+    assert cleaning.poll() is None, "clean escaped the pipeline's physical project lock"
+    assert running.wait(timeout=5) == 0
+    assert cleaning.wait(timeout=5) == 0
+    assert not target.exists()
 
 
 def test_clean_recovers_an_interrupted_quarantine(

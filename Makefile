@@ -107,16 +107,16 @@ prepare-state: ## mark the selected project-local runtime directory as disposabl
 	$(RUNTIME_STATE) prepare
 
 .PHONY: pipeline
-pipeline: prepare-state ## run the CDC pipeline into local DuckDB
-	$(UV) run cdc-flight --destination duckdb --max-seconds 90 --idle-seconds 8
+pipeline: ## run the CDC pipeline into local DuckDB
+	$(RUNTIME_STATE) run -- $(UV) run cdc-flight --destination duckdb --max-seconds 90 --idle-seconds 8
 
 .PHONY: pipeline-fresh
-pipeline-fresh: prepare-state ## run the pipeline from scratch (drops offsets + dlt state first)
-	$(UV) run cdc-flight --destination duckdb --reset-state --max-seconds 120 --idle-seconds 8
+pipeline-fresh: ## run the pipeline from scratch (drops offsets + dlt state first)
+	$(RUNTIME_STATE) run -- $(UV) run cdc-flight --destination duckdb --reset-state --max-seconds 120 --idle-seconds 8
 
 .PHONY: pipeline-md
-pipeline-md: prepare-state ## run the CDC pipeline into MotherDuck (needs $$motherduck_token)
-	$(UV) run cdc-flight --destination motherduck --max-seconds 120 --idle-seconds 8
+pipeline-md: ## run the CDC pipeline into MotherDuck (needs $$motherduck_token)
+	$(RUNTIME_STATE) run -- $(UV) run cdc-flight --destination motherduck --max-seconds 120 --idle-seconds 8
 
 .PHONY: query
 query: ## show what landed in the local DuckDB file
