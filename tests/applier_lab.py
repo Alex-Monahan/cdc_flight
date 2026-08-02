@@ -41,10 +41,21 @@ from cdc_flight.envelope import (
     KIND_TXN_END,
     PendingRecord,
 )
+from cdc_flight.snapshot_completion import SnapshotCompletion
 
 TOPIC_PREFIX = "cdcflight"
 DATASET = "cdc_raw"
 PARTITION = {"server": TOPIC_PREFIX}
+SNAPSHOT_TABLES = frozenset(
+    {
+        "app.customers",
+        "app.orders",
+        "app.sensor_readings",
+        "app.documents",
+        "app.wide_types",
+        "app.audit_log",
+    }
+)
 
 
 class _Raw:
@@ -230,7 +241,15 @@ def heartbeat(lsn: int) -> PendingRecord:
 class Lab:
     """One `Applier` over one DuckDB file, driven record by record."""
 
-    def __init__(self, path: Path, *, resume_lsn: int = 0, catalog=None, **cfg: Any) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        resume_lsn: int = 0,
+        catalog=None,
+        full_snapshot: bool = False,
+        **cfg: Any,
+    ) -> None:
         self.path = Path(path)
         self.con = duckdb.connect(str(self.path))
         dest_mod.ensure_control_schema(self.con)
@@ -238,6 +257,14 @@ class Lab:
         self.committer = FakeCommitter()
         cfg.setdefault("verify_offset_file", False)
         self.config = ApplierConfig(**cfg)
+        # Most lab scenarios are streaming-only. Snapshot scenarios opt into the
+        # synthetic callback protocol explicitly because the lab has no Debezium
+        # notification stream; production callers supply the real ordered callbacks.
+        if full_snapshot:
+            completion = SnapshotCompletion.full_snapshot(SNAPSHOT_TABLES)
+            completion.observe_notification("STARTED", {})
+        else:
+            completion = SnapshotCompletion.streaming_only()
         self.lease = Lease("lab", ttl_seconds=600)
         self.lease.acquire(self.con)
         self.applier = Applier(
@@ -252,6 +279,7 @@ class Lab:
             lease=self.lease,
             runner_id="lab-runner",
             catalog=catalog,
+            completion=completion,
         )
         self.applier._committer = self.committer
 

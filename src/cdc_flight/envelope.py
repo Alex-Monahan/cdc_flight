@@ -79,11 +79,21 @@ KIND_HEARTBEAT = "heartbeat"
 KIND_MESSAGE = "logical_message"
 KIND_SCHEMA_CHANGE = "schema_change"
 KIND_UNKNOWN = "unknown"
+# A validated Initial Snapshot COMPLETED boundary. It carries the source offset
+# into the destination resume point but deliberately has no Debezium raw handle:
+# the notification is acknowledged only after the completion machine reaches its
+# terminal state.
+KIND_SNAPSHOT_BOUNDARY = "snapshot_boundary"
 
 
 @dataclass
 class PendingRecord:
-    """One decoded Debezium record, plus the Java object needed to acknowledge it."""
+    """One decoded record, optionally retaining the Java object to acknowledge it.
+
+    Snapshot-boundary records are synthetic: their decoded Connect offset is real,
+    but ``raw`` is intentionally ``None`` because the corresponding notification is
+    acknowledged only after the closed completion proof succeeds.
+    """
 
     raw: Any
     kind: str

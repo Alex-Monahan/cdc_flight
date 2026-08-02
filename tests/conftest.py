@@ -1,21 +1,21 @@
 """Fixtures for the cdc_flight test suite.
 
-Everything runs natively: a project-local Postgres cluster on :15432 driven by
+Everything runs natively: a project-local Postgres cluster driven by
 `scripts/pg.sh`, the Debezium embedded engine inside a JVM, and DuckDB on disk.
-No Docker, no Kafka, no testcontainers.
+No Docker, no Kafka, no testcontainers. Physical-cluster ownership is derived
+from the canonical data directory, host, and port; the logical instance ID only
+names databases, slots, and other non-authority resources.
 """
 
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
-import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -29,8 +29,8 @@ import psycopg
 import pytest
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-PG_SH = PROJECT_DIR / "scripts" / "pg.sh"
 VENV_BIN = PROJECT_DIR / ".venv" / "bin"
+SANDBOX_IDLE_SECONDS = 6
 
 #: Tables the pipeline replicates. Used to fingerprint the shared source so a
 #: concurrent writer produces a diagnostic instead of a mystery assertion.
@@ -48,20 +48,41 @@ sys.path.insert(0, str(PROJECT_DIR / "src"))
 # which pytest imports with only their own directory on `sys.path`.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import postgres_test_instance
+
 from cdc_flight.config import DestinationConfig, ReplicationConfig, SourceConfig
 
+POSTGRES_TEST_INSTANCE = postgres_test_instance.INSTANCE
+PG_SH = POSTGRES_TEST_INSTANCE.pg_sh
+_enforce_no_worker_restarts = postgres_test_instance._enforce_no_worker_restarts
+pytest_configure = postgres_test_instance.pytest_configure
+pytest_sessionstart = postgres_test_instance.pytest_sessionstart
+pytest_unconfigure = postgres_test_instance.pytest_unconfigure
+exclusive_source = postgres_test_instance.exclusive_source
+postgres_cluster = postgres_test_instance.postgres_cluster
 
-# --------------------------------------------------------------------------- #
-# helpers
-# --------------------------------------------------------------------------- #
-def _pg(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [str(PG_SH), *args],
-        capture_output=True,
-        text=True,
-        check=check,
-        timeout=180,
-    )
+TEST_PGPORT = POSTGRES_TEST_INSTANCE.port
+TEST_PGDATABASE = POSTGRES_TEST_INSTANCE.database
+TEST_PGDATA = POSTGRES_TEST_INSTANCE.data_dir
+TEST_PGSOCKET = POSTGRES_TEST_INSTANCE.socket_dir
+TEST_PGLOG = POSTGRES_TEST_INSTANCE.log_path
+TEST_CLUSTER_SENTINEL = POSTGRES_TEST_INSTANCE.sentinel
+TEST_INSTANCE_ID = POSTGRES_TEST_INSTANCE.instance_id
+TEST_SLOT_PREFIX = POSTGRES_TEST_INSTANCE.slot_prefix
+TEMPLATE_DATABASE_PREFIX = POSTGRES_TEST_INSTANCE.template_database_prefix
+WORKER_DATABASE_PREFIX = POSTGRES_TEST_INSTANCE.worker_database_prefix
+TEST_LOCK_PATH = POSTGRES_TEST_INSTANCE.run_lock_path
+TEST_SETUP_LOCK_PATH = POSTGRES_TEST_INSTANCE.setup_lock_path
+
+_pg = POSTGRES_TEST_INSTANCE.pg
+_acquire_test_run_lock = POSTGRES_TEST_INSTANCE.acquire_run_lock
+_required_replication_capacity = POSTGRES_TEST_INSTANCE.required_replication_capacity
+_isolated_source = POSTGRES_TEST_INSTANCE.isolated_source
+_require_disposable_cluster = POSTGRES_TEST_INSTANCE.require_disposable_cluster
+_owned_database_name = POSTGRES_TEST_INSTANCE.owns_database
+_reset_test_database = POSTGRES_TEST_INSTANCE.reset_test_database
+_source_environment = POSTGRES_TEST_INSTANCE.source_environment
+_drop_slot = POSTGRES_TEST_INSTANCE.drop_slot
 
 
 def _executable(name: str) -> str:
@@ -82,100 +103,6 @@ def _reset_fault_spec():
     yield
     faults.refresh()
     faults.reset_arrivals()
-
-
-# --------------------------------------------------------------------------- #
-# session-scoped environment
-# --------------------------------------------------------------------------- #
-@pytest.fixture(scope="session")
-def exclusive_source() -> Iterator[Path]:
-    """Serialise whole test sessions against the shared Postgres cluster.
-
-    Every sandbox has a private slot, offset directory and DuckDB file, but they
-    all mutate the *same* `app` schema and publication, and `reseed()` drops and
-    recreates both (`sql/01_schema.sql:7-12`, `:142-150`). Two concurrent
-    sessions - two reviewers running `make test` at once against :15432, which is
-    exactly what happened during the 1.0 review - therefore corrupt each other:
-    one session's snapshot picks up another's rows, or its publication vanishes
-    mid-run. That produced the review's "1 failed, 21 passed" and Codex's
-    "healthy snapshot contained 40 rather than 20 records".
-
-    A whole-session exclusive `flock` is the cheapest fix that actually removes
-    the class of failure rather than papering over one symptom (Opus B4,
-    Codex 12). Per-worker databases would be better and are the follow-up if the
-    suite is ever parallelised.
-    """
-    lock_path = PROJECT_DIR / ".pytest-source.lock"
-    lock_path.touch(exist_ok=True)
-    handle = lock_path.open("r+")
-    waited = 0.0
-    while True:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            break
-        except BlockingIOError:
-            if waited == 0.0:
-                print(
-                    f"\nwaiting for another test session to release {lock_path} "
-                    "(the Postgres cluster on :15432 is shared)"
-                )
-            time.sleep(1.0)
-            waited += 1.0
-            if waited > 1800:
-                pytest.fail(f"timed out waiting 30 min for {lock_path}")
-    try:
-        yield lock_path
-    finally:
-        fcntl.flock(handle, fcntl.LOCK_UN)
-        handle.close()
-
-
-@pytest.fixture(scope="session")
-def postgres_cluster(exclusive_source: Path) -> Iterator[SourceConfig]:
-    """Start (if needed) the project-local Postgres cluster and load the schema.
-
-    The cluster is intentionally left running afterwards: `initdb` + start costs a
-    few seconds and every test session reseeds anyway. `make down` stops it.
-    """
-    if not PG_SH.exists():
-        pytest.skip("scripts/pg.sh missing")
-    _pg("start")
-    _pg("seed")
-    _sweep_stale_test_slots(SourceConfig())
-    yield SourceConfig()
-
-
-def _sweep_stale_test_slots(source: SourceConfig) -> None:
-    """Drop replication slots left behind by earlier sessions (Opus MAJOR-2).
-
-    Every sandbox slot is named `t_<scenario>_<pid>` and dropped on cleanup, but a hard
-    crash - which several fault scenarios cause ON PURPOSE - leaves one behind, and so
-    does a `_rs` throwaway from an interrupted re-snapshot. A logical slot holds WAL for
-    ever and counts against `max_replication_slots`, so the leaks accumulate until the
-    suite fails with "all replication slots are in use" - which is exactly how this run
-    failed once while the fix was being written, and how two independent review sessions
-    degraded the shared cluster in a single day.
-
-    Safe to do unconditionally at session start: `exclusive_source` holds the whole-session
-    lock, so no other session owns a `t_...` slot right now, and an ACTIVE slot is never
-    touched.
-    """
-    try:
-        with psycopg.connect(source.dsn, autocommit=True, connect_timeout=10) as conn:
-            stale = [
-                row[0]
-                for row in conn.execute(
-                    "SELECT slot_name FROM pg_replication_slots "
-                    "WHERE NOT active AND (slot_name LIKE 't\\_%' OR slot_name LIKE '%\\_rs')"
-                ).fetchall()
-            ]
-            for name in stale:
-                with contextlib.suppress(Exception):
-                    conn.execute("SELECT pg_drop_replication_slot(%s)", (name,))
-            if stale:
-                print(f"\nswept {len(stale)} stale replication slot(s): {sorted(stale)}")
-    except Exception as exc:  # pragma: no cover - hygiene must never fail a session
-        print(f"\ncould not sweep stale replication slots: {exc}")
 
 
 def source_fingerprint(source: SourceConfig) -> dict[str, int]:
@@ -215,8 +142,8 @@ def source_conn(postgres_cluster: SourceConfig) -> Iterator[psycopg.Connection]:
 
 @pytest.fixture
 def fresh_seed(postgres_cluster: SourceConfig) -> SourceConfig:
-    """Reload schema + seed data so a test starts from a known row set."""
-    _pg("seed")
+    """Clone the canonical template so a test starts from a known row set."""
+    _reset_test_database(postgres_cluster)
     return postgres_cluster
 
 
@@ -226,32 +153,21 @@ def fresh_seed(postgres_cluster: SourceConfig) -> SourceConfig:
 @pytest.fixture
 def cdc_env(tmp_path: Path, postgres_cluster: SourceConfig) -> Iterator[dict[str, str]]:
     """Per-test Debezium offsets, dlt state, replication slot and DuckDB file."""
-    slot = f"test_slot_{os.getpid()}_{abs(hash(tmp_path)) % 100000}"
+    suffix = f"{os.getpid()}_{abs(hash(tmp_path)) % 100000}"
+    slot = f"{TEST_SLOT_PREFIX[: 63 - len(suffix)]}{suffix}"
     env = {
-        **os.environ,
+        **_source_environment(postgres_cluster),
         "CDC_STATE_DIR": str(tmp_path / "cdc_state"),
         "CDC_PIPELINES_DIR": str(tmp_path / "cdc_state" / "dlt_pipelines"),
         "CDC_DUCKDB_PATH": str(tmp_path / "cdc_flight.duckdb"),
         "CDC_SLOT_NAME": slot,
-        "CDC_PIPELINE_NAME": "cdc_flight_test",
+        "CDC_PIPELINE_NAME": f"cdc_flight_test_{TEST_INSTANCE_ID}",
         "RUNTIME__DLTHUB_TELEMETRY": "false",
     }
     _drop_slot(postgres_cluster, slot)
     yield env
     _drop_slot(postgres_cluster, slot)
     shutil.rmtree(tmp_path / "cdc_state", ignore_errors=True)
-
-
-def _drop_slot(source: SourceConfig, slot: str) -> None:
-    try:
-        with psycopg.connect(source.dsn, autocommit=True) as conn:
-            conn.execute(
-                "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
-                "WHERE slot_name = %s",
-                (slot,),
-            )
-    except Exception:
-        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -416,16 +332,21 @@ class Sandbox:
         self.dir = base
         self.dir.mkdir(parents=True, exist_ok=True)
         self.source = source
-        self.slot = re.sub(r"[^a-z0-9_]", "_", f"t_{name}_{os.getpid()}".lower())[:60]
+        self.slot = re.sub(
+            r"[^a-z0-9_]", "_", f"{TEST_SLOT_PREFIX}t_{name}_{os.getpid()}".lower()
+        )[:60]
         self.duckdb_path = self.dir / "cdc_flight.duckdb"
         self.state_dir = self.dir / "cdc_state"
         self.env = {
-            **os.environ,
+            **_source_environment(source),
             "CDC_STATE_DIR": str(self.state_dir),
             "CDC_PIPELINES_DIR": str(self.state_dir / "dlt_pipelines"),
             "CDC_DUCKDB_PATH": str(self.duckdb_path),
             "CDC_SLOT_NAME": self.slot,
-            "CDC_PIPELINE_NAME": f"cdc_flight_{re.sub(r'[^a-z0-9_]', '_', name.lower())}",
+            "CDC_PIPELINE_NAME": (
+                f"cdc_flight_{TEST_INSTANCE_ID}_"
+                f"{re.sub(r'[^a-z0-9_]', '_', name.lower())}"
+            ),
             "RUNTIME__DLTHUB_TELEMETRY": "false",
         }
         self.drop_slot()
@@ -439,7 +360,8 @@ class Sandbox:
         _drop_slot(self.source, self.slot)
 
     def reseed(self) -> None:
-        _pg("seed")
+        self.drop_slot()
+        _reset_test_database(self.source)
 
     def cleanup(self) -> None:
         self.drop_slot()
@@ -474,7 +396,7 @@ class Sandbox:
     # -- pipeline ----------------------------------------------------------- #
     def run(self, *, extra_env: dict[str, str] | None = None, **kwargs) -> dict:
         kwargs.setdefault("max_seconds", 120)
-        kwargs.setdefault("idle_seconds", 6)
+        kwargs.setdefault("idle_seconds", SANDBOX_IDLE_SECONDS)
         return _invoke_pipeline({**self.env, **(extra_env or {})}, **kwargs)
 
     def spawn(
@@ -656,9 +578,9 @@ def crash_replay(tmp_path_factory, postgres_cluster: SourceConfig) -> Iterator[d
         }
     finally:
         box.cleanup()
-        # Leave the shared source in its canonical state (Opus B4 / Codex 12).
+        # Leave this worker's source in its canonical state before another module.
         with contextlib.suppress(Exception):  # teardown must not mask a failure
-            _pg("seed")
+            _reset_test_database(postgres_cluster)
 
 
 @pytest.fixture(scope="module")

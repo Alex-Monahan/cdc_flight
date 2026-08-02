@@ -10,10 +10,19 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 
 from .assembler import CompleteUnit
 
-__all__ = ["OpenGroup"]
+__all__ = ["CommitResult", "OpenGroup"]
+
+
+class CommitResult(Enum):
+    """Outcome of trying to close the current in-memory commit group."""
+
+    EMPTY = "empty"
+    BLOCKED = "blocked"
+    COMMITTED = "committed"
 
 
 @dataclass

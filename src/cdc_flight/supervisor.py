@@ -23,6 +23,7 @@ from .config import RunConfig
 from .errors import EngineFailure
 from .machines import PHASE_DRAINING
 from .run_state import RunOutcome
+from .snapshot_completion import SnapshotCompletion
 from .source_health import SourceHealth
 
 if TYPE_CHECKING:  # `engine` imports pydbzengine, which boots a JVM on import.
@@ -53,6 +54,7 @@ def run_engine_bounded(
     catalog=None,
     catalog_drain_seconds: float = 30.0,
     stop_when=None,
+    completion: SnapshotCompletion | None = None,
     phases=None,
     outcome: RunOutcome | None = None,
     quiescence_observer=None,
@@ -99,6 +101,10 @@ def run_engine_bounded(
     and the two owners could disagree about how badly a run had gone (Codex r1 MAJOR-2).
     The caller passes `phases.outcome`; the default keeps this function usable alone.
     """
+    # Production callers pass the policy selected during acquisition. The default keeps
+    # this low-level helper useful for streaming-only fakes without inventing a second
+    # completion definition.
+    completion = completion or SnapshotCompletion.streaming_only()
     started = time.monotonic()
     error_box: list[BaseException] = []
     final_poll_done = False
@@ -160,7 +166,11 @@ def run_engine_bounded(
             # never stop while a commit group is being applied.
             warmed_up = elapsed >= min(run.idle_seconds, 5.0)
             if enough and quiet and warmed_up and not handler.busy:
-                if health is None or health.may_declare_idle(min_seconds=run.idle_seconds):
+                source_idle = (
+                    health is None
+                    or health.may_declare_idle(min_seconds=run.idle_seconds)
+                )
+                if source_idle and completion.phase_ended:
                     if catalog is not None and not final_poll_done:
                         # The synchronous final poll. A DROP that happened after the
                         # last scheduled poll is seen by THIS run, and it is also the
@@ -190,7 +200,7 @@ def run_engine_bounded(
                     outcome.record("idle")
                     break
                 idle_blocked_by_source += 1
-                if idle_blocked_by_source % 20 == 1:
+                if not source_idle and idle_blocked_by_source % 20 == 1:
                     log.warning(
                         "stream quiet for %.1fs but the source disagrees it is idle: %s",
                         handler.seconds_since_last_batch,
@@ -282,6 +292,7 @@ def run_engine_bounded(
         "offset_flushes_verified": engine.offset_flushes_verified,
         **handler.stats(),
     }
+    summary.update(completion.as_dict())
     if close_hung:
         # Recorded even when it is not the reported reason, because "we could not shut
         # the engine down" is operationally interesting whatever caused it.
@@ -336,6 +347,14 @@ def run_engine_bounded(
             f"the source has been unreachable for {health.unknown_for:.1f}s "
             f"({health.summary()}); the delivery cannot be shown to be complete, so "
             "this run is not a success (TODO 4.6(b))",
+            summary,
+        )
+
+    if completion.required and not completion.completed:
+        raise EngineFailure(
+            "the required snapshot did not complete before the engine stopped; "
+            "source-idle timing is not positive evidence that Debezium delivered the "
+            "snapshot terminal signal",
             summary,
         )
 

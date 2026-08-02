@@ -53,14 +53,16 @@ from .assembler import (
     TransactionAssembler,
 )
 from .catalog_apply import CatalogCoordinator
-from .commit_group import OpenGroup
+from .commit_group import CommitResult, OpenGroup
 from .destination import AlertSink, Lease, ResumePoint
-from .envelope import PendingRecord, decode
+from .envelope import KIND_SNAPSHOT_BOUNDARY, PendingRecord, decode
 from .errors import AmbiguousDelete, DestinationIdentityCollision
 from .faults import arm_group, maybe_crash
 from .planner import GroupPlan, stream_event_id
 from .run_state import COMMIT_ACK
 from .snapshot import SnapshotCoordinator
+from .snapshot_completion import SnapshotCompletion, SnapshotObservationError
+from .snapshot_notifications import decode_notification
 from .spill import SpillBuffer, StagedEvent
 
 log = logging.getLogger("cdc_flight.applier")
@@ -86,6 +88,7 @@ class Applier:
         transactional_ddl: bool = True,
         catalog=None,
         watermarks: dict[str, int] | None = None,
+        completion: SnapshotCompletion | None = None,
     ):
         self.con = con
         self.pipeline = pipeline
@@ -109,22 +112,12 @@ class Applier:
         #: transaction that straddles the consistent point is in no image at all and
         #: must be applied in full (`cdc_flight.resnapshot`).
         self.watermarks: dict[str, int] = dict(watermarks or {})
+        #: The one owner of this invocation's snapshot completion state. The default
+        #: keeps the in-process laboratory's full-snapshot behaviour; production callers
+        #: pass the policy selected during acquisition.
+        self.snapshot_completion = completion or SnapshotCompletion.full_snapshot()
         #: the consistent point of the snapshot this run applied, if any
         self.last_snapshot_lsn: int | None = None
-        #: True once Debezium's OWN end-of-snapshot marker has been applied and every
-        #: table it opened has been swapped in. Never inferred from "no table is
-        #: currently mid-snapshot": at a Debezium batch boundary between table A's
-        #: last record and table B's first, that is true and the snapshot is not over
-        #: (Codex B1 / Opus BLOCKER-1).
-        self.snapshot_completed = False
-        #: True once a committed group carried `snapshot='last'` — Debezium saying the
-        #: whole snapshot, over the whole requested capture set, has ended.
-        self.snapshot_final_seen = False
-        #: `"<schema>.<table>"` for every table that produced at least one snapshot
-        #: record on this run. The positive evidence behind "this table was scanned":
-        #: a requested table absent from this set was either never reached or is
-        #: genuinely empty, and only a source check can tell those apart.
-        self.snapshot_tables_seen: set[str] = set()
 
         self.registry = apply_sql.SchemaRegistry(
             con, dataset, constraints=config.destination_constraints
@@ -136,6 +129,7 @@ class Applier:
             spill_bytes=config.unit_spill_bytes,
             on_spill=self._spill_events,
             keep_all_records=config.ack_every_record,
+            discard_streaming=config.resnapshot,
         )
 
         #: The open commit group, as ONE object. Replaced wholesale at COMMIT and at
@@ -190,6 +184,12 @@ class Applier:
         self.batch_count = 0
         self.data_batch_count = 0
         self.skipped_count = 0
+        self.snapshot_notification_count = 0
+        self._pending_snapshot_notifications: list[Any] = []
+        #: Re-snapshot streaming units are complete source observations but have no
+        #: destination side. Keep only their acknowledgeable terminal handles until a
+        #: preceding snapshot group is durable; they must never enter ``self.group``.
+        self._pending_discarded_records: list[Any] = []
         self.commit_groups = 0
         self.data_commit_groups = 0
         self.applied_events = 0
@@ -242,6 +242,22 @@ class Applier:
         with self._lock:
             return dict(self.table_counts)
 
+    @property
+    def snapshot_completion_required(self) -> bool:
+        return self.snapshot_completion.required
+
+    @property
+    def snapshot_completed(self) -> bool:
+        return self.snapshot_completion.completed
+
+    @property
+    def snapshot_final_seen(self) -> bool:
+        return self.snapshot_completion.marker_seen
+
+    @property
+    def snapshot_tables_seen(self) -> set[str]:
+        return self.snapshot_completion.tables_seen
+
     def stats(self) -> dict:
         return {
             "commit_groups": self.commit_groups,
@@ -274,6 +290,11 @@ class Applier:
             "resnapshot_discarded_events": self.resnapshot_discarded_events,
             "ambiguous_resnapshots_queued": self.ambiguous_resnapshots_queued,
             "snapshot_consistent_lsn": self.last_snapshot_lsn,
+            "snapshot_notifications": self.snapshot_notification_count,
+            "snapshot_notifications_pending": len(
+                self._pending_snapshot_notifications
+            ),
+            **self.snapshot_completion.as_dict(),
             # Round 8 MAJOR-1: this is the callback/connection ownership proof. A late
             # callback after the seal is a recorded no-op and can never decode, write,
             # mutate replay state, or acknowledge Debezium.
@@ -367,9 +388,49 @@ class Applier:
         # commit->ack window, now that Debezium has polled at least once since it
         # (Codex 7).
         self._run_pending_verification()
-        n = len(records)
+        source_records = 0
         data_in_batch = 0
         for raw in records:
+            notification = decode_notification(raw, topic_prefix=self.topic_prefix)
+            if notification is not None and self.assembler.open_transaction_id is not None:
+                raise SnapshotObservationError(
+                    "snapshot notification arrived inside an open streaming transaction; "
+                    "its callback order cannot be acknowledged safely"
+                )
+            if notification is not None:
+                self.snapshot_notification_count += 1
+                boundary = None
+                if notification.observation == "COMPLETED":
+                    # Validate the terminal observation BEFORE any destination
+                    # transaction can write its source offset. The raw notification
+                    # remains pending; this decoded boundary is deliberately not
+                    # acknowledgeable and exists only to carry its Connect offset into
+                    # the final destination transaction.
+                    boundary = decode(
+                        raw, topic_prefix=self.topic_prefix, want_offsets=True
+                    )
+                    if not boundary.source_partition or not boundary.source_offset:
+                        raise SnapshotObservationError(
+                            "COMPLETED snapshot notification has no Connect offset; "
+                            "refusing to advance the destination resume point"
+                        )
+                    boundary.kind = KIND_SNAPSHOT_BOUNDARY
+                    boundary.raw = None
+                self.snapshot_completion.observe_notification(
+                    notification.observation, notification.data
+                )
+                self._pending_snapshot_notifications.append(raw)
+                if boundary is not None:
+                    # The ordered terminal callback is the boundary after the last row
+                    # callback. Feed only this explicit boundary through the assembler:
+                    # progress callbacks must never fragment snapshot chunks or swap
+                    # shadows, and the pending raw notification must not be acked as a
+                    # normal commit-group record.
+                    for unit in self.assembler.feed_snapshot_boundary(boundary):
+                        self._add_unit(unit)
+                continue
+
+            source_records += 1
             rec = decode(raw, topic_prefix=self.topic_prefix)
             if rec.is_data:
                 data_in_batch += 1
@@ -380,7 +441,7 @@ class Applier:
 
         with self._lock:
             self.batch_count += 1
-            self.record_count += n
+            self.record_count += source_records
             if data_in_batch:
                 self.data_batch_count += 1
 
@@ -388,6 +449,7 @@ class Applier:
             maybe_crash("decode", self.data_batch_count)
 
         if not self.group.units:
+            self._ack_discarded_records()
             return
         # ADR §3.3 soft triggers, plus one pragmatic rule the ADR's pseudocode
         # needs and does not state: Debezium calls `markBatchFinished()` itself on
@@ -395,7 +457,7 @@ class Applier:
         # stream goes quiet would never commit. A batch smaller than
         # `max.batch.size` means the queue drained, so commit now; a full batch
         # means more is already queued, so keep accumulating up to the triggers.
-        drained = n < self.cfg.max_batch_size
+        drained = source_records < self.cfg.max_batch_size
         if self.assembler.open_unit_has_spilled:
             # Invariant B: the rows staged for the still-open unit live in this
             # group's transaction, so committing now would drain a PARTIAL Postgres
@@ -426,23 +488,63 @@ class Applier:
     # group assembly
     # ------------------------------------------------------------------ #
     def _add_unit(self, unit: CompleteUnit) -> None:
-        is_snapshot = unit.kind == UNIT_SNAPSHOT_CHUNK
+        if self._discard_resnapshot_unit(unit):
+            return
+        is_snapshot = self._is_snapshot_unit(unit)
+        was_snapshot = self.group.is_snapshot
+        if not is_snapshot:
+            # This must happen before an open snapshot group is committed or the
+            # incoming streaming unit is appended. The completion machine, not the
+            # current group's row shape, owns the phase barrier.
+            if (
+                self.group.units
+                and self.group.is_snapshot
+                and self._has_snapshot_boundary(self.group.units)
+            ):
+                # A terminal boundary is itself the proof-bearing phase barrier. If
+                # its projected rows are ready, commit that snapshot group first;
+                # `observe_committed_group()` then takes completion_notified ->
+                # callbacks_complete, after which the stream edge can be checked.
+                result = self.commit_group("snapshot_chunk")
+                if result is not CommitResult.COMMITTED:
+                    self.snapshot_completion.check_streaming_admission()
+                    raise SnapshotObservationError(
+                        "cannot cross the snapshot phase boundary with commit result "
+                        f"{result.value}"
+                    )
+            else:
+                # An open snapshot group without its terminal boundary must never be
+                # committed merely because a stream unit arrived.
+                self.snapshot_completion.check_streaming_admission()
         # ADR §3.5: snapshot units are never mixed with streaming units, so a
-        # commit_log row unambiguously says which phase it belongs to.
-        if self.group.units and is_snapshot != self.group.is_snapshot:
-            self.commit_group("snapshot_chunk" if self.group.is_snapshot else "phase")
+        # commit_log row unambiguously says which phase it belongs to. The explicit
+        # terminal boundary is control-shaped but belongs to the snapshot group so its
+        # offset commits atomically with the final snapshot rows.
+        if (
+            self.group.units
+            and is_snapshot != self.group.is_snapshot
+        ):
+            result = self.commit_group(
+                "snapshot_chunk" if was_snapshot else "phase"
+            )
+            if result is not CommitResult.COMMITTED:
+                raise SnapshotObservationError(
+                    f"cannot cross the snapshot phase boundary with commit result "
+                    f"{result.value}"
+                )
+        if not is_snapshot:
+            # For a phase mismatch this runs only after the prior snapshot group has
+            # committed. For an empty group it is the admission edge that used to be
+            # skipped entirely.
+            self.snapshot_completion.enter_streaming()
+        self._append_unit(unit, is_snapshot=is_snapshot)
+
+    def _append_unit(
+        self, unit: CompleteUnit, *, is_snapshot: bool
+    ) -> None:
         if not self.group.units:
             self.group.is_snapshot = is_snapshot
             self.group.opened_at = time.monotonic()
-
-        if self.cfg.resnapshot and unit.kind == UNIT_TXN:
-            # A re-snapshot engine streams for as long as it takes us to notice the
-            # snapshot finished. Those events belong to the real slot, which has not
-            # consumed them, so applying them here would be a duplicate delivery.
-            unit.fenced = True
-            self.fenced_units += 1
-            self.fenced_events += unit.event_count
-            self.resnapshot_discarded_events += unit.event_count
 
         if unit.kind == UNIT_TXN and unit.last_lsn and unit.last_lsn <= self.resume_point.last_lsn:
             # ADR §4.4 idempotency fence. Correctness does not depend on it - the
@@ -469,6 +571,49 @@ class Applier:
         self.group.events += unit.event_count
         self.group.nbytes += unit.nbytes
 
+    def _discard_resnapshot_unit(self, unit: CompleteUnit) -> bool:
+        """Drop throwaway-slot streaming before it reaches phase or commit logic.
+
+        A re-snapshot's slot is temporary and its streaming records are duplicates of
+        records the real slot will deliver after the replacement image is handed off.
+        The assembler has already proven the transaction whole, but this unit has no
+        destination owner: no ``OpenGroup``, spill table, commit log, or resume point.
+        Its acknowledgeable handles wait until any preceding snapshot group is durable.
+        """
+        if not self.cfg.resnapshot or unit.kind != UNIT_TXN:
+            return False
+        unit.fenced = True
+        self.fenced_units += 1
+        self.fenced_events += unit.event_count
+        self.resnapshot_discarded_events += unit.event_count
+        self._pending_discarded_records.extend(unit.records)
+        if unit.spilled_events:
+            # Compatibility counter for ordinary observability. The re-snapshot
+            # assembler discard path does not populate this field because it never
+            # writes the destination spill table.
+            self.fenced_spilled_events += unit.spilled_events
+        log.debug(
+            "discarding %s streaming events from throwaway re-snapshot transaction %s",
+            unit.event_count,
+            unit.txn_id,
+        )
+        return True
+
+    @staticmethod
+    def _is_snapshot_unit(unit: CompleteUnit) -> bool:
+        """Classify row and synthetic control units by their source phase."""
+        return unit.kind == UNIT_SNAPSHOT_CHUNK or any(
+            record.kind == KIND_SNAPSHOT_BOUNDARY for record in unit.records
+        )
+
+    @staticmethod
+    def _has_snapshot_boundary(units: list[CompleteUnit]) -> bool:
+        return any(
+            record.kind == KIND_SNAPSHOT_BOUNDARY
+            for unit in units
+            for record in unit.records
+        )
+
     def _reset_group(self) -> None:
         """One assignment, and that is the whole point (rubric 1.9).
 
@@ -487,19 +632,43 @@ class Applier:
         """
         self.group = OpenGroup()
 
+    def _reserve_commit_id(self) -> int:
+        """Reserve a per-pipeline commit id for an owner opened before COMMIT."""
+        commit_id = self._next_commit_id
+        self._next_commit_id += 1
+        return commit_id
+
     # ------------------------------------------------------------------ #
     # the transaction
     # ------------------------------------------------------------------ #
-    def commit_group(self, trigger: str) -> None:
+    def commit_group(self, trigger: str) -> CommitResult:
+        """Commit the one destination-owned group.
+
+        Re-snapshot streaming units are discarded before this method is reached. A
+        single owner therefore publishes the only shared resume point, and this method
+        has no alternate connection/group context that could overtake it.
+        """
         group = self.group.units
         if not group:
-            return
+            self._ack_discarded_records()
+            return CommitResult.EMPTY
+        # Snapshot rows are observations of the same closed protocol as the direct
+        # notifications. Validate their state and declared counts before BEGIN/COMMIT;
+        # a terminal boundary also waits here until its final buffered rows make the
+        # completion proof terminal. The post-commit observer only records evidence
+        # that has now become durable.
+        if not self.snapshot_completion.commit_ready(group):
+            return CommitResult.BLOCKED
+        acknowledge_snapshot_notifications = (
+            self.snapshot_completion.will_complete_after_commit(group)
+        )
         commit_id = self.group.spill_commit_id or self._next_commit_id
         opened_at = destination.now()
         # Tell the destination-fault wrapper which data group this is, so a
         # `destination_*` fault fires at the group the spec names rather than at one
         # the wrapper inferred from the SQL it happened to see (rubric 1.7).
-        arm_group(self.data_commit_groups + 1)
+        fault_group = self.data_commit_groups + 1
+        arm_group(fault_group)
         # NOT `or spill.rows > 0`: staged rows belonging only to *fenced*
         # units are about to be discarded, and counting them made a group with no
         # applicable content a "data group", which shifts every `<nth>`-indexed
@@ -507,13 +676,14 @@ class Applier:
         has_data = any(
             not u.fenced and (u.events or u.spilled_events) for u in group
         )
+        fault_enabled = has_data
 
         if not self.group.txn_open:
             self.con.execute("BEGIN TRANSACTION")
             self.group.txn_open = True
         try:
             if has_data:
-                maybe_crash("begin", self.data_commit_groups + 1)
+                maybe_crash("begin", fault_group)
             self.lease.renew(self.con)
             stats = self._apply_units(group, commit_id, has_data=has_data)
             new_point = resume.point_for(
@@ -553,8 +723,8 @@ class Applier:
                 offset_blob=self._pending_offset_blob,
                 offset_key_blob=self._pending_offset_key_blob,
             )
-            if has_data:
-                maybe_crash("pre_commit", self.data_commit_groups + 1)
+            if fault_enabled:
+                maybe_crash("pre_commit", fault_group)
             # Principle (3): the pre-flush fingerprint of `offsets.dat` is taken
             # HERE, before the commit, because it is only a *forensic* baseline -
             # it does not need to lengthen the commit->ack path (Codex 7).
@@ -565,23 +735,57 @@ class Applier:
             # One attribute assignment, no lock, no allocation - see
             # `run_state._CommitAckWindow` for why that is the only acceptable cost here.
             stage = ["observability_gate"]
+            marked = 0
+            pending_discards = list(self._pending_discarded_records)
             with self_heal.commit_watchdog(
                 self.cfg.commit_timeout, commit_id, stage=lambda: stage[0]
             ):
                 # INSIDE the watchdog (Codex r3 MAJOR-2). `enter()` waits, without a
                 # bound of its own, until no independent write is in flight — that is
                 # what makes the exclusion absolute rather than instrumented — and the
-                # watchdog is what stops a wedged observability cursor from stalling the
-                # commit path silently. It turns into the same loud, bounded EX_TEMPFAIL
-                # death a wedged COMMIT produces. `stage` tells the watchdog WHICH of the
-                # two it killed, because "the commit never started" and "the commit is
-                # ambiguous" call for different operator responses (Codex r4 MAJOR-1).
+                # watchdog bounds both COMMIT and every acknowledgement below.
                 COMMIT_ACK.enter()
-                stage[0] = "commit"
-                self.con.execute("COMMIT")
-            self.group.txn_open = False
-            if has_data:
-                maybe_crash("post_commit_pre_ack", self.data_commit_groups + 1)
+                try:
+                    stage[0] = "commit"
+                    self.con.execute("COMMIT")
+                    self.group.txn_open = False
+                    if fault_enabled:
+                        maybe_crash("post_commit_pre_ack", fault_group)
+
+                    # The only operations in the guarded post-COMMIT path are the
+                    # acknowledgement calls. Pending snapshot notifications join the
+                    # same plan only once the pure pre-commit completion check says this
+                    # group will make the callback proof terminal.
+                    stage[0] = "ack"
+                    pending = (
+                        list(self._pending_snapshot_notifications)
+                        if acknowledge_snapshot_notifications
+                        else []
+                    )
+                    for unit in group:
+                        for rec in unit.records:
+                            if rec.raw is None:  # released by `_add_unit`
+                                continue
+                            self._committer.markProcessed(rec.raw)
+                            marked += 1
+                    for raw in pending:
+                        self._committer.markProcessed(raw)
+                        marked += 1
+                    for record in pending_discards:
+                        if record.raw is None:
+                            continue
+                        self._committer.markProcessed(record.raw)
+                        marked += 1
+                    self._committer.markBatchFinished()
+                    if pending:
+                        # Do not discard the handles until markBatchFinished succeeds.
+                        del self._pending_snapshot_notifications[: len(pending)]
+                    if pending_discards:
+                        del self._pending_discarded_records[: len(pending_discards)]
+                finally:
+                    # A mark call can raise; a stuck window would silently drop every
+                    # later phase write, so the gate is closed in all cases.
+                    COMMIT_ACK.leave()
         except (AmbiguousDelete, DestinationIdentityCollision) as ambiguous:
             # Rubric 4.7. The group still rolls back - a fold that cannot be decided is
             # never committed - but a bare rollback here is a *permanent* failure: the
@@ -598,28 +802,11 @@ class Applier:
             self._rollback_quietly()
             raise
         except BaseException:
-            COMMIT_ACK.leave()
             self._rollback_quietly()
             raise
 
-        # ── the ONLY window that matters, and it contains nothing else ──────
-        marked = 0
-        try:
-            for unit in group:
-                for rec in unit.records:
-                    if rec.raw is None:  # released by `_add_unit`
-                        continue
-                    self._committer.markProcessed(rec.raw)
-                    marked += 1
-            self._committer.markBatchFinished()
-        finally:
-            # In a `finally` because `markProcessed`/`markBatchFinished` can raise
-            # (pydbzengine interrupts this thread when the handler fails) and a window
-            # left open would silently drop every subsequent phase write (Codex r2
-            # MAJOR-1). One attribute assignment, so it adds nothing to the interval.
-            COMMIT_ACK.leave()
-        if has_data:
-            maybe_crash("post_ack", self.data_commit_groups + 1)
+        if fault_enabled:
+            maybe_crash("post_ack", fault_group)
         # next poll() -> performCommit() -> flushLsn(new)  ── nothing between ──
         # No filesystem work, no hashing: the "did the flush happen" check is a
         # liveness canary, not a prerequisite under Invariant O, so it runs on the
@@ -628,41 +815,66 @@ class Applier:
         if self.verifier is not None and marked:
             self._pending_verification = (offset_fingerprint, marked)
 
-        self._settle_catalog()
-        self._flush_alerts()
-        # Recorded only after COMMIT: what the re-snapshot decides on the strength of
-        # these must be durable, not merely applied.
-        for unit in group:
-            if unit.kind != UNIT_SNAPSHOT_CHUNK or unit.fenced:
-                continue
-            if unit.schema and unit.table:
-                self.snapshot_tables_seen.add(f"{unit.schema}.{unit.table}")
-            if unit.snapshot_last:
-                self.snapshot_final_seen = True
-        if self.snapshot_final_seen and not self.snapshots.active:
-            # Debezium has emitted its own end-of-snapshot marker AND every table it
-            # opened has been swapped in, durably. `cdc_flight.resnapshot` stops its
-            # engine on this rather than waiting out an idle window it does not need.
-            #
-            # `snapshot_final_seen` and not `swaps and not active`: the old condition
-            # was a statement about the tables seen SO FAR, and Debezium closes a
-            # table's chunk the moment a record for the NEXT table arrives. A batch
-            # boundary in that gap satisfied "swaps and not active" with the next table
-            # unscanned, and the caller then classified it as empty and deleted its
-            # live destination rows (Codex B1 / Opus BLOCKER-1).
-            self.snapshot_completed = True
+        self._settle_catalog(self.group)
+        self._flush_alerts(self.group)
+        # Snapshot completion is one policy shared by the main and re-snapshot engines.
+        # Row evidence is recorded only after COMMIT; direct per-table/global callbacks
+        # and declared/committed counts take the terminal edge. Row markers are
+        # diagnostic only and never prove completion.
+        self.snapshot_completion.observe_committed_group(
+            group, snapshot_active=self.snapshots.active
+        )
         self.commit_groups += 1
         if has_data:
             self.data_commit_groups += 1
         self.applied_events += stats["events"]
         self.last_commit_id = commit_id
         self.resume_point = new_point
-        self._next_commit_id = commit_id + 1
-        if self.cfg.verify_offset_file:
+        self._next_commit_id = max(self._next_commit_id, commit_id + 1)
+        # A throwaway re-snapshot has its own Debezium offset file, which may already
+        # include acknowledged duplicate streaming records that arrived after the
+        # snapshot image's point. It is disposable handoff evidence, not the main
+        # destination resume point; comparing that file with the snapshot group's
+        # temporary point would manufacture an Invariant-O drift (r15 acceptance).
+        if self.cfg.verify_offset_file and not self.cfg.resnapshot:
             self._pending_offset_key_blob, self._pending_offset_blob = (
                 resume.capture_offset_file(self.offset_path, new_point)
             )
         self._reset_group()
+        return CommitResult.COMMITTED
+
+    def _ack_discarded_records(self) -> None:
+        """Acknowledge a discard-only re-snapshot unit without a destination commit.
+
+        The temporary re-snapshot offset store is disposable and is never used for the
+        main handoff. If a snapshot group is open, these handles are held until that
+        group commits; when no destination group exists, this is the only safe progress
+        action. The acknowledgement remains inside the same exclusion/watchdog used by
+        the normal post-COMMIT acknowledgement window, but it does not write destination
+        state or a resume point.
+        """
+        pending = list(self._pending_discarded_records)
+        if not pending:
+            return
+        offset_fingerprint = self.verifier.before() if self.verifier else None
+        stage = ["discard_ack"]
+        marked = 0
+        with self_heal.commit_watchdog(
+            self.cfg.commit_timeout, self.last_commit_id, stage=lambda: stage[0]
+        ):
+            COMMIT_ACK.enter()
+            try:
+                for record in pending:
+                    if record.raw is None:
+                        continue
+                    self._committer.markProcessed(record.raw)
+                    marked += 1
+                self._committer.markBatchFinished()
+            finally:
+                COMMIT_ACK.leave()
+        del self._pending_discarded_records[: len(pending)]
+        if self.verifier is not None and marked:
+            self._pending_verification = (offset_fingerprint, marked)
 
     def _request_resnapshot_for(
         self, ambiguous: AmbiguousDelete | DestinationIdentityCollision
@@ -747,7 +959,13 @@ class Applier:
     # ------------------------------------------------------------------ #
     # applying units — one ordered pass, delegated to the planner
     # ------------------------------------------------------------------ #
-    def _apply_units(self, group: list[CompleteUnit], commit_id: int, *, has_data: bool) -> dict:
+    def _apply_units(
+        self,
+        group: list[CompleteUnit],
+        commit_id: int,
+        *,
+        has_data: bool,
+    ) -> dict:
         plan = GroupPlan(
             self.con,
             commit_id=commit_id,
@@ -760,12 +978,9 @@ class Applier:
         )
         for unit in group:
             if unit.fenced:
-                # ADR §4.4 / Codex 5: the fence is set at `_add_unit`, which is the
-                # unit's END - long after its prefix was staged. Skipping only the
-                # in-memory half re-applied the prefix of a transaction the
-                # destination already holds, which made A9's "the fence alone
-                # prevents duplication" false for every spilled unit. The staged
-                # rows are deleted with the rest below, inside this transaction.
+                # This is retained for ordinary idempotency-fenced units. A
+                # re-snapshot overlap is discarded before admission and therefore
+                # cannot reach this apply pass.
                 if unit.spill_unit_seq is not None:
                     self.fenced_spilled_events += unit.spilled_events
                     plan.staged_units = True
@@ -828,7 +1043,12 @@ class Applier:
             )
         self.group.table_events = []
 
-    def _apply_catalog_changes(self, commit_id: int, durable_lsn: int, stats: dict) -> None:
+    def _apply_catalog_changes(
+        self,
+        commit_id: int,
+        durable_lsn: int,
+        stats: dict,
+    ) -> None:
         """Apply the source-catalog changes whose fence has opened (rubric 1.5).
 
         Runs inside the commit group's transaction, *after* the group's events, so a
@@ -852,21 +1072,21 @@ class Applier:
         if self.group.table_events:
             self._flush_table_events(commit_id)
 
-    def _settle_catalog(self) -> None:
+    def _settle_catalog(self, group_obj: OpenGroup) -> None:
         """Forget the catalog work this group made durable. Runs after COMMIT."""
         if self.catalog is None:
             return
-        plan = self.group.catalog_plan
+        plan = group_obj.catalog_plan
         if plan is not None:
-            self.catalog_coordinator.settle(plan, self.group.source_tables)
-            self.group.catalog_plan = None
-        elif self.group.source_tables:
-            self.catalog.observe_replicated(self.group.source_tables)
+            self.catalog_coordinator.settle(plan, group_obj.source_tables)
+            group_obj.catalog_plan = None
+        elif group_obj.source_tables:
+            self.catalog.observe_replicated(group_obj.source_tables)
 
-    def _flush_alerts(self) -> None:
-        for alert in self.group.pending_alerts:
+    def _flush_alerts(self, group_obj: OpenGroup) -> None:
+        for alert in group_obj.pending_alerts:
             self._raise_alert(alert)
-        self.group.pending_alerts = []
+        group_obj.pending_alerts = []
 
     def _raise_alert(self, alert: dict) -> None:
         self.alerts.raise_alert(
@@ -899,10 +1119,17 @@ class Applier:
         """
         if not events:
             return 0
+        if self.cfg.resnapshot and snapshot is None:
+            # The assembler is configured to discard these events before invoking this
+            # callback. Keep this defensive branch side-effect free if a caller invokes
+            # the callback directly: a throwaway stream must never open a destination
+            # transaction merely because it crossed a memory threshold.
+            log.debug("discarding %s throwaway re-snapshot events before destination spill", len(events))
+            return len(events)
         if not self.group.txn_open:
             self.con.execute("BEGIN TRANSACTION")
             self.group.txn_open = True
-            self.group.spill_commit_id = self._next_commit_id
+            self.group.spill_commit_id = self._reserve_commit_id()
         commit_id = self.group.spill_commit_id or self._next_commit_id
         # Creates the shadow table, its `table_state` row and the snapshot epoch
         # BEFORE any record of this table can be staged.
@@ -989,4 +1216,3 @@ def _epoch_ms(value) -> Any:
     from datetime import UTC, datetime
 
     return datetime.fromtimestamp(value / 1000.0, tz=UTC)
-

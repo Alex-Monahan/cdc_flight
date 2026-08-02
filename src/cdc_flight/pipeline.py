@@ -45,6 +45,7 @@ from . import recovery as recovery_mod
 from . import resnapshot as resnapshot_mod
 from . import resnapshot_recovery as resnapshot_recovery_mod
 from .applier import Applier, ApplierConfig
+from .completion_stage import PostEngineCompletion
 from .config import (
     CatalogConfig,
     DestinationConfig,
@@ -67,6 +68,7 @@ from .machines import (
 )
 from .ownership import DestinationOwnership
 from .run_state import RunOutcome, RunPhaseWriter
+from .snapshot_completion import SnapshotCompletion
 from .source_health import SourceHealth
 from .supervisor import run_engine_bounded
 
@@ -410,8 +412,11 @@ def run(
             summary_extra["interrupted_snapshots_requeued"] = interrupted
         owed = dest_mod.tables_awaiting_snapshot(con, dest.pipeline_name)
         will_snapshot_everything = (
-            reconciliation.resume_point.last_lsn == 0
-            and props["snapshot.mode"] in reconcile_mod.SNAPSHOT_MODES_WITH_DATA
+            props["snapshot.mode"] == "always"
+            or (
+                reconciliation.resume_point.last_lsn == 0
+                and props["snapshot.mode"] in reconcile_mod.SNAPSHOT_MODES_WITH_DATA
+            )
         )
         if (
             owed
@@ -578,6 +583,8 @@ def run(
         # Imported late: importing pydbzengine boots a JVM.
         from .engine import SupervisedDebeziumEngine
 
+        snapshot_completion = SnapshotCompletion.for_capture(
+            will_snapshot_everything, schema=source.schema, tables=source.tables)
         applier = Applier(
             con,
             pipeline=dest.pipeline_name,
@@ -592,6 +599,7 @@ def run(
             transactional_ddl=transactional_ddl,
             catalog=watcher,
             watermarks=watermarks,
+            completion=snapshot_completion,
         )
         ownership.attach(applier)
         engine = SupervisedDebeziumEngine(
@@ -618,24 +626,32 @@ def run(
             max_lag_bytes=run_cfg.idle_max_lag_bytes,
         ).start()
 
-        def _decorate(result: dict) -> dict:
-            result.update(summary_extra)
-            result["destination"] = dest.kind
-            result["dataset"] = dest.dataset_name
-            result["runner_id"] = runner_id
-            if dest.kind == "duckdb":
-                result["duckdb_path"] = str(dest.duckdb_path)
-            else:
-                result["motherduck_database"] = dest.motherduck_database
-            return result
+        completion_stage = PostEngineCompletion(
+            con=con,
+            source_dsn=source.dsn,
+            slot_name=replication.slot_name,
+            pipeline=dest.pipeline_name,
+            namespace=namespace,
+            dataset=dest.dataset_name,
+            snapshot_mode=props["snapshot.mode"],
+            destination=dest,
+            runner_id=runner_id,
+            watcher=watcher,
+            journal=journal,
+            baseline=baseline,
+            snapshot_completion=snapshot_completion,
+            outcome=outcome,
+            base_summary=summary_extra,
+        )
 
-        terminating_modes = {"initial_only", "recovery_only"}
         try:
             phases.to(PHASE_STREAMING)
             ownership.activate(applier)
             result = run_engine_bounded(
                 engine, applier, run_cfg, health,
-                engine_terminates_normally=props["snapshot.mode"] in terminating_modes,
+                engine_terminates_normally=(
+                    props["snapshot.mode"] in {"initial_only", "recovery_only"}
+                ),
                 catalog=watcher,
                 catalog_drain_seconds=catalog_cfg.drain_seconds,
                 phases=phases,
@@ -645,135 +661,20 @@ def run(
                 # ordinary run and a severe result could be published as the mild
                 # default.
                 outcome=outcome,
+                completion=snapshot_completion,
                 quiescence_observer=ownership.quiescence_observer(applier),
             )
-            summary_extra["invariant_o_end"] = reconcile_mod.check_invariant_o(
-                con, pipeline=dest.pipeline_name, namespace=namespace,
-                dsn=source.dsn, slot_name=replication.slot_name,
-                snapshot_mode=props["snapshot.mode"],
-            )
-            # QUIESCE, VALIDATE, FLUSH, REPORT — in that order (Codex r3 BLOCKER-1).
-            # `run_engine_bounded` has stopped the watcher and refused to return at all
-            # unless it proved the thread dead, so nothing can add dirty state now.
-            # Persisting here rather than only through a commit group is the fix: a run
-            # that committed NO groups used to persist nothing, so everything the
-            # watcher learned vanished — and after an offline drop-and-recreate the next
-            # run accepted the replacement oid as though it had always owned that
-            # relation, leaving the old relation's rows beside the new one's for ever.
-            learned = dest_mod.flush_learned_relations(
-                con, pipeline=dest.pipeline_name, catalog=watcher,
-                # A relation NOTHING HAS REBUILT must not have its observed oid become
-                # history: the next run would then agree with the source and never ask
-                # again (Codex r6 BLOCKER-2). Normally empty — by here the blocking
-                # re-snapshot has rebuilt them.
-                #
-                # `unrebuilt_relations`, not `unrelatable_relations(include_owed=True)`:
-                # a relation the re-snapshot has just rebuilt is `complete` and still has
-                # no registry row, because THIS FLUSH is what writes it. Excluding on "no
-                # identity" would exclude the very write that establishes the identity,
-                # and the confirmation would then refuse over a rebuild that happened.
-                exclude=set(
-                    baseline_mod.unrebuilt_relations(
-                        con, pipeline=dest.pipeline_name, dataset=dest.dataset_name,
-                    )
-                ),
-            )
-            if learned:
-                summary_extra["source_relations_persisted"] = learned
-            # The recovery is over when the work it asked for has actually been done.
-            # The PREDICATE LIVES IN `recovery.py` (Codex r1 MAJOR-5): it validates the
-            # captured obligation the journal recorded, performs the `armed -> absent`
-            # edge itself, and returns a typed result. Clearing any earlier would throw
-            # away the forced snapshot mode the rest of the rebuild depends on.
-            if journal is not None:
-                # A captured relation that is EMPTY at the source emits no snapshot
-                # records, so the coordinator never opens a shadow and never swaps one
-                # in — and the destination table keeps whatever it held. Under a
-                # journalled obligation that is stale data certified as a rebuild
-                # (Codex r2 BLOCKER-1, measured: a `--reset-state` reported `ok: true`
-                # over two rows the source had truncated away). The blocking
-                # re-snapshot has always closed this with three independent facts;
-                # this is the same machinery asked the same question after the MAIN
-                # engine's snapshot, so an operator's reset converges in one run rather
-                # than failing and self-healing on the next.
-                emptied, fence = resnapshot_mod.finish_empty_tables_after_main_snapshot(
-                    con,
-                    pipeline=dest.pipeline_name,
-                    dataset=dest.dataset_name,
-                    dsn=source.dsn,
-                    owed=dest_mod.tables_awaiting_snapshot(con, dest.pipeline_name),
-                    applier=applier,
-                    stop_reason=str(result.get("stop_reason")),
-                )
-                if emptied:
-                    summary_extra["verified_empty_after_snapshot"] = emptied
-                    summary_extra["verified_empty_fence_lsn"] = fence
-                completion = recovery_mod.complete_if_ready(
-                    con, pipeline=dest.pipeline_name, namespace=namespace, record=journal,
-                    verified_empty=emptied,
-                )
-                if completion.cleared:
-                    summary_extra["recovery_cleared"] = completion.recovery_id
-                else:
-                    # The blueprint's nesting invariant: no successful stopped run while
-                    # a destructive recovery is uncleared. It used to add a summary key
-                    # and let the run report `ok: true` over a half-finished rebuild —
-                    # `run_ok` came from the supervisor result and nothing else looked
-                    # (Codex r1 MAJOR-5). Raised rather than flagged, because a summary
-                    # that says `ok: false` behind a zero exit code is the same defect
-                    # one layer out.
-                    summary_extra["recovery_still_armed"] = completion.recovery_id
-                    summary_extra["recovery_still_owed"] = list(completion.still_owed)
-                    outcome.record("recovery_uncleared")
-                    result["stop_reason"] = outcome.value
-                    raise EngineFailure(
-                        f"recovery {completion.recovery_id} is still armed at shutdown: "
-                        f"{completion.reason}. The destination is knowingly mid-rebuild, "
-                        "so this run is not a success",
-                        result,
-                    )
-            # ...and the CLAIM about them, which is the durable half (rubric 1.9/SM-E).
-            #
-            # LAST, after every rebuild path has finished — including
-            # `finish_empty_tables_after_main_snapshot`, which is what empties and
-            # fences a relation that is genuinely empty at the source. Asked before
-            # it, this verdict saw six tables still holding their pre-reset rows and
-            # refused an `--reset-state` of an entirely empty source that had in fact
-            # converged (MEASURED). The baseline is the run's last claim, so it is
-            # taken when there is nothing left that could change the answer.
-            #
-            # Recomputed from durable state, so the verdict is a statement about what
-            # the destination now holds rather than about what this process remembers.
-            if watcher is not None:
-                baseline = baseline_mod.confirm(
-                    con, pipeline=dest.pipeline_name, dataset=dest.dataset_name,
-                    check=baseline, successful_polls=watcher.successful_polls,
-                    runner_id=runner_id,
-                )
-                summary_extra.update(baseline.as_dict())
-                if not baseline.valid:
-                    # No successful run over an unconfirmed baseline. This is the
-                    # nesting invariant the r5 defect slipped through: the *narrow*
-                    # symptom (zero polls) was rejected, but a later healthy run could
-                    # still report success while the destination durably held one
-                    # relation's rows under another relation's identity.
-                    outcome.record("engine_error")
-                    result["stop_reason"] = outcome.value
-                    raise EngineFailure(
-                        "the source-catalog baseline is "
-                        f"{baseline.state!r} at shutdown: {baseline.reason}. Until every "
-                        "relation the destination holds rows for can be related to an "
-                        "identity at the source, adopting what we observe would present "
-                        "one relation's rows as another's. Refusing to report success",
-                        result,
-                    )
-            run_ok = bool(result.get("ok"))
-            outcome.record(result.get("stop_reason") or outcome.value)
-            reported = _decorate(result)
+            # QUIESCE, VALIDATE, FLUSH, REPORT — in that order. The completion stage
+            # owns every durable post-engine discharge and returns a complete summary;
+            # this loop only supervises the callback runtime.
+            report = completion_stage.finish(result)
+            run_ok = report.run_ok
+            outcome.record(report.summary.get("stop_reason") or outcome.value)
+            reported = report.summary
             return reported
         except EngineFailure as failure:
             outcome.record(failure.summary.get("stop_reason") or "engine_error")
-            reported = _decorate(failure.summary)
+            reported = failure.summary
             raise
         finally:
             health.stop()

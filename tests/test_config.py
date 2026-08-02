@@ -5,7 +5,12 @@ from __future__ import annotations
 
 import pytest
 
-from cdc_flight.config import ReplicationConfig, SourceConfig, applier_settings
+from cdc_flight.config import (
+    DestinationConfig,
+    ReplicationConfig,
+    SourceConfig,
+    applier_settings,
+)
 from cdc_flight.debezium_props import (
     assert_no_internal_topic_collision,
     build_properties,
@@ -20,6 +25,30 @@ def test_source_dsn_and_table_list():
     assert f":{src.port}/" in src.dsn
     assert "app.customers" in src.tables
     assert all("." in t for t in src.tables)
+
+
+def test_default_runtime_artifacts_are_disjoint_per_instance(monkeypatch):
+    for name in (
+        "CDC_STATE_DIR",
+        "CDC_PIPELINES_DIR",
+        "CDC_DUCKDB_PATH",
+        "CDC_PIPELINE_NAME",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    paths = {}
+    for instance in ("pg15432", "pg15436"):
+        monkeypatch.setenv("CDC_TEST_INSTANCE_ID", instance)
+        replication = ReplicationConfig()
+        destination = DestinationConfig()
+        paths[instance] = {
+            replication.state_dir,
+            destination.pipelines_dir,
+            destination.duckdb_path,
+        }
+        assert instance in destination.pipeline_name
+
+    assert paths["pg15432"].isdisjoint(paths["pg15436"])
 
 
 def test_properties_use_pgoutput_and_a_version_controlled_publication(tmp_path):

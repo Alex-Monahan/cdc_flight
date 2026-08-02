@@ -27,7 +27,7 @@ shape is right.
 
 | # | Blog | Here | Reason |
 |---|---|---|---|
-| D1 | `testcontainers` + `debezium/example-postgres` Docker image | native Homebrew Postgres 18 cluster in `./.pgdata` on :15432, managed by `scripts/pg.sh` | Project constraint: no Docker. Also gives us a real `postgresql.conf` we control and a cluster we can crash/restart for fault injection later (rubric 1.7, 4.x). |
+| D1 | `testcontainers` + `debezium/example-postgres` Docker image | native Homebrew Postgres 18 cluster in `CDC_TEST_PGDATA` (default `./.pgdata`) on `CDC_TEST_PGPORT` (default :15432), managed by `scripts/pg.sh` | Project constraint: no Docker. Also gives us a real `postgresql.conf` we control and a cluster we can crash/restart for fault injection later (rubric 1.7, 4.x). |
 | D2 | `table.whitelist` / `schema.whitelist` / `database.whitelist` | `table.include.list` / `schema.include.list` | The `*.whitelist` properties are **removed** in Debezium 2.x+. The blog's config is silently ignored on 3.6 — it captures *everything*. Bitrot. |
 | D3 | `transforms.unwrap.delete.handling.mode=rewrite` | `transforms.unwrap.delete.tombstone.handling.mode=rewrite` | Renamed in Debezium 3.x; the old key is ignored (upstream's own example file was already updated). |
 | D4 | default `plugin.name` | explicit `plugin.name=pgoutput`, explicit `slot.name`, explicit `publication.name`, `publication.autocreate.mode=disabled` | Rubric 7.1 wants pgoutput with no extension; an autocreated publication is invisible infrastructure, so `sql/01_schema.sql` owns it. |

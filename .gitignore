@@ -7,8 +7,10 @@ venv/
 build/
 dist/
 .pytest_cache/
+.pytest-instance-locks/
 .ruff_cache/
 .mypy_cache/
+.pytest-source.lock
 
 # uv
 # (uv.lock IS committed on purpose)
@@ -22,6 +24,7 @@ _storage/
 
 # CDC runtime state (Debezium offsets, engine logs)
 .cdc_state/
+.cdc_instances/
 logs/
 
 # Local env
@@ -32,6 +35,7 @@ logs/
 
 # Project-local Postgres cluster (disposable; recreate with `make pg-init`)
 .pgdata/
+.pgdata_*/
 .pgdata_replica/
 .cdc_state_md/
 
@@ -42,5 +46,5 @@ probes/.out/
 hs_err_pid*.log
 replay_pid*.log
 
-# Test-session mutex for the shared :15432 cluster (see tests/conftest.py)
-.pytest-source.lock
+# Per-instance test-session mutexes (see tests/conftest.py)
+.pytest-source-*.lock

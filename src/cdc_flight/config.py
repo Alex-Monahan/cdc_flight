@@ -7,6 +7,7 @@ from a test fixture, a Makefile target, or (later) a MotherDuck Flight.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -18,15 +19,41 @@ def _env(name: str, default: str) -> str:
     return default if value is None or value == "" else value
 
 
+def _instance_id() -> str:
+    """Return the instance namespace used by default Postgres artifacts."""
+    raw = _env(
+        "CDC_TEST_INSTANCE_ID",
+        _env("CDC_TEST_PGPORT", _env("PGPORT", "15432")),
+    )
+    return re.sub(r"[^a-z0-9_]+", "_", raw.lower()).strip("_") or "pg15432"
+
+
+def _default_slot_name() -> str:
+    """Keep the default logical slot unique when several clusters share a host."""
+    prefix = _env("CDC_SLOT_PREFIX", "cdc_flight_slot_")
+    return f"{prefix}{_instance_id()}"[:63]
+
+
+def _instance_runtime_root() -> Path:
+    """Keep normal pipeline artifacts disjoint across selected instances."""
+    return PROJECT_DIR / ".cdc_instances" / _instance_id()
+
+
 @dataclass(frozen=True)
 class SourceConfig:
     """Connection details for the project-local Postgres cluster."""
 
     host: str = field(default_factory=lambda: _env("PGHOST", "127.0.0.1"))
-    port: int = field(default_factory=lambda: int(_env("PGPORT", "15432")))
+    port: int = field(
+        default_factory=lambda: int(_env("CDC_TEST_PGPORT", _env("PGPORT", "15432")))
+    )
     user: str = field(default_factory=lambda: _env("PGUSER", "postgres"))
     password: str = field(default_factory=lambda: _env("PGPASSWORD", "postgres"))
-    dbname: str = field(default_factory=lambda: _env("PGDATABASE", "cdc_source"))
+    dbname: str = field(
+        default_factory=lambda: _env(
+            "CDC_TEST_PGDATABASE", _env("PGDATABASE", "cdc_source")
+        )
+    )
     schema: str = field(default_factory=lambda: _env("CDC_SCHEMA", "app"))
 
     @property
@@ -48,14 +75,16 @@ class SourceConfig:
 class ReplicationConfig:
     """Debezium / logical-decoding identifiers."""
 
-    slot_name: str = field(default_factory=lambda: _env("CDC_SLOT_NAME", "cdc_flight_slot"))
+    slot_name: str = field(default_factory=lambda: _env("CDC_SLOT_NAME", _default_slot_name()))
     publication_name: str = field(
         default_factory=lambda: _env("CDC_PUBLICATION", "cdc_flight_pub")
     )
     topic_prefix: str = field(default_factory=lambda: _env("CDC_TOPIC_PREFIX", "cdcflight"))
     snapshot_mode: str = field(default_factory=lambda: _env("CDC_SNAPSHOT_MODE", "initial"))
     state_dir: Path = field(
-        default_factory=lambda: Path(_env("CDC_STATE_DIR", str(PROJECT_DIR / ".cdc_state")))
+        default_factory=lambda: Path(
+            _env("CDC_STATE_DIR", str(_instance_runtime_root() / "cdc_state"))
+        )
     )
 
     @property
@@ -68,11 +97,13 @@ class DestinationConfig:
     """Where dlt writes the change events."""
 
     kind: str = field(default_factory=lambda: _env("CDC_DESTINATION", "duckdb"))
-    pipeline_name: str = field(default_factory=lambda: _env("CDC_PIPELINE_NAME", "cdc_flight"))
+    pipeline_name: str = field(
+        default_factory=lambda: _env("CDC_PIPELINE_NAME", f"cdc_flight_{_instance_id()}")
+    )
     dataset_name: str = field(default_factory=lambda: _env("CDC_DATASET", "cdc_raw"))
     duckdb_path: Path = field(
         default_factory=lambda: Path(
-            _env("CDC_DUCKDB_PATH", str(PROJECT_DIR / "cdc_flight.duckdb"))
+            _env("CDC_DUCKDB_PATH", str(_instance_runtime_root() / "cdc_flight.duckdb"))
         )
     )
     motherduck_database: str = field(
@@ -80,7 +111,10 @@ class DestinationConfig:
     )
     pipelines_dir: Path = field(
         default_factory=lambda: Path(
-            _env("CDC_PIPELINES_DIR", str(PROJECT_DIR / ".cdc_state" / "dlt_pipelines"))
+            _env(
+                "CDC_PIPELINES_DIR",
+                str(_instance_runtime_root() / "cdc_state" / "dlt_pipelines"),
+            )
         )
     )
 

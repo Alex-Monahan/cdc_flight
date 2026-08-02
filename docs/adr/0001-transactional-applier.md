@@ -2904,6 +2904,43 @@ predates this table reads `absent` and may already hold rows it has no identity 
 it reconciles like any other unconfirmed baseline rather than being trusted for having
 made no claim — see A63.4.
 
+**`snapshot_completion`** — Has Debezium's ordered callback queue delivered every
+per-table snapshot terminal and then the global completion callback?
+
+persistence: **memory only** · initial: `awaiting_callbacks` · terminal:
+`callbacks_complete`, `not_required`, `streaming`
+
+| from | to | terminal |
+|---|---|---|
+| `awaiting_callbacks` | `callbacks_started` | no |
+| `callbacks_started` | `callbacks_started` | no |
+| `callbacks_started` | `completion_notified` | no |
+| `callbacks_started` | `callbacks_complete` | yes |
+| `completion_notified` | `completion_notified` | no |
+| `completion_notified` | `callbacks_complete` | yes |
+| `not_required` | `not_required` | yes |
+| `callbacks_complete` | `streaming` | yes |
+| `not_required` | `streaming` | yes |
+
+**`runtime_root_lifecycle`** — Is the project-local disposable root healthy and
+reusable, privately provisioning, or irreversibly committed to cleanup?
+
+persistence: `.cdc_instances/{instance}` plus its parent completion record · initial:
+`absent` · terminal: none (deleted state is reconciled to `absent`)
+
+| from | to | terminal |
+|---|---|---|
+| `absent` | `provisioning` | no |
+| `active` | `active` | no |
+| `active` | `quarantining` | no |
+| `completion_recorded` | `completion_recorded` | no |
+| `completion_recorded` | `deleted_recorded` | no |
+| `deleted_recorded` | `absent` | no |
+| `provisioning` | `absent` | no |
+| `provisioning` | `active` | no |
+| `quarantining` | `completion_recorded` | no |
+| `quarantining` | `quarantining` | no |
+
 #### A51.2 — the inventory, anchored to those edges
 
 | # | machine · edge | failure mode | detection | recovery | crash cut | class |
@@ -2974,13 +3011,14 @@ made no claim — see A63.4.
 | 59 | connection_retirement (domain) | a heartbeat write, cursor close, or parent connection close never returns; or close raises | one canonical daemon-worker close protocol bounds both idle cursor and parent close calls; a live writer retains cursor ownership until it returns | the run tears down within the bound and reports `closed`, `failed` (with the close error), or `abandoned` for each handle before process exit | n/a — the heartbeat is not load-bearing for any decision | **UNDEFINED** (rev 16 — honest: nothing clears the non-terminal heartbeat row an abandoned runner left behind; `last_run.json` is the terminal record and stale-row sweeping belongs to 4.4/6.1) |
 | 60 | interruption_marker: armed -> consumed | restart or preparation at any interruption-marker state, including after destination requeue and at the preparation cleanup-to-arm cut | the marker's declared `state`, with legacy state-less markers parsed as `armed` | restart reasserts `armed` idempotently before consumption; preparation refuses and preserves `armed`, retires `consumed` through the separately declared edge, and directly cleans siblings only from logical `absent` | **STATE-SIMULATED IN PROCESS** at all three durable configurations; monkeypatched cuts cover post-write/pre-consume and orphan-cleanup/pre-arm, while an armed marker and offsets are compared byte-for-byte across refused preparation. These tests do not claim process-crash timing | AUTO (rev 21) |
 | 61 | destination_ownership: active -> callback_owned | callback leaves after failed quiescence, or a pending `BaseException` skips post-`finally` summary construction | the supervisor publishes a typed proof inside its `finally`; unretired active ownership also transfers fail-closed | terminal ownership preserves marker/slot/offset/alert/lease/heartbeat/parent state; outer teardown writes the failure summary and takes the hard-exit path | exact late-exit schedule plus a summaryless `KeyboardInterrupt` through the real supervisor boundary; marker remains `armed`, `reassert_owed` is skipped, resources survive, and the in-process outer teardown is process-terminal | AUTO (rev 20) |
+| 62 | runtime_root_lifecycle: active -> quarantining | persistent `prepare` or `run` observes a root already committed to destructive cleanup, including a partial sweep | the exhaustive parent/root marker classifier returns `quarantining`, `completion_recorded`, or `deleted_recorded` | persistent commands refuse with `clean` recovery guidance; only `clean` advances destructive states to `absent` | hard cuts after quarantine, after terminal-marker removal, after root removal, and before private publication; no child runs and the next clean/private reconciliation is deterministic | AUTO (rev 22) |
 
-**The counts, parsed from the rows above rather than recalled.** 66 rows, one
+**The counts, parsed from the rows above rather than recalled.** 67 rows, one
 failure and one terminal class each.
 
 | class | count | rows |
 |---|---:|---|
-| `AUTO` | **42** | 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 24b, 32, 35, 36, 40, 43, 44, 45, 46, 47, 53, 54, 55, 56, 57, 58, 60, 61 |
+| `AUTO` | **43** | 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 24b, 32, 35, 36, 40, 43, 44, 45, 46, 47, 53, 54, 55, 56, 57, 58, 60, 61, 62 |
 | `MANUAL` | **15** | 17b, 25, 26, 27, 28, 29, 33, 38, 41, 42, 44b, 49, 51, 51a, 52 |
 | `UNDEFINED` | **9** | 30, 31, 32b, 35b, 37, 39, 48, 50, 59 |
 
@@ -3281,7 +3319,7 @@ machine is ceremony — worse than ceremony, because it advertises recoverable i
 states that do not exist. If yes, the state needs a name, a persisted value and a
 transition table.
 
-#### What was built (seven machines + one precedence)
+#### What was built (nine focused machines + one precedence)
 
 | machine | owns | states | edges | persistence |
 |---|---|---|---|---|
@@ -3293,6 +3331,8 @@ transition table.
 | `destination_ownership` | who owns the destination after callback admission or failed quiescence | 4 | 5 | **memory only** |
 | `catalog_change` | where is one DDL fact in observe → confirm → fence → apply | 9 | 30 | **memory only** |
 | `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
+| `snapshot_completion` | have all ordered snapshot callbacks arrived | 6 | 9 | **memory only** |
+| `runtime_root_lifecycle` | is the disposable root reusable or committed to cleanup | 6 | 10 | project-local root and parent markers |
 
 Generated transition tables: §A51.1. Declarations: `cdc_flight/machines.py`, which is one
 file an operator or a reviewer can read to see every consistency-affecting state in the

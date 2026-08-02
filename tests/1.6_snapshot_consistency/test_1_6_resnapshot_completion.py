@@ -7,8 +7,8 @@ Opus BLOCKER-1). Two independent halves of the same claim:
    one swap happened and no table is currently mid-snapshot". At a Debezium batch
    boundary that lands between table A's last record and table B's first, *no* table is
    mid-snapshot and A has swapped — so the supervisor stopped a two-table re-snapshot
-   after one table. The authoritative signal (Debezium's own `snapshot='last'` marker)
-   was already decoded into `CompleteUnit.snapshot_last` and simply was not used.
+   after one table. The authoritative signal is Debezium's ordered Initial Snapshot
+   `COMPLETED` callback after every per-table terminal callback.
 
 2. **The classification.** `resnapshot._finish_empty_tables` treated *every* requested
    table that had not swapped as "the source relation held no rows", and ran
@@ -23,13 +23,17 @@ evidence lives in `test_1_6_resnapshot_multi_table.py`.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import duckdb
 import pytest
 from applier_lab import DATASET, Lab, snap
 
 from cdc_flight import destination as dest_mod
 from cdc_flight import resnapshot as resnapshot_mod
+from cdc_flight.assembler import UNIT_SNAPSHOT_CHUNK
 from cdc_flight.errors import EngineFailure
+from cdc_flight.snapshot_completion import SnapshotCompletion
 
 PIPELINE = "test_resnap_completion"
 
@@ -46,6 +50,10 @@ def test_one_table_finishing_is_not_the_snapshot_finishing(tmp_path):
     coordinator yet. `snapshot_completed` used to flip here.
     """
     lab = Lab(tmp_path / "stop.duckdb")
+    lab.applier.snapshot_completion = SnapshotCompletion.full_snapshot(
+        {"app.customers", "app.orders"}
+    )
+    lab.applier.snapshot_completion.observe_notification("STARTED", {})
     try:
         # Table A's whole image, closed as "last for this table" but NOT as
         # "last of the snapshot" — exactly what Debezium emits when another table
@@ -55,6 +63,14 @@ def test_one_table_finishing_is_not_the_snapshot_finishing(tmp_path):
                 snap("customers", 100, ident=1, value="a"),
                 snap("customers", 100, ident=2, value="b", marker="last_in_data_collection"),
             ]
+        )
+        lab.applier.snapshot_completion.observe_notification(
+            "TABLE_SCAN_COMPLETED",
+            {
+                "scanned_collection": "app.customers",
+                "status": "SUCCEEDED",
+                "total_rows_scanned": "2",
+            },
         )
         assert lab.applier.snapshots.swaps == 1, "table A should have swapped"
         assert not lab.applier.snapshots.active, "no table is mid-snapshot here"
@@ -71,8 +87,17 @@ def test_one_table_finishing_is_not_the_snapshot_finishing(tmp_path):
                 snap("orders", 100, ident=2, value="y", marker="last"),
             ]
         )
+        lab.applier.snapshot_completion.observe_notification(
+            "TABLE_SCAN_COMPLETED",
+            {
+                "scanned_collection": "app.orders",
+                "status": "SUCCEEDED",
+                "total_rows_scanned": "2",
+            },
+        )
+        lab.applier.snapshot_completion.observe_notification("COMPLETED", {})
         assert lab.applier.snapshot_completed is True, (
-            "Debezium's own end-of-snapshot marker is the authoritative signal"
+            "Debezium's ordered end-of-snapshot callback is the authoritative signal"
         )
     finally:
         lab.close()
@@ -80,7 +105,7 @@ def test_one_table_finishing_is_not_the_snapshot_finishing(tmp_path):
 
 def test_the_completion_flag_records_which_tables_the_engine_reached(tmp_path):
     """`snapshot_tables_seen` is the positive evidence the empty check needs."""
-    lab = Lab(tmp_path / "seen.duckdb")
+    lab = Lab(tmp_path / "seen.duckdb", full_snapshot=True)
     try:
         lab.run([snap("customers", 100, ident=1, value="a", marker="last_in_data_collection")])
         assert lab.applier.snapshot_tables_seen == {"app.customers"}
@@ -246,33 +271,75 @@ def test_a_verified_empty_table_is_emptied_and_fenced_at_the_verified_lsn(tmp_pa
 # --------------------------------------------------------------------------- #
 class _FakeApplier:
     def __init__(self, final_seen: bool, seen: set[str]):
-        self.snapshot_final_seen = final_seen
-        self.snapshot_tables_seen = seen
+        # The closed row domain is explicit even in this callback-free fake. An empty
+        # `seen` set means no rows were observed, not that every table name is valid.
+        expected = set(seen) or {"app.customers"}
+        self.completion = SnapshotCompletion.full_snapshot(expected)
+        # A committed snapshot row is legal only after Debezium's STARTED callback.
+        self.completion.observe_notification("STARTED", {})
+        units = [
+            SimpleNamespace(
+                kind=UNIT_SNAPSHOT_CHUNK,
+                schema=qualified.split(".")[0],
+                table=qualified.split(".")[1],
+                snapshot_last=final_seen,
+                fenced=False,
+                event_count=1,
+            )
+            for qualified in seen
+        ]
+        if final_seen and not units:
+            units = [
+                SimpleNamespace(
+                    kind=UNIT_SNAPSHOT_CHUNK,
+                    schema="app",
+                    table="customers",
+                    snapshot_last=True,
+                    fenced=False,
+                    event_count=1,
+                )
+            ]
+        self.completion.observe_committed_group(units, snapshot_active=not final_seen)
 
 
-def test_debeziums_own_marker_ends_the_snapshot_phase():
+def test_debeziums_ordered_callback_ends_the_snapshot_phase():
     applier = _FakeApplier(True, {"app.customers"})
-    assert resnapshot_mod.snapshot_phase_ended(applier, "work_done") is True
+    applier.completion = SnapshotCompletion.full_snapshot({"app.customers"})
+    applier.completion.observe_notification("STARTED", {})
+    applier.completion.observe_notification(
+        "TABLE_SCAN_COMPLETED",
+        {
+            "scanned_collection": "app.customers",
+            "status": "SUCCEEDED",
+            "total_rows_scanned": "0",
+        },
+    )
+    applier.completion.observe_notification("COMPLETED", {})
+    assert resnapshot_mod.snapshot_phase_ended(applier.completion) is True
 
 
-def test_an_entirely_empty_capture_set_ends_when_the_connector_reaches_streaming():
-    """Otherwise a genuinely empty table could never complete, on any run, for ever.
-
-    An empty capture set emits no records, so there is no record for `snapshot='last'`
-    to ride on. `stop_reason == 'idle'` is the positive evidence that the phase ended:
-    `SourceHealth.may_declare_idle()` requires the slot to have been *streaming*, and
-    the connector only streams once its snapshot is over.
-    """
-    applier = _FakeApplier(False, set())
-    assert resnapshot_mod.snapshot_phase_ended(applier, "idle") is True
+def test_an_empty_table_ends_from_its_terminal_callback_not_streaming():
+    completion = SnapshotCompletion.full_snapshot({"app.customers"})
+    completion.observe_notification("STARTED", {})
+    completion.observe_notification(
+        "TABLE_SCAN_COMPLETED",
+        {
+            "scanned_collection": "app.customers",
+            "status": "SUCCEEDED",
+            "total_rows_scanned": "0",
+        },
+    )
+    completion.observe_notification("COMPLETED", {})
+    assert resnapshot_mod.snapshot_phase_ended(completion) is True
 
 
 def test_an_interrupted_engine_never_counts_as_an_ended_snapshot_phase():
-    for stop_reason in ("max_seconds", "work_done", "hung", "engine_error", "source_dark"):
-        assert resnapshot_mod.snapshot_phase_ended(_FakeApplier(False, set()), stop_reason) is False
+    for _stop_reason in ("max_seconds", "work_done", "hung", "engine_error", "source_dark"):
+        completion = _FakeApplier(False, set()).completion
+        assert resnapshot_mod.snapshot_phase_ended(completion) is False
     # ... and neither does a run that scanned SOMETHING but never saw the marker.
     assert resnapshot_mod.snapshot_phase_ended(
-        _FakeApplier(False, {"app.customers"}), "idle"
+        _FakeApplier(False, {"app.customers"}).completion
     ) is False
 
 

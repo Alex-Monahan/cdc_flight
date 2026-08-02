@@ -6,14 +6,26 @@ data: the commit→ack window must contain nothing but the acknowledgement
 pipeline (Codex 9), and a group must be one destination transaction across every
 table it touches (rubric 1.3, asserted here at the mechanism level; the
 end-to-end proof is the MotherDuck observer test).
+
+Re-snapshot streaming overlap is intentionally outside this protocol. Its transaction
+is proven whole by the assembler, then dropped before ``OpenGroup`` admission; only the
+snapshot image uses the destination transaction and publishes the resume point. The
+overlap tests below cover empty/open/boundary, spill thresholds, soft triggers, and the
+r15 owner-overtake sequence as behavior: no destination rows, control rows, spill rows,
+or resume advancement are attributable to the discarded stream.
 """
 
 from __future__ import annotations
 
-import pytest
-from applier_lab import DATASET, Lab, data, end, keyed
+import json
 
+import pytest
+from applier_lab import DATASET, Lab, begin, data, end, keyed, snap
+
+from cdc_flight.envelope import KIND_SNAPSHOT_BOUNDARY, PendingRecord
 from cdc_flight.errors import OffsetFlushFailed
+from cdc_flight.run_state import COMMIT_ACK
+from cdc_flight.snapshot_completion import SnapshotCompletion, SnapshotObservationError
 
 
 @pytest.fixture
@@ -54,6 +66,627 @@ def test_shutdown_seals_callback_admission_and_records_late_batches(lab, monkeyp
     assert stats["callback_seal_reason"] == "test_retirement"
     assert stats["callback_batches_rejected"] == 1
     assert stats["callback_records_rejected"] == 2
+
+
+class _SnapshotNotification:
+    """Minimal ordered notification with a real Connect offset shape."""
+
+    class _Map(dict):
+        class _Entry:
+            def __init__(self, key, value):
+                self._key = key
+                self._value = value
+
+            def getKey(self):
+                return self._key
+
+            def getValue(self):
+                return self._value
+
+        def entrySet(self):
+            return [self._Entry(key, value) for key, value in self.items()]
+
+    def __init__(self, observation: str, lsn: int, data: dict[str, str] | None = None):
+        self._topic = "cdcflight.cdc_flight_snapshot_notifications"
+        self._value = json.dumps(
+            {
+                "aggregate_type": "Initial Snapshot",
+                "type": observation,
+                "additional_data": data or {},
+            }
+        )
+        self._partition = self._Map(server="cdcflight")
+        self._offset = self._Map(lsn=lsn, lsn_proc=lsn, ts_usec=lsn * 1000)
+
+    def destination(self):
+        return self._topic
+
+    def value(self):
+        return self._value
+
+    def key(self):
+        return None
+
+    def sourceRecord(self):
+        return self
+
+    def sourcePartition(self):
+        return self._partition
+
+    def sourceOffset(self):
+        return self._offset
+
+
+def test_invalid_terminal_refuses_before_resume_commit_or_ack(lab):
+    """Invariant O: a refused COMPLETED observation crosses no durable boundary."""
+    box = lab()
+    box.applier.snapshot_completion = SnapshotCompletion.full_snapshot(
+        {"app.customers", "app.orders"}
+    )
+
+    box.applier._handle([_SnapshotNotification("STARTED", 101)], box.committer)
+    with pytest.raises(SnapshotObservationError, match=r"app\.orders"):
+        box.applier._handle([_SnapshotNotification("COMPLETED", 102)], box.committer)
+
+    assert box.committer.marked == 0
+    assert box.committer.batches == 0
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 0
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.debezium_offsets") == 0
+
+
+def test_valid_terminal_offset_commits_before_pending_notifications_are_acked(lab):
+    """The terminal offset is durable, but its raw callback is acked only at completion."""
+    box = lab()
+    box.applier.snapshot_completion = SnapshotCompletion.full_snapshot({"app.customers"})
+
+    box.applier._handle([_SnapshotNotification("STARTED", 101)], box.committer)
+    box.feed([snap("customers", 100, ident=1, value="s", marker="last")])
+    box.applier._handle(
+        [
+            _SnapshotNotification(
+                "TABLE_SCAN_COMPLETED",
+                102,
+                {
+                    "scanned_collection": "app.customers",
+                    "status": "SUCCEEDED",
+                    "total_rows_scanned": "1",
+                },
+            ),
+            _SnapshotNotification("COMPLETED", 103),
+        ],
+        box.committer,
+    )
+
+    assert box.applier.snapshot_completed is True
+    point = box.applier.resume_point
+    assert point.last_lsn == 103
+    assert point.offset["lsn"] == 103
+    assert box.applier.commit_groups == 1
+    # One row record plus the three pending notifications; the synthetic boundary has
+    # raw=None and therefore cannot be acknowledged as an ordinary control record.
+    assert box.committer.marked == 4
+    assert box.committer.batches == 1
+
+
+def test_every_snapshot_ack_is_guarded_and_empty_snapshot_arms_flush_verifier(lab):
+    """Pending notification offsets share the same verified post-COMMIT path.
+
+    The all-empty shape is the canary: the synthetic boundary has no ordinary raw
+    record, so the verifier must count the three pending notifications instead.
+    """
+    box = lab()
+    box.applier.snapshot_completion = SnapshotCompletion.full_snapshot({"app.customers"})
+    verifier = _RecordingVerifier()
+    box.applier.verifier = verifier
+
+    class _GuardedCommitter:
+        def __init__(self):
+            self.marked = 0
+            self.batches = 0
+            self.window_states: list[bool] = []
+
+        def markProcessed(self, record):
+            self.window_states.append(COMMIT_ACK.active)
+            self.marked += 1
+
+        def markBatchFinished(self):
+            self.batches += 1
+
+    committer = _GuardedCommitter()
+    box.applier._handle([_SnapshotNotification("STARTED", 101)], committer)
+    box.applier._handle(
+        [
+            _SnapshotNotification(
+                "TABLE_SCAN_COMPLETED",
+                102,
+                {
+                    "scanned_collection": "app.customers",
+                    "status": "SUCCEEDED",
+                    "total_rows_scanned": "0",
+                },
+            ),
+            _SnapshotNotification("COMPLETED", 103),
+        ],
+        committer,
+    )
+
+    assert committer.marked == 3
+    assert committer.batches == 1
+    assert committer.window_states == [True, True, True]
+    assert verifier.before_calls == 1
+    assert verifier.after_calls == 0
+
+    # The comparison remains deferred until the next poll, but it is armed by the
+    # notification acknowledgements even though the group carried no row record.
+    box.applier._handle([], committer)
+    assert verifier.after_calls == 1
+
+
+def test_not_ready_terminal_boundary_refuses_streaming_phase_transition(lab):
+    """A delayed final snapshot row cannot be mixed with the first stream unit."""
+    box = lab(snapshot_chunk_events=1)
+    box.applier.snapshot_completion = SnapshotCompletion.full_snapshot({"app.customers"})
+    box.applier.snapshot_completion.observe_notification("STARTED", {})
+
+    # One row is durable in the open snapshot group, but Debezium declared two.
+    box.feed([snap("customers", 100, ident=1, marker="true")])
+    box.applier._handle(
+        [
+            _SnapshotNotification(
+                "TABLE_SCAN_COMPLETED",
+                200,
+                {
+                    "scanned_collection": "app.customers",
+                    "status": "SUCCEEDED",
+                    "total_rows_scanned": "2",
+                },
+            ),
+            _SnapshotNotification("COMPLETED", 201),
+        ],
+        box.committer,
+    )
+    assert box.applier.snapshot_completion.state == "completion_notified"
+
+    with pytest.raises(SnapshotObservationError, match="streaming"):
+        box.feed(
+            [
+                begin("stream-1", 300),
+                data("stream-1", 1, 301, key={"id": 2}, after={"id": 2, "name": "c"}),
+                end("stream-1", 1, 302, {"app.customers": 1}),
+            ]
+        )
+
+    assert all(unit.kind != "txn" for unit in box.applier.group.units)
+
+    # The delayed row can finish the original snapshot group and is not lost or
+    # forced through a streaming route.
+    box.feed([snap("customers", 200, ident=2, marker="last")])
+    box.commit()
+    assert box.applier.snapshot_completed is True
+
+
+def test_resnapshot_fenced_overlap_survives_not_ready_terminal_boundary(lab):
+    """A fenced overlap cannot force an under-counted snapshot boundary to commit."""
+    box = lab(resnapshot=True, snapshot_chunk_events=1)
+    box.applier.snapshot_completion = SnapshotCompletion.full_snapshot({"app.customers"})
+    box.applier.snapshot_completion.observe_notification("STARTED", {})
+
+    box.feed([snap("customers", 100, ident=1, marker="true")])
+    box.applier._handle(
+        [
+            _SnapshotNotification(
+                "TABLE_SCAN_COMPLETED",
+                200,
+                {
+                    "scanned_collection": "app.customers",
+                    "status": "SUCCEEDED",
+                    "total_rows_scanned": "2",
+                },
+            ),
+            _SnapshotNotification("COMPLETED", 201),
+        ],
+        box.committer,
+    )
+    assert box.applier.snapshot_completion.state == "completion_notified"
+    assert [unit.kind for unit in box.applier.group.units] == [
+        "snapshot_chunk",
+        "control",
+    ]
+
+    box.feed(_streaming_transaction())
+
+    assert box.applier.snapshot_completion.state == "completion_notified"
+    assert [unit.kind for unit in box.applier.group.units] == [
+        "snapshot_chunk",
+        "control",
+    ]
+    assert box.applier.fenced_units == 1
+    assert box.applier.resnapshot_discarded_events == 1
+
+    box.feed([snap("customers", 200, ident=2, marker="last")])
+    box.commit()
+    assert box.applier.snapshot_completed is True
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 1
+
+
+def test_resnapshot_fenced_spilled_overlap_does_not_start_destination_transaction(lab):
+    """A fenced overlap never stages its prefix in the destination.
+
+    The overlap is deliberately two events so the assembler crosses its configured
+    threshold before the END marker makes the unit complete. The payload is dropped by
+    the re-snapshot assembler path, so no destination owner exists to nest.
+    """
+    box = lab(resnapshot=True, snapshot_chunk_events=1, unit_spill_events=2)
+    box.applier.snapshot_completion = SnapshotCompletion.full_snapshot({"app.customers"})
+    box.applier.snapshot_completion.observe_notification("STARTED", {})
+
+    box.feed([snap("customers", 100, ident=1, marker="true")])
+    box.applier._handle(
+        [
+            _SnapshotNotification(
+                "TABLE_SCAN_COMPLETED",
+                200,
+                {
+                    "scanned_collection": "app.customers",
+                    "status": "SUCCEEDED",
+                    "total_rows_scanned": "2",
+                },
+            ),
+            _SnapshotNotification("COMPLETED", 201),
+        ],
+        box.committer,
+    )
+    snapshot_group = box.applier.group
+
+    overlap = [
+        begin("stream-spilled", 300),
+        keyed("stream-spilled", 1, 301, 2, "c"),
+        keyed("stream-spilled", 2, 302, 3, "d"),
+        end("stream-spilled", 2, 303, {"app.customers": 2}),
+    ]
+    box.feed(overlap)
+
+    assert box.applier.spilled_events == 0
+    assert box.applier.fenced_spilled_events == 0
+    assert box.applier.group is snapshot_group
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.spill_events") == 0
+    assert box.applier.snapshot_completion.state == "completion_notified"
+
+    box.feed([snap("customers", 200, ident=2, marker="last")])
+    box.commit()
+
+    assert box.applier.snapshot_completed is True
+    assert box.applier.commit_groups == 1
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.spill_events") == 0
+
+
+def test_resnapshot_overlap_is_dropped_before_shared_commit_publication(lab):
+    """A spilled overlap cannot reserve or publish the re-snapshot resume point.
+
+    The throwaway slot's streaming transaction is already known to be discard-only.
+    It must not become a destination owner merely because its prefix crosses the
+    assembler threshold while a snapshot boundary is buffered. The later snapshot
+    commit must publish its own terminal tuple, not a newer LSN paired with the
+    boundary's older offset (the r15 overtake sequence).
+    """
+    box = lab(resnapshot=True, snapshot_chunk_events=1, unit_spill_events=2)
+    _prepare_not_ready_snapshot_boundary(box)
+
+    box.feed(
+        [
+            begin("stream-overtake", 300),
+            keyed("stream-overtake", 1, 301, 2, "c"),
+            keyed("stream-overtake", 2, 302, 3, "d"),
+            end("stream-overtake", 2, 303, {"app.customers": 2}),
+        ]
+    )
+
+    assert box.applier.group.units, "the snapshot group must remain buffered"
+    assert box.applier.commit_groups == 0
+    assert box.applier.last_commit_id == 0
+    assert box.applier.resume_point.last_lsn == 0
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 0
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.spill_events") == 0
+
+    box.feed([snap("customers", 200, ident=2, marker="last")])
+    box.commit()
+
+    assert box.applier.commit_groups == 1
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 1
+    assert box.applier.resume_point.last_lsn == 201
+    assert box.applier.resume_point.offset["lsn"] == 200
+    assert box.applier.fenced_units == 1
+    assert box.applier.resnapshot_discarded_events == 2
+
+
+def test_resnapshot_overlap_does_not_create_a_second_destination_owner(lab):
+    """Multiple overlap units are dropped while the snapshot owner remains open."""
+    box = lab(
+        resnapshot=True,
+        snapshot_chunk_events=2,
+        unit_spill_events=2,
+    )
+    box.applier.snapshot_completion = SnapshotCompletion.full_snapshot({"app.customers"})
+    box.applier.snapshot_completion.observe_notification("STARTED", {})
+
+    box.feed(
+        [
+            snap("customers", 100, ident=1, marker="true"),
+            snap("customers", 101, ident=2, marker="true"),
+        ]
+    )
+    assert box.applier.group.txn_open is True
+    assert box.applier.group.spill_commit_id == 1
+
+    box.applier._handle(
+        [
+            _SnapshotNotification(
+                "TABLE_SCAN_COMPLETED",
+                200,
+                {
+                    "scanned_collection": "app.customers",
+                    "status": "SUCCEEDED",
+                    "total_rows_scanned": "3",
+                },
+            ),
+            _SnapshotNotification("COMPLETED", 201),
+        ],
+        box.committer,
+    )
+
+    box.feed(
+        [
+            begin("stream-spilled", 300),
+            keyed("stream-spilled", 1, 301, 3, "c"),
+            keyed("stream-spilled", 2, 302, 4, "d"),
+            end("stream-spilled", 2, 303, {"app.customers": 2}),
+        ]
+    )
+
+    assert box.applier.group.txn_open is True
+    assert box.applier.fenced_spilled_events == 0
+    assert box.applier.fenced_units == 1
+    assert box.applier.resnapshot_discarded_events == 2
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.spill_events") == 2
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 0
+
+    box.feed([snap("customers", 200, ident=3, marker="last")])
+    box.commit()
+    assert box.applier.snapshot_completed is True
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 1
+
+
+def test_resnapshot_drops_empty_overlap_without_entering_streaming(lab):
+    """An empty BEGIN/END overlap has no destination boundary at all."""
+    box = lab(resnapshot=True, snapshot_chunk_events=1)
+    _prepare_not_ready_snapshot_boundary(box)
+
+    box.feed([begin("empty-overlap", 300), end("empty-overlap", 0, 301, {})])
+
+    assert box.applier.fenced_units == 1
+    assert box.applier.resnapshot_discarded_events == 0
+    assert box.applier.snapshot_completion.state == "completion_notified"
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 0
+
+    box.feed([snap("customers", 200, ident=2, marker="last")])
+    box.commit()
+
+    assert box.applier.snapshot_completed is True
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 1
+
+
+@pytest.mark.parametrize("anchor", ["pre_commit", "post_commit_pre_ack"])
+def test_fault_anchors_have_no_path_for_a_discarded_overlap(lab, monkeypatch, anchor):
+    """Discard-only overlap does not arm destination commit fault anchors."""
+    from cdc_flight import faults
+
+    box = lab(resnapshot=True, snapshot_chunk_events=1)
+    _prepare_not_ready_snapshot_boundary(box)
+    monkeypatch.setenv("CDC_FAULT_INJECT", f"{anchor}:1:raise")
+    faults.refresh()
+
+    box.feed(_streaming_transaction())
+
+    assert box.committer.marked == 0
+    assert box.committer.batches == 0
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.spill_events") == 0
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 0
+    assert box.applier.snapshot_completion.state == "completion_notified"
+
+
+def _complete_empty_snapshot(box):
+    completion = SnapshotCompletion.full_snapshot({"app.customers"})
+    completion.observe_notification("STARTED", {})
+    completion.observe_notification(
+        "TABLE_SCAN_COMPLETED",
+        {
+            "scanned_collection": "app.customers",
+            "status": "SUCCEEDED",
+            "total_rows_scanned": "0",
+        },
+    )
+    completion.observe_notification("COMPLETED", {})
+    box.applier.snapshot_completion = completion
+
+
+def _snapshot_boundary(lsn: int = 100) -> PendingRecord:
+    return PendingRecord(
+        raw=None,
+        kind=KIND_SNAPSHOT_BOUNDARY,
+        topic="cdcflight.cdc_flight_snapshot_notifications",
+        nbytes=0,
+        lsn=lsn,
+        source_partition={"server": "cdcflight"},
+        source_offset={"lsn": lsn, "lsn_proc": lsn, "ts_usec": lsn * 1000},
+    )
+
+
+def _add_snapshot_boundary(box, lsn: int = 100) -> None:
+    for unit in box.applier.assembler.feed_snapshot_boundary(_snapshot_boundary(lsn)):
+        box.applier._add_unit(unit)
+
+
+def _streaming_transaction():
+    return [
+        begin("stream-1", 300),
+        data(
+            "stream-1",
+            1,
+            301,
+            key={"id": 2},
+            after={"id": 2, "name": "c"},
+        ),
+        end("stream-1", 1, 302, {"app.customers": 1}),
+    ]
+
+
+def _prepare_not_ready_snapshot_boundary(box, *, declared: int = 2) -> None:
+    box.applier.snapshot_completion = SnapshotCompletion.full_snapshot({"app.customers"})
+    box.applier.snapshot_completion.observe_notification("STARTED", {})
+    box.feed([snap("customers", 100, ident=1, marker="true")])
+    box.applier._handle(
+        [
+            _SnapshotNotification(
+                "TABLE_SCAN_COMPLETED",
+                200,
+                {
+                    "scanned_collection": "app.customers",
+                    "status": "SUCCEEDED",
+                    "total_rows_scanned": str(declared),
+                },
+            ),
+            _SnapshotNotification("COMPLETED", 201),
+        ],
+        box.committer,
+    )
+
+
+def test_boundary_only_group_is_classified_as_snapshot_phase(lab):
+    box = lab()
+    _complete_empty_snapshot(box)
+
+    _add_snapshot_boundary(box)
+
+    assert len(box.applier.group.units) == 1
+    assert box.applier.group.is_snapshot is True
+
+
+def test_empty_group_cannot_admit_streaming_before_snapshot_completed(lab):
+    box = lab(full_snapshot=True)
+
+    with pytest.raises(SnapshotObservationError, match="streaming"):
+        box.run(_streaming_transaction())
+
+    assert box.applier.commit_groups == 0
+    assert box.applier.resume_point.last_lsn == 0
+    assert box.applier.snapshot_completion.state == "callbacks_started"
+    assert box.applier.group.units == []
+
+
+def test_boundary_and_first_streaming_unit_are_committed_separately(lab):
+    box = lab()
+    _complete_empty_snapshot(box)
+    _add_snapshot_boundary(box)
+
+    box.feed(_streaming_transaction())
+
+    assert box.applier.commit_groups == 1
+    assert [unit.kind for unit in box.applier.group.units] == ["txn"]
+    assert box.applier.snapshot_completion.state == "streaming"
+    assert box.applier.resume_point.last_lsn == 100
+
+    box.commit()
+    assert box.applier.commit_groups == 2
+    assert box.applier.resume_point.last_lsn == 302
+
+
+def test_streaming_refusal_precedes_commit_of_open_snapshot_group(lab):
+    box = lab(full_snapshot=True, snapshot_chunk_events=1)
+
+    box.feed([snap("customers", 100, ident=1, marker="true")])
+    assert [unit.kind for unit in box.applier.group.units] == ["snapshot_chunk"]
+
+    with pytest.raises(SnapshotObservationError, match="streaming"):
+        box.feed(_streaming_transaction())
+
+    assert box.applier.commit_groups == 0
+    assert box.applier.resume_point.last_lsn == 0
+    assert box.committer.marked == 0
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 0
+    assert [unit.kind for unit in box.applier.group.units] == ["snapshot_chunk"]
+
+
+def test_resnapshot_fences_streaming_unit_before_empty_group_admission(lab):
+    """A throwaway-slot transaction is discarded even before snapshot rows exist."""
+    box = lab(full_snapshot=True, resnapshot=True)
+
+    box.run(_streaming_transaction())
+
+    assert box.applier.commit_groups == 0
+    assert box.applier.resume_point.last_lsn == 0
+    assert box.applier.fenced_units == 1
+    assert box.applier.resnapshot_discarded_events == 1
+    assert box.applier.snapshot_completion.state == "callbacks_started"
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 0
+
+
+def test_resnapshot_fences_streaming_unit_after_open_snapshot_group(lab):
+    """A fenced overlap is dropped and does not enter live streaming."""
+    box = lab(full_snapshot=True, resnapshot=True)
+
+    box.feed([snap("customers", 100, ident=1, marker="true")])
+    box.feed(_streaming_transaction())
+
+    assert box.applier.commit_groups == 0
+    assert box.applier.resume_point.last_lsn == 0
+    assert [unit.kind for unit in box.applier.group.units] == ["snapshot_chunk"]
+    assert box.applier.snapshot_completion.state == "callbacks_started"
+
+    box.commit()
+    assert box.applier.commit_groups == 1
+    assert box.applier.resume_point.last_lsn == 100
+    assert box.applier.snapshot_completion.state == "callbacks_started"
+
+
+@pytest.mark.parametrize("trigger_kind", ["size", "age"])
+def test_resnapshot_overlap_during_age_and_size_trigger_stays_fenced(
+    lab, trigger_kind
+):
+    """A pending soft close cannot turn the overlap into live streaming."""
+    if trigger_kind == "size":
+        box = lab(
+            full_snapshot=True,
+            resnapshot=True,
+            commit_max_events=1,
+            commit_max_age=60.0,
+            snapshot_chunk_events=1,
+        )
+    else:
+        box = lab(
+            full_snapshot=True,
+            resnapshot=True,
+            commit_max_events=1000,
+            commit_max_age=1.0,
+            snapshot_chunk_events=1,
+        )
+    box.feed([snap("customers", 100, ident=1, marker="true")])
+    if trigger_kind == "size":
+        assert box.applier.group.events >= box.config.commit_max_events
+    else:
+        box.applier.group.opened_at -= 2.0
+        assert box.applier._soft_trigger_hit() is True
+    # This is the timer's exact request flag; the overlap is delivered before the
+    # poll thread gets to honor it, which is the composition under test.
+    box.applier.group.close_requested = True
+
+    box.feed(_streaming_transaction())
+
+    assert box.applier.fenced_units == 1
+    assert box.applier.resnapshot_discarded_events == 1
+    assert box.applier.snapshot_completion.state == "callbacks_started"
+    assert box.applier.group.units[0].fenced is False
+    box.commit()
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 1
 
 
 class _RecordingVerifier:
@@ -212,6 +845,7 @@ def test_two_pipelines_on_one_destination_do_not_contend_for_commit_ids(tmp_path
             config=ApplierConfig(verify_offset_file=False),
             lease=lease,
             runner_id=f"{name}-runner",
+            completion=SnapshotCompletion.streaming_only(),
         )
         applier._committer = type(
             "C", (), {"markProcessed": lambda s, r: None, "markBatchFinished": lambda s: None}

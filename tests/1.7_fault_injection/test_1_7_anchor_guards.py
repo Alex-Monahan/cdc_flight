@@ -27,6 +27,7 @@ import pytest
 from applier_lab import DATASET, Lab, begin, end, keyed, snap
 
 from cdc_flight import faults
+from cdc_flight.snapshot_completion import SnapshotCompletion
 
 
 @pytest.fixture(autouse=True)
@@ -171,6 +172,10 @@ def test_the_swap_anchor_fires_between_the_drop_and_the_rename(tmp_path, monkeyp
         # A live table with rows in it.
         lab.run([begin("t1", 100), keyed("t1", 1, 100, 1, "original"), end("t1", 1, 101, {"app.customers": 1})])
         assert lab.rows(lab.target("customers"), "name") == [("original",)]
+
+        completion = SnapshotCompletion.full_snapshot({"app.customers"})
+        completion.observe_notification("STARTED", {})
+        lab.applier.snapshot_completion = completion
 
         monkeypatch.setenv(faults.ENV_VAR, "swap:1:raise")
         faults.refresh()

@@ -26,7 +26,7 @@ resume point in the destination transaction — but dlt remains as a *library*
                   ┌──────────────────────────────────────────── one Python process ──┐
  PostgreSQL 18    │                                                                  │
  (local cluster,  │  JVM (JPype)                       Python                         │
-  :15432,         │  ┌────────────────────┐  full      ┌──────────────────────┐       │
+  :CDC_TEST_PGPORT│  ┌────────────────────┐  full      ┌──────────────────────┐       │
   wal_level=      │  │ Debezium 3.6       │  envelope  │ TransactionAssembler │       │
   logical)        │  │ PostgresConnector  ├───────────▶│   -> whole units     │       │
     │  WAL        │  │ plugin=pgoutput    │  + BEGIN/  └──────────┬───────────┘       │
@@ -49,7 +49,7 @@ inside the Python process via JPype; Postgres is a project-local Homebrew cluste
 
 | Component | Version used | Notes |
 |---|---|---|
-| PostgreSQL | **18.1** (Homebrew `postgresql@18`) | latest GA major; project-local cluster on **:15432** |
+| PostgreSQL | **18.1** (Homebrew `postgresql@18`) | latest GA major; project-local cluster on **`CDC_TEST_PGPORT`** (default **:15432**) |
 | Java (JDK) | **OpenJDK 23.0.2** (Homebrew `openjdk`) | pydbzengine needs JDK **17+** on `PATH` |
 | Debezium | **3.6.0.Final** | bundled inside `pydbzengine` 3.6.0.0 |
 | pydbzengine | **3.6.0.0** | installed from GitHub (not on PyPI any more) |
@@ -62,16 +62,17 @@ brew install postgresql@18 openjdk
 brew install uv           # if not already installed
 ```
 
-The project-local cluster lives in `./.pgdata` and **never touches** a Homebrew
-`postgresql@N` service you may already run on :5432.
+The project-local cluster lives in `CDC_TEST_PGDATA` and **never touches** a Homebrew
+`postgresql@N` service you may already run on :5432. Its default is `./.pgdata` at
+port 15432 and `./.pgdata_<port>` for another test port.
 
 ## Quick start
 
 ```bash
 make install       # uv venv + editable install (pulls the ~340 MB pydbzengine repo once)
-make up            # initdb (first time) + start Postgres on :15432, create cdc_source
+make up            # initdb (first time) + start Postgres on CDC_TEST_PGPORT, create cdc_source
 make seed          # apply sql/01_schema.sql and sql/02_seed.sql
-make pipeline      # Debezium snapshot + stream → ./cdc_flight.duckdb
+make pipeline      # Debezium snapshot + stream → ./.cdc_instances/pg15432/cdc_flight.duckdb
 make changes       # generate inserts/updates/deletes in Postgres
 make pipeline      # run again → the new change events land in DuckDB
 make query         # show row counts + a sample of what landed
@@ -86,17 +87,41 @@ make reset
 
 ### What each step actually does
 
-* **`make up`** → `scripts/pg.sh start`. First run does `initdb` into `./.pgdata` and appends
-  `wal_level=logical`, `max_replication_slots=20`, `max_wal_senders=20`, `port=15432`,
-  `unix_socket_directories=<pgdata>` to `postgresql.conf`. Then `pg_ctl start` and
-  `createdb cdc_source`.
+* **`make up`** → `scripts/pg.sh start`. First run does `initdb` into the disposable
+  derived `CDC_TEST_PGDATA` test cluster and configures `wal_level=logical`, replication capacities
+  and test-only durability settings only after creating a disposable-cluster sentinel.
+  A legacy canonical test directory can be recreated once with
+  `CDC_TEST_RECREATE_UNMARKED_DISPOSABLE=1 make pg-reset`; non-derived data paths
+  are always refused.
+  `28/28/4` (slots/senders/logical workers), `port=CDC_TEST_PGPORT`, and
+  `unix_socket_directories=CDC_TEST_PGSOCKET`. A sentinel-gated test-only include disables `fsync`,
+  `synchronous_commit`, and `full_page_writes` **only in this disposable cluster**;
+  never copy those durability settings to production or a durable development database.
+  Then it runs `pg_ctl start` and creates `cdc_source`.
 * **`make seed`** → `sql/01_schema.sql` builds schema `app` (6 tables: PK tables, a **no-PK**
   table with `REPLICA IDENTITY FULL`, a **TOAST**-heavy `documents` table, a `wide_types`
   table covering ~34 Postgres types, and a **partitioned** `audit_log`) and creates
   `PUBLICATION cdc_flight_pub`. `sql/02_seed.sql` inserts deterministic starting rows.
-* **`make pipeline`** → `cdc-flight`. Builds Debezium properties (see
+* **`make pipeline`** → `cdc-flight`. Its state, dlt pipeline metadata, and DuckDB
+  file live under `.cdc_instances/<instance>/`. `run` provisions a private,
+  sentinel-marked root only when the instance is absent, atomically publishes it without
+  replacement, and reopens that exact owned root on every later invocation. `prepare-state`
+  and a failed child therefore leave a persistent pipeline that can be retried; an
+  unmarked existing directory is never adopted. The retained project lock is inherited
+  by the child and lasts through its mutation lifetime, so all repository runtime writers
+  serialize under one cooperative-writer authority even if the wrapper dies. The staged
+  root's fd and identity are retained inside that creation critical section. `make
+  clean-state` records an in-root `quarantining` state, revalidates the tree, and removes
+  entries only relative to retained no-follow descriptors. Its terminal state is a
+  parent-held record bound to the instance device/inode, so interruption after the final
+  in-root marker is removed is recoverable by either prepare or clean. Binding checks are
+  fail-closed, but the guarantee is intentionally scoped to writers that honor the
+  retained lock: ordinary POSIX descriptors cannot prove containment against an
+  out-of-band same-user rename between a check and a syscall. The helper refuses an
+  observed symlink, unowned root, detached runtime parent, missing exact sentinel, or
+  the removed `CDC_INSTANCE_RUNTIME_ROOT` override. It builds Debezium properties (see
   `src/cdc_flight/debezium_props.py`), starts the embedded engine on a background thread,
-  and loads every batch through `dlt` into `cdc_flight.duckdb`, dataset `cdc_raw`.
+  and loads every batch through `dlt` into the instance DuckDB file, dataset `cdc_raw`.
   The run is **bounded**: it stops once the stream has been quiet for `--idle-seconds`
   (default 8) or after `--max-seconds` (default 90) — the shape a scheduled Flight needs.
 * **`make changes`** → `cdc-datagen changes`. One deterministic wave of ~25 DML statements
@@ -187,21 +212,37 @@ Policy: `CDC_TRUNCATE_MODE` and `CDC_DROP_MODE`, each `replicate` (default) | `l
 ## Testing
 
 ```bash
-make test        # default suite, local only (Postgres + DuckDB), no cloud, no slow tests
-make test-md     # MotherDuck smoke test only        (marker: motherduck)
-make test-slow   # slow fault injection only         (marker: slow)
-make test-all    # everything
+make test         # fast default lane: 12 xdist workers, local only
+make test-serial  # same tests and selector, serial debugging escape hatch
+make test-md      # MotherDuck smoke test only        (marker: motherduck)
+make test-slow    # slow fault injection only         (marker: slow)
+make test-all     # everything
 ```
 
-`pytest` is configured with `--durations=20`, so every run prints a timing report.
-MotherDuck tests carry the `motherduck` marker and long fault-injection tests carry
-`slow`; both are deselected by `make test`.
+`make test` uses pytest-xdist with `--dist=loadscope`, keeping module-scoped CDC
+scenarios together while isolating every worker's Postgres database/template,
+replication slots, state directory, and DuckDB path. Set `CDC_TEST_PGPORT` for an
+independent physical cluster; the data, socket, and log paths follow it. The optional
+`CDC_TEST_INSTANCE_ID` changes logical database/slot names but cannot split physical
+ownership. Override the host-tuned default
+with `PYTEST_WORKERS=N make test`; values above 12 also require increasing the disposable
+cluster's replication capacities. MotherDuck tests carry the `motherduck` marker and
+long fault-injection tests carry `slow`; both are deselected by `make test` and
+`make test-serial`. Every lane prints its 20 slowest durations.
+
+The controller disables crashed-worker replacement, sweeps stale instance-owned
+databases and slots before workers start, and requires capacity for two slots per
+worker (base plus re-snapshot) with four additional slots of headroom.
 
 Measured on an M-series Mac. Only executed runs are reported here; see
 `RUBRIC_STATUS.md` for the per-item evidence.
 
 | suite | result | wall clock | measured |
 |---|---|---|---|
+| `make test` on 15432 (12 workers) | **660 passed** | **102.75 s** | 2026-08-01, round-2 current-HEAD standalone acceptance |
+| `make test` on 15432 (12 workers) | **660 passed** | **133.36 s** | 2026-08-01, round-2 current-HEAD concurrent acceptance |
+| `make test` on 15436 (12 workers) | **660 passed** | **130.68 s** | 2026-08-01, concurrent with 15432 |
+| `make test-serial` | **660 passed, 130 deselected** | **549.87 s** (9:09) | 2026-08-01, round-2 current-HEAD baseline |
 | `make test` (local only) | **562 passed, 0 xfail** | **550.0 s** (9:10) | 2026-08-01, after the round-5 fixes |
 | `make test-slow` | **95 passed** | **1 320.7 s** (22:00) | 2026-08-01, after the round-5 fixes |
 | `make test` (local only) | 560 passed, 0 xfail | 548.9 s (9:08) | 2026-07-31, after the round-4 fixes |
@@ -228,15 +269,12 @@ Measured on an M-series Mac. Only executed runs are reported here; see
 | `make test-slow` | 9 passed | 179 s (2:58) | 2026-07-31, after the 1.1-1.3 review round |
 | `make test-md` | 12 passed | 155 s (2:34) | 2026-07-31, after the 1.1-1.3 review round |
 
-The default suite is at **9:10 of a 10-minute budget** with **119 more tests than the
-1.6-1.8 round** (526.0 s then, 550.0 s now). Most of the 1.9 rounds' 110 new default tests
-cost about a second in total, because they drive the shipped code in-process — the state
-machines against a DuckDB file in a tmp dir, the recovery anchors against an injectable
-slot drop, the hard-death cuts against a child process that opens the same file. The
-sixteen seconds that did appear are the two-thread `COMMIT_ACK` barrier probes and the real
-catalog-quiescence test, which are wall-clock by construction: they exist to prove a
-timing property, and a timing property cannot be proved instantly. The expensive
-end-to-end pairing for each item is in `-m slow`, now 95 tests in 22:00.
+The default lane is now about **1:43** on the measured host, versus **9:09** for the same
+660 selected tests in serial. Most state-machine tests are inexpensive; the remaining
+wall time is dominated by correctness-sensitive JVM startup, crash/restart, fault, and
+snapshot scenarios. Parallelism changes only orchestration and isolation—the selector,
+assertions, and scenario logic are identical to `make test-serial`. The expensive
+end-to-end pairing for each item remains in `-m slow`.
 
 `make test-slow` is 18:18 for 83 tests (was 17:45 for 78): the five new ones are the
 end-to-end pairing for the recovery anchors — a real `cdc-flight` process killed at
@@ -314,11 +352,16 @@ scenarios*, not by running fewer assertions: the rubric gap suites build their s
 once per module (or, for `crash_replay`, once per session) and then interrogate it with
 many cheap tests.
 
-**One session at a time.** Every sandbox has its own slot, offsets and DuckDB file, but
-they all share the `app` schema and publication on :15432, and reseeding drops and
-recreates both. Two concurrent `make test` runs used to corrupt each other - that is what
-produced the 1.0 review's `assert 110 == 0`. A session-wide `flock` on
-`.pytest-source.lock` now serialises whole sessions; a second run waits and says so.
+**Worker isolation.** Each xdist worker clones a private database from its own template
+and uses private slots, offsets, state, and DuckDB files. `PostgresTestInstance` hashes
+the canonical data directory, host, and port into one controller-held full-run lock, so
+two logical IDs that select the same physical cluster still serialize. Free-form lock
+path and directory overrides are ignored: both the canonical lock directory and hashed
+filenames derive from the physical cluster identity. A second hashed setup lock
+serializes template provisioning while workers execute independently. A crashed controller releases
+ownership through the kernel; stale metadata is replaced only after the next controller
+acquires that kernel lock. Worker database/template and slot prefixes include the
+logical instance id, so independent ports do not collide.
 
 ### Test layout and conventions
 
@@ -453,7 +496,8 @@ the 40-item Postgres-CDC decision matrix, with the evidence for each score.
 **On this branch: 2.05 / 5, five items at 5 (1.1, 1.2, 1.3, 1.4, 7.1) and 1.5 at 4.**
 
 The evidence comes from [`probes/`](probes/) — small, reproducible experiments
-(`uv run python probes/p01_dml_edge_cases.py`, output in `probes/.out/`). They
+(`uv run python probes/p01_dml_edge_cases.py`, output in
+`probes/.out/<instance>/`). They
 are *not* tests: several deliberately break the source schema, and each reseeds
 it first and uses its own replication slot, offset file and DuckDB file.
 
