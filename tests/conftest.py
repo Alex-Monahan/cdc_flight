@@ -2,28 +2,23 @@
 
 Everything runs natively: a project-local Postgres cluster driven by
 `scripts/pg.sh`, the Debezium embedded engine inside a JVM, and DuckDB on disk.
-No Docker, no Kafka, no testcontainers.  The Postgres instance namespace is
-derived from ``CDC_TEST_PGPORT`` (or ``CDC_TEST_INSTANCE_ID``) so independent
-sessions do not share database, lock, or slot names.
+No Docker, no Kafka, no testcontainers. Physical-cluster ownership is derived
+from the canonical data directory, host, and port; the logical instance ID only
+names databases, slots, and other non-authority resources.
 """
 
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import os
 import re
 import shutil
-import socket
 import subprocess
 import sys
-import time
-import uuid
 from collections.abc import Iterator
-from dataclasses import replace
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any
 
 # Must precede DuckDB/PyArrow imports. PyArrow 25.0.0's default mimalloc backend can
 # SIGSEGV on the JPype JVM callback thread used by the live recovery path (ADR A14/A66).
@@ -32,80 +27,9 @@ os.environ.setdefault("ARROW_DEFAULT_MEMORY_POOL", "system")
 import duckdb
 import psycopg
 import pytest
-from psycopg import sql
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-PG_SH = PROJECT_DIR / "scripts" / "pg.sh"
 VENV_BIN = PROJECT_DIR / ".venv" / "bin"
-TEST_PGPORT = int(os.environ.get("CDC_TEST_PGPORT", "15432"))
-TEST_PGDATABASE = os.environ.get("CDC_TEST_PGDATABASE", "cdc_source")
-TEST_PGDATA = Path(
-    os.environ.get(
-        "CDC_TEST_PGDATA",
-        str(
-            PROJECT_DIR
-            / (".pgdata" if TEST_PGPORT == 15432 else f".pgdata_{TEST_PGPORT}")
-        ),
-    )
-)
-TEST_PGSOCKET = Path(os.environ.get("CDC_TEST_PGSOCKET", str(TEST_PGDATA)))
-TEST_PGLOG = Path(
-    os.environ.get("CDC_TEST_PGLOG", str(TEST_PGDATA / "server.log"))
-)
-TEST_CLUSTER_SENTINEL = TEST_PGDATA / ".cdc_flight_disposable_test_cluster"
-
-
-def _safe_instance_id(value: str) -> str:
-    return re.sub(r"[^a-z0-9_]+", "_", value.lower()).strip("_") or f"pg{TEST_PGPORT}"
-
-
-TEST_INSTANCE_ID = _safe_instance_id(
-    os.environ.get("CDC_TEST_INSTANCE_ID", f"pg{TEST_PGPORT}")
-)
-TEST_SLOT_PREFIX = _safe_instance_id(
-    os.environ.get("CDC_TEST_SLOT_PREFIX", f"test_slot_{TEST_INSTANCE_ID}_")
-)
-# Preserve a trailing separator when a caller supplies a prefix without one.
-if not TEST_SLOT_PREFIX.endswith("_"):
-    TEST_SLOT_PREFIX += "_"
-
-
-def _database_prefix(name: str, default: str) -> str:
-    prefix = re.sub(r"[^a-z0-9_]+", "_", os.environ.get(name, default).lower())
-    return prefix if prefix.endswith("_") else f"{prefix}_"
-
-
-TEMPLATE_DATABASE_PREFIX = _database_prefix(
-    "CDC_TEST_TEMPLATE_DATABASE_PREFIX",
-    f"cdc_flight_test_template_{TEST_INSTANCE_ID}_",
-)
-WORKER_DATABASE_PREFIX = _database_prefix(
-    "CDC_TEST_WORKER_DATABASE_PREFIX",
-    f"cdc_flight_test_{TEST_INSTANCE_ID}_",
-)
-TEST_LOCK_PATH = Path(
-    os.environ.get(
-        "CDC_TEST_LOCK_PATH",
-        str(PROJECT_DIR / f".pytest-source-{TEST_INSTANCE_ID}.lock"),
-    )
-)
-TEST_SETUP_LOCK_PATH = Path(
-    os.environ.get(
-        "CDC_TEST_SETUP_LOCK_PATH",
-        str(PROJECT_DIR / f".pytest-source-{TEST_INSTANCE_ID}-setup.lock"),
-    )
-)
-
-# Pin defaults used by SourceConfig in this pytest process before any fixture
-# constructs one.  In particular, an unrelated PGPORT in the parent shell must
-# not redirect a test run away from its selected CDC_TEST_PGPORT.
-os.environ.setdefault("CDC_TEST_PGPORT", str(TEST_PGPORT))
-os.environ.setdefault("CDC_TEST_PGDATA", str(TEST_PGDATA))
-os.environ.setdefault("CDC_TEST_PGSOCKET", str(TEST_PGSOCKET))
-os.environ.setdefault("CDC_TEST_PGLOG", str(TEST_PGLOG))
-os.environ.setdefault("CDC_TEST_PGDATABASE", TEST_PGDATABASE)
-os.environ.setdefault("CDC_TEST_INSTANCE_ID", TEST_INSTANCE_ID)
-os.environ.setdefault("CDC_TEST_SLOT_PREFIX", TEST_SLOT_PREFIX)
 SANDBOX_IDLE_SECONDS = 6
 
 #: Tables the pipeline replicates. Used to fingerprint the shared source so a
@@ -124,31 +48,41 @@ sys.path.insert(0, str(PROJECT_DIR / "src"))
 # which pytest imports with only their own directory on `sys.path`.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import postgres_test_instance
+
 from cdc_flight.config import DestinationConfig, ReplicationConfig, SourceConfig
 
+POSTGRES_TEST_INSTANCE = postgres_test_instance.INSTANCE
+PG_SH = POSTGRES_TEST_INSTANCE.pg_sh
+_enforce_no_worker_restarts = postgres_test_instance._enforce_no_worker_restarts
+pytest_configure = postgres_test_instance.pytest_configure
+pytest_sessionstart = postgres_test_instance.pytest_sessionstart
+pytest_unconfigure = postgres_test_instance.pytest_unconfigure
+exclusive_source = postgres_test_instance.exclusive_source
+postgres_cluster = postgres_test_instance.postgres_cluster
 
-# --------------------------------------------------------------------------- #
-# helpers
-# --------------------------------------------------------------------------- #
-def _pg(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-    env = {
-        **os.environ,
-        "CDC_TEST_PGPORT": str(TEST_PGPORT),
-        "CDC_TEST_PGDATA": str(TEST_PGDATA),
-        "CDC_TEST_PGSOCKET": str(TEST_PGSOCKET),
-        "CDC_TEST_PGLOG": str(TEST_PGLOG),
-        "PGPORT": str(TEST_PGPORT),
-        "CDC_TEST_PGDATABASE": TEST_PGDATABASE,
-        "PGDATABASE": TEST_PGDATABASE,
-    }
-    return subprocess.run(
-        [str(PG_SH), *args],
-        capture_output=True,
-        text=True,
-        check=check,
-        timeout=180,
-        env=env,
-    )
+TEST_PGPORT = POSTGRES_TEST_INSTANCE.port
+TEST_PGDATABASE = POSTGRES_TEST_INSTANCE.database
+TEST_PGDATA = POSTGRES_TEST_INSTANCE.data_dir
+TEST_PGSOCKET = POSTGRES_TEST_INSTANCE.socket_dir
+TEST_PGLOG = POSTGRES_TEST_INSTANCE.log_path
+TEST_CLUSTER_SENTINEL = POSTGRES_TEST_INSTANCE.sentinel
+TEST_INSTANCE_ID = POSTGRES_TEST_INSTANCE.instance_id
+TEST_SLOT_PREFIX = POSTGRES_TEST_INSTANCE.slot_prefix
+TEMPLATE_DATABASE_PREFIX = POSTGRES_TEST_INSTANCE.template_database_prefix
+WORKER_DATABASE_PREFIX = POSTGRES_TEST_INSTANCE.worker_database_prefix
+TEST_LOCK_PATH = POSTGRES_TEST_INSTANCE.run_lock_path
+TEST_SETUP_LOCK_PATH = POSTGRES_TEST_INSTANCE.setup_lock_path
+
+_pg = POSTGRES_TEST_INSTANCE.pg
+_acquire_test_run_lock = POSTGRES_TEST_INSTANCE.acquire_run_lock
+_required_replication_capacity = POSTGRES_TEST_INSTANCE.required_replication_capacity
+_isolated_source = POSTGRES_TEST_INSTANCE.isolated_source
+_require_disposable_cluster = POSTGRES_TEST_INSTANCE.require_disposable_cluster
+_owned_database_name = POSTGRES_TEST_INSTANCE.owns_database
+_reset_test_database = POSTGRES_TEST_INSTANCE.reset_test_database
+_source_environment = POSTGRES_TEST_INSTANCE.source_environment
+_drop_slot = POSTGRES_TEST_INSTANCE.drop_slot
 
 
 def _executable(name: str) -> str:
@@ -169,375 +103,6 @@ def _reset_fault_spec():
     yield
     faults.refresh()
     faults.reset_arrivals()
-
-
-# --------------------------------------------------------------------------- #
-# session-scoped environment
-# --------------------------------------------------------------------------- #
-_RUN_LOCK_HANDLE: TextIO | None = None
-
-
-def _acquire_test_run_lock(
-    lock_path: Path,
-    *,
-    run_uid: str,
-    wait_seconds: float = 1800,
-    poll_seconds: float = 1,
-) -> TextIO:
-    """Acquire the instance's test-run ownership lock.
-
-    The kernel lock is the authority. File contents are diagnostic metadata only:
-    after a crash the OS releases the lock, and the next owner may replace stale
-    metadata immediately. Conversely, metadata age never permits takeover while
-    another process still holds the lock.
-    """
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = lock_path.open("a+")
-    deadline = time.monotonic() + wait_seconds
-    announced = False
-    while True:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            break
-        except BlockingIOError:
-            handle.seek(0)
-            owner = handle.read().strip() or "unknown owner"
-            if not announced:
-                print(
-                    f"\nwaiting for test-run owner of {TEST_INSTANCE_ID} "
-                    f"at {lock_path}: {owner}"
-                )
-                announced = True
-            if time.monotonic() >= deadline:
-                handle.close()
-                raise TimeoutError(
-                    f"timed out waiting for test-run lock {lock_path}: {owner}"
-                ) from None
-            time.sleep(poll_seconds)
-
-    metadata = {
-        "hostname": socket.gethostname(),
-        "instance_id": TEST_INSTANCE_ID,
-        "pid": os.getpid(),
-        "run_uid": run_uid,
-        "started_at": time.time(),
-    }
-    handle.seek(0)
-    handle.truncate()
-    json.dump(metadata, handle, sort_keys=True)
-    handle.write("\n")
-    handle.flush()
-    os.fsync(handle.fileno())
-    return handle
-
-
-def _enforce_no_worker_restarts(config) -> None:
-    workers = getattr(config.option, "numprocesses", None)
-    if not workers:
-        return
-    restarts = getattr(config.option, "maxworkerrestart", None)
-    if restarts not in (None, 0, "0"):
-        raise pytest.UsageError(
-            "the disposable test lane requires --max-worker-restart=0; "
-            "replacement workers cannot inherit crashed-worker cleanup"
-        )
-    config.option.maxworkerrestart = 0
-
-
-@pytest.hookimpl(tryfirst=True)
-def pytest_configure(config) -> None:
-    """Let the controller own the selected Postgres instance for the whole run."""
-    if hasattr(config, "workerinput"):
-        return
-    _enforce_no_worker_restarts(config)
-    global _RUN_LOCK_HANDLE
-    if _RUN_LOCK_HANDLE is not None:
-        return
-    run_uid = config.getoption("testrunuid", default=None) or uuid.uuid4().hex
-    try:
-        _RUN_LOCK_HANDLE = _acquire_test_run_lock(TEST_LOCK_PATH, run_uid=run_uid)
-    except TimeoutError as exc:
-        raise pytest.UsageError(str(exc)) from exc
-
-
-def _worker_count(config) -> int:
-    workers = getattr(config.option, "numprocesses", None)
-    if isinstance(workers, int):
-        return max(workers, 1)
-    if isinstance(workers, str) and workers.isdigit():
-        return max(int(workers), 1)
-    if workers in ("auto", "logical"):
-        return os.cpu_count() or 1
-    return 1
-
-
-def _required_replication_capacity(worker_count: int) -> int:
-    """One retained base plus one active re-snapshot slot per worker, plus four."""
-    return worker_count * 2 + 4
-
-
-@pytest.hookimpl(tryfirst=True)
-def pytest_sessionstart(session) -> None:
-    """Prepare and clean the instance before xdist starts any worker."""
-    config = session.config
-    if hasattr(config, "workerinput"):
-        return
-    try:
-        _pg("start")
-        source = _isolated_source(TEST_PGDATABASE)
-        _require_disposable_cluster(source)
-        _sweep_stale_instance_artifacts(source)
-        _assert_replication_budget(source, _worker_count(config))
-        _pg("seed")
-    except Exception as exc:
-        raise pytest.UsageError(f"test-cluster startup refused: {exc}") from exc
-
-
-def pytest_unconfigure(config) -> None:
-    """Release ownership after every worker and finalizer has stopped."""
-    if hasattr(config, "workerinput"):
-        return
-    global _RUN_LOCK_HANDLE
-    if _RUN_LOCK_HANDLE is None:
-        return
-    fcntl.flock(_RUN_LOCK_HANDLE, fcntl.LOCK_UN)
-    _RUN_LOCK_HANDLE.close()
-    _RUN_LOCK_HANDLE = None
-
-
-@pytest.fixture(scope="session")
-def exclusive_source() -> Iterator[Path]:
-    """Provide the worker-setup lock nested inside controller run ownership."""
-    lock_path = TEST_SETUP_LOCK_PATH
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path.touch(exist_ok=True)
-    yield lock_path
-
-
-@contextlib.contextmanager
-def _cluster_setup_lock(lock_path: Path) -> Iterator[None]:
-    """Serialize only cluster/template setup across xdist workers."""
-    with lock_path.open("r+") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
-
-
-def _worker_database_name() -> str:
-    worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
-    worker = re.sub(r"[^a-z0-9_]", "_", worker.lower())
-    return f"{WORKER_DATABASE_PREFIX}{worker}"[:63]
-
-
-def _template_database_name() -> str:
-    worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
-    worker = re.sub(r"[^a-z0-9_]", "_", worker.lower())
-    return f"{TEMPLATE_DATABASE_PREFIX}{worker}"[:63]
-
-
-def _isolated_source(dbname: str) -> SourceConfig:
-    source = SourceConfig(dbname=dbname)
-    if source.host != "127.0.0.1":
-        pytest.fail(
-            f"test isolation refused non-local Postgres host {source.host!r}; "
-            "expected '127.0.0.1'"
-        )
-    if source.port != TEST_PGPORT:
-        pytest.fail(
-            f"test isolation refused to use Postgres port {source.port}; "
-            f"expected {TEST_PGPORT}"
-        )
-    return source
-
-
-_VERIFIED_CLUSTER_IDENTITY: tuple[str, int, Path] | None = None
-
-
-def _require_disposable_cluster(source: SourceConfig) -> None:
-    """Prove destructive test operations target this provisioned test cluster."""
-    global _VERIFIED_CLUSTER_IDENTITY
-    expected = (source.host, source.port, TEST_PGDATA.resolve())
-    if expected == _VERIFIED_CLUSTER_IDENTITY:
-        return
-    if source.host != "127.0.0.1":
-        raise RuntimeError(f"refusing destructive operation on host {source.host!r}")
-    if not TEST_CLUSTER_SENTINEL.is_file():
-        raise RuntimeError(
-            f"refusing destructive operation: missing {TEST_CLUSTER_SENTINEL}"
-        )
-    admin = replace(source, dbname="postgres")
-    with psycopg.connect(admin.dsn, autocommit=True, connect_timeout=10) as conn:
-        data_directory = Path(conn.execute("SHOW data_directory").fetchone()[0]).resolve()
-        server_port = int(conn.execute("SHOW port").fetchone()[0])
-    if data_directory != expected[2] or server_port != TEST_PGPORT:
-        raise RuntimeError(
-            "refusing destructive operation on unexpected cluster: "
-            f"data_directory={data_directory}, port={server_port}; "
-            f"expected {expected[2]}, port={TEST_PGPORT}"
-        )
-    _VERIFIED_CLUSTER_IDENTITY = expected
-
-
-def _drop_database(admin: SourceConfig, dbname: str) -> None:
-    """Terminate this disposable database's backends, slots, and database."""
-    _require_disposable_cluster(admin)
-    with psycopg.connect(admin.dsn, autocommit=True) as conn:
-        conn.execute(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-            "WHERE datname = %s AND pid <> pg_backend_pid()",
-            (dbname,),
-        )
-        slots = conn.execute(
-            "SELECT r.slot_name FROM pg_replication_slots AS r "
-            "WHERE r.database = %s",
-            (dbname,),
-        ).fetchall()
-        for (slot,) in slots:
-            with contextlib.suppress(Exception):
-                conn.execute("SELECT pg_drop_replication_slot(%s)", (slot,))
-        conn.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(dbname)))
-
-
-def _owned_database_name(dbname: str) -> bool:
-    return dbname.startswith((WORKER_DATABASE_PREFIX, TEMPLATE_DATABASE_PREFIX))
-
-
-def _sweep_stale_instance_artifacts(source: SourceConfig) -> dict[str, list[str]]:
-    """Reap databases and slots from a crashed prior owner of this instance."""
-    _require_disposable_cluster(source)
-    admin = replace(source, dbname="postgres")
-    with psycopg.connect(admin.dsn, autocommit=True) as conn:
-        databases = sorted(
-            row[0]
-            for row in conn.execute(
-                "SELECT datname FROM pg_database "
-                "WHERE starts_with(datname, %s) OR starts_with(datname, %s)",
-                (WORKER_DATABASE_PREFIX, TEMPLATE_DATABASE_PREFIX),
-            ).fetchall()
-            if _owned_database_name(row[0])
-        )
-    for dbname in databases:
-        _drop_database(admin, dbname)
-
-    with psycopg.connect(admin.dsn, autocommit=True) as conn:
-        slots = conn.execute(
-            "SELECT slot_name, active_pid FROM pg_replication_slots "
-            "WHERE starts_with(slot_name, %s)",
-            (TEST_SLOT_PREFIX,),
-        ).fetchall()
-        for _slot_name, active_pid in slots:
-            if active_pid is not None:
-                conn.execute("SELECT pg_terminate_backend(%s)", (active_pid,))
-        for slot_name, _active_pid in slots:
-            conn.execute("SELECT pg_drop_replication_slot(%s)", (slot_name,))
-
-    swept = {"databases": databases, "slots": sorted(row[0] for row in slots)}
-    if databases or slots:
-        print(f"\nswept stale artifacts for {TEST_INSTANCE_ID}: {swept}")
-    return swept
-
-
-def _assert_replication_budget(source: SourceConfig, worker_count: int) -> None:
-    required = _required_replication_capacity(worker_count)
-    admin = replace(source, dbname="postgres")
-    with psycopg.connect(admin.dsn, autocommit=True) as conn:
-        slots = int(conn.execute("SHOW max_replication_slots").fetchone()[0])
-        senders = int(conn.execute("SHOW max_wal_senders").fetchone()[0])
-    if slots < required or senders < required:
-        raise RuntimeError(
-            "insufficient replication budget: "
-            f"workers={worker_count}, required={required}, "
-            f"max_replication_slots={slots}, max_wal_senders={senders}"
-        )
-
-
-def _create_database(admin: SourceConfig, dbname: str, template: str) -> None:
-    with psycopg.connect(admin.dsn, autocommit=True) as conn:
-        conn.execute(
-            sql.SQL("CREATE DATABASE {} TEMPLATE {}").format(
-                sql.Identifier(dbname), sql.Identifier(template)
-            )
-        )
-
-
-def _reset_test_database(source: SourceConfig) -> None:
-    admin = replace(source, dbname="postgres")
-    _drop_database(admin, source.dbname)
-    _create_database(admin, source.dbname, _template_database_name())
-
-
-def _source_environment(source: SourceConfig) -> dict[str, str]:
-    """Route every child process to this worker's isolated database and port."""
-    return {
-        **os.environ,
-        "PGHOST": source.host,
-        "PGPORT": str(source.port),
-        "CDC_TEST_PGPORT": str(source.port),
-        "PGUSER": source.user,
-        "PGPASSWORD": source.password,
-        "PGDATABASE": source.dbname,
-        "CDC_TEST_PGDATABASE": source.dbname,
-    }
-
-
-@pytest.fixture(scope="session")
-def postgres_cluster(exclusive_source: Path) -> Iterator[SourceConfig]:
-    """Start one cluster, then clone a private database for this pytest worker."""
-    if not PG_SH.exists():
-        pytest.skip("scripts/pg.sh missing")
-
-    source = _isolated_source(TEST_PGDATABASE)
-    admin = replace(source, dbname="postgres")
-    worker_source = replace(source, dbname=_worker_database_name())
-    with _cluster_setup_lock(exclusive_source):
-        template_database = _template_database_name()
-        _drop_database(admin, template_database)
-        _create_database(admin, template_database, source.dbname)
-        _drop_database(admin, worker_source.dbname)
-        _create_database(admin, worker_source.dbname, template_database)
-
-    _sweep_stale_test_slots(worker_source)
-    try:
-        yield worker_source
-    finally:
-        with contextlib.suppress(Exception):
-            _drop_database(admin, worker_source.dbname)
-
-
-def _sweep_stale_test_slots(source: SourceConfig) -> None:
-    """Drop replication slots left behind by earlier sessions (Opus MAJOR-2).
-
-    Every sandbox slot is named `t_<scenario>_<pid>` and dropped on cleanup, but a hard
-    crash - which several fault scenarios cause ON PURPOSE - leaves one behind, and so
-    does a `_rs` throwaway from an interrupted re-snapshot. A logical slot holds WAL for
-    ever and counts against `max_replication_slots`, so the leaks accumulate until the
-    suite fails with "all replication slots are in use" - which is exactly how this run
-    failed once while the fix was being written, and how two independent review sessions
-    degraded the shared cluster in a single day.
-
-    Safe to do unconditionally at worker start: the query is restricted to this
-    worker's database, and an ACTIVE slot is never touched.
-    """
-    try:
-        with psycopg.connect(source.dsn, autocommit=True, connect_timeout=10) as conn:
-            stale = [
-                row[0]
-                for row in conn.execute(
-                    "SELECT slot_name FROM pg_replication_slots "
-                    "WHERE NOT active AND database = %s "
-                    "AND starts_with(slot_name, %s)",
-                    (source.dbname, TEST_SLOT_PREFIX),
-                ).fetchall()
-            ]
-            for name in stale:
-                with contextlib.suppress(Exception):
-                    conn.execute("SELECT pg_drop_replication_slot(%s)", (name,))
-            if stale:
-                print(f"\nswept {len(stale)} stale replication slot(s): {sorted(stale)}")
-    except Exception as exc:  # pragma: no cover - hygiene must never fail a session
-        print(f"\ncould not sweep stale replication slots: {exc}")
 
 
 def source_fingerprint(source: SourceConfig) -> dict[str, int]:
@@ -603,18 +168,6 @@ def cdc_env(tmp_path: Path, postgres_cluster: SourceConfig) -> Iterator[dict[str
     yield env
     _drop_slot(postgres_cluster, slot)
     shutil.rmtree(tmp_path / "cdc_state", ignore_errors=True)
-
-
-def _drop_slot(source: SourceConfig, slot: str) -> None:
-    try:
-        with psycopg.connect(source.dsn, autocommit=True) as conn:
-            conn.execute(
-                "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
-                "WHERE slot_name = %s",
-                (slot,),
-            )
-    except Exception:
-        pass
 
 
 # --------------------------------------------------------------------------- #

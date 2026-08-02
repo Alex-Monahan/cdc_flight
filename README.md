@@ -208,9 +208,10 @@ make test-all     # everything
 
 `make test` uses pytest-xdist with `--dist=loadscope`, keeping module-scoped CDC
 scenarios together while isolating every worker's Postgres database/template,
-replication slots, state directory, and DuckDB path. Set `CDC_TEST_PGPORT` (and,
-if needed, `CDC_TEST_INSTANCE_ID`) for an independent cluster; the data, socket,
-log, lock, database, and slot namespaces follow it. Override the host-tuned default
+replication slots, state directory, and DuckDB path. Set `CDC_TEST_PGPORT` for an
+independent physical cluster; the data, socket, and log paths follow it. The optional
+`CDC_TEST_INSTANCE_ID` changes logical database/slot names but cannot split physical
+ownership. Override the host-tuned default
 with `PYTEST_WORKERS=N make test`; values above 12 also require increasing the disposable
 cluster's replication capacities. MotherDuck tests carry the `motherduck` marker and
 long fault-injection tests carry `slow`; both are deselected by `make test` and
@@ -338,13 +339,15 @@ once per module (or, for `crash_replay`, once per session) and then interrogate 
 many cheap tests.
 
 **Worker isolation.** Each xdist worker clones a private database from its own template
-and uses private slots, offsets, state, and DuckDB files. The per-instance
-`.pytest-source-<instance>.lock` is held by the pytest controller for the entire run,
-so two sessions cannot mutate the same instance. A separate instance-scoped setup lock
-serialises template provisioning while workers execute independently. A crashed
-controller releases ownership through the kernel; stale lock-file metadata is replaced
-only after the next controller acquires that kernel lock. Worker database/template and
-slot prefixes include the instance id, so independent ports do not collide.
+and uses private slots, offsets, state, and DuckDB files. `PostgresTestInstance` hashes
+the canonical data directory, host, and port into one controller-held full-run lock, so
+two logical IDs that select the same physical cluster still serialize. Free-form lock
+file overrides are ignored; `CDC_TEST_LOCK_DIR` may move the lock directory, while the
+hashed filenames remain derived. A second hashed setup lock serializes template
+provisioning while workers execute independently. A crashed controller releases
+ownership through the kernel; stale metadata is replaced only after the next controller
+acquires that kernel lock. Worker database/template and slot prefixes include the
+logical instance id, so independent ports do not collide.
 
 ### Test layout and conventions
 

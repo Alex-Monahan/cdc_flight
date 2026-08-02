@@ -6,20 +6,21 @@ import fcntl
 import json
 import os
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import conftest
 import pytest
+from postgres_test_instance import PostgresTestInstance
 
 
 def test_run_lock_takes_over_stale_metadata_after_kernel_release(tmp_path: Path):
     lock_path = tmp_path / "instance.lock"
     lock_path.write_text('{"pid": 999999, "run_uid": "crashed"}\n')
 
-    handle = conftest._acquire_test_run_lock(
-        lock_path, run_uid="replacement", wait_seconds=0
-    )
+    instance = replace(conftest.POSTGRES_TEST_INSTANCE, run_lock_path=lock_path)
+    handle = instance.acquire_run_lock(run_uid="replacement", wait_seconds=0)
     try:
         metadata = json.loads(lock_path.read_text())
         assert metadata["run_uid"] == "replacement"
@@ -35,9 +36,8 @@ def test_run_lock_never_takes_over_a_live_kernel_owner(tmp_path: Path):
     fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
     try:
         with pytest.raises(TimeoutError, match="timed out waiting"):
-            conftest._acquire_test_run_lock(
-                lock_path, run_uid="intruder", wait_seconds=0
-            )
+            instance = replace(conftest.POSTGRES_TEST_INSTANCE, run_lock_path=lock_path)
+            instance.acquire_run_lock(run_uid="intruder", wait_seconds=0)
     finally:
         fcntl.flock(owner, fcntl.LOCK_UN)
         owner.close()
@@ -45,8 +45,43 @@ def test_run_lock_never_takes_over_a_live_kernel_owner(tmp_path: Path):
 
 def test_run_and_setup_locks_are_distinct_and_instance_scoped():
     assert conftest.TEST_LOCK_PATH != conftest.TEST_SETUP_LOCK_PATH
-    assert conftest.TEST_INSTANCE_ID in conftest.TEST_LOCK_PATH.name
-    assert conftest.TEST_INSTANCE_ID in conftest.TEST_SETUP_LOCK_PATH.name
+    assert conftest.POSTGRES_TEST_INSTANCE.physical_key in conftest.TEST_LOCK_PATH.name
+    assert conftest.POSTGRES_TEST_INSTANCE.physical_key in conftest.TEST_SETUP_LOCK_PATH.name
+
+
+def test_two_logical_ids_on_one_physical_cluster_share_one_owner_lock(tmp_path: Path):
+    physical = {
+        "CDC_TEST_PGPORT": str(conftest.TEST_PGPORT),
+        "CDC_TEST_PGDATA": str(conftest.TEST_PGDATA),
+        "CDC_TEST_LOCK_DIR": str(tmp_path),
+        "PGHOST": "127.0.0.1",
+    }
+    owner_a = PostgresTestInstance.from_environ(
+        {
+            **physical,
+            "CDC_TEST_INSTANCE_ID": "owner_a",
+            "CDC_TEST_LOCK_PATH": str(tmp_path / "ignored-a.lock"),
+        }
+    )
+    owner_b = PostgresTestInstance.from_environ(
+        {
+            **physical,
+            "CDC_TEST_INSTANCE_ID": "owner_b",
+            "CDC_TEST_LOCK_PATH": str(tmp_path / "ignored-b.lock"),
+        }
+    )
+
+    assert owner_a.physical_identity == owner_b.physical_identity
+    assert owner_a.run_lock_path == owner_b.run_lock_path
+    assert owner_a.setup_lock_path == owner_b.setup_lock_path
+
+    handle = owner_a.acquire_run_lock(run_uid="owner-a", wait_seconds=0)
+    try:
+        with pytest.raises(TimeoutError, match="timed out waiting"):
+            owner_b.acquire_run_lock(run_uid="owner-b", wait_seconds=0)
+    finally:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
 
 
 def test_test_source_rejects_a_remote_pghost(monkeypatch):
@@ -75,18 +110,16 @@ def test_provisioner_refuses_a_non_derived_data_directory(tmp_path: Path):
     assert "refusing non-derived CDC_TEST_PGDATA" in proc.stderr
 
 
-def test_destructive_guard_requires_the_provisioner_sentinel(monkeypatch, tmp_path):
-    monkeypatch.setattr(conftest, "TEST_PGDATA", tmp_path)
-    monkeypatch.setattr(
-        conftest,
-        "TEST_CLUSTER_SENTINEL",
-        tmp_path / ".cdc_flight_disposable_test_cluster",
+def test_destructive_guard_requires_the_provisioner_sentinel(tmp_path):
+    instance = replace(
+        conftest.POSTGRES_TEST_INSTANCE,
+        data_dir=tmp_path,
+        sentinel=tmp_path / ".cdc_flight_disposable_test_cluster",
     )
-    monkeypatch.setattr(conftest, "_VERIFIED_CLUSTER_IDENTITY", None)
     source = conftest.SourceConfig(host="127.0.0.1", port=conftest.TEST_PGPORT)
 
     with pytest.raises(RuntimeError, match="missing"):
-        conftest._require_disposable_cluster(source)
+        instance.require_disposable_cluster(source)
 
 
 def test_replication_budget_covers_base_resnapshot_and_headroom():
