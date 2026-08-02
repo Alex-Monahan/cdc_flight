@@ -284,7 +284,9 @@ INTERRUPTION_MARKER = Machine(
         # consumed.
         (MARKER_ARMED, MARKER_CONSUMED),
         # Retirement is a declared transition too: the terminal marker instance and
-        # its sibling Debezium offset state are destroyed together on restart.
+        # its sibling Debezium offset state are destroyed together on restart or before
+        # preparing the next instance. `armed -> absent` and `armed -> armed` remain
+        # deliberately absent: preparation must refuse an undischarged obligation.
         (MARKER_CONSUMED, MARKER_ABSENT),
     ),
     terminal=(MARKER_CONSUMED,),

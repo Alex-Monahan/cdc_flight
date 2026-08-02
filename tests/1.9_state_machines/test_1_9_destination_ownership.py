@@ -572,6 +572,144 @@ def test_next_run_requeues_an_armed_resnapshot_and_can_complete_it(tmp_path):
     con.close()
 
 
+def test_prepare_refuses_to_erase_an_existing_armed_recovery(tmp_path):
+    """A new recovery instance cannot replace an undischarged obligation."""
+    state_dir = tmp_path / "state" / "resnapshot"
+    old_tables = [("app", "owed_old", "cdcflight_app_owed_old")]
+    resnapshot_recovery_mod.arm_interruption_marker(
+        state_dir, pipeline="old_pipeline", tables=old_tables
+    )
+    offsets = state_dir / "offsets.dat"
+    offsets.write_bytes(b"callback-owned offset state")
+    marker_before = resnapshot_recovery_mod.interruption_marker(state_dir).read_bytes()
+
+    with pytest.raises(EngineFailure, match="armed interrupted re-snapshot recovery"):
+        resnapshot_recovery_mod.InterruptionRecovery.prepare(
+            state_dir, pipeline=PIPELINE, tables=TABLES
+        )
+
+    assert (
+        resnapshot_recovery_mod.interruption_marker(state_dir).read_bytes()
+        == marker_before
+    )
+    assert offsets.read_bytes() == b"callback-owned offset state"
+    assert resnapshot_recovery_mod._read_interruption_marker(state_dir) == (
+        MARKER_ARMED,
+        {
+            "pipeline": "old_pipeline",
+            "state": MARKER_ARMED,
+            "tables": [["app", "owed_old", "cdcflight_app_owed_old"]],
+        },
+    )
+
+
+def test_prepare_cannot_reach_the_post_cleanup_crash_cut_from_armed(
+    monkeypatch, tmp_path
+):
+    """The old rmtree-to-arm crash window must be unreachable from `armed`."""
+    state_dir = tmp_path / "state" / "resnapshot"
+    resnapshot_recovery_mod.arm_interruption_marker(
+        state_dir, pipeline=PIPELINE, tables=TABLES
+    )
+    offsets = state_dir / "offsets.dat"
+    offsets.write_bytes(b"live offsets")
+    marker_before = resnapshot_recovery_mod.interruption_marker(state_dir).read_bytes()
+    arm_calls = 0
+
+    def _crash_instead_of_arm(_recovery):
+        nonlocal arm_calls
+        arm_calls += 1
+        raise KeyboardInterrupt("crash between cleanup and arm")
+
+    monkeypatch.setattr(
+        resnapshot_recovery_mod.InterruptionRecovery, "arm", _crash_instead_of_arm
+    )
+    with pytest.raises(EngineFailure, match="armed interrupted re-snapshot recovery"):
+        resnapshot_recovery_mod.InterruptionRecovery.prepare(
+            state_dir, pipeline=PIPELINE, tables=TABLES
+        )
+
+    assert arm_calls == 0
+    assert (
+        resnapshot_recovery_mod.interruption_marker(state_dir).read_bytes()
+        == marker_before
+    )
+    assert offsets.read_bytes() == b"live offsets"
+
+
+def test_prepare_is_reentrant_after_a_crash_between_orphan_cleanup_and_arm(
+    monkeypatch, tmp_path
+):
+    """A crash at the remaining cleanup cut can only leave logical `absent`."""
+    state_dir = tmp_path / "state" / "resnapshot"
+    state_dir.mkdir(parents=True)
+    (state_dir / "offsets.dat").write_bytes(b"orphan offsets")
+    real_arm = resnapshot_recovery_mod.InterruptionRecovery.arm
+
+    def _crash_instead_of_arm(_recovery):
+        raise KeyboardInterrupt("crash between cleanup and arm")
+
+    monkeypatch.setattr(
+        resnapshot_recovery_mod.InterruptionRecovery, "arm", _crash_instead_of_arm
+    )
+    with pytest.raises(KeyboardInterrupt, match="between cleanup and arm"):
+        resnapshot_recovery_mod.InterruptionRecovery.prepare(
+            state_dir, pipeline=PIPELINE, tables=TABLES
+        )
+
+    assert resnapshot_recovery_mod._read_interruption_marker(state_dir) == ("absent", None)
+    assert not (state_dir / "offsets.dat").exists()
+
+    monkeypatch.setattr(
+        resnapshot_recovery_mod.InterruptionRecovery, "arm", real_arm
+    )
+    recovery = resnapshot_recovery_mod.InterruptionRecovery.prepare(
+        state_dir, pipeline=PIPELINE, tables=TABLES
+    )
+    assert recovery.state == MARKER_ARMED
+
+
+def test_prepare_propagates_required_orphan_cleanup_failure(monkeypatch, tmp_path):
+    """A replacement offset store cannot start beside orphan state we could not clean."""
+    state_dir = tmp_path / "state" / "resnapshot"
+    state_dir.mkdir(parents=True)
+    offsets = state_dir / "offsets.dat"
+    offsets.write_bytes(b"orphan offsets")
+
+    def _fail_cleanup(_path):
+        raise OSError("cleanup denied")
+
+    monkeypatch.setattr(resnapshot_recovery_mod.shutil, "rmtree", _fail_cleanup)
+    with pytest.raises(OSError, match="cleanup denied"):
+        resnapshot_recovery_mod.InterruptionRecovery.prepare(
+            state_dir, pipeline=PIPELINE, tables=TABLES
+        )
+    assert offsets.read_bytes() == b"orphan offsets"
+    assert resnapshot_recovery_mod._read_interruption_marker(state_dir) == ("absent", None)
+
+
+def test_prepare_retires_consumed_before_arming_the_next_instance(tmp_path):
+    """Replacement takes only declared `consumed -> absent -> armed` edges."""
+    state_dir = tmp_path / "state" / "resnapshot"
+    resnapshot_recovery_mod.arm_interruption_marker(
+        state_dir, pipeline=PIPELINE, tables=TABLES
+    )
+    (state_dir / "offsets.dat").write_bytes(b"terminal offsets")
+    resnapshot_recovery_mod.consume_interruption_marker(state_dir)
+
+    recovery = resnapshot_recovery_mod.InterruptionRecovery.prepare(
+        state_dir, pipeline=PIPELINE, tables=TABLES
+    )
+
+    assert recovery.state == MARKER_ARMED
+    assert not (state_dir / "offsets.dat").exists()
+    assert resnapshot_recovery_mod._read_interruption_marker(state_dir)[1] == {
+        "pipeline": PIPELINE,
+        "state": MARKER_ARMED,
+        "tables": [["app", "customers", "cdcflight_app_customers"]],
+    }
+
+
 @pytest.mark.parametrize(
     ("marker_state", "expected_requests"),
     [("absent", 0), (MARKER_ARMED, 1), (MARKER_CONSUMED, 0)],

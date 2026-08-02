@@ -185,7 +185,22 @@ class InterruptionRecovery:
         cls, state_dir, *, pipeline: str, tables: list[TableIdentity]
     ) -> InterruptionRecovery:
         recovery = cls(Path(state_dir), pipeline, tables)
-        shutil.rmtree(recovery.state_dir, ignore_errors=True)
+        state, _payload = _read_interruption_marker(recovery.state_dir)
+        if state == MARKER_ARMED:
+            raise EngineFailure(
+                "refusing to replace armed interrupted re-snapshot recovery marker "
+                f"{recovery.marker}; discharge it through restart recovery first"
+            )
+        if state == MARKER_CONSUMED:
+            # Validate ownership before retiring the previous terminal instance. The
+            # cleanup itself checks the declared `consumed -> absent` edge.
+            _validated_record(pipeline=pipeline, state_dir=recovery.state_dir)
+            discard_consumed_interruption_marker(recovery.state_dir)
+        elif recovery.state_dir.exists():
+            # No marker means no logical recovery instance. Sibling files are orphaned
+            # state from an unarmed/crashed preparation and may be removed, but failure
+            # must remain fatal: Debezium cannot consume replacement offsets beside it.
+            shutil.rmtree(recovery.state_dir)
         recovery.state_dir.mkdir(parents=True, exist_ok=True)
         recovery.arm()
         return recovery
