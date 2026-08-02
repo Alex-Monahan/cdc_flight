@@ -4,7 +4,7 @@ Scores every item of `cdc_tool_decision_matrix_v3_for_swarm.md` against the
 **Phase-0 baseline** of this repo, i.e.
 
 ```
-PostgreSQL 18.1 (project-local cluster, :15432, wal_level=logical)
+PostgreSQL 18.1 (project-local cluster, `CDC_TEST_PGPORT` default :15432, wal_level=logical)
   -> Debezium 3.6.0.Final embedded engine (pydbzengine 3.6.0.0 / JPype, plugin=pgoutput)
   -> ExtractNewRecordState (unwrap, delete.tombstone.handling.mode=rewrite)
   -> dlt 1.29.1, write_disposition="append"
@@ -2377,7 +2377,7 @@ around a type-mapping problem (2.4).
 `primary only=1, replica but disrupts primary=3, replica with light primary workload=5`
 
 **Evidence** (`probes/p09_replica.py`). A hot standby was built with
-`pg_basebackup` on :15433 (`hot_standby_feedback=on`) and the pipeline pointed at
+`pg_basebackup` on the derived `CDC_TEST_REPLICA_PGPORT` (`hot_standby_feedback=on`) and the pipeline pointed at
 it. It **worked**: `pg_is_in_recovery() = t`, the run snapshotted 21 records
 including a row inserted on the primary, and the logical slot was created on the
 standby — `primary_slots` shows only the physical `probe_standby_slot`. Debezium
