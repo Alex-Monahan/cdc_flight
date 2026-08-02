@@ -58,7 +58,7 @@ class HangingCloseEngine(FakeEngine):
 
 
 class FakeHandler:
-    def __init__(self):
+    def __init__(self, *, snapshot_completion_required=False):
         self.record_count = 0
         self.batch_count = 0
         self.data_batch_count = 0
@@ -68,6 +68,8 @@ class FakeHandler:
         self.seconds_since_last_batch = 0.0
         self.lifecycle: list[str] = []
         self.quiesced = True
+        self.snapshot_completion_required = snapshot_completion_required
+        self.snapshot_completed = False
 
     def snapshot_counts(self):
         return {}
@@ -147,6 +149,30 @@ def test_close_is_marked_intentional_on_a_clean_stop():
     summary = run_engine_bounded(engine, handler, _run_cfg())
     assert summary["stop_reason"] == "idle"
     assert engine.closed_intentional is True
+
+
+def test_initial_snapshot_cannot_declare_idle_with_zero_records():
+    """Round 6 MAJOR-3: WAL-idle is not proof that a snapshot even started.
+
+    This is the exact load-sensitive failure reduced to a deterministic unit shape:
+    the connector thread is alive, source health is allowed to corroborate idle, no
+    callback has arrived, and the initial snapshot obligation is still open.  The run
+    must fail at its deadline instead of reporting an empty successful snapshot.
+    """
+    engine = FakeEngine(run_seconds=1.0)
+    handler = FakeHandler(snapshot_completion_required=True)
+    handler.seconds_since_last_batch = 99
+
+    with pytest.raises(EngineFailure) as excinfo:
+        run_engine_bounded(
+            engine,
+            handler,
+            _run_cfg(max_seconds=0.6, idle_seconds=0.01, close_timeout=1),
+        )
+
+    assert excinfo.value.summary["records"] == 0
+    assert excinfo.value.summary["stop_reason"] == "max_seconds"
+    assert "snapshot did not complete" in str(excinfo.value)
 
 
 def test_a_non_quiescent_callback_keeps_ownership_and_is_not_drained():

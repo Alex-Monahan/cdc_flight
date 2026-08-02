@@ -156,10 +156,14 @@ def run_engine_bounded(
                 break
             enough = handler.record_count >= run.min_records
             quiet = handler.seconds_since_last_batch >= run.idle_seconds
+            snapshot_complete = (
+                not getattr(handler, "snapshot_completion_required", False)
+                or handler.snapshot_completed
+            )
             # Never stop before the connector has had a chance to start, and
             # never stop while a commit group is being applied.
             warmed_up = elapsed >= min(run.idle_seconds, 5.0)
-            if enough and quiet and warmed_up and not handler.busy:
+            if enough and quiet and warmed_up and not handler.busy and snapshot_complete:
                 if health is None or health.may_declare_idle(min_seconds=run.idle_seconds):
                     if catalog is not None and not final_poll_done:
                         # The synchronous final poll. A DROP that happened after the
@@ -282,6 +286,9 @@ def run_engine_bounded(
         "offset_flushes_verified": engine.offset_flushes_verified,
         **handler.stats(),
     }
+    if getattr(handler, "snapshot_completion_required", False):
+        summary["snapshot_completion_required"] = True
+        summary["snapshot_completed"] = bool(handler.snapshot_completed)
     if close_hung:
         # Recorded even when it is not the reported reason, because "we could not shut
         # the engine down" is operationally interesting whatever caused it.
@@ -336,6 +343,17 @@ def run_engine_bounded(
             f"the source has been unreachable for {health.unknown_for:.1f}s "
             f"({health.summary()}); the delivery cannot be shown to be complete, so "
             "this run is not a success (TODO 4.6(b))",
+            summary,
+        )
+
+    if (
+        getattr(handler, "snapshot_completion_required", False)
+        and not handler.snapshot_completed
+    ):
+        raise EngineFailure(
+            "the required snapshot did not complete before the engine stopped; "
+            "source-idle timing is not positive evidence that Debezium delivered the "
+            "snapshot terminal signal",
             summary,
         )
 

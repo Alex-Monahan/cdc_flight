@@ -410,8 +410,11 @@ def run(
             summary_extra["interrupted_snapshots_requeued"] = interrupted
         owed = dest_mod.tables_awaiting_snapshot(con, dest.pipeline_name)
         will_snapshot_everything = (
-            reconciliation.resume_point.last_lsn == 0
-            and props["snapshot.mode"] in reconcile_mod.SNAPSHOT_MODES_WITH_DATA
+            props["snapshot.mode"] == "always"
+            or (
+                reconciliation.resume_point.last_lsn == 0
+                and props["snapshot.mode"] in reconcile_mod.SNAPSHOT_MODES_WITH_DATA
+            )
         )
         if (
             owed
@@ -593,6 +596,7 @@ def run(
             catalog=watcher,
             watermarks=watermarks,
         )
+        applier.snapshot_completion_required = will_snapshot_everything
         ownership.attach(applier)
         engine = SupervisedDebeziumEngine(
             properties=props,

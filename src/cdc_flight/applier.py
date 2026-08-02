@@ -117,6 +117,11 @@ class Applier:
         #: last record and table B's first, that is true and the snapshot is not over
         #: (Codex B1 / Opus BLOCKER-1).
         self.snapshot_completed = False
+        #: Set by the main pipeline when this engine invocation owes a full snapshot.
+        #: Source-idle evidence says nothing about snapshot rows, so the supervisor
+        #: must keep the engine alive until ``snapshot_completed`` supplies Debezium's
+        #: positive terminal signal.
+        self.snapshot_completion_required = False
         #: True once a committed group carried `snapshot='last'` — Debezium saying the
         #: whole snapshot, over the whole requested capture set, has ended.
         self.snapshot_final_seen = False
@@ -989,4 +994,3 @@ def _epoch_ms(value) -> Any:
     from datetime import UTC, datetime
 
     return datetime.fromtimestamp(value / 1000.0, tz=UTC)
-
