@@ -345,9 +345,9 @@ many cheap tests.
 and uses private slots, offsets, state, and DuckDB files. `PostgresTestInstance` hashes
 the canonical data directory, host, and port into one controller-held full-run lock, so
 two logical IDs that select the same physical cluster still serialize. Free-form lock
-file overrides are ignored; `CDC_TEST_LOCK_DIR` may move the lock directory, while the
-hashed filenames remain derived. A second hashed setup lock serializes template
-provisioning while workers execute independently. A crashed controller releases
+path and directory overrides are ignored: both the canonical lock directory and hashed
+filenames derive from the physical cluster identity. A second hashed setup lock
+serializes template provisioning while workers execute independently. A crashed controller releases
 ownership through the kernel; stale metadata is replaced only after the next controller
 acquires that kernel lock. Worker database/template and slot prefixes include the
 logical instance id, so independent ports do not collide.

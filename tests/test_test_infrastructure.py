@@ -49,29 +49,46 @@ def test_run_and_setup_locks_are_distinct_and_instance_scoped():
     assert conftest.POSTGRES_TEST_INSTANCE.physical_key in conftest.TEST_SETUP_LOCK_PATH.name
 
 
-def test_two_logical_ids_on_one_physical_cluster_share_one_owner_lock(tmp_path: Path):
+def test_non_authority_overrides_cannot_split_one_physical_owner_lock(tmp_path: Path):
+    data_dir = tmp_path / "physical-cluster" / ".pgdata"
     physical = {
         "CDC_TEST_PGPORT": str(conftest.TEST_PGPORT),
-        "CDC_TEST_PGDATA": str(conftest.TEST_PGDATA),
-        "CDC_TEST_LOCK_DIR": str(tmp_path),
+        "CDC_TEST_PGDATA": str(data_dir),
         "PGHOST": "127.0.0.1",
     }
     owner_a = PostgresTestInstance.from_environ(
         {
             **physical,
             "CDC_TEST_INSTANCE_ID": "owner_a",
+            "CDC_TEST_LOCK_DIR": str(tmp_path / "attempted-locks-a"),
             "CDC_TEST_LOCK_PATH": str(tmp_path / "ignored-a.lock"),
+            "CDC_TEST_SETUP_LOCK_PATH": str(tmp_path / "ignored-setup-a.lock"),
+            "CDC_TEST_PGDATABASE": "logical_source_a",
+            "CDC_TEST_PGSOCKET": str(tmp_path / "socket-a"),
+            "CDC_TEST_PGLOG": str(tmp_path / "postgres-a.log"),
+            "CDC_TEST_SLOT_PREFIX": "logical_slot_a_",
+            "CDC_TEST_TEMPLATE_DATABASE_PREFIX": "logical_template_a_",
+            "CDC_TEST_WORKER_DATABASE_PREFIX": "logical_worker_a_",
         }
     )
     owner_b = PostgresTestInstance.from_environ(
         {
             **physical,
             "CDC_TEST_INSTANCE_ID": "owner_b",
+            "CDC_TEST_LOCK_DIR": str(tmp_path / "attempted-locks-b"),
             "CDC_TEST_LOCK_PATH": str(tmp_path / "ignored-b.lock"),
+            "CDC_TEST_SETUP_LOCK_PATH": str(tmp_path / "ignored-setup-b.lock"),
+            "CDC_TEST_PGDATABASE": "logical_source_b",
+            "CDC_TEST_PGSOCKET": str(tmp_path / "socket-b"),
+            "CDC_TEST_PGLOG": str(tmp_path / "postgres-b.log"),
+            "CDC_TEST_SLOT_PREFIX": "logical_slot_b_",
+            "CDC_TEST_TEMPLATE_DATABASE_PREFIX": "logical_template_b_",
+            "CDC_TEST_WORKER_DATABASE_PREFIX": "logical_worker_b_",
         }
     )
 
     assert owner_a.physical_identity == owner_b.physical_identity
+    assert owner_a.lock_dir == data_dir.resolve().parent / ".pytest-instance-locks"
     assert owner_a.run_lock_path == owner_b.run_lock_path
     assert owner_a.setup_lock_path == owner_b.setup_lock_path
 

@@ -96,9 +96,9 @@ class PostgresTestInstance:
         host = env.get("PGHOST", "127.0.0.1")
         physical_identity = f"{host}\0{port}\0{data_dir}"
         physical_key = hashlib.sha256(physical_identity.encode()).hexdigest()[:20]
-        lock_dir = Path(
-            env.get("CDC_TEST_LOCK_DIR", str(project_dir / ".pytest-instance-locks"))
-        ).resolve()
+        # The containing directory is derived from canonical PGDATA just like the
+        # hashed filenames. Logical settings cannot split one physical lock inode.
+        lock_dir = data_dir.parent / ".pytest-instance-locks"
         return cls(
             project_dir=project_dir,
             pg_sh=project_dir / "scripts" / "pg.sh",
