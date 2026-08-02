@@ -132,8 +132,24 @@ class SnapshotCompletion:
         self._validate_snapshot_units(snapshot_units)
         return self._will_complete_after(snapshot_units)
 
+    def check_streaming_admission(self) -> None:
+        """Check the phase edge before a streaming unit can affect a group.
+
+        This is deliberately non-mutating.  The applier uses it before closing an
+        open snapshot group, so an illegal edge cannot first commit snapshot rows and
+        only then be reported.  Once the model is already in ``streaming``, repeated
+        streaming units are admitted without inventing a second transition.
+        """
+        if self._state == SNAPSHOT_STREAMING:
+            return
+        self._check_streaming_edge()
+
     def enter_streaming(self) -> None:
         """Take the only phase-changing edge out of the snapshot model."""
+        self.check_streaming_admission()
+        self._state = SNAPSHOT_STREAMING
+
+    def _check_streaming_edge(self) -> None:
         try:
             SNAPSHOT_COMPLETION.check(self._state, SNAPSHOT_STREAMING)
         except (IllegalTransition, UnknownState) as exc:
@@ -141,7 +157,6 @@ class SnapshotCompletion:
                 f"snapshot phase transition to streaming refused from {self._state}: "
                 f"{exc}"
             ) from exc
-        self._state = SNAPSHOT_STREAMING
 
     def observe_committed_group(self, units, *, snapshot_active: bool) -> None:
         """Record rows after ``COMMIT``; direct callbacks prove completion.

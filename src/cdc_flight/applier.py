@@ -482,11 +482,32 @@ class Applier:
     # group assembly
     # ------------------------------------------------------------------ #
     def _add_unit(self, unit: CompleteUnit) -> None:
-        is_snapshot = unit.kind == UNIT_SNAPSHOT_CHUNK
+        is_snapshot = self._is_snapshot_unit(unit)
         was_snapshot = self.group.is_snapshot
-        is_snapshot_boundary = any(
-            record.kind == KIND_SNAPSHOT_BOUNDARY for record in unit.records
-        )
+        if not is_snapshot:
+            # This must happen before an open snapshot group is committed or the
+            # incoming streaming unit is appended. The completion machine, not the
+            # current group's row shape, owns the phase barrier.
+            if (
+                self.group.units
+                and self.group.is_snapshot
+                and self._has_snapshot_boundary(self.group.units)
+            ):
+                # A terminal boundary is itself the proof-bearing phase barrier. If
+                # its projected rows are ready, commit that snapshot group first;
+                # `observe_committed_group()` then takes completion_notified ->
+                # callbacks_complete, after which the stream edge can be checked.
+                result = self.commit_group("snapshot_chunk")
+                if result is not CommitResult.COMMITTED:
+                    self.snapshot_completion.check_streaming_admission()
+                    raise SnapshotObservationError(
+                        "cannot cross the snapshot phase boundary with commit result "
+                        f"{result.value}"
+                    )
+            else:
+                # An open snapshot group without its terminal boundary must never be
+                # committed merely because a stream unit arrived.
+                self.snapshot_completion.check_streaming_admission()
         # ADR §3.5: snapshot units are never mixed with streaming units, so a
         # commit_log row unambiguously says which phase it belongs to. The explicit
         # terminal boundary is control-shaped but belongs to the snapshot group so its
@@ -494,22 +515,20 @@ class Applier:
         if (
             self.group.units
             and is_snapshot != self.group.is_snapshot
-            and not (is_snapshot_boundary and self.group.is_snapshot)
         ):
             result = self.commit_group(
                 "snapshot_chunk" if was_snapshot else "phase"
             )
-            if was_snapshot and not is_snapshot:
-                # This call is intentionally made even when `result` is BLOCKED. The
-                # closed completion machine has no `completion_notified -> streaming`
-                # edge, so the illegal phase crossing is a loud refusal and the unit
-                # cannot be appended to the open snapshot group.
-                self.snapshot_completion.enter_streaming()
             if result is not CommitResult.COMMITTED:
                 raise SnapshotObservationError(
                     f"cannot cross the snapshot phase boundary with commit result "
                     f"{result.value}"
                 )
+        if not is_snapshot:
+            # For a phase mismatch this runs only after the prior snapshot group has
+            # committed. For an empty group it is the admission edge that used to be
+            # skipped entirely.
+            self.snapshot_completion.enter_streaming()
         if not self.group.units:
             self.group.is_snapshot = is_snapshot
             self.group.opened_at = time.monotonic()
@@ -547,6 +566,21 @@ class Applier:
         self.group.units.append(unit)
         self.group.events += unit.event_count
         self.group.nbytes += unit.nbytes
+
+    @staticmethod
+    def _is_snapshot_unit(unit: CompleteUnit) -> bool:
+        """Classify row and synthetic control units by their source phase."""
+        return unit.kind == UNIT_SNAPSHOT_CHUNK or any(
+            record.kind == KIND_SNAPSHOT_BOUNDARY for record in unit.records
+        )
+
+    @staticmethod
+    def _has_snapshot_boundary(units: list[CompleteUnit]) -> bool:
+        return any(
+            record.kind == KIND_SNAPSHOT_BOUNDARY
+            for unit in units
+            for record in unit.records
+        )
 
     def _reset_group(self) -> None:
         """One assignment, and that is the whole point (rubric 1.9).
