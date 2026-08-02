@@ -2,7 +2,7 @@
 shipped applier, plus the ones it proved correct and which must stay correct.
 
 Every case in the first section was executed by a reviewer, against a real
-Postgres 18.1 cluster on `:15432` for the source truth and against the shipped
+Postgres 18.1 cluster on `CDC_TEST_PGPORT` for the source truth and against the shipped
 `Applier` for the destination answer, and the two disagreed. They are all one
 defect family, and Codex named the root:
 

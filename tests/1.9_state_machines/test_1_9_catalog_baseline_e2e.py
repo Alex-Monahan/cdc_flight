@@ -2,7 +2,7 @@
 
 `test_1_9_catalog_baseline.py` proves the *decision* in process, in under a second, and
 that is where the fine-grained assertions live. This proves the **composition** — four
-real pipeline runs against Postgres on :15432 with a real Debezium engine — because the
+real pipeline runs against Postgres on the selected CDC_TEST_PGPORT with a real Debezium engine — because the
 whole finding was that each piece was individually defensible and the sequence was not:
 
 1. a destination populated with **no relation registry** (`CDC_DROP_MODE=ignore`, which

@@ -3,9 +3,9 @@
 Rubric item answered: 7.2 (read from a replica, light workload on the primary).
 
 Builds a throwaway hot standby of the project cluster with `pg_basebackup` on
-port 15433, points the pipeline at it, and reports what happens. The standby is
-torn down at the end; the primary on :15432 is untouched apart from one
-temporary physical replication connection.
+the derived replica port, points the pipeline at it, and reports what happens.
+The standby is torn down at the end; the selected primary is untouched apart
+from one temporary physical replication connection.
 """
 
 from __future__ import annotations
@@ -16,11 +16,29 @@ import subprocess
 import time
 from pathlib import Path
 
-from _common import PROJECT_DIR, Probe, query, reseed, sql
+from _common import INSTANCE_ID, PROJECT_DIR, Probe, query, reseed, sql
+
+from cdc_flight.config import SourceConfig
 
 PGBIN = Path(os.environ.get("PGBIN", "/opt/homebrew/opt/postgresql@18/bin"))
-REPLICA_DIR = PROJECT_DIR / ".pgdata_replica"
-REPLICA_PORT = 15433
+PRIMARY_PORT = SourceConfig().port
+PRIMARY_DATABASE = SourceConfig().dbname
+REPLICA_PORT = int(
+    os.environ.get("CDC_TEST_REPLICA_PGPORT", str(PRIMARY_PORT + 1))
+)
+DEFAULT_REPLICA_DIR = PROJECT_DIR / (
+    ".pgdata_replica" if PRIMARY_PORT == 15432 else f".pgdata_replica_{PRIMARY_PORT}"
+)
+REPLICA_DIR = Path(os.environ.get("CDC_TEST_REPLICA_PGDATA", str(DEFAULT_REPLICA_DIR)))
+REPLICA_SOCKET = Path(
+    os.environ.get("CDC_TEST_REPLICA_PGSOCKET", str(REPLICA_DIR))
+)
+REPLICA_LOG = Path(
+    os.environ.get("CDC_TEST_REPLICA_PGLOG", str(REPLICA_DIR / "server.log"))
+)
+REPLICA_SLOT = os.environ.get(
+    "CDC_TEST_REPLICA_SLOT", f"probe_{INSTANCE_ID}_standby_slot"
+)[:63]
 
 
 def sh(cmd: list[str], **kw) -> subprocess.CompletedProcess:
@@ -46,7 +64,7 @@ def main() -> None:
             "-h",
             "127.0.0.1",
             "-p",
-            "15432",
+            str(PRIMARY_PORT),
             "-U",
             "postgres",
             "-D",
@@ -56,7 +74,7 @@ def main() -> None:
             "-R",
             "-C",
             "-S",
-            "probe_standby_slot",
+            REPLICA_SLOT,
             "-P",
         ],
         env=env,
@@ -70,7 +88,8 @@ def main() -> None:
 
     with (REPLICA_DIR / "postgresql.auto.conf").open("a") as fh:
         fh.write(f"\nport = {REPLICA_PORT}\nhot_standby = on\nhot_standby_feedback = on\n")
-        fh.write(f"unix_socket_directories = '{REPLICA_DIR}'\n")
+        fh.write(f"unix_socket_directories = '{REPLICA_SOCKET}'\n")
+    REPLICA_SOCKET.mkdir(parents=True, exist_ok=True)
 
     start = sh(
         [
@@ -78,7 +97,7 @@ def main() -> None:
             "-D",
             str(REPLICA_DIR),
             "-l",
-            str(REPLICA_DIR / "server.log"),
+            str(REPLICA_LOG),
             "-w",
             "-t",
             "60",
@@ -98,7 +117,7 @@ def main() -> None:
             "-U",
             "postgres",
             "-d",
-            "cdc_source",
+            PRIMARY_DATABASE,
             "-tAc",
             "select pg_is_in_recovery(), count(*) from app.customers",
         ],
@@ -116,7 +135,10 @@ def main() -> None:
         max_seconds=90,
         idle_seconds=8,
         expect_success=False,
-        extra_env={"PGPORT": str(REPLICA_PORT)},
+        extra_env={
+            "CDC_TEST_PGPORT": str(REPLICA_PORT),
+            "PGPORT": str(REPLICA_PORT),
+        },
     )
     p.findings["pipeline_against_replica"] = run
     p.findings["destination_tables"] = p.tables()
@@ -130,8 +152,11 @@ def main() -> None:
     )
 
     teardown()
-    query("SELECT pg_drop_replication_slot('probe_standby_slot') "
-          "FROM pg_replication_slots WHERE slot_name = 'probe_standby_slot'")
+    query(
+        "SELECT pg_drop_replication_slot(%s) FROM pg_replication_slots "
+        "WHERE slot_name = %s",
+        (REPLICA_SLOT, REPLICA_SLOT),
+    )
     p.cleanup()
     p.emit()
 

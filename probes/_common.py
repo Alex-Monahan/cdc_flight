@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -33,6 +34,17 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 PG_SH = PROJECT_DIR / "scripts" / "pg.sh"
 VENV_BIN = PROJECT_DIR / ".venv" / "bin"
 OUT_DIR = PROJECT_DIR / "probes" / ".out"
+
+
+def _instance_id() -> str:
+    raw = os.environ.get(
+        "CDC_TEST_INSTANCE_ID",
+        os.environ.get("CDC_TEST_PGPORT", os.environ.get("PGPORT", "15432")),
+    )
+    return re.sub(r"[^a-z0-9_]+", "_", raw.lower()).strip("_") or "pg15432"
+
+
+INSTANCE_ID = _instance_id()
 
 sys.path.insert(0, str(PROJECT_DIR / "src"))
 
@@ -127,7 +139,7 @@ class Probe:
         if clean and self.dir.exists():
             shutil.rmtree(self.dir)
         self.dir.mkdir(parents=True, exist_ok=True)
-        self.slot = f"probe_{name}"[:60]
+        self.slot = f"probe_{INSTANCE_ID}_{name}"[:60]
         self.duckdb_path = self.dir / "probe.duckdb"
         self.env = {
             **os.environ,

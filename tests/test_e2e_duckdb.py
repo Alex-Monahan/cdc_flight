@@ -1,6 +1,6 @@
 """End-to-end test of the applier path.
 
-    Postgres (native, :15432)
+    Postgres (native, CDC_TEST_PGPORT; default :15432)
       -> Debezium embedded engine, FULL envelope (snapshot, then streaming)
       -> the transactional applier
       -> local DuckDB
@@ -235,7 +235,7 @@ def test_second_run_is_incremental(fresh_seed, run_pipeline, duck, dataset):
 
     This assertion is about *our* offsets, but its literal form ("the second run
     saw zero change events") is a statement about the whole shared cluster, so
-    any other writer on :15432 breaks it with a baffling message. Sessions are
+    any other writer on the selected test port breaks it with a baffling message. Sessions are
     serialised by the `exclusive_source` lock; this fingerprint check catches
     anything that still slips past and says so plainly.
     """

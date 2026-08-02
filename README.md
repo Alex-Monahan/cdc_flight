@@ -26,7 +26,7 @@ resume point in the destination transaction — but dlt remains as a *library*
                   ┌──────────────────────────────────────────── one Python process ──┐
  PostgreSQL 18    │                                                                  │
  (local cluster,  │  JVM (JPype)                       Python                         │
-  :15432,         │  ┌────────────────────┐  full      ┌──────────────────────┐       │
+  :CDC_TEST_PGPORT│  ┌────────────────────┐  full      ┌──────────────────────┐       │
   wal_level=      │  │ Debezium 3.6       │  envelope  │ TransactionAssembler │       │
   logical)        │  │ PostgresConnector  ├───────────▶│   -> whole units     │       │
     │  WAL        │  │ plugin=pgoutput    │  + BEGIN/  └──────────┬───────────┘       │
@@ -49,7 +49,7 @@ inside the Python process via JPype; Postgres is a project-local Homebrew cluste
 
 | Component | Version used | Notes |
 |---|---|---|
-| PostgreSQL | **18.1** (Homebrew `postgresql@18`) | latest GA major; project-local cluster on **:15432** |
+| PostgreSQL | **18.1** (Homebrew `postgresql@18`) | latest GA major; project-local cluster on **`CDC_TEST_PGPORT`** (default **:15432**) |
 | Java (JDK) | **OpenJDK 23.0.2** (Homebrew `openjdk`) | pydbzengine needs JDK **17+** on `PATH` |
 | Debezium | **3.6.0.Final** | bundled inside `pydbzengine` 3.6.0.0 |
 | pydbzengine | **3.6.0.0** | installed from GitHub (not on PyPI any more) |
@@ -62,14 +62,15 @@ brew install postgresql@18 openjdk
 brew install uv           # if not already installed
 ```
 
-The project-local cluster lives in `./.pgdata` and **never touches** a Homebrew
-`postgresql@N` service you may already run on :5432.
+The project-local cluster lives in `CDC_TEST_PGDATA` and **never touches** a Homebrew
+`postgresql@N` service you may already run on :5432. Its default is `./.pgdata` at
+port 15432 and `./.pgdata_<port>` for another test port.
 
 ## Quick start
 
 ```bash
 make install       # uv venv + editable install (pulls the ~340 MB pydbzengine repo once)
-make up            # initdb (first time) + start Postgres on :15432, create cdc_source
+make up            # initdb (first time) + start Postgres on CDC_TEST_PGPORT, create cdc_source
 make seed          # apply sql/01_schema.sql and sql/02_seed.sql
 make pipeline      # Debezium snapshot + stream → ./cdc_flight.duckdb
 make changes       # generate inserts/updates/deletes in Postgres
@@ -87,9 +88,9 @@ make reset
 ### What each step actually does
 
 * **`make up`** → `scripts/pg.sh start`. First run does `initdb` into the disposable
-  `./.pgdata` test cluster and appends `wal_level=logical`, replication capacities
-  `16/16/4` (slots/senders/logical workers), `port=15432`, and
-  `unix_socket_directories=<pgdata>` to `postgresql.conf`. It also disables `fsync`,
+  `CDC_TEST_PGDATA` test cluster and appends `wal_level=logical`, replication capacities
+  `16/16/4` (slots/senders/logical workers), `port=CDC_TEST_PGPORT`, and
+  `unix_socket_directories=CDC_TEST_PGSOCKET` to `postgresql.conf`. It also disables `fsync`,
   `synchronous_commit`, and `full_page_writes` **only in this disposable cluster**;
   never copy those durability settings to production or a durable development database.
   Then it runs `pg_ctl start` and creates `cdc_source`.
@@ -199,7 +200,9 @@ make test-all     # everything
 
 `make test` uses pytest-xdist with `--dist=loadscope`, keeping module-scoped CDC
 scenarios together while isolating every worker's Postgres database/template,
-replication slots, state directory, and DuckDB path. Override the host-tuned default
+replication slots, state directory, and DuckDB path. Set `CDC_TEST_PGPORT` (and,
+if needed, `CDC_TEST_INSTANCE_ID`) for an independent cluster; the data, socket,
+log, lock, database, and slot namespaces follow it. Override the host-tuned default
 with `PYTEST_WORKERS=N make test`; values above 12 also require increasing the disposable
 cluster's replication capacities. MotherDuck tests carry the `motherduck` marker and
 long fault-injection tests carry `slow`; both are deselected by `make test` and
@@ -322,10 +325,10 @@ once per module (or, for `crash_replay`, once per session) and then interrogate 
 many cheap tests.
 
 **Worker isolation.** Each xdist worker clones a private database from its own template
-and uses private slots, offsets, state, and DuckDB files. `.pytest-source.lock` serialises
-only cluster/template setup, so workers execute independently after provisioning. Do not
-launch two separate pytest sessions concurrently in the same checkout: worker names such
-as `gw0` are session-local and would collide across those independent invocations.
+and uses private slots, offsets, state, and DuckDB files. The per-instance
+`.pytest-source-<instance>.lock` serialises only cluster/template setup, so workers
+execute independently after provisioning. Worker database/template and slot prefixes
+include the instance id, so independent ports do not collide in shared tooling.
 
 ### Test layout and conventions
 
