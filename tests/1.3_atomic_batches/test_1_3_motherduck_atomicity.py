@@ -209,8 +209,8 @@ def test_target_one_commit_group_per_pg_transaction_in_motherduck(md_observed_tx
     assert len(commits) == 1, f"PG transaction split across {len(commits)} commit groups"
 
 
-def test_motherduck_fenced_spilled_overlap_has_an_isolated_owner(md_token, tmp_path):
-    """MotherDuck accepts the same fenced spill ownership protocol as local DuckDB."""
+def test_motherduck_fenced_spilled_overlap_is_dropped_without_owner(md_token, tmp_path):
+    """MotherDuck sees no destination owner for a discarded overlap."""
     dataset = f"cdc_overlap_{uuid.uuid4().hex[:8]}"
     pipeline = f"md_overlap_{uuid.uuid4().hex[:8]}"
     dsn = f"md:{MD_DATABASE}?motherduck_token={md_token}"
@@ -285,7 +285,7 @@ def test_motherduck_fenced_spilled_overlap_has_an_isolated_owner(md_token, tmp_p
         feed([snap("customers", 200, ident=2, marker="last")])
         applier.commit_group("motherduck_matrix")
 
-        assert applier.fenced_spilled_events == 2
+        assert applier.fenced_spilled_events == 0
         assert applier.snapshot_completed is True
         assert committer.marked > 0
         verify = duckdb.connect(dsn)
@@ -303,7 +303,7 @@ def test_motherduck_fenced_spilled_overlap_has_an_isolated_owner(md_token, tmp_p
                 "SELECT count(*), sum(fenced_units) FROM _cdc_flight.commit_log "
                 "WHERE pipeline = ?",
                 [pipeline],
-            ).fetchone() == (2, 1)
+            ).fetchone() == (1, 0)
         finally:
             verify.close()
     finally:
