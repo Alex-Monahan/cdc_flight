@@ -1,6 +1,6 @@
 # ADR 0001 — The transactional applier
 
-* **Status:** accepted (revision 20, 2026-08-01 — implemented through the rubric 1.9 round-11 fail-closed proof publication)
+* **Status:** accepted (revision 21, 2026-08-01 — implemented through the rubric 1.9 round-12 recovery-preparation guard)
 * **Date:** 2026-07-30
 * **Task:** TODO 1.0(a); revised under TODO 1.0(feedback)
 * **Decides rubric items:** 1.1, 1.2, 1.3, 1.7 (directly), and 1.4, 1.6, 1.8, 3.2,
@@ -29,6 +29,7 @@
 | 18 | 2026-08-01 | **Round-9 ownership composition.** One `DestinationOwnership` token spans the blocking re-snapshot and main stream. The token is attached before consumer construction and activated only when callbacks may enter; outer teardown no longer infers quiescence from a caller-local `applier is None`. A failed re-snapshot quiescence proof retains its alert cursor, parent, lease, heartbeat sink, throwaway slot and offset state, while a pre-armed filesystem marker makes next-run owed-state repair durable without writing through the contested connection. An inactive main-applier construction failure is sealed and retired normally (A67). |
 | 19 | 2026-08-01 | **Round-10 sticky recovery handoff.** Failed callback quiescence is now the terminal `destination_ownership: active -> callback_owned` transition; a later callback exit cannot let an enclosing finalizer revoke it. The filesystem recovery marker is the durable `absent -> armed -> consumed` machine, and cleanup requires `consumed`, not a fresh quiescence read. In-process simulations cover all three durable marker configurations and the exact live-at-catch/quiescent-at-finally race. `pipeline.run()` enforces a process-terminal exit after transfer, so an in-process caller cannot outlive the lease and start beside retained ownership (A68). |
 | 20 | 2026-08-01 | **Round-11 fail-closed publication and recovery boundary.** The supervisor now publishes one typed quiescence proof from inside its `finally`, so a pending `KeyboardInterrupt`, `SystemExit`, or other `BaseException` cannot bypass `active -> callback_owned` by skipping later summary construction. Ownership retirement independently transfers any unretired active callback fail-closed. Marker retirement declares `consumed -> absent`, removes the sibling offset directory, and lives with restart discharge and slot cleanup in `resnapshot_recovery.py`; the summaryless interrupt composition and process-terminal outer teardown are pinned (A69). |
+| 21 | 2026-08-01 | **Round-12 recovery preparation guard.** `InterruptionRecovery.prepare()` now reads the durable marker before cleanup, refuses and preserves `armed`, retires `consumed` only through the declared `consumed -> absent` edge, and directly removes sibling state only when the logical marker is `absent`. Required cleanup errors propagate. Regressions pin the old cleanup-to-arm interruption cut and byte-for-byte preservation of armed marker/offset state (A70). |
 
 ---
 
@@ -2971,7 +2972,7 @@ made no claim — see A63.4.
 | 57 | catalog_baseline: invalidated -> valid | — (the discharge, after rebuild completion) | a durable `include_owed=True` query finds no relation that still holds rows without an identity: every queued rebuild positively completed and the learned identity was eligible for flush | n/a; merely reaching `awaiting_snapshot` keeps the baseline `invalidated` and a disabled/skipped repair refuses before streaming | as 56 | AUTO (rev 16 — a queued rebuild is not a finished one) |
 | 58 | catalog_baseline: valid -> absent | the recorded source catalog is forgotten (`--reset-state`, a source identity change) | `recovery.begin(forget_catalog=True)` | the claim is deleted in the SAME transaction as `source_relations`: a claim about a registry that no longer exists would suppress the reconciliation of the one replacing it | one transaction, so there is no cut | AUTO (rev 14) |
 | 59 | connection_retirement (domain) | a heartbeat write, cursor close, or parent connection close never returns; or close raises | one canonical daemon-worker close protocol bounds both idle cursor and parent close calls; a live writer retains cursor ownership until it returns | the run tears down within the bound and reports `closed`, `failed` (with the close error), or `abandoned` for each handle before process exit | n/a — the heartbeat is not load-bearing for any decision | **UNDEFINED** (rev 16 — honest: nothing clears the non-terminal heartbeat row an abandoned runner left behind; `last_run.json` is the terminal record and stale-row sweeping belongs to 4.4/6.1) |
-| 60 | interruption_marker: armed -> consumed | restart at any interruption-marker state, including after destination requeue but before marker retirement | the marker's declared `state`, with legacy state-less markers parsed as `armed` | `absent` does nothing; `armed` idempotently reasserts owed work before becoming `consumed`; the separately declared `consumed -> absent` edge retires the whole marker/offset instance without repeating the destination write | **STATE-SIMULATED IN PROCESS** at all three durable configurations; the post-write/pre-consume cut raises a monkeypatched `KeyboardInterrupt`, remains `armed`, and repeats safely. These tests do not claim process-crash timing | AUTO (rev 20) |
+| 60 | interruption_marker: armed -> consumed | restart or preparation at any interruption-marker state, including after destination requeue and at the preparation cleanup-to-arm cut | the marker's declared `state`, with legacy state-less markers parsed as `armed` | restart reasserts `armed` idempotently before consumption; preparation refuses and preserves `armed`, retires `consumed` through the separately declared edge, and directly cleans siblings only from logical `absent` | **STATE-SIMULATED IN PROCESS** at all three durable configurations; monkeypatched cuts cover post-write/pre-consume and orphan-cleanup/pre-arm, while an armed marker and offsets are compared byte-for-byte across refused preparation. These tests do not claim process-crash timing | AUTO (rev 21) |
 | 61 | destination_ownership: active -> callback_owned | callback leaves after failed quiescence, or a pending `BaseException` skips post-`finally` summary construction | the supervisor publishes a typed proof inside its `finally`; unretired active ownership also transfers fail-closed | terminal ownership preserves marker/slot/offset/alert/lease/heartbeat/parent state; outer teardown writes the failure summary and takes the hard-exit path | exact late-exit schedule plus a summaryless `KeyboardInterrupt` through the real supervisor boundary; marker remains `armed`, `reassert_owed` is skipped, resources survive, and the in-process outer teardown is process-terminal | AUTO (rev 20) |
 
 **The counts, parsed from the rows above rather than recalled.** 66 rows, one
@@ -3344,7 +3345,10 @@ gain), `machine.check(from, to)` raising `IllegalTransition`, `machine.parse()` 
   `absent -> armed` is fsynced before callback activation, and only a safe destination
   owner may take `armed -> consumed` after reasserting the rebuild obligation.
   `consumed -> absent` is the declared retirement of that marker instance together with
-  its sibling offset directory; `armed` never may be retired.
+  its sibling offset directory; `armed` never may be retired or replaced. Preparation
+  reads this state before physical cleanup, so an `armed` obligation is refused intact;
+  a prior `consumed` instance takes the declared retirement edge before a new
+  `absent -> armed` instance begins.
 * **`destination_ownership`.** `available -> attached -> active` names callback
   admission. A bounded failed-quiescence verdict takes the terminal
   `active -> callback_owned` edge, so a later callback exit cannot be reinterpreted by
@@ -4295,3 +4299,25 @@ restart discharge, and terminal slot/offset/marker cleanup. `resnapshot.py` is a
 orchestrator below 1,000 lines. The marker-state tests construct `absent`, `armed`, and
 `consumed` in process and monkeypatch the post-write/pre-consume cut; they are deliberately
 described as durable-state simulations, not as process-crash timing tests.
+
+### A70 — rev 21: recovery preparation cannot erase an armed obligation
+
+Round 12 found that the extracted owner still depended on its sole caller first running
+restart discharge. `InterruptionRecovery.prepare()` unconditionally removed the entire
+state directory before `arm()` read the marker, physically taking the undeclared
+`armed -> absent -> armed` path. An interruption after the removal and before arming
+lost both the old durable obligation and the callback-owned Debezium offsets.
+
+Preparation now reads the marker before any cleanup. `armed` is a hard refusal which
+leaves the marker payload and sibling offset file untouched. `consumed` is validated for
+the current pipeline and retired only by the common cleanup boundary, which checks the
+declared `consumed -> absent` edge; the new instance then takes `absent -> armed`.
+Only a marker-absent directory is orphan state that may be removed directly, and an
+`rmtree` failure propagates before Debezium can consume replacement offsets beside it.
+
+The regression reproduces the old cleanup-to-arm cut with a monkeypatched
+`KeyboardInterrupt`. From `armed`, preparation refuses before the cut is reachable and
+preserves marker and offsets byte-for-byte. From logical `absent`, the cut can leave only
+`absent`, and the next preparation is re-entrant. Machine guards explicitly reject both
+`armed -> absent` and `armed -> armed`; the generated inventory remains three states and
+three declared edges.

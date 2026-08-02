@@ -367,7 +367,7 @@ correct assumptions in the notes below:
 | 1.6 | Snapshot/backfill consistent with CDC | ~~3~~ → **5** | Postgres's **exported snapshot** makes the boundary an iff, and the fence is on the transaction's **commit** LSN, so a transaction straddling `C` is applied in full rather than lost. Proven with ~200 transactions committing throughout a snapshot — every row on exactly one side. A re-snapshot is complete only when **every requested table** reaches a terminal state: swapped, or verified empty on three independent facts (Debezium's own end-of-snapshot marker, zero records for that table, and a source count of zero). A disagreement between the two readings of `C` is fatal. Proven against a four-table re-snapshot with a keyless table, a genuinely empty table and a concurrent writer. |
 | 1.7 | Failures do not cause correctness issues | ~~1~~ ~~4~~ → **3** | **Twenty-one in-process anchors**: eight protocol, five destination (including the genuinely ambiguous `destination_commit_late`), seven recovery/catalog-baseline, and one source-catalog fault, plus a real network blackhole injected from outside the process. The matrix is enumerated from `faults.ALL_POINTS`, every anchor writes a machine-readable fired record, and the chaos harness asserts each workload affected source rows before arming. Round 7 still scores this 3/5: substantial evidence, but repeated adversarial compositions were found outside the suite, so the 5-band's “robust injection” is not yet the reviewer's verdict. |
 | 1.8 | Externally-advanced slot detected → backfill | ~~1~~ → **5** | Checked on every slot acquisition. Seven decisions trigger an **automatic** re-snapshot: slot ahead, slot missing, slot recreated, source identity changed, **source timeline forked**, source WAL rewound, and an empty destination with a positioned slot. The recovery is a **journalled state machine**: the intent is durable before any mutation, every step is idempotent and re-entrant after a crash at any phase, and a slot that will not drop fails the recovery rather than being logged and stepped over. A **populated** destination with no resume point refuses instead of being rebuilt. Proven by comparing the whole destination against the whole source after a real `pg_replication_slot_advance` and a real `pg_drop_replication_slot`, and by cutting the recovery at every phase boundary. |
-| 1.9 | Consistency-affecting state managed with state machines | **5** (new item) | Seven focused machines plus one precedence are declared together in `cdc_flight/machines.py`: `table_lifecycle`, `run_phase`, `acquisition_recovery`, `interruption_marker`, `destination_ownership`, `catalog_change`, and `catalog_baseline`, plus `run_outcome` as cause-before-symptom precedence. The inventories are generated from those declarations. Failed quiescence is published inside the supervisor's `finally`, and marker retirement is a declared edge, so neither state depends on exception-summary shape. This satisfies the literal 5 band (“an appropriate number of state machines, over 1”). |
+| 1.9 | Consistency-affecting state managed with state machines | **5** (new item) | Seven focused machines plus one precedence are declared together in `cdc_flight/machines.py`: `table_lifecycle`, `run_phase`, `acquisition_recovery`, `interruption_marker`, `destination_ownership`, `catalog_change`, and `catalog_baseline`, plus `run_outcome` as cause-before-symptom precedence. The inventories are generated from those declarations. Failed quiescence is published inside the supervisor's `finally`; marker preparation refuses `armed` and retires `consumed` only through its declared edge. This satisfies the literal 5 band (“an appropriate number of state machines, over 1”). |
 | 2.1 | Added / dropped columns handled | 2 | Adds work correctly; a dropped column silently lingers and reads NULL, indistinguishable from a real NULL. |
 | 2.2 | Renamed columns handled well | 1 | Rename lands as "new column + old column silently goes NULL". No tombstone, no linkage. |
 | 2.3 | New tables and schemas auto-discovered | 1 | Needs `ALTER PUBLICATION` + config change + restart, and pre-existing rows are silently never snapshotted. |
@@ -1532,7 +1532,7 @@ raising `IllegalTransition`, `machine.parse()` raising `UnknownState`, and
 `machine.table()` emitting the transition table as data. `cdc_flight/machines.py` is the
 one file a reviewer reads to see every consistency-affecting state in the system.
 
-#### Four measured bugs are now edges that do not exist
+#### Five measured bugs are now edges that do not exist
 
 Each of these is a test in `tests/1.9_state_machines/`, named after the finding:
 
@@ -1550,6 +1550,11 @@ Each of these is a test in `tests/1.9_state_machines/`, named after the finding:
 * `ACQUISITION_RECOVERY.check("requested", "armed")` **raises**, and `-> absent` is
   reachable only from `armed`. No caller can claim a slot was dropped that never was, and
   no caller can clear a journal that still describes a half-done destructive sequence.
+* `INTERRUPTION_MARKER.check("armed", "absent")` and `check("armed", "armed")`
+  **raise**. Preparing a new re-snapshot reads the existing marker first, refuses an
+  undischarged `armed` obligation without changing its marker or offsets, and retires a
+  terminal predecessor only through `consumed -> absent` before taking
+  `absent -> armed`.
 
 #### The behavioural changes, not just the checks
 
@@ -1602,7 +1607,8 @@ a count. Full table in ADR §20/A55.
 
 | what | where | cost |
 |---|---|---|
-| the mechanism, and the four bugs as illegal edges | `tests/1.9_state_machines/test_1_9_machines.py` | ms |
+| the mechanism, and the five bugs as illegal edges | `tests/1.9_state_machines/test_1_9_machines.py` | ms |
+| interruption preparation at `armed`, terminal replacement, and cleanup-to-arm cuts | `tests/1.9_state_machines/test_1_9_destination_ownership.py` | ms |
 | one writer, the `in_progress` residue, the owed queue, `--reset-state`, alerts | `tests/1.9_state_machines/test_1_9_table_lifecycle.py` | ms |
 | the durable phase row, the precedence, the migration, the independent connection | `tests/1.9_state_machines/test_1_9_run_state.py` | ms |
 | the per-relation state and the fence | `tests/1.9_state_machines/test_1_9_catalog_change.py` | ms |
@@ -1624,6 +1630,11 @@ of state machines (over 1).” Seven focused machines own seven concepts, and
 cross-process recovery obligation, and `destination_ownership` owns the terminal
 failed-quiescence handoff. Their state and edge counts in this document and the ADR are
 mechanically compared with `machines.py`.
+
+The interruption owner also enforces that inventory at its destructive boundary.
+Preparation refuses `armed` before filesystem cleanup, retires `consumed` through the
+declared edge, and may directly remove sibling files only while the marker state is
+`absent`; cleanup failure is fatal before a replacement offset store can start.
 
 Its safety partition is explicit and conservative. Every state except `valid`, including
 the no-row pseudo-state `absent`, is untrusted; only a confirmed baseline permits an
