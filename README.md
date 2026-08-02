@@ -88,7 +88,11 @@ make reset
 ### What each step actually does
 
 * **`make up`** → `scripts/pg.sh start`. First run does `initdb` into the disposable
-  `CDC_TEST_PGDATA` test cluster and appends `wal_level=logical`, replication capacities
+  derived `CDC_TEST_PGDATA` test cluster and appends `wal_level=logical`, replication capacities
+  and test-only durability settings only after creating a disposable-cluster sentinel.
+  A legacy canonical test directory can be recreated once with
+  `CDC_TEST_RECREATE_UNMARKED_DISPOSABLE=1 make pg-reset`; non-derived data paths
+  are always refused.
   `16/16/4` (slots/senders/logical workers), `port=CDC_TEST_PGPORT`, and
   `unix_socket_directories=CDC_TEST_PGSOCKET` to `postgresql.conf`. It also disables `fsync`,
   `synchronous_commit`, and `full_page_writes` **only in this disposable cluster**;

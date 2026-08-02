@@ -52,6 +52,7 @@ TEST_PGSOCKET = Path(os.environ.get("CDC_TEST_PGSOCKET", str(TEST_PGDATA)))
 TEST_PGLOG = Path(
     os.environ.get("CDC_TEST_PGLOG", str(TEST_PGDATA / "server.log"))
 )
+TEST_CLUSTER_SENTINEL = TEST_PGDATA / ".cdc_flight_disposable_test_cluster"
 
 
 def _safe_instance_id(value: str) -> str:
@@ -290,6 +291,11 @@ def _template_database_name() -> str:
 
 def _isolated_source(dbname: str) -> SourceConfig:
     source = SourceConfig(dbname=dbname)
+    if source.host != "127.0.0.1":
+        pytest.fail(
+            f"test isolation refused non-local Postgres host {source.host!r}; "
+            "expected '127.0.0.1'"
+        )
     if source.port != TEST_PGPORT:
         pytest.fail(
             f"test isolation refused to use Postgres port {source.port}; "
@@ -298,8 +304,37 @@ def _isolated_source(dbname: str) -> SourceConfig:
     return source
 
 
+_VERIFIED_CLUSTER_IDENTITY: tuple[str, int, Path] | None = None
+
+
+def _require_disposable_cluster(source: SourceConfig) -> None:
+    """Prove destructive test operations target this provisioned test cluster."""
+    global _VERIFIED_CLUSTER_IDENTITY
+    expected = (source.host, source.port, TEST_PGDATA.resolve())
+    if expected == _VERIFIED_CLUSTER_IDENTITY:
+        return
+    if source.host != "127.0.0.1":
+        raise RuntimeError(f"refusing destructive operation on host {source.host!r}")
+    if not TEST_CLUSTER_SENTINEL.is_file():
+        raise RuntimeError(
+            f"refusing destructive operation: missing {TEST_CLUSTER_SENTINEL}"
+        )
+    admin = replace(source, dbname="postgres")
+    with psycopg.connect(admin.dsn, autocommit=True, connect_timeout=10) as conn:
+        data_directory = Path(conn.execute("SHOW data_directory").fetchone()[0]).resolve()
+        server_port = int(conn.execute("SHOW port").fetchone()[0])
+    if data_directory != expected[2] or server_port != TEST_PGPORT:
+        raise RuntimeError(
+            "refusing destructive operation on unexpected cluster: "
+            f"data_directory={data_directory}, port={server_port}; "
+            f"expected {expected[2]}, port={TEST_PGPORT}"
+        )
+    _VERIFIED_CLUSTER_IDENTITY = expected
+
+
 def _drop_database(admin: SourceConfig, dbname: str) -> None:
     """Terminate this disposable database's backends, slots, and database."""
+    _require_disposable_cluster(admin)
     with psycopg.connect(admin.dsn, autocommit=True) as conn:
         conn.execute(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "

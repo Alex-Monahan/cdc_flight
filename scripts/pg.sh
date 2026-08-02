@@ -22,7 +22,26 @@ if [[ "${PGPORT}" == "${DEFAULT_PGPORT}" ]]; then
 else
   DEFAULT_PGDATA="${PROJECT_DIR}/.pgdata_${PGPORT}"
 fi
-export PGDATA="${CDC_TEST_PGDATA:-${PGDATA:-${DEFAULT_PGDATA}}}"
+
+canonical_path() {
+  local candidate="$1"
+  local parent
+  parent="$(dirname "${candidate}")"
+  if [[ ! -d "${parent}" ]]; then
+    echo "ERROR: parent directory does not exist: ${parent}" >&2
+    return 2
+  fi
+  printf '%s/%s\n' "$(cd "${parent}" && pwd -P)" "$(basename "${candidate}")"
+}
+
+EXPECTED_PGDATA="$(canonical_path "${DEFAULT_PGDATA}")"
+CONFIGURED_PGDATA="$(canonical_path "${CDC_TEST_PGDATA:-${DEFAULT_PGDATA}}")"
+if [[ "${CONFIGURED_PGDATA}" != "${EXPECTED_PGDATA}" ]]; then
+  echo "ERROR: refusing non-derived CDC_TEST_PGDATA '${CONFIGURED_PGDATA}'" >&2
+  echo "       selected port ${PGPORT} owns only '${EXPECTED_PGDATA}'" >&2
+  exit 2
+fi
+export PGDATA="${EXPECTED_PGDATA}"
 export CDC_TEST_PGDATA="${PGDATA}"
 PGSOCKET="${CDC_TEST_PGSOCKET:-${PGSOCKET:-${PGDATA}}}"
 export CDC_TEST_PGSOCKET="${PGSOCKET}"
@@ -33,6 +52,8 @@ PGDATABASE_NAME="${CDC_TEST_PGDATABASE:-${PGDATABASE:-cdc_source}}"
 export PGDATABASE="${PGDATABASE_NAME}"
 LOGFILE="${CDC_TEST_PGLOG:-${PGDATA}/server.log}"
 export CDC_TEST_PGLOG="${LOGFILE}"
+TEST_CLUSTER_SENTINEL="${PGDATA}/.cdc_flight_disposable_test_cluster"
+TEST_ONLY_CONFIG="${PGDATA}/cdc_flight_test_only.conf"
 
 if [[ ! -x "${PGBIN}/initdb" ]]; then
   echo "ERROR: PostgreSQL ${PG_VERSION} binaries not found at ${PGBIN}" >&2
@@ -45,6 +66,11 @@ fi
 
 cmd_init() {
   if [[ -f "${PGDATA}/PG_VERSION" ]]; then
+    if [[ ! -f "${TEST_CLUSTER_SENTINEL}" ]]; then
+      echo "ERROR: refusing unmarked cluster at ${PGDATA}" >&2
+      echo "       recreate it with this disposable test provisioner" >&2
+      exit 2
+    fi
     echo "Cluster already initialised at ${PGDATA} (use 'reset' to recreate)."
     return 0
   fi
@@ -65,6 +91,8 @@ cmd_init() {
     --encoding=UTF8 \
     --locale=C >/dev/null
   rm -f "${pwfile}"
+  printf 'cdc_flight disposable test cluster\nport=%s\n' "${PGPORT}" \
+    > "${TEST_CLUSTER_SENTINEL}"
 
   # Logical decoding + isolation from the developer's default cluster.
   cat >> "${PGDATA}/postgresql.conf" <<EOF
@@ -76,17 +104,12 @@ unix_socket_directories = '${PGSOCKET}'
 
 # Logical replication (required by Debezium / pgoutput)
 wal_level = logical
-# Twelve xdist workers need at most one active slot/sender each; leave four
-# spare slots/senders for throwaway resnapshot/recovery connections.
-max_replication_slots = 16
-max_wal_senders = 16
+# Twelve xdist workers may each retain a base slot while a throwaway re-snapshot
+# slot is active; provide that 24-slot worst case plus four slots of headroom.
+max_replication_slots = 28
+max_wal_senders = 28
 max_logical_replication_workers = 4
-
-# This cluster is disposable test infrastructure. Keep logical decoding enabled,
-# but avoid durability work whose only consumer is a throwaway test database.
-fsync = off
-synchronous_commit = off
-full_page_writes = off
+include = 'cdc_flight_test_only.conf'
 
 # Keep the dev cluster small & chatty enough to debug
 shared_buffers = 256MB
@@ -96,6 +119,16 @@ log_min_duration_statement = 2000
 
 # Surface TOAST + logical-decoding behaviour quickly in tests
 wal_sender_timeout = 60s
+EOF
+  if [[ ! -f "${TEST_CLUSTER_SENTINEL}" ]]; then
+    echo "ERROR: test-only settings require ${TEST_CLUSTER_SENTINEL}" >&2
+    exit 2
+  fi
+  cat > "${TEST_ONLY_CONFIG}" <<EOF
+# Generated only for the sentinel-marked disposable cluster at ${PGDATA}.
+fsync = off
+synchronous_commit = off
+full_page_writes = off
 EOF
   echo "Initialised. Data dir: ${PGDATA}"
 }
@@ -133,6 +166,13 @@ cmd_status() {
 }
 
 cmd_reset() {
+  if [[ -e "${PGDATA}" && ! -f "${TEST_CLUSTER_SENTINEL}" \
+        && "${CDC_TEST_RECREATE_UNMARKED_DISPOSABLE:-0}" != "1" ]]; then
+    echo "ERROR: refusing to remove unmarked directory ${PGDATA}" >&2
+    echo "       set CDC_TEST_RECREATE_UNMARKED_DISPOSABLE=1 only to migrate" >&2
+    echo "       this canonical derived test path to the sentinel boundary" >&2
+    exit 2
+  fi
   cmd_stop
   echo "Removing ${PGDATA}..."
   rm -rf "${PGDATA}"

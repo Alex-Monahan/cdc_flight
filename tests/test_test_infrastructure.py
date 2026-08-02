@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
+import subprocess
 from pathlib import Path
 
 import conftest
@@ -44,6 +46,46 @@ def test_run_and_setup_locks_are_distinct_and_instance_scoped():
     assert conftest.TEST_LOCK_PATH != conftest.TEST_SETUP_LOCK_PATH
     assert conftest.TEST_INSTANCE_ID in conftest.TEST_LOCK_PATH.name
     assert conftest.TEST_INSTANCE_ID in conftest.TEST_SETUP_LOCK_PATH.name
+
+
+def test_test_source_rejects_a_remote_pghost(monkeypatch):
+    monkeypatch.setenv("PGHOST", "db.example.invalid")
+
+    with pytest.raises(pytest.fail.Exception, match="refused non-local"):
+        conftest._isolated_source("postgres")
+
+
+def test_provisioner_refuses_a_non_derived_data_directory(tmp_path: Path):
+    env = {
+        **os.environ,
+        "CDC_TEST_PGPORT": str(conftest.TEST_PGPORT),
+        "CDC_TEST_PGDATA": str(tmp_path / "arbitrary-pgdata"),
+    }
+
+    proc = subprocess.run(
+        [str(conftest.PG_SH), "init"],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+
+    assert proc.returncode == 2
+    assert "refusing non-derived CDC_TEST_PGDATA" in proc.stderr
+
+
+def test_destructive_guard_requires_the_provisioner_sentinel(monkeypatch, tmp_path):
+    monkeypatch.setattr(conftest, "TEST_PGDATA", tmp_path)
+    monkeypatch.setattr(
+        conftest,
+        "TEST_CLUSTER_SENTINEL",
+        tmp_path / ".cdc_flight_disposable_test_cluster",
+    )
+    monkeypatch.setattr(conftest, "_VERIFIED_CLUSTER_IDENTITY", None)
+    source = conftest.SourceConfig(host="127.0.0.1", port=conftest.TEST_PGPORT)
+
+    with pytest.raises(RuntimeError, match="missing"):
+        conftest._require_disposable_cluster(source)
 
 
 @pytest.mark.parametrize("requested", [6, 10])
