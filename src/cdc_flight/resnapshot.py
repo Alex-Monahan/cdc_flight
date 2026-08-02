@@ -124,6 +124,7 @@ from .errors import EngineFailure
 from .naming import quote
 from .ownership import DestinationOwnership
 from .resnapshot_recovery import InterruptionRecovery
+from .snapshot_completion import SnapshotCompletion
 from .source_health import SourceHealth
 
 log = logging.getLogger("cdc_flight.resnapshot")
@@ -373,6 +374,7 @@ def run(
     health = None
     applier = None
     source_stopped = False
+    completion = SnapshotCompletion.full_snapshot()
     try:
         applier = Applier(
             con,
@@ -387,6 +389,7 @@ def run(
             runner_id=runner_id,
             transactional_ddl=transactional_ddl,
             catalog=None,
+            completion=completion,
         )
         ownership.attach(applier)
         from .engine import SupervisedDebeziumEngine
@@ -417,15 +420,18 @@ def run(
                     min_records=0,
                 ),
                 health,
-                stop_when=lambda: applier.snapshot_completed,
+                stop_when=lambda: completion.completed,
+                completion=completion,
                 quiescence_observer=ownership.quiescence_observer(applier),
             )
         finally:
             health.stop()
             watcher.stop()
             source_stopped = True
-            outcome.snapshot_phase_ended = applier.snapshot_final_seen
-            outcome.tables_scanned = sorted(applier.snapshot_tables_seen)
+            # This is the same semantic fact the supervisor used to authorize the
+            # stop and the emptiness decision below; sample it once for the outcome.
+            outcome.snapshot_phase_ended = completion.phase_ended
+            outcome.tables_scanned = sorted(completion.tables_seen)
         outcome.engine_stop_reason = str(summary.get("stop_reason"))
         outcome.events = int(summary.get("applied_events") or 0)
 
@@ -443,10 +449,8 @@ def run(
         evidence = _gather_emptiness_evidence(
             source.dsn,
             pending=pending,
-            snapshot_phase_ended=snapshot_phase_ended(
-                applier, str(outcome.engine_stop_reason)
-            ),
-            tables_seen=set(applier.snapshot_tables_seen),
+            snapshot_phase_ended=outcome.snapshot_phase_ended,
+            tables_seen=completion.tables_seen,
         )
         outcome.empty_check_lsn = evidence.wal_lsn
         outcome.emptied = finish_verified_empty_tables(
@@ -522,27 +526,9 @@ def run(
             recovery.retire_terminal_resources(dsn=source.dsn, slot=slot)
 
 
-def snapshot_phase_ended(applier, stop_reason: str) -> bool:
-    """Did the engine reach the end of the WHOLE requested snapshot? Two ways to know.
-
-    1. **Debezium said so.** `snapshot='last'` rides on the final snapshot record, so any
-       capture set with at least one row produces it. This is the ordinary case and the
-       one that fixes the batch-boundary defect (A52).
-    2. **There were no records at all AND the connector reached streaming.** An entirely
-       empty capture set emits nothing, so there is no record for the marker to ride on —
-       and if the marker were the only evidence accepted, a genuinely empty table could
-       never complete and the re-snapshot would fail on every run for ever. `stop_reason
-       == 'idle'` is the positive evidence: `SourceHealth.may_declare_idle()` requires
-       the slot to have been *streaming*, and the connector only streams once its
-       snapshot phase is over. Every other exit from `run_engine_bounded` raises.
-
-    Anything else — `max_seconds`, `work_done` without a marker, a stop we did not ask
-    for — means the engine may have been interrupted mid-scan, and a table it had not
-    reached must not be mistaken for an empty one.
-    """
-    if applier.snapshot_final_seen:
-        return True
-    return not applier.snapshot_tables_seen and stop_reason == "idle"
+def snapshot_phase_ended(completion: SnapshotCompletion) -> bool:
+    """Compatibility projection of the canonical completion policy."""
+    return completion.phase_ended
 
 
 def reassert_owed(
@@ -842,9 +828,8 @@ def finish_empty_tables_after_main_snapshot(
     dataset: str,
     dsn: str,
     owed: list[tuple[str, str, str]],
-    applier,
-    stop_reason: str,
-) -> list[str]:
+    completion: SnapshotCompletion,
+) -> tuple[list[str], int | None]:
     """Close out the tables a MAIN-engine snapshot left owed because they are empty.
 
     A source relation with zero rows emits no snapshot records at all, so
@@ -877,8 +862,8 @@ def finish_empty_tables_after_main_snapshot(
     evidence = _gather_emptiness_evidence(
         dsn,
         pending=owed,
-        snapshot_phase_ended=snapshot_phase_ended(applier, stop_reason),
-        tables_seen=set(applier.snapshot_tables_seen),
+        snapshot_phase_ended=completion.phase_ended,
+        tables_seen=completion.tables_seen,
     )
     emptied = finish_verified_empty_tables(
         con,

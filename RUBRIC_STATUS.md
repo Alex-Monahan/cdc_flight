@@ -367,7 +367,7 @@ correct assumptions in the notes below:
 | 1.6 | Snapshot/backfill consistent with CDC | ~~3~~ → **5** | Postgres's **exported snapshot** makes the boundary an iff, and the fence is on the transaction's **commit** LSN, so a transaction straddling `C` is applied in full rather than lost. Proven with ~200 transactions committing throughout a snapshot — every row on exactly one side. A re-snapshot is complete only when **every requested table** reaches a terminal state: swapped, or verified empty on three independent facts (Debezium's own end-of-snapshot marker, zero records for that table, and a source count of zero). A disagreement between the two readings of `C` is fatal. Proven against a four-table re-snapshot with a keyless table, a genuinely empty table and a concurrent writer. |
 | 1.7 | Failures do not cause correctness issues | ~~1~~ ~~4~~ → **3** | **Twenty-one in-process anchors**: eight protocol, five destination (including the genuinely ambiguous `destination_commit_late`), seven recovery/catalog-baseline, and one source-catalog fault, plus a real network blackhole injected from outside the process. The matrix is enumerated from `faults.ALL_POINTS`, every anchor writes a machine-readable fired record, and the chaos harness asserts each workload affected source rows before arming. Round 7 still scores this 3/5: substantial evidence, but repeated adversarial compositions were found outside the suite, so the 5-band's “robust injection” is not yet the reviewer's verdict. |
 | 1.8 | Externally-advanced slot detected → backfill | ~~1~~ → **5** | Checked on every slot acquisition. Seven decisions trigger an **automatic** re-snapshot: slot ahead, slot missing, slot recreated, source identity changed, **source timeline forked**, source WAL rewound, and an empty destination with a positioned slot. The recovery is a **journalled state machine**: the intent is durable before any mutation, every step is idempotent and re-entrant after a crash at any phase, and a slot that will not drop fails the recovery rather than being logged and stepped over. A **populated** destination with no resume point refuses instead of being rebuilt. Proven by comparing the whole destination against the whole source after a real `pg_replication_slot_advance` and a real `pg_drop_replication_slot`, and by cutting the recovery at every phase boundary. |
-| 1.9 | Consistency-affecting state managed with state machines | **5** (new item) | Seven focused machines plus one precedence are declared together in `cdc_flight/machines.py`: `table_lifecycle`, `run_phase`, `acquisition_recovery`, `interruption_marker`, `destination_ownership`, `catalog_change`, and `catalog_baseline`, plus `run_outcome` as cause-before-symptom precedence. The inventories are generated from those declarations. Failed quiescence is published inside the supervisor's `finally`; marker preparation refuses `armed` and retires `consumed` only through its declared edge. This satisfies the literal 5 band (“an appropriate number of state machines, over 1”). |
+| 1.9 | Consistency-affecting state managed with state machines | **5** (new item) | Eight focused machines plus one precedence are declared together in `cdc_flight/machines.py`, including `snapshot_completion`, the one owner of snapshot terminal evidence. The inventories are generated from those declarations. Failed quiescence is published inside the supervisor's `finally`; marker preparation refuses `armed` and retires `consumed` only through its declared edge. This satisfies the literal 5 band (“an appropriate number of state machines, over 1”). |
 | 2.1 | Added / dropped columns handled | 2 | Adds work correctly; a dropped column silently lingers and reads NULL, indistinguishable from a real NULL. |
 | 2.2 | Renamed columns handled well | 1 | Rename lands as "new column + old column silently goes NULL". No tombstone, no linkage. |
 | 2.3 | New tables and schemas auto-discovered | 1 | Needs `ALTER PUBLICATION` + config change + restart, and pre-existing rows are silently never snapshotted. |
@@ -1485,7 +1485,7 @@ ours, it runs before the engine starts, and it does not depend on Debezium notic
 
 ### 1.9 Consistency-affecting state managed with state machines — **5 / 5**
 
-> **Current inventory: seven machines plus one precedence; score 5/5.** Round 7 awarded
+> **Current inventory: eight machines plus one precedence; score 5/5.** Round 7 awarded
 > 5/5 on the then-current five-machine inventory. Later reviews correctly identified
 > callback ownership and filesystem interruption recovery as two more
 > consistency-affecting states; both are now declared and mechanically inventoried.
@@ -1511,7 +1511,7 @@ therefore mutated by a path the design did not enumerate.**
 Explicit machines do not make the system correct. They make the **unenumerated path** a
 run-time error instead of a review finding.
 
-#### What was built — seven machines and one precedence
+#### What was built — eight machines and one precedence
 
 | machine | owns | states | edges | persistence |
 |---|---|---|---|---|
@@ -1523,6 +1523,7 @@ run-time error instead of a review finding.
 | `destination_ownership` | who owns the destination after callback admission or failed quiescence | 4 | 5 | **memory only** |
 | `catalog_change` | where is one DDL fact in observe → confirm → fence → apply | 9 | 30 | **memory only** |
 | `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
+| `snapshot_completion` | has this engine invocation's snapshot phase ended | 4 | 5 | **memory only** |
 
 Style, deliberately minimal: `cdc_flight/states.py` is 293 lines with **no dependencies**
 — plain-`str` states (they are already durable strings in `VARCHAR` columns, in

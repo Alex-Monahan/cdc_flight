@@ -2904,6 +2904,20 @@ predates this table reads `absent` and may already hold rows it has no identity 
 it reconciles like any other unconfirmed baseline rather than being trusted for having
 made no claim — see A63.4.
 
+**`snapshot_completion`** — Has this engine invocation's snapshot phase ended, with
+positive evidence for a nonempty or legitimately empty capture set?
+
+persistence: **memory only** · initial: `pending` · terminal: `record_complete`,
+`empty_complete`, `not_required`
+
+| from | to | terminal |
+|---|---|---|
+| `pending` | `record_complete` | yes |
+| `pending` | `empty_complete` | yes |
+| `record_complete` | `record_complete` | yes |
+| `empty_complete` | `empty_complete` | yes |
+| `not_required` | `not_required` | yes |
+
 #### A51.2 — the inventory, anchored to those edges
 
 | # | machine · edge | failure mode | detection | recovery | crash cut | class |
@@ -3281,7 +3295,7 @@ machine is ceremony — worse than ceremony, because it advertises recoverable i
 states that do not exist. If yes, the state needs a name, a persisted value and a
 transition table.
 
-#### What was built (seven machines + one precedence)
+#### What was built (eight machines + one precedence)
 
 | machine | owns | states | edges | persistence |
 |---|---|---|---|---|
@@ -3293,6 +3307,7 @@ transition table.
 | `destination_ownership` | who owns the destination after callback admission or failed quiescence | 4 | 5 | **memory only** |
 | `catalog_change` | where is one DDL fact in observe → confirm → fence → apply | 9 | 30 | **memory only** |
 | `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
+| `snapshot_completion` | has this engine invocation's snapshot phase ended | 4 | 5 | **memory only** |
 
 Generated transition tables: §A51.1. Declarations: `cdc_flight/machines.py`, which is one
 file an operator or a reviewer can read to see every consistency-affecting state in the

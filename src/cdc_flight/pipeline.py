@@ -67,6 +67,7 @@ from .machines import (
 )
 from .ownership import DestinationOwnership
 from .run_state import RunOutcome, RunPhaseWriter
+from .snapshot_completion import SnapshotCompletion
 from .source_health import SourceHealth
 from .supervisor import run_engine_bounded
 
@@ -581,6 +582,11 @@ def run(
         # Imported late: importing pydbzengine boots a JVM.
         from .engine import SupervisedDebeziumEngine
 
+        snapshot_completion = (
+            SnapshotCompletion.full_snapshot()
+            if will_snapshot_everything
+            else SnapshotCompletion.streaming_only()
+        )
         applier = Applier(
             con,
             pipeline=dest.pipeline_name,
@@ -595,8 +601,8 @@ def run(
             transactional_ddl=transactional_ddl,
             catalog=watcher,
             watermarks=watermarks,
+            completion=snapshot_completion,
         )
-        applier.snapshot_completion_required = will_snapshot_everything
         ownership.attach(applier)
         engine = SupervisedDebeziumEngine(
             properties=props,
@@ -649,6 +655,7 @@ def run(
                 # ordinary run and a severe result could be published as the mild
                 # default.
                 outcome=outcome,
+                completion=snapshot_completion,
                 quiescence_observer=ownership.quiescence_observer(applier),
             )
             summary_extra["invariant_o_end"] = reconcile_mod.check_invariant_o(
@@ -706,8 +713,7 @@ def run(
                     dataset=dest.dataset_name,
                     dsn=source.dsn,
                     owed=dest_mod.tables_awaiting_snapshot(con, dest.pipeline_name),
-                    applier=applier,
-                    stop_reason=str(result.get("stop_reason")),
+                    completion=snapshot_completion,
                 )
                 if emptied:
                     summary_extra["verified_empty_after_snapshot"] = emptied

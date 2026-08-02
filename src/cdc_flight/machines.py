@@ -2,7 +2,7 @@
 
 Rubric 1.9 asks that *any state that can affect consistency is managed with a state
 machine approach*, and grades **an appropriate number of machines (more than one)** at
-5. This file is what "appropriate" means here: seven machines, each owning one state,
+5. This file is what "appropriate" means here: eight machines, each owning one state,
 each with a declared edge set — plus the frozen decision domains, which are
 classifications rather than states and are deliberately **not** dressed up as machines.
 The count is not the claim; coverage is. See SM-G for `CatalogBaseline`, the fifth
@@ -227,6 +227,43 @@ RUN_OUTCOME = ranked(
 #: `EngineFailure` in the case that is one. Calling every `engine_finished` a failure
 #: made `RunOutcome.failed` disagree with the run's own verdict.
 OUTCOME_FAILURES = frozenset(OUTCOME_ORDER[OUTCOME_ORDER.index("hung"):])
+
+
+# --------------------------------------------------------------------------- #
+# SM-B(iii) · SnapshotCompletion — memory only, per engine invocation
+# --------------------------------------------------------------------------- #
+SNAPSHOT_PENDING = "pending"
+SNAPSHOT_RECORD_COMPLETE = "record_complete"
+SNAPSHOT_EMPTY_COMPLETE = "empty_complete"
+SNAPSHOT_NOT_REQUIRED = "not_required"
+
+SNAPSHOT_COMPLETION = Machine(
+    "snapshot_completion",
+    states=(
+        SNAPSHOT_PENDING,
+        SNAPSHOT_RECORD_COMPLETE,
+        SNAPSHOT_EMPTY_COMPLETE,
+        SNAPSHOT_NOT_REQUIRED,
+    ),
+    edges=(
+        (SNAPSHOT_PENDING, SNAPSHOT_RECORD_COMPLETE),
+        (SNAPSHOT_PENDING, SNAPSHOT_EMPTY_COMPLETE),
+        (SNAPSHOT_RECORD_COMPLETE, SNAPSHOT_RECORD_COMPLETE),
+        (SNAPSHOT_EMPTY_COMPLETE, SNAPSHOT_EMPTY_COMPLETE),
+        (SNAPSHOT_NOT_REQUIRED, SNAPSHOT_NOT_REQUIRED),
+    ),
+    terminal=(
+        SNAPSHOT_RECORD_COMPLETE,
+        SNAPSHOT_EMPTY_COMPLETE,
+        SNAPSHOT_NOT_REQUIRED,
+    ),
+    initial=SNAPSHOT_PENDING,
+    durable=None,
+    purpose=(
+        "Has this engine invocation's snapshot phase ended, proven either by a "
+        "committed Debezium terminal record or by a source-confirmed empty phase?"
+    ),
+)
 
 
 # --------------------------------------------------------------------------- #

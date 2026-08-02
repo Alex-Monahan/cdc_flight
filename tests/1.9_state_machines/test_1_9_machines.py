@@ -105,6 +105,7 @@ DECLARED = {
     "catalog_baseline",
     "interruption_marker",
     "destination_ownership",
+    "snapshot_completion",
 }
 
 

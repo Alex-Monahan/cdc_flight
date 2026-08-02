@@ -26,6 +26,7 @@ from cdc_flight.engine import SupervisedDebeziumEngine
 from cdc_flight.errors import EngineFailure, OffsetFlushFailed
 from cdc_flight.faults import FaultSpecError, parse_spec
 from cdc_flight.pipeline import run_engine_bounded
+from cdc_flight.snapshot_completion import SnapshotCompletion
 
 
 # --------------------------------------------------------------------------- #
@@ -89,6 +90,20 @@ class FakeHandler:
 
     def stats(self):
         return {}
+
+
+class EmptySnapshotHealth:
+    """Source-side positive evidence that an empty snapshot reached streaming."""
+
+    ever_sampled = True
+    unknown_for = 0.0
+    not_streaming_for = 0.0
+
+    def may_declare_idle(self, *, min_seconds):
+        return True
+
+    def summary(self):
+        return {"slot_health": "streaming"}
 
 
 def _run_cfg(**kwargs) -> RunConfig:
@@ -168,11 +183,28 @@ def test_initial_snapshot_cannot_declare_idle_with_zero_records():
             engine,
             handler,
             _run_cfg(max_seconds=0.6, idle_seconds=0.01, close_timeout=1),
+            completion=SnapshotCompletion.full_snapshot(),
         )
 
     assert excinfo.value.summary["records"] == 0
     assert excinfo.value.summary["stop_reason"] == "max_seconds"
     assert "snapshot did not complete" in str(excinfo.value)
+
+
+def test_all_empty_snapshot_completes_from_source_streaming_evidence():
+    handler = FakeHandler(snapshot_completion_required=True)
+    handler.seconds_since_last_batch = 99
+    summary = run_engine_bounded(
+        FakeEngine(run_seconds=1),
+        handler,
+        _run_cfg(max_seconds=2, idle_seconds=0.01, close_timeout=1),
+        health=EmptySnapshotHealth(),
+        completion=SnapshotCompletion.full_snapshot(),
+    )
+
+    assert summary["stop_reason"] == "idle"
+    assert summary["snapshot_completion_state"] == "empty_complete"
+    assert summary["snapshot_completed"] is True
 
 
 def test_a_non_quiescent_callback_keeps_ownership_and_is_not_drained():

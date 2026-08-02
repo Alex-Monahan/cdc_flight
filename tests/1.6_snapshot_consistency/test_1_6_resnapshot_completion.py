@@ -23,13 +23,17 @@ evidence lives in `test_1_6_resnapshot_multi_table.py`.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import duckdb
 import pytest
 from applier_lab import DATASET, Lab, snap
 
 from cdc_flight import destination as dest_mod
 from cdc_flight import resnapshot as resnapshot_mod
+from cdc_flight.assembler import UNIT_SNAPSHOT_CHUNK
 from cdc_flight.errors import EngineFailure
+from cdc_flight.snapshot_completion import SnapshotCompletion
 
 PIPELINE = "test_resnap_completion"
 
@@ -246,13 +250,33 @@ def test_a_verified_empty_table_is_emptied_and_fenced_at_the_verified_lsn(tmp_pa
 # --------------------------------------------------------------------------- #
 class _FakeApplier:
     def __init__(self, final_seen: bool, seen: set[str]):
-        self.snapshot_final_seen = final_seen
-        self.snapshot_tables_seen = seen
+        self.completion = SnapshotCompletion.full_snapshot()
+        units = [
+            SimpleNamespace(
+                kind=UNIT_SNAPSHOT_CHUNK,
+                schema=qualified.split(".")[0],
+                table=qualified.split(".")[1],
+                snapshot_last=final_seen,
+                fenced=False,
+            )
+            for qualified in seen
+        ]
+        if final_seen and not units:
+            units = [
+                SimpleNamespace(
+                    kind=UNIT_SNAPSHOT_CHUNK,
+                    schema="app",
+                    table="customers",
+                    snapshot_last=True,
+                    fenced=False,
+                )
+            ]
+        self.completion.observe_committed_group(units, snapshot_active=not final_seen)
 
 
 def test_debeziums_own_marker_ends_the_snapshot_phase():
     applier = _FakeApplier(True, {"app.customers"})
-    assert resnapshot_mod.snapshot_phase_ended(applier, "work_done") is True
+    assert resnapshot_mod.snapshot_phase_ended(applier.completion) is True
 
 
 def test_an_entirely_empty_capture_set_ends_when_the_connector_reaches_streaming():
@@ -264,15 +288,17 @@ def test_an_entirely_empty_capture_set_ends_when_the_connector_reaches_streaming
     the connector only streams once its snapshot is over.
     """
     applier = _FakeApplier(False, set())
-    assert resnapshot_mod.snapshot_phase_ended(applier, "idle") is True
+    applier.completion.observe_source_streaming()
+    assert resnapshot_mod.snapshot_phase_ended(applier.completion) is True
 
 
 def test_an_interrupted_engine_never_counts_as_an_ended_snapshot_phase():
-    for stop_reason in ("max_seconds", "work_done", "hung", "engine_error", "source_dark"):
-        assert resnapshot_mod.snapshot_phase_ended(_FakeApplier(False, set()), stop_reason) is False
+    for _stop_reason in ("max_seconds", "work_done", "hung", "engine_error", "source_dark"):
+        completion = _FakeApplier(False, set()).completion
+        assert resnapshot_mod.snapshot_phase_ended(completion) is False
     # ... and neither does a run that scanned SOMETHING but never saw the marker.
     assert resnapshot_mod.snapshot_phase_ended(
-        _FakeApplier(False, {"app.customers"}), "idle"
+        _FakeApplier(False, {"app.customers"}).completion
     ) is False
 
 

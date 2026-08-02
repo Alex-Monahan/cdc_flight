@@ -23,6 +23,7 @@ from .config import RunConfig
 from .errors import EngineFailure
 from .machines import PHASE_DRAINING
 from .run_state import RunOutcome
+from .snapshot_completion import SnapshotCompletion
 from .source_health import SourceHealth
 
 if TYPE_CHECKING:  # `engine` imports pydbzengine, which boots a JVM on import.
@@ -53,6 +54,7 @@ def run_engine_bounded(
     catalog=None,
     catalog_drain_seconds: float = 30.0,
     stop_when=None,
+    completion: SnapshotCompletion | None = None,
     phases=None,
     outcome: RunOutcome | None = None,
     quiescence_observer=None,
@@ -99,6 +101,10 @@ def run_engine_bounded(
     and the two owners could disagree about how badly a run had gone (Codex r1 MAJOR-2).
     The caller passes `phases.outcome`; the default keeps this function usable alone.
     """
+    # Production callers pass the policy selected during acquisition. The default keeps
+    # this low-level helper useful for streaming-only fakes without inventing a second
+    # completion definition.
+    completion = completion or SnapshotCompletion.streaming_only()
     started = time.monotonic()
     error_box: list[BaseException] = []
     final_poll_done = False
@@ -156,15 +162,21 @@ def run_engine_bounded(
                 break
             enough = handler.record_count >= run.min_records
             quiet = handler.seconds_since_last_batch >= run.idle_seconds
-            snapshot_complete = (
-                not getattr(handler, "snapshot_completion_required", False)
-                or handler.snapshot_completed
-            )
             # Never stop before the connector has had a chance to start, and
             # never stop while a commit group is being applied.
             warmed_up = elapsed >= min(run.idle_seconds, 5.0)
-            if enough and quiet and warmed_up and not handler.busy and snapshot_complete:
-                if health is None or health.may_declare_idle(min_seconds=run.idle_seconds):
+            if enough and quiet and warmed_up and not handler.busy:
+                source_idle = (
+                    health is None
+                    or health.may_declare_idle(min_seconds=run.idle_seconds)
+                )
+                if source_idle and health is not None:
+                    # A full snapshot with no rows has no terminal record. The same
+                    # source gate that proves stream idleness now supplies the one
+                    # positive empty-phase edge; a snapshot with records remains
+                    # pending until its committed Debezium marker arrives.
+                    completion.observe_source_streaming()
+                if source_idle and completion.phase_ended:
                     if catalog is not None and not final_poll_done:
                         # The synchronous final poll. A DROP that happened after the
                         # last scheduled poll is seen by THIS run, and it is also the
@@ -194,7 +206,7 @@ def run_engine_bounded(
                     outcome.record("idle")
                     break
                 idle_blocked_by_source += 1
-                if idle_blocked_by_source % 20 == 1:
+                if not source_idle and idle_blocked_by_source % 20 == 1:
                     log.warning(
                         "stream quiet for %.1fs but the source disagrees it is idle: %s",
                         handler.seconds_since_last_batch,
@@ -286,9 +298,7 @@ def run_engine_bounded(
         "offset_flushes_verified": engine.offset_flushes_verified,
         **handler.stats(),
     }
-    if getattr(handler, "snapshot_completion_required", False):
-        summary["snapshot_completion_required"] = True
-        summary["snapshot_completed"] = bool(handler.snapshot_completed)
+    summary.update(completion.as_dict())
     if close_hung:
         # Recorded even when it is not the reported reason, because "we could not shut
         # the engine down" is operationally interesting whatever caused it.
@@ -346,10 +356,7 @@ def run_engine_bounded(
             summary,
         )
 
-    if (
-        getattr(handler, "snapshot_completion_required", False)
-        and not handler.snapshot_completed
-    ):
+    if completion.required and not completion.completed:
         raise EngineFailure(
             "the required snapshot did not complete before the engine stopped; "
             "source-idle timing is not positive evidence that Debezium delivered the "

@@ -61,6 +61,7 @@ from .faults import arm_group, maybe_crash
 from .planner import GroupPlan, stream_event_id
 from .run_state import COMMIT_ACK
 from .snapshot import SnapshotCoordinator
+from .snapshot_completion import SnapshotCompletion
 from .spill import SpillBuffer, StagedEvent
 
 log = logging.getLogger("cdc_flight.applier")
@@ -86,6 +87,7 @@ class Applier:
         transactional_ddl: bool = True,
         catalog=None,
         watermarks: dict[str, int] | None = None,
+        completion: SnapshotCompletion | None = None,
     ):
         self.con = con
         self.pipeline = pipeline
@@ -109,27 +111,12 @@ class Applier:
         #: transaction that straddles the consistent point is in no image at all and
         #: must be applied in full (`cdc_flight.resnapshot`).
         self.watermarks: dict[str, int] = dict(watermarks or {})
+        #: The one owner of this invocation's snapshot completion state. The default
+        #: keeps the in-process laboratory's full-snapshot behaviour; production callers
+        #: pass the policy selected during acquisition.
+        self.snapshot_completion = completion or SnapshotCompletion.full_snapshot()
         #: the consistent point of the snapshot this run applied, if any
         self.last_snapshot_lsn: int | None = None
-        #: True once Debezium's OWN end-of-snapshot marker has been applied and every
-        #: table it opened has been swapped in. Never inferred from "no table is
-        #: currently mid-snapshot": at a Debezium batch boundary between table A's
-        #: last record and table B's first, that is true and the snapshot is not over
-        #: (Codex B1 / Opus BLOCKER-1).
-        self.snapshot_completed = False
-        #: Set by the main pipeline when this engine invocation owes a full snapshot.
-        #: Source-idle evidence says nothing about snapshot rows, so the supervisor
-        #: must keep the engine alive until ``snapshot_completed`` supplies Debezium's
-        #: positive terminal signal.
-        self.snapshot_completion_required = False
-        #: True once a committed group carried `snapshot='last'` — Debezium saying the
-        #: whole snapshot, over the whole requested capture set, has ended.
-        self.snapshot_final_seen = False
-        #: `"<schema>.<table>"` for every table that produced at least one snapshot
-        #: record on this run. The positive evidence behind "this table was scanned":
-        #: a requested table absent from this set was either never reached or is
-        #: genuinely empty, and only a source check can tell those apart.
-        self.snapshot_tables_seen: set[str] = set()
 
         self.registry = apply_sql.SchemaRegistry(
             con, dataset, constraints=config.destination_constraints
@@ -247,6 +234,22 @@ class Applier:
         with self._lock:
             return dict(self.table_counts)
 
+    @property
+    def snapshot_completion_required(self) -> bool:
+        return self.snapshot_completion.required
+
+    @property
+    def snapshot_completed(self) -> bool:
+        return self.snapshot_completion.completed
+
+    @property
+    def snapshot_final_seen(self) -> bool:
+        return self.snapshot_completion.marker_seen
+
+    @property
+    def snapshot_tables_seen(self) -> set[str]:
+        return self.snapshot_completion.tables_seen
+
     def stats(self) -> dict:
         return {
             "commit_groups": self.commit_groups,
@@ -279,6 +282,7 @@ class Applier:
             "resnapshot_discarded_events": self.resnapshot_discarded_events,
             "ambiguous_resnapshots_queued": self.ambiguous_resnapshots_queued,
             "snapshot_consistent_lsn": self.last_snapshot_lsn,
+            **self.snapshot_completion.as_dict(),
             # Round 8 MAJOR-1: this is the callback/connection ownership proof. A late
             # callback after the seal is a recorded no-op and can never decode, write,
             # mutate replay state, or acknowledge Debezium.
@@ -635,27 +639,13 @@ class Applier:
 
         self._settle_catalog()
         self._flush_alerts()
-        # Recorded only after COMMIT: what the re-snapshot decides on the strength of
-        # these must be durable, not merely applied.
-        for unit in group:
-            if unit.kind != UNIT_SNAPSHOT_CHUNK or unit.fenced:
-                continue
-            if unit.schema and unit.table:
-                self.snapshot_tables_seen.add(f"{unit.schema}.{unit.table}")
-            if unit.snapshot_last:
-                self.snapshot_final_seen = True
-        if self.snapshot_final_seen and not self.snapshots.active:
-            # Debezium has emitted its own end-of-snapshot marker AND every table it
-            # opened has been swapped in, durably. `cdc_flight.resnapshot` stops its
-            # engine on this rather than waiting out an idle window it does not need.
-            #
-            # `snapshot_final_seen` and not `swaps and not active`: the old condition
-            # was a statement about the tables seen SO FAR, and Debezium closes a
-            # table's chunk the moment a record for the NEXT table arrives. A batch
-            # boundary in that gap satisfied "swaps and not active" with the next table
-            # unscanned, and the caller then classified it as empty and deleted its
-            # live destination rows (Codex B1 / Opus BLOCKER-1).
-            self.snapshot_completed = True
+        # Snapshot completion is one policy shared by the main and re-snapshot engines.
+        # It is updated only after COMMIT, and the policy itself requires the final
+        # marker plus an inactive shadow coordinator before taking the record-complete
+        # edge (Codex B1 / r7 MAJOR-3).
+        self.snapshot_completion.observe_committed_group(
+            group, snapshot_active=self.snapshots.active
+        )
         self.commit_groups += 1
         if has_data:
             self.data_commit_groups += 1
