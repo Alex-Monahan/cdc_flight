@@ -86,10 +86,13 @@ make reset
 
 ### What each step actually does
 
-* **`make up`** → `scripts/pg.sh start`. First run does `initdb` into `./.pgdata` and appends
-  `wal_level=logical`, `max_replication_slots=20`, `max_wal_senders=20`, `port=15432`,
-  `unix_socket_directories=<pgdata>` to `postgresql.conf`. Then `pg_ctl start` and
-  `createdb cdc_source`.
+* **`make up`** → `scripts/pg.sh start`. First run does `initdb` into the disposable
+  `./.pgdata` test cluster and appends `wal_level=logical`, replication capacities
+  `16/16/4` (slots/senders/logical workers), `port=15432`, and
+  `unix_socket_directories=<pgdata>` to `postgresql.conf`. It also disables `fsync`,
+  `synchronous_commit`, and `full_page_writes` **only in this disposable cluster**;
+  never copy those durability settings to production or a durable development database.
+  Then it runs `pg_ctl start` and creates `cdc_source`.
 * **`make seed`** → `sql/01_schema.sql` builds schema `app` (6 tables: PK tables, a **no-PK**
   table with `REPLICA IDENTITY FULL`, a **TOAST**-heavy `documents` table, a `wide_types`
   table covering ~34 Postgres types, and a **partitioned** `audit_log`) and creates
@@ -187,21 +190,28 @@ Policy: `CDC_TRUNCATE_MODE` and `CDC_DROP_MODE`, each `replicate` (default) | `l
 ## Testing
 
 ```bash
-make test        # default suite, local only (Postgres + DuckDB), no cloud, no slow tests
-make test-md     # MotherDuck smoke test only        (marker: motherduck)
-make test-slow   # slow fault injection only         (marker: slow)
-make test-all    # everything
+make test         # fast default lane: 12 xdist workers, local only
+make test-serial  # same tests and selector, serial debugging escape hatch
+make test-md      # MotherDuck smoke test only        (marker: motherduck)
+make test-slow    # slow fault injection only         (marker: slow)
+make test-all     # everything
 ```
 
-`pytest` is configured with `--durations=20`, so every run prints a timing report.
-MotherDuck tests carry the `motherduck` marker and long fault-injection tests carry
-`slow`; both are deselected by `make test`.
+`make test` uses pytest-xdist with `--dist=loadscope`, keeping module-scoped CDC
+scenarios together while isolating every worker's Postgres database/template,
+replication slots, state directory, and DuckDB path. Override the host-tuned default
+with `PYTEST_WORKERS=N make test`; values above 12 also require increasing the disposable
+cluster's replication capacities. MotherDuck tests carry the `motherduck` marker and
+long fault-injection tests carry `slow`; both are deselected by `make test` and
+`make test-serial`. Every lane prints its 20 slowest durations.
 
 Measured on an M-series Mac. Only executed runs are reported here; see
 `RUBRIC_STATUS.md` for the per-item evidence.
 
 | suite | result | wall clock | measured |
 |---|---|---|---|
+| `make test` (12 workers) | **632 passed, 130 deselected** | **70.21 s** (repeat: **68.88 s**) | 2026-08-01, T-1 fast-suite validation |
+| `make test-serial` | **632 passed, 130 deselected** | **365.43 s** (6:05) | 2026-08-01, T-1 same-HEAD baseline |
 | `make test` (local only) | **562 passed, 0 xfail** | **550.0 s** (9:10) | 2026-08-01, after the round-5 fixes |
 | `make test-slow` | **95 passed** | **1 320.7 s** (22:00) | 2026-08-01, after the round-5 fixes |
 | `make test` (local only) | 560 passed, 0 xfail | 548.9 s (9:08) | 2026-07-31, after the round-4 fixes |
@@ -228,15 +238,12 @@ Measured on an M-series Mac. Only executed runs are reported here; see
 | `make test-slow` | 9 passed | 179 s (2:58) | 2026-07-31, after the 1.1-1.3 review round |
 | `make test-md` | 12 passed | 155 s (2:34) | 2026-07-31, after the 1.1-1.3 review round |
 
-The default suite is at **9:10 of a 10-minute budget** with **119 more tests than the
-1.6-1.8 round** (526.0 s then, 550.0 s now). Most of the 1.9 rounds' 110 new default tests
-cost about a second in total, because they drive the shipped code in-process — the state
-machines against a DuckDB file in a tmp dir, the recovery anchors against an injectable
-slot drop, the hard-death cuts against a child process that opens the same file. The
-sixteen seconds that did appear are the two-thread `COMMIT_ACK` barrier probes and the real
-catalog-quiescence test, which are wall-clock by construction: they exist to prove a
-timing property, and a timing property cannot be proved instantly. The expensive
-end-to-end pairing for each item is in `-m slow`, now 95 tests in 22:00.
+The default lane is now about **1:10** on the measured host, versus **6:05** for the same
+632 selected tests in serial. Most state-machine tests are inexpensive; the remaining
+wall time is dominated by correctness-sensitive JVM startup, crash/restart, fault, and
+snapshot scenarios. Parallelism changes only orchestration and isolation—the selector,
+assertions, and scenario logic are identical to `make test-serial`. The expensive
+end-to-end pairing for each item remains in `-m slow`.
 
 `make test-slow` is 18:18 for 83 tests (was 17:45 for 78): the five new ones are the
 end-to-end pairing for the recovery anchors — a real `cdc-flight` process killed at
@@ -314,11 +321,11 @@ scenarios*, not by running fewer assertions: the rubric gap suites build their s
 once per module (or, for `crash_replay`, once per session) and then interrogate it with
 many cheap tests.
 
-**One session at a time.** Every sandbox has its own slot, offsets and DuckDB file, but
-they all share the `app` schema and publication on :15432, and reseeding drops and
-recreates both. Two concurrent `make test` runs used to corrupt each other - that is what
-produced the 1.0 review's `assert 110 == 0`. A session-wide `flock` on
-`.pytest-source.lock` now serialises whole sessions; a second run waits and says so.
+**Worker isolation.** Each xdist worker clones a private database from its own template
+and uses private slots, offsets, state, and DuckDB files. `.pytest-source.lock` serialises
+only cluster/template setup, so workers execute independently after provisioning. Do not
+launch two separate pytest sessions concurrently in the same checkout: worker names such
+as `gw0` are session-local and would collide across those independent invocations.
 
 ### Test layout and conventions
 

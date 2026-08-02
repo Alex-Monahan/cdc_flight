@@ -13,7 +13,7 @@ export PGDATABASE ?= cdc_source
 # JPype/JVM callback thread. This is a production compatibility requirement too;
 # keep every repository launch safe while respecting an explicit operator choice.
 export ARROW_DEFAULT_MEMORY_POOL ?= system
-PYTEST_WORKERS ?= auto
+PYTEST_WORKERS ?= 12
 PYTEST_XDIST_ARGS ?= -n $(PYTEST_WORKERS) --dist=loadscope
 
 .DEFAULT_GOAL := help
@@ -91,8 +91,12 @@ query: ## show what landed in the local DuckDB file
 ## ---------------------------------------------------------------------------
 
 .PHONY: test
-test: ## run the default (local-only, fast) suite with timings
+test: ## run the default local-only suite in parallel (12 workers by default)
 	$(UV) run pytest $(PYTEST_XDIST_ARGS) -m "not motherduck and not slow" --durations=20
+
+.PHONY: test-serial
+test-serial: ## run the default local-only suite serially for debugging
+	$(UV) run pytest -p no:xdist -m "not motherduck and not slow" --durations=20
 
 .PHONY: test-all
 test-all: ## run everything: MotherDuck smoke test + slow fault injection
