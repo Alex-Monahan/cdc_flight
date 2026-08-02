@@ -32,6 +32,7 @@ logs/
 
 # Project-local Postgres cluster (disposable; recreate with `make pg-init`)
 .pgdata/
+.pgdata_*/
 .pgdata_replica/
 .cdc_state_md/
 
@@ -42,5 +43,5 @@ probes/.out/
 hs_err_pid*.log
 replay_pid*.log
 
-# Test-session mutex for the shared :15432 cluster (see tests/conftest.py)
-.pytest-source.lock
+# Per-instance test-session mutexes (see tests/conftest.py)
+.pytest-source-*.lock

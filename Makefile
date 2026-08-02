@@ -3,12 +3,37 @@ PROJECT_DIR := $(shell cd "$(dir $(lastword $(MAKEFILE_LIST)))" && pwd)
 UV ?= uv
 PG := $(PROJECT_DIR)/scripts/pg.sh
 
+# The test cluster is deliberately separate from any Postgres service on the
+# host.  Use CDC_TEST_PGPORT as the one required per-instance input; all other
+# instance-scoped paths and names derive from it unless explicitly overridden.
+CDC_TEST_PGPORT ?= 15432
+CDC_TEST_PGDATA ?= $(PROJECT_DIR)/.pgdata$(if $(filter 15432,$(CDC_TEST_PGPORT)),,_$(CDC_TEST_PGPORT))
+CDC_TEST_INSTANCE_ID ?= pg$(CDC_TEST_PGPORT)
+CDC_TEST_PGSOCKET ?= $(CDC_TEST_PGDATA)
+CDC_TEST_PGLOG ?= $(CDC_TEST_PGDATA)/server.log
+CDC_TEST_LOCK_PATH ?= $(PROJECT_DIR)/.pytest-source-$(CDC_TEST_INSTANCE_ID).lock
+CDC_TEST_PGDATABASE ?= cdc_source
+CDC_TEST_TEMPLATE_DATABASE_PREFIX ?= cdc_flight_test_template_$(CDC_TEST_INSTANCE_ID)_
+CDC_TEST_WORKER_DATABASE_PREFIX ?= cdc_flight_test_$(CDC_TEST_INSTANCE_ID)_
+CDC_TEST_SLOT_PREFIX ?= test_slot_$(CDC_TEST_INSTANCE_ID)_
+
 # Everything (Postgres, the JVM, DuckDB) runs natively on the host: no Docker.
 export PGHOST ?= 127.0.0.1
-export PGPORT ?= 15432
+export CDC_TEST_PGPORT
+export CDC_TEST_PGDATA
+export CDC_TEST_INSTANCE_ID
+export CDC_TEST_PGSOCKET
+export CDC_TEST_PGLOG
+export CDC_TEST_LOCK_PATH
+export CDC_TEST_PGDATABASE
+export CDC_TEST_TEMPLATE_DATABASE_PREFIX
+export CDC_TEST_WORKER_DATABASE_PREFIX
+export CDC_TEST_SLOT_PREFIX
+export PGPORT = $(CDC_TEST_PGPORT)
+export PGDATA = $(CDC_TEST_PGDATA)
 export PGUSER ?= postgres
 export PGPASSWORD ?= postgres
-export PGDATABASE ?= cdc_source
+export PGDATABASE = $(CDC_TEST_PGDATABASE)
 # PyArrow 25.0.0's mimalloc pool can SIGSEGV when Arrow arrays are built on the
 # JPype/JVM callback thread. This is a production compatibility requirement too;
 # keep every repository launch safe while respecting an explicit operator choice.
@@ -28,15 +53,15 @@ install: ## create .venv and install the project (+ dev extras)
 	$(UV) pip install -e ".[dev]"
 
 ## ---------------------------------------------------------------------------
-## Postgres (project-local Homebrew cluster on :15432 - never touches :5432)
+## Postgres (project-local Homebrew cluster on the CDC_TEST_PGPORT - never touches :5432)
 ## ---------------------------------------------------------------------------
 
 .PHONY: pg-init
-pg-init: ## initdb a fresh cluster in ./.pgdata (wal_level=logical)
+pg-init: ## initdb a fresh cluster in the instance data directory (wal_level=logical)
 	$(PG) init
 
 .PHONY: pg-start up
-pg-start up: ## start the cluster and create the cdc_source database
+pg-start up: ## start the instance cluster and create its test database
 	$(PG) start
 
 .PHONY: pg-stop down
@@ -52,7 +77,7 @@ pg-reset: ## destroy and recreate the cluster from scratch
 	$(PG) reset
 
 .PHONY: pg-psql
-pg-psql: ## open psql against cdc_source
+pg-psql: ## open psql against the instance test database
 	$(PG) psql
 
 .PHONY: seed

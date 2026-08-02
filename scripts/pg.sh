@@ -3,7 +3,7 @@
 #
 # Deliberately does NOT touch any Homebrew-managed cluster the developer already
 # runs (e.g. `brew services start postgresql@18` on :5432). Everything lives in
-# ./.pgdata and listens on :15432 only.
+# the instance data/socket paths and listens on CDC_TEST_PGPORT only.
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -11,14 +11,28 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # --- configuration (override via env) ---------------------------------------
 PG_VERSION="${PG_VERSION:-18}"
 PGBIN="${PGBIN:-/opt/homebrew/opt/postgresql@${PG_VERSION}/bin}"
-export PGDATA="${PGDATA:-${PROJECT_DIR}/.pgdata}"
-export PGPORT="${PGPORT:-15432}"
+DEFAULT_PGPORT="15432"
+export PGPORT="${CDC_TEST_PGPORT:-${PGPORT:-${DEFAULT_PGPORT}}}"
+if ! [[ "${PGPORT}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: CDC_TEST_PGPORT/PGPORT must be numeric, got '${PGPORT}'" >&2
+  exit 2
+fi
+if [[ "${PGPORT}" == "${DEFAULT_PGPORT}" ]]; then
+  DEFAULT_PGDATA="${PROJECT_DIR}/.pgdata"
+else
+  DEFAULT_PGDATA="${PROJECT_DIR}/.pgdata_${PGPORT}"
+fi
+export PGDATA="${CDC_TEST_PGDATA:-${PGDATA:-${DEFAULT_PGDATA}}}"
+export CDC_TEST_PGDATA="${PGDATA}"
+PGSOCKET="${CDC_TEST_PGSOCKET:-${PGSOCKET:-${PGDATA}}}"
+export CDC_TEST_PGSOCKET="${PGSOCKET}"
 export PGHOST="${PGHOST:-127.0.0.1}"
 export PGUSER="${PGUSER:-postgres}"
 export PGPASSWORD="${PGPASSWORD:-postgres}"
-PGDATABASE_NAME="${PGDATABASE:-cdc_source}"
+PGDATABASE_NAME="${CDC_TEST_PGDATABASE:-${PGDATABASE:-cdc_source}}"
 export PGDATABASE="${PGDATABASE_NAME}"
-LOGFILE="${PROJECT_DIR}/.pgdata/server.log"
+LOGFILE="${CDC_TEST_PGLOG:-${PGDATA}/server.log}"
+export CDC_TEST_PGLOG="${LOGFILE}"
 
 if [[ ! -x "${PGBIN}/initdb" ]]; then
   echo "ERROR: PostgreSQL ${PG_VERSION} binaries not found at ${PGBIN}" >&2
@@ -36,6 +50,8 @@ cmd_init() {
   fi
   mkdir -p "${PGDATA}"
   chmod 700 "${PGDATA}"
+  mkdir -p "${PGSOCKET}"
+  chmod 700 "${PGSOCKET}"
   local pwfile
   pwfile="$(mktemp)"
   printf '%s' "${PGPASSWORD}" > "${pwfile}"
@@ -56,7 +72,7 @@ cmd_init() {
 # ---- cdc_flight overrides -------------------------------------------------
 listen_addresses = 'localhost'
 port = ${PGPORT}
-unix_socket_directories = '${PGDATA}'
+unix_socket_directories = '${PGSOCKET}'
 
 # Logical replication (required by Debezium / pgoutput)
 wal_level = logical
@@ -86,6 +102,8 @@ EOF
 
 cmd_start() {
   cmd_init
+  mkdir -p "${PGSOCKET}"
+  chmod 700 "${PGSOCKET}"
   if cmd_status >/dev/null 2>&1; then
     echo "Cluster already running on :${PGPORT}."
   else
@@ -93,10 +111,10 @@ cmd_start() {
     "${PGBIN}/pg_ctl" -D "${PGDATA}" -l "${LOGFILE}" -w -t 60 start
   fi
   # Create the application database if missing.
-  if ! "${PGBIN}/psql" -h "${PGDATA}" -p "${PGPORT}" -U "${PGUSER}" -d postgres \
+  if ! "${PGBIN}/psql" -h "${PGSOCKET}" -p "${PGPORT}" -U "${PGUSER}" -d postgres \
         -tAc "SELECT 1 FROM pg_database WHERE datname='${PGDATABASE_NAME}'" | grep -q 1; then
     echo "Creating database ${PGDATABASE_NAME}..."
-    "${PGBIN}/createdb" -h "${PGDATA}" -p "${PGPORT}" -U "${PGUSER}" "${PGDATABASE_NAME}"
+    "${PGBIN}/createdb" -h "${PGSOCKET}" -p "${PGPORT}" -U "${PGUSER}" "${PGDATABASE_NAME}"
   fi
   echo "Ready: postgresql://${PGUSER}:***@${PGHOST}:${PGPORT}/${PGDATABASE_NAME}"
 }
@@ -122,13 +140,13 @@ cmd_reset() {
 }
 
 cmd_psql() {
-  exec "${PGBIN}/psql" -h "${PGDATA}" -p "${PGPORT}" -U "${PGUSER}" -d "${PGDATABASE_NAME}" "$@"
+  exec "${PGBIN}/psql" -h "${PGSOCKET}" -p "${PGPORT}" -U "${PGUSER}" -d "${PGDATABASE_NAME}" "$@"
 }
 
 cmd_seed() {
   echo "Applying schema + seed data to ${PGDATABASE_NAME}..."
   echo "  -> 01_schema.sql + 02_seed.sql (one transaction)"
-  "${PGBIN}/psql" -h "${PGDATA}" -p "${PGPORT}" -U "${PGUSER}" -d "${PGDATABASE_NAME}" \
+  "${PGBIN}/psql" -h "${PGSOCKET}" -p "${PGPORT}" -U "${PGUSER}" -d "${PGDATABASE_NAME}" \
     -v ON_ERROR_STOP=1 -q --single-transaction \
     -f "${PROJECT_DIR}/sql/01_schema.sql" -f "${PROJECT_DIR}/sql/02_seed.sql"
   echo "Seed complete."

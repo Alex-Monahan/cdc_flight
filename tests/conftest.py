@@ -1,8 +1,10 @@
 """Fixtures for the cdc_flight test suite.
 
-Everything runs natively: a project-local Postgres cluster on :15432 driven by
+Everything runs natively: a project-local Postgres cluster driven by
 `scripts/pg.sh`, the Debezium embedded engine inside a JVM, and DuckDB on disk.
-No Docker, no Kafka, no testcontainers.
+No Docker, no Kafka, no testcontainers.  The Postgres instance namespace is
+derived from ``CDC_TEST_PGPORT`` (or ``CDC_TEST_INSTANCE_ID``) so independent
+sessions do not share database, lock, or slot names.
 """
 
 from __future__ import annotations
@@ -32,11 +34,70 @@ from psycopg import sql
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 PG_SH = PROJECT_DIR / "scripts" / "pg.sh"
 VENV_BIN = PROJECT_DIR / ".venv" / "bin"
-TEST_PGPORT = 15432
+TEST_PGPORT = int(os.environ.get("CDC_TEST_PGPORT", "15432"))
+TEST_PGDATABASE = os.environ.get("CDC_TEST_PGDATABASE", "cdc_source")
+TEST_PGDATA = Path(
+    os.environ.get(
+        "CDC_TEST_PGDATA",
+        str(
+            PROJECT_DIR
+            / (".pgdata" if TEST_PGPORT == 15432 else f".pgdata_{TEST_PGPORT}")
+        ),
+    )
+)
+TEST_PGSOCKET = Path(os.environ.get("CDC_TEST_PGSOCKET", str(TEST_PGDATA)))
+TEST_PGLOG = Path(
+    os.environ.get("CDC_TEST_PGLOG", str(TEST_PGDATA / "server.log"))
+)
+
+
+def _safe_instance_id(value: str) -> str:
+    return re.sub(r"[^a-z0-9_]+", "_", value.lower()).strip("_") or f"pg{TEST_PGPORT}"
+
+
+TEST_INSTANCE_ID = _safe_instance_id(
+    os.environ.get("CDC_TEST_INSTANCE_ID", f"pg{TEST_PGPORT}")
+)
+TEST_SLOT_PREFIX = _safe_instance_id(
+    os.environ.get("CDC_TEST_SLOT_PREFIX", f"test_slot_{TEST_INSTANCE_ID}_")
+)
+# Preserve a trailing separator when a caller supplies a prefix without one.
+if not TEST_SLOT_PREFIX.endswith("_"):
+    TEST_SLOT_PREFIX += "_"
+
+
+def _database_prefix(name: str, default: str) -> str:
+    prefix = re.sub(r"[^a-z0-9_]+", "_", os.environ.get(name, default).lower())
+    return prefix if prefix.endswith("_") else f"{prefix}_"
+
+
+TEMPLATE_DATABASE_PREFIX = _database_prefix(
+    "CDC_TEST_TEMPLATE_DATABASE_PREFIX",
+    f"cdc_flight_test_template_{TEST_INSTANCE_ID}_",
+)
+WORKER_DATABASE_PREFIX = _database_prefix(
+    "CDC_TEST_WORKER_DATABASE_PREFIX",
+    f"cdc_flight_test_{TEST_INSTANCE_ID}_",
+)
+TEST_LOCK_PATH = Path(
+    os.environ.get(
+        "CDC_TEST_LOCK_PATH",
+        str(PROJECT_DIR / f".pytest-source-{TEST_INSTANCE_ID}.lock"),
+    )
+)
+
+# Pin defaults used by SourceConfig in this pytest process before any fixture
+# constructs one.  In particular, an unrelated PGPORT in the parent shell must
+# not redirect a test run away from its selected CDC_TEST_PGPORT.
+os.environ.setdefault("CDC_TEST_PGPORT", str(TEST_PGPORT))
+os.environ.setdefault("CDC_TEST_PGDATA", str(TEST_PGDATA))
+os.environ.setdefault("CDC_TEST_PGSOCKET", str(TEST_PGSOCKET))
+os.environ.setdefault("CDC_TEST_PGLOG", str(TEST_PGLOG))
+os.environ.setdefault("CDC_TEST_PGDATABASE", TEST_PGDATABASE)
+os.environ.setdefault("CDC_TEST_INSTANCE_ID", TEST_INSTANCE_ID)
+os.environ.setdefault("CDC_TEST_SLOT_PREFIX", TEST_SLOT_PREFIX)
 SANDBOX_IDLE_SECONDS = 2
 ROOT_E2E_IDLE_SECONDS = 1
-TEMPLATE_DATABASE_PREFIX = "cdc_flight_test_template_"
-WORKER_DATABASE_PREFIX = "cdc_flight_test_"
 
 #: Tables the pipeline replicates. Used to fingerprint the shared source so a
 #: concurrent writer produces a diagnostic instead of a mystery assertion.
@@ -61,7 +122,16 @@ from cdc_flight.config import DestinationConfig, ReplicationConfig, SourceConfig
 # helpers
 # --------------------------------------------------------------------------- #
 def _pg(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-    env = {**os.environ, "PGPORT": str(TEST_PGPORT), "PGDATABASE": "cdc_source"}
+    env = {
+        **os.environ,
+        "CDC_TEST_PGPORT": str(TEST_PGPORT),
+        "CDC_TEST_PGDATA": str(TEST_PGDATA),
+        "CDC_TEST_PGSOCKET": str(TEST_PGSOCKET),
+        "CDC_TEST_PGLOG": str(TEST_PGLOG),
+        "PGPORT": str(TEST_PGPORT),
+        "CDC_TEST_PGDATABASE": TEST_PGDATABASE,
+        "PGDATABASE": TEST_PGDATABASE,
+    }
     return subprocess.run(
         [str(PG_SH), *args],
         capture_output=True,
@@ -104,7 +174,8 @@ def exclusive_source() -> Iterator[Path]:
     cloned from a canonical template, so the lock is only used while workers
     start Postgres and prepare their databases.
     """
-    lock_path = PROJECT_DIR / ".pytest-source.lock"
+    lock_path = TEST_LOCK_PATH
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path.touch(exist_ok=True)
     yield lock_path
 
@@ -194,7 +265,7 @@ def postgres_cluster(exclusive_source: Path) -> Iterator[SourceConfig]:
     if not PG_SH.exists():
         pytest.skip("scripts/pg.sh missing")
 
-    source = _isolated_source("cdc_source")
+    source = _isolated_source(TEST_PGDATABASE)
     admin = replace(source, dbname="postgres")
     worker_source = replace(source, dbname=_worker_database_name())
     with _cluster_setup_lock(exclusive_source):
@@ -298,14 +369,15 @@ def fresh_seed(postgres_cluster: SourceConfig) -> SourceConfig:
 @pytest.fixture
 def cdc_env(tmp_path: Path, postgres_cluster: SourceConfig) -> Iterator[dict[str, str]]:
     """Per-test Debezium offsets, dlt state, replication slot and DuckDB file."""
-    slot = f"test_slot_{os.getpid()}_{abs(hash(tmp_path)) % 100000}"
+    suffix = f"{os.getpid()}_{abs(hash(tmp_path)) % 100000}"
+    slot = f"{TEST_SLOT_PREFIX[: 63 - len(suffix)]}{suffix}"
     env = {
         **_source_environment(postgres_cluster),
         "CDC_STATE_DIR": str(tmp_path / "cdc_state"),
         "CDC_PIPELINES_DIR": str(tmp_path / "cdc_state" / "dlt_pipelines"),
         "CDC_DUCKDB_PATH": str(tmp_path / "cdc_flight.duckdb"),
         "CDC_SLOT_NAME": slot,
-        "CDC_PIPELINE_NAME": "cdc_flight_test",
+        "CDC_PIPELINE_NAME": f"cdc_flight_test_{TEST_INSTANCE_ID}",
         "RUNTIME__DLTHUB_TELEMETRY": "false",
     }
     _drop_slot(postgres_cluster, slot)
@@ -492,7 +564,9 @@ class Sandbox:
         self.dir = base
         self.dir.mkdir(parents=True, exist_ok=True)
         self.source = source
-        self.slot = re.sub(r"[^a-z0-9_]", "_", f"t_{name}_{os.getpid()}".lower())[:60]
+        self.slot = re.sub(
+            r"[^a-z0-9_]", "_", f"{TEST_SLOT_PREFIX}t_{name}_{os.getpid()}".lower()
+        )[:60]
         self.duckdb_path = self.dir / "cdc_flight.duckdb"
         self.state_dir = self.dir / "cdc_state"
         self.env = {
@@ -501,7 +575,10 @@ class Sandbox:
             "CDC_PIPELINES_DIR": str(self.state_dir / "dlt_pipelines"),
             "CDC_DUCKDB_PATH": str(self.duckdb_path),
             "CDC_SLOT_NAME": self.slot,
-            "CDC_PIPELINE_NAME": f"cdc_flight_{re.sub(r'[^a-z0-9_]', '_', name.lower())}",
+            "CDC_PIPELINE_NAME": (
+                f"cdc_flight_{TEST_INSTANCE_ID}_"
+                f"{re.sub(r'[^a-z0-9_]', '_', name.lower())}"
+            ),
             "RUNTIME__DLTHUB_TELEMETRY": "false",
         }
         self.drop_slot()

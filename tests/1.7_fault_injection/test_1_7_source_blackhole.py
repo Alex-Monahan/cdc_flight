@@ -30,7 +30,7 @@ import time
 
 import psycopg
 import pytest
-from conftest import PROJECT_DIR, _executable
+from conftest import PROJECT_DIR, TEST_INSTANCE_ID, TEST_SLOT_PREFIX, _executable
 from tcp_relay import TcpRelay
 
 
@@ -56,7 +56,7 @@ def _wait_for(predicate, timeout: float, interval: float = 0.25) -> bool:
 @pytest.mark.slow
 def test_a_blackholed_source_never_reports_ok(tmp_path, postgres_cluster, relay):
     """The run must exit non-zero, and `last_run.json` must say what happened."""
-    slot = f"blackhole_slot_{os.getpid()}"
+    slot = f"{TEST_SLOT_PREFIX}blackhole_{os.getpid()}"[:63]
     state = tmp_path / "cdc_state"
     env = {
         **os.environ,
@@ -64,10 +64,11 @@ def test_a_blackholed_source_never_reports_ok(tmp_path, postgres_cluster, relay)
         # sampler, the catalog poller - goes through the relay.
         "PGHOST": "127.0.0.1",
         "PGPORT": str(relay.port),
+        "CDC_TEST_PGPORT": str(relay.port),
         "CDC_STATE_DIR": str(state),
         "CDC_DUCKDB_PATH": str(tmp_path / "cdc_flight.duckdb"),
         "CDC_SLOT_NAME": slot,
-        "CDC_PIPELINE_NAME": "cdc_flight_blackhole",
+        "CDC_PIPELINE_NAME": f"cdc_flight_blackhole_{TEST_INSTANCE_ID}",
         "CDC_IDLE_SECONDS": "6",
         "RUNTIME__DLTHUB_TELEMETRY": "false",
     }
