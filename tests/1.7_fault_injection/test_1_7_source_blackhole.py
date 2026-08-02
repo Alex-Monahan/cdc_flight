@@ -65,6 +65,8 @@ def test_a_blackholed_source_never_reports_ok(tmp_path, postgres_cluster, relay)
         "PGHOST": "127.0.0.1",
         "PGPORT": str(relay.port),
         "CDC_TEST_PGPORT": str(relay.port),
+        "PGDATABASE": postgres_cluster.dbname,
+        "CDC_TEST_PGDATABASE": postgres_cluster.dbname,
         "CDC_STATE_DIR": str(state),
         "CDC_DUCKDB_PATH": str(tmp_path / "cdc_flight.duckdb"),
         "CDC_SLOT_NAME": slot,

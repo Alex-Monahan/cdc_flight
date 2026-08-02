@@ -253,9 +253,11 @@ def _source_environment(source: SourceConfig) -> dict[str, str]:
         **os.environ,
         "PGHOST": source.host,
         "PGPORT": str(source.port),
+        "CDC_TEST_PGPORT": str(source.port),
         "PGUSER": source.user,
         "PGPASSWORD": source.password,
         "PGDATABASE": source.dbname,
+        "CDC_TEST_PGDATABASE": source.dbname,
     }
 
 
