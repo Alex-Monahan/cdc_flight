@@ -621,9 +621,13 @@ def test_a_recovery_that_forgets_the_catalog_forgets_the_baseline_with_it():
 def _pipeline_source() -> str:
     from pathlib import Path
 
-    return (
-        Path(__file__).resolve().parents[2] / "src" / "cdc_flight" / "pipeline.py"
-    ).read_text()
+    source_root = Path(__file__).resolve().parents[2] / "src" / "cdc_flight"
+    # The post-engine completion stage is an owned part of pipeline execution, so
+    # structural guards that span that boundary inspect both modules.
+    return "\n".join(
+        (source_root / name).read_text()
+        for name in ("pipeline.py", "completion_stage.py")
+    )
 
 
 def test_the_pipeline_refuses_to_run_when_the_rebuild_is_switched_off():
