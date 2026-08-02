@@ -124,7 +124,9 @@ def test_prepare_then_clean_removes_only_the_selected_runtime_child(
         isolated_project, "prepare", CDC_TEST_INSTANCE_ID=instance
     )
     assert prepared.returncode == 0, prepared.stderr
-    (target / "state.txt").write_text("disposable\n")
+    nested = target / "cdc_state" / "nested"
+    nested.mkdir(parents=True)
+    (nested / "state.txt").write_text("disposable\n")
 
     cleaned = _runtime_state(
         isolated_project, "clean", CDC_TEST_INSTANCE_ID=instance
@@ -154,6 +156,32 @@ def test_clean_state_rejects_a_child_symlink_that_escapes_the_project(
     assert proc.returncode == 2
     assert marker.read_text() == "external\n"
     assert "refusing" in proc.stderr.lower()
+
+
+def test_clean_state_rejects_a_nested_symlink(
+    isolated_project: Path, tmp_path: Path
+):
+    instance = "cleanup_nested_symlink_escape"
+    target = isolated_project / ".cdc_instances" / instance
+    prepared = _runtime_state(
+        isolated_project, "prepare", CDC_TEST_INSTANCE_ID=instance
+    )
+    assert prepared.returncode == 0, prepared.stderr
+
+    victim = tmp_path / "must-survive-nested"
+    victim.mkdir()
+    marker = victim / "user-data.txt"
+    marker.write_text("external\n")
+    (target / "nested-link").symlink_to(victim, target_is_directory=True)
+
+    proc = _runtime_state(
+        isolated_project, "clean", CDC_TEST_INSTANCE_ID=instance
+    )
+
+    assert proc.returncode == 2
+    assert marker.read_text() == "external\n"
+    assert target.exists()
+    assert "symlink" in proc.stderr.lower()
 
 
 def test_clean_state_rejects_a_parent_symlink_that_escapes_the_project(

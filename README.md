@@ -104,8 +104,10 @@ make reset
   `PUBLICATION cdc_flight_pub`. `sql/02_seed.sql` inserts deterministic starting rows.
 * **`make pipeline`** → `cdc-flight`. Its state, dlt pipeline metadata, and DuckDB
   file live under `.cdc_instances/<instance>/`. The make target first marks that exact
-  project-local child as disposable; `make clean-state` canonicalizes it and refuses
-  cleanup if it escapes `.cdc_instances`, lacks the sentinel, or comes from the removed
+  newly created project-local child as disposable. An existing child must already have
+  its exact instance sentinel. `make clean-state` opens every directory relative to
+  no-follow descriptors and refuses cleanup if any component is a symlink, resolves
+  outside the physical project tree, lacks its exact sentinel, or comes from the removed
   `CDC_INSTANCE_RUNTIME_ROOT` override. It builds Debezium properties (see
   `src/cdc_flight/debezium_props.py`), starts the embedded engine on a background thread,
   and loads every batch through `dlt` into the instance DuckDB file, dataset `cdc_raw`.
