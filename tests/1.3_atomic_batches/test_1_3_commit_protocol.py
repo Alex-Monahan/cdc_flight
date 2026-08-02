@@ -13,9 +13,10 @@ from __future__ import annotations
 import json
 
 import pytest
-from applier_lab import DATASET, Lab, data, end, keyed, snap
+from applier_lab import DATASET, Lab, begin, data, end, keyed, snap
 
 from cdc_flight.errors import OffsetFlushFailed
+from cdc_flight.run_state import COMMIT_ACK
 from cdc_flight.snapshot_completion import SnapshotCompletion, SnapshotObservationError
 
 
@@ -156,7 +157,104 @@ def test_valid_terminal_offset_commits_before_pending_notifications_are_acked(la
     # One row record plus the three pending notifications; the synthetic boundary has
     # raw=None and therefore cannot be acknowledged as an ordinary control record.
     assert box.committer.marked == 4
-    assert box.committer.batches == 2
+    assert box.committer.batches == 1
+
+
+def test_every_snapshot_ack_is_guarded_and_empty_snapshot_arms_flush_verifier(lab):
+    """Pending notification offsets share the same verified post-COMMIT path.
+
+    The all-empty shape is the canary: the synthetic boundary has no ordinary raw
+    record, so the verifier must count the three pending notifications instead.
+    """
+    box = lab()
+    box.applier.snapshot_completion = SnapshotCompletion.full_snapshot({"app.customers"})
+    verifier = _RecordingVerifier()
+    box.applier.verifier = verifier
+
+    class _GuardedCommitter:
+        def __init__(self):
+            self.marked = 0
+            self.batches = 0
+            self.window_states: list[bool] = []
+
+        def markProcessed(self, record):
+            self.window_states.append(COMMIT_ACK.active)
+            self.marked += 1
+
+        def markBatchFinished(self):
+            self.batches += 1
+
+    committer = _GuardedCommitter()
+    box.applier._handle([_SnapshotNotification("STARTED", 101)], committer)
+    box.applier._handle(
+        [
+            _SnapshotNotification(
+                "TABLE_SCAN_COMPLETED",
+                102,
+                {
+                    "scanned_collection": "app.customers",
+                    "status": "SUCCEEDED",
+                    "total_rows_scanned": "0",
+                },
+            ),
+            _SnapshotNotification("COMPLETED", 103),
+        ],
+        committer,
+    )
+
+    assert committer.marked == 3
+    assert committer.batches == 1
+    assert committer.window_states == [True, True, True]
+    assert verifier.before_calls == 1
+    assert verifier.after_calls == 0
+
+    # The comparison remains deferred until the next poll, but it is armed by the
+    # notification acknowledgements even though the group carried no row record.
+    box.applier._handle([], committer)
+    assert verifier.after_calls == 1
+
+
+def test_not_ready_terminal_boundary_refuses_streaming_phase_transition(lab):
+    """A delayed final snapshot row cannot be mixed with the first stream unit."""
+    box = lab(snapshot_chunk_events=1)
+    box.applier.snapshot_completion = SnapshotCompletion.full_snapshot({"app.customers"})
+    box.applier.snapshot_completion.observe_notification("STARTED", {})
+
+    # One row is durable in the open snapshot group, but Debezium declared two.
+    box.feed([snap("customers", 100, ident=1, marker="true")])
+    box.applier._handle(
+        [
+            _SnapshotNotification(
+                "TABLE_SCAN_COMPLETED",
+                200,
+                {
+                    "scanned_collection": "app.customers",
+                    "status": "SUCCEEDED",
+                    "total_rows_scanned": "2",
+                },
+            ),
+            _SnapshotNotification("COMPLETED", 201),
+        ],
+        box.committer,
+    )
+    assert box.applier.snapshot_completion.state == "completion_notified"
+
+    with pytest.raises(SnapshotObservationError, match="streaming"):
+        box.feed(
+            [
+                begin("stream-1", 300),
+                data("stream-1", 1, 301, key={"id": 2}, after={"id": 2, "name": "c"}),
+                end("stream-1", 1, 302, {"app.customers": 1}),
+            ]
+        )
+
+    assert all(unit.kind != "txn" for unit in box.applier.group.units)
+
+    # The delayed row can finish the original snapshot group and is not lost or
+    # forced through a streaming route.
+    box.feed([snap("customers", 200, ident=2, marker="last")])
+    box.commit()
+    assert box.applier.snapshot_completed is True
 
 
 class _RecordingVerifier:

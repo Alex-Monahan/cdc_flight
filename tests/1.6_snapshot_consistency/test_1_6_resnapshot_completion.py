@@ -271,7 +271,10 @@ def test_a_verified_empty_table_is_emptied_and_fenced_at_the_verified_lsn(tmp_pa
 # --------------------------------------------------------------------------- #
 class _FakeApplier:
     def __init__(self, final_seen: bool, seen: set[str]):
-        self.completion = SnapshotCompletion.full_snapshot()
+        # The closed row domain is explicit even in this callback-free fake. An empty
+        # `seen` set means no rows were observed, not that every table name is valid.
+        expected = set(seen) or {"app.customers"}
+        self.completion = SnapshotCompletion.full_snapshot(expected)
         # A committed snapshot row is legal only after Debezium's STARTED callback.
         self.completion.observe_notification("STARTED", {})
         units = [

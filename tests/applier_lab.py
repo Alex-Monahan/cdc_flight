@@ -46,6 +46,16 @@ from cdc_flight.snapshot_completion import SnapshotCompletion
 TOPIC_PREFIX = "cdcflight"
 DATASET = "cdc_raw"
 PARTITION = {"server": TOPIC_PREFIX}
+SNAPSHOT_TABLES = frozenset(
+    {
+        "app.customers",
+        "app.orders",
+        "app.sensor_readings",
+        "app.documents",
+        "app.wide_types",
+        "app.audit_log",
+    }
+)
 
 
 class _Raw:
@@ -242,7 +252,7 @@ class Lab:
         # Direct snapshot-driving tests do not have a Debezium notification stream,
         # so begin the lab's synthetic full-snapshot protocol explicitly. Production
         # callers supply the policy and its real ordered callbacks.
-        completion = SnapshotCompletion.full_snapshot()
+        completion = SnapshotCompletion.full_snapshot(SNAPSHOT_TABLES)
         completion.observe_notification("STARTED", {})
         self.lease = Lease("lab", ttl_seconds=600)
         self.lease.acquire(self.con)

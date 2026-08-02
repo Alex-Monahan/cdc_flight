@@ -34,8 +34,13 @@ def test_declared_completion_machine_has_one_terminal_definition():
         "completion_notified",
         "callbacks_complete",
         "not_required",
+        "streaming",
     )
-    assert SNAPSHOT_COMPLETION.terminal == {"callbacks_complete", "not_required"}
+    assert SNAPSHOT_COMPLETION.terminal == {
+        "callbacks_complete",
+        "not_required",
+        "streaming",
+    }
     assert SNAPSHOT_COMPLETION.edges == {
         ("awaiting_callbacks", "callbacks_started"),
         ("callbacks_started", "callbacks_started"),
@@ -44,6 +49,8 @@ def test_declared_completion_machine_has_one_terminal_definition():
         ("completion_notified", "completion_notified"),
         ("completion_notified", "callbacks_complete"),
         ("not_required", "not_required"),
+        ("callbacks_complete", "streaming"),
+        ("not_required", "streaming"),
     }
 
 
@@ -70,6 +77,28 @@ def test_row_marker_is_diagnostic_after_started_callback():
     assert completion.marker_seen is True
     completion.observe_committed_group([], snapshot_active=False)
     assert completion.phase_ended is False
+
+
+def test_committed_snapshot_row_for_unexpected_table_is_refused():
+    completion = SnapshotCompletion.full_snapshot({"app.customers"})
+    completion.observe_notification("STARTED", {})
+
+    with pytest.raises(SnapshotObservationError, match=r"unexpected table.*app\.orders"):
+        completion.observe_committed_group(
+            [_snapshot_unit(table="orders")], snapshot_active=False
+        )
+
+    assert completion.tables_seen == set()
+    completion.observe_notification(
+        "TABLE_SCAN_COMPLETED",
+        {
+            "scanned_collection": "app.customers",
+            "status": "SUCCEEDED",
+            "total_rows_scanned": "0",
+        },
+    )
+    completion.observe_notification("COMPLETED", {})
+    assert completion.completed is True
 
 
 def test_direct_snapshot_callbacks_complete_an_all_empty_expected_set():
