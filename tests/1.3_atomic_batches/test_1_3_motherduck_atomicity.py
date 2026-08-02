@@ -30,8 +30,14 @@ import uuid
 
 import duckdb
 import pytest
+from applier_lab import FakeCommitter, begin, end, keyed, snap
 
+from cdc_flight import destination as dest_mod
+from cdc_flight.applier import Applier, ApplierConfig
 from cdc_flight.config import motherduck_token
+from cdc_flight.destination import Lease, ResumePoint
+from cdc_flight.envelope import KIND_SNAPSHOT_BOUNDARY, PendingRecord
+from cdc_flight.snapshot_completion import SnapshotCompletion
 
 pytestmark = [pytest.mark.motherduck, pytest.mark.e2e]
 
@@ -201,3 +207,112 @@ def test_target_one_commit_group_per_pg_transaction_in_motherduck(md_observed_tx
         "              WHERE c.id = o.customer_id AND c.name LIKE 'mdatomic-c-%')"
     ).fetchall()
     assert len(commits) == 1, f"PG transaction split across {len(commits)} commit groups"
+
+
+def test_motherduck_fenced_spilled_overlap_has_an_isolated_owner(md_token, tmp_path):
+    """MotherDuck accepts the same fenced spill ownership protocol as local DuckDB."""
+    dataset = f"cdc_overlap_{uuid.uuid4().hex[:8]}"
+    pipeline = f"md_overlap_{uuid.uuid4().hex[:8]}"
+    dsn = f"md:{MD_DATABASE}?motherduck_token={md_token}"
+    bootstrap = duckdb.connect(f"md:?motherduck_token={md_token}")
+    bootstrap.execute(f'CREATE DATABASE IF NOT EXISTS "{MD_DATABASE}"')
+    bootstrap.close()
+
+    con = duckdb.connect(dsn)
+    dest_mod.ensure_control_schema(con)
+    dest_mod.ensure_dataset(con, dataset)
+    lease = Lease(pipeline, ttl_seconds=600)
+    lease.acquire(con)
+    completion = SnapshotCompletion.full_snapshot({"app.customers"})
+    completion.observe_notification("STARTED", {})
+    completion.observe_notification(
+        "TABLE_SCAN_COMPLETED",
+        {
+            "scanned_collection": "app.customers",
+            "status": "SUCCEEDED",
+            "total_rows_scanned": "2",
+        },
+    )
+    completion.observe_notification("COMPLETED", {})
+    applier = Applier(
+        con,
+        pipeline=pipeline,
+        namespace="md-overlap",
+        dataset=dataset,
+        topic_prefix="cdcflight",
+        offset_path=tmp_path / "offsets.dat",
+        resume_point=ResumePoint(),
+        config=ApplierConfig(
+            verify_offset_file=False,
+            resnapshot=True,
+            snapshot_chunk_events=1,
+            unit_spill_events=2,
+        ),
+        lease=lease,
+        runner_id="md-overlap-runner",
+        completion=completion,
+    )
+    committer = FakeCommitter()
+    applier._committer = committer
+
+    boundary = PendingRecord(
+        raw=None,
+        kind=KIND_SNAPSHOT_BOUNDARY,
+        topic="cdcflight.cdc_flight_snapshot_notifications",
+        nbytes=0,
+        lsn=201,
+        source_partition={"server": "cdcflight"},
+        source_offset={"lsn": 201, "lsn_proc": 201, "ts_usec": 201000},
+    )
+
+    def feed(records):
+        for record in records:
+            for unit in applier.assembler.feed(record):
+                applier._add_unit(unit)
+
+    try:
+        feed([snap("customers", 100, ident=1, marker="true")])
+        for unit in applier.assembler.feed_snapshot_boundary(boundary):
+            applier._add_unit(unit)
+        feed(
+            [
+                begin("md-overlap-txn", 300),
+                keyed("md-overlap-txn", 1, 301, 2, "overlap-a"),
+                keyed("md-overlap-txn", 2, 302, 3, "overlap-b"),
+                end("md-overlap-txn", 2, 303, {"app.customers": 2}),
+            ]
+        )
+        feed([snap("customers", 200, ident=2, marker="last")])
+        applier.commit_group("motherduck_matrix")
+
+        assert applier.fenced_spilled_events == 2
+        assert applier.snapshot_completed is True
+        assert committer.marked > 0
+        verify = duckdb.connect(dsn)
+        try:
+            verify.execute("FORCE CHECKPOINT")
+            table = f'"{dataset}"."cdcflight_app_customers"'
+            assert verify.execute(f"SELECT id, name FROM {table} ORDER BY id").fetchall() == [
+                (1, "s"),
+                (2, "s"),
+            ]
+            assert verify.execute(
+                "SELECT count(*) FROM _cdc_flight.spill_events"
+            ).fetchone()[0] == 0
+            assert verify.execute(
+                "SELECT count(*), sum(fenced_units) FROM _cdc_flight.commit_log "
+                "WHERE pipeline = ?",
+                [pipeline],
+            ).fetchone() == (2, 1)
+        finally:
+            verify.close()
+    finally:
+        applier.drain_on_shutdown()
+        lease.release(con)
+        applier.alerts.close()
+        con.close()
+        cleanup = duckdb.connect(dsn)
+        try:
+            cleanup.execute(f'DROP SCHEMA IF EXISTS "{dataset}" CASCADE')
+        finally:
+            cleanup.close()
