@@ -55,7 +55,7 @@ from .assembler import (
 from .catalog_apply import CatalogCoordinator
 from .commit_group import OpenGroup
 from .destination import AlertSink, Lease, ResumePoint
-from .envelope import KIND_UNKNOWN, PendingRecord, decode
+from .envelope import KIND_SNAPSHOT_BOUNDARY, PendingRecord, decode
 from .errors import AmbiguousDelete, DestinationIdentityCollision
 from .faults import arm_group, maybe_crash
 from .planner import GroupPlan, stream_event_id
@@ -394,21 +394,35 @@ class Applier:
                 )
             if notification is not None:
                 self.snapshot_notification_count += 1
-                self._pending_snapshot_notifications.append(raw)
+                boundary = None
                 if notification.observation == "COMPLETED":
-                    # The ordered terminal callback is the boundary after the last row
-                    # callback. Feed only this boundary through the assembler: progress
-                    # callbacks must never fragment snapshot chunks or swap shadows.
-                    rec = decode(raw, topic_prefix=self.topic_prefix)
-                    rec.kind = KIND_UNKNOWN
-                    for unit in self.assembler.feed(rec):
-                        self._add_unit(unit)
-                    self.commit_group("snapshot_callback_completed")
+                    # Validate the terminal observation BEFORE any destination
+                    # transaction can write its source offset. The raw notification
+                    # remains pending; this decoded boundary is deliberately not
+                    # acknowledgeable and exists only to carry its Connect offset into
+                    # the final destination transaction.
+                    boundary = decode(
+                        raw, topic_prefix=self.topic_prefix, want_offsets=True
+                    )
+                    if not boundary.source_partition or not boundary.source_offset:
+                        raise SnapshotObservationError(
+                            "COMPLETED snapshot notification has no Connect offset; "
+                            "refusing to advance the destination resume point"
+                        )
+                    boundary.kind = KIND_SNAPSHOT_BOUNDARY
+                    boundary.raw = None
                 self.snapshot_completion.observe_notification(
                     notification.observation, notification.data
                 )
-                if self.snapshot_completion.completed:
-                    self._ack_snapshot_notifications()
+                self._pending_snapshot_notifications.append(raw)
+                if boundary is not None:
+                    # The ordered terminal callback is the boundary after the last row
+                    # callback. Feed only this explicit boundary through the assembler:
+                    # progress callbacks must never fragment snapshot chunks or swap
+                    # shadows, and the pending raw notification must not be acked as a
+                    # normal commit-group record.
+                    for unit in self.assembler.feed_snapshot_boundary(boundary):
+                        self._add_unit(unit)
                 continue
 
             source_records += 1
@@ -469,9 +483,18 @@ class Applier:
     # ------------------------------------------------------------------ #
     def _add_unit(self, unit: CompleteUnit) -> None:
         is_snapshot = unit.kind == UNIT_SNAPSHOT_CHUNK
+        is_snapshot_boundary = any(
+            record.kind == KIND_SNAPSHOT_BOUNDARY for record in unit.records
+        )
         # ADR §3.5: snapshot units are never mixed with streaming units, so a
-        # commit_log row unambiguously says which phase it belongs to.
-        if self.group.units and is_snapshot != self.group.is_snapshot:
+        # commit_log row unambiguously says which phase it belongs to. The explicit
+        # terminal boundary is control-shaped but belongs to the snapshot group so its
+        # offset commits atomically with the final snapshot rows.
+        if (
+            self.group.units
+            and is_snapshot != self.group.is_snapshot
+            and not (is_snapshot_boundary and self.group.is_snapshot)
+        ):
             self.commit_group("snapshot_chunk" if self.group.is_snapshot else "phase")
         if not self.group.units:
             self.group.is_snapshot = is_snapshot
@@ -535,6 +558,13 @@ class Applier:
     def commit_group(self, trigger: str) -> None:
         group = self.group.units
         if not group:
+            return
+        # Snapshot rows are observations of the same closed protocol as the direct
+        # notifications. Validate their state and declared counts before BEGIN/COMMIT;
+        # a terminal boundary also waits here until its final buffered rows make the
+        # completion proof terminal. The post-commit observer only records evidence
+        # that has now become durable.
+        if not self.snapshot_completion.commit_ready(group):
             return
         commit_id = self.group.spill_commit_id or self._next_commit_id
         opened_at = destination.now()
@@ -673,9 +703,9 @@ class Applier:
         self._settle_catalog()
         self._flush_alerts()
         # Snapshot completion is one policy shared by the main and re-snapshot engines.
-        # It is updated only after COMMIT, and the policy itself requires the final
-        # marker plus an inactive shadow coordinator before taking the record-complete
-        # edge (Codex B1 / r7 MAJOR-3).
+        # Row evidence is recorded only after COMMIT; direct per-table/global callbacks
+        # and declared/committed counts take the terminal edge. Row markers are
+        # diagnostic only and never prove completion.
         self.snapshot_completion.observe_committed_group(
             group, snapshot_active=self.snapshots.active
         )

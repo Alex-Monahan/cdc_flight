@@ -60,6 +60,7 @@ from .envelope import (
     KIND_MESSAGE,
     KIND_SCHEMA_CHANGE,
     KIND_SNAPSHOT,
+    KIND_SNAPSHOT_BOUNDARY,
     KIND_TRUNCATE,
     KIND_TXN_BEGIN,
     KIND_TXN_END,
@@ -273,6 +274,29 @@ class TransactionAssembler:
             units.extend(self._feed_control(rec))
         else:
             units.extend(self._feed_control(rec))
+        self.units_emitted += len(units)
+        return units
+
+    def feed_snapshot_boundary(self, rec: PendingRecord) -> list[CompleteUnit]:
+        """Emit the explicit, non-acknowledgeable Initial Snapshot boundary.
+
+        The terminal notification is not an ordinary control record. Its Connect
+        offset must join the final destination transaction, while its Debezium handle
+        must remain pending until the completion machine has accepted the exact table
+        set and all declared rows are durable. Keeping this operation separate from
+        :meth:`feed` makes that ownership visible at the assembler boundary.
+        """
+        if rec.kind != KIND_SNAPSHOT_BOUNDARY or rec.raw is not None:
+            raise TransactionAssemblyError(
+                "snapshot boundary must be a typed record without an acknowledgeable "
+                "Debezium handle"
+            )
+        if self._txn is not None:
+            raise TransactionAssemblyError(
+                "snapshot boundary arrived while a streaming transaction is open"
+            )
+        units = self._close_chunk(last_for_table=True)
+        units.append(self._control_unit(rec))
         self.units_emitted += len(units)
         return units
 

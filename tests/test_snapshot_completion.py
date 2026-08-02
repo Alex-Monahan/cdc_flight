@@ -38,7 +38,6 @@ def test_declared_completion_machine_has_one_terminal_definition():
     assert SNAPSHOT_COMPLETION.terminal == {"callbacks_complete", "not_required"}
     assert SNAPSHOT_COMPLETION.edges == {
         ("awaiting_callbacks", "callbacks_started"),
-        ("awaiting_callbacks", "awaiting_callbacks"),
         ("callbacks_started", "callbacks_started"),
         ("callbacks_started", "completion_notified"),
         ("callbacks_started", "callbacks_complete"),
@@ -48,19 +47,22 @@ def test_declared_completion_machine_has_one_terminal_definition():
     }
 
 
-def test_committed_debezium_last_marker_is_diagnostic_not_completion():
+def test_committed_snapshot_row_before_started_is_refused():
     completion = SnapshotCompletion.full_snapshot({"app.customers"})
 
-    completion.observe_committed_group([_snapshot_unit(last=True)], snapshot_active=False)
+    with pytest.raises(SnapshotObservationError, match="awaiting_callbacks"):
+        completion.observe_committed_group(
+            [_snapshot_unit(last=True)], snapshot_active=False
+        )
 
     assert completion.phase_ended is False
     assert completion.state == "awaiting_callbacks"
-    assert completion.tables_seen == {"app.customers"}
-    assert completion.marker_seen is True
+    assert completion.tables_seen == set()
 
 
-def test_terminal_marker_waits_for_the_shadow_swap_to_finish():
+def test_row_marker_is_diagnostic_after_started_callback():
     completion = SnapshotCompletion.full_snapshot({"app.customers"})
+    completion.observe_notification("STARTED", {})
 
     completion.observe_committed_group([_snapshot_unit(last=True)], snapshot_active=True)
 
@@ -100,13 +102,14 @@ def test_direct_snapshot_callbacks_complete_an_all_empty_expected_set():
 
 def test_source_streaming_is_not_a_completion_observation():
     completion = SnapshotCompletion.full_snapshot({"app.customers"})
+    completion.observe_notification("STARTED", {})
     completion.observe_committed_group([_snapshot_unit()], snapshot_active=True)
 
     with pytest.raises(SnapshotObservationError, match="source streaming"):
         completion.observe_source_streaming()
 
     assert completion.phase_ended is False
-    assert completion.state == "awaiting_callbacks"
+    assert completion.state == "callbacks_started"
 
 
 def test_terminal_callback_waits_for_load_delayed_row_callbacks():
@@ -166,3 +169,13 @@ def test_streaming_only_run_has_no_snapshot_obligation():
 
     assert completion.phase_ended is True
     assert completion.state == "not_required"
+
+
+def test_streaming_only_run_refuses_committed_snapshot_rows():
+    completion = SnapshotCompletion.streaming_only()
+
+    with pytest.raises(SnapshotObservationError, match="not_required"):
+        completion.observe_committed_group([_snapshot_unit()], snapshot_active=False)
+
+    assert completion.state == "not_required"
+    assert completion.tables_seen == set()

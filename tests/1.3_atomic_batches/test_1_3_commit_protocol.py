@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from applier_lab import DATASET, Lab, data, end, keyed
+from applier_lab import DATASET, Lab, data, end, keyed, snap
 
 from cdc_flight.errors import OffsetFlushFailed
 from cdc_flight.snapshot_completion import SnapshotCompletion, SnapshotObservationError
@@ -62,17 +62,32 @@ def test_shutdown_seals_callback_admission_and_records_late_batches(lab, monkeyp
 class _SnapshotNotification:
     """Minimal ordered notification with a real Connect offset shape."""
 
-    def __init__(self, observation: str, lsn: int):
+    class _Map(dict):
+        class _Entry:
+            def __init__(self, key, value):
+                self._key = key
+                self._value = value
+
+            def getKey(self):
+                return self._key
+
+            def getValue(self):
+                return self._value
+
+        def entrySet(self):
+            return [self._Entry(key, value) for key, value in self.items()]
+
+    def __init__(self, observation: str, lsn: int, data: dict[str, str] | None = None):
         self._topic = "cdcflight.cdc_flight_snapshot_notifications"
         self._value = json.dumps(
             {
                 "aggregate_type": "Initial Snapshot",
                 "type": observation,
-                "additional_data": {},
+                "additional_data": data or {},
             }
         )
-        self._partition = {"server": "cdcflight"}
-        self._offset = {"lsn": lsn, "lsn_proc": lsn, "ts_usec": lsn * 1000}
+        self._partition = self._Map(server="cdcflight")
+        self._offset = self._Map(lsn=lsn, lsn_proc=lsn, ts_usec=lsn * 1000)
 
     def destination(self):
         return self._topic
@@ -108,6 +123,40 @@ def test_invalid_terminal_refuses_before_resume_commit_or_ack(lab):
     assert box.committer.batches == 0
     assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 0
     assert box.scalar("SELECT count(*) FROM _cdc_flight.debezium_offsets") == 0
+
+
+def test_valid_terminal_offset_commits_before_pending_notifications_are_acked(lab):
+    """The terminal offset is durable, but its raw callback is acked only at completion."""
+    box = lab()
+    box.applier.snapshot_completion = SnapshotCompletion.full_snapshot({"app.customers"})
+
+    box.applier._handle([_SnapshotNotification("STARTED", 101)], box.committer)
+    box.feed([snap("customers", 100, ident=1, value="s", marker="last")])
+    box.applier._handle(
+        [
+            _SnapshotNotification(
+                "TABLE_SCAN_COMPLETED",
+                102,
+                {
+                    "scanned_collection": "app.customers",
+                    "status": "SUCCEEDED",
+                    "total_rows_scanned": "1",
+                },
+            ),
+            _SnapshotNotification("COMPLETED", 103),
+        ],
+        box.committer,
+    )
+
+    assert box.applier.snapshot_completed is True
+    point = box.applier.resume_point
+    assert point.last_lsn == 103
+    assert point.offset["lsn"] == 103
+    assert box.applier.commit_groups == 1
+    # One row record plus the three pending notifications; the synthetic boundary has
+    # raw=None and therefore cannot be acknowledged as an ordinary control record.
+    assert box.committer.marked == 4
+    assert box.committer.batches == 2
 
 
 class _RecordingVerifier:

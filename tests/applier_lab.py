@@ -41,6 +41,7 @@ from cdc_flight.envelope import (
     KIND_TXN_END,
     PendingRecord,
 )
+from cdc_flight.snapshot_completion import SnapshotCompletion
 
 TOPIC_PREFIX = "cdcflight"
 DATASET = "cdc_raw"
@@ -238,6 +239,11 @@ class Lab:
         self.committer = FakeCommitter()
         cfg.setdefault("verify_offset_file", False)
         self.config = ApplierConfig(**cfg)
+        # Direct snapshot-driving tests do not have a Debezium notification stream,
+        # so begin the lab's synthetic full-snapshot protocol explicitly. Production
+        # callers supply the policy and its real ordered callbacks.
+        completion = SnapshotCompletion.full_snapshot()
+        completion.observe_notification("STARTED", {})
         self.lease = Lease("lab", ttl_seconds=600)
         self.lease.acquire(self.con)
         self.applier = Applier(
@@ -252,6 +258,7 @@ class Lab:
             lease=self.lease,
             runner_id="lab-runner",
             catalog=catalog,
+            completion=completion,
         )
         self.applier._committer = self.committer
 

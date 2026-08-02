@@ -3,8 +3,8 @@
 Debezium's ``sink`` notification channel places initial-snapshot notifications in the
 same ordered ``ChangeEventQueue`` as row records.  A delivered ``COMPLETED`` notification
 therefore proves that every earlier snapshot callback crossed the Python boundary.  The
-per-table ``TABLE_SCAN_COMPLETED`` notifications also cover empty relations, which have
-no row record on which a ``snapshot='last'`` marker could ride.
+per-table ``TABLE_SCAN_COMPLETED`` notifications also cover empty relations, which
+have no row record but still have direct completion evidence.
 
 Source slot state is deliberately outside this model.  Reaching streaming says where the
 connector is; it says nothing about callbacks already waiting in its delivery queue.
@@ -13,6 +13,7 @@ connector is; it says nothing about callbacks already waiting in its delivery qu
 from __future__ import annotations
 
 from .assembler import UNIT_SNAPSHOT_CHUNK
+from .envelope import KIND_SNAPSHOT_BOUNDARY
 from .machines import (
     SNAPSHOT_AWAITING_CALLBACKS,
     SNAPSHOT_CALLBACK_OBSERVATIONS,
@@ -101,33 +102,55 @@ class SnapshotCompletion:
     def snapshot_units(self) -> int:
         return self._snapshot_units
 
-    def observe_committed_group(self, units, *, snapshot_active: bool) -> None:
-        """Retain row diagnostics; row markers are not a completion edge."""
-        del snapshot_active
-        snapshot_units = [
-            unit
-            for unit in units
-            if unit.kind == UNIT_SNAPSHOT_CHUNK and not unit.fenced
-        ]
-        if snapshot_units and self._state == SNAPSHOT_CALLBACKS_COMPLETE:
+    def validate_committed_group(self, units) -> None:
+        """Validate snapshot-row observations before their destination transaction.
+
+        ``observe_committed_group`` records the rows only after ``COMMIT``. Its
+        validation therefore has to be available before the commit as well, or an
+        illegal row/state or an over-counted callback can advance the resume point
+        before the refusal is raised.
+        """
+        self._validate_snapshot_units(self._snapshot_units_in(units))
+
+    def commit_ready(self, units) -> bool:
+        """Whether a group may carry a terminal snapshot offset to ``COMMIT``.
+
+        A valid ``COMPLETED`` callback can arrive while its final row units are still
+        buffered. Keep the boundary with those rows until their declared counts match;
+        otherwise the destination could durably skip the queued rows while the model
+        still says ``completion_notified``.
+        """
+        self.validate_committed_group(units)
+        if not self._has_boundary(units):
+            return True
+        if self._state == SNAPSHOT_CALLBACKS_COMPLETE:
+            return True
+        if self._state != SNAPSHOT_COMPLETION_NOTIFIED:
             raise SnapshotObservationError(
-                "snapshot row callback arrived after Debezium's ordered COMPLETED "
-                "callback; refusing an impossible callback order"
+                f"snapshot boundary reached {self._state} without a validated "
+                "COMPLETED observation"
             )
+        return self._counts_match(
+            self._projected_rows(self._snapshot_units_in(units))
+        )
+
+    def observe_committed_group(self, units, *, snapshot_active: bool) -> None:
+        """Record rows after ``COMMIT``; direct callbacks prove completion.
+
+        The old shadow/marker model is gone. A row marker remains diagnostic, while
+        the per-table and global notifications plus declared/committed row counts
+        are the only completion proof.
+        """
+        del snapshot_active
+        snapshot_units = self._snapshot_units_in(units)
+        self._validate_snapshot_units(snapshot_units)
         for unit in snapshot_units:
             self._snapshot_units += 1
-            if unit.schema and unit.table:
-                table = _qualified(f"{unit.schema}.{unit.table}")
-                self._tables_seen.add(table)
-                self._committed_rows[table] = (
-                    self._committed_rows.get(table, 0) + unit.event_count
-                )
-                declared = self._callback_rows.get(table)
-                if declared is not None and self._committed_rows[table] > declared:
-                    raise SnapshotObservationError(
-                        f"committed {self._committed_rows[table]} snapshot row callbacks "
-                        f"for {table}, beyond Debezium's declared {declared}"
-                    )
+            table = _qualified(f"{unit.schema}.{unit.table}")
+            self._tables_seen.add(table)
+            self._committed_rows[table] = (
+                self._committed_rows.get(table, 0) + unit.event_count
+            )
             if unit.snapshot_last:
                 self._marker_seen = True
         if snapshot_units:
@@ -139,6 +162,63 @@ class SnapshotCompletion:
                 SNAPSHOT_COMPLETION_NOTIFIED,
             }:
                 self._transition(self._state)
+
+    @staticmethod
+    def _snapshot_units_in(units):
+        return [
+            unit
+            for unit in units
+            if unit.kind == UNIT_SNAPSHOT_CHUNK and not unit.fenced
+        ]
+
+    @staticmethod
+    def _has_boundary(units) -> bool:
+        return any(
+            record.kind == KIND_SNAPSHOT_BOUNDARY
+            for unit in units
+            for record in unit.records
+        )
+
+    def _projected_rows(self, snapshot_units) -> dict[str, int]:
+        projected = dict(self._committed_rows)
+        for unit in snapshot_units:
+            table = _qualified(f"{unit.schema}.{unit.table}")
+            projected[table] = projected.get(table, 0) + unit.event_count
+        return projected
+
+    def _validate_snapshot_units(self, snapshot_units) -> None:
+        if not snapshot_units:
+            return
+        legal_states = {
+            SNAPSHOT_CALLBACKS_STARTED,
+            SNAPSHOT_COMPLETION_NOTIFIED,
+        }
+        if self._state not in legal_states:
+            raise SnapshotObservationError(
+                f"committed snapshot row callback arrived in {self._state} state; "
+                "rows are legal only after STARTED and before callbacks_complete"
+            )
+        # Keep the observation on the declared machine, including its self-edges.
+        # The explicit state set above is necessary because not_required also has a
+        # self-edge for repeated SKIPPED notifications, not for rows.
+        try:
+            SNAPSHOT_COMPLETION.check(self._state, self._state)
+        except IllegalTransition as exc:  # pragma: no cover - declaration guard
+            raise SnapshotObservationError(str(exc)) from exc
+
+        projected = self._projected_rows(snapshot_units)
+        for unit in snapshot_units:
+            if not unit.schema or not unit.table:
+                raise SnapshotObservationError(
+                    "committed snapshot row callback has no schema.table identity"
+                )
+            table = _qualified(f"{unit.schema}.{unit.table}")
+            declared = self._callback_rows.get(table)
+            if declared is not None and projected[table] > declared:
+                raise SnapshotObservationError(
+                    f"committed {projected[table]} snapshot row callbacks for {table}, "
+                    f"beyond Debezium's declared {declared}"
+                )
 
     def observe_notification(self, observation: str, data: dict[str, str]) -> None:
         """Consume one Debezium ``Initial Snapshot`` notification, exhaustively."""
@@ -272,9 +352,10 @@ class SnapshotCompletion:
                 f"{sorted(self._expected_tables)}"
             )
 
-    def _counts_match(self) -> bool:
+    def _counts_match(self, committed_rows: dict[str, int] | None = None) -> bool:
+        committed_rows = self._committed_rows if committed_rows is None else committed_rows
         return all(
-            self._committed_rows.get(table, 0) == self._callback_rows.get(table)
+            committed_rows.get(table, 0) == self._callback_rows.get(table)
             for table in self._expected_tables
         )
 

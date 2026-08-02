@@ -72,10 +72,11 @@ and there are exactly two terminal states:
 
 * `swapped` — a shadow was built and atomically renamed over the live table. `C` is the
   snapshot records' own `source.lsn`, which is `slotCreatedInfo.startLsn()`.
-* `verified_empty` — three independent facts agree: Debezium emitted its own
-  end-of-snapshot marker (so the engine reached the end of the *whole* capture set),
-  this table produced **zero** snapshot records, and a source count taken afterwards
-  says the relation holds no rows. Only then is the destination table emptied.
+* `verified_empty` — three independent facts agree: Debezium emitted the ordered
+  per-table and global Initial Snapshot notifications (so the engine reached the end of
+  the *whole* capture set), this table produced **zero** snapshot records, and a source
+  count taken afterwards says the relation holds no rows. Only then is the destination
+  table emptied.
 
 Anything else leaves the table `awaiting_snapshot` and fails the run. The previous
 implementation inferred "empty" from "not swapped", which is a statement about *our*
@@ -183,8 +184,8 @@ class EmptinessEvidence:
     Debezium engine (Opus BLOCKER-1, "test coverage of this path: zero").
     """
 
-    #: Debezium emitted `snapshot='last'`, i.e. the engine reached the end of the
-    #: WHOLE requested capture set rather than stopping somewhere inside it.
+    #: The closed completion model accepted the per-table and global notifications, so
+    #: the engine reached the end of the WHOLE requested capture set.
     snapshot_phase_ended: bool
     #: `"<schema>.<table>"` for every table that produced at least one snapshot record.
     tables_seen: set[str]
@@ -198,8 +199,8 @@ class EmptinessEvidence:
         """`(is_verified_empty, why not)` for one requested table."""
         if not self.snapshot_phase_ended:
             return False, (
-                "the snapshot engine never emitted its end-of-snapshot marker, so this "
-                "table may simply not have been reached"
+                "the snapshot completion callbacks never proved the end of the whole "
+                "capture set, so this table may simply not have been reached"
             )
         if qualified in self.tables_seen:
             return False, (
@@ -223,11 +224,10 @@ class _SlotWatcher:
     running the only offset the connector has is the snapshot's own LSN, so any flush
     confirms exactly `C`.
 
-    It is a **corroboration** and never a source of `C` on its own. It used to be the
-    fallback for an all-empty capture set, and that was a race with no upper bound:
-    with no rows to scan, the engine can finish the image, enter streaming and advance
-    `confirmed_flush_lsn` before the first poll lands (Codex B2). An empty table is now
-    fenced at a WAL position we sample ourselves, immediately before verifying the
+    It is a **corroboration** and never a source of `C` on its own. Snapshot completion
+    comes from Debezium's ordered per-table/global notifications, including for empty
+    tables; source streaming and a slot poll are never completion edges. An empty table
+    is fenced at a WAL position we sample ourselves, immediately before verifying the
     emptiness, which cannot be ahead of the image.
     """
 
@@ -413,9 +413,10 @@ def run(
                 applier,
                 dataclasses.replace(
                     run_cfg,
-                    # The snapshot is over the moment Debezium says it is, so the idle
-                    # window is only a fallback for a capture set that turns out to be
-                    # entirely empty (which emits no records and therefore no marker).
+                    # The snapshot is over only after the ordered per-table and global
+                    # callbacks prove it. Empty tables emit no row records, but their
+                    # direct notifications still supply the completion evidence; idle
+                    # is never a snapshot-completion fallback.
                     idle_seconds=min(run_cfg.idle_seconds, 6.0),
                     min_records=0,
                 ),
@@ -727,8 +728,9 @@ def finish_verified_empty_tables(
     about the source: a table the engine stopped before reaching also produces no
     records, and deleting its live destination rows is silent destruction (Opus
     BLOCKER-1, reproduced against a populated table). Every pending table is therefore
-    checked against `EmptinessEvidence`, which requires an end-of-snapshot marker, zero
-    records for *this* table, and a source count of zero. A table that fails any of the
+    checked against `EmptinessEvidence`, which requires the direct per-table/global
+    completion callbacks, zero records for *this* table, and a source count of zero. A
+    table that fails any of the
     three is left completely untouched and stays `awaiting_snapshot`; the caller then
     fails the run through `assert_every_requested_table_completed`.
     """
@@ -789,8 +791,9 @@ def finish_verified_empty_tables(
                 lsn=consistent_lsn,
                 rows_removed=removed,
                 detail=(
-                    "the source relation was VERIFIED to hold no rows: the snapshot "
-                    "engine reached its end-of-snapshot marker, produced no record for "
+                    "the source relation was VERIFIED to hold no rows: the ordered "
+                    "per-table and global snapshot callbacks completed, and no record "
+                    "was produced for "
                     "this table, and a REPEATABLE READ count taken after "
                     f"pg_current_wal_lsn()={consistent_lsn} returned zero. The "
                     "destination table was emptied rather than swapped, and is fenced "
@@ -846,8 +849,8 @@ def finish_empty_tables_after_main_snapshot(
     independent facts are unchanged, and so is the rule that a table failing any of them
     is left completely untouched and stays owed:
 
-    1. Debezium emitted its own end-of-snapshot marker (or produced nothing at all and
-       the connector reached streaming), so the engine saw the whole capture set;
+    1. Debezium's ordered per-table and global completion notifications prove that the
+       engine saw the whole capture set;
     2. this table produced **zero** snapshot records;
     3. a source count taken after the engine stopped says the relation holds no rows,
        fenced at a WAL position sampled before that count.

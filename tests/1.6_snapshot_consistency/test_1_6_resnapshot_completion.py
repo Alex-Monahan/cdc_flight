@@ -272,6 +272,8 @@ def test_a_verified_empty_table_is_emptied_and_fenced_at_the_verified_lsn(tmp_pa
 class _FakeApplier:
     def __init__(self, final_seen: bool, seen: set[str]):
         self.completion = SnapshotCompletion.full_snapshot()
+        # A committed snapshot row is legal only after Debezium's STARTED callback.
+        self.completion.observe_notification("STARTED", {})
         units = [
             SimpleNamespace(
                 kind=UNIT_SNAPSHOT_CHUNK,
