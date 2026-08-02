@@ -326,9 +326,12 @@ many cheap tests.
 
 **Worker isolation.** Each xdist worker clones a private database from its own template
 and uses private slots, offsets, state, and DuckDB files. The per-instance
-`.pytest-source-<instance>.lock` serialises only cluster/template setup, so workers
-execute independently after provisioning. Worker database/template and slot prefixes
-include the instance id, so independent ports do not collide in shared tooling.
+`.pytest-source-<instance>.lock` is held by the pytest controller for the entire run,
+so two sessions cannot mutate the same instance. A separate instance-scoped setup lock
+serialises template provisioning while workers execute independently. A crashed
+controller releases ownership through the kernel; stale lock-file metadata is replaced
+only after the next controller acquires that kernel lock. Worker database/template and
+slot prefixes include the instance id, so independent ports do not collide.
 
 ### Test layout and conventions
 

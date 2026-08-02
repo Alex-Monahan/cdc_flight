@@ -15,12 +15,15 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import time
+import uuid
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 # Must precede DuckDB/PyArrow imports. PyArrow 25.0.0's default mimalloc backend can
 # SIGSEGV on the JPype JVM callback thread used by the live recovery path (ADR A14/A66).
@@ -83,6 +86,12 @@ TEST_LOCK_PATH = Path(
     os.environ.get(
         "CDC_TEST_LOCK_PATH",
         str(PROJECT_DIR / f".pytest-source-{TEST_INSTANCE_ID}.lock"),
+    )
+)
+TEST_SETUP_LOCK_PATH = Path(
+    os.environ.get(
+        "CDC_TEST_SETUP_LOCK_PATH",
+        str(PROJECT_DIR / f".pytest-source-{TEST_INSTANCE_ID}-setup.lock"),
     )
 )
 
@@ -164,16 +173,93 @@ def _reset_fault_spec():
 # --------------------------------------------------------------------------- #
 # session-scoped environment
 # --------------------------------------------------------------------------- #
+_RUN_LOCK_HANDLE: TextIO | None = None
+
+
+def _acquire_test_run_lock(
+    lock_path: Path,
+    *,
+    run_uid: str,
+    wait_seconds: float = 1800,
+    poll_seconds: float = 1,
+) -> TextIO:
+    """Acquire the instance's test-run ownership lock.
+
+    The kernel lock is the authority. File contents are diagnostic metadata only:
+    after a crash the OS releases the lock, and the next owner may replace stale
+    metadata immediately. Conversely, metadata age never permits takeover while
+    another process still holds the lock.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+")
+    deadline = time.monotonic() + wait_seconds
+    announced = False
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            handle.seek(0)
+            owner = handle.read().strip() or "unknown owner"
+            if not announced:
+                print(
+                    f"\nwaiting for test-run owner of {TEST_INSTANCE_ID} "
+                    f"at {lock_path}: {owner}"
+                )
+                announced = True
+            if time.monotonic() >= deadline:
+                handle.close()
+                raise TimeoutError(
+                    f"timed out waiting for test-run lock {lock_path}: {owner}"
+                ) from None
+            time.sleep(poll_seconds)
+
+    metadata = {
+        "hostname": socket.gethostname(),
+        "instance_id": TEST_INSTANCE_ID,
+        "pid": os.getpid(),
+        "run_uid": run_uid,
+        "started_at": time.time(),
+    }
+    handle.seek(0)
+    handle.truncate()
+    json.dump(metadata, handle, sort_keys=True)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+    return handle
+
+
+def pytest_configure(config) -> None:
+    """Let the controller own the selected Postgres instance for the whole run."""
+    if hasattr(config, "workerinput"):
+        return
+    global _RUN_LOCK_HANDLE
+    if _RUN_LOCK_HANDLE is not None:
+        return
+    run_uid = config.getoption("testrunuid", default=None) or uuid.uuid4().hex
+    try:
+        _RUN_LOCK_HANDLE = _acquire_test_run_lock(TEST_LOCK_PATH, run_uid=run_uid)
+    except TimeoutError as exc:
+        raise pytest.UsageError(str(exc)) from exc
+
+
+def pytest_unconfigure(config) -> None:
+    """Release ownership after every worker and finalizer has stopped."""
+    if hasattr(config, "workerinput"):
+        return
+    global _RUN_LOCK_HANDLE
+    if _RUN_LOCK_HANDLE is None:
+        return
+    fcntl.flock(_RUN_LOCK_HANDLE, fcntl.LOCK_UN)
+    _RUN_LOCK_HANDLE.close()
+    _RUN_LOCK_HANDLE = None
+
+
 @pytest.fixture(scope="session")
 def exclusive_source() -> Iterator[Path]:
-    """Provide a short setup lock; worker databases make test execution independent.
-
-    The old fixture held this lock for the entire session because every test
-    mutated one shared `app` schema. Each pytest worker now receives a database
-    cloned from a canonical template, so the lock is only used while workers
-    start Postgres and prepare their databases.
-    """
-    lock_path = TEST_LOCK_PATH
+    """Provide the worker-setup lock nested inside controller run ownership."""
+    lock_path = TEST_SETUP_LOCK_PATH
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path.touch(exist_ok=True)
     yield lock_path
