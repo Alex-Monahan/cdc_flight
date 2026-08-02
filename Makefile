@@ -2,6 +2,7 @@ SHELL := /bin/bash
 PROJECT_DIR := $(shell cd "$(dir $(lastword $(MAKEFILE_LIST)))" && pwd)
 UV ?= uv
 PG := $(PROJECT_DIR)/scripts/pg.sh
+RUNTIME_STATE := $(PROJECT_DIR)/scripts/runtime_state.sh
 
 # The test cluster is deliberately separate from any Postgres service on the
 # host.  Use CDC_TEST_PGPORT as the one required per-instance input; all other
@@ -17,10 +18,9 @@ CDC_TEST_PGDATABASE ?= cdc_source
 CDC_TEST_TEMPLATE_DATABASE_PREFIX ?= cdc_flight_test_template_$(CDC_TEST_INSTANCE_ID)_
 CDC_TEST_WORKER_DATABASE_PREFIX ?= cdc_flight_test_$(CDC_TEST_INSTANCE_ID)_
 CDC_TEST_SLOT_PREFIX ?= test_slot_$(CDC_TEST_INSTANCE_ID)_
-CDC_INSTANCE_RUNTIME_ROOT ?= $(PROJECT_DIR)/.cdc_instances/$(CDC_TEST_INSTANCE_ID)
-CDC_STATE_DIR ?= $(CDC_INSTANCE_RUNTIME_ROOT)/cdc_state
+CDC_STATE_DIR ?= $(PROJECT_DIR)/.cdc_instances/$(CDC_TEST_INSTANCE_ID)/cdc_state
 CDC_PIPELINES_DIR ?= $(CDC_STATE_DIR)/dlt_pipelines
-CDC_DUCKDB_PATH ?= $(CDC_INSTANCE_RUNTIME_ROOT)/cdc_flight.duckdb
+CDC_DUCKDB_PATH ?= $(PROJECT_DIR)/.cdc_instances/$(CDC_TEST_INSTANCE_ID)/cdc_flight.duckdb
 CDC_PIPELINE_NAME ?= cdc_flight_$(CDC_TEST_INSTANCE_ID)
 
 # Everything (Postgres, the JVM, DuckDB) runs natively on the host: no Docker.
@@ -36,7 +36,6 @@ export CDC_TEST_PGDATABASE
 export CDC_TEST_TEMPLATE_DATABASE_PREFIX
 export CDC_TEST_WORKER_DATABASE_PREFIX
 export CDC_TEST_SLOT_PREFIX
-export CDC_INSTANCE_RUNTIME_ROOT
 export CDC_STATE_DIR
 export CDC_PIPELINES_DIR
 export CDC_DUCKDB_PATH
@@ -107,16 +106,20 @@ reset: clean-state pg-reset seed ## nuke everything (cluster, offsets, duckdb) a
 changes: ## generate one deterministic wave of inserts/updates/deletes
 	$(UV) run cdc-datagen changes --scale 1 --seed 42
 
+.PHONY: prepare-state
+prepare-state: ## mark the selected project-local runtime directory as disposable
+	$(RUNTIME_STATE) prepare
+
 .PHONY: pipeline
-pipeline: ## run the CDC pipeline into local DuckDB
+pipeline: prepare-state ## run the CDC pipeline into local DuckDB
 	$(UV) run cdc-flight --destination duckdb --max-seconds 90 --idle-seconds 8
 
 .PHONY: pipeline-fresh
-pipeline-fresh: ## run the pipeline from scratch (drops offsets + dlt state first)
+pipeline-fresh: prepare-state ## run the pipeline from scratch (drops offsets + dlt state first)
 	$(UV) run cdc-flight --destination duckdb --reset-state --max-seconds 120 --idle-seconds 8
 
 .PHONY: pipeline-md
-pipeline-md: ## run the CDC pipeline into MotherDuck (needs $$motherduck_token)
+pipeline-md: prepare-state ## run the CDC pipeline into MotherDuck (needs $$motherduck_token)
 	$(UV) run cdc-flight --destination motherduck --max-seconds 120 --idle-seconds 8
 
 .PHONY: query
@@ -157,7 +160,7 @@ lint: ## ruff
 
 .PHONY: clean-state
 clean-state: ## drop Debezium offsets, dlt pipeline state and the local DuckDB file
-	rm -rf $(CDC_INSTANCE_RUNTIME_ROOT)
+	$(RUNTIME_STATE) clean
 
 .PHONY: clean
 clean: clean-state ## clean-state plus caches

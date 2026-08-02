@@ -103,8 +103,10 @@ make reset
   table covering ~34 Postgres types, and a **partitioned** `audit_log`) and creates
   `PUBLICATION cdc_flight_pub`. `sql/02_seed.sql` inserts deterministic starting rows.
 * **`make pipeline`** → `cdc-flight`. Its state, dlt pipeline metadata, and DuckDB
-  file live under `.cdc_instances/<instance>/`, and `make clean-state` removes only
-  that selected instance root. It builds Debezium properties (see
+  file live under `.cdc_instances/<instance>/`. The make target first marks that exact
+  project-local child as disposable; `make clean-state` canonicalizes it and refuses
+  cleanup if it escapes `.cdc_instances`, lacks the sentinel, or comes from the removed
+  `CDC_INSTANCE_RUNTIME_ROOT` override. It builds Debezium properties (see
   `src/cdc_flight/debezium_props.py`), starts the embedded engine on a background thread,
   and loads every batch through `dlt` into the instance DuckDB file, dataset `cdc_raw`.
   The run is **bounded**: it stops once the stream has been quiet for `--idle-seconds`
