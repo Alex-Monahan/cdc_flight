@@ -103,7 +103,7 @@ implementation.
 | **Codex B5** — the persisted timeline never participated in the decision | **fixed.** `source_timeline_changed`, ordered after identity and before LSN regression, with the catalog discarded (which also closes **Codex M1**) |
 | **Codex B6** — the four giant modules regrew | **fixed, and re-fixed at Codex r1 MINOR-5.** The 1.6-1.8 round split `applier_config.py`, `self_heal.py`, `supervisor.py` and `control_schema.py` out; the 1.9 rounds put the growth back, so `OpenGroup` is now `commit_group.py` and the four pre-engine decisions are `acquisition.py`. Measured after round 4: `applier.py` 928, `resnapshot.py` 926, `destination.py` 914, `catalog.py` 875, `pipeline.py` 806, `reconcile.py` 611, `recovery.py` 609. `destination.py` crossed 1,000 in round 4 and the source-relation registry became `source_relations.py`; `applier.py` and `resnapshot.py` are the ones to watch and are a **carry-forward** |
 | **Codex M2 / M3, Opus MAJOR-5 / MAJOR-6, MINOR-1** — the fault matrix proved declared labels, not outcomes; four tautologies; the hung-commit test accepted any death; `hang_seconds` was the exit code; the chaos harness did not compose | **fixed.** Every anchor writes a fsynced `fault_fired.json`; the outcome class is derived from the run; exact exit codes; `CDC_FAULT_HANG_SECONDS`; `destination_commit_late` for genuine ambiguity; chaos injects during recovery over a shuffled cover with a per-iteration fired assertion. ADR §19/A54 |
-| **Codex M5, Opus MAJOR-3** — the A51 counts were arithmetically false and the inventory incomplete | **fixed.** 66 rows, one failure and one class each, **42/15/9**, with `tests/4.7_self_healing/test_4_7_inventory.py` parsing the table so the headline cannot drift again. The missing modes (`CDC_RESNAPSHOT=0`, the unqueueable folds, drop-failure, `C` disagreement, the startup-dark fail-open, and more) are rows |
+| **Codex M5, Opus MAJOR-3** — the A51 counts were arithmetically false and the inventory incomplete | **fixed.** 67 rows, one failure and one class each, **43/15/9**, with `tests/4.7_self_healing/test_4_7_inventory.py` parsing the table so the headline cannot drift again. The missing modes (`CDC_RESNAPSHOT=0`, the unqueueable folds, drop-failure, `C` disagreement, the startup-dark fail-open, and more) are rows |
 | **Codex M6, Opus MINOR-7** — `write_slot_state` was a non-atomic DELETE+INSERT | **fixed.** One transaction. "Typed record" is a **carry-forward**: it is still a dict |
 | **Opus MAJOR-4** — `RUBRIC_STATUS` contradicted itself on 1.5 and 4.6 and had no 4.7 detail | **fixed.** Headings reconciled, 1.5's stale falsifier struck through with what replaced it, 4.6's "no test exists" replaced by what the test measures, 4.7 has a detail section |
 | **Opus Q5, Codex m3** — 57 of 91 new tests and 10 of 12 fault anchors were slow-only | **fixed.** Every anchor and every reconciliation cell now has a default-suite guard; see "Suite partition" below |
@@ -367,7 +367,7 @@ correct assumptions in the notes below:
 | 1.6 | Snapshot/backfill consistent with CDC | ~~3~~ → **5** | Postgres's **exported snapshot** makes the boundary an iff, and the fence is on the transaction's **commit** LSN, so a transaction straddling `C` is applied in full rather than lost. Proven with ~200 transactions committing throughout a snapshot — every row on exactly one side. A re-snapshot is complete only when **every requested table** reaches a terminal state: swapped, or verified empty on three independent facts (Debezium's own end-of-snapshot marker, zero records for that table, and a source count of zero). A disagreement between the two readings of `C` is fatal. Proven against a four-table re-snapshot with a keyless table, a genuinely empty table and a concurrent writer. |
 | 1.7 | Failures do not cause correctness issues | ~~1~~ ~~4~~ → **3** | **Twenty-one in-process anchors**: eight protocol, five destination (including the genuinely ambiguous `destination_commit_late`), seven recovery/catalog-baseline, and one source-catalog fault, plus a real network blackhole injected from outside the process. The matrix is enumerated from `faults.ALL_POINTS`, every anchor writes a machine-readable fired record, and the chaos harness asserts each workload affected source rows before arming. Round 7 still scores this 3/5: substantial evidence, but repeated adversarial compositions were found outside the suite, so the 5-band's “robust injection” is not yet the reviewer's verdict. |
 | 1.8 | Externally-advanced slot detected → backfill | ~~1~~ → **5** | Checked on every slot acquisition. Seven decisions trigger an **automatic** re-snapshot: slot ahead, slot missing, slot recreated, source identity changed, **source timeline forked**, source WAL rewound, and an empty destination with a positioned slot. The recovery is a **journalled state machine**: the intent is durable before any mutation, every step is idempotent and re-entrant after a crash at any phase, and a slot that will not drop fails the recovery rather than being logged and stepped over. A **populated** destination with no resume point refuses instead of being rebuilt. Proven by comparing the whole destination against the whole source after a real `pg_replication_slot_advance` and a real `pg_drop_replication_slot`, and by cutting the recovery at every phase boundary. |
-| 1.9 | Consistency-affecting state managed with state machines | **5** (new item) | Eight focused machines plus one precedence are declared together in `cdc_flight/machines.py`, including `snapshot_completion`, the one owner of snapshot terminal evidence. The inventories are generated from those declarations. Failed quiescence is published inside the supervisor's `finally`; marker preparation refuses `armed` and retires `consumed` only through its declared edge. This satisfies the literal 5 band (“an appropriate number of state machines, over 1”). |
+| 1.9 | Consistency-affecting state managed with state machines | **5** (new item) | Nine focused machines plus one precedence are declared together in `cdc_flight/machines.py`, including the closed `snapshot_completion` and durable `runtime_root_lifecycle` models. The inventories are generated from those declarations. Failed quiescence is published inside the supervisor's `finally`; marker preparation refuses `armed` and retires `consumed` only through its declared edge. This satisfies the literal 5 band (“an appropriate number of state machines, over 1”). |
 | 2.1 | Added / dropped columns handled | 2 | Adds work correctly; a dropped column silently lingers and reads NULL, indistinguishable from a real NULL. |
 | 2.2 | Renamed columns handled well | 1 | Rename lands as "new column + old column silently goes NULL". No tombstone, no linkage. |
 | 2.3 | New tables and schemas auto-discovered | 1 | Needs `ALTER PUBLICATION` + config change + restart, and pre-existing rows are silently never snapshotted. |
@@ -387,7 +387,7 @@ correct assumptions in the notes below:
 | 4.4 | Idle-slot heartbeat | 1 | `heartbeat.interval.ms` unset, no `heartbeat.action.query`. |
 | 4.5 | Errors must not hang or lock | 2 | Bounded runner + JVM watchdog make hangs survivable (one observed in p09), but nothing systematic prevents them. |
 | 4.6 | Detect silently-dead Postgres connection | ~~1~~ → **3** | TODO 4.6(b) closed: a blackholed Postgres used to exit `ok: true` on a partial delivery, because `unknown` slot health licensed an idle declaration *and* reset the not-streaming clock. A source that was answering and goes dark now fails the run within `CDC_SOURCE_DARK_SECONDS` (45 s), proven against a real TCP blackhole. Not 5: there is still no heartbeat (4.4) and no bounded JDBC socket timeout (4.6(c)), so detection depends on our 0.5 s sampler rather than on the connection itself. |
-| 4.7 | Self-heal without human intervention | **1** (new item; claimed 3, rescored 1) | The rubric's 1-band is a **count**: "more than 2 cases that cause manual human intervention". The corrected inventory (ADR §19/A51, 66 rows, parsed by `tests/4.7_self_healing/test_4_7_inventory.py`) is **42 AUTO / 15 MANUAL / 9 UNDEFINED**. Fifteen is more than two, so it is a 1 under every defensible reading. The direction is right — automatic recovery now covers forty-two enumerated cases, including the Flight's own half-finished recovery — while the mechanical inventory keeps the remaining exceptions explicit. See the detail section. |
+| 4.7 | Self-heal without human intervention | **1** (new item; claimed 3, rescored 1) | The rubric's 1-band is a **count**: "more than 2 cases that cause manual human intervention". The corrected inventory (ADR §19/A51, 67 rows, parsed by `tests/4.7_self_healing/test_4_7_inventory.py`) is **43 AUTO / 15 MANUAL / 9 UNDEFINED**. Fifteen is more than two, so it is a 1 under every defensible reading. The direction is right — automatic recovery now covers forty-three enumerated cases, including the Flight's own half-finished recovery — while the mechanical inventory keeps the remaining exceptions explicit. See the detail section. |
 | 5.1 | CDC fast on large changes | 3 | 50 k-row transaction absorbed at ~3.5 k rows/s into local DuckDB; no failure, but a full `dlt.run()` per 2048-row batch is the ceiling. |
 | 5.2 | Low latency on small changes | 1 | Capture latency is 83 ms, but the deliverable is a bounded batch job with no defined cadence — end-to-end latency is the schedule interval. |
 | 5.3 | Keep up with high Postgres TPS | 2 | ~1 k events/s inside the engine, but ~17 s of per-run JVM/connect overhead drops the shipped bounded job to ~157 events/s to MotherDuck. |
@@ -1485,7 +1485,7 @@ ours, it runs before the engine starts, and it does not depend on Debezium notic
 
 ### 1.9 Consistency-affecting state managed with state machines — **5 / 5**
 
-> **Current inventory: eight machines plus one precedence; score 5/5.** Round 7 awarded
+> **Current inventory: nine focused machines plus one precedence; score 5/5.** Round 7 awarded
 > 5/5 on the then-current five-machine inventory. Later reviews correctly identified
 > callback ownership and filesystem interruption recovery as two more
 > consistency-affecting states; both are now declared and mechanically inventoried.
@@ -1511,7 +1511,7 @@ therefore mutated by a path the design did not enumerate.**
 Explicit machines do not make the system correct. They make the **unenumerated path** a
 run-time error instead of a review finding.
 
-#### What was built — eight machines and one precedence
+#### What was built — nine focused machines and one precedence
 
 | machine | owns | states | edges | persistence |
 |---|---|---|---|---|
@@ -1523,7 +1523,8 @@ run-time error instead of a review finding.
 | `destination_ownership` | who owns the destination after callback admission or failed quiescence | 4 | 5 | **memory only** |
 | `catalog_change` | where is one DDL fact in observe → confirm → fence → apply | 9 | 30 | **memory only** |
 | `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
-| `snapshot_completion` | has this engine invocation's snapshot phase ended | 4 | 5 | **memory only** |
+| `snapshot_completion` | have all ordered snapshot callbacks arrived | 5 | 8 | **memory only** |
+| `runtime_root_lifecycle` | is the disposable root reusable or committed to cleanup | 6 | 10 | project-local root and parent markers |
 
 Style, deliberately minimal: `cdc_flight/states.py` is 293 lines with **no dependencies**
 — plain-`str` states (they are already durable strings in `VARCHAR` columns, in
@@ -2134,7 +2135,7 @@ literal count rather than a judgement. That is why it is scored the way it is.*
 #### The number, and where it comes from
 
 ADR §19/A51 enumerates every raise site, fatal log, refusal and `stop_reason` in the
-tree: **66 rows, 42 AUTO / 15 MANUAL / 9 UNDEFINED**. Fifteen manual cases is more than
+tree: **67 rows, 43 AUTO / 15 MANUAL / 9 UNDEFINED**. Fifteen manual cases is more than
 two, so the 1-band's test is met on our own evidence.
 
 The count is not recalled: `tests/4.7_self_healing/test_4_7_inventory.py` re-parses the
