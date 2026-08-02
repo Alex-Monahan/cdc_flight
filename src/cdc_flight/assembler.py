@@ -105,6 +105,9 @@ class CompleteUnit:
     #: `spilled prefix -> in-memory tail -> next unit` in true source order
     #: (Opus B-1) and lets a fenced unit suppress its own prefix (Codex 5).
     spill_unit_seq: int | None = None
+    #: events counted and validated for a discard-only re-snapshot stream unit.
+    #: They are intentionally never retained or sent to the destination spill table.
+    discarded_events: int = 0
 
     @property
     def terminal(self) -> PendingRecord | None:
@@ -112,7 +115,7 @@ class CompleteUnit:
 
     @property
     def event_count(self) -> int:
-        return len(self.events) + self.spilled_events
+        return len(self.events) + self.spilled_events + self.discarded_events
 
     def tables_touched(self) -> set[str]:
         return {
@@ -122,8 +125,8 @@ class CompleteUnit:
 
 class _OpenTxn:
     __slots__ = (
-        "begin_seen", "count", "events", "mem_bytes", "message_count", "nbytes", "orders",
-        "per_table", "records", "spill_unit_seq", "spilled", "txn_id",
+        "begin_seen", "count", "events", "last_lsn", "mem_bytes", "message_count",
+        "nbytes", "orders", "per_table", "records", "spill_unit_seq", "spilled", "txn_id",
     )
 
     def __init__(self, txn_id: str, begin_seen: bool):
@@ -131,6 +134,7 @@ class _OpenTxn:
         self.begin_seen = begin_seen
         self.events: list[PendingRecord] = []
         self.records: list[PendingRecord] = []
+        self.last_lsn = 0
         #: total size of the unit, for the group's byte trigger
         self.nbytes = 0
         #: size of what is still IN MEMORY. Reset on every spill - see
@@ -186,6 +190,7 @@ class TransactionAssembler:
         spill_events: int = 500_000,
         spill_bytes: int = 64 * 1024 * 1024,
         keep_all_records: bool = False,
+        discard_streaming: bool = False,
     ):
         self.snapshot_chunk_events = snapshot_chunk_events
         self.snapshot_chunk_bytes = snapshot_chunk_bytes
@@ -198,6 +203,10 @@ class TransactionAssembler:
         #: struggles: MEASURED 12 500 events/s for the first 88 000 and then
         #: ~1 000 events/s. `CDC_ACK_EVERY_RECORD=1` restores full retention.
         self.keep_all_records = keep_all_records
+        #: A re-snapshot applies only snapshot chunks. Streaming units still have to
+        #: reach a verified END so their source boundary is proven, but their payload
+        #: is never retained or handed to the destination spill callback.
+        self.discard_streaming = discard_streaming
         #: callback(unit_events) -> int, invoked while a unit is over the hard
         #: spill threshold. Returns how many events it took off our hands.
         self.on_spill = on_spill
@@ -306,7 +315,7 @@ class TransactionAssembler:
             raise TransactionAssemblyError(
                 f"Debezium emitted BEGIN for transaction {rec.txn_id} while "
                 f"transaction {self._txn.txn_id} is still open "
-                f"({len(self._txn.events)} events buffered). Transaction metadata "
+                f"({self._txn.count} events buffered). Transaction metadata "
                 "is not self-consistent, so a commit group could contain part of a "
                 "Postgres transaction (ADR 0001 §3.2)."
             )
@@ -377,15 +386,17 @@ class TransactionAssembler:
             )
         self._txn.orders.add(order)
         rec.total_order = order
-        self._txn.events.append(rec)
         self._txn.count += 1
         self._retain(self._txn, rec)
         self._txn.nbytes += rec.nbytes
-        self._txn.mem_bytes += rec.nbytes
+        self._txn.last_lsn = max(self._txn.last_lsn, rec.lsn or 0)
         table = rec.qualified_table
         if table:
             self._txn.per_table[table] = self._txn.per_table.get(table, 0) + 1
-        self._maybe_spill_txn()
+        if not self.discard_streaming:
+            self._txn.events.append(rec)
+            self._txn.mem_bytes += rec.nbytes
+            self._maybe_spill_txn()
         return []
 
     def _feed_end(self, rec: PendingRecord) -> list[CompleteUnit]:
@@ -407,9 +418,7 @@ class TransactionAssembler:
         txn.nbytes += rec.nbytes
         self._verify_complete(txn, rec)
 
-        commit_lsn = rec.lsn or max(
-            (e.lsn or 0 for e in txn.events), default=0
-        )
+        commit_lsn = rec.lsn or txn.last_lsn
         unit = CompleteUnit(
             kind=UNIT_TXN,
             events=txn.events,
@@ -421,6 +430,7 @@ class TransactionAssembler:
             spilled=bool(spilled),
             spilled_events=spilled,
             spill_unit_seq=txn.spill_unit_seq,
+            discarded_events=txn.count - len(txn.events) - spilled,
         )
         return [unit]
 
