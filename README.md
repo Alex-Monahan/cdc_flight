@@ -103,21 +103,23 @@ make reset
   table covering ~34 Postgres types, and a **partitioned** `audit_log`) and creates
   `PUBLICATION cdc_flight_pub`. `sql/02_seed.sql` inserts deterministic starting rows.
 * **`make pipeline`** → `cdc-flight`. Its state, dlt pipeline metadata, and DuckDB
-  file live under `.cdc_instances/<instance>/`. The make target creates and marks that
-  exact project-local child, then retains the physical-project lock and the verified
-  project/runtime-parent/instance descriptors while the pipeline mutates it. An existing
-  child is never adopted; clean requires its exact instance sentinel. All repository
-  runtime writers serialize on that same kernel lock. `prepare-state` provisions one
-  private sentinel-marked instance root and atomically publishes it without replacement,
-  so an existing or swapped public directory is never adopted or marked. `make
-  clean-state` records an in-root `quarantining` state, revalidates the
-  tree, and removes entries only relative to retained no-follow descriptors. Its terminal
-  state is a parent-held record bound to the instance device/inode, so interruption after
-  the final in-root marker is removed is recoverable by either prepare or clean. It
-  refuses cleanup if any component is a symlink, the verified runtime parent leaves the
-  physical project, the instance leaves that parent, the exact sentinel is absent, or it
-  comes from the removed
-  `CDC_INSTANCE_RUNTIME_ROOT` override. It builds Debezium properties (see
+  file live under `.cdc_instances/<instance>/`. `run` provisions a private,
+  sentinel-marked root only when the instance is absent, atomically publishes it without
+  replacement, and reopens that exact owned root on every later invocation. `prepare-state`
+  and a failed child therefore leave a persistent pipeline that can be retried; an
+  unmarked existing directory is never adopted. The retained project lock is inherited
+  by the child and lasts through its mutation lifetime, so all repository runtime writers
+  serialize under one cooperative-writer authority even if the wrapper dies. The staged
+  root's fd and identity are retained inside that creation critical section. `make
+  clean-state` records an in-root `quarantining` state, revalidates the tree, and removes
+  entries only relative to retained no-follow descriptors. Its terminal state is a
+  parent-held record bound to the instance device/inode, so interruption after the final
+  in-root marker is removed is recoverable by either prepare or clean. Binding checks are
+  fail-closed, but the guarantee is intentionally scoped to writers that honor the
+  retained lock: ordinary POSIX descriptors cannot prove containment against an
+  out-of-band same-user rename between a check and a syscall. The helper refuses an
+  observed symlink, unowned root, detached runtime parent, missing exact sentinel, or
+  the removed `CDC_INSTANCE_RUNTIME_ROOT` override. It builds Debezium properties (see
   `src/cdc_flight/debezium_props.py`), starts the embedded engine on a background thread,
   and loads every batch through `dlt` into the instance DuckDB file, dataset `cdc_raw`.
   The run is **bounded**: it stops once the stream has been quiet for `--idle-seconds`

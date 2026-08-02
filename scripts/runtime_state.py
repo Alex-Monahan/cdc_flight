@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""Locked, descriptor-owned lifecycle for one disposable runtime root."""
+"""Own one disposable runtime with one retained, cooperative authority.
+
+The authority is a lock on the physical project directory plus descriptor-relative
+project, runtime-parent and instance handles. Every mutator holds that lock for its full
+lifetime. ``run`` passes the project descriptor to its child, so wrapper death cannot
+release the authority while the child still owns the runtime.
+
+This is intentionally a cooperative-writer guarantee. Ordinary POSIX descriptors and
+pre-operation ``stat`` calls cannot prove that an out-of-band same-user rename stays
+under a directory after the last check and before a syscall. The binding checks remain
+fail-closed diagnostics; the enforceable boundary is the inherited lock.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -28,22 +40,41 @@ RENAME_NOREPLACE = 1
 RENAME_EXCL = 4
 
 
-@dataclass(frozen=True)
-class _Parent:
+@dataclass
+class _Authority:
+    """The one retained authority for a project, parent and selected instance."""
+
     project_fd: int
-    name: str
-    fd: int
-    identity: Identity
-    display: Path
+    parent_fd: int
+    parent_identity: Identity
+    parent_display: Path
+    root_name: str | None = None
+    root_fd: int | None = None
+    root_identity: Identity | None = None
+    root_display: Path | None = None
 
-
-@dataclass(frozen=True)
-class _Root:
-    parent: _Parent
-    name: str
-    fd: int
-    identity: Identity
-    display: Path
+    def check(self, phase: str) -> None:
+        """Check the retained bindings while the authority lock is held."""
+        _check_binding(
+            self.project_fd,
+            RUNTIME_PARENT_NAME,
+            self.parent_fd,
+            self.parent_identity,
+            self.parent_display,
+            phase,
+        )
+        if self.root_fd is None or self.root_name is None or self.root_identity is None:
+            return
+        if self.root_display is None:  # pragma: no cover - internal construction guard
+            raise Refusal("runtime authority has no root display path")
+        _check_binding(
+            self.parent_fd,
+            self.root_name,
+            self.root_fd,
+            self.root_identity,
+            self.root_display,
+            phase,
+        )
 
 
 def _checkpoint(name: str, path: Path) -> None:
@@ -75,27 +106,34 @@ def _check_binding(
         raise Refusal(f"runtime directory changed {phase}: {display}")
 
 
-def _check_parent(parent: _Parent, phase: str) -> None:
-    _check_binding(
-        parent.project_fd,
-        parent.name,
-        parent.fd,
-        parent.identity,
-        parent.display,
-        phase,
-    )
+def _root_fd(authority: _Authority) -> int:
+    if authority.root_fd is None:
+        raise Refusal("runtime authority has no selected instance root")
+    return authority.root_fd
 
 
-def _check_root(root: _Root, phase: str) -> None:
-    _check_parent(root.parent, phase)
-    _check_binding(
-        root.parent.fd,
-        root.name,
-        root.fd,
-        root.identity,
-        root.display,
-        phase,
-    )
+def _close_root(authority: _Authority) -> None:
+    if authority.root_fd is not None:
+        with suppress(OSError):
+            os.close(authority.root_fd)
+    authority.root_name = None
+    authority.root_fd = None
+    authority.root_identity = None
+    authority.root_display = None
+
+
+def _set_root(
+    authority: _Authority,
+    name: str,
+    fd: int,
+    identity: Identity,
+    display: Path,
+) -> None:
+    _close_root(authority)
+    authority.root_name = name
+    authority.root_fd = fd
+    authority.root_identity = identity
+    authority.root_display = display
 
 
 def _read_at(fd: int, name: str, limit: int, *, missing: bool = False) -> bytes | None:
@@ -108,11 +146,12 @@ def _read_at(fd: int, name: str, limit: int, *, missing: bool = False) -> bytes 
         raise
 
 
-def _read(root: _Root, name: str, limit: int, *, missing: bool = False) -> bytes | None:
+def _read(authority: _Authority, name: str, limit: int, *, missing: bool = False) -> bytes | None:
     try:
-        return _read_at(root.fd, name, limit, missing=missing)
+        return _read_at(_root_fd(authority), name, limit, missing=missing)
     except FileNotFoundError as exc:
-        raise Refusal(f"missing runtime metadata {root.display / name}") from exc
+        display = authority.root_display or authority.parent_display
+        raise Refusal(f"missing runtime metadata {display / name}") from exc
 
 
 def _write_exclusive(fd: int, name: str, data: bytes) -> None:
@@ -129,8 +168,8 @@ def _write_exclusive(fd: int, name: str, data: bytes) -> None:
         raise
 
 
-def _write(root: _Root, name: str, data: bytes) -> None:
-    _write_exclusive(root.fd, name, data)
+def _write(authority: _Authority, name: str, data: bytes) -> None:
+    _write_exclusive(_root_fd(authority), name, data)
 
 
 def _scan(fd: int) -> list[str]:
@@ -138,9 +177,9 @@ def _scan(fd: int) -> list[str]:
         return [entry.name for entry in entries]
 
 
-def _validate_tree(fd: int, display: Path, root: _Root) -> None:
+def _validate_tree(fd: int, display: Path, authority: _Authority) -> None:
     for name in _scan(fd):
-        if fd == root.fd and name in META:
+        if fd == authority.root_fd and name in META:
             continue
         path = display / name
         info = os.stat(name, dir_fd=fd, follow_symlinks=False)
@@ -160,16 +199,16 @@ def _validate_tree(fd: int, display: Path, root: _Root) -> None:
                 path,
                 "while opening",
             )
-            _validate_tree(child_fd, path, root)
+            _validate_tree(child_fd, path, authority)
         finally:
             os.close(child_fd)
 
 
-def _delete_tree(fd: int, display: Path, root: _Root) -> None:
+def _delete_tree(fd: int, display: Path, authority: _Authority) -> None:
     for name in _scan(fd):
-        if fd == root.fd and name in META:
+        if fd == authority.root_fd and name in META:
             continue
-        _check_root(root, "before deletion")
+        authority.check("before deletion")
         path = display / name
         info = os.stat(name, dir_fd=fd, follow_symlinks=False)
         if stat.S_ISLNK(info.st_mode):
@@ -182,17 +221,11 @@ def _delete_tree(fd: int, display: Path, root: _Root) -> None:
         try:
             _checkpoint("after_delete_child_open", path)
             child_identity = info.st_dev, info.st_ino
-            _check_binding(
-                fd, name, child_fd, child_identity, path, "while opening"
-            )
+            _check_binding(fd, name, child_fd, child_identity, path, "while opening")
             _checkpoint("after_delete_child_verify", path)
-            _check_binding(
-                fd, name, child_fd, child_identity, path, "before deletion"
-            )
-            _delete_tree(child_fd, path, root)
-            _check_binding(
-                fd, name, child_fd, child_identity, path, "before removal"
-            )
+            _check_binding(fd, name, child_fd, child_identity, path, "before deletion")
+            _delete_tree(child_fd, path, authority)
+            _check_binding(fd, name, child_fd, child_identity, path, "before removal")
         finally:
             os.close(child_fd)
         os.rmdir(name, dir_fd=fd)
@@ -218,9 +251,7 @@ def _rename_noreplace(parent_fd: int, source: str, target: str) -> None:
             ctypes.c_char_p,
             ctypes.c_uint,
         ]
-        result = rename(
-            parent_fd, source_bytes, parent_fd, target_bytes, RENAME_EXCL
-        )
+        result = rename(parent_fd, source_bytes, parent_fd, target_bytes, RENAME_EXCL)
     elif sys.platform.startswith("linux"):
         try:
             rename = libc.renameat2
@@ -243,51 +274,57 @@ def _rename_noreplace(parent_fd: int, source: str, target: str) -> None:
         raise OSError(error, os.strerror(error), target)
 
 
-def _provision(parent: _Parent, name: str, display: Path) -> _Root:
-    _check_parent(parent, "before provisioning")
+def _provision(authority: _Authority, instance_id: str, display: Path) -> None:
+    authority.check("before provisioning")
     _checkpoint("before_target_mkdir", display)
-    private_name = f".{name}.provision.{os.getpid()}.{secrets.token_hex(8)}"
+    private_name = (
+        f".{instance_id}.provision.{os.getpid()}.{secrets.token_hex(8)}"
+    )
     try:
-        os.mkdir(private_name, 0o700, dir_fd=parent.fd)
+        os.mkdir(private_name, 0o700, dir_fd=authority.parent_fd)
     except FileExistsError as exc:
         raise Refusal(f"cannot allocate private runtime directory for {display}") from exc
 
-    # Build and sentinel-mark the retained created inode under an unpredictable private
-    # name.  Only an atomic no-replace rename publishes it at the public instance name,
-    # so a foreign directory can make publication fail but can never receive a marker.
-    fd = os.open(private_name, DIR_FLAGS, dir_fd=parent.fd)
-    root = _Root(parent, private_name, fd, _identity(fd), display)
+    # mkdir has no portable fd-returning form. The retained project lock makes the
+    # mkdir -> open -> fstat sequence one authority critical section for cooperating
+    # writers; the fd, not a later public-name stat, owns all marking and publication.
     try:
-        _check_root(root, "while opening")
-        if _scan(root.fd):
+        fd = os.open(private_name, DIR_FLAGS, dir_fd=authority.parent_fd)
+    except BaseException:
+        with suppress(OSError):
+            os.rmdir(private_name, dir_fd=authority.parent_fd)
+        raise
+    _set_root(authority, private_name, fd, _identity(fd), display)
+    try:
+        authority.check("while opening")
+        if _scan(_root_fd(authority)):
             raise Refusal(f"created runtime directory was replaced before marking: {display}")
-        _write(root, SENTINEL_NAME, _sentinel(name))
-        os.fsync(root.fd)
+        _write(authority, SENTINEL_NAME, _sentinel(instance_id))
+        os.fsync(_root_fd(authority))
         _checkpoint("before_target_publish", display)
         try:
-            _rename_noreplace(parent.fd, private_name, name)
+            _rename_noreplace(authority.parent_fd, private_name, instance_id)
         except FileExistsError as exc:
             raise Refusal(
                 f"cannot provision {display}: existing root is not adopted; "
                 "verify its sentinel"
             ) from exc
-        root = _Root(parent, name, fd, root.identity, display)
-        os.fsync(parent.fd)
+        authority.root_name = instance_id
+        os.fsync(authority.parent_fd)
         _checkpoint("after_target_mkdir", display)
-        _check_root(root, "after publication")
-        return root
+        authority.check("after publication")
     except BaseException as original:
         try:
-            _check_root(root, "during rollback")
+            authority.check("during rollback")
         except BaseException:
-            os.close(root.fd)
+            _close_root(authority)
             raise original from None
         for metadata in META:
             with suppress(FileNotFoundError):
-                os.unlink(metadata, dir_fd=root.fd)
+                os.unlink(metadata, dir_fd=_root_fd(authority))
         with suppress(OSError):
-            os.rmdir(root.name, dir_fd=parent.fd)
-        os.close(root.fd)
+            os.rmdir(authority.root_name, dir_fd=authority.parent_fd)
+        _close_root(authority)
         raise
 
 
@@ -295,9 +332,11 @@ def _record_name(instance_id: str) -> str:
     return f"{COMPLETION_PREFIX}{instance_id}"
 
 
-def _record_data(root: _Root) -> bytes:
-    dev, ino = root.identity
-    return f"version=1\ninstance={root.name}\ndev={dev}\nino={ino}\n".encode()
+def _record_data(authority: _Authority) -> bytes:
+    if authority.root_name is None or authority.root_identity is None:
+        raise Refusal("cannot record an unselected runtime root")
+    dev, ino = authority.root_identity
+    return f"version=1\ninstance={authority.root_name}\ndev={dev}\nino={ino}\n".encode()
 
 
 def _parse_record(data: bytes, instance_id: str, display: Path) -> Identity:
@@ -315,156 +354,183 @@ def _parse_record(data: bytes, instance_id: str, display: Path) -> Identity:
         raise Refusal(f"invalid parent completion record for {display}") from exc
 
 
-def _ensure_completion_record(root: _Root) -> str:
-    name = _record_name(root.name)
-    expected = _record_data(root)
-    current = _read_at(root.parent.fd, name, len(expected) + 1, missing=True)
+def _ensure_completion_record(authority: _Authority) -> str:
+    if authority.root_name is None:
+        raise Refusal("cannot complete an unselected runtime root")
+    name = _record_name(authority.root_name)
+    expected = _record_data(authority)
+    current = _read_at(authority.parent_fd, name, len(expected) + 1, missing=True)
     if current is None:
-        _write_exclusive(root.parent.fd, name, expected)
-        os.fsync(root.parent.fd)
+        _write_exclusive(authority.parent_fd, name, expected)
+        os.fsync(authority.parent_fd)
     elif current != expected:
-        raise Refusal(f"invalid parent completion record for {root.display}")
+        display = authority.root_display or authority.parent_display
+        raise Refusal(f"invalid parent completion record for {display}")
     return name
 
 
-def _finish_recorded(root: _Root, record_name: str) -> None:
-    _checkpoint("before_target_rmdir", root.display)
-    _check_root(root, "before removal")
-    leftovers = set(_scan(root.fd)) - META
+def _finish_recorded(authority: _Authority, record_name: str) -> None:
+    if authority.root_name is None or authority.root_display is None:
+        raise Refusal("cannot finish an unselected runtime root")
+    _checkpoint("before_target_rmdir", authority.root_display)
+    authority.check("before removal")
+    leftovers = set(_scan(_root_fd(authority))) - META
     if leftovers:
         raise Refusal(
-            f"completion record for {root.display} has unexpected payload: "
+            f"completion record for {authority.root_display} has unexpected payload: "
             f"{', '.join(sorted(leftovers))}"
         )
     for name in META:
         with suppress(FileNotFoundError):
-            os.unlink(name, dir_fd=root.fd)
-    os.fsync(root.fd)
-    _checkpoint("after_terminal_markers_removed", root.display)
-    _check_root(root, "before removal")
-    os.rmdir(root.name, dir_fd=root.parent.fd)
-    os.fsync(root.parent.fd)
-    os.unlink(record_name, dir_fd=root.parent.fd)
-    os.fsync(root.parent.fd)
+            os.unlink(name, dir_fd=_root_fd(authority))
+    os.fsync(_root_fd(authority))
+    _checkpoint("after_terminal_markers_removed", authority.root_display)
+    authority.check("before removal")
+    os.rmdir(authority.root_name, dir_fd=authority.parent_fd)
+    os.fsync(authority.parent_fd)
+    os.unlink(record_name, dir_fd=authority.parent_fd)
+    os.fsync(authority.parent_fd)
 
 
-def _finish(root: _Root) -> None:
-    record_name = _ensure_completion_record(root)
-    _checkpoint("after_parent_completion", root.display)
-    _finish_recorded(root, record_name)
+def _finish(authority: _Authority) -> None:
+    record_name = _ensure_completion_record(authority)
+    display = authority.root_display or authority.parent_display
+    _checkpoint("after_parent_completion", display)
+    _finish_recorded(authority, record_name)
 
 
-def _clean(root: _Root, instance_id: str) -> None:
+def _clean(authority: _Authority, instance_id: str) -> None:
     expected = _sentinel(instance_id)
-    quarantining = _read(root, QUARANTINE_NAME, 1, missing=True) is not None
-    if _read(root, SENTINEL_NAME, len(expected) + 1) != expected:
-        raise Refusal(f"invalid sentinel {root.display / SENTINEL_NAME}")
+    quarantining = _read(authority, QUARANTINE_NAME, 1, missing=True) is not None
+    if _read(authority, SENTINEL_NAME, len(expected) + 1) != expected:
+        display = authority.root_display or authority.parent_display
+        raise Refusal(f"invalid sentinel {display / SENTINEL_NAME}")
+    display = authority.root_display or authority.parent_display
     if not quarantining:
-        _validate_tree(root.fd, root.display, root)
-        _checkpoint("after_validation", root.display)
-        _check_root(root, "before quarantine")
-        _write(root, QUARANTINE_NAME, b"")
-        os.fsync(root.fd)
-        _checkpoint("after_quarantine", root.display)
-    _checkpoint("before_delete_tree", root.display)
-    _check_root(root, "before deletion")
-    _validate_tree(root.fd, root.display, root)
-    _delete_tree(root.fd, root.display, root)
-    _finish(root)
+        _validate_tree(_root_fd(authority), display, authority)
+        _checkpoint("after_validation", display)
+        authority.check("before quarantine")
+        _write(authority, QUARANTINE_NAME, b"")
+        os.fsync(_root_fd(authority))
+        _checkpoint("after_quarantine", display)
+    _checkpoint("before_delete_tree", display)
+    authority.check("before deletion")
+    _validate_tree(_root_fd(authority), display, authority)
+    _delete_tree(_root_fd(authority), display, authority)
+    _finish(authority)
 
 
-def _open_root(parent: _Parent, instance_id: str, display: Path) -> _Root | None:
+def _open_root(authority: _Authority, instance_id: str, display: Path) -> bool:
     try:
-        fd = os.open(instance_id, DIR_FLAGS, dir_fd=parent.fd)
+        fd = os.open(instance_id, DIR_FLAGS, dir_fd=authority.parent_fd)
     except FileNotFoundError:
-        return None
-    root = _Root(parent, instance_id, fd, _identity(fd), display)
+        return False
+    _set_root(authority, instance_id, fd, _identity(fd), display)
     try:
-        _check_root(root, "while opening")
-        return root
+        authority.check("while opening")
+        return True
     except BaseException:
-        os.close(fd)
+        _close_root(authority)
         raise
 
 
-def _reconcile_completion(parent: _Parent, instance_id: str, display: Path) -> bool:
+def _open_owned_root(authority: _Authority, instance_id: str, display: Path) -> bool:
+    """Reopen only the exact sentinel-owned root; never adopt a directory by name."""
+    if not _open_root(authority, instance_id, display):
+        return False
+    expected = _sentinel(instance_id)
+    try:
+        if _read(authority, SENTINEL_NAME, len(expected) + 1) != expected:
+            raise Refusal(f"invalid sentinel {display / SENTINEL_NAME}")
+        return True
+    except BaseException:
+        _close_root(authority)
+        raise
+
+
+def _reconcile_completion(
+    authority: _Authority, instance_id: str, display: Path
+) -> bool:
     name = _record_name(instance_id)
-    data = _read_at(parent.fd, name, 256, missing=True)
+    data = _read_at(authority.parent_fd, name, 256, missing=True)
     if data is None:
         return False
     expected_identity = _parse_record(data, instance_id, display)
-    root = _open_root(parent, instance_id, display)
-    if root is None:
-        os.unlink(name, dir_fd=parent.fd)
-        os.fsync(parent.fd)
+    if not _open_root(authority, instance_id, display):
+        authority.check("before completion-record removal")
+        os.unlink(name, dir_fd=authority.parent_fd)
+        os.fsync(authority.parent_fd)
         return True
     try:
-        if root.identity != expected_identity:
+        if authority.root_identity != expected_identity:
             raise Refusal(f"completion record no longer owns {display}")
-        _finish_recorded(root, name)
+        _finish_recorded(authority, name)
         return True
     finally:
-        os.close(root.fd)
+        _close_root(authority)
 
 
-def _open_parent(project_fd: int, project: Path, command: str) -> _Parent | None:
+def _open_authority(project_fd: int, project: Path, command: str) -> _Authority | None:
     try:
-        fd = os.open(RUNTIME_PARENT_NAME, DIR_FLAGS, dir_fd=project_fd)
+        parent_fd = os.open(RUNTIME_PARENT_NAME, DIR_FLAGS, dir_fd=project_fd)
     except FileNotFoundError:
         if command == "clean":
             return None
         os.mkdir(RUNTIME_PARENT_NAME, 0o700, dir_fd=project_fd)
-        fd = os.open(RUNTIME_PARENT_NAME, DIR_FLAGS, dir_fd=project_fd)
-    parent = _Parent(
-        project_fd,
-        RUNTIME_PARENT_NAME,
-        fd,
-        _identity(fd),
-        project / RUNTIME_PARENT_NAME,
+        parent_fd = os.open(RUNTIME_PARENT_NAME, DIR_FLAGS, dir_fd=project_fd)
+    authority = _Authority(
+        project_fd=project_fd,
+        parent_fd=parent_fd,
+        parent_identity=_identity(parent_fd),
+        parent_display=project / RUNTIME_PARENT_NAME,
     )
     try:
-        _checkpoint("after_runtime_parent_open", parent.display)
-        _check_parent(parent, "while opening runtime parent")
-        return parent
+        _checkpoint("after_runtime_parent_open", authority.parent_display)
+        authority.check("while opening runtime parent")
+        return authority
     except BaseException:
-        os.close(fd)
+        os.close(parent_fd)
         raise
 
 
 def _run(command: str, instance_id: str, child_command: list[str] | None = None) -> int:
     project = Path(__file__).resolve(strict=True).parent.parent
     project_fd = os.open(project, DIR_FLAGS)
-    parent = None
-    root = None
+    authority = None
     try:
-        # This lock is on the physical project-directory inode.  Every repository
-        # runtime mutator enters through this helper; ``run`` retains it while the
-        # pipeline child writes the verified instance directory.
+        # This lock is the authority, not an advisory hint: every cooperating runtime
+        # writer holds it for its whole mutation lifetime, and run passes this fd to its
+        # child so wrapper death cannot release it early.
         fcntl.flock(project_fd, fcntl.LOCK_EX)
-        parent = _open_parent(project_fd, project, command)
-        if parent is None:
+        authority = _open_authority(project_fd, project, command)
+        if authority is None:
             return 0
-        display = parent.display / instance_id
-        completed = _reconcile_completion(parent, instance_id, display)
+        display = authority.parent_display / instance_id
+        if command == "run" and not child_command:
+            raise Refusal("run requires a command after --")
+        completed = _reconcile_completion(authority, instance_id, display)
         if command == "clean" and completed:
             return 0
         if command in {"prepare", "run"}:
-            root = _provision(parent, instance_id, display)
-        else:
-            root = _open_root(parent, instance_id, display)
-            if root is not None:
-                _clean(root, instance_id)
+            if not _open_owned_root(authority, instance_id, display):
+                _provision(authority, instance_id, display)
+        elif _open_owned_root(authority, instance_id, display):
+            _clean(authority, instance_id)
         if command == "run":
-            if not child_command:
-                raise Refusal("run requires a command after --")
-            return subprocess.run(child_command, cwd=project, check=False).returncode
+            return subprocess.run(
+                child_command,
+                cwd=project,
+                check=False,
+                pass_fds=(project_fd,),
+            ).returncode
         return 0
     finally:
-        if root is not None:
-            os.close(root.fd)
-        if parent is not None:
-            os.close(parent.fd)
-        os.close(project_fd)
+        if authority is not None:
+            _close_root(authority)
+            with suppress(OSError):
+                os.close(authority.parent_fd)
+        with suppress(OSError):
+            os.close(project_fd)
 
 
 def main() -> int:

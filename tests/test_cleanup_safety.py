@@ -30,7 +30,7 @@ def isolated_project(tmp_path: Path) -> Path:
 
 
 def _runtime_state(
-    project: Path, command: str, **overrides: str
+    project: Path, command: str, child: list[str] | None = None, **overrides: str
 ) -> subprocess.CompletedProcess:
     env = {
         key: value
@@ -38,8 +38,11 @@ def _runtime_state(
         if key not in {"CDC_INSTANCE_RUNTIME_ROOT", "CDC_TEST_INSTANCE_ID"}
     }
     env.update(overrides)
+    args = [str(project / "scripts" / "runtime_state.sh"), command]
+    if child is not None:
+        args.extend(["--", *child])
     return subprocess.run(
-        [str(project / "scripts" / "runtime_state.sh"), command],
+        args,
         cwd=project,
         capture_output=True,
         text=True,
@@ -672,6 +675,127 @@ def test_run_holds_project_lock_for_pipeline_mutation_lifetime(
     assert cleaning.poll() is None, "clean escaped the pipeline's physical project lock"
     assert running.wait(timeout=5) == 0
     assert cleaning.wait(timeout=5) == 0
+    assert not target.exists()
+
+
+def test_run_reopens_the_same_owned_root_for_a_second_invocation(
+    isolated_project: Path,
+):
+    instance = "cleanup_persistent_run"
+    target = isolated_project / ".cdc_instances" / instance
+    write_first = (
+        "from pathlib import Path; "
+        "Path('.cdc_instances/cleanup_persistent_run/first').write_text('one')"
+    )
+    write_second = (
+        "from pathlib import Path; "
+        "Path('.cdc_instances/cleanup_persistent_run/second').write_text('two')"
+    )
+
+    first = _runtime_state(
+        isolated_project,
+        "run",
+        [sys.executable, "-c", write_first],
+        CDC_TEST_INSTANCE_ID=instance,
+    )
+    second = _runtime_state(
+        isolated_project,
+        "run",
+        [sys.executable, "-c", write_second],
+        CDC_TEST_INSTANCE_ID=instance,
+    )
+
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+    assert (target / "first").read_text() == "one"
+    assert (target / "second").read_text() == "two"
+
+
+def test_prepare_then_run_reuses_the_prepared_root(isolated_project: Path):
+    instance = "cleanup_prepare_then_run"
+    target = isolated_project / ".cdc_instances" / instance
+    prepared = _runtime_state(
+        isolated_project, "prepare", CDC_TEST_INSTANCE_ID=instance
+    )
+    ran = _runtime_state(
+        isolated_project,
+        "run",
+        [sys.executable, "-c", "from pathlib import Path; Path('.cdc_instances/cleanup_prepare_then_run/ran').touch()"],
+        CDC_TEST_INSTANCE_ID=instance,
+    )
+
+    assert prepared.returncode == 0, prepared.stderr
+    assert ran.returncode == 0, ran.stderr
+    assert (target / "ran").exists()
+
+
+def test_failed_child_leaves_the_owned_root_for_a_retry(isolated_project: Path):
+    instance = "cleanup_retry_run"
+    target = isolated_project / ".cdc_instances" / instance
+    failed = _runtime_state(
+        isolated_project,
+        "run",
+        [sys.executable, "-c", "raise SystemExit(17)"],
+        CDC_TEST_INSTANCE_ID=instance,
+    )
+    retried = _runtime_state(
+        isolated_project,
+        "run",
+        [sys.executable, "-c", "pass"],
+        CDC_TEST_INSTANCE_ID=instance,
+    )
+
+    assert failed.returncode == 17
+    assert target.exists()
+    assert retried.returncode == 0, retried.stderr
+
+
+def test_retained_authority_survives_wrapper_death_until_child_exits(
+    isolated_project: Path, tmp_path: Path
+):
+    instance = "cleanup_wrapper_death"
+    target = isolated_project / ".cdc_instances" / instance
+    started = tmp_path / "child-started"
+    finished = tmp_path / "child-finished"
+    code = (
+        "from pathlib import Path; import time; "
+        f"Path({str(started)!r}).write_text('started'); time.sleep(1.2); "
+        f"Path({str(finished)!r}).write_text('finished')"
+    )
+    env = os.environ.copy()
+    env.pop("CDC_INSTANCE_RUNTIME_ROOT", None)
+    env["CDC_TEST_INSTANCE_ID"] = instance
+    running = subprocess.Popen(
+        [
+            str(isolated_project / "scripts" / "runtime_state.sh"),
+            "run",
+            "--",
+            sys.executable,
+            "-c",
+            code,
+        ],
+        cwd=isolated_project,
+        env=env,
+    )
+    deadline = time.monotonic() + 5
+    while not started.exists():
+        assert running.poll() is None
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+
+    running.kill()
+    assert running.wait(timeout=5) is not None
+    cleaning = subprocess.Popen(
+        [str(isolated_project / "scripts" / "runtime_state.sh"), "clean"],
+        cwd=isolated_project,
+        env=env,
+    )
+    time.sleep(0.2)
+    assert cleaning.poll() is None, "wrapper death released authority held by the child"
+    assert finished.exists() is False
+    assert cleaning.poll() is None
+    assert cleaning.wait(timeout=5) == 0
+    assert finished.read_text() == "finished"
     assert not target.exists()
 
 
