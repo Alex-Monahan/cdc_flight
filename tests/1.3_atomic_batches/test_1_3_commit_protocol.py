@@ -10,10 +10,13 @@ end-to-end proof is the MotherDuck observer test).
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from applier_lab import DATASET, Lab, data, end, keyed
 
 from cdc_flight.errors import OffsetFlushFailed
+from cdc_flight.snapshot_completion import SnapshotCompletion, SnapshotObservationError
 
 
 @pytest.fixture
@@ -54,6 +57,57 @@ def test_shutdown_seals_callback_admission_and_records_late_batches(lab, monkeyp
     assert stats["callback_seal_reason"] == "test_retirement"
     assert stats["callback_batches_rejected"] == 1
     assert stats["callback_records_rejected"] == 2
+
+
+class _SnapshotNotification:
+    """Minimal ordered notification with a real Connect offset shape."""
+
+    def __init__(self, observation: str, lsn: int):
+        self._topic = "cdcflight.cdc_flight_snapshot_notifications"
+        self._value = json.dumps(
+            {
+                "aggregate_type": "Initial Snapshot",
+                "type": observation,
+                "additional_data": {},
+            }
+        )
+        self._partition = {"server": "cdcflight"}
+        self._offset = {"lsn": lsn, "lsn_proc": lsn, "ts_usec": lsn * 1000}
+
+    def destination(self):
+        return self._topic
+
+    def value(self):
+        return self._value
+
+    def key(self):
+        return None
+
+    def sourceRecord(self):
+        return self
+
+    def sourcePartition(self):
+        return self._partition
+
+    def sourceOffset(self):
+        return self._offset
+
+
+def test_invalid_terminal_refuses_before_resume_commit_or_ack(lab):
+    """Invariant O: a refused COMPLETED observation crosses no durable boundary."""
+    box = lab()
+    box.applier.snapshot_completion = SnapshotCompletion.full_snapshot(
+        {"app.customers", "app.orders"}
+    )
+
+    box.applier._handle([_SnapshotNotification("STARTED", 101)], box.committer)
+    with pytest.raises(SnapshotObservationError, match=r"app\.orders"):
+        box.applier._handle([_SnapshotNotification("COMPLETED", 102)], box.committer)
+
+    assert box.committer.marked == 0
+    assert box.committer.batches == 0
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 0
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.debezium_offsets") == 0
 
 
 class _RecordingVerifier:
