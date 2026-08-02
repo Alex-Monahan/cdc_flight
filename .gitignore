@@ -9,6 +9,7 @@ dist/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.pytest-source.lock
 
 # uv
 # (uv.lock IS committed on purpose)

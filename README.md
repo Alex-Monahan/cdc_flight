@@ -223,7 +223,8 @@ Measured on an M-series Mac. Only executed runs are reported here; see
 
 | suite | result | wall clock | measured |
 |---|---|---|---|
-| `make test` (12 workers) | **632 passed, 130 deselected** | **70.21 s** (repeat: **68.88 s**) | 2026-08-01, T-1 fast-suite validation |
+| `make test` on 15432 (12 workers) | **649 passed, 130 deselected** | **136.36 s** | 2026-08-01, T-1 concurrent acceptance |
+| `make test` on 15436 (12 workers) | **649 passed, 130 deselected** | **130.23 s** | 2026-08-01, concurrent with 15432 |
 | `make test-serial` | **632 passed, 130 deselected** | **365.43 s** (6:05) | 2026-08-01, T-1 same-HEAD baseline |
 | `make test` (local only) | **562 passed, 0 xfail** | **550.0 s** (9:10) | 2026-08-01, after the round-5 fixes |
 | `make test-slow` | **95 passed** | **1 320.7 s** (22:00) | 2026-08-01, after the round-5 fixes |
