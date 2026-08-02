@@ -482,9 +482,10 @@ class Applier:
     # group assembly
     # ------------------------------------------------------------------ #
     def _add_unit(self, unit: CompleteUnit) -> None:
+        resnapshot_fenced = self._fence_resnapshot_unit(unit)
         is_snapshot = self._is_snapshot_unit(unit)
         was_snapshot = self.group.is_snapshot
-        if not is_snapshot:
+        if not is_snapshot and not resnapshot_fenced:
             # This must happen before an open snapshot group is committed or the
             # incoming streaming unit is appended. The completion machine, not the
             # current group's row shape, owns the phase barrier.
@@ -524,7 +525,7 @@ class Applier:
                     f"cannot cross the snapshot phase boundary with commit result "
                     f"{result.value}"
                 )
-        if not is_snapshot:
+        if not is_snapshot and not resnapshot_fenced:
             # For a phase mismatch this runs only after the prior snapshot group has
             # committed. For an empty group it is the admission edge that used to be
             # skipped entirely.
@@ -532,15 +533,6 @@ class Applier:
         if not self.group.units:
             self.group.is_snapshot = is_snapshot
             self.group.opened_at = time.monotonic()
-
-        if self.cfg.resnapshot and unit.kind == UNIT_TXN:
-            # A re-snapshot engine streams for as long as it takes us to notice the
-            # snapshot finished. Those events belong to the real slot, which has not
-            # consumed them, so applying them here would be a duplicate delivery.
-            unit.fenced = True
-            self.fenced_units += 1
-            self.fenced_events += unit.event_count
-            self.resnapshot_discarded_events += unit.event_count
 
         if unit.kind == UNIT_TXN and unit.last_lsn and unit.last_lsn <= self.resume_point.last_lsn:
             # ADR §4.4 idempotency fence. Correctness does not depend on it - the
@@ -566,6 +558,22 @@ class Applier:
         self.group.units.append(unit)
         self.group.events += unit.event_count
         self.group.nbytes += unit.nbytes
+
+    def _fence_resnapshot_unit(self, unit: CompleteUnit) -> bool:
+        """Discard throwaway-slot streaming before the live phase barrier.
+
+        A re-snapshot engine can deliver a transaction while its callbacks are still
+        in flight. That transaction belongs to the real slot, so it must be fenced,
+        acknowledged, and kept in its own commit group without advancing the shared
+        snapshot-completion machine into live streaming.
+        """
+        if not self.cfg.resnapshot or unit.kind != UNIT_TXN:
+            return False
+        unit.fenced = True
+        self.fenced_units += 1
+        self.fenced_events += unit.event_count
+        self.resnapshot_discarded_events += unit.event_count
+        return True
 
     @staticmethod
     def _is_snapshot_unit(unit: CompleteUnit) -> bool:

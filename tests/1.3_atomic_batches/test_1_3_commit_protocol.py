@@ -359,6 +359,42 @@ def test_streaming_refusal_precedes_commit_of_open_snapshot_group(lab):
     assert [unit.kind for unit in box.applier.group.units] == ["snapshot_chunk"]
 
 
+def test_resnapshot_fences_streaming_unit_before_empty_group_admission(lab):
+    """A throwaway-slot transaction is discarded even before snapshot rows exist."""
+    box = lab(full_snapshot=True, resnapshot=True)
+
+    box.run(_streaming_transaction())
+
+    assert box.applier.commit_groups == 1
+    assert box.applier.resume_point.last_lsn == 302
+    assert box.applier.fenced_units == 1
+    assert box.applier.resnapshot_discarded_events == 1
+    assert box.applier.snapshot_completion.state == "callbacks_started"
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 1
+    assert box.scalar(
+        "SELECT unit_count FROM _cdc_flight.commit_log"
+    ) == 0
+
+
+def test_resnapshot_fences_streaming_unit_after_open_snapshot_group(lab):
+    """A fenced overlap commits separately and does not enter live streaming."""
+    box = lab(full_snapshot=True, resnapshot=True)
+
+    box.feed([snap("customers", 100, ident=1, marker="true")])
+    box.feed(_streaming_transaction())
+
+    assert box.applier.commit_groups == 1
+    assert box.applier.resume_point.last_lsn == 100
+    assert [unit.kind for unit in box.applier.group.units] == ["txn"]
+    assert box.applier.group.units[0].fenced is True
+    assert box.applier.snapshot_completion.state == "callbacks_started"
+
+    box.commit()
+    assert box.applier.commit_groups == 2
+    assert box.applier.resume_point.last_lsn == 302
+    assert box.applier.snapshot_completion.state == "callbacks_started"
+
+
 class _RecordingVerifier:
     """Stands in for `OffsetFlushVerifier` and records *when* it was consulted."""
 
