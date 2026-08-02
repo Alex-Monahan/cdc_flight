@@ -6,6 +6,21 @@ data: the commit→ack window must contain nothing but the acknowledgement
 pipeline (Codex 9), and a group must be one destination transaction across every
 table it touches (rubric 1.3, asserted here at the mechanism level; the
 end-to-end proof is the MotherDuck observer test).
+
+Round-14 fenced-overlap composition matrix:
+
+* spill: ``test_resnapshot_fenced_spilled_overlap_does_not_start_nested_transaction``
+  (and the earlier snapshot-boundary regression);
+* empty/boundary-only: ``test_resnapshot_fences_empty_overlap_unit_without_entering_streaming``;
+* ``pre_commit`` / ``post_commit_pre_ack``: ``test_fault_anchors_cover_the_fenced_overlap_commit``;
+* age/size trigger: ``test_resnapshot_overlap_during_age_and_size_trigger_stays_fenced``;
+* a second open spill owner: refused before staging by
+  ``test_resnapshot_fenced_overlap_refuses_second_owner_while_snapshot_spills``;
+* MotherDuck: ``test_motherduck_fenced_spilled_overlap_has_an_isolated_owner``.
+
+The refusal is deliberate: DuckDB cannot let two open owners publish the one shared
+resume-point row without one owner observing a stale snapshot. No composition in the
+requested set is unreachable; the refusal is machine-checked at the ownership edge.
 """
 
 from __future__ import annotations
@@ -302,6 +317,162 @@ def test_resnapshot_fenced_overlap_survives_not_ready_terminal_boundary(lab):
     assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 2
 
 
+def test_resnapshot_fenced_spilled_overlap_does_not_start_nested_transaction(lab):
+    """A fenced overlap's staged prefix stays owned by a real transaction.
+
+    The overlap is deliberately two events so the assembler stages its prefix before
+    the END marker makes the unit complete.  The terminal snapshot boundary is still
+    under-counted, so the snapshot group cannot be committed while the overlap is
+    discarded.
+    """
+    box = lab(resnapshot=True, snapshot_chunk_events=1, unit_spill_events=2)
+    box.applier.snapshot_completion = SnapshotCompletion.full_snapshot({"app.customers"})
+    box.applier.snapshot_completion.observe_notification("STARTED", {})
+
+    box.feed([snap("customers", 100, ident=1, marker="true")])
+    box.applier._handle(
+        [
+            _SnapshotNotification(
+                "TABLE_SCAN_COMPLETED",
+                200,
+                {
+                    "scanned_collection": "app.customers",
+                    "status": "SUCCEEDED",
+                    "total_rows_scanned": "2",
+                },
+            ),
+            _SnapshotNotification("COMPLETED", 201),
+        ],
+        box.committer,
+    )
+    snapshot_group = box.applier.group
+
+    overlap = [
+        begin("stream-spilled", 300),
+        keyed("stream-spilled", 1, 301, 2, "c"),
+        keyed("stream-spilled", 2, 302, 3, "d"),
+        end("stream-spilled", 2, 303, {"app.customers": 2}),
+    ]
+    box.feed(overlap)
+
+    assert box.applier.spilled_events == 2
+    assert box.applier.fenced_spilled_events == 2
+    assert box.applier.group is snapshot_group
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.spill_events") == 0
+    assert box.applier.snapshot_completion.state == "completion_notified"
+
+    box.feed([snap("customers", 200, ident=2, marker="last")])
+    box.commit()
+
+    assert box.applier.snapshot_completed is True
+    assert box.applier.commit_groups == 2
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.spill_events") == 0
+
+
+def test_resnapshot_fenced_overlap_refuses_second_owner_while_snapshot_spills(lab):
+    """Refuse a second owner before it can split one shared resume point."""
+    box = lab(
+        resnapshot=True,
+        snapshot_chunk_events=2,
+        unit_spill_events=2,
+    )
+    box.applier.snapshot_completion = SnapshotCompletion.full_snapshot({"app.customers"})
+    box.applier.snapshot_completion.observe_notification("STARTED", {})
+
+    box.feed(
+        [
+            snap("customers", 100, ident=1, marker="true"),
+            snap("customers", 101, ident=2, marker="true"),
+        ]
+    )
+    assert box.applier.group.txn_open is True
+    assert box.applier.group.spill_commit_id == 1
+
+    box.applier._handle(
+        [
+            _SnapshotNotification(
+                "TABLE_SCAN_COMPLETED",
+                200,
+                {
+                    "scanned_collection": "app.customers",
+                    "status": "SUCCEEDED",
+                    "total_rows_scanned": "3",
+                },
+            ),
+            _SnapshotNotification("COMPLETED", 201),
+        ],
+        box.committer,
+    )
+
+    with pytest.raises(SnapshotObservationError, match="shared resume point"):
+        box.feed(
+            [
+                begin("stream-spilled", 300),
+                keyed("stream-spilled", 1, 301, 3, "c"),
+                keyed("stream-spilled", 2, 302, 4, "d"),
+                end("stream-spilled", 2, 303, {"app.customers": 2}),
+            ]
+        )
+
+    assert box.applier.group.txn_open is True
+    assert box.applier.fenced_spilled_events == 0
+    assert box.applier._fenced_commits == {}
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.spill_events") == 2
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 0
+
+
+def test_resnapshot_fences_empty_overlap_unit_without_entering_streaming(lab):
+    """An empty BEGIN/END overlap still gets its own durable discard boundary."""
+    box = lab(resnapshot=True, snapshot_chunk_events=1)
+    _prepare_not_ready_snapshot_boundary(box)
+
+    box.feed([begin("empty-overlap", 300), end("empty-overlap", 0, 301, {})])
+
+    assert box.applier.fenced_units == 1
+    assert box.applier.resnapshot_discarded_events == 0
+    assert box.applier.snapshot_completion.state == "completion_notified"
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 1
+    assert box.scalar("SELECT event_count FROM _cdc_flight.commit_log") == 0
+
+    box.feed([snap("customers", 200, ident=2, marker="last")])
+    box.commit()
+
+    assert box.applier.snapshot_completed is True
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 2
+
+
+@pytest.mark.parametrize(
+    ("anchor", "committed_before_ack"),
+    [("pre_commit", False), ("post_commit_pre_ack", True)],
+)
+def test_fault_anchors_cover_the_fenced_overlap_commit(lab, monkeypatch, anchor, committed_before_ack):
+    """The fenced owner has the same pre/post-commit crash cuts as a data group."""
+    from cdc_flight import faults
+
+    box = lab(resnapshot=True, snapshot_chunk_events=1)
+    _prepare_not_ready_snapshot_boundary(box)
+    monkeypatch.setenv("CDC_FAULT_INJECT", f"{anchor}:1:raise")
+    faults.refresh()
+
+    with pytest.raises(faults.InjectedFault, match=anchor):
+        box.feed(_streaming_transaction())
+
+    assert box.committer.marked == 0
+    assert box.committer.batches == 0
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.spill_events") == 0
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == int(
+        committed_before_ack
+    )
+    assert box.applier.snapshot_completion.state == "completion_notified"
+
+    if not committed_before_ack:
+        monkeypatch.delenv("CDC_FAULT_INJECT")
+        faults.refresh()
+        box.feed([snap("customers", 200, ident=2, marker="last")])
+        box.commit()
+        assert box.applier.snapshot_completed is True
+
+
 def _complete_empty_snapshot(box):
     completion = SnapshotCompletion.full_snapshot({"app.customers"})
     completion.observe_notification("STARTED", {})
@@ -346,6 +517,27 @@ def _streaming_transaction():
         ),
         end("stream-1", 1, 302, {"app.customers": 1}),
     ]
+
+
+def _prepare_not_ready_snapshot_boundary(box, *, declared: int = 2) -> None:
+    box.applier.snapshot_completion = SnapshotCompletion.full_snapshot({"app.customers"})
+    box.applier.snapshot_completion.observe_notification("STARTED", {})
+    box.feed([snap("customers", 100, ident=1, marker="true")])
+    box.applier._handle(
+        [
+            _SnapshotNotification(
+                "TABLE_SCAN_COMPLETED",
+                200,
+                {
+                    "scanned_collection": "app.customers",
+                    "status": "SUCCEEDED",
+                    "total_rows_scanned": str(declared),
+                },
+            ),
+            _SnapshotNotification("COMPLETED", 201),
+        ],
+        box.committer,
+    )
 
 
 def test_boundary_only_group_is_classified_as_snapshot_phase(lab):
@@ -437,6 +629,30 @@ def test_resnapshot_fences_streaming_unit_after_open_snapshot_group(lab):
     assert box.applier.commit_groups == 2
     assert box.applier.resume_point.last_lsn == 302
     assert box.applier.snapshot_completion.state == "callbacks_started"
+
+
+def test_resnapshot_overlap_during_age_and_size_trigger_stays_fenced(lab):
+    """A pending soft close cannot turn the overlap into live streaming."""
+    box = lab(
+        full_snapshot=True,
+        resnapshot=True,
+        commit_max_events=1,
+        snapshot_chunk_events=1,
+    )
+    box.feed([snap("customers", 100, ident=1, marker="true")])
+    assert box.applier.group.events >= box.config.commit_max_events
+    # This is the timer's exact request flag; the overlap is delivered before the
+    # poll thread gets to honor it, which is the composition under test.
+    box.applier.group.close_requested = True
+
+    box.feed(_streaming_transaction())
+
+    assert box.applier.fenced_units == 1
+    assert box.applier.resnapshot_discarded_events == 1
+    assert box.applier.snapshot_completion.state == "callbacks_started"
+    assert box.applier.group.units[0].fenced is True
+    box.commit()
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 2
 
 
 class _RecordingVerifier:

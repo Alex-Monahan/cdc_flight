@@ -42,6 +42,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from . import apply_sql, destination, resume, self_heal, table_work
@@ -57,7 +58,7 @@ from .commit_group import CommitResult, OpenGroup
 from .destination import AlertSink, Lease, ResumePoint
 from .envelope import KIND_SNAPSHOT_BOUNDARY, PendingRecord, decode
 from .errors import AmbiguousDelete, DestinationIdentityCollision
-from .faults import arm_group, maybe_crash
+from .faults import arm_group, maybe_crash, wrap_destination
 from .planner import GroupPlan, stream_event_id
 from .run_state import COMMIT_ACK
 from .snapshot import SnapshotCoordinator
@@ -66,6 +67,25 @@ from .snapshot_notifications import decode_notification
 from .spill import SpillBuffer, StagedEvent
 
 log = logging.getLogger("cdc_flight.applier")
+
+
+@dataclass
+class _FencedCommitContext:
+    """The real owner of a fenced overlap's staging transaction.
+
+    A spill starts before the assembler has an ``END`` marker and therefore before
+    ``_add_unit`` can decide how the completed unit will be grouped.  Re-snapshot
+    streaming is known to be fenced at that earlier point, so its staged rows get a
+    dedicated transaction connection and group from the beginning.  The main
+    ``OpenGroup`` can consequently remain blocked on a snapshot boundary without
+    lending its transaction to the throwaway unit.
+    """
+
+    group: OpenGroup
+    con: Any
+    spill: SpillBuffer
+    registry: Any
+    close_con: Any | None = None
 
 
 class Applier:
@@ -153,6 +173,11 @@ class Applier:
             transactional_ddl=transactional_ddl,
         )
         self.spill = SpillBuffer(con)
+        #: Streaming units on a re-snapshot are fenced before their END arrives. If
+        #: such a unit spills, this map owns the actual destination transaction until
+        #: the assembler emits the complete unit. It is separate from ``self.group``
+        #: so a blocked snapshot group never accidentally owns the overlap's rows.
+        self._fenced_commits: dict[int, _FencedCommitContext] = {}
         self.alerts = AlertSink(con, pipeline=pipeline)
         # rubric 1.9: an illegal table-lifecycle transition must reach an operator, and
         # the only connection that survives this group's rollback is the sink's.
@@ -538,6 +563,12 @@ class Applier:
                     f"cannot cross the snapshot phase boundary with commit result "
                     f"{result.value}"
                 )
+        # A spilled fenced unit was staged by its own transaction before the END
+        # marker arrived. It must never be appended to the main group after a phase
+        # commit, because that would leave its staged rows owned by a different group.
+        if resnapshot_fenced and unit.spill_unit_seq is not None:
+            self._commit_fenced_resnapshot_unit(unit)
+            return
         if not is_snapshot and not resnapshot_fenced:
             # For a phase mismatch this runs only after the prior snapshot group has
             # committed. For an empty group it is the admission edge that used to be
@@ -546,24 +577,43 @@ class Applier:
         self._append_unit(unit, is_snapshot=is_snapshot)
 
     def _commit_fenced_resnapshot_unit(self, unit: CompleteUnit) -> None:
-        """Commit a fenced overlap without taking ownership of snapshot completion."""
-        snapshot_group = self.group
-        self.group = OpenGroup()
+        """Commit a fenced overlap without taking ownership of snapshot completion.
+
+        The assembler may have staged the unit before it emitted ``CompleteUnit``.
+        In that case the context already owns a live DuckDB transaction. A unit with
+        no staged prefix still gets the same explicit context, which keeps this path
+        honest and avoids rebinding ``self.group`` while another transaction is open.
+        """
+        context = None
+        if unit.spill_unit_seq is not None:
+            context = self._fenced_commits.pop(unit.spill_unit_seq, None)
+        if context is None:
+            context = self._new_fenced_commit_context()
         try:
-            self._append_unit(unit, is_snapshot=False)
-            result = self.commit_group("resnapshot_overlap")
+            self._append_unit(unit, is_snapshot=False, group=context.group)
+            result = self.commit_group(
+                "resnapshot_overlap",
+                group_obj=context.group,
+                con=context.con,
+                spill=context.spill,
+                registry=context.registry,
+            )
             if result is not CommitResult.COMMITTED:
                 raise SnapshotObservationError(
                     "cannot discard fenced re-snapshot overlap with commit result "
                     f"{result.value}"
                 )
         finally:
-            self.group = snapshot_group
+            if context.close_con is not None:
+                context.close_con.close()
 
-    def _append_unit(self, unit: CompleteUnit, *, is_snapshot: bool) -> None:
-        if not self.group.units:
-            self.group.is_snapshot = is_snapshot
-            self.group.opened_at = time.monotonic()
+    def _append_unit(
+        self, unit: CompleteUnit, *, is_snapshot: bool, group: OpenGroup | None = None
+    ) -> None:
+        target_group = self.group if group is None else group
+        if not target_group.units:
+            target_group.is_snapshot = is_snapshot
+            target_group.opened_at = time.monotonic()
 
         if unit.kind == UNIT_TXN and unit.last_lsn and unit.last_lsn <= self.resume_point.last_lsn:
             # ADR §4.4 idempotency fence. Correctness does not depend on it - the
@@ -586,9 +636,44 @@ class Applier:
                 record.raw = None
             unit.records = [unit.records[-1]]
 
-        self.group.units.append(unit)
-        self.group.events += unit.event_count
-        self.group.nbytes += unit.nbytes
+        target_group.units.append(unit)
+        target_group.events += unit.event_count
+        target_group.nbytes += unit.nbytes
+
+    def _new_fenced_commit_context(self) -> _FencedCommitContext:
+        """Open the isolated owner used by a fenced streaming unit.
+
+        ``DuckDBPyConnection.cursor()`` is a separate transaction context. The
+        parent connection may still hold a snapshot-group staging transaction, so
+        using this owner is what makes the two commit decisions independent rather
+        than a Python-level swap of ``OpenGroup`` metadata.
+        """
+        if self.group.txn_open:
+            raise SnapshotObservationError(
+                "cannot isolate a fenced overlap while the main OpenGroup owns an "
+                "open destination transaction: both groups publish one shared resume "
+                "point, and DuckDB cannot safely commit the overlap beside that owner; "
+                "refusing before staging any overlap rows"
+            )
+        close_con = self.con.cursor()
+        try:
+            con = wrap_destination(close_con)
+            context = _FencedCommitContext(
+                group=OpenGroup(),
+                con=con,
+                spill=SpillBuffer(con),
+                registry=apply_sql.SchemaRegistry(
+                    con, self.dataset, constraints=self.cfg.destination_constraints
+                ),
+                close_con=close_con,
+            )
+            con.execute("BEGIN TRANSACTION")
+            context.group.txn_open = True
+            context.group.spill_commit_id = self._reserve_commit_id()
+        except BaseException:
+            close_con.close()
+            raise
+        return context
 
     def _fence_resnapshot_unit(self, unit: CompleteUnit) -> bool:
         """Discard throwaway-slot streaming before the live phase barrier.
@@ -639,11 +724,37 @@ class Applier:
         """
         self.group = OpenGroup()
 
+    def _reserve_commit_id(self) -> int:
+        """Reserve a per-pipeline commit id for an owner opened before COMMIT."""
+        commit_id = self._next_commit_id
+        self._next_commit_id += 1
+        return commit_id
+
     # ------------------------------------------------------------------ #
     # the transaction
     # ------------------------------------------------------------------ #
-    def commit_group(self, trigger: str) -> CommitResult:
-        group = self.group.units
+    def commit_group(
+        self,
+        trigger: str,
+        *,
+        group_obj: OpenGroup | None = None,
+        con=None,
+        spill: SpillBuffer | None = None,
+        registry=None,
+    ) -> CommitResult:
+        """Commit one explicitly owned group/transaction context.
+
+        The normal path uses ``self.group`` and the applier connection. A fenced
+        re-snapshot overlap can instead pass an isolated ``OpenGroup`` plus its
+        connection and spill buffer. Keeping ownership as arguments is important:
+        rebinding ``self.group`` cannot transfer a DuckDB transaction that is already
+        open on the original connection.
+        """
+        target_group = self.group if group_obj is None else group_obj
+        target_con = self.con if con is None else con
+        target_spill = self.spill if spill is None else spill
+        target_registry = self.registry if registry is None else registry
+        group = target_group.units
         if not group:
             return CommitResult.EMPTY
         # Snapshot rows are observations of the same closed protocol as the direct
@@ -656,12 +767,13 @@ class Applier:
         acknowledge_snapshot_notifications = (
             self.snapshot_completion.will_complete_after_commit(group)
         )
-        commit_id = self.group.spill_commit_id or self._next_commit_id
+        commit_id = target_group.spill_commit_id or self._next_commit_id
         opened_at = destination.now()
         # Tell the destination-fault wrapper which data group this is, so a
         # `destination_*` fault fires at the group the spec names rather than at one
         # the wrapper inferred from the SQL it happened to see (rubric 1.7).
-        arm_group(self.data_commit_groups + 1)
+        fault_group = self.data_commit_groups + 1
+        arm_group(fault_group)
         # NOT `or spill.rows > 0`: staged rows belonging only to *fenced*
         # units are about to be discarded, and counting them made a group with no
         # applicable content a "data group", which shifts every `<nth>`-indexed
@@ -669,15 +781,36 @@ class Applier:
         has_data = any(
             not u.fenced and (u.events or u.spilled_events) for u in group
         )
+        # A fenced overlap still has a real commit boundary even though it applies no
+        # user rows. Exercise the protocol anchors there without counting it as a data
+        # group; otherwise the transaction-owner path would be invisible to the fault
+        # matrix.
+        fault_enabled = has_data or trigger == "resnapshot_overlap"
 
-        if not self.group.txn_open:
-            self.con.execute("BEGIN TRANSACTION")
-            self.group.txn_open = True
+        if not target_group.txn_open:
+            target_con.execute("BEGIN TRANSACTION")
+            target_group.txn_open = True
         try:
             if has_data:
-                maybe_crash("begin", self.data_commit_groups + 1)
-            self.lease.renew(self.con)
-            stats = self._apply_units(group, commit_id, has_data=has_data)
+                maybe_crash("begin", fault_group)
+            if target_group is self.group:
+                self.lease.renew(target_con)
+            else:
+                # A fenced discard group writes no user rows and may run beside the
+                # main snapshot's open DuckDB transaction. Renewing the shared lease
+                # row from that isolated writer would create a write conflict with the
+                # snapshot owner; the applier already holds the lease, and this
+                # bounded discard does not need a second lease mutation.
+                log.debug("fenced overlap reuses the applier lease without renewing it")
+            stats = self._apply_units(
+                group,
+                commit_id,
+                has_data=has_data,
+                group_obj=target_group,
+                con=target_con,
+                spill=target_spill,
+                registry=target_registry,
+            )
             new_point = resume.point_for(
                 group,
                 previous=self.resume_point,
@@ -686,9 +819,15 @@ class Applier:
             )
             # rubric 1.5: DDL the stream cannot carry, fenced on the resume point this
             # group is about to make durable.
-            self._apply_catalog_changes(commit_id, new_point.last_lsn, stats)
+            self._apply_catalog_changes(
+                commit_id,
+                new_point.last_lsn,
+                stats,
+                group_obj=target_group,
+                con=target_con,
+            )
             destination.write_commit_log(
-                self.con,
+                target_con,
                 commit_id=commit_id,
                 pipeline=self.pipeline,
                 runner_id=self.runner_id,
@@ -707,7 +846,7 @@ class Applier:
                 tables_touched=sorted(table_work.live_names(stats["tables"])),
             )
             destination.write_resume_point(
-                self.con,
+                target_con,
                 pipeline=self.pipeline,
                 namespace=self.namespace,
                 point=new_point,
@@ -715,8 +854,8 @@ class Applier:
                 offset_blob=self._pending_offset_blob,
                 offset_key_blob=self._pending_offset_key_blob,
             )
-            if has_data:
-                maybe_crash("pre_commit", self.data_commit_groups + 1)
+            if fault_enabled:
+                maybe_crash("pre_commit", fault_group)
             # Principle (3): the pre-flush fingerprint of `offsets.dat` is taken
             # HERE, before the commit, because it is only a *forensic* baseline -
             # it does not need to lengthen the commit->ack path (Codex 7).
@@ -727,6 +866,7 @@ class Applier:
             # One attribute assignment, no lock, no allocation - see
             # `run_state._CommitAckWindow` for why that is the only acceptable cost here.
             stage = ["observability_gate"]
+            marked = 0
             with self_heal.commit_watchdog(
                 self.cfg.commit_timeout, commit_id, stage=lambda: stage[0]
             ):
@@ -737,10 +877,13 @@ class Applier:
                 COMMIT_ACK.enter()
                 try:
                     stage[0] = "commit"
-                    self.con.execute("COMMIT")
-                    self.group.txn_open = False
-                    if has_data:
-                        maybe_crash("post_commit_pre_ack", self.data_commit_groups + 1)
+                    if target_group is self.group:
+                        self.con.execute("COMMIT")
+                    else:
+                        target_con.execute("COMMIT")
+                    target_group.txn_open = False
+                    if fault_enabled:
+                        maybe_crash("post_commit_pre_ack", fault_group)
 
                     # The only operations in the guarded post-COMMIT path are the
                     # acknowledgement calls. Pending snapshot notifications join the
@@ -752,7 +895,6 @@ class Applier:
                         if acknowledge_snapshot_notifications
                         else []
                     )
-                    marked = 0
                     for unit in group:
                         for rec in unit.records:
                             if rec.raw is None:  # released by `_add_unit`
@@ -783,14 +925,20 @@ class Applier:
             # (ADR 0001 §19/A47).
             COMMIT_ACK.leave()
             self._request_resnapshot_for(ambiguous)
-            self._rollback_quietly()
+            if target_group is self.group:
+                self._rollback_quietly()
+            else:
+                self._rollback_quietly(group_obj=target_group, con=target_con)
             raise
         except BaseException:
-            self._rollback_quietly()
+            if target_group is self.group:
+                self._rollback_quietly()
+            else:
+                self._rollback_quietly(group_obj=target_group, con=target_con)
             raise
 
-        if has_data:
-            maybe_crash("post_ack", self.data_commit_groups + 1)
+        if fault_enabled:
+            maybe_crash("post_ack", fault_group)
         # next poll() -> performCommit() -> flushLsn(new)  ── nothing between ──
         # No filesystem work, no hashing: the "did the flush happen" check is a
         # liveness canary, not a prerequisite under Invariant O, so it runs on the
@@ -799,8 +947,8 @@ class Applier:
         if self.verifier is not None and marked:
             self._pending_verification = (offset_fingerprint, marked)
 
-        self._settle_catalog()
-        self._flush_alerts()
+        self._settle_catalog(target_group)
+        self._flush_alerts(target_group)
         # Snapshot completion is one policy shared by the main and re-snapshot engines.
         # Row evidence is recorded only after COMMIT; direct per-table/global callbacks
         # and declared/committed counts take the terminal edge. Row markers are
@@ -814,12 +962,13 @@ class Applier:
         self.applied_events += stats["events"]
         self.last_commit_id = commit_id
         self.resume_point = new_point
-        self._next_commit_id = commit_id + 1
+        self._next_commit_id = max(self._next_commit_id, commit_id + 1)
         if self.cfg.verify_offset_file:
             self._pending_offset_key_blob, self._pending_offset_blob = (
                 resume.capture_offset_file(self.offset_path, new_point)
             )
-        self._reset_group()
+        if target_group is self.group:
+            self._reset_group()
         return CommitResult.COMMITTED
 
     def _request_resnapshot_for(
@@ -837,17 +986,46 @@ class Applier:
             self.group.pending_alerts.append(alert)
         self.ambiguous_resnapshots_queued += int(recorded)
 
-    def _rollback_quietly(self) -> None:
-        if not self.group.txn_open:
-            self._reset_after_rollback()
+    def _rollback_quietly(
+        self, *, group_obj: OpenGroup | None = None, con=None
+    ) -> None:
+        target_group = self.group if group_obj is None else group_obj
+        target_con = self.con if con is None else con
+        if not target_group.txn_open:
+            if target_group is self.group:
+                self._reset_after_rollback()
             return
         try:
-            self.con.execute("ROLLBACK")
+            target_con.execute("ROLLBACK")
         except Exception:  # pragma: no cover - never mask the original error
             log.debug("rollback failed", exc_info=True)
         finally:
-            self.group.txn_open = False
-            self._reset_after_rollback()
+            target_group.txn_open = False
+            if target_group is self.group:
+                self._reset_after_rollback()
+            else:
+                failed = target_group.discard_units()
+                if failed:
+                    self.deferred_units += len(failed)
+                    self.deferred_events += sum(u.event_count for u in failed)
+
+    def _rollback_fenced_commits(self) -> None:
+        """Release incomplete isolated spill owners at shutdown/error teardown."""
+        contexts = list(self._fenced_commits.values())
+        self._fenced_commits.clear()
+        for context in contexts:
+            try:
+                if context.group.txn_open:
+                    context.con.execute("ROLLBACK")
+            except Exception:  # pragma: no cover - teardown must not mask the cause
+                log.debug("fenced overlap rollback failed", exc_info=True)
+            finally:
+                context.group.txn_open = False
+                if context.close_con is not None:
+                    try:
+                        context.close_con.close()
+                    except Exception:  # pragma: no cover
+                        log.debug("fenced overlap connection close failed", exc_info=True)
 
     def _reset_after_rollback(self) -> None:
         """Everything the discarded transaction touched, in memory as well.
@@ -905,15 +1083,25 @@ class Applier:
     # ------------------------------------------------------------------ #
     # applying units — one ordered pass, delegated to the planner
     # ------------------------------------------------------------------ #
-    def _apply_units(self, group: list[CompleteUnit], commit_id: int, *, has_data: bool) -> dict:
+    def _apply_units(
+        self,
+        group: list[CompleteUnit],
+        commit_id: int,
+        *,
+        has_data: bool,
+        group_obj: OpenGroup,
+        con,
+        spill: SpillBuffer,
+        registry,
+    ) -> dict:
         plan = GroupPlan(
-            self.con,
+            con,
             commit_id=commit_id,
-            registry_of=lambda: self.registry,
+            registry_of=lambda: registry,
             snapshots=self.snapshots,
-            spill=self.spill,
+            spill=spill,
             truncate_mode=self.cfg.truncate_mode,
-            created_in_txn=self.group.created_in_txn,
+            created_in_txn=group_obj.created_in_txn,
             watermarks=self.watermarks,
         )
         for unit in group:
@@ -929,7 +1117,7 @@ class Applier:
                     plan.staged_units = True
                 continue
             if unit.kind == UNIT_SNAPSHOT_CHUNK:
-                self.group.is_snapshot = True
+                group_obj.is_snapshot = True
             plan.add_unit(unit)
 
         # The `mid_apply` anchor is documented as "some tables written, others not".
@@ -944,7 +1132,7 @@ class Applier:
         stats = plan.write(after_first_table=anchor)
         for target, (schema, table) in plan.created_tables.items():
             destination.register_table(
-                self.con,
+                con,
                 pipeline=self.pipeline,
                 source_schema=schema,
                 source_table=table,
@@ -956,19 +1144,21 @@ class Applier:
         self.truncates_applied += plan.truncates_applied
         self.truncates_logged += plan.truncates_logged
         self.watermark_fenced_events += plan.watermark_fenced_events
-        if self.group.is_snapshot and stats.get("last_lsn"):
+        if group_obj.is_snapshot and stats.get("last_lsn"):
             # Every snapshot record of one snapshot carries the exported snapshot's
             # consistent point, so this is `C` (rubric 1.6, `cdc_flight.resnapshot`).
             self.last_snapshot_lsn = stats["last_lsn"]
-        self.group.source_tables |= plan.source_tables
-        self.group.table_events.extend(plan.markers())
-        self._flush_table_events(commit_id)
+        group_obj.source_tables |= plan.source_tables
+        group_obj.table_events.extend(plan.markers())
+        self._flush_table_events(commit_id, group_obj=group_obj, con=con)
         return stats
 
     # ------------------------------------------------------------------ #
     # table-level events and catalog DDL (rubric 1.5)
     # ------------------------------------------------------------------ #
-    def _flush_table_events(self, commit_id: int) -> None:
+    def _flush_table_events(
+        self, commit_id: int, *, group_obj: OpenGroup, con
+    ) -> None:
         """Write this group's `table_events` rows, inside its transaction.
 
         Deliberately transactional with the data: "the destination table was emptied"
@@ -976,17 +1166,25 @@ class Applier:
         the audit trail can outlive a rolled-back apply and describe something that
         never happened.
         """
-        for marker in self.group.table_events:
+        for marker in group_obj.table_events:
             destination.write_table_event(
-                self.con,
+                con,
                 pipeline=self.pipeline,
                 commit_id=commit_id,
-                seq=self.group.next_table_event_seq(),
+                seq=group_obj.next_table_event_seq(),
                 **marker,
             )
-        self.group.table_events = []
+        group_obj.table_events = []
 
-    def _apply_catalog_changes(self, commit_id: int, durable_lsn: int, stats: dict) -> None:
+    def _apply_catalog_changes(
+        self,
+        commit_id: int,
+        durable_lsn: int,
+        stats: dict,
+        *,
+        group_obj: OpenGroup,
+        con,
+    ) -> None:
         """Apply the source-catalog changes whose fence has opened (rubric 1.5).
 
         Runs inside the commit group's transaction, *after* the group's events, so a
@@ -1001,30 +1199,30 @@ class Applier:
         plan = coordinator.plan(durable_lsn)
         if not plan.actions and not plan.relations and not plan.alerts:
             return
-        self.group.catalog_plan = plan
-        self.group.table_events.extend(coordinator.apply(self.con, plan, stats))
+        group_obj.catalog_plan = plan
+        group_obj.table_events.extend(coordinator.apply(con, plan, stats))
         # A destructive action that could not be applied is exactly the signal an
         # operator must still get when the group rolls back; one that describes an
         # applied action must NOT outlive the rollback that undid it (Codex 7).
-        self.group.pending_alerts.extend(plan.alerts)
-        if self.group.table_events:
-            self._flush_table_events(commit_id)
+        group_obj.pending_alerts.extend(plan.alerts)
+        if group_obj.table_events:
+            self._flush_table_events(commit_id, group_obj=group_obj, con=con)
 
-    def _settle_catalog(self) -> None:
+    def _settle_catalog(self, group_obj: OpenGroup) -> None:
         """Forget the catalog work this group made durable. Runs after COMMIT."""
         if self.catalog is None:
             return
-        plan = self.group.catalog_plan
+        plan = group_obj.catalog_plan
         if plan is not None:
-            self.catalog_coordinator.settle(plan, self.group.source_tables)
-            self.group.catalog_plan = None
-        elif self.group.source_tables:
-            self.catalog.observe_replicated(self.group.source_tables)
+            self.catalog_coordinator.settle(plan, group_obj.source_tables)
+            group_obj.catalog_plan = None
+        elif group_obj.source_tables:
+            self.catalog.observe_replicated(group_obj.source_tables)
 
-    def _flush_alerts(self) -> None:
-        for alert in self.group.pending_alerts:
+    def _flush_alerts(self, group_obj: OpenGroup) -> None:
+        for alert in group_obj.pending_alerts:
             self._raise_alert(alert)
-        self.group.pending_alerts = []
+        group_obj.pending_alerts = []
 
     def _raise_alert(self, alert: dict) -> None:
         self.alerts.raise_alert(
@@ -1057,11 +1255,29 @@ class Applier:
         """
         if not events:
             return 0
-        if not self.group.txn_open:
-            self.con.execute("BEGIN TRANSACTION")
-            self.group.txn_open = True
-            self.group.spill_commit_id = self._next_commit_id
-        commit_id = self.group.spill_commit_id or self._next_commit_id
+        # In a re-snapshot applier every streaming unit is fenced. Decide that at
+        # spill time, before the assembler has emitted its END, and give the staged
+        # rows their own connection/group. The main connection may already own an
+        # uncommitted snapshot group, so sharing it here would make later ownership
+        # depend on which unit happened to finish first.
+        fenced_context = None
+        if self.cfg.resnapshot and snapshot is None:
+            fenced_context = self._fenced_commits.get(unit_seq)
+            if fenced_context is None:
+                fenced_context = self._new_fenced_commit_context()
+                self._fenced_commits[unit_seq] = fenced_context
+            owner_group = fenced_context.group
+            owner_con = fenced_context.con
+            owner_spill = fenced_context.spill
+        else:
+            owner_group = self.group
+            owner_con = self.con
+            owner_spill = self.spill
+        if not owner_group.txn_open:
+            owner_con.execute("BEGIN TRANSACTION")
+            owner_group.txn_open = True
+            owner_group.spill_commit_id = self._reserve_commit_id()
+        commit_id = owner_group.spill_commit_id or self._next_commit_id
         # Creates the shadow table, its `table_state` row and the snapshot epoch
         # BEFORE any record of this table can be staged.
         state = self.snapshots.state_for(*snapshot) if snapshot is not None else None
@@ -1091,7 +1307,7 @@ class Applier:
                         seq=event.total_order,
                     )
                 )
-        staged = self.spill.stage(
+        staged = owner_spill.stage(
             commit_id=commit_id, unit_seq=unit_seq, prepared=prepared
         )
         self.spilled_events += staged
@@ -1112,6 +1328,7 @@ class Applier:
         (Opus MINOR-9). They are counted into the summary now.
         """
         self.shutdown()
+        self._rollback_fenced_commits()
         if self.group.units:
             self.deferred_units += len(self.group.units)
             self.deferred_events += sum(u.event_count for u in self.group.units)
