@@ -237,6 +237,7 @@ SNAPSHOT_CALLBACKS_STARTED = "callbacks_started"
 SNAPSHOT_COMPLETION_NOTIFIED = "completion_notified"
 SNAPSHOT_CALLBACKS_COMPLETE = "callbacks_complete"
 SNAPSHOT_NOT_REQUIRED = "not_required"
+SNAPSHOT_STREAMING = "streaming"
 
 SNAPSHOT_COMPLETION = Machine(
     "snapshot_completion",
@@ -246,6 +247,7 @@ SNAPSHOT_COMPLETION = Machine(
         SNAPSHOT_COMPLETION_NOTIFIED,
         SNAPSHOT_CALLBACKS_COMPLETE,
         SNAPSHOT_NOT_REQUIRED,
+        SNAPSHOT_STREAMING,
     ),
     edges=(
         (SNAPSHOT_AWAITING_CALLBACKS, SNAPSHOT_CALLBACKS_STARTED),
@@ -255,10 +257,15 @@ SNAPSHOT_COMPLETION = Machine(
         (SNAPSHOT_COMPLETION_NOTIFIED, SNAPSHOT_COMPLETION_NOTIFIED),
         (SNAPSHOT_COMPLETION_NOTIFIED, SNAPSHOT_CALLBACKS_COMPLETE),
         (SNAPSHOT_NOT_REQUIRED, SNAPSHOT_NOT_REQUIRED),
+        # The applier may cross into the stream only after the completion proof is
+        # terminal. There is deliberately no `completion_notified -> streaming` edge.
+        (SNAPSHOT_CALLBACKS_COMPLETE, SNAPSHOT_STREAMING),
+        (SNAPSHOT_NOT_REQUIRED, SNAPSHOT_STREAMING),
     ),
     terminal=(
         SNAPSHOT_CALLBACKS_COMPLETE,
         SNAPSHOT_NOT_REQUIRED,
+        SNAPSHOT_STREAMING,
     ),
     initial=SNAPSHOT_AWAITING_CALLBACKS,
     durable=None,

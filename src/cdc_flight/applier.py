@@ -53,7 +53,7 @@ from .assembler import (
     TransactionAssembler,
 )
 from .catalog_apply import CatalogCoordinator
-from .commit_group import OpenGroup
+from .commit_group import CommitResult, OpenGroup
 from .destination import AlertSink, Lease, ResumePoint
 from .envelope import KIND_SNAPSHOT_BOUNDARY, PendingRecord, decode
 from .errors import AmbiguousDelete, DestinationIdentityCollision
@@ -483,6 +483,7 @@ class Applier:
     # ------------------------------------------------------------------ #
     def _add_unit(self, unit: CompleteUnit) -> None:
         is_snapshot = unit.kind == UNIT_SNAPSHOT_CHUNK
+        was_snapshot = self.group.is_snapshot
         is_snapshot_boundary = any(
             record.kind == KIND_SNAPSHOT_BOUNDARY for record in unit.records
         )
@@ -495,7 +496,20 @@ class Applier:
             and is_snapshot != self.group.is_snapshot
             and not (is_snapshot_boundary and self.group.is_snapshot)
         ):
-            self.commit_group("snapshot_chunk" if self.group.is_snapshot else "phase")
+            result = self.commit_group(
+                "snapshot_chunk" if was_snapshot else "phase"
+            )
+            if was_snapshot and not is_snapshot:
+                # This call is intentionally made even when `result` is BLOCKED. The
+                # closed completion machine has no `completion_notified -> streaming`
+                # edge, so the illegal phase crossing is a loud refusal and the unit
+                # cannot be appended to the open snapshot group.
+                self.snapshot_completion.enter_streaming()
+            if result is not CommitResult.COMMITTED:
+                raise SnapshotObservationError(
+                    f"cannot cross the snapshot phase boundary with commit result "
+                    f"{result.value}"
+                )
         if not self.group.units:
             self.group.is_snapshot = is_snapshot
             self.group.opened_at = time.monotonic()
@@ -555,17 +569,20 @@ class Applier:
     # ------------------------------------------------------------------ #
     # the transaction
     # ------------------------------------------------------------------ #
-    def commit_group(self, trigger: str) -> None:
+    def commit_group(self, trigger: str) -> CommitResult:
         group = self.group.units
         if not group:
-            return
+            return CommitResult.EMPTY
         # Snapshot rows are observations of the same closed protocol as the direct
         # notifications. Validate their state and declared counts before BEGIN/COMMIT;
         # a terminal boundary also waits here until its final buffered rows make the
         # completion proof terminal. The post-commit observer only records evidence
         # that has now become durable.
         if not self.snapshot_completion.commit_ready(group):
-            return
+            return CommitResult.BLOCKED
+        acknowledge_snapshot_notifications = (
+            self.snapshot_completion.will_complete_after_commit(group)
+        )
         commit_id = self.group.spill_commit_id or self._next_commit_id
         opened_at = destination.now()
         # Tell the destination-fault wrapper which data group this is, so a
@@ -643,17 +660,43 @@ class Applier:
                 # INSIDE the watchdog (Codex r3 MAJOR-2). `enter()` waits, without a
                 # bound of its own, until no independent write is in flight — that is
                 # what makes the exclusion absolute rather than instrumented — and the
-                # watchdog is what stops a wedged observability cursor from stalling the
-                # commit path silently. It turns into the same loud, bounded EX_TEMPFAIL
-                # death a wedged COMMIT produces. `stage` tells the watchdog WHICH of the
-                # two it killed, because "the commit never started" and "the commit is
-                # ambiguous" call for different operator responses (Codex r4 MAJOR-1).
+                # watchdog bounds both COMMIT and every acknowledgement below.
                 COMMIT_ACK.enter()
-                stage[0] = "commit"
-                self.con.execute("COMMIT")
-            self.group.txn_open = False
-            if has_data:
-                maybe_crash("post_commit_pre_ack", self.data_commit_groups + 1)
+                try:
+                    stage[0] = "commit"
+                    self.con.execute("COMMIT")
+                    self.group.txn_open = False
+                    if has_data:
+                        maybe_crash("post_commit_pre_ack", self.data_commit_groups + 1)
+
+                    # The only operations in the guarded post-COMMIT path are the
+                    # acknowledgement calls. Pending snapshot notifications join the
+                    # same plan only once the pure pre-commit completion check says this
+                    # group will make the callback proof terminal.
+                    stage[0] = "ack"
+                    pending = (
+                        list(self._pending_snapshot_notifications)
+                        if acknowledge_snapshot_notifications
+                        else []
+                    )
+                    marked = 0
+                    for unit in group:
+                        for rec in unit.records:
+                            if rec.raw is None:  # released by `_add_unit`
+                                continue
+                            self._committer.markProcessed(rec.raw)
+                            marked += 1
+                    for raw in pending:
+                        self._committer.markProcessed(raw)
+                        marked += 1
+                    self._committer.markBatchFinished()
+                    if pending:
+                        # Do not discard the handles until markBatchFinished succeeds.
+                        del self._pending_snapshot_notifications[: len(pending)]
+                finally:
+                    # A mark call can raise; a stuck window would silently drop every
+                    # later phase write, so the gate is closed in all cases.
+                    COMMIT_ACK.leave()
         except (AmbiguousDelete, DestinationIdentityCollision) as ambiguous:
             # Rubric 4.7. The group still rolls back - a fold that cannot be decided is
             # never committed - but a bare rollback here is a *permanent* failure: the
@@ -670,26 +713,9 @@ class Applier:
             self._rollback_quietly()
             raise
         except BaseException:
-            COMMIT_ACK.leave()
             self._rollback_quietly()
             raise
 
-        # ── the ONLY window that matters, and it contains nothing else ──────
-        marked = 0
-        try:
-            for unit in group:
-                for rec in unit.records:
-                    if rec.raw is None:  # released by `_add_unit`
-                        continue
-                    self._committer.markProcessed(rec.raw)
-                    marked += 1
-            self._committer.markBatchFinished()
-        finally:
-            # In a `finally` because `markProcessed`/`markBatchFinished` can raise
-            # (pydbzengine interrupts this thread when the handler fails) and a window
-            # left open would silently drop every subsequent phase write (Codex r2
-            # MAJOR-1). One attribute assignment, so it adds nothing to the interval.
-            COMMIT_ACK.leave()
         if has_data:
             maybe_crash("post_ack", self.data_commit_groups + 1)
         # next poll() -> performCommit() -> flushLsn(new)  ── nothing between ──
@@ -709,8 +735,6 @@ class Applier:
         self.snapshot_completion.observe_committed_group(
             group, snapshot_active=self.snapshots.active
         )
-        if self.snapshot_completion.completed:
-            self._ack_snapshot_notifications()
         self.commit_groups += 1
         if has_data:
             self.data_commit_groups += 1
@@ -723,16 +747,7 @@ class Applier:
                 resume.capture_offset_file(self.offset_path, new_point)
             )
         self._reset_group()
-
-    def _ack_snapshot_notifications(self) -> None:
-        """Acknowledge control callbacks only after all preceding rows are durable."""
-        pending = list(self._pending_snapshot_notifications)
-        if not pending:
-            return
-        for raw in pending:
-            self._committer.markProcessed(raw)
-        self._committer.markBatchFinished()
-        del self._pending_snapshot_notifications[: len(pending)]
+        return CommitResult.COMMITTED
 
     def _request_resnapshot_for(
         self, ambiguous: AmbiguousDelete | DestinationIdentityCollision

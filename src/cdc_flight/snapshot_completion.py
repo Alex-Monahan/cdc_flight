@@ -22,6 +22,7 @@ from .machines import (
     SNAPSHOT_COMPLETION,
     SNAPSHOT_COMPLETION_NOTIFIED,
     SNAPSHOT_NOT_REQUIRED,
+    SNAPSHOT_STREAMING,
 )
 from .states import IllegalTransition, UnknownState
 
@@ -123,16 +124,24 @@ class SnapshotCompletion:
         self.validate_committed_group(units)
         if not self._has_boundary(units):
             return True
-        if self._state == SNAPSHOT_CALLBACKS_COMPLETE:
-            return True
-        if self._state != SNAPSHOT_COMPLETION_NOTIFIED:
+        return self._will_complete_after(self._snapshot_units_in(units), boundary=True)
+
+    def will_complete_after_commit(self, units) -> bool:
+        """Predict the post-COMMIT completion edge without mutating the model."""
+        snapshot_units = self._snapshot_units_in(units)
+        self._validate_snapshot_units(snapshot_units)
+        return self._will_complete_after(snapshot_units)
+
+    def enter_streaming(self) -> None:
+        """Take the only phase-changing edge out of the snapshot model."""
+        try:
+            SNAPSHOT_COMPLETION.check(self._state, SNAPSHOT_STREAMING)
+        except (IllegalTransition, UnknownState) as exc:
             raise SnapshotObservationError(
-                f"snapshot boundary reached {self._state} without a validated "
-                "COMPLETED observation"
-            )
-        return self._counts_match(
-            self._projected_rows(self._snapshot_units_in(units))
-        )
+                f"snapshot phase transition to streaming refused from {self._state}: "
+                f"{exc}"
+            ) from exc
+        self._state = SNAPSHOT_STREAMING
 
     def observe_committed_group(self, units, *, snapshot_active: bool) -> None:
         """Record rows after ``COMMIT``; direct callbacks prove completion.
@@ -206,12 +215,20 @@ class SnapshotCompletion:
         except IllegalTransition as exc:  # pragma: no cover - declaration guard
             raise SnapshotObservationError(str(exc)) from exc
 
-        projected = self._projected_rows(snapshot_units)
         for unit in snapshot_units:
             if not unit.schema or not unit.table:
                 raise SnapshotObservationError(
                     "committed snapshot row callback has no schema.table identity"
                 )
+            table = _qualified(f"{unit.schema}.{unit.table}")
+            if table not in self._expected_tables:
+                raise SnapshotObservationError(
+                    f"committed snapshot row callback named unexpected table {table!r}; "
+                    f"expected {sorted(self._expected_tables)}"
+                )
+
+        projected = self._projected_rows(snapshot_units)
+        for unit in snapshot_units:
             table = _qualified(f"{unit.schema}.{unit.table}")
             declared = self._callback_rows.get(table)
             if declared is not None and projected[table] > declared:
@@ -358,6 +375,18 @@ class SnapshotCompletion:
             committed_rows.get(table, 0) == self._callback_rows.get(table)
             for table in self._expected_tables
         )
+
+    def _will_complete_after(self, snapshot_units, *, boundary: bool = False) -> bool:
+        if self.phase_ended:
+            return True
+        if self._state != SNAPSHOT_COMPLETION_NOTIFIED:
+            if not boundary:
+                return False
+            raise SnapshotObservationError(
+                f"snapshot boundary reached {self._state} without a validated "
+                "COMPLETED observation"
+            )
+        return self._counts_match(self._projected_rows(snapshot_units))
 
     def _unexpected(self, observation: str) -> None:
         raise SnapshotObservationError(

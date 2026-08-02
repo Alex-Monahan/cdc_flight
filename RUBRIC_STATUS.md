@@ -1523,7 +1523,7 @@ run-time error instead of a review finding.
 | `destination_ownership` | who owns the destination after callback admission or failed quiescence | 4 | 5 | **memory only** |
 | `catalog_change` | where is one DDL fact in observe → confirm → fence → apply | 9 | 30 | **memory only** |
 | `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
-| `snapshot_completion` | have all ordered snapshot callbacks arrived | 5 | 7 | **memory only** |
+| `snapshot_completion` | have all ordered snapshot callbacks arrived | 6 | 9 | **memory only** |
 | `runtime_root_lifecycle` | is the disposable root reusable or committed to cleanup | 6 | 10 | project-local root and parent markers |
 
 Style, deliberately minimal: `cdc_flight/states.py` is 293 lines with **no dependencies**

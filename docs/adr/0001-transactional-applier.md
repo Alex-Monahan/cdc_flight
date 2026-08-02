@@ -2908,7 +2908,7 @@ made no claim — see A63.4.
 per-table snapshot terminal and then the global completion callback?
 
 persistence: **memory only** · initial: `awaiting_callbacks` · terminal:
-`callbacks_complete`, `not_required`
+`callbacks_complete`, `not_required`, `streaming`
 
 | from | to | terminal |
 |---|---|---|
@@ -2919,6 +2919,8 @@ persistence: **memory only** · initial: `awaiting_callbacks` · terminal:
 | `completion_notified` | `completion_notified` | no |
 | `completion_notified` | `callbacks_complete` | yes |
 | `not_required` | `not_required` | yes |
+| `callbacks_complete` | `streaming` | yes |
+| `not_required` | `streaming` | yes |
 
 **`runtime_root_lifecycle`** — Is the project-local disposable root healthy and
 reusable, privately provisioning, or irreversibly committed to cleanup?
@@ -3329,7 +3331,7 @@ transition table.
 | `destination_ownership` | who owns the destination after callback admission or failed quiescence | 4 | 5 | **memory only** |
 | `catalog_change` | where is one DDL fact in observe → confirm → fence → apply | 9 | 30 | **memory only** |
 | `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
-| `snapshot_completion` | have all ordered snapshot callbacks arrived | 5 | 7 | **memory only** |
+| `snapshot_completion` | have all ordered snapshot callbacks arrived | 6 | 9 | **memory only** |
 | `runtime_root_lifecycle` | is the disposable root reusable or committed to cleanup | 6 | 10 | project-local root and parent markers |
 
 Generated transition tables: §A51.1. Declarations: `cdc_flight/machines.py`, which is one
