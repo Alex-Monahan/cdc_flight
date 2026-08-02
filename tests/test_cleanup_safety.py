@@ -471,3 +471,105 @@ def test_clean_state_rejects_a_parent_symlink_that_escapes_the_project(
     assert proc.returncode == 2
     assert marker.read_text() == "external\n"
     assert "refusing" in proc.stderr.lower()
+
+
+def test_clean_refuses_when_retained_root_leaves_parent_before_sweep(
+    isolated_project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    instance = "cleanup_retained_root_escape"
+    target = isolated_project / ".cdc_instances" / instance
+    escaped = tmp_path / "retained-root-escaped"
+    prepared = _runtime_state(
+        isolated_project, "prepare", CDC_TEST_INSTANCE_ID=instance
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    marker = target / "must-survive.txt"
+    marker.write_text("preserved\n")
+    module = _load_runtime_state(isolated_project)
+
+    def move_root(event: str, _path: Path) -> None:
+        if event == "before_delete_tree":
+            target.rename(escaped)
+
+    monkeypatch.setattr(module, "_checkpoint", move_root)
+
+    with pytest.raises(module.Refusal, match="changed before deletion"):
+        module._run("clean", instance)
+
+    assert (escaped / marker.name).read_text() == "preserved\n"
+
+
+def test_clean_refuses_when_delete_child_leaves_retained_root(
+    isolated_project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    instance = "cleanup_delete_child_escape"
+    target = isolated_project / ".cdc_instances" / instance
+    child = target / "child"
+    escaped = tmp_path / "delete-child-escaped"
+    prepared = _runtime_state(
+        isolated_project, "prepare", CDC_TEST_INSTANCE_ID=instance
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    child.mkdir()
+    (child / "must-survive.txt").write_text("preserved\n")
+    module = _load_runtime_state(isolated_project)
+
+    def move_child(event: str, path: Path) -> None:
+        if event == "after_delete_child_verify" and path.name == "child":
+            child.rename(escaped)
+
+    monkeypatch.setattr(module, "_checkpoint", move_child)
+
+    with pytest.raises(module.Refusal, match="left its verified parent"):
+        module._run("clean", instance)
+
+    assert (escaped / "must-survive.txt").read_text() == "preserved\n"
+
+
+def test_prepare_refuses_foreign_replacement_after_mkdir(
+    isolated_project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    instance = "cleanup_post_mkdir_replacement"
+    target = isolated_project / ".cdc_instances" / instance
+    escaped = tmp_path / "original-root"
+    module = _load_runtime_state(isolated_project)
+
+    def replace_root(event: str, _path: Path) -> None:
+        if event == "after_target_mkdir":
+            target.rename(escaped)
+            target.mkdir()
+            (target / "must-survive.txt").write_text("foreign\n")
+
+    monkeypatch.setattr(module, "_checkpoint", replace_root)
+
+    with pytest.raises(module.Refusal, match="changed while opening"):
+        module._run("prepare", instance)
+
+    assert (target / "must-survive.txt").read_text() == "foreign\n"
+    assert not (target / ".cdc_flight_disposable_runtime").exists()
+
+
+def test_clean_recovers_an_interrupted_quarantine(
+    isolated_project: Path, monkeypatch: pytest.MonkeyPatch
+):
+    instance = "cleanup_interrupted_quarantine"
+    target = isolated_project / ".cdc_instances" / instance
+    prepared = _runtime_state(
+        isolated_project, "prepare", CDC_TEST_INSTANCE_ID=instance
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    (target / "must-delete.txt").write_text("disposable\n")
+    module = _load_runtime_state(isolated_project)
+
+    def interrupt(event: str, _path: Path) -> None:
+        if event == "after_quarantine":
+            raise OSError("injected interruption")
+
+    monkeypatch.setattr(module, "_checkpoint", interrupt)
+    with pytest.raises(OSError, match="injected interruption"):
+        module._run("clean", instance)
+    assert (target / module.QUARANTINE_NAME).exists()
+
+    monkeypatch.undo()
+    module._run("clean", instance)
+    assert not target.exists()
