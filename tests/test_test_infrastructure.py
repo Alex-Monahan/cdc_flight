@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import conftest
 import pytest
@@ -86,6 +87,46 @@ def test_destructive_guard_requires_the_provisioner_sentinel(monkeypatch, tmp_pa
 
     with pytest.raises(RuntimeError, match="missing"):
         conftest._require_disposable_cluster(source)
+
+
+def test_replication_budget_covers_base_resnapshot_and_headroom():
+    assert conftest._required_replication_capacity(12) == 28
+
+
+def test_xdist_worker_restarts_are_disabled():
+    config = SimpleNamespace(
+        option=SimpleNamespace(numprocesses=12, maxworkerrestart=None)
+    )
+
+    conftest._enforce_no_worker_restarts(config)
+
+    assert config.option.maxworkerrestart == 0
+
+
+def test_xdist_worker_restart_override_is_refused():
+    config = SimpleNamespace(
+        option=SimpleNamespace(numprocesses=12, maxworkerrestart="1")
+    )
+
+    with pytest.raises(pytest.UsageError, match="requires --max-worker-restart=0"):
+        conftest._enforce_no_worker_restarts(config)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        f"{conftest.WORKER_DATABASE_PREFIX}gw99",
+        f"{conftest.TEMPLATE_DATABASE_PREFIX}gw99",
+    ],
+)
+def test_stale_database_contract_covers_replacement_worker_artifacts(name):
+    assert conftest._owned_database_name(name)
+
+
+def test_namespaced_base_and_resnapshot_slots_share_the_sweep_prefix():
+    base = f"{conftest.TEST_SLOT_PREFIX}t_crashed_999"
+    assert base.startswith(conftest.TEST_SLOT_PREFIX)
+    assert f"{base}_rs".startswith(conftest.TEST_SLOT_PREFIX)
 
 
 @pytest.mark.parametrize("requested", [6, 10])

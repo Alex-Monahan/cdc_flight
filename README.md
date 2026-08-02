@@ -212,6 +212,10 @@ cluster's replication capacities. MotherDuck tests carry the `motherduck` marker
 long fault-injection tests carry `slow`; both are deselected by `make test` and
 `make test-serial`. Every lane prints its 20 slowest durations.
 
+The controller disables crashed-worker replacement, sweeps stale instance-owned
+databases and slots before workers start, and requires capacity for two slots per
+worker (base plus re-snapshot) with four additional slots of headroom.
+
 Measured on an M-series Mac. Only executed runs are reported here; see
 `RUBRIC_STATUS.md` for the per-item evidence.
 

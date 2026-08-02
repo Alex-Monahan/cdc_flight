@@ -231,10 +231,25 @@ def _acquire_test_run_lock(
     return handle
 
 
+def _enforce_no_worker_restarts(config) -> None:
+    workers = getattr(config.option, "numprocesses", None)
+    if not workers:
+        return
+    restarts = getattr(config.option, "maxworkerrestart", None)
+    if restarts not in (None, 0, "0"):
+        raise pytest.UsageError(
+            "the disposable test lane requires --max-worker-restart=0; "
+            "replacement workers cannot inherit crashed-worker cleanup"
+        )
+    config.option.maxworkerrestart = 0
+
+
+@pytest.hookimpl(tryfirst=True)
 def pytest_configure(config) -> None:
     """Let the controller own the selected Postgres instance for the whole run."""
     if hasattr(config, "workerinput"):
         return
+    _enforce_no_worker_restarts(config)
     global _RUN_LOCK_HANDLE
     if _RUN_LOCK_HANDLE is not None:
         return
@@ -243,6 +258,39 @@ def pytest_configure(config) -> None:
         _RUN_LOCK_HANDLE = _acquire_test_run_lock(TEST_LOCK_PATH, run_uid=run_uid)
     except TimeoutError as exc:
         raise pytest.UsageError(str(exc)) from exc
+
+
+def _worker_count(config) -> int:
+    workers = getattr(config.option, "numprocesses", None)
+    if isinstance(workers, int):
+        return max(workers, 1)
+    if isinstance(workers, str) and workers.isdigit():
+        return max(int(workers), 1)
+    if workers in ("auto", "logical"):
+        return os.cpu_count() or 1
+    return 1
+
+
+def _required_replication_capacity(worker_count: int) -> int:
+    """One retained base plus one active re-snapshot slot per worker, plus four."""
+    return worker_count * 2 + 4
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_sessionstart(session) -> None:
+    """Prepare and clean the instance before xdist starts any worker."""
+    config = session.config
+    if hasattr(config, "workerinput"):
+        return
+    try:
+        _pg("start")
+        source = _isolated_source(TEST_PGDATABASE)
+        _require_disposable_cluster(source)
+        _sweep_stale_instance_artifacts(source)
+        _assert_replication_budget(source, _worker_count(config))
+        _pg("seed")
+    except Exception as exc:
+        raise pytest.UsageError(f"test-cluster startup refused: {exc}") from exc
 
 
 def pytest_unconfigure(config) -> None:
@@ -352,6 +400,59 @@ def _drop_database(admin: SourceConfig, dbname: str) -> None:
         conn.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(dbname)))
 
 
+def _owned_database_name(dbname: str) -> bool:
+    return dbname.startswith((WORKER_DATABASE_PREFIX, TEMPLATE_DATABASE_PREFIX))
+
+
+def _sweep_stale_instance_artifacts(source: SourceConfig) -> dict[str, list[str]]:
+    """Reap databases and slots from a crashed prior owner of this instance."""
+    _require_disposable_cluster(source)
+    admin = replace(source, dbname="postgres")
+    with psycopg.connect(admin.dsn, autocommit=True) as conn:
+        databases = sorted(
+            row[0]
+            for row in conn.execute(
+                "SELECT datname FROM pg_database "
+                "WHERE starts_with(datname, %s) OR starts_with(datname, %s)",
+                (WORKER_DATABASE_PREFIX, TEMPLATE_DATABASE_PREFIX),
+            ).fetchall()
+            if _owned_database_name(row[0])
+        )
+    for dbname in databases:
+        _drop_database(admin, dbname)
+
+    with psycopg.connect(admin.dsn, autocommit=True) as conn:
+        slots = conn.execute(
+            "SELECT slot_name, active_pid FROM pg_replication_slots "
+            "WHERE starts_with(slot_name, %s)",
+            (TEST_SLOT_PREFIX,),
+        ).fetchall()
+        for _slot_name, active_pid in slots:
+            if active_pid is not None:
+                conn.execute("SELECT pg_terminate_backend(%s)", (active_pid,))
+        for slot_name, _active_pid in slots:
+            conn.execute("SELECT pg_drop_replication_slot(%s)", (slot_name,))
+
+    swept = {"databases": databases, "slots": sorted(row[0] for row in slots)}
+    if databases or slots:
+        print(f"\nswept stale artifacts for {TEST_INSTANCE_ID}: {swept}")
+    return swept
+
+
+def _assert_replication_budget(source: SourceConfig, worker_count: int) -> None:
+    required = _required_replication_capacity(worker_count)
+    admin = replace(source, dbname="postgres")
+    with psycopg.connect(admin.dsn, autocommit=True) as conn:
+        slots = int(conn.execute("SHOW max_replication_slots").fetchone()[0])
+        senders = int(conn.execute("SHOW max_wal_senders").fetchone()[0])
+    if slots < required or senders < required:
+        raise RuntimeError(
+            "insufficient replication budget: "
+            f"workers={worker_count}, required={required}, "
+            f"max_replication_slots={slots}, max_wal_senders={senders}"
+        )
+
+
 def _create_database(admin: SourceConfig, dbname: str, template: str) -> None:
     with psycopg.connect(admin.dsn, autocommit=True) as conn:
         conn.execute(
@@ -391,9 +492,6 @@ def postgres_cluster(exclusive_source: Path) -> Iterator[SourceConfig]:
     admin = replace(source, dbname="postgres")
     worker_source = replace(source, dbname=_worker_database_name())
     with _cluster_setup_lock(exclusive_source):
-        _pg("start")
-        _pg("seed")
-        _sweep_stale_test_slots(source)
         template_database = _template_database_name()
         _drop_database(admin, template_database)
         _create_database(admin, template_database, source.dbname)
@@ -429,9 +527,8 @@ def _sweep_stale_test_slots(source: SourceConfig) -> None:
                 for row in conn.execute(
                     "SELECT slot_name FROM pg_replication_slots "
                     "WHERE NOT active AND database = %s "
-                    "AND (slot_name LIKE 't\\_' || chr(37) "
-                    "OR slot_name LIKE chr(37) || '\\_rs')",
-                    (source.dbname,),
+                    "AND starts_with(slot_name, %s)",
+                    (source.dbname, TEST_SLOT_PREFIX),
                 ).fetchall()
             ]
             for name in stale:

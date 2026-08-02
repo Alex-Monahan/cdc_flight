@@ -41,7 +41,7 @@ export PGDATABASE = $(CDC_TEST_PGDATABASE)
 # keep every repository launch safe while respecting an explicit operator choice.
 export ARROW_DEFAULT_MEMORY_POOL ?= system
 PYTEST_WORKERS ?= 12
-PYTEST_XDIST_ARGS ?= -n $(PYTEST_WORKERS) --dist=loadscope
+PYTEST_XDIST_ARGS ?= -n $(PYTEST_WORKERS) --dist=loadscope --max-worker-restart=0
 
 .DEFAULT_GOAL := help
 
