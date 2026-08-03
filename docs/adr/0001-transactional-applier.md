@@ -1,6 +1,6 @@
 # ADR 0001 — The transactional applier
 
-* **Status:** accepted (revision 21, 2026-08-01 — implemented through the rubric 1.9 round-12 recovery-preparation guard)
+* **Status:** accepted (revision 22, 2026-08-02 — schema evolution and live catalog discovery)
 * **Date:** 2026-07-30
 * **Task:** TODO 1.0(a); revised under TODO 1.0(feedback)
 * **Decides rubric items:** 1.1, 1.2, 1.3, 1.7 (directly), and 1.4, 1.6, 1.8, 3.2,
@@ -30,6 +30,7 @@
 | 19 | 2026-08-01 | **Round-10 sticky recovery handoff.** Failed callback quiescence is now the terminal `destination_ownership: active -> callback_owned` transition; a later callback exit cannot let an enclosing finalizer revoke it. The filesystem recovery marker is the durable `absent -> armed -> consumed` machine, and cleanup requires `consumed`, not a fresh quiescence read. In-process simulations cover all three durable marker configurations and the exact live-at-catch/quiescent-at-finally race. `pipeline.run()` enforces a process-terminal exit after transfer, so an in-process caller cannot outlive the lease and start beside retained ownership (A68). |
 | 20 | 2026-08-01 | **Round-11 fail-closed publication and recovery boundary.** The supervisor now publishes one typed quiescence proof from inside its `finally`, so a pending `KeyboardInterrupt`, `SystemExit`, or other `BaseException` cannot bypass `active -> callback_owned` by skipping later summary construction. Ownership retirement independently transfers any unretired active callback fail-closed. Marker retirement declares `consumed -> absent`, removes the sibling offset directory, and lives with restart discharge and slot cleanup in `resnapshot_recovery.py`; the summaryless interrupt composition and process-terminal outer teardown are pinned (A69). |
 | 21 | 2026-08-01 | **Round-12 recovery preparation guard.** `InterruptionRecovery.prepare()` now reads the durable marker before cleanup, refuses and preserves `armed`, retires `consumed` only through the declared `consumed -> absent` edge, and directly removes sibling state only when the logical marker is `absent`. Required cleanup errors propagate. Regressions pin the old cleanup-to-arm interruption cut and byte-for-byte preservation of armed marker/offset state (A70). |
+| 22 | 2026-08-02 | **Rubric 2.1–2.3 schema evolution and discovery.** `pg_attribute.attnum`/type identity drives transactional add/drop/rename actions; added values are backfilled behind the catalog fence, dropped destination columns are physically removed, and late renames merge the two names atomically. The watcher polls all non-system schemas by default, admits new relations to table-scoped publications, and performs an in-process main-slot-preserving single-table re-snapshot hand-off for existing rows without restart. The live discovery hand-off adds `streaming -> snapshotting -> streaming` to `run_phase` (A71). |
 
 ---
 
@@ -2742,6 +2743,7 @@ persistence: `_cdc_flight.heartbeat.phase` · initial: `starting` · terminal: `
 | `stopping` | `failed` | yes |
 | `stopping` | `stopped` | yes |
 | `stopping` | `stopping` | no |
+| `streaming` | `snapshotting` | no |
 | `streaming` | `draining` | no |
 | `streaming` | `failed` | yes |
 | `streaming` | `stopping` | no |
@@ -3324,7 +3326,7 @@ transition table.
 | machine | owns | states | edges | persistence |
 |---|---|---|---|---|
 | `table_lifecycle` | is this destination table a trustworthy image, and who owes the work | 5 | 21 | `_cdc_flight.table_state.snapshot_state` |
-| `run_phase` | where is this run, readable from the destination while it runs | 9 | 23 | `_cdc_flight.heartbeat.phase` |
+| `run_phase` | where is this run, readable from the destination while it runs | 9 | 24 | `_cdc_flight.heartbeat.phase` |
 | `run_outcome` | why did this run stop — cause before symptom | 10 | 45 (a **precedence**: escalations only) | `heartbeat.terminal_reason`, `last_run.json` |
 | `acquisition_recovery` | what has this destructive recovery already done | 5 | 9 | `_cdc_flight.recovery_state.phase` |
 | `interruption_marker` | has filesystem recovery intent been armed, safely discharged, and retired | 3 | 3 | `<state_dir>/resnapshot/interrupted.json.state` |
@@ -4361,3 +4363,50 @@ preserves marker and offsets byte-for-byte. From logical `absent`, the cut can l
 `absent`, and the next preparation is re-entrant. Machine guards explicitly reject both
 `armed -> absent` and `armed -> armed`; the generated inventory remains three states and
 three declared edges.
+
+### A71 — rev 22: schema evolution is a catalog-fenced action, and discovery is a live hand-off
+
+The Postgres logical stream carries row images, not DDL. A relation's `oid` therefore
+continues to identify the table, while `pg_attribute.attnum` and the source type
+identity identify a logical column. The catalog watcher records the ordered column
+shape in `source_relations.columns_json` and emits one fenced `schema_changed` action
+for an attnum-preserving rename, an add, a drop, or a type-plus-rename combination.
+
+The destination policy for rubric 2.1 is **current-state physical schema**: an added
+column is created with the catalog-derived destination type and existing source values
+are copied before the commit is durable; a dropped source column is physically dropped
+from the destination. The add backfill uses destination primary-key values for keyed
+tables. Keyless tables have only connector event identity, so a non-uniform source
+value cannot be joined honestly to historical rows; the common uniform ADD default/NULL
+case is applied to all keyless changelog rows, and a non-uniform case fails the group
+rather than silently writing the wrong rows. Schema DDL runs before row DML in the
+same transaction because DuckDB/MotherDuck can otherwise validate an old primary-key
+version at commit; table drops remain after row DML.
+
+For rubric 2.2, a rename is a true destination `ALTER TABLE ... RENAME COLUMN`, never
+a drop/add pair. If a row with the new name arrives before the catalog poll, the row
+path may temporarily create the new physical column; the fenced action then merges
+`COALESCE(new, old)` and drops the old column in that same transaction. This preserves
+old values, prefers already-arrived new values, and records one `column_renamed` audit
+event. A synchronous `pg_attribute` probe before appending an unknown-shape unit and
+the normal WAL fence cover late detection; unrelated adds/drops in the same source
+DDL are applied from the same attnum diff.
+
+For rubric 2.3, auto-discovery is enabled by default with a 10-second configurable
+catalog interval (the supported default is at most 60 seconds). With no schema include
+list the watcher scans every non-system schema; `CDC_SCHEMA_INCLUDE_LIST`/`CDC_SCHEMAS`
+can narrow that scope. A table-scoped publication receives `ALTER PUBLICATION ... ADD
+TABLE` automatically. A `FOR ALL TABLES` publication already captures the relation and
+needs no ALTER; publication failure leaves the `new` action pending and is surfaced.
+The running process quiesces the main callback, keeps the main slot and durable resume
+point, runs the existing single-table re-snapshot for pre-existing rows, advances the
+snapshot epoch, and starts a no-data engine on the same main slot. This is the declared
+`run_phase: streaming -> snapshotting -> streaming` hand-off, so no restart or config
+edit is required and WAL is not lost between the image and resumed stream. Multiple
+new relations are safe by default but produce a warning (`mass_add_observed`) for
+operator visibility; unlike mass drops, additions cannot remove destination data.
+After the image is committed, the watcher closes the existing discovery object through
+the already-declared `pending -> due -> applied` catalog-change edges and retains its
+dirty relation for the normal post-engine `source_relations` flush. That prevents the
+resumed stream from emitting a second false `new` marker and adds no new
+consistency-affecting state machine.
