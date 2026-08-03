@@ -39,9 +39,18 @@ import logging
 from dataclasses import dataclass, field
 
 from . import destination, naming
-from .catalog import CHANGE_DROPPED, CHANGE_RECREATED, DESTRUCTIVE, CatalogChange
+from .catalog import (
+    CHANGE_DROPPED,
+    CHANGE_NEW,
+    CHANGE_RECREATED,
+    CHANGE_SCHEMA,
+    DESTRUCTIVE,
+    FENCED,
+    CatalogChange,
+)
 from .config import DROP_IGNORE, DROP_REPLICATE
 from .machines import CHANGE_APPLIED, CHANGE_REFUSED
+from .schema_evolution import apply_column_changes
 
 log = logging.getLogger("cdc_flight.catalog_apply")
 
@@ -175,6 +184,29 @@ class CatalogCoordinator:
         refused: list[tuple[CatalogChange, str]] = []
         alerts: list[dict] = []
 
+        new_changes = [change for change in due if change.kind == CHANGE_NEW]
+        if len(new_changes) > 1:
+            names = sorted(change.qualified for change in new_changes)
+            alerts.append(
+                {
+                    "severity": "warning",
+                    "code": "mass_add_observed",
+                    "on_rollback": False,
+                    "message": (
+                        f"automatically accepting {len(names)} newly discovered source "
+                        "relations; adds are safe by default, but this may indicate a "
+                        "schema migration or an overly broad discovery scope"
+                    ),
+                    "context": {"tables": names, "safe_default": True},
+                }
+            )
+            log.warning(
+                "mass catalog add: automatically accepting %s discovered relations "
+                "(%s)",
+                len(names),
+                ", ".join(names),
+            )
+
         destructive_changes = [
             c
             for c in due
@@ -259,6 +291,15 @@ class CatalogCoordinator:
                 )
             elif destructive and not change.fenced:
                 detail = "applied without a WAL fence marker (CDC_CATALOG_GRACE)"
+            elif change.kind == CHANGE_SCHEMA:
+                detail = "; ".join(
+                    (
+                        f"{item.old_name} -> {item.new_name}"
+                        if item.kind == "renamed"
+                        else item.new_name or item.old_name or f"attnum {item.attnum}"
+                    )
+                    for item in change.column_changes
+                )
             actions.append(
                 CatalogAction(
                     change=change, target=target, destructive=destructive, detail=detail
@@ -305,11 +346,21 @@ class CatalogCoordinator:
         remaining = {
             change.qualified
             for change in self.catalog.pending()
-            if change.kind in DESTRUCTIVE and id(change) not in applied
+            if change.kind in FENCED and id(change) not in applied
         }
+        relations = list(self.catalog.dirty(exclude=remaining))
+        known_relations = {relation.qualified for relation in relations}
+        # A schema action carries the post-DDL relation explicitly. Persisting it in
+        # this same transaction is what makes a restart see the new column baseline
+        # only after the destination RENAME/ADD/DROP has committed.
+        for action in actions:
+            relation = action.change.new_relation
+            if relation is not None and relation.qualified not in known_relations:
+                relations.append(relation)
+                known_relations.add(relation.qualified)
         return CatalogPlan(
             actions=tuple(actions),
-            relations=tuple(self.catalog.dirty(exclude=remaining)),
+            relations=tuple(relations),
             refused=tuple(refused),
             alerts=alerts,
         )
@@ -345,6 +396,9 @@ class CatalogCoordinator:
         markers: list[dict] = []
         for action in plan.actions:
             change = action.change
+            if change.kind == CHANGE_SCHEMA:
+                apply_column_changes(self.registry, action.target, change.column_changes)
+                stats["tables"].add(action.target)
             if action.destructive:
                 # The shadow goes too: a table dropped mid-backfill would otherwise
                 # leave `<target>__cdcf_tmp` behind forever.
@@ -376,19 +430,36 @@ class CatalogCoordinator:
                     source_schema=change.schema,
                     source_table=change.table,
                 )
-            markers.append(
-                {
-                    "event": change.kind,
-                    "source_schema": change.schema,
-                    "source_table": change.table,
-                    "target_table": action.target,
-                    "applied": action.destructive,
-                    "lsn": change.detected_lsn,
-                    "txn_id": None,
-                    "detail": action.detail,
-                    "rows_removed": None,
-                }
-            )
+            if change.kind == CHANGE_SCHEMA and change.column_changes:
+                event_details = [
+                    (
+                        f"column_{column_change.kind}",
+                        (
+                            f"{column_change.old_name} -> {column_change.new_name}"
+                            if column_change.kind == "renamed"
+                            else column_change.new_name
+                            or column_change.old_name
+                            or f"attnum {column_change.attnum}"
+                        ),
+                    )
+                    for column_change in change.column_changes
+                ]
+            else:
+                event_details = [(change.kind, action.detail)]
+            for event, detail in event_details:
+                markers.append(
+                    {
+                        "event": event,
+                        "source_schema": change.schema,
+                        "source_table": change.table,
+                        "target_table": action.target,
+                        "applied": action.destructive or change.kind == CHANGE_SCHEMA,
+                        "lsn": change.detected_lsn,
+                        "txn_id": None,
+                        "detail": detail,
+                        "rows_removed": None,
+                    }
+                )
             self.changes_applied += 1
         for relation in plan.relations:
             destination.upsert_source_relation(
@@ -399,9 +470,67 @@ class CatalogCoordinator:
                 relation_oid=relation.oid,
                 published=relation.published,
                 replica_identity=relation.replica_identity,
+                columns=relation.columns,
             )
         self.destructive_refused += len(plan.refused)
         return markers
+
+    def backfill_schema(self, con, plan: CatalogPlan) -> None:
+        """Backfill values for source columns added by this schema plan.
+
+        PostgreSQL's ADD COLUMN default is visible immediately on existing source
+        rows, but those rows have no pgoutput UPDATE.  The schema DDL is applied in the
+        first phase of the commit; this second, still-transactional phase reads the
+        fenced source rows and updates only the newly added destination columns.  A
+        source read failure aborts the destination transaction so the schema action
+        remains pending and cannot publish a shape/data mismatch.
+        """
+        if self.catalog is None or not hasattr(self.catalog, "read_columns"):
+            return
+        for action in plan.actions:
+            change = action.change
+            if change.kind != CHANGE_SCHEMA or change.new_relation is None:
+                continue
+            value_columns = tuple(
+                item.destination_new_name
+                for item in change.column_changes
+                if item.kind == "added" and item.destination_new_name
+            )
+            if not value_columns:
+                continue
+            table = self.registry.get(action.target)
+            if not table.exists:
+                continue
+            source_names = {
+                naming.normalize(column.name) for column in change.new_relation.columns
+            }
+            stable_keys = tuple(
+                key for key in table.key_columns if key in source_names
+            )
+            if len(stable_keys) == len(table.key_columns) and stable_keys:
+                rows = self.catalog.read_columns(
+                    change.new_relation,
+                    stable_keys,
+                    value_columns,
+                )
+                self.registry.backfill_columns(
+                    action.target,
+                    key_columns=stable_keys,
+                    value_columns=value_columns,
+                    rows=rows,
+                )
+                continue
+
+            # Keyless CDC rows are intentionally keyed by the connector event id, not
+            # by source row content.  There is no honest per-row join for an ADD, but
+            # PostgreSQL's ordinary ADD default/NULL case is uniform and can be
+            # applied to the complete changelog without fabricating identity.
+            rows = self.catalog.read_columns(change.new_relation, (), value_columns)
+            self.registry.backfill_constant_columns(
+                action.target,
+                value_columns=value_columns,
+                rows=rows,
+            )
 
     # ------------------------------------------------------------------ #
     # after COMMIT

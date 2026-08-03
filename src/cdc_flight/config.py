@@ -70,6 +70,18 @@ class SourceConfig:
         )
         return [f"{self.schema}.{t.strip()}" for t in raw.split(",") if t.strip()]
 
+    @property
+    def schemas(self) -> set[str] | None:
+        """Optional catalog scope; ``None`` means all non-system schemas."""
+        raw = os.environ.get("CDC_SCHEMA_INCLUDE_LIST") or os.environ.get("CDC_SCHEMAS")
+        if not raw:
+            return None
+        return {item.strip() for item in raw.split(",") if item.strip()}
+
+    @property
+    def auto_discovery(self) -> bool:
+        return _flag("CDC_AUTO_DISCOVERY", True)
+
 
 @dataclass(frozen=True)
 class ReplicationConfig:

@@ -17,11 +17,13 @@ shape as `source_health.py` - and answers four questions per replicated table:
 | the name is gone from `pg_class` | `dropped` | drop the destination table |
 | the name is back with a different `oid` | `recreated` | drop the destination table and mark it `awaiting_snapshot` (rubric 2.3/3.4 owns rebuilding it) |
 | the name is there but no longer in the publication | `unpublished` | nothing but a marker + alert: Postgres still holds the rows, so dropping the destination would destroy data the source has |
-| a table in the include list we have never seen | `new` | nothing but a marker; rubric 2.3 owns discovery, and this is the mechanism it will use |
+| a table in the watched schemas we have never seen | `new` | add it to a table-scoped publication, audit it, and hand it to the existing single-table re-snapshot path (rubric 2.3) |
 
-**This module observes. It never decides**: `cdc_flight.catalog_apply` owns the
-policy, the circuit breaker and the DDL, because the observation and the action are
-separated in time and the gap is where a stale fact becomes a wrong drop.
+The watcher owns safe discovery admission (`ALTER PUBLICATION ... ADD TABLE` for a
+table-scoped publication); `cdc_flight.catalog_apply` still owns destructive policy,
+schema DDL, the circuit breaker and all destination actions.  The observation and any
+destructive action remain separated in time by the fence, which is where a stale fact
+could become a wrong drop.
 
 **The fence.** A detected drop must not be applied before the destination has
 consumed every event that happened *before* it. The drop is discovered after the
@@ -49,6 +51,7 @@ everything" (Opus Q2/Q5).
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -59,6 +62,7 @@ from . import source_marker as marker_mod
 from .destination import CONTROL_SCHEMA
 from .machines import (
     CATALOG_CHANGE,
+    CHANGE_APPLIED,
     CHANGE_DEFERRED,
     CHANGE_DUE,
     CHANGE_MARKED,
@@ -68,6 +72,8 @@ from .machines import (
     CHANGE_UNCONFIRMED,
     LIVE_CHANGE_STATES,
 )
+from .naming import normalize, quote
+from .schema_evolution import ColumnChange, SourceColumn, diff_columns
 from .states import IllegalTransition, UnknownState
 
 log = logging.getLogger("cdc_flight.catalog")
@@ -77,9 +83,13 @@ CHANGE_RECREATED = "recreated"
 CHANGE_UNPUBLISHED = "unpublished"
 CHANGE_REPUBLISHED = "republished"
 CHANGE_NEW = "new"
+CHANGE_SCHEMA = "schema_changed"
 
 #: Actions that remove the destination table when `drop_mode='replicate'`.
 DESTRUCTIVE = (CHANGE_DROPPED, CHANGE_RECREATED)
+# Schema DDL changes the row shape and is therefore held behind the same WAL fence,
+# although it never destroys the whole destination table.
+FENCED = (*DESTRUCTIVE, CHANGE_SCHEMA)
 
 DROP_REPLICATE = "replicate"
 DROP_LOG = "log"
@@ -100,12 +110,40 @@ SELECT n.nspname                                  AS source_schema,
        c.relname                                  AS source_table,
        c.oid::bigint                              AS relation_oid,
        c.relreplident                             AS replica_identity,
-       (pr.prrelid IS NOT NULL)                   AS published
+       (
+           COALESCE(p.puballtables, false)
+           OR pr.prrelid IS NOT NULL
+           OR parent_pr.prrelid IS NOT NULL
+       )                                           AS published,
+       COALESCE(p.puballtables, false)             AS publication_all_tables,
+       COALESCE(inh.inhparent IS NOT NULL, false)  AS is_partition,
+       COALESCE(
+           jsonb_agg(
+               jsonb_build_object(
+                   'attnum', a.attnum,
+                   'name', a.attname,
+                   'type_oid', a.atttypid::bigint,
+                   'type_name', format_type(a.atttypid, a.atttypmod),
+                   'nullable', NOT a.attnotnull
+               ) ORDER BY a.attnum
+           ) FILTER (WHERE a.attnum IS NOT NULL),
+           '[]'::jsonb
+       )                                           AS columns_json
 FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
 LEFT JOIN pg_publication p ON p.pubname = %s
 LEFT JOIN pg_publication_rel pr ON pr.prrelid = c.oid AND pr.prpubid = p.oid
-WHERE c.relkind IN ('r', 'p') AND n.nspname = %s
+LEFT JOIN pg_inherits inh ON inh.inhrelid = c.oid
+LEFT JOIN pg_publication_rel parent_pr
+    ON parent_pr.prrelid = inh.inhparent AND parent_pr.prpubid = p.oid
+LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+WHERE c.relkind IN ('r', 'p')
+  AND (
+      (%s::text[] IS NULL AND n.nspname NOT IN ('pg_catalog', 'information_schema', '_cdc_flight'))
+      OR n.nspname = ANY(%s::text[])
+  )
+GROUP BY n.nspname, c.relname, c.oid, c.relreplident, p.puballtables,
+         pr.prrelid, inh.inhparent, parent_pr.prrelid
 """
 
 #: Guard 3's query (`catalog_apply`): the current oid of specific relations, read
@@ -119,6 +157,23 @@ WHERE c.relkind IN ('r', 'p') AND (n.nspname, c.relname) IN (SELECT * FROM unnes
 
 _LSN_SQL = "SELECT (pg_current_wal_lsn() - '0/0'::pg_lsn)::bigint"
 
+_PARTITION_SQL = """
+SELECT child_n.nspname, child.relname
+FROM pg_inherits i
+JOIN pg_class child ON child.oid = i.inhrelid
+JOIN pg_namespace child_n ON child_n.oid = child.relnamespace
+JOIN pg_class parent ON parent.oid = i.inhparent
+JOIN pg_namespace parent_n ON parent_n.oid = parent.relnamespace
+LEFT JOIN pg_publication p ON p.pubname = %s
+LEFT JOIN pg_publication_rel pr ON pr.prrelid = parent.oid AND pr.prpubid = p.oid
+WHERE parent.relkind IN ('r', 'p')
+  AND (
+      (%s::text[] IS NULL AND parent_n.nspname NOT IN ('pg_catalog', 'information_schema', '_cdc_flight'))
+      OR parent_n.nspname = ANY(%s::text[])
+  )
+  AND (COALESCE(p.puballtables, false) OR pr.prrelid IS NOT NULL)
+"""
+
 
 @dataclass(frozen=True)
 class SourceRelation:
@@ -127,6 +182,11 @@ class SourceRelation:
     oid: int
     published: bool
     replica_identity: str
+    #: Source columns in PostgreSQL attribute order. Optional for old persisted rows
+    #: and for the 1.5 unit helpers that only care about relation identity.
+    columns: tuple[SourceColumn, ...] = ()
+    publication_all_tables: bool = False
+    is_partition: bool = False
 
     @property
     def qualified(self) -> str:
@@ -144,6 +204,10 @@ class CatalogChange:
     detected_at: float = field(default_factory=time.monotonic)
     old_oid: int | None = None
     new_oid: int | None = None
+    #: The source relation after the observation, used to persist the new column
+    #: baseline only in the same transaction as the schema action.
+    new_relation: SourceRelation | None = None
+    column_changes: tuple[ColumnChange, ...] = ()
     #: how many times the applier has looked at this change and declined
     deferrals: int = 0
     #: consecutive polls that agreed with this observation before it was queued
@@ -206,6 +270,15 @@ class CatalogChange:
             "detected_lsn": self.detected_lsn,
             "old_oid": self.old_oid,
             "new_oid": self.new_oid,
+            "columns": [
+                {
+                    "kind": change.kind,
+                    "attnum": change.attnum,
+                    "old_name": change.old_name,
+                    "new_name": change.new_name,
+                }
+                for change in self.column_changes
+            ],
             "fenced": self.fenced,
             "state": self.state,
             "confirmations": self.confirmations,
@@ -239,18 +312,34 @@ def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
     changed.
     """
     rows = con.execute(
-        f"SELECT source_schema, source_table, relation_oid, published, replica_identity "
+        f"SELECT source_schema, source_table, relation_oid, published, replica_identity, "
+        "columns_json "
         f"FROM {CONTROL_SCHEMA}.source_relations WHERE pipeline = ?",
         [pipeline],
     ).fetchall()
     known: dict[str, SourceRelation] = {}
-    for schema, table, oid, published, identity in rows:
+    for schema, table, oid, published, identity, columns_json in rows:
+        try:
+            raw_columns = json.loads(columns_json or "[]")
+        except (TypeError, ValueError):
+            raw_columns = []
+        columns = tuple(
+            SourceColumn(
+                attnum=int(raw["attnum"]),
+                name=str(raw["name"]),
+                type_oid=int(raw["type_oid"]),
+                type_name=str(raw["type_name"]),
+                nullable=bool(raw.get("nullable", True)),
+            )
+            for raw in raw_columns
+        )
         known[f"{schema}.{table}"] = SourceRelation(
             schema=schema,
             table=table,
             oid=int(oid or 0),
             published=bool(published),
             replica_identity=identity or "d",
+            columns=columns,
         )
     return known
 
@@ -284,6 +373,9 @@ class CatalogWatcher:
         publication: str,
         schema: str,
         include: set[str],
+        schemas: set[str] | None = None,
+        all_schemas: bool = False,
+        auto_discover: bool = False,
         known: dict[str, SourceRelation] | None = None,
         replicated: set[str] | None = None,
         unrelatable: set[str] | None = None,
@@ -300,6 +392,14 @@ class CatalogWatcher:
         self.schema = schema
         #: qualified names the configuration says we replicate (`table.include.list`)
         self.include = set(include)
+        #: Schemas to poll. `all_schemas` is the default pipeline mode; the explicit
+        #: set keeps deployments that intentionally limit catalog discovery bounded.
+        self.schemas = set(schemas or {schema})
+        self.all_schemas = bool(all_schemas)
+        #: When enabled, every non-partition relation in the watched schemas is a
+        #: candidate. The publication remains the source of truth for streaming, and
+        #: a table-scoped publication is amended by the discovery policy.
+        self.auto_discover = bool(auto_discover)
         #: qualified names we have a destination table for
         self.replicated = set(replicated or ())
         #: Relations the destination holds rows for whose observed identity may NOT be
@@ -341,6 +441,8 @@ class CatalogWatcher:
         self._changes: list[CatalogChange] = []
         #: relations whose `source_relations` row needs (re)writing
         self._dirty: dict[str, SourceRelation] = {}
+        #: data units that already triggered a synchronous late-schema probe
+        self._schema_probe_names: set[str] = set()
         #: `name -> the CatalogChange object that is in state `unconfirmed``.
         #: It used to be `name -> ((kind, new_oid), count)` while the observation's own
         #: object was thrown away and a *new* one constructed for the confirming poll -
@@ -364,6 +466,7 @@ class CatalogWatcher:
         #: about. `supervisor.run_engine_bounded` fails the run on this one (A51 row 51).
         self.machine_error: str | None = None
         self.last_lsn: int = 0
+        self._snapshot_partitions: set[str] = set()
 
     @property
     def emit_marker(self) -> bool:
@@ -378,6 +481,17 @@ class CatalogWatcher:
         if self.poll_seconds <= 0:
             log.info("catalog polling disabled (poll_seconds=%s)", self.poll_seconds)
             return self
+        # A live discovery hand-off pauses the watcher while the main engine is
+        # quiesced and the throwaway snapshot runs. Reusing the same watcher preserves
+        # its catalog-change machine and baselines, so restart the thread rather than
+        # constructing a second observer. The stop event belongs to the old thread.
+        self._stop.clear()
+        self.quiesced = False
+        # Make discovery/re-snapshot decisions before the main engine is built. The
+        # background loop still polls at the configured interval, but a table created
+        # while the process was down is available to the existing blocking snapshot
+        # machinery immediately rather than one interval later.
+        self.poll_quietly()
         self._thread = threading.Thread(target=self._loop, name="cdc-catalog", daemon=True)
         self._thread.start()
         return self
@@ -476,15 +590,42 @@ class CatalogWatcher:
         # pipeline is down, then a healthy retry — an executable test.
         faults_mod.maybe_fail_repeatedly("catalog_poll")
         with self._connect() as conn:
-            rows = conn.execute(_CATALOG_SQL, (self.publication, self.schema)).fetchall()
+            schema_array = None if self.all_schemas else sorted(self.schemas)
+            rows = conn.execute(
+                _CATALOG_SQL, (self.publication, schema_array, schema_array)
+            ).fetchall()
+            partition_rows = conn.execute(
+                _PARTITION_SQL, (self.publication, schema_array, schema_array)
+            ).fetchall()
             lsn = int(conn.execute(_LSN_SQL).fetchone()[0])
-            observed = {
-                f"{r[0]}.{r[1]}": SourceRelation(
-                    schema=r[0], table=r[1], oid=int(r[2]),
-                    replica_identity=str(r[3]), published=bool(r[4]),
+            observed: dict[str, SourceRelation] = {}
+            for row in rows:
+                raw_columns = row[7] if len(row) > 7 else []
+                if isinstance(raw_columns, str):
+                    try:
+                        raw_columns = json.loads(raw_columns)
+                    except ValueError:
+                        raw_columns = []
+                columns = tuple(
+                    SourceColumn(
+                        attnum=int(raw["attnum"]),
+                        name=str(raw["name"]),
+                        type_oid=int(raw["type_oid"]),
+                        type_name=str(raw["type_name"]),
+                        nullable=bool(raw.get("nullable", True)),
+                    )
+                    for raw in (raw_columns or [])
                 )
-                for r in rows
-            }
+                observed[f"{row[0]}.{row[1]}"] = SourceRelation(
+                    schema=row[0],
+                    table=row[1],
+                    oid=int(row[2]),
+                    replica_identity=str(row[3]),
+                    published=bool(row[4]),
+                    columns=columns,
+                    publication_all_tables=bool(row[5]) if len(row) > 5 else False,
+                    is_partition=bool(row[6]) if len(row) > 6 else False,
+                )
             if not observed:
                 # Opus Q2's absolute guard. An empty schema is the signature of a DSN
                 # pointed at the wrong database, a failover target that has not been
@@ -501,7 +642,12 @@ class CatalogWatcher:
                 )
                 log.error("catalog poll: %s", self.last_error)
                 return []
+            with self._lock:
+                self._snapshot_partitions = {
+                    f"{row[0]}.{row[1]}" for row in partition_rows
+                }
             added = self._compare(observed, lsn)
+            self._ensure_published(conn, observed, added)
             with self._lock:
                 self.successful_polls += 1
             # Emitted while a **destructive** change is pending, not only when one is
@@ -509,12 +655,66 @@ class CatalogWatcher:
             # self-healing (a marker that was written but not delivered is simply
             # followed by another one), bounded by the marker's own write budget.
             # Nothing is written to the source when there is nothing to fence.
-            unfenced = [c for c in self.pending() if c.kind in DESTRUCTIVE]
+            unfenced = [c for c in self.pending() if c.kind in FENCED]
             if unfenced:
-                self._emit_marker(conn, [c for c in added if c.kind in DESTRUCTIVE] or unfenced)
+                self._emit_marker(conn, [c for c in added if c.kind in FENCED] or unfenced)
         if self.marker.last_error is None:
             self.last_error = None
         return added
+
+    def _ensure_published(self, conn, observed, changes: list[CatalogChange]) -> None:
+        """Add newly discovered relations to a table-scoped publication.
+
+        ``FOR ALL TABLES`` already reports membership through ``puballtables`` and needs
+        no DDL.  For an explicit publication the watcher owns this safe mass-add policy:
+        a relation add cannot erase destination data, so it is automatic and is recorded
+        as a normal ``new`` table event.  A missing publication remains an error rather
+        than being invented; publication ownership stays version-controlled.
+        """
+        if not self.auto_discover:
+            return
+        for change in changes:
+            if change.kind != CHANGE_NEW:
+                continue
+            relation = observed.get(change.qualified)
+            if (
+                relation is None
+                or relation.published
+                or relation.publication_all_tables
+                or relation.is_partition
+            ):
+                continue
+            try:
+                conn.execute(
+                    f"ALTER PUBLICATION {quote(self.publication)} ADD TABLE "
+                    f"{quote(relation.schema)}.{quote(relation.table)}"
+                )
+            except Exception as exc:
+                # Leave the relation unpublished and its `new` change pending. The next
+                # poll retries, while the coordinator's audit row remains honest about
+                # whether it actually became streamable.
+                self.last_error = (
+                    f"could not add discovered relation {change.qualified} to "
+                    f"publication {self.publication!r}: {exc}"
+                )
+                log.warning(self.last_error)
+                continue
+            updated = SourceRelation(
+                schema=relation.schema,
+                table=relation.table,
+                oid=relation.oid,
+                published=True,
+                replica_identity=relation.replica_identity,
+                columns=relation.columns,
+                publication_all_tables=relation.publication_all_tables,
+                is_partition=relation.is_partition,
+            )
+            observed[change.qualified] = updated
+            change.new_relation = updated
+            with self._lock:
+                self.known[change.qualified] = updated
+                self._dirty[change.qualified] = updated
+            log.info("added discovered relation %s to publication %s", change.qualified, self.publication)
 
     def relation_oids(self, names: set[tuple[str, str]]) -> dict[str, int | None]:
         """Current oid of each `(schema, table)`, `None` when it does not exist.
@@ -534,6 +734,141 @@ class CatalogWatcher:
         found = {f"{schema}.{table}": int(oid) for schema, table, oid in rows}
         return {f"{s}.{t}": found.get(f"{s}.{t}") for s, t in names}
 
+    def captured_relations(self) -> tuple[SourceRelation, ...]:
+        """Published relations from the latest successful catalog observation."""
+        with self._lock:
+            return tuple(
+                sorted(
+                    (relation for relation in self.known.values() if relation.published),
+                    key=lambda relation: relation.qualified,
+                )
+            )
+
+    def snapshot_names(self) -> tuple[str, ...]:
+        """Logical relations whose snapshot callbacks are expected at startup.
+
+        With ``publish_via_partition_root`` Debezium emits the child rows under the
+        published parent relation and reports completion for that parent. The catalog
+        query still records child partitions for 7.3 diagnostics, but they must not be
+        added to the exact callback set or a healthy snapshot would look incomplete.
+        """
+        with self._lock:
+            return tuple(
+                sorted(
+                    {
+                        relation.qualified
+                        for relation in self.known.values()
+                        if relation.published and not relation.is_partition
+                    }
+                )
+            )
+
+    def new_relations(self, *, exclude: set[str] | None = None) -> tuple[SourceRelation, ...]:
+        """Relations whose first-sight ``new`` marker is still live."""
+        excluded = exclude or set()
+        with self._lock:
+            return tuple(
+                sorted(
+                    (
+                        self.known.get(change.qualified)
+                        for change in self._live()
+                        if (
+                            change.kind == CHANGE_NEW
+                            and change.qualified not in excluded
+                            and self.known.get(change.qualified)
+                            and self.known[change.qualified].published
+                        )
+                    ),
+                    key=lambda relation: relation.qualified,
+                )
+            )
+
+    def complete_discoveries(self, names: set[str]) -> list[str]:
+        """Close ``new`` changes discharged by a completed relation re-snapshot.
+
+        Live discovery applies its audit marker from the re-snapshot commit, before a
+        resumed main-stream group exists.  Leaving the watcher's ``new`` change pending
+        would make that first later CDC group write a second, ``applied=False`` marker.
+        Move the existing object through the declared catalog machine and retain its
+        dirty relation for the normal durable registry flush at run teardown.
+        """
+        completed: list[str] = []
+        wanted = set(names)
+        with self._lock:
+            for change in self._live():
+                if change.kind != CHANGE_NEW or change.qualified not in wanted:
+                    continue
+                if change.state != CHANGE_DUE:
+                    change.to(CHANGE_DUE)
+                change.to(CHANGE_APPLIED)
+                completed.append(change.qualified)
+            if completed:
+                done = set(completed)
+                self._changes = [
+                    change for change in self._changes if change.qualified not in done
+                ]
+            self.replicated |= wanted
+        return completed
+
+    def observe_unit(self, unit) -> None:
+        """Fence a late schema event by polling before its unit is appended.
+
+        A catalog poll may be asleep while pgoutput is already delivering a row with the
+        new name.  The row is allowed into the current group (the normal schema registry
+        adds its columns), but the synchronous probe queues the source schema action so
+        the rename/drop is applied after this unit's durable LSN, never before it.
+        """
+        candidates: list[str] = []
+        for record in unit.events:
+            if not record.schema or not record.table:
+                continue
+            name = f"{record.schema}.{record.table}"
+            fields = set()
+            for image in (record.before, record.after, record.key):
+                if image:
+                    fields.update(image)
+            with self._lock:
+                relation = self.known.get(name)
+                known_names = {column.destination_name for column in relation.columns} if relation else set()
+                already_probed = name in self._schema_probe_names
+            if relation is not None and fields - known_names and not already_probed:
+                candidates.append(name)
+        if candidates:
+            with self._lock:
+                self._schema_probe_names.update(candidates)
+            self.poll_quietly()
+
+    def read_columns(
+        self,
+        relation: SourceRelation,
+        key_columns: tuple[str, ...],
+        value_columns: tuple[str, ...],
+    ) -> list[tuple]:
+        """Read current source values for a fenced add-column backfill.
+
+        The catalog poll has already fenced the schema action behind WAL.  Reading the
+        source here supplies the values PostgreSQL materialised for rows that predate
+        the ADD, including defaults; the applier then updates the destination inside
+        the same commit that changes its schema.  Names are mapped through the same dlt
+        normaliser as the row path, while SQL identifiers remain quoted source names.
+        """
+        source_names = {
+            normalize(column.name): column.name for column in relation.columns
+        }
+        destinations = tuple(key_columns) + tuple(value_columns)
+        missing = [name for name in destinations if name not in source_names]
+        if missing:
+            raise ValueError(
+                f"source relation {relation.qualified} has no catalog columns for "
+                f"{missing}"
+            )
+        select_list = ", ".join(quote(source_names[name]) for name in destinations)
+        with self._connect() as conn:
+            return conn.execute(
+                f"SELECT {select_list} FROM {quote(relation.schema)}."
+                f"{quote(relation.table)}"
+            ).fetchall()
+
     def _compare(self, observed: dict[str, SourceRelation], lsn: int) -> list[CatalogChange]:
         added: list[CatalogChange] = []
         superseded: list[str] = []
@@ -549,16 +884,31 @@ class CatalogWatcher:
                 | set(self.known)
                 | {c.qualified for c in self._live() if c.kind in DESTRUCTIVE}
             )
+            if self.auto_discover:
+                # `observed` is the catalog's complete relation set in this mode. This
+                # is what makes a table omitted from CDC_TABLES discoverable; the
+                # publication membership still decides whether it can stream.
+                interesting |= set(observed)
             for name in sorted(interesting):
-                if not name.startswith(f"{self.schema}."):
-                    # Opus MINOR-4: `_CATALOG_SQL` polls ONE schema, while
-                    # `observe_replicated` accepts any `schema.table` the stream
-                    # carries. A name outside the polled schema is simply unobserved,
-                    # and reading that as `dropped` would destroy its destination table
-                    # the moment multi-schema capture lands (2.3 / 3.x).
+                source_schema, _, source_table = name.partition(".")
+                if not source_table or (
+                    not self.all_schemas and source_schema not in self.schemas
+                ):
+                    # A relation outside the configured catalog scope is unobserved,
+                    # not dropped. In all-schemas mode this branch is only defensive.
                     continue
                 current = observed.get(name)
                 previous = self.known.get(name)
+                if (
+                    current is not None
+                    and current.is_partition
+                    and name not in self.include
+                    and name not in self.replicated
+                    and name not in self.known
+                ):
+                    # Publication-root snapshots may report child partitions, but a
+                    # child is not an independent discovery target.
+                    continue
                 if current is not None:
                     # Guard 2: the relation is there, so a pending `dropped` for it
                     # describes a world that no longer exists. A pending `recreated`
@@ -566,8 +916,10 @@ class CatalogWatcher:
                     # recreate looks like.
                     superseded.extend(self._supersede(name, CHANGE_DROPPED))
                     if previous is not None and current.oid == previous.oid:
-                        stale = self._unconfirmed.pop(name, None)
-                        if stale is not None:
+                        column_diff = diff_columns(previous.columns, current.columns)
+                        stale = self._unconfirmed.get(name)
+                        if stale is not None and not column_diff:
+                            self._unconfirmed.pop(name, None)
                             # The relation is unchanged, so whatever streak was building
                             # describes a world that no longer exists. Cancelled through
                             # the machine rather than dropped on the floor, so nothing is
@@ -581,7 +933,7 @@ class CatalogWatcher:
                 # AFTER supersession: a change this poll has just cancelled must not
                 # then suppress the change this poll should queue instead.
                 queued = any(
-                    c.qualified == name and c.kind in DESTRUCTIVE for c in self._live()
+                    c.qualified == name and c.kind in FENCED for c in self._live()
                 )
                 if previous is None:
                     if current is None:
@@ -640,7 +992,7 @@ class CatalogWatcher:
                             self.known[name] = current
                             self._dirty[name] = current
                         continue
-                    if name in self.replicated or name in self.include:
+                    if name in self.replicated or name in self.include or self.auto_discover:
                         # First sight. Record the oid; report `new` only for something
                         # we have never replicated (rubric 2.3's hook).
                         self.known[name] = current
@@ -680,6 +1032,32 @@ class CatalogWatcher:
                         added.append(change)
                         self.known[name] = current
                         self._dirty[name] = current
+                    continue
+                column_changes = diff_columns(previous.columns, current.columns)
+                if column_changes:
+                    schema_queued = any(
+                        c.qualified == name and c.kind == CHANGE_SCHEMA
+                        for c in self._live()
+                    )
+                    if not schema_queued:
+                        change = self._confirm(
+                            name,
+                            self._change(
+                                CHANGE_SCHEMA,
+                                current,
+                                lsn,
+                                old_oid=previous.oid,
+                                new_oid=current.oid,
+                                column_changes=column_changes,
+                            ),
+                        )
+                        if change is not None:
+                            added.append(change)
+                            self.known[name] = current
+                            self._dirty[name] = current
+                    # Do not collapse a schema transition into a plain source-relation
+                    # update: the destination action must happen before this baseline
+                    # is persisted.
                     continue
                 if current.published != previous.published:
                     added.append(
@@ -726,9 +1104,24 @@ class CatalogWatcher:
         is refreshed to the latest agreeing poll, because that is the LSN the fence has
         to clear.
         """
-        shape = (change.kind, change.new_oid)
+        shape = (
+            change.kind,
+            change.new_oid,
+            tuple(
+                (item.kind, item.attnum, item.old_name, item.new_name, item.type_oid)
+                for item in change.column_changes
+            ),
+        )
         seen = self._unconfirmed.get(name)
-        if seen is not None and (seen.kind, seen.new_oid) != shape:
+        seen_shape = (
+            seen.kind,
+            seen.new_oid,
+            tuple(
+                (item.kind, item.attnum, item.old_name, item.new_name, item.type_oid)
+                for item in seen.column_changes
+            ),
+        ) if seen is not None else None
+        if seen is not None and seen_shape != shape:
             # A different observation: the streak restarts, and the old object is
             # cancelled rather than left dangling in a state nothing will advance.
             seen.to(CHANGE_SUPERSEDED)
@@ -773,6 +1166,7 @@ class CatalogWatcher:
         return [name]
 
     def _change(self, kind, relation: SourceRelation, lsn: int, **oids) -> CatalogChange:
+        oids.setdefault("new_relation", relation)
         return CatalogChange(
             kind=kind, schema=relation.schema, table=relation.table, detected_lsn=lsn, **oids
         )
@@ -813,13 +1207,11 @@ class CatalogWatcher:
         with self._lock:
             for change in self._live():
                 _queued(change)
-                if change.kind not in DESTRUCTIVE:
+                if change.kind not in FENCED:
                     change.to(CHANGE_DUE)
                     # Nothing is removed for a `new`, `unpublished` or `republished`
                     # change - it is a marker row and an operator decision - so there is
-                    # nothing for the fence to protect. Fencing them anyway kept them
-                    # pending on an idle stream, which in turn kept the watcher writing
-                    # marker records to the source for no reason.
+                    # nothing for the fence to protect.
                     out.append(change)
                     continue
                 if durable_lsn >= change.detected_lsn:
@@ -880,6 +1272,17 @@ class CatalogWatcher:
         with self._lock:
             return [c for c in self._live() if c.kind in DESTRUCTIVE]
 
+    def pending_fenced(self) -> list[CatalogChange]:
+        """Fenced catalog work still waiting for a destination commit.
+
+        Schema changes share the destructive-change WAL fence even though their
+        destination action is non-destructive. The supervisor must therefore hold a
+        quiet run open for both classes; checking only ``pending_destructive`` could
+        leave an ADD/DROP/RENAME discovered by the final poll until the next run.
+        """
+        with self._lock:
+            return [c for c in self._live() if c.kind in FENCED]
+
     def dirty(self, *, exclude: set[str] | None = None) -> list[SourceRelation]:
         """Relations whose persisted row is stale, minus `exclude`. Non-destructive.
 
@@ -931,6 +1334,7 @@ class CatalogWatcher:
             "catalog_pending_destructive": sum(
                 1 for c in pending if c.kind in DESTRUCTIVE
             ),
+            "catalog_pending_schema": sum(1 for c in pending if c.kind == CHANGE_SCHEMA),
             "catalog_superseded": self.superseded,
             "catalog_error": self.last_error,
             # Preserved rather than cleared by the next successful poll: a marker

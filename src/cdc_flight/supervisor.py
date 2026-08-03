@@ -58,6 +58,7 @@ def run_engine_bounded(
     phases=None,
     outcome: RunOutcome | None = None,
     quiescence_observer=None,
+    keep_catalog: bool = False,
 ) -> dict:
     """Run the Debezium engine until the *source* agrees it is idle, or the deadline hits.
 
@@ -95,6 +96,11 @@ def run_engine_bounded(
     phase transition, `streaming -> draining`, because this is the only place that knows
     when the engine stopped producing and started shutting down.
 
+    `keep_catalog` is used only by the in-process discovery hand-off. It leaves the
+    catalog watcher alive after this engine instance is quiescent so the caller can
+    stop it, run the existing blocking re-snapshot, and attach a fresh engine to the
+    same main slot. No final catalog verdict is taken for an intermediate hand-off.
+
     `outcome` is the run's **one** `RunOutcome`. It used to be constructed here while
     `RunPhaseWriter` constructed a second, unrelated one, so `last_run.json` shipped
     `stop_reason="idle"` next to `run_outcome="max_seconds"` on ordinary successful runs
@@ -112,6 +118,13 @@ def run_engine_bounded(
     applier_quiesced = True
     drain_until = 0.0
     catalog_unresolved: list[str] = []
+    intermediate_handoff = False
+
+    def pending_fenced():
+        if catalog is None:
+            return []
+        method = getattr(catalog, "pending_fenced", None)
+        return method() if method is not None else catalog.pending_destructive()
 
     def _run():
         try:
@@ -159,6 +172,7 @@ def run_engine_bounded(
             # applier NOT busy so a group in flight is never abandoned.
             if stop_when is not None and not handler.busy and stop_when():
                 outcome.record("work_done")
+                intermediate_handoff = bool(keep_catalog)
                 break
             enough = handler.record_count >= run.min_records
             quiet = handler.seconds_since_last_batch >= run.idle_seconds
@@ -171,7 +185,7 @@ def run_engine_bounded(
                     or health.may_declare_idle(min_seconds=run.idle_seconds)
                 )
                 if source_idle and completion.phase_ended:
-                    if catalog is not None and not final_poll_done:
+                    if catalog is not None and not intermediate_handoff and not final_poll_done:
                         # The synchronous final poll. A DROP that happened after the
                         # last scheduled poll is seen by THIS run, and it is also the
                         # poll that completes `CDC_DROP_CONFIRM_POLLS` on a short run.
@@ -179,7 +193,7 @@ def run_engine_bounded(
                         catalog.poll_quietly()
                         drain_until = time.monotonic() + catalog_drain_seconds
                     unresolved = (
-                        [c.qualified for c in catalog.pending_destructive()]
+                        [c.qualified for c in pending_fenced()]
                         if catalog is not None
                         else []
                     )
@@ -257,7 +271,7 @@ def run_engine_bounded(
             )
             close_hung = True
             outcome.record("hung")
-        if catalog is not None:
+        if catalog is not None and not intermediate_handoff:
             # QUIESCED BEFORE ANY VERDICT IS TAKEN (Codex r2 MAJOR-3), and quiescence is
             # now something we PROVE rather than something `stop()` attempts (Codex r3
             # MAJOR-3). The poller runs on its own thread; a poll that outlives a timed
@@ -266,7 +280,7 @@ def run_engine_bounded(
             # whether the thread is actually dead, and a false is a failed run — see the
             # `catalog_quiesced` check after the summary is built.
             quiesced = catalog.stop()
-        if applier_quiesced and phases is not None:
+        if applier_quiesced and phases is not None and not intermediate_handoff:
             # This cursor is a child of the applier's parent connection. It is safe to
             # write `draining` only after the callback boundary is quiescent.
             try:
@@ -442,8 +456,8 @@ def run_engine_bounded(
             summary,
         )
 
-    if catalog is not None:
-        still_pending = [c.qualified for c in catalog.pending_destructive()]
+    if catalog is not None and not intermediate_handoff:
+        still_pending = [c.qualified for c in pending_fenced()]
         if still_pending or catalog_unresolved:
             names = sorted(set(still_pending) | set(catalog_unresolved))
             outcome.record("catalog_unresolved")

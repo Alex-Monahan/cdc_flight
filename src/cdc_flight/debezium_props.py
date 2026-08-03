@@ -169,8 +169,6 @@ def build_properties(
         # so Debezium must not invent its own.
         "publication.autocreate.mode": "disabled",
         "topic.prefix": replication.topic_prefix,
-        "schema.include.list": source.schema,
-        "table.include.list": ",".join(source.tables),
         "snapshot.mode": snapshot,
         # --- offsets ----------------------------------------------------------
         # File-backed offsets: the simplest Kafka-less store. This is a known
@@ -249,4 +247,11 @@ def build_properties(
         # yet. Rubric 4.4/4.5/4.6 require an idle-slot heartbeat; that is Phase 4
         # work and is deliberately absent from the baseline so the gap is visible.
     }
+    # In discovery mode the publication is the capture contract. A static table or
+    # schema include list would make a catalog watcher capable of observing a new
+    # relation but Debezium incapable of delivering its rows. The explicit opt-out
+    # retains the old bounded-capture behaviour for deployments that want it.
+    if not source.auto_discovery:
+        props["schema.include.list"] = source.schema
+        props["table.include.list"] = ",".join(source.tables)
     return props

@@ -173,6 +173,9 @@ RUN_PHASE = Machine(
         (PHASE_RECOVERING, PHASE_RECONCILING),
         (PHASE_RECONCILING, PHASE_SNAPSHOTTING),  # the blocking re-snapshot (1.6)
         (PHASE_RECONCILING, PHASE_STREAMING),
+        # A live catalog discovery briefly quiesces streaming, rebuilds only the new
+        # relation while the main slot retains WAL, then resumes the same run.
+        (PHASE_STREAMING, PHASE_SNAPSHOTTING),
         (PHASE_SNAPSHOTTING, PHASE_STREAMING),
         (PHASE_STREAMING, PHASE_DRAINING),
         (PHASE_DRAINING, PHASE_STOPPING),

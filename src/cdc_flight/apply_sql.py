@@ -184,6 +184,9 @@ class SchemaRegistry:
         self._tables.pop(name, None)
 
     def _load(self, table: TableSchema) -> None:
+        self._refresh(table)
+
+    def _refresh(self, table: TableSchema) -> None:
         rows = self.con.execute(
             "SELECT column_name, data_type FROM information_schema.columns "
             "WHERE table_schema = ? AND table_name = ?",
@@ -193,6 +196,20 @@ class SchemaRegistry:
             table.exists = True
             table.columns = {name: _normalise_type(dtype) for name, dtype in rows}
             table.raw_types = {name: str(dtype).upper() for name, dtype in rows}
+            key_rows = self.con.execute(
+                "SELECT k.column_name "
+                "FROM information_schema.key_column_usage k "
+                "JOIN information_schema.table_constraints t "
+                "  ON t.constraint_schema = k.constraint_schema "
+                " AND t.constraint_name = k.constraint_name "
+                " AND t.table_name = k.table_name "
+                "WHERE k.table_schema = ? AND k.table_name = ? "
+                "  AND t.constraint_type = 'PRIMARY KEY' "
+                "ORDER BY k.ordinal_position",
+                [self.dataset, table.name],
+            ).fetchall()
+            if key_rows:
+                table.key_columns = tuple(row[0] for row in key_rows)
 
     # -- DDL ---------------------------------------------------------------- #
     def ensure(
@@ -286,6 +303,144 @@ class SchemaRegistry:
         table = self.get(name)
         self.con.execute(f"DROP TABLE IF EXISTS {table.qualified}")
         self.forget(name)
+
+    def drop_column(self, name: str, column: str) -> None:
+        """Physically remove a source-dropped column in the open transaction."""
+        table = self.get(name)
+        if not table.exists or column not in table.columns:
+            return
+        self.con.execute(f"ALTER TABLE {table.qualified} DROP COLUMN {quote(column)}")
+        table.columns.pop(column, None)
+        table.raw_types.pop(column, None)
+        table.key_columns = tuple(c for c in table.key_columns if c != column)
+
+    def rename_column(self, name: str, old: str | None, new: str | None) -> None:
+        """Apply a true rename, including a late-arriving new-name row.
+
+        The latter shape is possible because the catalog poll and the Debezium callback
+        are independent.  Merging with ``COALESCE`` preserves old rows and any new-name
+        values already applied, then the old physical column is removed.  All statements
+        run in the applier's transaction, so no consumer observes the intermediate pair.
+        """
+        if not old or not new or old == new:
+            return
+        table = self.get(name)
+        if not table.exists:
+            return
+        # A late Debezium row may already have caused the normal ensure path to add the
+        # new-name column since this registry entry was cached. Re-read metadata before
+        # deciding whether this is a physical RENAME or a merge.
+        self._refresh(table)
+        old_exists = old in table.columns
+        new_exists = new in table.columns
+        if old_exists and not new_exists:
+            self.con.execute(
+                f"ALTER TABLE {table.qualified} RENAME COLUMN {quote(old)} TO {quote(new)}"
+            )
+            table.columns[new] = table.columns.pop(old)
+            table.raw_types[new] = table.raw_types.pop(old)
+        elif old_exists and new_exists:
+            # Prefer the already-arriving new image; fall back to the old value for rows
+            # that predate the catalog poll. This is the only safe merge for a rename
+            # whose source values are allowed to be NULL.
+            self.con.execute(
+                f"UPDATE {table.qualified} SET {quote(new)} = "
+                f"COALESCE({quote(new)}, {quote(old)})"
+            )
+            self.con.execute(f"ALTER TABLE {table.qualified} DROP COLUMN {quote(old)}")
+            table.columns.pop(old, None)
+            table.raw_types.pop(old, None)
+        # If only the new name remains, an earlier group already performed the
+        # idempotent late-rename merge. If neither remains, the source relation may have
+        # produced no row carrying either shape; the catalog action remains harmless.
+        table.key_columns = tuple(new if c == old else c for c in table.key_columns)
+        if old in table.key_columns:
+            table.key_columns = tuple(c for c in table.key_columns if c != old)
+
+    def backfill_columns(
+        self,
+        name: str,
+        *,
+        key_columns: tuple[str, ...],
+        value_columns: tuple[str, ...],
+        rows: list[tuple],
+    ) -> None:
+        """Copy current source values into newly added columns in this transaction.
+
+        PostgreSQL evaluates an ADD COLUMN default for rows already in the source.
+        The CDC stream only carries future row changes, so a destination-side ADD alone
+        would leave those rows NULL forever.  The catalog fence supplies a stable key
+        and source read; this method makes the existing destination rows agree before
+        the commit becomes durable.  It deliberately uses UPDATE, not a delete/insert
+        merge, so the operation remains safe after the schema DDL has run in the same
+        transaction on DuckDB/MotherDuck.
+        """
+        if not key_columns or not value_columns or not rows:
+            return
+        table = self.get(name)
+        if not table.exists:
+            return
+        key_columns = tuple(column for column in key_columns if column in table.columns)
+        value_columns = tuple(column for column in value_columns if column in table.columns)
+        if not key_columns or not value_columns:
+            return
+        set_clause = ", ".join(f"{quote(column)} = ?" for column in value_columns)
+        where_clause = " AND ".join(
+            f"{quote(column)} IS NOT DISTINCT FROM ?" for column in key_columns
+        )
+        value_count = len(value_columns)
+        key_count = len(key_columns)
+        for row in rows:
+            keys = row[:key_count]
+            values = row[key_count : key_count + value_count]
+            params = [
+                bind(value, table.columns[column])
+                for column, value in zip(value_columns, values, strict=True)
+            ] + [
+                bind(value, table.columns[column])
+                for column, value in zip(key_columns, keys, strict=True)
+            ]
+            self.con.execute(
+                f"UPDATE {table.qualified} SET {set_clause} WHERE {where_clause}",
+                params,
+            )
+
+    def backfill_constant_columns(
+        self,
+        name: str,
+        *,
+        value_columns: tuple[str, ...],
+        rows: list[tuple],
+    ) -> None:
+        """Backfill a keyless destination when the source values are uniform.
+
+        A source table without a primary key has no durable identity that can match a
+        current source row to a historical ``cdcf_event_id`` row.  Applying a value
+        that differs by source row would therefore be an invented mapping.  PostgreSQL
+        ADD COLUMN normally gives every existing row one default (or NULL), so that
+        common case has a safe all-rows operation; a non-uniform source is rejected by
+        the caller before this update runs.
+        """
+        if not value_columns or not rows:
+            return
+        table = self.get(name)
+        if not table.exists:
+            return
+        value_columns = tuple(column for column in value_columns if column in table.columns)
+        if not value_columns:
+            return
+        values = tuple(rows[0][: len(value_columns)])
+        if any(tuple(row[: len(value_columns)]) != values for row in rows[1:]):
+            raise ValueError(
+                f"cannot backfill keyless table {name}: added-column values are not "
+                "uniform and the source has no stable row identity"
+            )
+        set_clause = ", ".join(f"{quote(column)} = ?" for column in value_columns)
+        params = [
+            bind(value, table.columns[column])
+            for column, value in zip(value_columns, values, strict=True)
+        ]
+        self.con.execute(f"UPDATE {table.qualified} SET {set_clause}", params)
 
 
 #: Destination types the widening lattice actually understands. Anything else is

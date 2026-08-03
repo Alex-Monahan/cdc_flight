@@ -136,6 +136,7 @@ CONTROL_DDL = [
             relation_oid      BIGINT      NOT NULL,
             published         BOOLEAN     NOT NULL,
             replica_identity  VARCHAR,
+            columns_json      VARCHAR,
             first_seen_at     TIMESTAMPTZ NOT NULL,
             last_seen_at      TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (pipeline, source_schema, source_table)
@@ -319,6 +320,9 @@ _ADDED_COLUMNS = {
         ("verdict", "VARCHAR"),
         ("verdict_message", "VARCHAR"),
         ("verdict_at", "TIMESTAMPTZ"),
+    ),
+    "source_relations": (
+        ("columns_json", "VARCHAR"),
     ),
 }
 

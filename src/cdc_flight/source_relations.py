@@ -16,6 +16,7 @@ rows beside the new one's for ever (Codex r3 BLOCKER-1, reproduced end to end).
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 
 from .control_schema import CONTROL_SCHEMA
@@ -40,6 +41,7 @@ def upsert_source_relation(
     relation_oid: int,
     published: bool,
     replica_identity: str | None,
+    columns=(),
 ) -> None:
     """Record what the source catalog says, inside the commit group's transaction.
 
@@ -61,10 +63,25 @@ def upsert_source_relation(
     con.execute(
         f"INSERT INTO {CONTROL_SCHEMA}.source_relations "
         "(pipeline, source_schema, source_table, relation_oid, published, "
-        " replica_identity, first_seen_at, last_seen_at) VALUES (?,?,?,?,?,?,?,?)",
+        " replica_identity, columns_json, first_seen_at, last_seen_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
         [
             pipeline, source_schema, source_table, relation_oid, published,
-            replica_identity, (first_seen[0][0] if first_seen else current), current,
+            replica_identity,
+            json.dumps(
+                [
+                    {
+                        "attnum": column.attnum,
+                        "name": column.name,
+                        "type_oid": column.type_oid,
+                        "type_name": column.type_name,
+                        "nullable": column.nullable,
+                    }
+                    for column in columns
+                ],
+                sort_keys=True,
+            ),
+            (first_seen[0][0] if first_seen else current), current,
         ],
     )
 
@@ -104,13 +121,18 @@ def flush_learned_relations(
     # Two independent reasons a learned oid must not become history yet, and they are
     # the same rule: **persisted state may not run ahead of the action it implies.**
     #
-    # 1. a destructive action for this relation is still pending (the original guard);
+    # 1. a fenced action for this relation is still pending (table DDL or schema DDL);
     # 2. the catalog baseline could not relate this relation's destination rows to any
     #    identity at the source and nothing has rebuilt it yet (Codex r6 BLOCKER-2).
     #    Writing the observed oid here would make the NEXT run agree with the source and
     #    never ask again — the same silent inconsistency one run later, reached through
     #    a failing run rather than a successful one.
-    blocked = {c.qualified for c in catalog.pending_destructive()} | set(exclude or ())
+    pending_fenced = (
+        catalog.pending_fenced()
+        if hasattr(catalog, "pending_fenced")
+        else catalog.pending_destructive()
+    )
+    blocked = {c.qualified for c in pending_fenced} | set(exclude or ())
     relations = catalog.dirty(exclude=blocked)
     if not relations:
         return []
@@ -125,6 +147,7 @@ def flush_learned_relations(
                 relation_oid=relation.oid,
                 published=relation.published,
                 replica_identity=relation.replica_identity,
+                columns=relation.columns,
             )
         con.execute("COMMIT")
     except BaseException:

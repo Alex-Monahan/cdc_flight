@@ -318,6 +318,7 @@ def run(
     reason: str,
     namespace: str,
     ownership: DestinationOwnership,
+    new_relations: set[str] | None = None,
 ) -> ResnapshotOutcome:
     """Re-snapshot `tables` into shadow tables and swap them in, then return.
 
@@ -444,7 +445,12 @@ def run(
 
         if outcome.consistent_lsn is not None:
             outcome.swapped = _completed_tables(
-                con, pipeline, tables, outcome.consistent_lsn, reason=reason
+                con,
+                pipeline,
+                tables,
+                outcome.consistent_lsn,
+                reason=reason,
+                new_relations=new_relations or set(),
             )
         pending = [t for t in tables if f"{t[0]}.{t[1]}" not in set(outcome.swapped)]
         evidence = _gather_emptiness_evidence(
@@ -658,6 +664,7 @@ def _completed_tables(
     consistent_lsn: int,
     *,
     reason: str = "",
+    new_relations: set[str] | None = None,
 ) -> list[str]:
     """The requested tables whose shadow has been swapped in, per `table_state`.
 
@@ -674,6 +681,7 @@ def _completed_tables(
     *find* the gap rather than be told about it in a docstring.
     """
     done: list[str] = []
+    discovered = new_relations or set()
     for schema, table, target in tables:
         state = table_lifecycle.read(
             con, pipeline=pipeline, source_schema=schema, source_table=table
@@ -703,6 +711,23 @@ def _completed_tables(
                     "individual events (rubric 8.2's changelog is discontinuous here)."
                 ),
             )
+            if f"{schema}.{table}" in discovered:
+                dest_mod.write_table_event(
+                    con,
+                    pipeline=pipeline,
+                    commit_id=0,
+                    seq=1,
+                    event="new",
+                    source_schema=schema,
+                    source_table=table,
+                    target_table=target,
+                    applied=True,
+                    lsn=consistent_lsn,
+                    detail=(
+                        "new source relation discovered by the catalog watcher and "
+                        "snapshotted before streaming"
+                    ),
+                )
             done.append(f"{schema}.{table}")
     return done
 

@@ -9,7 +9,8 @@ acknowledged **after** it commits.
 BEGIN TRANSACTION
     renew lease                       # 4.2 - the loser fails before it writes
     apply whole units, all tables     # 1.3 - multi-table atomicity
-    apply due catalog DDL             # 1.5 - fenced on this group's resume point
+    apply schema DDL before row DML   # 2.1/2.2 - avoid mixed DDL/DML version checks
+    apply due table DDL after rows    # 1.5 - fenced on this group's resume point
     write _cdc_flight.commit_log      # 1.7 / 6.1 audit trail
     write _cdc_flight.debezium_offsets# (4) data ∧ state atomic
 COMMIT                                # <- the only durability event
@@ -52,7 +53,8 @@ from .assembler import (
     CompleteUnit,
     TransactionAssembler,
 )
-from .catalog_apply import CatalogCoordinator
+from .catalog import CHANGE_SCHEMA
+from .catalog_apply import CatalogCoordinator, CatalogPlan
 from .commit_group import CommitResult, OpenGroup
 from .destination import AlertSink, Lease, ResumePoint
 from .envelope import KIND_SNAPSHOT_BOUNDARY, PendingRecord, decode
@@ -490,6 +492,11 @@ class Applier:
     def _add_unit(self, unit: CompleteUnit) -> None:
         if self._discard_resnapshot_unit(unit):
             return
+        if self.catalog is not None:
+            # A pgoutput row can outrun the background pg_attribute poll. Probe before
+            # appending the unit so the schema action is fenced behind this unit's LSN;
+            # the normal row path may still add the new-name column in this group.
+            self.catalog.observe_unit(unit)
         is_snapshot = self._is_snapshot_unit(unit)
         was_snapshot = self.group.is_snapshot
         if not is_snapshot:
@@ -685,16 +692,33 @@ class Applier:
             if has_data:
                 maybe_crash("begin", fault_group)
             self.lease.renew(self.con)
-            stats = self._apply_units(group, commit_id, has_data=has_data)
             new_point = resume.point_for(
                 group,
                 previous=self.resume_point,
                 commit_id=commit_id,
                 snapshot_epoch=self.snapshots.epoch,
             )
-            # rubric 1.5: DDL the stream cannot carry, fenced on the resume point this
-            # group is about to make durable.
-            self._apply_catalog_changes(commit_id, new_point.last_lsn, stats)
+            # DuckDB validates primary keys at COMMIT and treats a table altered after
+            # DML in the same transaction as a separate table version.  Applying a
+            # schema-only catalog action after the row fold therefore reports a false
+            # duplicate key, even though the fold deleted the old row first.  Plan the
+            # catalog once, apply schema actions before row DML, and keep destructive
+            # table actions after row DML.  All phases remain one destination
+            # transaction and one resume-point commit (ADR 0001 §3.3).
+            catalog_plan = self._plan_catalog_changes(new_point.last_lsn)
+            catalog_stats = {"tables": set()}
+            if catalog_plan is not None:
+                self._apply_catalog_phase(
+                    commit_id, catalog_plan, catalog_stats, schema_only=True
+                )
+            stats = self._apply_units(group, commit_id, has_data=has_data)
+            stats["tables"].update(catalog_stats["tables"])
+            if catalog_plan is not None:
+                self.catalog_coordinator.backfill_schema(self.con, catalog_plan)
+                self._apply_catalog_phase(
+                    commit_id, catalog_plan, stats, schema_only=False
+                )
+                self.group.pending_alerts.extend(catalog_plan.alerts)
             destination.write_commit_log(
                 self.con,
                 commit_id=commit_id,
@@ -1043,13 +1067,71 @@ class Applier:
             )
         self.group.table_events = []
 
+    def _plan_catalog_changes(self, durable_lsn: int) -> CatalogPlan | None:
+        """Plan catalog changes once for the commit group (rubric 1.5).
+
+        Planning is separate from applying so schema DDL can run before row DML while
+        destructive table DDL remains after it.  The plan is retained on ``OpenGroup``
+        and settled only after COMMIT.
+        """
+        coordinator = self.catalog_coordinator
+        if not coordinator.enabled:
+            return None
+        plan = coordinator.plan(durable_lsn)
+        if not plan.actions and not plan.relations and not plan.alerts:
+            return None
+        self.group.catalog_plan = plan
+        return plan
+
+    def _apply_catalog_phase(
+        self,
+        commit_id: int,
+        plan: CatalogPlan,
+        stats: dict,
+        *,
+        schema_only: bool,
+    ) -> None:
+        """Apply one phase of a catalog plan inside the commit transaction.
+
+        Schema actions run first because destination engines may reject a DML-plus-DDL
+        transaction at COMMIT even when the DML is logically non-duplicating.  Table
+        drops/recreates and discovery markers run in the second phase, after the data
+        units, preserving the existing drop fence semantics.
+        """
+        schema_actions = tuple(
+            action for action in plan.actions if action.change.kind == CHANGE_SCHEMA
+        )
+        actions = schema_actions if schema_only else tuple(
+            action for action in plan.actions if action.change.kind != CHANGE_SCHEMA
+        )
+        schema_names = {
+            action.change.qualified for action in schema_actions
+        }
+        relations = tuple(
+            relation
+            for relation in plan.relations
+            if (relation.qualified in schema_names) == schema_only
+        )
+        phase = CatalogPlan(
+            actions=actions,
+            relations=relations,
+            refused=plan.refused if not schema_only else (),
+        )
+        if not phase.actions and not phase.relations and not phase.refused:
+            return
+        self.group.table_events.extend(
+            self.catalog_coordinator.apply(self.con, phase, stats)
+        )
+        if self.group.table_events:
+            self._flush_table_events(commit_id)
+
     def _apply_catalog_changes(
         self,
         commit_id: int,
         durable_lsn: int,
         stats: dict,
     ) -> None:
-        """Apply the source-catalog changes whose fence has opened (rubric 1.5).
+        """Compatibility wrapper for callers that apply a complete catalog plan.
 
         Runs inside the commit group's transaction, *after* the group's events, so a
         `DROP` cannot remove rows that an event of this same group had still to add,
@@ -1057,20 +1139,14 @@ class Applier:
         policy - supersession, revalidation, the circuit breaker, `awaiting_snapshot` -
         is `catalog_apply.CatalogCoordinator`'s; this is only where it is executed.
         """
-        coordinator = self.catalog_coordinator
-        if not coordinator.enabled:
+        plan = self._plan_catalog_changes(durable_lsn)
+        if plan is None:
             return
-        plan = coordinator.plan(durable_lsn)
-        if not plan.actions and not plan.relations and not plan.alerts:
-            return
-        self.group.catalog_plan = plan
-        self.group.table_events.extend(coordinator.apply(self.con, plan, stats))
+        self._apply_catalog_phase(commit_id, plan, stats, schema_only=False)
         # A destructive action that could not be applied is exactly the signal an
         # operator must still get when the group rolls back; one that describes an
         # applied action must NOT outlive the rollback that undid it (Codex 7).
         self.group.pending_alerts.extend(plan.alerts)
-        if self.group.table_events:
-            self._flush_table_events(commit_id)
 
     def _settle_catalog(self, group_obj: OpenGroup) -> None:
         """Forget the catalog work this group made durable. Runs after COMMIT."""
