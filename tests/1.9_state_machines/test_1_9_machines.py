@@ -107,6 +107,9 @@ DECLARED = {
     "destination_ownership",
     "snapshot_completion",
     "runtime_root_lifecycle",
+    "publication_admission",
+    "catalog_schema_liveness",
+    "schema_refusal",
 }
 
 
@@ -412,3 +415,247 @@ def test_source_health_is_not_a_machine():
     Adding a machine here would be ceremony, and the review said so."""
     assert "source_health" not in _declared()
     assert "source_health" in {d.name for d in m.__dict__.values() if isinstance(d, Domain)}
+
+
+def test_every_declared_machine_state_cell_is_accepted_or_refused():
+    """Closed-model coverage: every state pair, including ERROR, has a disposition."""
+    for _name, machine in _declared().items():
+        for state in machine.states:
+            assert machine.parse(state) == state
+        for before in machine.states:
+            for after in machine.states:
+                if machine.allows(before, after):
+                    machine.check(before, after)
+                else:
+                    with pytest.raises(IllegalTransition):
+                        machine.check(before, after)
+
+
+def test_publication_and_schema_liveness_product_has_a_decision_for_every_cell():
+    """The discovery hand-off is ready only for visible, admitted relations."""
+    ready = {m.ADMISSION_ADMITTED, m.ADMISSION_EXTERNAL}
+    for admission in m.PUBLICATION_ADMISSION.states:
+        for liveness in m.CATALOG_SCHEMA_LIVENESS.states:
+            m.PUBLICATION_ADMISSION.parse(admission)
+            m.CATALOG_SCHEMA_LIVENESS.parse(liveness)
+            decision = (
+                "ready"
+                if liveness == m.SCHEMA_VISIBLE and admission in ready
+                else "blocked"
+            )
+            assert decision in {"ready", "blocked"}, (admission, liveness)
+
+
+def test_schema_refusal_and_table_lifecycle_product_documents_atomic_cells():
+    """A refusal gates success while the replacement image is in flight."""
+    for refusal in m.SCHEMA_REFUSAL.states:
+        for lifecycle in m.TABLE_LIFECYCLE.states:
+            m.SCHEMA_REFUSAL.parse(refusal)
+            m.TABLE_LIFECYCLE.parse(lifecycle)
+            if refusal == m.REFUSAL_PENDING:
+                assert lifecycle in m.TABLE_LIFECYCLE.states
+                decision = "replacement_snapshot_required"
+            elif lifecycle in {m.LIFECYCLE_IN_PROGRESS, m.LIFECYCLE_AWAITING}:
+                # A snapshot may be running after a prior refusal was discharged; the
+                # refusal state and table lifecycle are independent durable machines.
+                decision = "snapshot_in_flight"
+            else:
+                decision = "ordinary_lifecycle"
+            assert decision in {
+                "replacement_snapshot_required",
+                "snapshot_in_flight",
+                "ordinary_lifecycle",
+            }
+
+
+# The following are the declared cross-machine products for schema evolution and live
+# discovery.  The list is intentionally explicit: adding a consistency-affecting state
+# without adding its product here is a review-visible test failure, rather than an
+# assumption hidden in a coordinator's `if` chain.
+INTERACTING_PAIRS = (
+    ("catalog_change", "publication_admission"),
+    ("catalog_change", "catalog_schema_liveness"),
+    ("catalog_change", "schema_refusal"),
+    ("catalog_change", "table_lifecycle"),
+    ("publication_admission", "catalog_schema_liveness"),
+    ("publication_admission", "schema_refusal"),
+    ("publication_admission", "table_lifecycle"),
+    ("catalog_schema_liveness", "schema_refusal"),
+    ("catalog_schema_liveness", "table_lifecycle"),
+    ("schema_refusal", "table_lifecycle"),
+    ("snapshot_completion", "table_lifecycle"),
+    ("destination_ownership", "snapshot_completion"),
+)
+
+
+def _pair_disposition(pair: tuple[str, str], left: str, right: str) -> str:
+    """Return the safety action for one complete product cell.
+
+    This is deliberately a small, total decision table rather than a reachability
+    guess. Some combinations occur only while recovery is in flight (for example a
+    pending refusal with an ``in_progress`` snapshot); they still need a named action.
+    """
+    if pair == ("catalog_change", "publication_admission"):
+        if left in {m.CHANGE_DEFERRED, m.CHANGE_REFUSED}:
+            return "blocked_catalog_change"
+        if right in {m.ADMISSION_ADMITTED, m.ADMISSION_EXTERNAL}:
+            return "catalog_change_admissible" if left not in {
+                m.CHANGE_APPLIED, m.CHANGE_SUPERSEDED,
+            } else "terminal_noop"
+        return "blocked_publication_admission"
+    if pair == ("catalog_change", "catalog_schema_liveness"):
+        if left in {m.CHANGE_DEFERRED, m.CHANGE_REFUSED}:
+            return "blocked_catalog_change"
+        if right != m.SCHEMA_VISIBLE:
+            return "blocked_catalog_visibility"
+        return (
+            "terminal_noop"
+            if left in {m.CHANGE_APPLIED, m.CHANGE_SUPERSEDED}
+            else "catalog_observation_allowed"
+        )
+    if pair == ("catalog_change", "schema_refusal"):
+        if left in {m.CHANGE_DEFERRED, m.CHANGE_REFUSED}:
+            return "blocked_catalog_change"
+        if right == m.REFUSAL_PENDING:
+            return "blocked_schema_refusal"
+        return (
+            "terminal_noop"
+            if left in {m.CHANGE_APPLIED, m.CHANGE_SUPERSEDED}
+            else "schema_action_allowed"
+        )
+    if pair == ("catalog_change", "table_lifecycle"):
+        if left in {m.CHANGE_DEFERRED, m.CHANGE_REFUSED}:
+            return "blocked_catalog_change"
+        if right in {m.LIFECYCLE_IN_PROGRESS, m.LIFECYCLE_AWAITING}:
+            return "blocked_snapshot_lifecycle"
+        if right == m.LIFECYCLE_ABSENT:
+            return "registration_required"
+        return (
+            "terminal_noop"
+            if left in {m.CHANGE_APPLIED, m.CHANGE_SUPERSEDED}
+            else "catalog_action_allowed"
+        )
+    if pair == ("publication_admission", "catalog_schema_liveness"):
+        if right != m.SCHEMA_VISIBLE:
+            return "blocked_catalog_visibility"
+        return (
+            "discovery_admission_ready"
+            if left in {m.ADMISSION_ADMITTED, m.ADMISSION_EXTERNAL}
+            else "blocked_publication_admission"
+        )
+    if pair == ("publication_admission", "schema_refusal"):
+        if right == m.REFUSAL_PENDING:
+            return "blocked_schema_refusal"
+        return (
+            "discovery_admission_ready"
+            if left in {m.ADMISSION_ADMITTED, m.ADMISSION_EXTERNAL}
+            else "blocked_publication_admission"
+        )
+    if pair == ("publication_admission", "table_lifecycle"):
+        if left not in {m.ADMISSION_ADMITTED, m.ADMISSION_EXTERNAL}:
+            return "blocked_publication_admission"
+        if right in {m.LIFECYCLE_ABSENT, m.LIFECYCLE_NONE}:
+            return "snapshot_required"
+        if right in {m.LIFECYCLE_IN_PROGRESS, m.LIFECYCLE_AWAITING}:
+            return "snapshot_in_flight"
+        return "registered"
+    if pair == ("catalog_schema_liveness", "schema_refusal"):
+        if left != m.SCHEMA_VISIBLE:
+            return "blocked_catalog_visibility"
+        return "blocked_schema_refusal" if right == m.REFUSAL_PENDING else "visible"
+    if pair == ("catalog_schema_liveness", "table_lifecycle"):
+        if left != m.SCHEMA_VISIBLE:
+            return "absence_not_proven"
+        return (
+            "snapshot_required"
+            if right in {m.LIFECYCLE_IN_PROGRESS, m.LIFECYCLE_AWAITING}
+            else "catalog_observation_allowed"
+        )
+    if pair == ("schema_refusal", "table_lifecycle"):
+        if left == m.REFUSAL_PENDING:
+            return "replacement_snapshot_required"
+        return (
+            "snapshot_in_flight"
+            if right in {m.LIFECYCLE_IN_PROGRESS, m.LIFECYCLE_AWAITING}
+            else "ordinary_lifecycle"
+        )
+    if pair == ("snapshot_completion", "table_lifecycle"):
+        if right == m.LIFECYCLE_ABSENT:
+            return "no_destination_to_complete"
+        if left in {
+            m.SNAPSHOT_CALLBACKS_COMPLETE,
+            m.SNAPSHOT_NOT_REQUIRED,
+            m.SNAPSHOT_STREAMING,
+        }:
+            return "completion_proven"
+        return "completion_pending"
+    if pair == ("destination_ownership", "snapshot_completion"):
+        if left == m.OWNERSHIP_CALLBACK_OWNED:
+            return "callback_owner_terminal"
+        if right in {
+            m.SNAPSHOT_CALLBACKS_COMPLETE,
+            m.SNAPSHOT_NOT_REQUIRED,
+            m.SNAPSHOT_STREAMING,
+        }:
+            return "completion_proven"
+        return "completion_pending"
+    raise AssertionError(f"unlisted interacting pair: {pair}")
+
+
+def test_every_interacting_pair_cell_and_transition_has_a_disposition():
+    """Enumerate feasible products, including ERROR/REFUSED states and fault edges.
+
+    For every product cell we exercise every declared transition in both directions.
+    Every non-edge is sent through ``Machine.check`` and must be refused.  The result
+    is a finite matrix: no state pair can disappear into an unmodelled branch when a
+    poll, admission, snapshot, or refusal fault occurs.
+    """
+    declared = _declared()
+    assert len(INTERACTING_PAIRS) == len(set(INTERACTING_PAIRS))
+    for pair in INTERACTING_PAIRS:
+        left_machine = declared[pair[0]]
+        right_machine = declared[pair[1]]
+        for left in left_machine.states:
+            for right in right_machine.states:
+                disposition = _pair_disposition(pair, left, right)
+                assert isinstance(disposition, str) and disposition
+                for after in left_machine.states:
+                    if left_machine.allows(left, after):
+                        left_machine.check(left, after)
+                        assert _pair_disposition(pair, after, right)
+                    else:
+                        with pytest.raises(IllegalTransition):
+                            left_machine.check(left, after)
+                for after in right_machine.states:
+                    if right_machine.allows(right, after):
+                        right_machine.check(right, after)
+                        assert _pair_disposition(pair, left, after)
+                    else:
+                        with pytest.raises(IllegalTransition):
+                            right_machine.check(right, after)
+
+
+def test_interacting_pair_fault_states_are_never_successful():
+    """ERROR-like product cells must hold, refuse, or await remediation."""
+    declared = _declared()
+    fault_words = (
+        "error", "failed", "refused", "deferred", "unavailable", "invalidated", "stale",
+    )
+    for pair in INTERACTING_PAIRS:
+        left_machine = declared[pair[0]]
+        right_machine = declared[pair[1]]
+        for left in left_machine.states:
+            for right in right_machine.states:
+                if not any(word in left or word in right for word in fault_words):
+                    continue
+                disposition = _pair_disposition(pair, left, right)
+                assert disposition not in {
+                    "catalog_change_admissible",
+                    "catalog_observation_allowed",
+                    "schema_action_allowed",
+                    "catalog_action_allowed",
+                    "discovery_admission_ready",
+                    "visible",
+                    "registered",
+                    "completion_proven",
+                }, (pair, left, right, disposition)

@@ -2,7 +2,7 @@
 
 Rubric 1.9 asks that *any state that can affect consistency is managed with a state
 machine approach*, and grades **an appropriate number of machines (more than one)** at
-5. This file is what "appropriate" means here: nine focused machines, each owning one state,
+5. This file is what "appropriate" means here: twelve focused machines, each owning one state,
 each with a declared edge set — plus the frozen decision domains, which are
 classifications rather than states and are deliberately **not** dressed up as machines.
 The count is not the claim; coverage is. See SM-G for `CatalogBaseline`, the fifth
@@ -17,6 +17,9 @@ RunPhase                (per process,   _cdc_flight.heartbeat.phase)
  ├── TableLifecycle     (per table,     _cdc_flight.table_state.snapshot_state) [N, spans runs]
  ├── InterruptionMarker (per re-snapshot, interrupted.json)                    [0..1, spans runs]
  ├── CatalogChangeState (per relation,  memory only)                        [N, per run]
+ ├── PublicationAdmission(per relation, source_relations.admission_state)    [N, spans runs]
+ ├── CatalogSchemaLiveness(per schema, memory only)                          [N, per run]
+ ├── SchemaRefusal      (per relation, schema_refusals.state)                [N, spans runs]
  ├── DestinationOwnership(per connection, memory only)                       [1, per run]
  └── CommitGroup        (memory only, NO machine — see below)               [1 at a time]
 ```
@@ -503,6 +506,121 @@ CATALOG_CHANGE = Machine(
         "Where in the observe -> confirm -> fence -> apply pipeline is one DDL fact "
         "about one relation? Memory only: a lost pending change is re-detected, which "
         "is correct, so persisting it would buy nothing."
+    ),
+)
+
+
+# --------------------------------------------------------------------------- #
+# SM-F2 · PublicationAdmission — durable, `_cdc_flight.source_relations.admission_state`
+# --------------------------------------------------------------------------- #
+# Publication membership is a consistency boundary for discovery: a relation is not
+# eligible for a snapshot hand-off until the source will actually stream it.  The
+# state is separate from `published` because membership alone does not say whether the
+# Flight or an external operator owns the admission decision, and an ALTER failure is
+# an ERROR state that must remain retryable rather than looking like an ordinary poll.
+ADMISSION_ABSENT = "absent"
+ADMISSION_PENDING = "pending"
+ADMISSION_ERROR = "error"
+ADMISSION_ADMITTED = "admitted"
+ADMISSION_EXTERNAL = "external"
+ADMISSION_REFUSED = "refused"
+
+PUBLICATION_ADMISSION = Machine(
+    "publication_admission",
+    states=(
+        ADMISSION_ABSENT,
+        ADMISSION_PENDING,
+        ADMISSION_ERROR,
+        ADMISSION_ADMITTED,
+        ADMISSION_EXTERNAL,
+        ADMISSION_REFUSED,
+    ),
+    edges=(
+        (ADMISSION_ABSENT, ADMISSION_PENDING),
+        (ADMISSION_PENDING, ADMISSION_PENDING),
+        (ADMISSION_PENDING, ADMISSION_ERROR),
+        (ADMISSION_PENDING, ADMISSION_ADMITTED),
+        (ADMISSION_PENDING, ADMISSION_EXTERNAL),
+        (ADMISSION_PENDING, ADMISSION_REFUSED),
+        (ADMISSION_ADMITTED, ADMISSION_ERROR),
+        (ADMISSION_ADMITTED, ADMISSION_REFUSED),
+        (ADMISSION_ADMITTED, ADMISSION_EXTERNAL),
+        (ADMISSION_ERROR, ADMISSION_ERROR),
+        (ADMISSION_ERROR, ADMISSION_PENDING),
+        (ADMISSION_ERROR, ADMISSION_ADMITTED),
+        (ADMISSION_ERROR, ADMISSION_EXTERNAL),
+        (ADMISSION_ERROR, ADMISSION_REFUSED),
+        (ADMISSION_ADMITTED, ADMISSION_ADMITTED),
+        (ADMISSION_ADMITTED, ADMISSION_PENDING),
+        (ADMISSION_EXTERNAL, ADMISSION_EXTERNAL),
+        (ADMISSION_EXTERNAL, ADMISSION_PENDING),
+        (ADMISSION_EXTERNAL, ADMISSION_ERROR),
+        (ADMISSION_EXTERNAL, ADMISSION_REFUSED),
+        (ADMISSION_REFUSED, ADMISSION_REFUSED),
+        (ADMISSION_REFUSED, ADMISSION_PENDING),
+        # External ownership can become true after a previous refusal once the
+        # operator adds the relation to the publication; no Flight ALTER is needed.
+        (ADMISSION_REFUSED, ADMISSION_EXTERNAL),
+    ),
+    terminal=(),
+    initial=ADMISSION_ABSENT,
+    durable="_cdc_flight.source_relations.admission_state",
+    purpose=(
+        "Has a newly discovered relation been admitted to the source publication, "
+        "and who owns the admission decision?"
+    ),
+)
+
+
+# --------------------------------------------------------------------------- #
+# SM-F3 · CatalogSchemaLiveness — memory, refreshed per catalog observation
+# --------------------------------------------------------------------------- #
+SCHEMA_VISIBLE = "visible"
+SCHEMA_EMPTY = "empty"
+SCHEMA_UNAVAILABLE = "unavailable"
+SCHEMA_ERROR = "error"
+
+CATALOG_SCHEMA_LIVENESS = Machine(
+    "catalog_schema_liveness",
+    states=(SCHEMA_VISIBLE, SCHEMA_EMPTY, SCHEMA_UNAVAILABLE, SCHEMA_ERROR),
+    edges=tuple(
+        (before, after)
+        for before in (SCHEMA_VISIBLE, SCHEMA_EMPTY, SCHEMA_UNAVAILABLE, SCHEMA_ERROR)
+        for after in (SCHEMA_VISIBLE, SCHEMA_EMPTY, SCHEMA_UNAVAILABLE, SCHEMA_ERROR)
+    ),
+    terminal=(),
+    initial=SCHEMA_UNAVAILABLE,
+    durable=None,
+    purpose=(
+        "Does this watched schema provide positive catalog visibility before a "
+        "relation absence may be interpreted as a drop?"
+    ),
+)
+
+
+# --------------------------------------------------------------------------- #
+# SM-F4 · SchemaRefusal — durable, `_cdc_flight.schema_refusals.state`
+# --------------------------------------------------------------------------- #
+REFUSAL_ABSENT = "absent"
+REFUSAL_PENDING = "pending"
+REFUSAL_RESOLVED = "resolved"
+
+SCHEMA_REFUSAL = Machine(
+    "schema_refusal",
+    states=(REFUSAL_ABSENT, REFUSAL_PENDING, REFUSAL_RESOLVED),
+    edges=(
+        (REFUSAL_ABSENT, REFUSAL_PENDING),
+        (REFUSAL_PENDING, REFUSAL_PENDING),
+        (REFUSAL_PENDING, REFUSAL_RESOLVED),
+        (REFUSAL_RESOLVED, REFUSAL_RESOLVED),
+        (REFUSAL_RESOLVED, REFUSAL_PENDING),
+    ),
+    terminal=(REFUSAL_RESOLVED,),
+    initial=REFUSAL_ABSENT,
+    durable="_cdc_flight.schema_refusals.state",
+    purpose=(
+        "Has a schema transition been refused with a durable remediation obligation, "
+        "and has that obligation been discharged?"
     ),
 )
 

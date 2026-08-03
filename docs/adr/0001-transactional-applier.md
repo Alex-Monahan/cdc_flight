@@ -2875,6 +2875,71 @@ persistence: **memory only** · initial: `observed` · terminal: `applied`, `sup
 | `unconfirmed` | `superseded` | yes |
 | `unconfirmed` | `unconfirmed` | no |
 
+**`publication_admission`** — Has a newly discovered relation been admitted to the source publication, and who owns the admission decision?
+
+persistence: `_cdc_flight.source_relations.admission_state` · initial: `absent` · terminal: none
+
+| from | to | terminal |
+|---|---|---|
+| `absent` | `pending` | no |
+| `admitted` | `admitted` | no |
+| `admitted` | `error` | no |
+| `admitted` | `external` | no |
+| `admitted` | `pending` | no |
+| `admitted` | `refused` | no |
+| `error` | `admitted` | no |
+| `error` | `error` | no |
+| `error` | `external` | no |
+| `error` | `pending` | no |
+| `error` | `refused` | no |
+| `external` | `error` | no |
+| `external` | `external` | no |
+| `external` | `pending` | no |
+| `external` | `refused` | no |
+| `pending` | `admitted` | no |
+| `pending` | `error` | no |
+| `pending` | `external` | no |
+| `pending` | `pending` | no |
+| `pending` | `refused` | no |
+| `refused` | `external` | no |
+| `refused` | `pending` | no |
+| `refused` | `refused` | no |
+
+**`catalog_schema_liveness`** — Does this watched schema provide positive catalog visibility before a relation absence may be interpreted as a drop?
+
+persistence: `memory only` · initial: `unavailable` · terminal: none
+
+| from | to | terminal |
+|---|---|---|
+| `empty` | `empty` | no |
+| `empty` | `error` | no |
+| `empty` | `unavailable` | no |
+| `empty` | `visible` | no |
+| `error` | `empty` | no |
+| `error` | `error` | no |
+| `error` | `unavailable` | no |
+| `error` | `visible` | no |
+| `unavailable` | `empty` | no |
+| `unavailable` | `error` | no |
+| `unavailable` | `unavailable` | no |
+| `unavailable` | `visible` | no |
+| `visible` | `empty` | no |
+| `visible` | `error` | no |
+| `visible` | `unavailable` | no |
+| `visible` | `visible` | no |
+
+**`schema_refusal`** — Has a schema transition been refused with a durable remediation obligation, and has that obligation been discharged?
+
+persistence: `_cdc_flight.schema_refusals.state` · initial: `absent` · terminal: resolved
+
+| from | to | terminal |
+|---|---|---|
+| `absent` | `pending` | no |
+| `pending` | `pending` | no |
+| `pending` | `resolved` | yes |
+| `resolved` | `pending` | no |
+| `resolved` | `resolved` | yes |
+
 **`catalog_baseline`** — Can the relation identities this run observes be related to the rows the destination already holds, or must they be reconciled before they are adopted?
 
 persistence: `_cdc_flight.catalog_baseline.state` · initial: `absent` · terminal: *none — a confirmed baseline becomes unconfirmed again the moment the next run starts, which is why `valid` is not terminal*
@@ -2982,7 +3047,7 @@ persistence: `.cdc_instances/{instance}` plus its parent completion record · in
 | 31 | — | inconsistent Debezium transaction metadata (`TransactionAssemblyError`) | the assembler's own guarded state machine refuses | as 30 | as 30 | **UNDEFINED** — 4.3 |
 | 32 | — | `ResumePointDrift`: the offsets file disagrees with the durable point after COMMIT | assertion | run fails; the next run's reconciliation rebuilds the file from the destination | the data is already durable | AUTO |
 | 32b | — | `ResumePointDrift`: a snapshot record with no arrival ordinal | assertion | none — an internal invariant, not a repairable state | nothing wrong is written | **UNDEFINED** |
-| 33 | — | publication dropped / privileges revoked at the source | connector fails to start | run fails and repeats | nothing wrong is written | **MANUAL** (correctly — but 4.1 may want auto-recreate) |
+| 33 | publication_admission: admitted -> error | publication dropped / privileges revoked at the source | connector fails to start | run fails and repeats | nothing wrong is written | **MANUAL** (correctly — but 4.1 may want auto-recreate) |
 | 35 | table_lifecycle: in_progress -> awaiting_snapshot | re-snapshot yields no consistent point on ONE attempt | `resnapshot` refuses | run fails; tables stay owed; next run retries | nothing swapped | AUTO |
 | 35b | table_lifecycle: in_progress -> awaiting_snapshot | re-snapshot **persistently** yields no consistent point | the same failure every run | none; it repeats for ever | nothing swapped | **UNDEFINED** |
 | 36 | run_outcome: max_seconds -> hung | engine `close()` hangs / engine thread will not stop | `close_timeout`, 60 s join | run fails; process exits via the JVM watchdog | n/a (memory) — and it can no longer overwrite `source_dark` | AUTO |
@@ -2991,7 +3056,7 @@ persistence: `.cdc_instances/{instance}` plus its parent completion record · in
 | 39 | — | WAL retained until the slot is consumed (source disk pressure) | not detected here | — | — | **UNDEFINED** — 3.6/4.4 |
 | 40 | — | throwaway `_rs` slot leaked by ANY failure of a re-snapshot | swept by name at **every** start-up of the owning pipeline, plus a `try/finally` | dropped | no WAL held beyond the next run of that pipeline | AUTO |
 | 41 | slot_verdict (domain) | `CDC_RESNAPSHOT=0` | the operator set it | rows 12-17 and 21-24 stop being automatic and raise instead | nothing mutated | **MANUAL** (deliberate: the rubric's 4 instead of its 5) |
-| 42 | table_lifecycle: complete -> awaiting_snapshot | `CDC_AMBIGUOUS_RESNAPSHOT=0`, or an undecidable fold that did not name a table, or a re-snapshot request that could not be recorded | the fold refuses and the queue write fails or is disabled | none; the same transaction replays and fails identically for ever | nothing wrong is written | **MANUAL** |
+| 42 | schema_refusal: absent -> pending | `CDC_AMBIGUOUS_RESNAPSHOT=0`, or an undecidable fold that did not name a table, or a re-snapshot request that could not be recorded | the fold refuses and the queue write fails or is disabled | none; the same transaction replays and fails identically for ever | nothing wrong is written | **MANUAL** |
 | 43 | table_lifecycle: in_progress -> awaiting_snapshot | the two readings of the re-snapshot's consistent point disagree | `agree_on_consistent_point` | run fails; the tables are re-marked `awaiting_snapshot`; next run takes a fresh `C` | nothing swapped, nothing fenced | AUTO |
 | 44 | acquisition_recovery: resume_point_deleted -> armed | the load-bearing slot cannot be dropped on ONE attempt (another backend holds it) | `drop_slot` neither returns `dropped` nor `absent` | `RecoveryFailed`; the journal is intact and the next run retries the same phase | before: the journal stays at `resume_point_deleted` and the slot survives · after: `armed` | AUTO |
 | 44b | acquisition_recovery: resume_point_deleted -> armed | the load-bearing slot can **never** be dropped (the holder never lets go) | the same `RecoveryFailed` every run | none; a human has to free the slot | nothing snapshotted against a surviving slot | **MANUAL** |
@@ -3321,7 +3386,7 @@ machine is ceremony — worse than ceremony, because it advertises recoverable i
 states that do not exist. If yes, the state needs a name, a persisted value and a
 transition table.
 
-#### What was built (nine focused machines + one precedence)
+#### What was built (twelve focused machines + one precedence)
 
 | machine | owns | states | edges | persistence |
 |---|---|---|---|---|
@@ -3332,6 +3397,9 @@ transition table.
 | `interruption_marker` | has filesystem recovery intent been armed, safely discharged, and retired | 3 | 3 | `<state_dir>/resnapshot/interrupted.json.state` |
 | `destination_ownership` | who owns the destination after callback admission or failed quiescence | 4 | 5 | **memory only** |
 | `catalog_change` | where is one DDL fact in observe → confirm → fence → apply | 9 | 30 | **memory only** |
+| `publication_admission` | has a discovered relation been admitted to the publication, and who owns that decision | 6 | 23 | `_cdc_flight.source_relations.admission_state` |
+| `catalog_schema_liveness` | is a watched schema visibly queryable before absence can mean a drop | 4 | 16 | **memory only** |
+| `schema_refusal` | has a refused schema transition acquired a durable remediation obligation | 3 | 5 | `_cdc_flight.schema_refusals.state` |
 | `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
 | `snapshot_completion` | have all ordered snapshot callbacks arrived | 6 | 9 | **memory only** |
 | `runtime_root_lifecycle` | is the disposable root reusable or committed to cleanup | 6 | 10 | project-local root and parent markers |
