@@ -583,8 +583,15 @@ def run(
         # Imported late: importing pydbzengine boots a JVM.
         from .engine import SupervisedDebeziumEngine
 
+        # A journalled recovery forces the MAIN engine into a data-reading snapshot even
+        # when the interrupted run already committed a durable first group. In that case
+        # `will_snapshot_everything` is false by design (the resume point is non-zero),
+        # but the recovery snapshot's callbacks are still required evidence. The
+        # throwaway re-snapshot has its own required completion machine; an ordinary
+        # streaming run remains `not_required` here.
+        snapshot_completion_required = will_snapshot_everything or journal is not None
         snapshot_completion = SnapshotCompletion.for_capture(
-            will_snapshot_everything, schema=source.schema, tables=source.tables)
+            snapshot_completion_required, schema=source.schema, tables=source.tables)
         applier = Applier(
             con,
             pipeline=dest.pipeline_name,
