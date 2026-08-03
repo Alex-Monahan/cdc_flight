@@ -98,3 +98,42 @@ def test_mass_discovery_adds_are_safe_but_alerted():
     assert all(not action.destructive for action in plan.actions)
     assert [alert["code"] for alert in plan.alerts] == ["mass_add_observed"]
     assert plan.alerts[0]["context"]["safe_default"] is True
+
+
+def test_failed_publication_admission_is_retried_and_remains_visible():
+    """BLOCKER reproduction: a failed ADD must not disappear on the next poll."""
+
+    watcher = CatalogWatcher(
+        dsn="",
+        publication="cdc_flight_pub",
+        schema="app",
+        auto_discover=True,
+        include=set(),
+        poll_seconds=0,
+    )
+    change = CatalogChange(
+        kind=CHANGE_NEW,
+        schema="app",
+        table="arrival",
+        detected_lsn=100,
+        new_relation=relation("app", "arrival", 2, published=False),
+    )
+    watcher.known["app.arrival"] = change.new_relation
+    watcher.queue(change)
+
+    class FailingConnection:
+        attempts = 0
+
+        def execute(self, sql):
+            if "ALTER PUBLICATION" in sql:
+                self.attempts += 1
+                raise RuntimeError("publication is read-only")
+
+    conn = FailingConnection()
+    observed = {"app.arrival": change.new_relation}
+    watcher._ensure_published(conn, observed, [change])
+    watcher._ensure_published(conn, observed, [])
+
+    assert conn.attempts == 2
+    assert watcher.new_relations() == ()
+    assert watcher.pending_admission() == ("app.arrival",)

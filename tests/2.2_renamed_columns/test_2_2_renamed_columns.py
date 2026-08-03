@@ -123,3 +123,37 @@ def test_late_rename_is_idempotent_when_the_new_name_already_arrived(tmp_path):
         ]
     finally:
         con.close()
+
+
+def test_rename_then_drop_of_the_old_destination_name_preserves_the_rename(tmp_path):
+    """BLOCKER reproduction: a same-group rename/drop is identity ordered."""
+
+    con = duckdb.connect(str(tmp_path / "rename-name-reuse.duckdb"))
+    try:
+        con.execute("CREATE SCHEMA cdc_raw")
+        registry = SchemaRegistry(con, "cdc_raw")
+        registry.ensure(
+            "customers",
+            columns={"id": "BIGINT", "first_name": "VARCHAR", "last_name": "VARCHAR"},
+            key_columns=("id",),
+        )
+        con.execute(
+            'INSERT INTO "cdc_raw"."customers" VALUES (1, \'Ada\', \'Lovelace\')'
+        )
+
+        changes = diff_columns(
+            (col(1, "id", 20, "bigint"), col(2, "first_name"), col(3, "last_name")),
+            (col(1, "id", 20, "bigint"), col(2, "last_name")),
+        )
+        apply_column_changes(registry, "customers", changes)
+
+        assert con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'cdc_raw' AND table_name = 'customers' "
+            "ORDER BY ordinal_position"
+        ).fetchall() == [("id",), ("last_name",)]
+        assert con.execute(
+            'SELECT id, last_name FROM "cdc_raw"."customers"'
+        ).fetchall() == [(1, "Ada")]
+    finally:
+        con.close()
