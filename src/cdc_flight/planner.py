@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 
-from . import apply_sql, naming, table_work
+from . import apply_sql, destination, naming, table_work
 from .assembler import UNIT_CONTROL, UNIT_SNAPSHOT_CHUNK, CompleteUnit
 from .config import TRUNCATE_REPLICATE
 from .envelope import KIND_TRUNCATE, PendingRecord
@@ -82,6 +82,9 @@ class GroupPlan:
         self.source_tables: set[str] = set()
         #: `target -> (source_schema, source_table)` for tables created by this plan
         self.created_tables: dict[str, tuple[str, str]] = {}
+        #: source-image field presence for the late-rename NULL distinction.  Written
+        #: in the same destination transaction as the row plan.
+        self.column_presence: list[tuple[str, str, tuple[str, ...]]] = []
         self.truncates_applied = 0
         self.truncates_logged = 0
         self.staged_units = False
@@ -207,6 +210,14 @@ class GroupPlan:
         item = table_work.work_for(self.work, target, event, snapshot is not None)
         row = table_work.row_for(event, self.commit_id, event_id, snapshot=item.snapshot)
         table_work.collect(item, event, row, event_id, probe=self)
+        image = event.after if event.op != "d" else event.before
+        self.column_presence.append(
+            (
+                target,
+                event_id,
+                tuple(sorted(naming.normalize(column) for column in (image or {}))),
+            )
+        )
         self.source_tables.add(f"{event.schema}.{event.table}")
 
     def _count_event(self, event: PendingRecord) -> None:
@@ -327,7 +338,7 @@ class GroupPlan:
     # ------------------------------------------------------------------ #
     # writing
     # ------------------------------------------------------------------ #
-    def write(self, *, after_first_table=None) -> dict:
+    def write(self, *, after_first_table=None, clear_spill: bool = True) -> dict:
         """Apply every table's plan, then the snapshot swaps. Returns the stats.
 
         `after_first_table` is the `mid_apply` fault anchor: "some tables written,
@@ -354,7 +365,17 @@ class GroupPlan:
                     self.table_counts.get(item.target, 0) + item.events
                 )
 
-        if self.staged_units:
+        for target, event_id, columns in self.column_presence:
+            for column in columns:
+                destination.write_column_presence(
+                    self.con,
+                    target_dataset=self.registry.dataset,
+                    target_table=target,
+                    event_id=event_id,
+                    column_name=column,
+                )
+
+        if self.staged_units and clear_spill:
             self.spill.clear(self.commit_id)
 
         swaps = self.snapshots.states() if self._swap_all else self._swaps

@@ -85,6 +85,21 @@ class PostEngineCompletion:
         if self.watcher is not None:
             self._confirm_baseline(result, extra)
 
+        pending_refusals = dest_mod.pending_schema_refusals(
+            self.con, self.pipeline
+        )
+        if pending_refusals:
+            names = [f"{schema}.{table}" for schema, table, _reason in pending_refusals]
+            extra["schema_refusals_pending"] = names
+            self.outcome.record("catalog_unresolved")
+            result["stop_reason"] = self.outcome.value
+            raise EngineFailure(
+                "schema evolution refusal(s) remain unresolved at shutdown: "
+                + ", ".join(names)
+                + ". A complete replacement snapshot is required before success",
+                self._summary(result, extra),
+            )
+
         summary = self._summary(result, extra)
         return CompletionReport(summary=summary, run_ok=bool(result.get("ok")))
 

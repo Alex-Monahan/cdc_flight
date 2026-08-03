@@ -135,11 +135,57 @@ CONTROL_DDL = [
             source_table      VARCHAR     NOT NULL,
             relation_oid      BIGINT      NOT NULL,
             published         BOOLEAN     NOT NULL,
+            -- Publication membership and admission ownership are separate facts.
+            -- `admission_state` is the durable PUBLICATION_ADMISSION machine: a
+            -- failed or policy-refused discovery must remain visible across a quiet
+            -- run and a restart rather than looking like a completed snapshot.
+            admission_state  VARCHAR     NOT NULL DEFAULT 'external',
             replica_identity  VARCHAR,
             columns_json      VARCHAR,
             first_seen_at     TIMESTAMPTZ NOT NULL,
             last_seen_at      TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (pipeline, source_schema, source_table)
+        )""",
+    # A late rename can be observed after a row with the new name has already been
+    # applied.  NULL in that physical column is ambiguous: it may be an explicit
+    # source NULL or an absent field in a partial Debezium image.  The row path records
+    # field presence here inside the same destination transaction; the fenced rename
+    # consumes it before dropping the old physical name.
+    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.column_presence (
+            target_dataset  VARCHAR NOT NULL,
+            target_table    VARCHAR NOT NULL,
+            event_id        VARCHAR NOT NULL,
+            column_name     VARCHAR NOT NULL,
+            present         BOOLEAN NOT NULL,
+            PRIMARY KEY (target_dataset, target_table, event_id, column_name)
+        )""",
+    # A schema fold can be safely refused but must not become an infinite invisible
+    # retry.  This row is written after the failed data transaction rolls back and
+    # remains the operator/resnapshot obligation until explicitly discharged.
+    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.schema_refusals (
+            pipeline        VARCHAR NOT NULL,
+            source_schema   VARCHAR NOT NULL,
+            source_table    VARCHAR NOT NULL,
+            target_table    VARCHAR,
+            detected_lsn    BIGINT,
+            reason          VARCHAR NOT NULL,
+            state           VARCHAR NOT NULL DEFAULT 'pending',
+            refused_at      TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (pipeline, source_schema, source_table)
+        )""",
+    # Idempotency key for the post-swap snapshot discharge.  The shadow swap and the
+    # completion/audit projection are separate concerns, so a crash between them must
+    # be replayable without duplicate "new" or "resnapshot" facts.
+    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.snapshot_audits (
+            pipeline        VARCHAR NOT NULL,
+            source_schema   VARCHAR NOT NULL,
+            source_table    VARCHAR NOT NULL,
+            snapshot_lsn    BIGINT NOT NULL,
+            event           VARCHAR NOT NULL,
+            target_table    VARCHAR NOT NULL,
+            detail          VARCHAR,
+            recorded_at     TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (pipeline, source_schema, source_table, snapshot_lsn, event)
         )""",
     # rubric 1.9 / 1.5. Whether the pipeline can RELATE what it observes at the source
     # to the rows the destination already holds — `machines.CATALOG_BASELINE`.
@@ -323,6 +369,7 @@ _ADDED_COLUMNS = {
     ),
     "source_relations": (
         ("columns_json", "VARCHAR"),
+        ("admission_state", "VARCHAR NOT NULL DEFAULT 'external'"),
     ),
 }
 

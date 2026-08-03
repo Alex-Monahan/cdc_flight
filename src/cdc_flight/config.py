@@ -82,6 +82,23 @@ class SourceConfig:
     def auto_discovery(self) -> bool:
         return _flag("CDC_AUTO_DISCOVERY", True)
 
+    @property
+    def publication_ownership(self) -> str:
+        """Who may admit an auto-discovered table to the publication.
+
+        The default is deliberately explicit: the Flight owns the table-scoped
+        publication admission it performs. Deployments whose publication is managed
+        outside this process set ``CDC_PUBLICATION_OWNERSHIP=external``; in that mode
+        discovery waits for membership and never issues an ALTER.
+        """
+        value = _env("CDC_PUBLICATION_OWNERSHIP", "flight").strip().lower()
+        if value not in {"flight", "external"}:
+            raise ValueError(
+                "CDC_PUBLICATION_OWNERSHIP must be 'flight' or 'external', "
+                f"got {value!r}"
+            )
+        return value
+
 
 @dataclass(frozen=True)
 class ReplicationConfig:

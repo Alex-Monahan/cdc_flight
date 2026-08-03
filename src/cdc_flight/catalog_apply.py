@@ -49,6 +49,7 @@ from .catalog import (
     CatalogChange,
 )
 from .config import DROP_IGNORE, DROP_REPLICATE
+from .errors import SchemaEvolutionRefused
 from .machines import CHANGE_APPLIED, CHANGE_REFUSED
 from .schema_evolution import apply_column_changes
 
@@ -397,7 +398,18 @@ class CatalogCoordinator:
         for action in plan.actions:
             change = action.change
             if change.kind == CHANGE_SCHEMA:
-                apply_column_changes(self.registry, action.target, change.column_changes)
+                try:
+                    apply_column_changes(
+                        self.registry, action.target, change.column_changes
+                    )
+                except SchemaEvolutionRefused as refused:
+                    refused.source_schema = refused.source_schema or change.schema
+                    refused.source_table = refused.source_table or change.table
+                    refused.target = refused.target or action.target
+                    refused.detected_lsn = (
+                        refused.detected_lsn or change.detected_lsn
+                    )
+                    raise
                 stats["tables"].add(action.target)
             if action.destructive:
                 # The shadow goes too: a table dropped mid-backfill would otherwise
@@ -469,6 +481,7 @@ class CatalogCoordinator:
                 source_table=relation.table,
                 relation_oid=relation.oid,
                 published=relation.published,
+                admission_state=relation.admission_state or "external",
                 replica_identity=relation.replica_identity,
                 columns=relation.columns,
             )
@@ -507,30 +520,70 @@ class CatalogCoordinator:
             stable_keys = tuple(
                 key for key in table.key_columns if key in source_names
             )
-            if len(stable_keys) == len(table.key_columns) and stable_keys:
-                rows = self.catalog.read_columns(
-                    change.new_relation,
-                    stable_keys,
-                    value_columns,
-                )
-                self.registry.backfill_columns(
+            try:
+                if len(stable_keys) == len(table.key_columns) and stable_keys:
+                    rows = self.catalog.read_columns(
+                        change.new_relation,
+                        stable_keys,
+                        value_columns,
+                    )
+                    if not rows:
+                        defaults = self._missing_defaults(
+                            change.new_relation, value_columns
+                        )
+                        if defaults is not None:
+                            self.registry.backfill_constant_columns(
+                                action.target,
+                                value_columns=value_columns,
+                                rows=[defaults],
+                            )
+                            continue
+                    self.registry.backfill_columns(
+                        action.target,
+                        key_columns=stable_keys,
+                        value_columns=value_columns,
+                        rows=rows,
+                    )
+                    continue
+
+                # Keyless CDC rows are intentionally keyed by the connector event id,
+                # not by source row content.  There is no honest per-row join for an
+                # ADD, but a uniform source value can be applied to the complete
+                # changelog without fabricating identity.
+                rows = self.catalog.read_columns(change.new_relation, (), value_columns)
+                if not rows:
+                    defaults = self._missing_defaults(change.new_relation, value_columns)
+                    if defaults is not None:
+                        self.registry.backfill_constant_columns(
+                            action.target,
+                            value_columns=value_columns,
+                            rows=[defaults],
+                        )
+                        continue
+                self.registry.backfill_constant_columns(
                     action.target,
-                    key_columns=stable_keys,
                     value_columns=value_columns,
                     rows=rows,
                 )
-                continue
+            except SchemaEvolutionRefused as refused:
+                refused.source_schema = refused.source_schema or change.schema
+                refused.source_table = refused.source_table or change.table
+                refused.target = refused.target or action.target
+                refused.detected_lsn = refused.detected_lsn or change.detected_lsn
+                raise
 
-            # Keyless CDC rows are intentionally keyed by the connector event id, not
-            # by source row content.  There is no honest per-row join for an ADD, but
-            # PostgreSQL's ordinary ADD default/NULL case is uniform and can be
-            # applied to the complete changelog without fabricating identity.
-            rows = self.catalog.read_columns(change.new_relation, (), value_columns)
-            self.registry.backfill_constant_columns(
-                action.target,
-                value_columns=value_columns,
-                rows=rows,
-            )
+    @staticmethod
+    def _missing_defaults(relation, value_columns: tuple[str, ...]) -> tuple | None:
+        by_name = {
+            naming.normalize(column.name): column for column in relation.columns
+        }
+        values = []
+        for name in value_columns:
+            column = by_name.get(name)
+            if column is None or not column.has_missing_default:
+                return None
+            values.append(column.missing_value)
+        return tuple(values)
 
     # ------------------------------------------------------------------ #
     # after COMMIT

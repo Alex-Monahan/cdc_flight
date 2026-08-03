@@ -35,7 +35,11 @@ import logging
 import math
 from typing import Any
 
-from .errors import DestinationIdentityCollision
+from .errors import (
+    DestinationIdentityCollision,
+    SchemaBackfillRefused,
+    SchemaEvolutionRefused,
+)
 from .naming import (
     CDCF_COMMIT_ID,
     CDCF_EVENT_ID,
@@ -218,6 +222,7 @@ class SchemaRegistry:
         *,
         columns: dict[str, str],
         key_columns: tuple[str, ...],
+        strict: bool = False,
     ) -> tuple[TableSchema, bool]:
         """`(schema, created_now)`. `created_now` lets the caller skip the DELETE
         half of a merge against a table it just created."""
@@ -236,14 +241,31 @@ class SchemaRegistry:
             existing = table.columns.get(col)
             if existing is None:
                 # rubric 2.1 - an added source column must simply appear.
-                self.con.execute(
-                    f"ALTER TABLE {table.qualified} ADD COLUMN {quote(col)} {ctype}"
-                )
+                try:
+                    self.con.execute(
+                        f"ALTER TABLE {table.qualified} ADD COLUMN {quote(col)} {ctype}"
+                    )
+                except Exception as exc:
+                    if strict:
+                        raise SchemaEvolutionRefused(
+                            f"cannot add source column {name}.{col}: destination DDL "
+                            "failed, so the catalog baseline cannot be persisted",
+                            target=name,
+                        ) from exc
+                    raise
                 table.columns[col] = ctype
                 table.raw_types[col] = ctype
                 continue
             widened = widen(existing, ctype)
             if widened == existing:
+                if strict and existing != ctype:
+                    raise SchemaEvolutionRefused(
+                        f"cannot apply schema change to {name}.{col}: destination "
+                        f"type {existing} cannot adopt source type {ctype} through "
+                        "the safe widening lattice; refusing to persist an unadopted "
+                        "catalog baseline",
+                        target=name,
+                    )
                 continue
             raw = table.raw_types.get(col, existing)
             if raw not in _RECOGNISED_TYPES:
@@ -251,11 +273,14 @@ class SchemaRegistry:
                 # to VARCHAR, so an "upgrade" computed from that lattice can narrow a
                 # real TIMESTAMP column to text. Refuse explicitly instead of doing it
                 # by accident; rubric 2.4/2.5 own the real answer (Opus MINOR-15).
-                log.warning(
-                    "not altering %s.%s: the destination type %s is outside the type "
-                    "lattice, so widening it to %s could narrow it (rubric 2.4/2.5)",
-                    name, col, raw, widened,
+                message = (
+                    f"cannot apply schema change to {name}.{col}: destination type "
+                    f"{raw} is outside the safe widening lattice; refusing to persist "
+                    f"a catalog baseline as {widened}"
                 )
+                if strict:
+                    raise SchemaEvolutionRefused(message, target=name)
+                log.warning(message)
                 continue
             try:
                 self.con.execute(
@@ -265,10 +290,13 @@ class SchemaRegistry:
                 table.columns[col] = widened
                 table.raw_types[col] = widened
             except Exception as exc:  # rubric 2.5 owns the real answer
-                log.warning(
-                    "could not widen %s.%s from %s to %s: %s",
-                    name, col, existing, widened, exc,
+                message = (
+                    f"could not apply schema change to {name}.{col}: cannot widen "
+                    f"{existing} to {widened}: {exc}"
                 )
+                if strict:
+                    raise SchemaEvolutionRefused(message, target=name) from exc
+                log.warning(message)
         return table, False
 
     def _create(
@@ -309,7 +337,23 @@ class SchemaRegistry:
         table = self.get(name)
         if not table.exists or column not in table.columns:
             return
-        self.con.execute(f"ALTER TABLE {table.qualified} DROP COLUMN {quote(column)}")
+        if column in table.key_columns:
+            raise SchemaEvolutionRefused(
+                f"cannot drop primary-key column {name}.{column}: the source did not "
+                "provide a replacement identity, so the destination refuses to "
+                "continue without a lossless row key",
+                target=name,
+            )
+        try:
+            self.con.execute(
+                f"ALTER TABLE {table.qualified} DROP COLUMN {quote(column)}"
+            )
+        except Exception as exc:
+            raise SchemaEvolutionRefused(
+                f"cannot drop source column {name}.{column}: destination DDL failed, "
+                "so the catalog baseline cannot be persisted",
+                target=name,
+            ) from exc
         table.columns.pop(column, None)
         table.raw_types.pop(column, None)
         table.key_columns = tuple(c for c in table.key_columns if c != column)
@@ -334,28 +378,148 @@ class SchemaRegistry:
         old_exists = old in table.columns
         new_exists = new in table.columns
         if old_exists and not new_exists:
-            self.con.execute(
-                f"ALTER TABLE {table.qualified} RENAME COLUMN {quote(old)} TO {quote(new)}"
-            )
+            try:
+                self.con.execute(
+                    f"ALTER TABLE {table.qualified} RENAME COLUMN {quote(old)} "
+                    f"TO {quote(new)}"
+                )
+            except Exception as exc:
+                raise SchemaEvolutionRefused(
+                    f"cannot rename source column {name}.{old} -> {new}: destination "
+                    "DDL failed, so the catalog baseline cannot be persisted",
+                    target=name,
+                ) from exc
             table.columns[new] = table.columns.pop(old)
             table.raw_types[new] = table.raw_types.pop(old)
         elif old_exists and new_exists:
             # Prefer the already-arriving new image; fall back to the old value for rows
             # that predate the catalog poll. This is the only safe merge for a rename
             # whose source values are allowed to be NULL.
-            self.con.execute(
-                f"UPDATE {table.qualified} SET {quote(new)} = "
-                f"COALESCE({quote(new)}, {quote(old)})"
-            )
-            self.con.execute(f"ALTER TABLE {table.qualified} DROP COLUMN {quote(old)}")
-            table.columns.pop(old, None)
-            table.raw_types.pop(old, None)
+            # A NULL in the new-name column is a real source value, not proof that the
+            # new field was absent.  The presence journal is written with each CDC row
+            # inside its commit group; only rows with no explicit new-name field fall
+            # back to the old physical column.  Direct unit callers without the
+            # journal retain the conservative old COALESCE behavior for compatibility.
+            if CDCF_EVENT_ID in table.columns:
+                self.con.execute(
+                    f"UPDATE {table.qualified} AS t SET {quote(new)} = {quote(old)} "
+                    f"WHERE NOT EXISTS (SELECT 1 FROM {quote('_cdc_flight')}."
+                    f"{quote('column_presence')} AS p "
+                    f"WHERE p.target_dataset = ? AND p.target_table = ? "
+                    f"AND p.event_id = t.{quote(CDCF_EVENT_ID)} "
+                    f"AND p.column_name = ? AND p.present)",
+                    [self.dataset, table.name, new],
+                )
+            else:
+                self.con.execute(
+                    f"UPDATE {table.qualified} SET {quote(new)} = "
+                    f"COALESCE({quote(new)}, {quote(old)})"
+                )
+            key_was_renamed = old in table.key_columns
+            if key_was_renamed and table.constrained:
+                # DuckDB/MotherDuck do not support DROP CONSTRAINT for a primary key.
+                # Rebuild the table inside the caller's transaction so the new identity
+                # is validated before the old table is removed.  A duplicate new key
+                # therefore raises while the old table still exists and the enclosing
+                # commit group can roll back the whole schema change.
+                new_key_columns = tuple(new if c == old else c for c in table.key_columns)
+                self._rebuild_with_primary_key(
+                    table,
+                    drop_column=old,
+                    key_columns=new_key_columns,
+                )
+            else:
+                try:
+                    self.con.execute(
+                        f"ALTER TABLE {table.qualified} DROP COLUMN {quote(old)}"
+                    )
+                except Exception as exc:
+                    raise SchemaEvolutionRefused(
+                        f"cannot finish late rename {name}.{old} -> {new}: destination "
+                        "DDL failed, so the catalog baseline cannot be persisted",
+                        target=name,
+                    ) from exc
+                table.columns.pop(old, None)
+                table.raw_types.pop(old, None)
+            if CDCF_EVENT_ID in table.columns:
+                self.con.execute(
+                    f"DELETE FROM {quote('_cdc_flight')}."
+                    f"{quote('column_presence')} "
+                    "WHERE target_dataset = ? AND target_table = ? AND column_name = ?",
+                    [self.dataset, table.name, new],
+                )
         # If only the new name remains, an earlier group already performed the
         # idempotent late-rename merge. If neither remains, the source relation may have
         # produced no row carrying either shape; the catalog action remains harmless.
         table.key_columns = tuple(new if c == old else c for c in table.key_columns)
-        if old in table.key_columns:
-            table.key_columns = tuple(c for c in table.key_columns if c != old)
+
+    def _rebuild_with_primary_key(
+        self,
+        table: TableSchema,
+        *,
+        drop_column: str,
+        key_columns: tuple[str, ...],
+    ) -> None:
+        """Recreate a constrained table when its identity column is renamed.
+
+        DuckDB has no ``DROP CONSTRAINT`` implementation.  The temporary table is
+        created with the replacement key before the source table is dropped, so a
+        uniqueness failure cannot leave a destination with neither identity nor data.
+        The caller owns the transaction; the table-cache update happens only after all
+        physical statements succeed.
+        """
+        columns = {
+            column: type_name
+            for column, type_name in table.columns.items()
+            if column != drop_column
+        }
+        raw_types = {
+            column: table.raw_types.get(column, type_name)
+            for column, type_name in columns.items()
+        }
+        if not key_columns or any(column not in columns for column in key_columns):
+            raise SchemaEvolutionRefused(
+                f"cannot rebind primary-key identity {drop_column!r} on {table.name}: "
+                "the replacement key is not present in the destination schema",
+                target=table.name,
+            )
+        temp_name = f"{table.name}__cdcf_pk_rebind"
+        definitions = ", ".join(
+            f"{quote(column)} {raw_types[column]}" for column in columns
+        )
+        key_sql = ", ".join(quote(column) for column in key_columns)
+        try:
+            self.con.execute(
+                f"CREATE TABLE {quote(self.dataset)}.{quote(temp_name)} "
+                f"({definitions}, PRIMARY KEY ({key_sql}))"
+            )
+            column_sql = ", ".join(quote(column) for column in columns)
+            self.con.execute(
+                f"INSERT INTO {quote(self.dataset)}.{quote(temp_name)} ({column_sql}) "
+                f"SELECT {column_sql} FROM {table.qualified}"
+            )
+            self.con.execute(f"DROP TABLE {table.qualified}")
+            self.con.execute(
+                f"ALTER TABLE {quote(self.dataset)}.{quote(temp_name)} "
+                f"RENAME TO {quote(table.name)}"
+            )
+        except Exception as exc:
+            try:
+                self.con.execute(
+                    f"DROP TABLE IF EXISTS {quote(self.dataset)}.{quote(temp_name)}"
+                )
+            except Exception:  # pragma: no cover - the caller rolls back the transaction
+                log.debug("could not clean up failed PK-rebind table", exc_info=True)
+            raise SchemaEvolutionRefused(
+                f"cannot rebind primary-key identity {drop_column!r} -> "
+                f"{key_columns!r} on {table.name}: the destination identity is not "
+                "unique or the table could not be rebuilt",
+                target=table.name,
+            ) from exc
+        table.columns = columns
+        table.raw_types = raw_types
+        table.key_columns = key_columns
+        table.constrained = True
 
     def backfill_columns(
         self,
@@ -421,7 +585,7 @@ class SchemaRegistry:
         common case has a safe all-rows operation; a non-uniform source is rejected by
         the caller before this update runs.
         """
-        if not value_columns or not rows:
+        if not value_columns:
             return
         table = self.get(name)
         if not table.exists:
@@ -429,9 +593,21 @@ class SchemaRegistry:
         value_columns = tuple(column for column in value_columns if column in table.columns)
         if not value_columns:
             return
+        if not rows:
+            destination_rows = self.con.execute(
+                f"SELECT count(*) FROM {table.qualified}"
+            ).fetchone()[0]
+            if destination_rows:
+                raise SchemaBackfillRefused(
+                    f"cannot backfill keyless table {name}: the source returned no "
+                    f"rows for an added column while {destination_rows} destination "
+                    "changelog rows already exist; no stable identity or source value "
+                    "proves what those rows should contain"
+                )
+            return
         values = tuple(rows[0][: len(value_columns)])
         if any(tuple(row[: len(value_columns)]) != values for row in rows[1:]):
-            raise ValueError(
+            raise SchemaBackfillRefused(
                 f"cannot backfill keyless table {name}: added-column values are not "
                 "uniform and the source has no stable row identity"
             )

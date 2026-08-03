@@ -41,6 +41,7 @@ def upsert_source_relation(
     relation_oid: int,
     published: bool,
     replica_identity: str | None,
+    admission_state: str = "external",
     columns=(),
 ) -> None:
     """Record what the source catalog says, inside the commit group's transaction.
@@ -63,10 +64,11 @@ def upsert_source_relation(
     con.execute(
         f"INSERT INTO {CONTROL_SCHEMA}.source_relations "
         "(pipeline, source_schema, source_table, relation_oid, published, "
-        " replica_identity, columns_json, first_seen_at, last_seen_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?)",
+        " admission_state, replica_identity, columns_json, first_seen_at, last_seen_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
         [
             pipeline, source_schema, source_table, relation_oid, published,
+            admission_state,
             replica_identity,
             json.dumps(
                 [
@@ -76,6 +78,12 @@ def upsert_source_relation(
                         "type_oid": column.type_oid,
                         "type_name": column.type_name,
                         "nullable": column.nullable,
+                        "has_missing_default": column.has_missing_default,
+                        "missing_value_text": (
+                            str(column.missing_value)
+                            if column.has_missing_default and column.missing_value is not None
+                            else None
+                        ),
                     }
                     for column in columns
                 ],
@@ -147,6 +155,7 @@ def flush_learned_relations(
                 relation_oid=relation.oid,
                 published=relation.published,
                 replica_identity=relation.replica_identity,
+                admission_state=relation.admission_state or "pending",
                 columns=relation.columns,
             )
         con.execute("COMMIT")

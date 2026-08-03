@@ -393,8 +393,11 @@ def run(
             completion=completion,
         )
         ownership.attach(applier)
+        # Keep the historical pipeline seam: tests and embedding callers replace
+        # the bounded runner there, while production still resolves to the
+        # supervisor implementation re-exported by pipeline.py.
+        from . import pipeline as pipeline_mod
         from .engine import SupervisedDebeziumEngine
-        from .pipeline import run_engine_bounded
 
         engine = SupervisedDebeziumEngine(
             properties=props,
@@ -409,7 +412,7 @@ def run(
         ).start()
         ownership.activate(applier)
         try:
-            summary = run_engine_bounded(
+            summary = pipeline_mod.run_engine_bounded(
                 engine,
                 applier,
                 dataclasses.replace(
@@ -687,47 +690,72 @@ def _completed_tables(
             con, pipeline=pipeline, source_schema=schema, source_table=table
         )
         if state == table_lifecycle.COMPLETE:
-            con.execute(
-                f"UPDATE {CONTROL_SCHEMA}.table_state SET snapshot_lsn = ? "
-                "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
-                [consistent_lsn, pipeline, schema, table],
+            resnapshot_detail = (
+                f"re-snapshotted at consistent point {consistent_lsn} ({reason}). "
+                "The table holds exact current state; change events of transactions "
+                "that committed before this LSN are fenced rather than applied, so "
+                "per-event history for that span is the snapshot image and not the "
+                "individual events (rubric 8.2's changelog is discontinuous here)."
             )
-            dest_mod.write_table_event(
-                con,
-                pipeline=pipeline,
-                commit_id=0,
-                seq=0,
-                event="resnapshot",
-                source_schema=schema,
-                source_table=table,
-                target_table=target,
-                applied=True,
-                lsn=consistent_lsn,
-                detail=(
-                    f"re-snapshotted at consistent point {consistent_lsn} ({reason}). "
-                    "The table holds exact current state; change events of transactions "
-                    "that committed before this LSN are fenced rather than applied, so "
-                    "per-event history for that span is the snapshot image and not the "
-                    "individual events (rubric 8.2's changelog is discontinuous here)."
-                ),
-            )
-            if f"{schema}.{table}" in discovered:
-                dest_mod.write_table_event(
+            con.execute("BEGIN TRANSACTION")
+            try:
+                # State projection and its audit are one post-swap transaction.  The
+                # snapshot may already be complete from the shadow commit, so a crash
+                # before this block is harmless: the idempotency keys make the next
+                # discharge produce exactly the missing projection once.
+                con.execute(
+                    f"UPDATE {CONTROL_SCHEMA}.table_state SET snapshot_lsn = ? "
+                    "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+                    [consistent_lsn, pipeline, schema, table],
+                )
+                for event, seq, detail in (
+                    [("resnapshot", 0, resnapshot_detail)]
+                    + (
+                        [("new", 1, "new source relation discovered by the catalog "
+                          "watcher and snapshotted before streaming")]
+                        if f"{schema}.{table}" in discovered else []
+                    )
+                ):
+                    exists = con.execute(
+                        f"SELECT count(*) FROM {CONTROL_SCHEMA}.snapshot_audits "
+                        "WHERE pipeline = ? AND source_schema = ? AND source_table = ? "
+                        "AND snapshot_lsn = ? AND event = ?",
+                        [pipeline, schema, table, consistent_lsn, event],
+                    ).fetchone()[0]
+                    if exists:
+                        continue
+                    con.execute(
+                        f"INSERT INTO {CONTROL_SCHEMA}.snapshot_audits "
+                        "(pipeline, source_schema, source_table, snapshot_lsn, event, "
+                        "target_table, detail, recorded_at) VALUES (?,?,?,?,?,?,?,?)",
+                        [
+                            pipeline, schema, table, consistent_lsn, event, target,
+                            detail, dest_mod.now(),
+                        ],
+                    )
+                    dest_mod.write_table_event(
+                        con,
+                        pipeline=pipeline,
+                        commit_id=0,
+                        seq=seq,
+                        event=event,
+                        source_schema=schema,
+                        source_table=table,
+                        target_table=target,
+                        applied=True,
+                        lsn=consistent_lsn,
+                        detail=detail,
+                    )
+                dest_mod.resolve_schema_refusal(
                     con,
                     pipeline=pipeline,
-                    commit_id=0,
-                    seq=1,
-                    event="new",
                     source_schema=schema,
                     source_table=table,
-                    target_table=target,
-                    applied=True,
-                    lsn=consistent_lsn,
-                    detail=(
-                        "new source relation discovered by the catalog watcher and "
-                        "snapshotted before streaming"
-                    ),
                 )
+                con.execute("COMMIT")
+            except BaseException:
+                con.execute("ROLLBACK")
+                raise
             done.append(f"{schema}.{table}")
     return done
 
@@ -824,6 +852,12 @@ def finish_verified_empty_tables(
                     "destination table was emptied rather than swapped, and is fenced "
                     "at that LSN so every later transaction is applied on top."
                 ),
+            )
+            dest_mod.resolve_schema_refusal(
+                con,
+                pipeline=pipeline,
+                source_schema=schema,
+                source_table=table,
             )
             emptied.append(f"{schema}.{table}")
         con.execute("COMMIT")

@@ -154,6 +154,39 @@ class DestinationIdentityCollision(RuntimeError):
         self.target = target
 
 
+class SchemaEvolutionRefused(ValueError):
+    """A catalog schema transition cannot be applied without guessing.
+
+    This is intentionally distinct from row-shape inference.  A fenced catalog
+    baseline is authoritative, so an unsupported or failed destination ALTER must
+    abort the whole group and leave the source relation pending rather than persisting
+    a post-DDL baseline that the destination does not actually have.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        source_schema: str | None = None,
+        source_table: str | None = None,
+        target: str | None = None,
+        detected_lsn: int | None = None,
+    ):
+        super().__init__(message)
+        self.source_schema = source_schema
+        self.source_table = source_table
+        self.target = target
+        self.detected_lsn = detected_lsn
+
+
+class SchemaBackfillRefused(SchemaEvolutionRefused):
+    """A schema ADD has no safe value/identity mapping for existing rows."""
+
+
+class SchemaShapeUnexplained(SchemaEvolutionRefused):
+    """A row contains a column shape absent from every observed schema epoch."""
+
+
 class NoDurableDestinationRow(RuntimeError):
     """The replication slot exists and has advanced, but nothing is durable here.
 

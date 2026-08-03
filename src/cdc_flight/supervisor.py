@@ -126,6 +126,12 @@ def run_engine_bounded(
         method = getattr(catalog, "pending_fenced", None)
         return method() if method is not None else catalog.pending_destructive()
 
+    def pending_admission():
+        if catalog is None:
+            return []
+        method = getattr(catalog, "pending_admission", None)
+        return list(method()) if method is not None else []
+
     def _run():
         try:
             engine.run()
@@ -229,7 +235,9 @@ def run_engine_bounded(
         # the connection until `wait_for_quiescence()` proves it has left.
         handler.shutdown(reason="supervisor_shutdown")
         intentional = (
-            outcome.value != "engine_error" and handler.error is None and not error_box
+            outcome.value != "engine_error"
+            and getattr(handler, "error", None) is None
+            and not error_box
         )
         log.info(
             "closing debezium engine (reason=%s, intentional=%s)", outcome.value, intentional
@@ -458,18 +466,23 @@ def run_engine_bounded(
 
     if catalog is not None and not intermediate_handoff:
         still_pending = [c.qualified for c in pending_fenced()]
-        if still_pending or catalog_unresolved:
-            names = sorted(set(still_pending) | set(catalog_unresolved))
+        admission_pending = pending_admission()
+        if still_pending or catalog_unresolved or admission_pending:
+            names = sorted(
+                set(still_pending) | set(catalog_unresolved) | set(admission_pending)
+            )
             outcome.record("catalog_unresolved")
             summary["stop_reason"] = outcome.value
             summary["catalog_unresolved_tables"] = names
+            if admission_pending:
+                summary["catalog_publication_admission_pending"] = admission_pending
             # Codex 6: deferring is the correct *safety* choice - a destructive action
             # whose fence has not opened must not be guessed past - but it is not
             # faithful propagation and it is not honest to call the run successful.
             # The most common cause is a source that cannot be written to (a read-only
             # replica, a missing privilege), which `catalog_marker_error` names.
             raise EngineFailure(
-                f"{len(names)} destructive source-catalog change(s) are still "
+                f"{len(names)} source-catalog obligation(s) are still "
                 f"unresolved at shutdown ({', '.join(names)}): the destination is "
                 "knowingly out of step with the source. Most often the WAL fence "
                 "marker could not be written to the source (see "

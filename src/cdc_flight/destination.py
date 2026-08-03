@@ -23,7 +23,14 @@ from typing import Any
 from . import faults, table_lifecycle
 from .control_schema import CONTROL_DDL, ensure_control_schema
 from .errors import LeaseLost
-from .machines import LIFECYCLE_DURABLE_VALUES, SLOT_VERDICTS
+from .machines import (
+    LIFECYCLE_DURABLE_VALUES,
+    REFUSAL_ABSENT,
+    REFUSAL_PENDING,
+    REFUSAL_RESOLVED,
+    SCHEMA_REFUSAL,
+    SLOT_VERDICTS,
+)
 from .naming import quote
 from .retirement import RetirementResult, retire_handle
 
@@ -317,6 +324,132 @@ def write_table_event(
             target_table, applied, lsn, txn_id, rows_removed, detail,
         ],
     )
+
+
+def write_column_presence(
+    con,
+    *,
+    target_dataset: str,
+    target_table: str,
+    event_id: str,
+    column_name: str,
+    present: bool = True,
+) -> None:
+    """Record row-image field presence atomically with the row write.
+
+    ``NULL`` cannot carry presence information.  This tiny journal is consumed only
+    by a fenced late-rename merge and is deleted when that merge completes.
+    """
+    con.execute(
+        f"INSERT OR REPLACE INTO {CONTROL_SCHEMA}.column_presence "
+        "(target_dataset, target_table, event_id, column_name, present) VALUES (?,?,?,?,?)",
+        [target_dataset, target_table, event_id, column_name, present],
+    )
+
+
+def record_schema_refusal(
+    con,
+    *,
+    pipeline: str,
+    source_schema: str,
+    source_table: str,
+    target_table: str | None,
+    detected_lsn: int | None,
+    reason: str,
+) -> None:
+    """Persist a refused schema fold after its data transaction has rolled back."""
+    con.execute("BEGIN TRANSACTION")
+    try:
+        previous = con.execute(
+            f"SELECT state FROM {CONTROL_SCHEMA}.schema_refusals "
+            "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+            [pipeline, source_schema, source_table],
+        ).fetchone()
+        before = previous[0] if previous else REFUSAL_ABSENT
+        SCHEMA_REFUSAL.check(before, REFUSAL_PENDING)
+        con.execute(
+            f"INSERT OR REPLACE INTO {CONTROL_SCHEMA}.schema_refusals "
+            "(pipeline, source_schema, source_table, target_table, detected_lsn, "
+            "reason, state, refused_at) VALUES (?,?,?,?,?,?,?,?)",
+            [
+                pipeline, source_schema, source_table, target_table, detected_lsn,
+                reason, REFUSAL_PENDING, now(),
+            ],
+        )
+        mark_awaiting_snapshot(
+            con,
+            pipeline=pipeline,
+            source_schema=source_schema,
+            source_table=source_table,
+            target_table=target_table,
+            state=AWAITING_SNAPSHOT,
+        )
+        existing_event = con.execute(
+            f"SELECT 1 FROM {CONTROL_SCHEMA}.table_events "
+            "WHERE pipeline = ? AND commit_id = 0 AND event = 'schema_refusal' "
+            "AND source_schema = ? AND source_table = ?",
+            [pipeline, source_schema, source_table],
+        ).fetchone()
+        if existing_event is None:
+            next_seq = con.execute(
+                f"SELECT coalesce(max(seq), -1) + 1 FROM {CONTROL_SCHEMA}.table_events "
+                "WHERE pipeline = ? AND commit_id = 0",
+                [pipeline],
+            ).fetchone()[0]
+            write_table_event(
+                con,
+                pipeline=pipeline,
+                commit_id=0,
+                seq=int(next_seq),
+                event="schema_refusal",
+                source_schema=source_schema,
+                source_table=source_table,
+                target_table=target_table,
+                applied=False,
+                lsn=detected_lsn,
+                detail=reason,
+            )
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+
+
+def pending_schema_refusals(con, pipeline: str) -> list[tuple]:
+    return con.execute(
+        f"SELECT source_schema, source_table, reason FROM {CONTROL_SCHEMA}.schema_refusals "
+        "WHERE pipeline = ? AND state = ? ORDER BY source_schema, source_table",
+        [pipeline, REFUSAL_PENDING],
+    ).fetchall()
+
+
+def resolve_schema_refusal(
+    con, *, pipeline: str, source_schema: str, source_table: str
+) -> bool:
+    """Discharge a refusal only after a complete replacement image is durable.
+
+    The caller owns the surrounding transaction.  Keeping this transition beside the
+    refusal writer makes the error obligation explicit: a successful snapshot swaps or
+    verifies-empty the destination and resolves the refusal in the same MotherDuck
+    transaction, so a crash cannot publish one half of that pair.
+    """
+    row = con.execute(
+        f"SELECT state FROM {CONTROL_SCHEMA}.schema_refusals "
+        "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+        [pipeline, source_schema, source_table],
+    ).fetchone()
+    if row is None:
+        return False
+    before = str(row[0])
+    SCHEMA_REFUSAL.check(before, REFUSAL_RESOLVED)
+    if before == REFUSAL_RESOLVED:
+        return False
+    con.execute(
+        f"UPDATE {CONTROL_SCHEMA}.schema_refusals SET state = ? "
+        "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+        [REFUSAL_RESOLVED, pipeline, source_schema, source_table],
+    )
+    return True
 
 
 def forget_table_state(

@@ -46,6 +46,10 @@ class SourceColumn:
     type_oid: int
     type_name: str
     nullable: bool = True
+    #: PostgreSQL's `atthasmissing`/`attmissingval` evidence for an ADD DEFAULT.
+    #: It lets a keyless empty source prove the value without inventing a row join.
+    has_missing_default: bool = False
+    missing_value: object | None = None
 
     @property
     def destination_name(self) -> str:
@@ -67,6 +71,10 @@ class ColumnChange:
     type_oid: int | None = None
     type_name: str | None = None
     nullable: bool = True
+    #: True when an attnum-preserving rename also changed its source type.  It is
+    #: retained on the rename event so the destination can require a strict, explicit
+    #: ALTER rather than silently treating the new baseline as adopted.
+    type_changed: bool = False
 
     @property
     def destination_old_name(self) -> str | None:
@@ -131,6 +139,7 @@ def diff_columns(
                     type_oid=current.type_oid,
                     type_name=current.type_name,
                     nullable=current.nullable,
+                    type_changed=previous.type_identity != current.type_identity,
                 )
             )
         elif previous.type_identity != current.type_identity:
@@ -211,25 +220,34 @@ def apply_column_changes(registry, table_name: str, changes: Iterable[ColumnChan
     """Apply a catalog diff inside the caller's open destination transaction."""
 
     changes = tuple(changes)
-    # Renames run first so a simultaneous rename + add/drop cannot accidentally make
-    # the new source name look like an unrelated column.
-    for change in changes:
+    # If a rename targets the physical name of a different attnum that is being
+    # dropped in this same catalog observation, drop that *old identity* first.  The
+    # alternative (all renames first) turns `a -> b; drop b` into `drop b` after the
+    # rename, deleting the newly renamed identity.
+    renames = [change for change in changes if change.kind == COLUMN_RENAMED]
+    early_drops = [
+        change for change in changes
+        if change.kind == COLUMN_DROPPED
+        and change.destination_old_name in {item.destination_new_name for item in renames}
+    ]
+    late_drops = [change for change in changes if change not in early_drops]
+    for change in (*early_drops, *renames, *late_drops):
         if change.kind == COLUMN_RENAMED:
             registry.rename_column(
                 table_name,
                 change.destination_old_name,
                 change.destination_new_name,
             )
-            if change.type_name:
+            if change.type_name and change.type_changed:
                 registry.ensure(
                     table_name,
                     columns={
                         change.destination_new_name: destination_type(change.type_name)
                     },
                     key_columns=registry.get(table_name).key_columns,
+                    strict=True,
                 )
-    for change in changes:
-        if change.kind == COLUMN_DROPPED and change.destination_old_name:
+        elif change.kind == COLUMN_DROPPED and change.destination_old_name:
             registry.drop_column(table_name, change.destination_old_name)
     for change in changes:
         if (
@@ -242,6 +260,7 @@ def apply_column_changes(registry, table_name: str, changes: Iterable[ColumnChan
                     change.destination_new_name: destination_type(change.type_name)
                 },
                 key_columns=registry.get(table_name).key_columns,
+                strict=True,
             )
 
 

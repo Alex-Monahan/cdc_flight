@@ -58,10 +58,15 @@ from .catalog_apply import CatalogCoordinator, CatalogPlan
 from .commit_group import CommitResult, OpenGroup
 from .destination import AlertSink, Lease, ResumePoint
 from .envelope import KIND_SNAPSHOT_BOUNDARY, PendingRecord, decode
-from .errors import AmbiguousDelete, DestinationIdentityCollision
+from .errors import (
+    AmbiguousDelete,
+    DestinationIdentityCollision,
+    SchemaEvolutionRefused,
+)
 from .faults import arm_group, maybe_crash
 from .planner import GroupPlan, stream_event_id
 from .run_state import COMMIT_ACK
+from .schema_evolution import COLUMN_ADDED, COLUMN_DROPPED, COLUMN_RENAMED
 from .snapshot import SnapshotCoordinator
 from .snapshot_completion import SnapshotCompletion, SnapshotObservationError
 from .snapshot_notifications import decode_notification
@@ -698,23 +703,21 @@ class Applier:
                 commit_id=commit_id,
                 snapshot_epoch=self.snapshots.epoch,
             )
-            # DuckDB validates primary keys at COMMIT and treats a table altered after
-            # DML in the same transaction as a separate table version.  Applying a
-            # schema-only catalog action after the row fold therefore reports a false
-            # duplicate key, even though the fold deleted the old row first.  Plan the
-            # catalog once, apply schema actions before row DML, and keep destructive
-            # table actions after row DML.  All phases remain one destination
-            # transaction and one resume-point commit (ADR 0001 §3.3).
+            # A catalog fence is a position in the ordered unit stream, not a property
+            # of the final resume point.  Apply each schema action between the last
+            # pre-fence unit and the first post-fence unit, while retaining one
+            # destination transaction and one resume-point commit.
             catalog_plan = self._plan_catalog_changes(new_point.last_lsn)
             catalog_stats = {"tables": set()}
-            if catalog_plan is not None:
-                self._apply_catalog_phase(
-                    commit_id, catalog_plan, catalog_stats, schema_only=True
-                )
-            stats = self._apply_units(group, commit_id, has_data=has_data)
+            stats = self._apply_units_by_schema_epoch(
+                group,
+                commit_id,
+                has_data=has_data,
+                catalog_plan=catalog_plan,
+                catalog_stats=catalog_stats,
+            )
             stats["tables"].update(catalog_stats["tables"])
             if catalog_plan is not None:
-                self.catalog_coordinator.backfill_schema(self.con, catalog_plan)
                 self._apply_catalog_phase(
                     commit_id, catalog_plan, stats, schema_only=False
                 )
@@ -810,6 +813,10 @@ class Applier:
                     # A mark call can raise; a stuck window would silently drop every
                     # later phase write, so the gate is closed in all cases.
                     COMMIT_ACK.leave()
+        except SchemaEvolutionRefused as refused:
+            self._rollback_quietly()
+            self._record_schema_refusal(refused)
+            raise
         except (AmbiguousDelete, DestinationIdentityCollision) as ambiguous:
             # Rubric 4.7. The group still rolls back - a fold that cannot be decided is
             # never committed - but a bare rollback here is a *permanent* failure: the
@@ -915,6 +922,19 @@ class Applier:
             self.group.pending_alerts.append(alert)
         self.ambiguous_resnapshots_queued += int(recorded)
 
+    def _record_schema_refusal(self, refused: SchemaEvolutionRefused) -> None:
+        if not refused.source_schema or not refused.source_table:
+            return
+        destination.record_schema_refusal(
+            self.con,
+            pipeline=self.pipeline,
+            source_schema=refused.source_schema,
+            source_table=refused.source_table,
+            target_table=refused.target,
+            detected_lsn=refused.detected_lsn,
+            reason=str(refused),
+        )
+
     def _rollback_quietly(self) -> None:
         if not self.group.txn_open:
             self._reset_after_rollback()
@@ -983,13 +1003,259 @@ class Applier:
     # ------------------------------------------------------------------ #
     # applying units — one ordered pass, delegated to the planner
     # ------------------------------------------------------------------ #
+    def _apply_units_by_schema_epoch(
+        self,
+        group: list[CompleteUnit],
+        commit_id: int,
+        *,
+        has_data: bool,
+        catalog_plan: CatalogPlan | None,
+        catalog_stats: dict,
+    ) -> dict:
+        """Apply row units on the correct side of each catalog LSN fence.
+
+        A schema fence belongs between ordered source units.  Using the group's final
+        LSN for every unit applies a rename/drop before rows from the older epoch; this
+        helper retains one destination transaction while placing each catalog action
+        at its first post-fence unit.
+        """
+        actions = sorted(
+            (
+                action for action in (catalog_plan.actions if catalog_plan else ())
+                if action.change.kind == CHANGE_SCHEMA
+            ),
+            key=lambda action: (action.change.detected_lsn, action.change.qualified),
+        )
+        if not actions:
+            return self._apply_units(group, commit_id, has_data=has_data)
+
+        total: dict | None = None
+        cursor = 0
+        index = 0
+        created_in_txn = self.group.created_in_txn
+        while index < len(actions):
+            boundary = actions[index].change.detected_lsn
+            same_boundary: list = []
+            while index < len(actions) and actions[index].change.detected_lsn == boundary:
+                same_boundary.append(actions[index])
+                index += 1
+            for unit in group:
+                self._refuse_mixed_schema_epoch(
+                    self._events_for_schema_check(unit), same_boundary
+                )
+            end = cursor
+            while end < len(group) and (group[end].last_lsn or 0) <= boundary:
+                end += 1
+            # The catalog observation LSN is a *discovery* fence, not the source DDL's
+            # exact event LSN. A row emitted after the DDL can therefore carry an LSN
+            # below the poll's current-WAL value. Its shape is stronger evidence of the
+            # epoch: a dropped old name absent, an added/renamed new name present. Put
+            # the schema phase before that first post-DDL unit so DuckDB never sees
+            # DML followed by ALTER in one transaction (DuckDB defers the PK index and
+            # reports a duplicate at COMMIT even when the DML deleted the key first).
+            for position in range(cursor, end):
+                if self._unit_is_post_schema_epoch(group[position], same_boundary):
+                    end = position
+                    break
+            if end > cursor:
+                part = self._apply_units(
+                    group[cursor:end],
+                    commit_id,
+                    has_data=has_data,
+                    clear_spill=False,
+                    created_in_txn=created_in_txn,
+                )
+                total = self._merge_apply_stats(total, part)
+                cursor = end
+
+            names = {action.change.qualified for action in same_boundary}
+            phase = CatalogPlan(
+                actions=tuple(same_boundary),
+                relations=tuple(
+                    relation
+                    for relation in (catalog_plan.relations if catalog_plan else ())
+                    if relation.qualified in names
+                ),
+            )
+            self._apply_catalog_phase(
+                commit_id, phase, catalog_stats, schema_only=True
+            )
+            self.catalog_coordinator.backfill_schema(self.con, phase)
+
+        if cursor < len(group):
+            part = self._apply_units(
+                group[cursor:],
+                commit_id,
+                has_data=has_data,
+                clear_spill=True,
+                created_in_txn=created_in_txn,
+            )
+            total = self._merge_apply_stats(total, part)
+        elif any(unit.spill_unit_seq is not None for unit in group):
+            # Every unit was consumed before the final schema fence; no final row
+            # segment existed to perform the normal spill cleanup.
+            self.spill.clear(commit_id)
+        return total or self._empty_apply_stats()
+
+    def _events_for_schema_check(self, unit: CompleteUnit) -> list:
+        events = list(unit.events)
+        if unit.spill_unit_seq is not None:
+            events.extend(
+                staged.event
+                for staged in self.spill.load(
+                    commit_id=self.commit_id, unit_seq=unit.spill_unit_seq
+                )
+            )
+        return events
+
+    @staticmethod
+    def _refuse_mixed_schema_epoch(events: list, actions: list) -> None:
+        """Refuse one source unit that contains both sides of a schema fence.
+
+        A source transaction may contain DML before and after transactional DDL.  A
+        whole-unit applier cannot safely put the DDL before one row and after another;
+        committing either ordering could fold one event against the wrong destination
+        identity.  The refusal is durable and routes the table to a complete snapshot.
+        """
+        changes_by_table: dict[str, tuple] = {}
+        for action in actions:
+            changes_by_table.setdefault(action.change.qualified, ())
+            changes_by_table[action.change.qualified] += tuple(
+                action.change.column_changes
+            )
+        epochs: dict[str, set[str]] = {}
+        for event in events:
+            if not event.schema or not event.table:
+                continue
+            table = f"{event.schema}.{event.table}"
+            changes = changes_by_table.get(table)
+            if not changes:
+                continue
+            fields = set()
+            for image in (event.before, event.after, event.key):
+                if image:
+                    fields.update(image)
+            for change in changes:
+                old = change.destination_old_name
+                new = change.destination_new_name
+                epoch = None
+                if change.kind == COLUMN_ADDED and new:
+                    epoch = "post" if new in fields else "pre"
+                elif change.kind == COLUMN_DROPPED and old:
+                    epoch = "pre" if old in fields else "post"
+                elif change.kind == COLUMN_RENAMED and old and new:
+                    if old in fields and new in fields:
+                        raise SchemaEvolutionRefused(
+                            f"row shape for {table} contains both sides of the "
+                            f"rename {old!r} -> {new!r}; the source transaction "
+                            "cannot be ordered safely around the schema fence",
+                            source_schema=event.schema,
+                            source_table=event.table,
+                            target=table,
+                            detected_lsn=min(
+                                action.change.detected_lsn for action in actions
+                            ),
+                        )
+                    if old in fields:
+                        epoch = "pre"
+                    elif new in fields:
+                        epoch = "post"
+                if epoch is not None:
+                    epochs.setdefault(table, set()).add(epoch)
+        mixed = sorted(table for table, values in epochs.items() if len(values) > 1)
+        if mixed:
+            table = mixed[0]
+            schema, _, source_table = table.partition(".")
+            raise SchemaEvolutionRefused(
+                f"source unit for {table} contains row images from both sides of "
+                "a schema fence; a whole source transaction cannot be safely "
+                "canonicalized, so it is refused for a replacement snapshot",
+                source_schema=schema,
+                source_table=source_table,
+                target=table,
+                detected_lsn=min(action.change.detected_lsn for action in actions),
+            )
+
+    def _unit_is_post_schema_epoch(self, unit: CompleteUnit, actions: list) -> bool:
+        """Whether a unit's row shape proves it is after one of these schema changes."""
+        changes_by_table: dict[str, tuple] = {}
+        for action in actions:
+            changes_by_table.setdefault(action.change.qualified, ())
+            changes_by_table[action.change.qualified] += tuple(
+                action.change.column_changes
+            )
+        for event in self._events_for_schema_check(unit):
+            if not event.schema or not event.table:
+                continue
+            changes = changes_by_table.get(f"{event.schema}.{event.table}")
+            if not changes:
+                continue
+            fields = set()
+            for image in (event.before, event.after, event.key):
+                if image:
+                    fields.update(image)
+            if not fields:
+                continue
+            for change in changes:
+                old = change.destination_old_name
+                new = change.destination_new_name
+                if change.kind == COLUMN_ADDED and new and new in fields:
+                    return True
+                if change.kind == COLUMN_DROPPED and old and old not in fields:
+                    return True
+                if (
+                    change.kind == COLUMN_RENAMED
+                    and new
+                    and new in fields
+                    and old not in fields
+                ):
+                    return True
+        return False
+
+    @staticmethod
+    def _empty_apply_stats() -> dict:
+        return {
+            "events": 0,
+            "tables": set(),
+            "first_txn_id": None,
+            "last_txn_id": None,
+            "first_lsn": None,
+            "last_lsn": None,
+            "max_source_ts": None,
+        }
+
+    @staticmethod
+    def _merge_apply_stats(total: dict | None, part: dict) -> dict:
+        if total is None:
+            return part
+        total["events"] += part["events"]
+        total["tables"].update(part["tables"])
+        if total["first_txn_id"] is None:
+            total["first_txn_id"] = part["first_txn_id"]
+        if part["last_txn_id"] is not None:
+            total["last_txn_id"] = part["last_txn_id"]
+        if total["first_lsn"] is None:
+            total["first_lsn"] = part["first_lsn"]
+        if part["last_lsn"] is not None:
+            total["last_lsn"] = part["last_lsn"]
+        if part["max_source_ts"] is not None:
+            total["max_source_ts"] = max(
+                total["max_source_ts"] or 0, part["max_source_ts"]
+            )
+        return total
+
     def _apply_units(
         self,
         group: list[CompleteUnit],
         commit_id: int,
         *,
         has_data: bool,
+        clear_spill: bool = True,
+        created_in_txn: set[str] | None = None,
     ) -> dict:
+        created_in_txn = (
+            self.group.created_in_txn if created_in_txn is None else created_in_txn
+        )
         plan = GroupPlan(
             self.con,
             commit_id=commit_id,
@@ -997,7 +1263,7 @@ class Applier:
             snapshots=self.snapshots,
             spill=self.spill,
             truncate_mode=self.cfg.truncate_mode,
-            created_in_txn=self.group.created_in_txn,
+            created_in_txn=created_in_txn,
             watermarks=self.watermarks,
         )
         for unit in group:
@@ -1022,7 +1288,8 @@ class Applier:
         if has_data:
             def anchor() -> None:
                 maybe_crash("mid_apply", self.data_commit_groups + 1)
-        stats = plan.write(after_first_table=anchor)
+        stats = plan.write(after_first_table=anchor, clear_spill=clear_spill)
+        self.group.created_in_txn.update(created_in_txn)
         for target, (schema, table) in plan.created_tables.items():
             destination.register_table(
                 self.con,
