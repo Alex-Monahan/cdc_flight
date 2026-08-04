@@ -33,11 +33,13 @@ from cdc_flight.catalog import (
     CHANGE_RECREATED,
     CatalogChange,
     CatalogWatcher,
+    DESTRUCTIVE,
     SourceRelation,
 )
 from cdc_flight.config import DROP_IGNORE, DROP_LOG, DROP_MODES, DROP_REPLICATE
 from cdc_flight.destination import upsert_source_relation
 from cdc_flight.machines import CATALOG_BASELINE, CHANGE_MARKED
+from cdc_flight.snapshot_completion import SnapshotObservationError
 
 CUSTOMERS = "cdcflight_app_customers"
 ORDERS = "cdcflight_app_orders"
@@ -384,6 +386,111 @@ def test_drop_mode_log_keeps_the_destination_table(lab):
     assert markers(box) == [("dropped", "customers", False, None)]
 
 
+def _queue_recreated(watcher: CatalogWatcher, relation: SourceRelation) -> None:
+    _queue(
+        watcher,
+        CatalogChange(
+            kind=CHANGE_RECREATED,
+            schema=relation.schema,
+            table=relation.table,
+            detected_lsn=150,
+            old_oid=16384,
+            new_oid=relation.oid,
+            new_relation=relation,
+            state=CHANGE_MARKED,
+        ),
+    )
+
+
+def _assert_recreated_boundary(
+    box: Lab, relation: SourceRelation, expected_ids=(1, 2, 3)
+) -> None:
+    assert rows(box, CUSTOMERS) == [(ident,) for ident in expected_ids]
+    assert box.q(
+        "SELECT snapshot_state FROM _cdc_flight.table_state "
+        "WHERE pipeline = 'lab' AND source_table = 'customers'"
+    ) == [("awaiting_snapshot",)]
+    assert box.q(
+        "SELECT relation_oid FROM _cdc_flight.source_relations "
+        "WHERE pipeline = 'lab' AND source_table = 'customers'"
+    ) == [(relation.oid,)]
+
+
+def test_log_mode_recreate_refuses_new_relation_stream_until_resnapshot(lab):
+    """A retained log target must not accept the replacement relation's stream tail."""
+    old = _catalog_relation("customers", 16384)
+    new = _catalog_relation("customers", 16385)
+    watcher = _watcher(present={new.qualified: new.oid})
+    watcher._dirty[old.qualified] = old
+    box = lab(catalog=watcher, drop_mode=DROP_LOG)
+    preload(box)
+
+    _queue(
+        watcher,
+        CatalogChange(
+            kind=CHANGE_DROPPED,
+            schema="app",
+            table="customers",
+            detected_lsn=100,
+            old_oid=old.oid,
+            new_relation=old,
+            state=CHANGE_MARKED,
+        ),
+    )
+    box.run([heartbeat(125)])
+    assert rows(box, CUSTOMERS) == [(1,), (2,), (3,)]
+
+    _queue_recreated(watcher, new)
+    box.run([heartbeat(175)])
+    _assert_recreated_boundary(box, new)
+
+    with pytest.raises(SnapshotObservationError, match="awaiting_snapshot"):
+        box.run(txn("3", [keyed("3", 1, 300, 4, "new-lifecycle")]))
+    assert rows(box, CUSTOMERS) == [(1,), (2,), (3,)]
+
+
+def test_log_mode_recreate_while_flight_is_stopped_keeps_the_boundary(lab):
+    """The same refusal survives a restart between the drop and recreation."""
+    old = _catalog_relation("customers", 16384)
+    new = _catalog_relation("customers", 16385)
+    first_watcher = _watcher()
+    first_watcher._dirty[old.qualified] = old
+    box = lab(catalog=first_watcher, drop_mode=DROP_LOG)
+    preload(box)
+    _queue(
+        first_watcher,
+        CatalogChange(
+            kind=CHANGE_DROPPED,
+            schema="app",
+            table="customers",
+            detected_lsn=100,
+            old_oid=old.oid,
+            new_relation=old,
+            state=CHANGE_MARKED,
+        ),
+    )
+    box.run([heartbeat(125)])
+    path = box.path
+    box.lease.release(box.con)
+    box.close()
+
+    restarted_watcher = _watcher(
+        present={new.qualified: new.oid},
+        known={old.qualified: old},
+        replicated={old.qualified},
+    )
+    restarted = Lab(path, catalog=restarted_watcher, drop_mode=DROP_LOG, resume_lsn=125)
+    try:
+        _queue_recreated(restarted_watcher, new)
+        restarted.run([heartbeat(175)])
+        _assert_recreated_boundary(restarted, new)
+        with pytest.raises(SnapshotObservationError, match="awaiting_snapshot"):
+            restarted.run(txn("3", [keyed("3", 1, 300, 4, "new-lifecycle")]))
+        assert rows(restarted, CUSTOMERS) == [(1,), (2,), (3,)]
+    finally:
+        restarted.close()
+
+
 def _catalog_relation(table: str, oid: int) -> SourceRelation:
     return SourceRelation(
         schema="app", table=table, oid=oid, published=True, replica_identity="d"
@@ -477,27 +584,39 @@ def _baseline_state_for_matrix(box: Lab, relation: SourceRelation, state: str):
     )
 
 
+# Keep this matrix coupled to the declared destructive catalog domain. If a new
+# destructive lifecycle is added, the drop-mode matrix must grow with it.
+DROP_CHANGE_KINDS = tuple(DESTRUCTIVE)
 DROP_BASELINE_CELLS = tuple(
-    (drop_mode, baseline_state)
+    (drop_mode, baseline_state, change_kind)
     for drop_mode in DROP_MODES
     for baseline_state in sorted(CATALOG_BASELINE.reachable_states())
+    for change_kind in DROP_CHANGE_KINDS
 )
 
 
-@pytest.mark.parametrize("drop_mode, baseline_state", DROP_BASELINE_CELLS)
-def test_drop_mode_and_baseline_confirmation_matrix(lab, drop_mode, baseline_state):
-    """Every declared baseline state has an explicit outcome for every drop mode.
+@pytest.mark.parametrize("drop_mode, baseline_state, change_kind", DROP_BASELINE_CELLS)
+def test_drop_mode_and_baseline_confirmation_matrix(
+    lab, drop_mode, baseline_state, change_kind
+):
+    """Every baseline/change cell has an explicit outcome for every drop mode.
 
     ``ignore`` has no catalog watcher in the real pipeline, so its confirmation cells
     are deliberate machine refusals (zero successful polls), not an untested allow path.
-    ``replicate`` destroys the destination and identity; ``log`` keeps both durable
-    identities and destination state so confirmation can succeed.
+    ``replicate`` destroys the destination for both destructive changes; ``log`` keeps a
+    plain drop's identity and destination, but a recreate retains the rows only while its
+    new lifecycle is durably owed a re-snapshot.
     """
-    watcher = _watcher()
+    old_relation = _catalog_relation("customers", 16384)
+    new_relation = _catalog_relation("customers", 16385)
+    watcher = _watcher(
+        present={new_relation.qualified: new_relation.oid}
+        if change_kind == CHANGE_RECREATED
+        else None
+    )
     box = lab(catalog=watcher, drop_mode=drop_mode)
-    relation = _catalog_relation("customers", 16384)
     box.run(txn("1", [keyed("1", 1, 10, 1, "before")]))
-    check = _baseline_state_for_matrix(box, relation, baseline_state)
+    check = _baseline_state_for_matrix(box, old_relation, baseline_state)
 
     if drop_mode == DROP_IGNORE:
         box.run([heartbeat(200)])
@@ -514,21 +633,24 @@ def test_drop_mode_and_baseline_confirmation_matrix(lab, drop_mode, baseline_sta
         assert box.q(
             "SELECT relation_oid FROM _cdc_flight.source_relations "
             "WHERE pipeline = 'lab' AND source_table = 'customers'"
-        ) == [(16384,)]
+        ) == [(old_relation.oid,)]
         return
 
-    _queue(
-        watcher,
-        CatalogChange(
-            kind=CHANGE_DROPPED,
-            schema="app",
-            table="customers",
-            detected_lsn=100,
-            old_oid=relation.oid,
-            new_relation=relation,
-            state=CHANGE_MARKED,
-        ),
-    )
+    if change_kind == CHANGE_RECREATED:
+        _queue_recreated(watcher, new_relation)
+    else:
+        _queue(
+            watcher,
+            CatalogChange(
+                kind=CHANGE_DROPPED,
+                schema="app",
+                table="customers",
+                detected_lsn=100,
+                old_oid=old_relation.oid,
+                new_relation=old_relation,
+                state=CHANGE_MARKED,
+            ),
+        )
     box.run([heartbeat(200)])
 
     confirmed = catalog_baseline.confirm(
@@ -538,29 +660,49 @@ def test_drop_mode_and_baseline_confirmation_matrix(lab, drop_mode, baseline_sta
         check=check,
         successful_polls=1,
     )
-    assert confirmed.valid, (drop_mode, baseline_state, confirmed.reason)
+    if change_kind == CHANGE_RECREATED and drop_mode == DROP_LOG:
+        assert not confirmed.valid, (drop_mode, baseline_state, confirmed.reason)
+        assert confirmed.state == catalog_baseline.INVALIDATED
+        _assert_recreated_boundary(box, new_relation, expected_ids=(1,))
+    else:
+        assert confirmed.valid, (drop_mode, baseline_state, confirmed.reason)
+
     if drop_mode == DROP_LOG:
-        assert box.exists(CUSTOMERS)
-        assert box.q(
-            "SELECT relation_oid FROM _cdc_flight.source_relations "
-            "WHERE pipeline = 'lab' AND source_table = 'customers'"
-        ) == [(16384,)]
-        assert box.q(
-            "SELECT count(*) FROM _cdc_flight.table_state "
-            "WHERE pipeline = 'lab' AND source_table = 'customers'"
-        ) == [(1,)]
+        if change_kind == CHANGE_DROPPED:
+            assert box.exists(CUSTOMERS)
+            assert box.q(
+                "SELECT relation_oid FROM _cdc_flight.source_relations "
+                "WHERE pipeline = 'lab' AND source_table = 'customers'"
+            ) == [(old_relation.oid,)]
+            assert box.q(
+                "SELECT count(*) FROM _cdc_flight.table_state "
+                "WHERE pipeline = 'lab' AND source_table = 'customers'"
+            ) == [(1,)]
     else:
         assert drop_mode == DROP_REPLICATE
-        assert not box.exists(CUSTOMERS)
-        assert box.q(
-            "SELECT count(*) FROM _cdc_flight.source_relations "
-            "WHERE pipeline = 'lab' AND source_table = 'customers'"
-        ) == [(0,)]
-        assert box.q(
-            "SELECT count(*) FROM _cdc_flight.table_state "
-            "WHERE pipeline = 'lab' AND source_table = 'customers'"
-        ) == [(0,)]
-    assert markers(box) == [("dropped", "customers", drop_mode == DROP_REPLICATE, None)]
+        if change_kind == CHANGE_DROPPED:
+            assert not box.exists(CUSTOMERS)
+            assert box.q(
+                "SELECT count(*) FROM _cdc_flight.source_relations "
+                "WHERE pipeline = 'lab' AND source_table = 'customers'"
+            ) == [(0,)]
+            assert box.q(
+                "SELECT count(*) FROM _cdc_flight.table_state "
+                "WHERE pipeline = 'lab' AND source_table = 'customers'"
+            ) == [(0,)]
+        else:
+            assert not box.exists(CUSTOMERS)
+            assert box.q(
+                "SELECT relation_oid FROM _cdc_flight.source_relations "
+                "WHERE pipeline = 'lab' AND source_table = 'customers'"
+            ) == [(new_relation.oid,)]
+            assert box.q(
+                "SELECT snapshot_state FROM _cdc_flight.table_state "
+                "WHERE pipeline = 'lab' AND source_table = 'customers'"
+            ) == [("awaiting_snapshot",)]
+    assert markers(box) == [
+        (change_kind, "customers", drop_mode == DROP_REPLICATE, None)
+    ]
 
 
 def test_drop_mode_log_persists_identity_and_confirms_after_restart(lab):
