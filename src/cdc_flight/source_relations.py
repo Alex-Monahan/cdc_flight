@@ -20,6 +20,7 @@ import json
 import logging
 
 from .control_schema import CONTROL_SCHEMA
+from .machines import require_admission_state
 
 log = logging.getLogger("cdc_flight.source_relations")
 
@@ -50,6 +51,7 @@ def upsert_source_relation(
     this is the same pattern `write_resume_point` uses, so there is one idiom for
     "replace this row" in the whole control schema.
     """
+    admission_state = require_admission_state(admission_state)
     first_seen = con.execute(
         f"SELECT first_seen_at FROM {CONTROL_SCHEMA}.source_relations "
         "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
@@ -155,7 +157,7 @@ def flush_learned_relations(
                 relation_oid=relation.oid,
                 published=relation.published,
                 replica_identity=relation.replica_identity,
-                admission_state=relation.admission_state or "pending",
+                admission_state=require_admission_state(relation.admission_state),
                 columns=relation.columns,
             )
         con.execute("COMMIT")

@@ -47,7 +47,7 @@ over external state) — appear below only as frozen **domains** where they have
 
 from __future__ import annotations
 
-from .states import Domain, Machine, ranked
+from .states import Domain, Machine, UnknownState, ranked
 
 # --------------------------------------------------------------------------- #
 # SM-A · TableLifecycle — durable, `_cdc_flight.table_state.snapshot_state`
@@ -574,6 +574,21 @@ PUBLICATION_ADMISSION = Machine(
         "and who owns the admission decision?"
     ),
 )
+
+
+def require_admission_state(value: str | None) -> str:
+    """Validate the persisted publication-admission state at the state boundary.
+
+    MotherDuck cannot add ``NOT NULL`` to an existing column. A NULL therefore has to
+    be refused by the machine that owns the value, rather than treated as a convenient
+    synonym for ``pending`` or ``external`` and allowed to change the recovery path.
+    """
+    if value is None:
+        raise UnknownState(
+            "publication_admission: NULL is not a declared state; refusing to use a "
+            "source_relations row whose admission decision is not machine-checkable"
+        )
+    return PUBLICATION_ADMISSION.parse(value)
 
 
 # --------------------------------------------------------------------------- #

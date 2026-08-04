@@ -13,10 +13,13 @@ from dataclasses import dataclass, field
 
 from .destination import CONTROL_SCHEMA
 from .machines import (
+    ADMISSION_EXTERNAL,
+    ADMISSION_PENDING,
     CATALOG_CHANGE,
     CHANGE_MARKED,
     CHANGE_OBSERVED,
     CHANGE_PENDING,
+    require_admission_state,
 )
 from .schema_evolution import ColumnChange, SourceColumn
 
@@ -30,6 +33,13 @@ DESTRUCTIVE = (CHANGE_DROPPED, CHANGE_RECREATED)
 FENCED = (*DESTRUCTIVE, CHANGE_SCHEMA)
 
 
+class _AdmissionStateUnset:
+    """Sentinel for observations that have not come from durable state yet."""
+
+
+_ADMISSION_STATE_UNSET = _AdmissionStateUnset()
+
+
 @dataclass(frozen=True)
 class SourceRelation:
     schema: str
@@ -40,19 +50,13 @@ class SourceRelation:
     columns: tuple[SourceColumn, ...] = ()
     publication_all_tables: bool = False
     is_partition: bool = False
-    admission_state: str | None = None
+    admission_state: str | _AdmissionStateUnset | None = _ADMISSION_STATE_UNSET
 
     def __post_init__(self) -> None:
-        from .machines import (
-            ADMISSION_EXTERNAL,
-            ADMISSION_PENDING,
-            PUBLICATION_ADMISSION,
-        )
-
         state = self.admission_state
-        if state is None:
+        if state is _ADMISSION_STATE_UNSET:
             state = ADMISSION_EXTERNAL if self.published else ADMISSION_PENDING
-        PUBLICATION_ADMISSION.parse(state)
+        state = require_admission_state(state)
         object.__setattr__(self, "admission_state", state)
 
     @property
@@ -182,8 +186,9 @@ def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
             published=bool(published),
             replica_identity=identity or "d",
             columns=columns,
-            admission_state=admission_state
-            or ("external" if published else "pending"),
+            # This is a durable read, so NULL must reach the machine boundary and be
+            # refused; it is not an observation that may derive a default from `published`.
+            admission_state=admission_state,
         )
     return known
 

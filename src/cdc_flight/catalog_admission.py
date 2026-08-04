@@ -18,6 +18,7 @@ from .machines import (
     ADMISSION_PENDING,
     ADMISSION_REFUSED,
     PUBLICATION_ADMISSION,
+    require_admission_state,
 )
 from .naming import quote
 
@@ -104,7 +105,7 @@ def _record(watcher, change, relation, *, error: str | None) -> None:
         previous_state = (
             previous.admission_state if previous is not None else ADMISSION_PENDING
         )
-        target = relation.admission_state or ADMISSION_PENDING
+        target = require_admission_state(relation.admission_state)
         if previous_state != target:
             PUBLICATION_ADMISSION.check(previous_state, target)
         change.new_relation = relation

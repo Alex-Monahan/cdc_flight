@@ -12,6 +12,7 @@ a commit message.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 
 log = logging.getLogger("cdc_flight.control_schema")
@@ -370,17 +371,42 @@ _ADDED_COLUMNS = {
     ),
     "source_relations": (
         ("columns_json", "VARCHAR"),
-        ("admission_state", "VARCHAR NOT NULL DEFAULT 'external'"),
+        # MotherDuck/DuckDB reject constraints in ALTER TABLE ... ADD COLUMN.
+        # The state is backfilled and checked below in this same transaction; the
+        # application/state-machine boundary is the invariant for already-created
+        # destinations whose additive column is necessarily nullable.
+        ("admission_state", "VARCHAR"),
     ),
+}
+
+# Defaults for additive columns are deliberately values, not SQL fragments. They are
+# bound as parameters by `_backfill_added_column`, which keeps the migration portable
+# across DuckDB and MotherDuck and avoids reintroducing an inline ADD COLUMN constraint.
+_ADDED_COLUMN_DEFAULTS = {
+    ("source_relations", "admission_state"): "external",
 }
 
 
 def ensure_control_schema(con) -> None:
-    _migrate_commit_log_key(con)
-    for statement in CONTROL_DDL:
-        con.execute(statement)
-    for table, columns in _ADDED_COLUMNS.items():
-        _migrate_added_columns(con, table, columns)
+    """Create and migrate the control schema as one idempotent transaction.
+
+    MotherDuck supports the DDL used here transactionally, but does not support an
+    inline constraint on ``ALTER TABLE ... ADD COLUMN``. Keeping the DDL, additive
+    columns, and their backfills in one transaction means a failed migration cannot
+    leave a half-created control schema that later writers mistake for a valid one.
+    """
+    con.execute("BEGIN TRANSACTION")
+    try:
+        _migrate_commit_log_key(con)
+        for statement in CONTROL_DDL:
+            con.execute(statement)
+        for table, columns in _ADDED_COLUMNS.items():
+            _migrate_added_columns(con, table, columns)
+        con.execute("COMMIT")
+    except BaseException:
+        with contextlib.suppress(Exception):
+            con.execute("ROLLBACK")
+        raise
 
 
 def _table_columns(con, table: str) -> set[str]:
@@ -394,14 +420,25 @@ def _table_columns(con, table: str) -> set[str]:
     table genuinely has no columns we can see, and that is worth failing on too.
     """
     try:
-        return {
-            str(row[0])
-            for row in con.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema = ? AND table_name = ?",
-                [CONTROL_SCHEMA, table],
-            ).fetchall()
-        }
+        # MotherDuck's information_schema can expose the columns from a
+        # `CREATE TABLE IF NOT EXISTS` definition even when that definition did not
+        # alter an already-existing table. It is useful as a connectivity check (and
+        # remains part of the loud introspection contract), but PRAGMA table_info is
+        # the actual physical shape used to decide whether an ALTER is needed.
+        con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = ? AND table_name = ?",
+            [CONTROL_SCHEMA, table],
+        ).fetchall()
+        rows = con.execute(
+            f"PRAGMA table_info('{CONTROL_SCHEMA}.{table}')"
+        ).fetchall()
+        actual = {str(row[1]) for row in rows}
+        if not actual:
+            raise RuntimeError(
+                f"{CONTROL_SCHEMA}.{table} has no introspectable physical columns"
+            )
+        return actual
     except Exception as exc:
         raise ControlSchemaFailed(
             f"could not read the columns of {CONTROL_SCHEMA}.{table} ({exc}), so the "
@@ -422,6 +459,7 @@ def _migrate_added_columns(con, table: str, columns: tuple[tuple[str, str], ...]
     existing = _table_columns(con, table)
     for column, sql_type in columns:
         if column in existing:
+            _backfill_added_column(con, table, column)
             continue
         log.warning("adding %s.%s.%s", CONTROL_SCHEMA, table, column)
         try:
@@ -437,6 +475,7 @@ def _migrate_added_columns(con, table: str, columns: tuple[tuple[str, str], ...]
                     "%s.%s.%s already existed by the time the ALTER ran (a concurrent "
                     "runner won the race)", CONTROL_SCHEMA, table, column,
                 )
+                _backfill_added_column(con, table, column)
                 continue
             raise ControlSchemaFailed(
                 f"could not add {CONTROL_SCHEMA}.{table}.{column} ({exc}), and it is "
@@ -444,6 +483,34 @@ def _migrate_added_columns(con, table: str, columns: tuple[tuple[str, str], ...]
                 "would fail silently for the life of this destination. Grant the DDL "
                 f"privilege, or drop {CONTROL_SCHEMA}.{table} if it is empty."
             ) from exc
+        _backfill_added_column(con, table, column)
+
+
+def _backfill_added_column(con, table: str, column: str) -> None:
+    """Fill an additive column's logical default without relying on DDL constraints."""
+    default = _ADDED_COLUMN_DEFAULTS.get((table, column))
+    if default is None:
+        return
+    try:
+        con.execute(
+            f"UPDATE {CONTROL_SCHEMA}.{table} SET {column} = ? "
+            f"WHERE {column} IS NULL",
+            [default],
+        )
+        remaining = con.execute(
+            f"SELECT count(*) FROM {CONTROL_SCHEMA}.{table} WHERE {column} IS NULL"
+        ).fetchone()[0]
+    except Exception as exc:
+        raise ControlSchemaFailed(
+            f"could not backfill {CONTROL_SCHEMA}.{table}.{column} ({exc}); the "
+            "control-schema transaction is being rolled back"
+        ) from exc
+    if remaining:
+        raise ControlSchemaFailed(
+            f"backfill left {remaining} NULL value(s) in "
+            f"{CONTROL_SCHEMA}.{table}.{column}; refusing to publish a partially "
+            "initialized state column"
+        )
 
 
 def _commit_log_primary_key(con) -> tuple[str, ...] | None:
