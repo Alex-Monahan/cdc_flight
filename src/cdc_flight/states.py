@@ -81,7 +81,16 @@ _REGISTRY: dict[str, Machine] = {}
 class Machine:
     """A named state domain plus its legal edges. Frozen at construction."""
 
-    __slots__ = ("durable", "edges", "initial", "name", "purpose", "states", "terminal")
+    __slots__ = (
+        "durable",
+        "edges",
+        "initial",
+        "initial_states",
+        "name",
+        "purpose",
+        "states",
+        "terminal",
+    )
 
     def __init__(
         self,
@@ -91,6 +100,7 @@ class Machine:
         edges: tuple[tuple[str, str], ...],
         terminal: tuple[str, ...] = (),
         initial: str | None = None,
+        initial_states: tuple[str, ...] | None = None,
         purpose: str = "",
         durable: str | None = None,
     ) -> None:
@@ -107,13 +117,30 @@ class Machine:
         unknown -= set(states)
         if unknown:
             raise ValueError(f"{name}: edges/terminal name undeclared states {sorted(unknown)}")
-        if initial is not None and initial not in states:
-            raise ValueError(f"{name}: initial {initial!r} is not a declared state")
+        declared_initials = (
+            tuple(initial_states)
+            if initial_states is not None
+            else (() if initial is None else (initial,))
+        )
+        if len(set(declared_initials)) != len(declared_initials):
+            raise ValueError(f"{name}: duplicate initial state")
+        unknown_initials = set(declared_initials) - set(states)
+        if unknown_initials:
+            raise ValueError(
+                f"{name}: initial states undeclared {sorted(unknown_initials)}"
+            )
+        if initial is not None and initial not in declared_initials:
+            raise ValueError(
+                f"{name}: initial {initial!r} is not in initial_states"
+            )
         self.name = name
         self.states = tuple(states)
         self.edges = frozenset(edges)
         self.terminal = frozenset(terminal)
-        self.initial = initial
+        self.initial_states = declared_initials
+        self.initial = initial if initial is not None else (
+            declared_initials[0] if declared_initials else None
+        )
         self.purpose = purpose
         self.durable = durable
         if name in _REGISTRY:
@@ -159,6 +186,24 @@ class Machine:
 
     def successors(self, frm: str) -> set[str]:
         return {b for a, b in self.edges if a == frm}
+
+    def reachable_states(self) -> frozenset[str]:
+        """States reachable from every declared initial state.
+
+        A machine may have more than one legitimate starting condition.  The
+        snapshot-completion machine uses that to model a streaming-only run, whose
+        initial state is ``not_required`` and has no edge from the callback protocol.
+        Matrix coverage must enumerate those starts instead of silently dropping one.
+        """
+        reachable = set(self.initial_states)
+        frontier = list(reachable)
+        while frontier:
+            state = frontier.pop()
+            for successor in self.successors(state):
+                if successor not in reachable:
+                    reachable.add(successor)
+                    frontier.append(successor)
+        return frozenset(reachable)
 
     # -- the transition table, as data -------------------------------------- #
     def table(self) -> list[dict]:

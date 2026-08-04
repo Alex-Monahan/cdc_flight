@@ -274,6 +274,10 @@ SNAPSHOT_COMPLETION = Machine(
         SNAPSHOT_STREAMING,
     ),
     initial=SNAPSHOT_AWAITING_CALLBACKS,
+    # Streaming-only acquisition legitimately starts in ``not_required``; it is
+    # not an edge from the callback protocol.  Declaring both starts keeps the
+    # matrix and runtime model honest without inventing a fake transition.
+    initial_states=(SNAPSHOT_AWAITING_CALLBACKS, SNAPSHOT_NOT_REQUIRED),
     durable=None,
     purpose=(
         "Has Debezium's ordered callback queue delivered every per-table terminal "
@@ -720,6 +724,41 @@ CATALOG_BASELINE = Machine(
 BASELINE_UNTRUSTED = frozenset(
     s for s in CATALOG_BASELINE.states if s != BASELINE_VALID
 )
+
+
+# Products whose state owners make a consistency decision together.  This is part of
+# the declaration, not a test fixture: the matrix harness imports it and derives every
+# cell from these machine objects.  Pairs are unordered at the design level but kept in
+# the owner order used by the production gates and their tests.
+INTERACTING_MACHINE_PAIRS = (
+    ("catalog_change", "publication_admission"),
+    ("catalog_change", "catalog_schema_liveness"),
+    ("catalog_change", "schema_refusal"),
+    ("catalog_change", "table_lifecycle"),
+    ("publication_admission", "catalog_schema_liveness"),
+    ("publication_admission", "schema_refusal"),
+    ("publication_admission", "table_lifecycle"),
+    ("catalog_schema_liveness", "schema_refusal"),
+    ("catalog_schema_liveness", "table_lifecycle"),
+    ("schema_refusal", "table_lifecycle"),
+    ("snapshot_completion", "table_lifecycle"),
+    ("destination_ownership", "snapshot_completion"),
+)
+
+
+def declared_machines() -> dict[str, Machine]:
+    """Return only this module's system declarations.
+
+    ``states.machines()`` is intentionally a process-wide registry and therefore also
+    includes small machines constructed by mechanism tests.  Product coverage needs
+    the declarations that ship with Flight, so this accessor is the production-owned
+    boundary rather than a test-maintained name set.
+    """
+    return {
+        value.name: value
+        for value in globals().values()
+        if isinstance(value, Machine) and value.name != "t_basic"
+    }
 
 
 # --------------------------------------------------------------------------- #
