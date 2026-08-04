@@ -59,6 +59,7 @@ class SnapshotCoordinator:
         epoch: int,
         transactional_ddl: bool,
         alerts=None,
+        on_swap=None,
     ):
         self.con = con
         #: an `AlertSink`, or None. Only used to make an illegal lifecycle transition
@@ -80,6 +81,10 @@ class SnapshotCoordinator:
         self._get_registry = get_registry
         self.epoch = epoch
         self.transactional_ddl = transactional_ddl
+        #: Optional callback owned by a bounded re-snapshot.  It runs after the
+        #: shadow rename and lifecycle transition but before the surrounding COMMIT,
+        #: so discovery audit/refusal discharge cannot get ahead of the image.
+        self._on_swap = on_swap
         self.swaps = 0
         self._tables: dict[str, SnapshotTable] = {}
         self._session = False
@@ -271,6 +276,8 @@ class SnapshotCoordinator:
             last_commit_id=commit_id,
             alerts=self.alerts,
         )
+        if swapped and self._on_swap is not None:
+            self._on_swap(state, snapshot_lsn, commit_id)
         self._tables.pop(key, None)
         if not self._tables:
             self._session = False

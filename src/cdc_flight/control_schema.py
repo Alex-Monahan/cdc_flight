@@ -173,9 +173,10 @@ CONTROL_DDL = [
             refused_at      TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (pipeline, source_schema, source_table)
         )""",
-    # Idempotency key for the post-swap snapshot discharge.  The shadow swap and the
-    # completion/audit projection are separate concerns, so a crash between them must
-    # be replayable without duplicate "new" or "resnapshot" facts.
+    # Idempotency key for snapshot completion audits.  Production re-snapshots write
+    # these rows in the shadow-swap transaction; the key also makes recovery and the
+    # compatibility projection replayable without duplicate "new" or "resnapshot"
+    # facts.
     f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.snapshot_audits (
             pipeline        VARCHAR NOT NULL,
             source_schema   VARCHAR NOT NULL,

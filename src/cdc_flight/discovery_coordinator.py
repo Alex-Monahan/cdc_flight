@@ -18,7 +18,6 @@ from . import naming
 from . import resnapshot as resnapshot_mod
 from .applier import Applier
 from .config import CatalogConfig, ReplicationConfig, RunConfig, SourceConfig
-from .destination import CONTROL_SCHEMA
 from .errors import EngineFailure
 from .machines import PHASE_SNAPSHOTTING, PHASE_STREAMING
 from .ownership import DestinationOwnership
@@ -262,16 +261,13 @@ class LiveDiscoveryCoordinator:
                         "live_resnapshot": resnap.as_dict(),
                     }
                 )
-                self.con.execute(
-                    f"UPDATE {CONTROL_SCHEMA}.debezium_offsets SET snapshot_epoch = "
-                    "greatest(snapshot_epoch, ?) WHERE pipeline = ? AND namespace = ?",
-                    [
-                        self.main_resume.snapshot_epoch + len(tables) + 1,
-                        self.destination.pipeline_name,
-                        self.namespace,
-                    ],
+                # The re-snapshot callback advanced this durable epoch in the same
+                # transaction as the image/audit.  Only project that committed value
+                # into the next main applier; no post-swap state write remains here.
+                self.main_resume.snapshot_epoch = max(
+                    self.main_resume.snapshot_epoch,
+                    resnap.snapshot_epoch,
                 )
-                self.main_resume.snapshot_epoch += len(tables) + 1
                 self.watermarks = resnapshot_mod.read_watermarks(
                     self.con, self.destination.pipeline_name
                 )

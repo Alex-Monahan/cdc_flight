@@ -25,6 +25,7 @@ from cdc_flight.schema_evolution import (
     diff_columns,
     dlt_table_columns,
 )
+from cdc_flight.snapshot import SnapshotCoordinator
 
 
 def column(attnum: int, name: str, type_oid: int = 25, type_name: str = "text"):
@@ -400,5 +401,72 @@ def test_snapshot_audit_and_refusal_resolution_are_idempotent_after_swap(tmp_pat
             "WHERE pipeline = 'p' GROUP BY event ORDER BY event"
         ).fetchall() == [("new", 1), ("resnapshot", 1), ("schema_refusal", 1)]
         assert destination.pending_schema_refusals(con, "p") == []
+    finally:
+        con.close()
+
+
+def test_snapshot_swap_audit_is_in_the_same_transaction_as_the_image(tmp_path):
+    """A rollback after swap must also roll back the discovery completion audit."""
+    con = duckdb.connect(str(tmp_path / "snapshot-audit-atomic.duckdb"))
+    try:
+        destination.ensure_control_schema(con)
+        destination.ensure_dataset(con, "cdc_raw")
+        registry = SchemaRegistry(con, "cdc_raw")
+        destination.write_resume_point(
+            con,
+            pipeline="p",
+            namespace="main",
+            point=destination.ResumePoint(snapshot_epoch=2),
+            commit_id=0,
+            offset_blob=None,
+            offset_key_blob=None,
+        )
+        audit_calls = []
+
+        def audit(state, snapshot_lsn, commit_id):
+            audit_calls.append((state.schema, state.table, snapshot_lsn, commit_id))
+            resnapshot._record_snapshot_swap_audit(
+                con,
+                pipeline="p",
+                state=state,
+                snapshot_lsn=snapshot_lsn,
+                commit_id=commit_id,
+                reason="same transaction",
+                new_relations={"app.arrival"},
+                namespace="main",
+                snapshot_epoch=7,
+            )
+
+        coordinator = SnapshotCoordinator(
+            con,
+            dataset="cdc_raw",
+            pipeline="p",
+            topic_prefix="cdcflight",
+            created_in_txn=lambda: set(),
+            get_registry=lambda: registry,
+            epoch=0,
+            transactional_ddl=True,
+            on_swap=audit,
+        )
+        con.execute("BEGIN")
+        state = coordinator.state_for("app", "arrival")
+        con.execute(
+            'CREATE TABLE "cdc_raw"."cdcflight_app_arrival__cdcf_tmp" (id BIGINT)'
+        )
+        coordinator.swap(state, commit_id=7, snapshot_lsn=123)
+        assert audit_calls == [("app", "arrival", 123, 7)]
+        con.execute("ROLLBACK")
+
+        assert con.execute(
+            "SELECT count(*) FROM _cdc_flight.snapshot_audits"
+        ).fetchone()[0] == 0
+        assert con.execute(
+            "SELECT count(*) FROM _cdc_flight.table_state "
+            "WHERE pipeline = 'p' AND source_table = 'arrival'"
+        ).fetchone()[0] == 0
+        assert con.execute(
+            "SELECT snapshot_epoch FROM _cdc_flight.debezium_offsets "
+            "WHERE pipeline = 'p' AND namespace = 'main'"
+        ).fetchone()[0] == 2
     finally:
         con.close()

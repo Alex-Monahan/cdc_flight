@@ -151,6 +151,7 @@ class ResnapshotOutcome:
     events: int = 0
     reason: str = ""
     engine_stop_reason: str = ""
+    snapshot_epoch: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -166,6 +167,7 @@ class ResnapshotOutcome:
             "resnapshot_events": self.events,
             "resnapshot_reason": self.reason,
             "resnapshot_engine_stop_reason": self.engine_stop_reason,
+            "resnapshot_snapshot_epoch": self.snapshot_epoch,
         }
 
     @property
@@ -215,6 +217,105 @@ class EmptinessEvidence:
         if count != 0:
             return False, f"the source relation holds {count} row(s)"
         return True, ""
+
+
+def _record_snapshot_swap_audit(
+    con,
+    *,
+    pipeline: str,
+    state,
+    snapshot_lsn: int | None,
+    commit_id: int,
+    reason: str,
+    new_relations: set[str],
+    namespace: str | None = None,
+    snapshot_epoch: int | None = None,
+) -> None:
+    """Record a swapped image's audit and refusal discharge inside its COMMIT.
+
+    ``SnapshotCoordinator.swap`` invokes this callback while the image transaction is
+    still open.  The post-swap completion projection remains as a read-only compatibility
+    check; it is no longer the transaction that makes a discovery look complete.
+    """
+    if snapshot_lsn is None:
+        raise EngineFailure(
+            f"the snapshot for {state.schema}.{state.table} has no source LSN; "
+            "refusing to publish a discovery audit without a fence"
+        )
+    qualified = f"{state.schema}.{state.table}"
+    detail = (
+        f"re-snapshotted at consistent point {snapshot_lsn} ({reason}). "
+        "The table holds exact current state; change events of transactions "
+        "that committed before this LSN are fenced rather than applied, so "
+        "per-event history for that span is the snapshot image and not the "
+        "individual events (rubric 8.2's changelog is discontinuous here)."
+    )
+    events = [("resnapshot", 0, detail)]
+    if qualified in new_relations:
+        events.append(
+            (
+                "new",
+                1,
+                "new source relation discovered by the catalog watcher and "
+                "snapshotted before streaming",
+            )
+        )
+    for event, seq, event_detail in events:
+        exists = con.execute(
+            f"SELECT count(*) FROM {CONTROL_SCHEMA}.snapshot_audits "
+            "WHERE pipeline = ? AND source_schema = ? AND source_table = ? "
+            "AND snapshot_lsn = ? AND event = ?",
+            [pipeline, state.schema, state.table, snapshot_lsn, event],
+        ).fetchone()[0]
+        if exists:
+            continue
+        con.execute(
+            f"INSERT INTO {CONTROL_SCHEMA}.snapshot_audits "
+            "(pipeline, source_schema, source_table, snapshot_lsn, event, "
+            "target_table, detail, recorded_at) VALUES (?,?,?,?,?,?,?,?)",
+            [
+                pipeline, state.schema, state.table, snapshot_lsn, event, state.target,
+                event_detail, dest_mod.now(),
+            ],
+        )
+        dest_mod.write_table_event(
+            con,
+            pipeline=pipeline,
+            commit_id=commit_id,
+            seq=seq,
+            event=event,
+            source_schema=state.schema,
+            source_table=state.table,
+            target_table=state.target,
+            applied=True,
+            lsn=snapshot_lsn,
+            detail=event_detail,
+        )
+    dest_mod.resolve_schema_refusal(
+        con,
+        pipeline=pipeline,
+        source_schema=state.schema,
+        source_table=state.table,
+    )
+    _advance_snapshot_epoch(
+        con,
+        pipeline=pipeline,
+        namespace=namespace,
+        snapshot_epoch=snapshot_epoch,
+    )
+
+
+def _advance_snapshot_epoch(
+    con, *, pipeline: str, namespace: str | None, snapshot_epoch: int | None
+) -> None:
+    """Advance the main image identity in the same transaction as its image."""
+    if namespace is None or snapshot_epoch is None:
+        return
+    con.execute(
+        f"UPDATE {CONTROL_SCHEMA}.debezium_offsets SET snapshot_epoch = "
+        "greatest(snapshot_epoch, ?) WHERE pipeline = ? AND namespace = ?",
+        [snapshot_epoch, pipeline, namespace],
+    )
 
 
 class _SlotWatcher:
@@ -376,6 +477,18 @@ def run(
     applier = None
     source_stopped = False
     completion = SnapshotCompletion.full_snapshot(include)
+    def snapshot_audit(state, snapshot_lsn, commit_id):
+        _record_snapshot_swap_audit(
+            con,
+            pipeline=pipeline,
+            state=state,
+            snapshot_lsn=snapshot_lsn,
+            commit_id=commit_id,
+            reason=reason,
+            new_relations=new_relations or set(),
+            namespace=namespace,
+            snapshot_epoch=epoch_base + len(tables) + 1,
+        )
     try:
         applier = Applier(
             con,
@@ -391,6 +504,7 @@ def run(
             transactional_ddl=transactional_ddl,
             catalog=None,
             completion=completion,
+            snapshot_audit=snapshot_audit,
         )
         ownership.attach(applier)
         # Keep the historical pipeline seam: tests and embedding callers replace
@@ -454,6 +568,7 @@ def run(
                 outcome.consistent_lsn,
                 reason=reason,
                 new_relations=new_relations or set(),
+                write_audit=False,
             )
         pending = [t for t in tables if f"{t[0]}.{t[1]}" not in set(outcome.swapped)]
         evidence = _gather_emptiness_evidence(
@@ -470,6 +585,9 @@ def run(
             tables=tables,
             done=set(outcome.swapped),
             evidence=evidence,
+            new_relations=new_relations or set(),
+            namespace=namespace,
+            snapshot_epoch=epoch_base + len(tables) + 1,
         )
         if outcome.consistent_lsn is None and sorted(outcome.requested) != sorted(
             outcome.emptied
@@ -483,6 +601,7 @@ def run(
                 outcome.as_dict(),
             )
         assert_every_requested_table_completed(outcome)
+        outcome.snapshot_epoch = epoch_base + len(tables) + 1
         recovery.consume()
         log.warning(
             "RE-SNAPSHOT complete at consistent point %s: swapped %s, emptied %s",
@@ -668,6 +787,7 @@ def _completed_tables(
     *,
     reason: str = "",
     new_relations: set[str] | None = None,
+    write_audit: bool = True,
 ) -> list[str]:
     """The requested tables whose shadow has been swapped in, per `table_state`.
 
@@ -690,6 +810,14 @@ def _completed_tables(
             con, pipeline=pipeline, source_schema=schema, source_table=table
         )
         if state == table_lifecycle.COMPLETE:
+            if not write_audit:
+                # Production re-snapshots install the audit in the same transaction as
+                # the shadow swap through SnapshotCoordinator's callback.  At this
+                # point we only project which requested tables reached that terminal
+                # lifecycle state; writing here would recreate the crash window this
+                # function used to own.
+                done.append(f"{schema}.{table}")
+                continue
             resnapshot_detail = (
                 f"re-snapshotted at consistent point {consistent_lsn} ({reason}). "
                 "The table holds exact current state; change events of transactions "
@@ -768,6 +896,9 @@ def finish_verified_empty_tables(
     tables: list[tuple[str, str, str]],
     done: set[str],
     evidence: EmptinessEvidence,
+    new_relations: set[str] | None = None,
+    namespace: str | None = None,
+    snapshot_epoch: int | None = None,
 ) -> list[str]:
     """Empty the destination for the tables PROVEN empty at the source. Nothing else.
 
@@ -788,6 +919,7 @@ def finish_verified_empty_tables(
     fails the run through `assert_every_requested_table_completed`.
     """
     emptied: list[str] = []
+    discovered = new_relations or set()
     pending: list[tuple[str, str, str]] = []
     for schema, table, target in tables:
         qualified = f"{schema}.{table}"
@@ -830,6 +962,44 @@ def finish_verified_empty_tables(
                 to=table_lifecycle.COMPLETE,
                 reason="verified empty at the source; the destination table was emptied",
                 snapshot_lsn=consistent_lsn,
+            )
+            audit_detail = (
+                f"re-snapshot verified the source relation empty at consistent point "
+                f"{consistent_lsn}; the destination image was emptied atomically "
+                "and fenced at that point."
+            )
+            audit_events = [("resnapshot", audit_detail)]
+            if qualified in discovered:
+                audit_events.append(
+                    (
+                        "new",
+                        "new source relation discovered by the catalog watcher and "
+                        "verified empty before streaming",
+                    )
+                )
+            for event, detail in audit_events:
+                exists = con.execute(
+                    f"SELECT count(*) FROM {CONTROL_SCHEMA}.snapshot_audits "
+                    "WHERE pipeline = ? AND source_schema = ? AND source_table = ? "
+                    "AND snapshot_lsn = ? AND event = ?",
+                    [pipeline, schema, table, consistent_lsn, event],
+                ).fetchone()[0]
+                if exists:
+                    continue
+                con.execute(
+                    f"INSERT INTO {CONTROL_SCHEMA}.snapshot_audits "
+                    "(pipeline, source_schema, source_table, snapshot_lsn, event, "
+                    "target_table, detail, recorded_at) VALUES (?,?,?,?,?,?,?,?)",
+                    [
+                        pipeline, schema, table, consistent_lsn, event, target,
+                        detail, dest_mod.now(),
+                    ],
+                )
+            _advance_snapshot_epoch(
+                con,
+                pipeline=pipeline,
+                namespace=namespace,
+                snapshot_epoch=snapshot_epoch,
             )
             dest_mod.write_table_event(
                 con,

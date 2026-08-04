@@ -562,18 +562,13 @@ def run(
                 watcher.complete_discoveries(
                     {relation.qualified for relation in discovered}
                 )
-            # The main applier's snapshot identities must stay disjoint from the ones the
-            # re-snapshot just wrote, and the epoch is what makes them disjoint.
-            con.execute(
-                f"UPDATE {CONTROL_SCHEMA}.debezium_offsets SET snapshot_epoch = "
-                "greatest(snapshot_epoch, ?) WHERE pipeline = ? AND namespace = ?",
-                [
-                    reconciliation.resume_point.snapshot_epoch + len(owed) + 1,
-                    dest.pipeline_name,
-                    namespace,
-                ],
+            # The re-snapshot callback advanced the durable epoch in the same
+            # transaction as each completed image.  Keep the in-memory point aligned
+            # for the main applier without reopening a post-image write window.
+            reconciliation.resume_point.snapshot_epoch = max(
+                reconciliation.resume_point.snapshot_epoch,
+                resnap.snapshot_epoch,
             )
-            reconciliation.resume_point.snapshot_epoch += len(owed) + 1
         elif owed:
             log.warning(
                 "%s table(s) are marked awaiting_snapshot and are NOT being "
