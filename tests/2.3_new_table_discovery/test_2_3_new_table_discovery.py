@@ -97,6 +97,10 @@ def test_discovery_ownership_modules_stay_below_the_maintainability_boundary():
         "src/cdc_flight/catalog.py",
         "src/cdc_flight/pipeline.py",
         "src/cdc_flight/applier.py",
+        "src/cdc_flight/resnapshot.py",
+        "src/cdc_flight/resnapshot_compat.py",
+        "src/cdc_flight/resnapshot_projection.py",
+        "src/cdc_flight/state_interactions.py",
     ):
         assert len((root / relative).read_text().splitlines()) < 1000, relative
 

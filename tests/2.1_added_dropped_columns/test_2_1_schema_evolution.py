@@ -11,7 +11,7 @@ from __future__ import annotations
 import duckdb
 import pytest
 
-from cdc_flight import destination, resnapshot, table_lifecycle
+from cdc_flight import destination, resnapshot, resnapshot_projection, table_lifecycle
 from cdc_flight.apply_sql import SchemaRegistry
 from cdc_flight.catalog import CatalogChange, SourceRelation
 from cdc_flight.catalog_apply import CatalogAction, CatalogCoordinator, CatalogPlan
@@ -468,5 +468,124 @@ def test_snapshot_swap_audit_is_in_the_same_transaction_as_the_image(tmp_path):
             "SELECT snapshot_epoch FROM _cdc_flight.debezium_offsets "
             "WHERE pipeline = 'p' AND namespace = 'main'"
         ).fetchone()[0] == 2
+    finally:
+        con.close()
+
+
+def test_all_resnapshot_completion_paths_use_one_projection_component(monkeypatch, tmp_path):
+    con = duckdb.connect(str(tmp_path / "shared-projection.duckdb"))
+    try:
+        destination.ensure_control_schema(con)
+        destination.ensure_dataset(con, "cdc_raw")
+        calls = []
+        real_project = resnapshot_projection.project_snapshot_completion
+
+        def recording_project(*args, **kwargs):
+            calls.append(kwargs["events"])
+            return real_project(*args, **kwargs)
+
+        monkeypatch.setattr(
+            resnapshot_projection,
+            "project_snapshot_completion",
+            recording_project,
+        )
+
+        state = type(
+            "SnapshotState",
+            (),
+            {"schema": "app", "table": "swapped", "target": "cdcflight_app_swapped"},
+        )()
+        con.execute("BEGIN")
+        resnapshot._record_snapshot_swap_audit(
+            con,
+            pipeline="p",
+            state=state,
+            snapshot_lsn=101,
+            commit_id=7,
+            reason="callback",
+            new_relations={"app.swapped"},
+        )
+        con.execute("COMMIT")
+
+        table_lifecycle.transition(
+            con,
+            pipeline="p",
+            source_schema="app",
+            source_table="compat",
+            to=table_lifecycle.IN_PROGRESS,
+            reason="compatibility projection",
+        )
+        table_lifecycle.transition(
+            con,
+            pipeline="p",
+            source_schema="app",
+            source_table="compat",
+            to=table_lifecycle.COMPLETE,
+            reason="compatibility projection",
+            snapshot_lsn=102,
+        )
+        assert resnapshot._completed_tables(
+            con,
+            "p",
+            [("app", "compat", "cdcflight_app_compat")],
+            102,
+            new_relations={"app.compat"},
+        ) == ["app.compat"]
+
+        destination.request_snapshot(
+            con,
+            pipeline="p",
+            tables=[("app", "empty", "cdcflight_app_empty")],
+            detail="empty projection",
+        )
+        assert resnapshot.finish_verified_empty_tables(
+            con,
+            pipeline="p",
+            dataset="cdc_raw",
+            tables=[("app", "empty", "cdcflight_app_empty")],
+            done=set(),
+            evidence=resnapshot.EmptinessEvidence(
+                snapshot_phase_ended=True,
+                tables_seen=set(),
+                source_empty_at={"app.empty": 0},
+                wal_lsn=103,
+            ),
+            new_relations={"app.empty"},
+        ) == ["app.empty"]
+
+        assert len(calls) == 3
+    finally:
+        con.close()
+
+
+def test_verified_empty_discovery_emits_canonical_new_table_event(tmp_path):
+    con = duckdb.connect(str(tmp_path / "empty-discovery-audit.duckdb"))
+    try:
+        destination.ensure_control_schema(con)
+        destination.ensure_dataset(con, "cdc_raw")
+        tables = [("app", "empty", "cdcflight_app_empty")]
+        destination.request_snapshot(
+            con, pipeline="p", tables=tables, detail="new empty table"
+        )
+
+        assert resnapshot.finish_verified_empty_tables(
+            con,
+            pipeline="p",
+            dataset="cdc_raw",
+            tables=tables,
+            done=set(),
+            evidence=resnapshot.EmptinessEvidence(
+                snapshot_phase_ended=True,
+                tables_seen=set(),
+                source_empty_at={"app.empty": 0},
+                wal_lsn=123,
+            ),
+            new_relations={"app.empty"},
+        ) == ["app.empty"]
+
+        assert con.execute(
+            "SELECT event FROM _cdc_flight.table_events "
+            "WHERE pipeline = 'p' AND source_table = 'empty' ORDER BY seq"
+        ).fetchall() == [("resnapshot_empty",), ("new",)]
     finally:
         con.close()
