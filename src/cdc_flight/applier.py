@@ -45,15 +45,22 @@ import threading
 import time
 from typing import Any
 
-from . import apply_sql, destination, resume, self_heal, table_work
-from .applier_config import ApplierConfig
-from .assembler import (
-    UNIT_SNAPSHOT_CHUNK,
-    UNIT_TXN,
-    CompleteUnit,
-    TransactionAssembler,
+from . import (
+    ack_protocol,
+    apply_sql,
+    catalog_commit,
+    commit_metadata,
+    destination,
+    resume,
+    schema_epoch,
+    self_heal,
+    spill_protocol,
+    table_work,
+    unit_admission,
+    unit_apply,
 )
-from .catalog import CHANGE_SCHEMA
+from .applier_config import ApplierConfig
+from .assembler import CompleteUnit, TransactionAssembler
 from .catalog_apply import CatalogCoordinator, CatalogPlan
 from .commit_group import CommitResult, OpenGroup
 from .destination import AlertSink, Lease, ResumePoint
@@ -64,13 +71,11 @@ from .errors import (
     SchemaEvolutionRefused,
 )
 from .faults import arm_group, maybe_crash
-from .planner import GroupPlan, stream_event_id
 from .run_state import COMMIT_ACK
-from .schema_evolution import COLUMN_ADDED, COLUMN_DROPPED, COLUMN_RENAMED
 from .snapshot import SnapshotCoordinator
 from .snapshot_completion import SnapshotCompletion, SnapshotObservationError
 from .snapshot_notifications import decode_notification
-from .spill import SpillBuffer, StagedEvent
+from .spill import SpillBuffer
 
 log = logging.getLogger("cdc_flight.applier")
 
@@ -96,6 +101,7 @@ class Applier:
         catalog=None,
         watermarks: dict[str, int] | None = None,
         completion: SnapshotCompletion | None = None,
+        snapshot_audit=None,
     ):
         self.con = con
         self.pipeline = pipeline
@@ -159,6 +165,7 @@ class Applier:
             get_registry=lambda: self.registry,
             epoch=resume_point.snapshot_epoch,
             transactional_ddl=transactional_ddl,
+            on_swap=snapshot_audit,
         )
         self.spill = SpillBuffer(con)
         self.alerts = AlertSink(con, pipeline=pipeline)
@@ -174,6 +181,15 @@ class Applier:
             max_destructive_per_group=config.drop_max_per_group,
             allow_mass_drop=config.drop_allow_mass,
             revalidate=config.drop_revalidate,
+        )
+        self._schema_epochs = schema_epoch.SchemaEpochCoordinator(
+            spill=self.spill,
+            apply_units=self._apply_units,
+            apply_catalog_phase=self._apply_catalog_phase,
+            backfill_schema=lambda phase: self.catalog_coordinator.backfill_schema(
+                self.con, phase
+            ),
+            clear_spill=self.spill.clear,
         )
 
         self._committer = None
@@ -495,136 +511,7 @@ class Applier:
     # group assembly
     # ------------------------------------------------------------------ #
     def _add_unit(self, unit: CompleteUnit) -> None:
-        if self._discard_resnapshot_unit(unit):
-            return
-        if self.catalog is not None:
-            # A pgoutput row can outrun the background pg_attribute poll. Probe before
-            # appending the unit so the schema action is fenced behind this unit's LSN;
-            # the normal row path may still add the new-name column in this group.
-            self.catalog.observe_unit(unit)
-        is_snapshot = self._is_snapshot_unit(unit)
-        was_snapshot = self.group.is_snapshot
-        if not is_snapshot:
-            # This must happen before an open snapshot group is committed or the
-            # incoming streaming unit is appended. The completion machine, not the
-            # current group's row shape, owns the phase barrier.
-            if (
-                self.group.units
-                and self.group.is_snapshot
-                and self._has_snapshot_boundary(self.group.units)
-            ):
-                # A terminal boundary is itself the proof-bearing phase barrier. If
-                # its projected rows are ready, commit that snapshot group first;
-                # `observe_committed_group()` then takes completion_notified ->
-                # callbacks_complete, after which the stream edge can be checked.
-                result = self.commit_group("snapshot_chunk")
-                if result is not CommitResult.COMMITTED:
-                    self.snapshot_completion.check_streaming_admission()
-                    raise SnapshotObservationError(
-                        "cannot cross the snapshot phase boundary with commit result "
-                        f"{result.value}"
-                    )
-            else:
-                # An open snapshot group without its terminal boundary must never be
-                # committed merely because a stream unit arrived.
-                self.snapshot_completion.check_streaming_admission()
-        # ADR §3.5: snapshot units are never mixed with streaming units, so a
-        # commit_log row unambiguously says which phase it belongs to. The explicit
-        # terminal boundary is control-shaped but belongs to the snapshot group so its
-        # offset commits atomically with the final snapshot rows.
-        if (
-            self.group.units
-            and is_snapshot != self.group.is_snapshot
-        ):
-            result = self.commit_group(
-                "snapshot_chunk" if was_snapshot else "phase"
-            )
-            if result is not CommitResult.COMMITTED:
-                raise SnapshotObservationError(
-                    f"cannot cross the snapshot phase boundary with commit result "
-                    f"{result.value}"
-                )
-        if not is_snapshot:
-            # For a phase mismatch this runs only after the prior snapshot group has
-            # committed. For an empty group it is the admission edge that used to be
-            # skipped entirely.
-            self.snapshot_completion.enter_streaming()
-        self._append_unit(unit, is_snapshot=is_snapshot)
-
-    def _append_unit(
-        self, unit: CompleteUnit, *, is_snapshot: bool
-    ) -> None:
-        if not self.group.units:
-            self.group.is_snapshot = is_snapshot
-            self.group.opened_at = time.monotonic()
-
-        if unit.kind == UNIT_TXN and unit.last_lsn and unit.last_lsn <= self.resume_point.last_lsn:
-            # ADR §4.4 idempotency fence. Correctness does not depend on it - the
-            # resume point already excludes these - but it is the difference
-            # between "a replay is dropped" and "a replay is trusted", and it is
-            # what makes the `CDC_OFFSET_FILE_REPAIR=0` mode safe.
-            unit.fenced = True
-            self.fenced_units += 1
-            self.fenced_events += unit.event_count
-            log.info(
-                "fencing already-durable transaction %s (lsn %s <= durable %s)",
-                unit.txn_id, unit.last_lsn, self.resume_point.last_lsn,
-            )
-
-        if not self.cfg.ack_every_record and len(unit.records) > 1:
-            # Keep the terminal record (that is what carries the offset) and let
-            # go of every other Java reference in the unit. This is what bounds
-            # JVM memory for a large transaction; see ApplierConfig.
-            for record in unit.records[:-1]:
-                record.raw = None
-            unit.records = [unit.records[-1]]
-
-        self.group.units.append(unit)
-        self.group.events += unit.event_count
-        self.group.nbytes += unit.nbytes
-
-    def _discard_resnapshot_unit(self, unit: CompleteUnit) -> bool:
-        """Drop throwaway-slot streaming before it reaches phase or commit logic.
-
-        A re-snapshot's slot is temporary and its streaming records are duplicates of
-        records the real slot will deliver after the replacement image is handed off.
-        The assembler has already proven the transaction whole, but this unit has no
-        destination owner: no ``OpenGroup``, spill table, commit log, or resume point.
-        Its acknowledgeable handles wait until any preceding snapshot group is durable.
-        """
-        if not self.cfg.resnapshot or unit.kind != UNIT_TXN:
-            return False
-        unit.fenced = True
-        self.fenced_units += 1
-        self.fenced_events += unit.event_count
-        self.resnapshot_discarded_events += unit.event_count
-        self._pending_discarded_records.extend(unit.records)
-        if unit.spilled_events:
-            # Compatibility counter for ordinary observability. The re-snapshot
-            # assembler discard path does not populate this field because it never
-            # writes the destination spill table.
-            self.fenced_spilled_events += unit.spilled_events
-        log.debug(
-            "discarding %s streaming events from throwaway re-snapshot transaction %s",
-            unit.event_count,
-            unit.txn_id,
-        )
-        return True
-
-    @staticmethod
-    def _is_snapshot_unit(unit: CompleteUnit) -> bool:
-        """Classify row and synthetic control units by their source phase."""
-        return unit.kind == UNIT_SNAPSHOT_CHUNK or any(
-            record.kind == KIND_SNAPSHOT_BOUNDARY for record in unit.records
-        )
-
-    @staticmethod
-    def _has_snapshot_boundary(units: list[CompleteUnit]) -> bool:
-        return any(
-            record.kind == KIND_SNAPSHOT_BOUNDARY
-            for unit in units
-            for record in unit.records
-        )
+        unit_admission.add_unit(self, unit)
 
     def _reset_group(self) -> None:
         """One assignment, and that is the whole point (rubric 1.9).
@@ -738,7 +625,7 @@ class Applier:
                 last_txn_id=stats["last_txn_id"],
                 first_lsn=stats["first_lsn"],
                 last_lsn=stats["last_lsn"],
-                max_source_ts=_epoch_ms(stats["max_source_ts"]),
+                max_source_ts=commit_metadata.epoch_ms(stats["max_source_ts"]),
                 tables_touched=sorted(table_work.live_names(stats["tables"])),
             )
             destination.write_resume_point(
@@ -875,37 +762,7 @@ class Applier:
         return CommitResult.COMMITTED
 
     def _ack_discarded_records(self) -> None:
-        """Acknowledge a discard-only re-snapshot unit without a destination commit.
-
-        The temporary re-snapshot offset store is disposable and is never used for the
-        main handoff. If a snapshot group is open, these handles are held until that
-        group commits; when no destination group exists, this is the only safe progress
-        action. The acknowledgement remains inside the same exclusion/watchdog used by
-        the normal post-COMMIT acknowledgement window, but it does not write destination
-        state or a resume point.
-        """
-        pending = list(self._pending_discarded_records)
-        if not pending:
-            return
-        offset_fingerprint = self.verifier.before() if self.verifier else None
-        stage = ["discard_ack"]
-        marked = 0
-        with self_heal.commit_watchdog(
-            self.cfg.commit_timeout, self.last_commit_id, stage=lambda: stage[0]
-        ):
-            COMMIT_ACK.enter()
-            try:
-                for record in pending:
-                    if record.raw is None:
-                        continue
-                    self._committer.markProcessed(record.raw)
-                    marked += 1
-                self._committer.markBatchFinished()
-            finally:
-                COMMIT_ACK.leave()
-        del self._pending_discarded_records[: len(pending)]
-        if self.verifier is not None and marked:
-            self._pending_verification = (offset_fingerprint, marked)
+        ack_protocol.acknowledge_discarded_records(self)
 
     def _request_resnapshot_for(
         self, ambiguous: AmbiguousDelete | DestinationIdentityCollision
@@ -1012,237 +869,18 @@ class Applier:
         catalog_plan: CatalogPlan | None,
         catalog_stats: dict,
     ) -> dict:
-        """Apply row units on the correct side of each catalog LSN fence.
-
-        A schema fence belongs between ordered source units.  Using the group's final
-        LSN for every unit applies a rename/drop before rows from the older epoch; this
-        helper retains one destination transaction while placing each catalog action
-        at its first post-fence unit.
-        """
-        actions = sorted(
-            (
-                action for action in (catalog_plan.actions if catalog_plan else ())
-                if action.change.kind == CHANGE_SCHEMA
-            ),
-            key=lambda action: (action.change.detected_lsn, action.change.qualified),
+        return self._schema_epochs.apply(
+            group,
+            commit_id,
+            has_data=has_data,
+            catalog_plan=catalog_plan,
+            catalog_stats=catalog_stats,
+            created_in_txn=self.group.created_in_txn,
         )
-        if not actions:
-            return self._apply_units(group, commit_id, has_data=has_data)
-
-        total: dict | None = None
-        cursor = 0
-        index = 0
-        created_in_txn = self.group.created_in_txn
-        while index < len(actions):
-            boundary = actions[index].change.detected_lsn
-            same_boundary: list = []
-            while index < len(actions) and actions[index].change.detected_lsn == boundary:
-                same_boundary.append(actions[index])
-                index += 1
-            for unit in group:
-                self._refuse_mixed_schema_epoch(
-                    self._events_for_schema_check(unit), same_boundary
-                )
-            end = cursor
-            while end < len(group) and (group[end].last_lsn or 0) <= boundary:
-                end += 1
-            # The catalog observation LSN is a *discovery* fence, not the source DDL's
-            # exact event LSN. A row emitted after the DDL can therefore carry an LSN
-            # below the poll's current-WAL value. Its shape is stronger evidence of the
-            # epoch: a dropped old name absent, an added/renamed new name present. Put
-            # the schema phase before that first post-DDL unit so DuckDB never sees
-            # DML followed by ALTER in one transaction (DuckDB defers the PK index and
-            # reports a duplicate at COMMIT even when the DML deleted the key first).
-            for position in range(cursor, end):
-                if self._unit_is_post_schema_epoch(group[position], same_boundary):
-                    end = position
-                    break
-            if end > cursor:
-                part = self._apply_units(
-                    group[cursor:end],
-                    commit_id,
-                    has_data=has_data,
-                    clear_spill=False,
-                    created_in_txn=created_in_txn,
-                )
-                total = self._merge_apply_stats(total, part)
-                cursor = end
-
-            names = {action.change.qualified for action in same_boundary}
-            phase = CatalogPlan(
-                actions=tuple(same_boundary),
-                relations=tuple(
-                    relation
-                    for relation in (catalog_plan.relations if catalog_plan else ())
-                    if relation.qualified in names
-                ),
-            )
-            self._apply_catalog_phase(
-                commit_id, phase, catalog_stats, schema_only=True
-            )
-            self.catalog_coordinator.backfill_schema(self.con, phase)
-
-        if cursor < len(group):
-            part = self._apply_units(
-                group[cursor:],
-                commit_id,
-                has_data=has_data,
-                clear_spill=True,
-                created_in_txn=created_in_txn,
-            )
-            total = self._merge_apply_stats(total, part)
-        elif any(unit.spill_unit_seq is not None for unit in group):
-            # Every unit was consumed before the final schema fence; no final row
-            # segment existed to perform the normal spill cleanup.
-            self.spill.clear(commit_id)
-        return total or self._empty_apply_stats()
-
-    def _events_for_schema_check(self, unit: CompleteUnit) -> list:
-        events = list(unit.events)
-        if unit.spill_unit_seq is not None:
-            events.extend(
-                staged.event
-                for staged in self.spill.load(
-                    commit_id=self.commit_id, unit_seq=unit.spill_unit_seq
-                )
-            )
-        return events
 
     @staticmethod
     def _refuse_mixed_schema_epoch(events: list, actions: list) -> None:
-        """Refuse one source unit that contains both sides of a schema fence.
-
-        A source transaction may contain DML before and after transactional DDL.  A
-        whole-unit applier cannot safely put the DDL before one row and after another;
-        committing either ordering could fold one event against the wrong destination
-        identity.  The refusal is durable and routes the table to a complete snapshot.
-        """
-        changes_by_table: dict[str, tuple] = {}
-        for action in actions:
-            changes_by_table.setdefault(action.change.qualified, ())
-            changes_by_table[action.change.qualified] += tuple(
-                action.change.column_changes
-            )
-        epochs: dict[str, set[str]] = {}
-        for event in events:
-            if not event.schema or not event.table:
-                continue
-            table = f"{event.schema}.{event.table}"
-            changes = changes_by_table.get(table)
-            if not changes:
-                continue
-            fields = set()
-            for image in (event.before, event.after, event.key):
-                if image:
-                    fields.update(image)
-            for change in changes:
-                old = change.destination_old_name
-                new = change.destination_new_name
-                epoch = None
-                if change.kind == COLUMN_ADDED and new:
-                    epoch = "post" if new in fields else "pre"
-                elif change.kind == COLUMN_DROPPED and old:
-                    epoch = "pre" if old in fields else "post"
-                elif change.kind == COLUMN_RENAMED and old and new:
-                    if old in fields and new in fields:
-                        raise SchemaEvolutionRefused(
-                            f"row shape for {table} contains both sides of the "
-                            f"rename {old!r} -> {new!r}; the source transaction "
-                            "cannot be ordered safely around the schema fence",
-                            source_schema=event.schema,
-                            source_table=event.table,
-                            target=table,
-                            detected_lsn=min(
-                                action.change.detected_lsn for action in actions
-                            ),
-                        )
-                    if old in fields:
-                        epoch = "pre"
-                    elif new in fields:
-                        epoch = "post"
-                if epoch is not None:
-                    epochs.setdefault(table, set()).add(epoch)
-        mixed = sorted(table for table, values in epochs.items() if len(values) > 1)
-        if mixed:
-            table = mixed[0]
-            schema, _, source_table = table.partition(".")
-            raise SchemaEvolutionRefused(
-                f"source unit for {table} contains row images from both sides of "
-                "a schema fence; a whole source transaction cannot be safely "
-                "canonicalized, so it is refused for a replacement snapshot",
-                source_schema=schema,
-                source_table=source_table,
-                target=table,
-                detected_lsn=min(action.change.detected_lsn for action in actions),
-            )
-
-    def _unit_is_post_schema_epoch(self, unit: CompleteUnit, actions: list) -> bool:
-        """Whether a unit's row shape proves it is after one of these schema changes."""
-        changes_by_table: dict[str, tuple] = {}
-        for action in actions:
-            changes_by_table.setdefault(action.change.qualified, ())
-            changes_by_table[action.change.qualified] += tuple(
-                action.change.column_changes
-            )
-        for event in self._events_for_schema_check(unit):
-            if not event.schema or not event.table:
-                continue
-            changes = changes_by_table.get(f"{event.schema}.{event.table}")
-            if not changes:
-                continue
-            fields = set()
-            for image in (event.before, event.after, event.key):
-                if image:
-                    fields.update(image)
-            if not fields:
-                continue
-            for change in changes:
-                old = change.destination_old_name
-                new = change.destination_new_name
-                if change.kind == COLUMN_ADDED and new and new in fields:
-                    return True
-                if change.kind == COLUMN_DROPPED and old and old not in fields:
-                    return True
-                if (
-                    change.kind == COLUMN_RENAMED
-                    and new
-                    and new in fields
-                    and old not in fields
-                ):
-                    return True
-        return False
-
-    @staticmethod
-    def _empty_apply_stats() -> dict:
-        return {
-            "events": 0,
-            "tables": set(),
-            "first_txn_id": None,
-            "last_txn_id": None,
-            "first_lsn": None,
-            "last_lsn": None,
-            "max_source_ts": None,
-        }
-
-    @staticmethod
-    def _merge_apply_stats(total: dict | None, part: dict) -> dict:
-        if total is None:
-            return part
-        total["events"] += part["events"]
-        total["tables"].update(part["tables"])
-        if total["first_txn_id"] is None:
-            total["first_txn_id"] = part["first_txn_id"]
-        if part["last_txn_id"] is not None:
-            total["last_txn_id"] = part["last_txn_id"]
-        if total["first_lsn"] is None:
-            total["first_lsn"] = part["first_lsn"]
-        if part["last_lsn"] is not None:
-            total["last_lsn"] = part["last_lsn"]
-        if part["max_source_ts"] is not None:
-            total["max_source_ts"] = max(
-                total["max_source_ts"] or 0, part["max_source_ts"]
-            )
-        return total
+        schema_epoch.refuse_mixed_schema_epoch(events, actions)
 
     def _apply_units(
         self,
@@ -1253,102 +891,23 @@ class Applier:
         clear_spill: bool = True,
         created_in_txn: set[str] | None = None,
     ) -> dict:
-        created_in_txn = (
-            self.group.created_in_txn if created_in_txn is None else created_in_txn
-        )
-        plan = GroupPlan(
-            self.con,
-            commit_id=commit_id,
-            registry_of=lambda: self.registry,
-            snapshots=self.snapshots,
-            spill=self.spill,
-            truncate_mode=self.cfg.truncate_mode,
+        return unit_apply.apply_units(
+            self,
+            group,
+            commit_id,
+            has_data=has_data,
+            clear_spill=clear_spill,
             created_in_txn=created_in_txn,
-            watermarks=self.watermarks,
         )
-        for unit in group:
-            if unit.fenced:
-                # This is retained for ordinary idempotency-fenced units. A
-                # re-snapshot overlap is discarded before admission and therefore
-                # cannot reach this apply pass.
-                if unit.spill_unit_seq is not None:
-                    self.fenced_spilled_events += unit.spilled_events
-                    plan.staged_units = True
-                continue
-            if unit.kind == UNIT_SNAPSHOT_CHUNK:
-                self.group.is_snapshot = True
-            plan.add_unit(unit)
-
-        # The `mid_apply` anchor is documented as "some tables written, others not".
-        # It has to fire BETWEEN two table writes, or it cannot detect a transaction
-        # torn between table A and table B - the one interleaving rubric 1.3 is about
-        # (Codex 6) - and it is gated on `has_data` like every other anchor, because
-        # `<nth>` counts data-carrying groups (Opus MINOR-2).
-        anchor = None
-        if has_data:
-            def anchor() -> None:
-                maybe_crash("mid_apply", self.data_commit_groups + 1)
-        stats = plan.write(after_first_table=anchor, clear_spill=clear_spill)
-        self.group.created_in_txn.update(created_in_txn)
-        for target, (schema, table) in plan.created_tables.items():
-            destination.register_table(
-                self.con,
-                pipeline=self.pipeline,
-                source_schema=schema,
-                source_table=table,
-                target_table=target,
-            )
-        with self._lock:
-            for target, count in plan.table_counts.items():
-                self.table_counts[target] = self.table_counts.get(target, 0) + count
-        self.truncates_applied += plan.truncates_applied
-        self.truncates_logged += plan.truncates_logged
-        self.watermark_fenced_events += plan.watermark_fenced_events
-        if self.group.is_snapshot and stats.get("last_lsn"):
-            # Every snapshot record of one snapshot carries the exported snapshot's
-            # consistent point, so this is `C` (rubric 1.6, `cdc_flight.resnapshot`).
-            self.last_snapshot_lsn = stats["last_lsn"]
-        self.group.source_tables |= plan.source_tables
-        self.group.table_events.extend(plan.markers())
-        self._flush_table_events(commit_id)
-        return stats
 
     # ------------------------------------------------------------------ #
     # table-level events and catalog DDL (rubric 1.5)
     # ------------------------------------------------------------------ #
     def _flush_table_events(self, commit_id: int) -> None:
-        """Write this group's `table_events` rows, inside its transaction.
-
-        Deliberately transactional with the data: "the destination table was emptied"
-        and "here is the source event that emptied it" must become true together, or
-        the audit trail can outlive a rolled-back apply and describe something that
-        never happened.
-        """
-        for marker in self.group.table_events:
-            destination.write_table_event(
-                self.con,
-                pipeline=self.pipeline,
-                commit_id=commit_id,
-                seq=self.group.next_table_event_seq(),
-                **marker,
-            )
-        self.group.table_events = []
+        catalog_commit.flush_table_events(self, commit_id)
 
     def _plan_catalog_changes(self, durable_lsn: int) -> CatalogPlan | None:
-        """Plan catalog changes once for the commit group (rubric 1.5).
-
-        Planning is separate from applying so schema DDL can run before row DML while
-        destructive table DDL remains after it.  The plan is retained on ``OpenGroup``
-        and settled only after COMMIT.
-        """
-        coordinator = self.catalog_coordinator
-        if not coordinator.enabled:
-            return None
-        plan = coordinator.plan(durable_lsn)
-        if not plan.actions and not plan.relations and not plan.alerts:
-            return None
-        self.group.catalog_plan = plan
-        return plan
+        return catalog_commit.plan_catalog_changes(self, durable_lsn)
 
     def _apply_catalog_phase(
         self,
@@ -1358,73 +917,12 @@ class Applier:
         *,
         schema_only: bool,
     ) -> None:
-        """Apply one phase of a catalog plan inside the commit transaction.
-
-        Schema actions run first because destination engines may reject a DML-plus-DDL
-        transaction at COMMIT even when the DML is logically non-duplicating.  Table
-        drops/recreates and discovery markers run in the second phase, after the data
-        units, preserving the existing drop fence semantics.
-        """
-        schema_actions = tuple(
-            action for action in plan.actions if action.change.kind == CHANGE_SCHEMA
+        catalog_commit.apply_catalog_phase(
+            self, commit_id, plan, stats, schema_only=schema_only
         )
-        actions = schema_actions if schema_only else tuple(
-            action for action in plan.actions if action.change.kind != CHANGE_SCHEMA
-        )
-        schema_names = {
-            action.change.qualified for action in schema_actions
-        }
-        relations = tuple(
-            relation
-            for relation in plan.relations
-            if (relation.qualified in schema_names) == schema_only
-        )
-        phase = CatalogPlan(
-            actions=actions,
-            relations=relations,
-            refused=plan.refused if not schema_only else (),
-        )
-        if not phase.actions and not phase.relations and not phase.refused:
-            return
-        self.group.table_events.extend(
-            self.catalog_coordinator.apply(self.con, phase, stats)
-        )
-        if self.group.table_events:
-            self._flush_table_events(commit_id)
-
-    def _apply_catalog_changes(
-        self,
-        commit_id: int,
-        durable_lsn: int,
-        stats: dict,
-    ) -> None:
-        """Compatibility wrapper for callers that apply a complete catalog plan.
-
-        Runs inside the commit group's transaction, *after* the group's events, so a
-        `DROP` cannot remove rows that an event of this same group had still to add,
-        and a crash between the drop and the resume-point write replays both. The
-        policy - supersession, revalidation, the circuit breaker, `awaiting_snapshot` -
-        is `catalog_apply.CatalogCoordinator`'s; this is only where it is executed.
-        """
-        plan = self._plan_catalog_changes(durable_lsn)
-        if plan is None:
-            return
-        self._apply_catalog_phase(commit_id, plan, stats, schema_only=False)
-        # A destructive action that could not be applied is exactly the signal an
-        # operator must still get when the group rolls back; one that describes an
-        # applied action must NOT outlive the rollback that undid it (Codex 7).
-        self.group.pending_alerts.extend(plan.alerts)
 
     def _settle_catalog(self, group_obj: OpenGroup) -> None:
-        """Forget the catalog work this group made durable. Runs after COMMIT."""
-        if self.catalog is None:
-            return
-        plan = group_obj.catalog_plan
-        if plan is not None:
-            self.catalog_coordinator.settle(plan, group_obj.source_tables)
-            group_obj.catalog_plan = None
-        elif group_obj.source_tables:
-            self.catalog.observe_replicated(group_obj.source_tables)
+        catalog_commit.settle_catalog(self, group_obj)
 
     def _flush_alerts(self, group_obj: OpenGroup) -> None:
         for alert in group_obj.pending_alerts:
@@ -1449,66 +947,9 @@ class Applier:
         unit_seq: int,
         snapshot: tuple[str | None, str | None] | None = None,
     ) -> int:
-        """Stage one unit's events inside the group's own transaction (ADR §3.4).
-
-        `unit_seq` and `snapshot` are **inputs**, not inferences. This callback used
-        to look the phase up in the applier's snapshot mapping, which the apply pass
-        populates only later, so on the first spilled chunk of every snapshot it
-        concluded "streaming" and staged the rows into the **live** table with a
-        `<lsn>:None:None` identity; a consumer could then see a partial snapshot, and
-        the swap dropped those rows (Codex 1). Resolving the shadow *here*, through
-        the coordinator, is what makes that impossible; `unit_seq` is what lets the
-        drain order and fence per unit (Opus B-1, Codex 5).
-        """
-        if not events:
-            return 0
-        if self.cfg.resnapshot and snapshot is None:
-            # The assembler is configured to discard these events before invoking this
-            # callback. Keep this defensive branch side-effect free if a caller invokes
-            # the callback directly: a throwaway stream must never open a destination
-            # transaction merely because it crossed a memory threshold.
-            log.debug("discarding %s throwaway re-snapshot events before destination spill", len(events))
-            return len(events)
-        if not self.group.txn_open:
-            self.con.execute("BEGIN TRANSACTION")
-            self.group.txn_open = True
-            self.group.spill_commit_id = self._reserve_commit_id()
-        commit_id = self.group.spill_commit_id or self._next_commit_id
-        # Creates the shadow table, its `table_state` row and the snapshot epoch
-        # BEFORE any record of this table can be staged.
-        state = self.snapshots.state_for(*snapshot) if snapshot is not None else None
-
-        prepared: list[StagedEvent] = []
-        for event in events:
-            if not event.schema or not event.table:
-                continue
-            if state is not None:
-                prepared.append(
-                    StagedEvent(
-                        event=event,
-                        event_id=self.snapshots.event_id(event),
-                        target=state.shadow,
-                        seq=event.snapshot_ordinal,
-                    )
-                )
-            else:
-                prepared.append(
-                    StagedEvent(
-                        event=event,
-                        event_id=stream_event_id(event),
-                        target=self.snapshots.target_table(event.schema, event.table),
-                        # Mandatory and validated by the assembler, so there is
-                        # nothing to substitute a local sequence for: doing that gave
-                        # a replay a different identity (Codex 4).
-                        seq=event.total_order,
-                    )
-                )
-        staged = self.spill.stage(
-            commit_id=commit_id, unit_seq=unit_seq, prepared=prepared
+        return spill_protocol.stage_events(
+            self, events, unit_seq=unit_seq, snapshot=snapshot
         )
-        self.spilled_events += staged
-        maybe_crash("spill", self.data_commit_groups + 1)
-        return len(events)
 
     # ------------------------------------------------------------------ #
     # shutdown
@@ -1549,13 +990,3 @@ class Applier:
             if self.error is None:
                 self.error = exc
         return self.assembler.discard_open_unit()
-
-
-def _epoch_ms(value) -> Any:
-    """Debezium's `source.ts_ms` as a timestamp, so end-to-end lag is a SQL
-    subtraction rather than an arithmetic puzzle for whoever writes rubric 6.1."""
-    if value is None:
-        return None
-    from datetime import UTC, datetime
-
-    return datetime.fromtimestamp(value / 1000.0, tz=UTC)

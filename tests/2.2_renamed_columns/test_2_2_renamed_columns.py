@@ -11,6 +11,7 @@ from applier_lab import data
 from cdc_flight import destination
 from cdc_flight.applier import Applier
 from cdc_flight.apply_sql import SchemaRegistry
+from cdc_flight.assembler import UNIT_TXN, CompleteUnit
 from cdc_flight.catalog import CHANGE_SCHEMA, CatalogChange, CatalogWatcher, SourceRelation
 from cdc_flight.errors import SchemaEvolutionRefused, SchemaShapeUnexplained
 from cdc_flight.schema_evolution import (
@@ -313,6 +314,80 @@ def test_hidden_intermediate_column_shape_is_refused_instead_of_folded(tmp_path)
     )
     with pytest.raises(SchemaShapeUnexplained, match="intermediate DDL history"):
         watcher.observe_unit(unit)
+
+
+def test_hidden_shape_refusal_at_applier_callback_is_durable(tmp_path, monkeypatch):
+    """The callback boundary must leave a rebuild obligation, not only an exception."""
+    from applier_lab import Lab
+
+    old_columns = (col(1, "id", 20, "bigint"), col(2, "name"))
+    watcher = CatalogWatcher(
+        dsn="",
+        publication="pub",
+        schema="app",
+        include={"app.customers"},
+        poll_seconds=0,
+        known={
+            "app.customers": SourceRelation(
+                "app", "customers", 1, True, "d", old_columns
+            )
+        },
+    )
+    watcher.queue(
+        CatalogChange(
+            kind=CHANGE_SCHEMA,
+            schema="app",
+            table="customers",
+            detected_lsn=100,
+            new_relation=SourceRelation(
+                "app", "customers", 1, True, "d", old_columns
+            ),
+            column_changes=(
+                ColumnChange(COLUMN_RENAMED, 2, "name", "full_name", 25, "text", True),
+            ),
+        )
+    )
+    box = Lab(tmp_path / "hidden-shape-applier.duckdb", catalog=watcher)
+    try:
+        event = data(
+            "hidden-history",
+            1,
+            101,
+            key={"id": 1},
+            after={"id": 1, "nickname": "Ada"},
+        )
+        unit = CompleteUnit(
+            kind=UNIT_TXN,
+            events=[event],
+            records=[event],
+            txn_id="hidden-history",
+            last_lsn=101,
+            commit_lsn=101,
+        )
+        monkeypatch.setattr(box.applier.assembler, "feed", lambda _record: [unit])
+        monkeypatch.setattr(
+            "cdc_flight.applier.decode",
+            lambda _raw, topic_prefix, want_offsets=False: event,
+        )
+        monkeypatch.setattr(
+            "cdc_flight.applier.decode_notification",
+            lambda _raw, topic_prefix: None,
+        )
+
+        with pytest.raises(SchemaShapeUnexplained, match="intermediate DDL history"):
+            box.applier.handle_batch([object()], box.committer)
+
+        pending = destination.pending_schema_refusals(box.con, "lab")
+        assert len(pending) == 1
+        assert pending[0][0:2] == ("app", "customers")
+        assert "intermediate DDL history" in pending[0][2]
+        assert box.scalar(
+            "SELECT snapshot_state FROM _cdc_flight.table_state "
+            "WHERE pipeline = 'lab' AND source_schema = 'app' "
+            "AND source_table = 'customers'"
+        ) == "awaiting_snapshot"
+    finally:
+        box.close()
 
 
 def test_one_source_unit_with_pre_and_post_schema_shapes_is_refused():

@@ -93,7 +93,11 @@ def test_catalog_poll_default_is_short_and_configurable():
 
 def test_discovery_ownership_modules_stay_below_the_maintainability_boundary():
     root = Path(__file__).resolve().parents[2]
-    for relative in ("src/cdc_flight/catalog.py", "src/cdc_flight/pipeline.py"):
+    for relative in (
+        "src/cdc_flight/catalog.py",
+        "src/cdc_flight/pipeline.py",
+        "src/cdc_flight/applier.py",
+    ):
         assert len((root / relative).read_text().splitlines()) < 1000, relative
 
 
