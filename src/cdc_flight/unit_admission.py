@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 import time
 
+from . import table_lifecycle
 from .assembler import UNIT_SNAPSHOT_CHUNK, UNIT_TXN
+from .config import DROP_LOG
 from .envelope import KIND_SNAPSHOT_BOUNDARY
 from .errors import SchemaShapeUnexplained
 from .snapshot_completion import SnapshotObservationError
@@ -16,6 +18,7 @@ log = logging.getLogger("cdc_flight.unit_admission")
 def add_unit(applier, unit) -> None:
     if discard_resnapshot_unit(applier, unit):
         return
+    refuse_log_recreate_tail(applier, unit)
     if applier.catalog is not None:
         try:
             applier.catalog.observe_unit(unit)
@@ -55,6 +58,28 @@ def add_unit(applier, unit) -> None:
     if not is_snapshot:
         applier.snapshot_completion.enter_streaming()
     append_unit(applier, unit, is_snapshot=is_snapshot)
+
+
+def refuse_log_recreate_tail(applier, unit) -> None:
+    """Do not stream into a retained image that owes a replacement snapshot.
+
+    ``CatalogCoordinator`` records a log-mode recreate after the fenced group has
+    applied. A later whole Postgres transaction must not be allowed to append the new
+    relation's rows to that old image before the next run's re-snapshot. Reading the
+    durable lifecycle here makes the boundary survive a restart; the whole unit is
+    refused before it enters a commit group, so no source transaction is partially
+    admitted.
+    """
+    if applier.cfg.drop_mode != DROP_LOG or unit.kind != UNIT_TXN:
+        return
+    owing = set(table_lifecycle.owing_work(applier.con, applier.pipeline))
+    blocked = sorted(unit.tables_touched() & owing)
+    if blocked:
+        raise SnapshotObservationError(
+            "streaming admission refused for relation(s) awaiting_snapshot: "
+            + ", ".join(blocked)
+            + "; a replacement snapshot must complete before the new lifecycle streams"
+        )
 
 
 def append_unit(applier, unit, *, is_snapshot: bool) -> None:

@@ -836,14 +836,16 @@ def mark_awaiting_snapshot(
     target_table: str,
     state: str,
 ) -> None:
-    """Record that a table's destination data is gone and CDC cannot rebuild it.
+    """Record that a table's destination image cannot be trusted by CDC alone.
 
     Rubric 1.5 / Opus Q1. A `recreated` source relation means the destination table
     held a *different* relation's rows: keeping them presents pre-drop data as
     current, and dropping them and letting ordinary CDC re-create a partial table is
     worse still, because the destination then looks healthy while being silently
-    incomplete. So the row survives the drop carrying `snapshot_state` — the run
-    summary and `inspect` surface it, and rubric 2.3/3.4's re-snapshot clears it.
+    incomplete. In either drop policy the row carries `snapshot_state` — the run
+    summary and `inspect` surface it, and rubric 2.3/3.4's re-snapshot clears it. Log
+    mode deliberately keeps the stale image, so its new-relation stream tail is
+    refused until that rebuild.
     """
     table_lifecycle.transition(
         con,

@@ -236,6 +236,37 @@ def unrebuilt_relations(con, *, pipeline: str, dataset: str) -> list[str]:
     ]
 
 
+def owing_relations_with_rows(con, *, pipeline: str, dataset: str) -> list[str]:
+    """Return owed lifecycle names whose retained destination image is non-empty.
+
+    A replacement relation can already have a durable ``source_relations`` row: the
+    coordinator writes the new oid in the same transaction that records the recreate.
+    That row alone must not discharge the catalog baseline while the old image remains
+    queryable. The lifecycle machine is therefore the boundary, and the destination row
+    count distinguishes a retained log image from a destructive recreate whose table is
+    already gone.
+    """
+    owing = set(table_lifecycle.owing_work(con, pipeline))
+    if not owing:
+        return []
+    targets = {
+        f"{schema}.{table}": (str(schema), str(table), str(target))
+        for schema, table, target in con.execute(
+            f"SELECT source_schema, source_table, target_table FROM "
+            f"{CONTROL_SCHEMA}.table_state WHERE pipeline = ?",
+            [pipeline],
+        ).fetchall()
+    }
+    from .destination import destination_holds_rows
+
+    held = destination_holds_rows(
+        con,
+        dataset=dataset,
+        tables=[targets[name] for name in sorted(owing) if name in targets],
+    )
+    return sorted(held)
+
+
 # --------------------------------------------------------------------------- #
 # writing — the ONE writer, and every write takes a declared edge
 # --------------------------------------------------------------------------- #
@@ -508,6 +539,13 @@ def confirm(
         if check.reconciling
         else []
     )
+    # A relation identity is not enough after a same-name recreate in log mode. The
+    # old destination image is still present, and `awaiting_snapshot` is the durable
+    # proof that the new lifecycle has not yet been admitted. Without this check the
+    # coordinator could replace the oid and promote the baseline over both lifecycles.
+    remaining = sorted(set(remaining) | set(
+        owing_relations_with_rows(con, pipeline=pipeline, dataset=dataset)
+    ))
     if remaining:
         check.unreconciled = remaining
         check.reason = (

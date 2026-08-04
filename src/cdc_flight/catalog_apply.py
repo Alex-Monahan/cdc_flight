@@ -24,10 +24,11 @@ Four guards, in the order they run:
    worst of both.
 
 A `recreated` relation is the one case where the source table *exists* and the
-destination table is still wrong — it holds the rows of a different relation. It is
-dropped, alerted on, and the table is marked `awaiting_snapshot` in `table_state`
-so the incompleteness is loud rather than silent (Opus Q1); rubric 2.3/3.4 own the
-automatic re-snapshot that turns that flag off.
+destination table is still wrong — it holds the rows of a different relation. In
+replicate mode it is dropped; in log mode it is retained as an explicitly stale image.
+Either way it is alerted on and the table is marked `awaiting_snapshot` in
+`table_state`, so the incompleteness is loud rather than silent (Opus Q1); rubric
+2.3/3.4 own the automatic re-snapshot that turns that flag off.
 
 Alerts are returned, never written here: they must survive a rollback, which means a
 different connection and a moment after the transaction has settled (Codex 7).
@@ -281,15 +282,17 @@ class CatalogCoordinator:
                     )
                     continue
             detail = None
-            if change.kind in DESTRUCTIVE and not destructive:
-                detail = f"drop_mode={self.drop_mode}"
-            elif destructive and change.kind == CHANGE_RECREATED:
+            if change.kind == CHANGE_RECREATED:
                 detail = (
                     f"recreated with oid {change.new_oid} (was {change.old_oid}); the "
-                    "destination table held the OLD relation's rows and was dropped, "
-                    f"and `table_state.snapshot_state` is now {AWAITING_SNAPSHOT!r}: it "
-                    "is INCOMPLETE until a re-snapshot runs (rubric 2.3/3.4)"
+                    "destination table held the OLD relation's rows and was "
+                    + ("dropped" if destructive else "retained as a stale log image")
+                    + ", and `table_state.snapshot_state` is now "
+                    f"{AWAITING_SNAPSHOT!r}: it is INCOMPLETE until a re-snapshot "
+                    "runs (rubric 2.3/3.4)"
                 )
+            elif change.kind in DESTRUCTIVE and not destructive:
+                detail = f"drop_mode={self.drop_mode}"
             elif destructive and not change.fenced:
                 detail = "applied without a WAL fence marker (CDC_CATALOG_GRACE)"
             elif change.kind == CHANGE_SCHEMA:
@@ -430,17 +433,7 @@ class CatalogCoordinator:
                 # leave `<target>__cdcf_tmp` behind forever.
                 self.registry.drop(naming.shadow_table(action.target))
                 self.registry.drop(action.target)
-                if change.kind == CHANGE_RECREATED:
-                    destination.mark_awaiting_snapshot(
-                        con,
-                        pipeline=self.pipeline,
-                        source_schema=change.schema,
-                        source_table=change.table,
-                        target_table=action.target,
-                        state=AWAITING_SNAPSHOT,
-                    )
-                    self.awaiting_snapshot.add(change.qualified)
-                else:
+                if change.kind != CHANGE_RECREATED:
                     destination.forget_table_state(
                         con,
                         pipeline=self.pipeline,
@@ -449,6 +442,20 @@ class CatalogCoordinator:
                     )
                 stats["tables"].add(action.target)
                 self.tables_dropped += 1
+            if change.kind == CHANGE_RECREATED:
+                # A replacement relation is a new source lifecycle even when log mode
+                # retains the old rows. The retained image is not a valid baseline for
+                # the new oid, so it must enter the same durable re-snapshot queue as
+                # the destructive path before any new-relation stream tail is admitted.
+                destination.mark_awaiting_snapshot(
+                    con,
+                    pipeline=self.pipeline,
+                    source_schema=change.schema,
+                    source_table=change.table,
+                    target_table=action.target,
+                    state=AWAITING_SNAPSHOT,
+                )
+                self.awaiting_snapshot.add(change.qualified)
             if change.kind == CHANGE_DROPPED and action.destructive:
                 destination.forget_source_relation(
                     con,
