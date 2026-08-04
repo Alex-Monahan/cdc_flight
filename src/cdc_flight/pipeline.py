@@ -392,6 +392,14 @@ def run(
         # rebuild, and rebuilding every run would re-snapshot the world for ever.
         catalog_cfg = CatalogConfig()
         catalog_enabled = applier_cfg.drop_mode != "ignore" and catalog_cfg.poll_seconds > 0
+        if source.auto_discovery and not catalog_enabled:
+            # Publication-driven discovery requires a live catalog watcher to narrow
+            # the initial snapshot and to hand new relations through admission. When
+            # catalog polling is explicitly disabled (for example DROP_MODE=ignore),
+            # keep the configured capture bounded instead of letting Debezium snapshot
+            # every table in the publication while completion still expects CDC_TABLES.
+            props["schema.include.list"] = source.schema
+            props["table.include.list"] = ",".join(source.tables)
         baseline = baseline_mod.mark_unconfirmed(
             con, pipeline=dest.pipeline_name, dataset=dest.dataset_name,
             runner_id=runner_id, reconcile=catalog_enabled,

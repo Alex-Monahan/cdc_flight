@@ -50,7 +50,7 @@ from .catalog import (
 )
 from .config import DROP_IGNORE, DROP_REPLICATE
 from .errors import SchemaEvolutionRefused
-from .machines import CHANGE_APPLIED, CHANGE_REFUSED
+from .machines import CHANGE_APPLIED, CHANGE_REFUSED, require_admission_state
 from .schema_evolution import apply_column_changes
 
 log = logging.getLogger("cdc_flight.catalog_apply")
@@ -356,7 +356,15 @@ class CatalogCoordinator:
         # only after the destination RENAME/ADD/DROP has committed.
         for action in actions:
             relation = action.change.new_relation
-            if relation is not None and relation.qualified not in known_relations:
+            # A dropped relation has no post-action source baseline. Re-inserting the
+            # old `new_relation` after `forget_source_relation()` would make a later
+            # recreate look like CHANGE_RECREATED instead of a new discovery, and it
+            # would bypass the discovery re-snapshot hand-off entirely.
+            if (
+                relation is not None
+                and action.change.kind != CHANGE_DROPPED
+                and relation.qualified not in known_relations
+            ):
                 relations.append(relation)
                 known_relations.add(relation.qualified)
         return CatalogPlan(
@@ -481,7 +489,7 @@ class CatalogCoordinator:
                 source_table=relation.table,
                 relation_oid=relation.oid,
                 published=relation.published,
-                admission_state=relation.admission_state or "external",
+                admission_state=require_admission_state(relation.admission_state),
                 replica_identity=relation.replica_identity,
                 columns=relation.columns,
             )
