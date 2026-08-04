@@ -342,7 +342,9 @@ class CatalogCoordinator:
         # with the source and never notice the drop at all. Only a change that would
         # REMOVE the destination table has to block persistence - letting `new` or
         # `unpublished` block it was measured to leave a table with no row at all,
-        # which is how a drop between two runs went undetected.
+        # which is how a drop between two runs went undetected. A log-only drop is the
+        # opposite case: the destination table remains, so its durable pre-drop
+        # identity must remain with it for catalog-baseline confirmation.
         applied = {id(a.change) for a in actions}
         remaining = {
             change.qualified
@@ -356,13 +358,17 @@ class CatalogCoordinator:
         # only after the destination RENAME/ADD/DROP has committed.
         for action in actions:
             relation = action.change.new_relation
-            # A dropped relation has no post-action source baseline. Re-inserting the
+            # A destructive drop has no post-action source baseline. Re-inserting the
             # old `new_relation` after `forget_source_relation()` would make a later
             # recreate look like CHANGE_RECREATED instead of a new discovery, and it
-            # would bypass the discovery re-snapshot hand-off entirely.
+            # would bypass the discovery re-snapshot hand-off entirely. A log-only drop
+            # deliberately keeps the destination table, so retaining that same old
+            # identity is what makes the non-destructive marker durable and relatable.
             if (
                 relation is not None
-                and action.change.kind != CHANGE_DROPPED
+                and not (
+                    action.change.kind == CHANGE_DROPPED and action.destructive
+                )
                 and relation.qualified not in known_relations
             ):
                 relations.append(relation)
@@ -443,7 +449,7 @@ class CatalogCoordinator:
                     )
                 stats["tables"].add(action.target)
                 self.tables_dropped += 1
-            if change.kind == CHANGE_DROPPED:
+            if change.kind == CHANGE_DROPPED and action.destructive:
                 destination.forget_source_relation(
                     con,
                     pipeline=self.pipeline,
