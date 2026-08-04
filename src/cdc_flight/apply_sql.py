@@ -725,7 +725,13 @@ def _arrow_type(sql_type: str):
 
 
 def bulk_insert(
-    con, target: str, columns: list[str], rows: list[list], types: list[str] | None = None
+    con,
+    target: str,
+    columns: list[str],
+    rows: list[list],
+    types: list[str] | None = None,
+    *,
+    replace: bool = False,
 ) -> None:
     """Insert many rows through a registered Arrow table.
 
@@ -754,12 +760,15 @@ def bulk_insert(
         return
     collist = ", ".join(quote(c) for c in columns)
     column_types = types or [VARCHAR] * len(columns)
+    verb = "INSERT OR REPLACE" if replace else "INSERT"
     try:
         import pyarrow as pa
     except ImportError:  # pragma: no cover - pyarrow is a declared dependency
         log.warning("pyarrow is unavailable; falling back to a slow row-at-a-time insert")
         placeholders = ", ".join("?" for _ in columns)
-        con.executemany(f"INSERT INTO {target} ({collist}) VALUES ({placeholders})", rows)
+        con.executemany(
+            f"{verb} INTO {target} ({collist}) VALUES ({placeholders})", rows
+        )
         return
 
     view = "cdcf_bulk_rows"
@@ -780,7 +789,7 @@ def bulk_insert(
         table = pa.table(arrays)
         con.register(view, table)
         try:
-            con.execute(f"INSERT INTO {target} ({collist}) SELECT * FROM {view}")
+            con.execute(f"{verb} INTO {target} ({collist}) SELECT * FROM {view}")
         finally:
             con.unregister(view)
 

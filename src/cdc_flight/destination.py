@@ -347,6 +347,28 @@ def write_column_presence(
     )
 
 
+def write_column_presence_batch(con, rows: list[tuple]) -> None:
+    """Write immutable row-image presence facts in bounded SQL batches.
+
+    The facts are part of the caller's open commit-group transaction and are immutable
+    for an event.  Use the same Arrow-backed bulk path as destination row writes: a
+    row-at-a-time indexed insert turns a large whole-transaction group into minutes of
+    index maintenance and an avoidable multi-gigabyte memory spike.
+    """
+    if not rows:
+        return
+    from .apply_sql import BOOLEAN, VARCHAR, bulk_insert
+
+    bulk_insert(
+        con,
+        f"{CONTROL_SCHEMA}.column_presence",
+        ["target_dataset", "target_table", "event_id", "column_name", "present"],
+        [list(row) for row in rows],
+        [VARCHAR, VARCHAR, VARCHAR, VARCHAR, BOOLEAN],
+        replace=True,
+    )
+
+
 def record_schema_refusal(
     con,
     *,

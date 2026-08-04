@@ -365,15 +365,12 @@ class GroupPlan:
                     self.table_counts.get(item.target, 0) + item.events
                 )
 
-        for target, event_id, columns in self.column_presence:
-            for column in columns:
-                destination.write_column_presence(
-                    self.con,
-                    target_dataset=self.registry.dataset,
-                    target_table=target,
-                    event_id=event_id,
-                    column_name=column,
-                )
+        presence_rows = [
+            (self.registry.dataset, target, event_id, column, True)
+            for target, event_id, columns in self.column_presence
+            for column in columns
+        ]
+        destination.write_column_presence_batch(self.con, presence_rows)
 
         if self.staged_units and clear_spill:
             self.spill.clear(self.commit_id)
