@@ -20,7 +20,13 @@ from pathlib import Path
 import pytest
 
 from cdc_flight import machines as m
-from cdc_flight import state_matrix
+from cdc_flight import state_interactions, state_matrix
+from cdc_flight.machines import (
+    ADMISSION_ERROR,
+    ADMISSION_EXTERNAL,
+    CHANGE_PENDING,
+    CHANGE_REFUSED,
+)
 from cdc_flight.states import Domain, IllegalTransition, Machine, UnknownState, ranked
 
 
@@ -437,6 +443,39 @@ def test_every_declared_interacting_cell_drives_real_code(pair, left, right):
     assert result.kind in {"exercised", "refused"}
     if result.kind == "refused":
         assert result.reason
+
+
+def test_every_matrix_cell_delegates_to_the_production_interaction_gate(monkeypatch):
+    expected = state_matrix.cells(m.INTERACTING_MACHINE_PAIRS)
+    calls = []
+    real_gate = state_interactions.evaluate
+
+    def recording_gate(pair, left, right, **owners):
+        calls.append((pair, left, right))
+        return real_gate(pair, left, right, **owners)
+
+    monkeypatch.setattr(state_interactions, "evaluate", recording_gate)
+    for pair, left, right in expected:
+        state_matrix.exercise_cell(pair, left, right)
+
+    assert calls == expected
+
+
+def test_production_interaction_gate_consumes_both_states():
+    pair = ("catalog_change", "publication_admission")
+    admitted = state_interactions.evaluate(
+        pair, CHANGE_PENDING, ADMISSION_EXTERNAL
+    )
+    publication_error = state_interactions.evaluate(
+        pair, CHANGE_PENDING, ADMISSION_ERROR
+    )
+    refused_change = state_interactions.evaluate(
+        pair, CHANGE_REFUSED, ADMISSION_EXTERNAL
+    )
+
+    assert admitted.kind == "exercised"
+    assert publication_error.kind == "refused"
+    assert refused_change.kind == "refused"
 
 
 def test_interacting_pair_matrix_is_the_declared_matrix():

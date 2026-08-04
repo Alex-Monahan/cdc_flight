@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, replace
 
-from . import catalog_admission, catalog_reporting, destination, table_lifecycle
+from . import catalog_admission, catalog_reporting, destination, state_interactions, table_lifecycle
 from .catalog import CatalogWatcher
 from .catalog_state import CHANGE_NEW, CHANGE_SCHEMA, CatalogChange, SourceRelation
 from .control_schema import ensure_control_schema
@@ -30,7 +30,7 @@ from .machines import (
     SNAPSHOT_STREAMING,
 )
 from .ownership import DestinationOwnership
-from .snapshot_completion import SnapshotCompletion, SnapshotObservationError
+from .snapshot_completion import SnapshotCompletion
 from .states import Machine
 
 
@@ -329,45 +329,12 @@ def _destination_ownership(target: str):
 
 
 def _exercise_interaction(pair, left, right, left_owner, right_owner) -> None:
-    del left_owner, right_owner
-    if pair == ("snapshot_completion", "table_lifecycle"):
-        completion = _snapshot_completion(left)
-        if right != LIFECYCLE_ABSENT:
-            try:
-                completion.check_streaming_admission()
-            except SnapshotObservationError as exc:
-                raise MachineCellRefusal(str(exc)) from exc
-        return
-    if pair == ("destination_ownership", "snapshot_completion"):
-        owner = _destination_ownership(left)
-        completion = _snapshot_completion(right)
-        if owner.callback_owned:
-            if owner.destination_quiescent:
-                raise MachineCellRefusal(
-                    "callback-owned destination was reported quiescent"
-                )
-        else:
-            try:
-                completion.check_streaming_admission()
-            except SnapshotObservationError as exc:
-                raise MachineCellRefusal(str(exc)) from exc
-        return
-    # The remaining pairs are observation/discovery products.  Their real gates are
-    # exercised by the owner probes: catalog absence, publication admission, refusal
-    # persistence, and lifecycle reads all run through their production modules.  The
-    # change object is deliberately re-read as context so an error/fenced state cannot
-    # disappear merely because the other owner is in a terminal state.
-    if pair[0] == "catalog_change":
-        _catalog_change(left).context()
-    if "publication_admission" in pair:
-        _publication_admission(
-            left if pair[0] == "publication_admission" else right
-        ).pending_admission()
-    if "catalog_schema_liveness" in pair:
-        _schema_liveness(
-            left if pair[0] == "catalog_schema_liveness" else right
-        ).summary()
-    if "schema_refusal" in pair:
-        _schema_refusal(left if pair[0] == "schema_refusal" else right)
-    if "table_lifecycle" in pair:
-        _table_lifecycle(left if pair[0] == "table_lifecycle" else right)
+    decision = state_interactions.evaluate(
+        pair,
+        left,
+        right,
+        left_owner=left_owner,
+        right_owner=right_owner,
+    )
+    if decision.kind == "refused":
+        raise MachineCellRefusal(decision.reason)

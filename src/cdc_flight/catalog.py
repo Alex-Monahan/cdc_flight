@@ -58,7 +58,7 @@ from dataclasses import replace
 
 from . import catalog_admission as admission_mod
 from . import catalog_observation as observation_mod
-from . import catalog_poll, catalog_reporting, catalog_state
+from . import catalog_poll, catalog_reporting, catalog_state, state_interactions
 from . import source_marker as marker_mod
 from .machines import (
     ADMISSION_ADMITTED,
@@ -402,6 +402,9 @@ class CatalogWatcher:
                             and self.known[change.qualified].admission_state in {
                                 ADMISSION_ADMITTED, ADMISSION_EXTERNAL
                             }
+                            and state_interactions.discovery_admission_allowed(
+                                change, self.known.get(change.qualified)
+                            )
                         )
                     ),
                     key=lambda relation: relation.qualified,
