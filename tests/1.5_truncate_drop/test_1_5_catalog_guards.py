@@ -182,7 +182,7 @@ def test_a_relation_that_comes_back_unchanged_leaves_nothing_pending():
     assert "app.customers" in w.replicated, "and it is still ours"
 
 
-def test_a_relation_that_goes_away_cancels_its_pending_recreate():
+def test_a_relation_that_goes_away_keeps_its_pending_recreate_owed():
     w = watcher(confirm_polls=1)
     w.known = {"app.customers": relation("customers", 1)}
     w.replicated = {"app.customers"}
@@ -190,8 +190,12 @@ def test_a_relation_that_goes_away_cancels_its_pending_recreate():
         CHANGE_RECREATED
     ]
     added = w._compare({"app.orders": relation("orders", 9)}, lsn=20)
-    assert [c.kind for c in added] == [CHANGE_DROPPED]
-    assert [c.kind for c in w.pending_destructive()] == [CHANGE_DROPPED]
+    assert [
+        c.kind for c in added if c.qualified == "app.customers"
+    ] == []
+    assert [
+        c.kind for c in w.pending_destructive() if c.qualified == "app.customers"
+    ] == [CHANGE_RECREATED]
 
 
 # --------------------------------------------------------------------------- #
@@ -224,7 +228,7 @@ def test_a_durable_recreate_observation_quarantines_without_revalidation(lab):
     preload(box)
     queue(w, "customers", kind=CHANGE_RECREATED, old_oid=1, new_oid=99999)
     tick(box)
-    assert not box.exists(CUSTOMERS)
+    assert box.exists(CUSTOMERS)
     assert box.q(
         "SELECT snapshot_state FROM _cdc_flight.table_state "
         "WHERE source_table = 'customers'"

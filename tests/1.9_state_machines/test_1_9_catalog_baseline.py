@@ -337,6 +337,20 @@ def test_owed_work_does_not_discharge_the_baseline():
     assert catalog_baseline.read(con, PIPELINE) == catalog_baseline.INVALIDATED
 
 
+def test_an_empty_owed_target_still_invalidates_the_baseline():
+    """Lifecycle trust does not depend on whether the quarantined table has rows."""
+    con = _destination(rows=0, state=LIFECYCLE_AWAITING, registry_oid=20001)
+    check = catalog_baseline.mark_unconfirmed(
+        con, pipeline=PIPELINE, dataset=DATASET
+    )
+    confirmed = catalog_baseline.confirm(
+        con, pipeline=PIPELINE, dataset=DATASET, check=check, successful_polls=1
+    )
+    assert not confirmed.valid
+    assert confirmed.state == catalog_baseline.INVALIDATED
+    assert confirmed.unreconciled == [RELATION]
+
+
 def test_the_confirmation_asks_durable_state_not_this_runs_memory():
     """Otherwise the guarantee lasts exactly one run.
 

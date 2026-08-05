@@ -19,10 +19,11 @@ from recreate_admission_helpers import (
     txn,
 )
 
-from cdc_flight.catalog import CHANGE_DROPPED, CatalogChange
+from cdc_flight.catalog import CHANGE_DROPPED, CatalogChange, SourceRelation
 from cdc_flight.config import DROP_LOG, DROP_REPLICATE
 from cdc_flight.machines import (
     CATALOG_CHANGE,
+    CHANGE_DEFERRED,
     CHANGE_DUE,
     CHANGE_MARKED,
     CHANGE_SUPERSEDED,
@@ -47,8 +48,8 @@ def lab(tmp_path):
         box.close()
 
 
-def test_a_recreated_table_drops_the_destination_and_says_why(lab):
-    """A same-name replacement gets an absent target and an owed snapshot state."""
+def test_a_recreated_table_quarantines_the_destination_and_says_why(lab):
+    """A same-name replacement keeps the retained image and owes a snapshot."""
     watcher = _watcher(present={"app.customers": 99999})
     box = lab(catalog=watcher)
     preload(box)
@@ -60,7 +61,7 @@ def test_a_recreated_table_drops_the_destination_and_says_why(lab):
         ),
     )
     box.run(txn("2", [keyed("2", 1, 300, 9, "unrelated", table="orders")]))
-    assert not box.exists(CUSTOMERS)
+    assert box.exists(CUSTOMERS)
     detail = box.q(
         "SELECT detail FROM _cdc_flight.table_events WHERE event = 'recreated'"
     )[0][0]
@@ -100,7 +101,7 @@ def test_log_mode_recreate_refuses_new_relation_stream_until_resnapshot(lab):
 
     with pytest.raises(SnapshotObservationError, match="awaiting_snapshot"):
         box.run(txn("3", [keyed("3", 1, 300, 4, "new-lifecycle")]))
-    assert not box.exists(CUSTOMERS)
+    assert box.exists(CUSTOMERS)
 
 
 def test_log_mode_recreate_same_group_is_quarantined_after_group_dml(lab):
@@ -212,7 +213,7 @@ def test_log_mode_recreate_same_group_quarantine_wins_over_low_lsn_ordering(lab)
             ],
         )
     )
-    assert not box.exists(CUSTOMERS)
+    assert box.exists(CUSTOMERS)
     assert rows(box, ORDERS) == [(7,), (8,), (9,)]
     assert box.applier.fenced_units == 0
     assert box.q(
@@ -324,7 +325,7 @@ def test_log_mode_recreate_while_flight_is_stopped_keeps_the_boundary(lab):
         _assert_recreated_boundary(restarted, new)
         with pytest.raises(SnapshotObservationError, match="awaiting_snapshot"):
             restarted.run(txn("3", [keyed("3", 1, 300, 4, "new-lifecycle")]))
-        assert not restarted.exists(CUSTOMERS)
+        assert restarted.exists(CUSTOMERS)
     finally:
         restarted.close()
 
@@ -366,12 +367,12 @@ def test_queued_intermediate_recreate_is_superseded_by_the_final_generation(
 
     box.run(txn("2", [keyed("2", 1, 300, 4, "c-generation")]))
     _assert_recreated_boundary(box, replacement_c)
-    assert not box.exists(CUSTOMERS)
+    assert box.exists(CUSTOMERS)
     assert box.applier.fenced_units == 0
 
 
 def test_stale_recreate_after_source_drop_is_logged_without_quarantining_log_image(lab):
-    """A later durable absent observation reclassifies B as a final drop."""
+    """A later absent observation cannot cancel B before its quarantine is durable."""
     old = _catalog_relation("customers", 16384)
     replacement = _catalog_relation("customers", 16385)
     watcher = _watcher(
@@ -384,26 +385,176 @@ def test_stale_recreate_after_source_drop_is_logged_without_quarantining_log_ima
     box = lab(catalog=watcher, drop_mode=DROP_LOG)
     preload(box)
     _queue_recreated(watcher, replacement)
-    # The source is now absent before apply.  The watcher, rather than a final source
-    # proof, reclassifies the queued replacement as the policy-owned drop.
-    watcher._compare({}, lsn=160)
+    # The source is now absent before apply. This is not yet the final source fact for
+    # DROP_LOG/DROP_REPLICATE; the recreate obligation remains until re-snapshot.
+    changed = watcher._compare({}, lsn=160)
+    assert [
+        change.kind for change in changed if change.qualified == old.qualified
+    ] == []
+    assert [
+        change.kind
+        for change in watcher.pending_destructive()
+        if change.qualified == old.qualified
+    ] == ["recreated"]
 
     box.run([heartbeat(175)])
 
     assert box.exists(CUSTOMERS)
     assert rows(box, CUSTOMERS) == [(1,), (2,), (3,)]
     assert box.q(
-        "SELECT event, applied FROM _cdc_flight.table_events "
+        "SELECT event FROM _cdc_flight.table_events "
         "WHERE source_table = 'customers'"
-    ) == [("dropped", False)]
-    assert box.q(
-        "SELECT relation_oid FROM _cdc_flight.source_relations "
-        "WHERE source_table = 'customers'"
-    ) == [(old.oid,)]
+    ) == [("recreated",)]
     assert box.q(
         "SELECT snapshot_state FROM _cdc_flight.table_state "
         "WHERE source_table = 'customers'"
-    ) != [(LIFECYCLE_AWAITING,)]
+    ) == [(LIFECYCLE_AWAITING,)]
+
+
+def test_stale_recreate_after_final_observation_preserves_drop_log_image(lab):
+    """A source disappearance after the last poll cannot erase retained history."""
+    old = _with_filenode(_catalog_relation("customers", 16384), 91001)
+    replacement = _with_filenode(_catalog_relation("customers", 16385), 91002)
+    watcher = _watcher(
+        present={old.qualified: old},
+        known={old.qualified: old},
+        replicated={old.qualified},
+        confirm_polls=1,
+    )
+    watcher._dirty[old.qualified] = old
+    box = lab(catalog=watcher, drop_mode=DROP_LOG)
+    preload(box)
+
+    added = watcher._compare(
+        {replacement.qualified: replacement}, lsn=150
+    )
+    assert [
+        change.kind for change in added if change.qualified == replacement.qualified
+    ] == ["recreated"]
+    # This is the review's interleaving: B is the final observation, then the source
+    # disappears before the stale B plan is applied. There is deliberately no poll of
+    # the absent source between queueing and applying.
+    box.run([*txn("2", [keyed("2", 1, 130, 4, "replacement")]), heartbeat(175)])
+
+    _assert_recreated_boundary(box, replacement)
+    assert box.exists(CUSTOMERS)
+    assert rows(box, CUSTOMERS) == [(1,), (2,), (3,), (4,)]
+
+
+@pytest.mark.parametrize("drop_mode", [DROP_LOG, DROP_REPLICATE])
+def test_drop_seen_while_quarantine_is_owed_waits_for_resnapshot_policy(lab, drop_mode):
+    """A post-quarantine absence cannot destroy the retained image on a stale plan."""
+    old = _catalog_relation("customers", 16384)
+    replacement = _catalog_relation("customers", 16385)
+    watcher = _watcher(
+        present={old.qualified: old},
+        known={old.qualified: old},
+        replicated={old.qualified},
+        confirm_polls=1,
+    )
+    watcher._dirty[old.qualified] = old
+    box = lab(catalog=watcher, drop_mode=drop_mode)
+    preload(box)
+
+    watcher._compare({old.qualified: replacement}, lsn=150)
+    box.run([heartbeat(175)])
+    _assert_recreated_boundary(box, replacement)
+
+    # The replacement is now quarantined and owed. A later absence must be deferred
+    # until the re-snapshot reads the final source fact, even in DROP_REPLICATE mode.
+    watcher._compare({}, lsn=180)
+    box.run([heartbeat(200)])
+
+    assert box.exists(CUSTOMERS)
+    assert box.q(
+        "SELECT snapshot_state FROM _cdc_flight.table_state "
+        "WHERE source_table = 'customers'"
+    ) == [(LIFECYCLE_AWAITING,)]
+    assert [
+        (change.kind, change.state)
+        for change in watcher.pending_destructive()
+        if change.qualified == old.qualified
+    ] == [("dropped", CHANGE_DEFERRED)]
+
+
+@pytest.mark.parametrize("drop_mode", [DROP_LOG, DROP_REPLICATE])
+def test_pending_type_recreate_survives_same_lifecycle_rewrite(lab, drop_mode):
+    """A relfilenode-only rewrite updates the token without canceling the rebuild."""
+    old = SourceRelation(
+        "app", "customers", 16384, True, "d", relfilenode=91001,
+        relation_type_oid=92001,
+    )
+    replacement_b = SourceRelation(
+        "app", "customers", 16384, True, "d", relfilenode=91002,
+        relation_type_oid=92002,
+    )
+    replacement_c = SourceRelation(
+        "app", "customers", 16384, True, "d", relfilenode=91003,
+        relation_type_oid=92002,
+    )
+    watcher = _watcher(
+        present={old.qualified: old},
+        known={old.qualified: old},
+        replicated={old.qualified},
+        confirm_polls=1,
+    )
+    watcher._dirty[old.qualified] = old
+    box = lab(catalog=watcher, drop_mode=drop_mode)
+    preload(box)
+
+    queued = watcher._compare({old.qualified: replacement_b}, lsn=150)[0]
+    assert queued.kind == "recreated"
+    # B's WAL fence is still closed, so its row is admitted to the retained image.
+    box.run(txn("2", [keyed("2", 1, 120, 4, "b-generation")]))
+
+    watcher._compare({old.qualified: replacement_c}, lsn=160)
+    assert queued.state != CHANGE_SUPERSEDED
+    assert queued.new_identity == (
+        queued.new_identity.__class__(16384, 91003, 92002)
+    )
+
+    box.run(
+        txn(
+            "3",
+            [truncate("3", 1, 200), keyed("3", 2, 201, 5, "c-generation")],
+        )
+    )
+    assert box.q(
+        "SELECT snapshot_state FROM _cdc_flight.table_state "
+        "WHERE source_table = 'customers'"
+    ) == [(LIFECYCLE_AWAITING,)]
+    assert box.q(
+        "SELECT relation_oid, relation_filenode, relation_type_oid "
+        "FROM _cdc_flight.source_relations WHERE source_table = 'customers'"
+    ) == [(16384, 91003, 92002)]
+
+
+def test_settle_absorbs_superseded_due_change_and_keeps_newer_pending(lab):
+    """A watcher poll between due and settle cannot fail after acknowledgement."""
+    old = _catalog_relation("customers", 16384)
+    replacement_b = _catalog_relation("customers", 16385)
+    replacement_c = _catalog_relation("customers", 16386)
+    watcher = _watcher(
+        present={old.qualified: old},
+        known={old.qualified: old},
+        replicated={old.qualified},
+        confirm_polls=1,
+    )
+    watcher._dirty[old.qualified] = old
+    box = lab(catalog=watcher, drop_mode=DROP_LOG)
+
+    planned_b = watcher._compare({old.qualified: replacement_b}, lsn=100)[0]
+    plan = box.applier.catalog_coordinator.plan(100)
+    assert plan.actions and plan.actions[0].change is planned_b
+    watcher._compare({old.qualified: replacement_c}, lsn=110)
+    assert planned_b.state == CHANGE_SUPERSEDED
+
+    box.applier.catalog_coordinator.settle(plan, set())
+    assert planned_b.state == "applied"
+    assert [
+        (change.qualified, change.new_oid)
+        for change in watcher.pending_destructive()
+    ] == [(old.qualified, replacement_c.oid)]
 
 
 def test_replacement_uses_durable_watcher_state_without_commit_source_reads(lab):
@@ -502,7 +653,7 @@ def test_r9_m1_short_lived_replacement_that_is_absent_at_read_converges(
 def test_r9_m1_queued_b_disappears_and_policy_decides_the_retained_image(
     lab, drop_mode
 ):
-    """R9-M1(c): watcher supersession decides drop retention before apply."""
+    """R9-M1(c): a missing B keeps the recreate obligation until re-snapshot."""
     old = _catalog_relation("customers", 16384)
     replacement = _catalog_relation("customers", 16385)
     orders = _catalog_relation("orders", 16390)
@@ -517,25 +668,12 @@ def test_r9_m1_queued_b_disappears_and_policy_decides_the_retained_image(
     preload(box)
     _queue_recreated(watcher, replacement)
     changed = watcher._compare({orders.qualified: orders}, lsn=160)
-    assert any(
-        change.qualified == old.qualified and change.kind == "dropped"
-        for change in changed
-    )
+    assert changed == []
+    assert [change.kind for change in watcher.pending_destructive()] == ["recreated"]
     box.run([heartbeat(175)])
 
-    if drop_mode == DROP_LOG:
-        assert box.exists(CUSTOMERS)
-        assert rows(box, CUSTOMERS) == [(1,), (2,), (3,)]
-        assert box.q(
-            "SELECT event, applied FROM _cdc_flight.table_events "
-            "WHERE source_table = 'customers'"
-        ) == [("dropped", False)]
-    else:
-        assert not box.exists(CUSTOMERS)
-        assert box.q(
-            "SELECT event, applied FROM _cdc_flight.table_events "
-            "WHERE source_table = 'customers'"
-        ) == [("dropped", True)]
+    _assert_recreated_boundary(box, replacement)
+    assert rows(box, CUSTOMERS) == [(1,), (2,), (3,)]
 
 
 def _with_filenode(relation: object, filenode: int):
@@ -672,9 +810,48 @@ def test_log_mode_rapid_recreate_drop_sequences_converge_without_image_loss(lab)
     assert box.q(
         "SELECT event, applied FROM _cdc_flight.table_events "
         "WHERE source_table = 'customers' ORDER BY commit_id, seq"
-    )[-1:] == [("dropped", False)]
+    )[-1:] == [("recreated", True)]
+    assert box.q(
+        "SELECT snapshot_state FROM _cdc_flight.table_state "
+        "WHERE source_table = 'customers'"
+    ) == [(LIFECYCLE_AWAITING,)]
     assert watcher.pending() == []
     assert watcher.superseded >= 1
+
+
+@pytest.mark.parametrize("drop_mode", [DROP_LOG, DROP_REPLICATE])
+def test_seeded_convergence_does_not_poll_intermediate_generations_before_apply(
+    lab, drop_mode
+):
+    """The final observed replacement is applied without a stale absence poll."""
+    rng = random.Random(0xB11)
+    old = _with_filenode(_catalog_relation("customers", 16384), 91001)
+    generations = [
+        _with_filenode(_catalog_relation("customers", 16385 + index), 91002 + index)
+        for index in range(5)
+    ]
+    final = generations[rng.randrange(len(generations))]
+    watcher = _watcher(
+        present={final.qualified: final},
+        known={old.qualified: old},
+        replicated={old.qualified},
+        confirm_polls=1,
+    )
+    watcher._dirty[old.qualified] = old
+    box = lab(catalog=watcher, drop_mode=drop_mode)
+    preload(box)
+
+    added = watcher._compare({final.qualified: final}, lsn=150)
+    assert [
+        change.kind for change in added if change.qualified == final.qualified
+    ] == ["recreated"]
+    # The other seeded generations are deliberately not passed to _compare. They are
+    # the review's unpolled intermediate states between the last observation and apply.
+    box.run([*txn("2", [keyed("2", 1, 130, 4, "replacement")]), heartbeat(175)])
+
+    _assert_recreated_boundary(box, final)
+    assert rows(box, CUSTOMERS) == [(1,), (2,), (3,), (4,)]
+    assert watcher.pending() == []
 
 
 # --------------------------------------------------------------------------- #

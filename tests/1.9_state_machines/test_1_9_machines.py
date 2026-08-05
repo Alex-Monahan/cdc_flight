@@ -308,11 +308,11 @@ def test_a_catalog_change_cannot_be_applied_without_becoming_due():
     m.CATALOG_CHANGE.check("due", "applied")
 
 
-def test_a_superseded_or_applied_change_is_terminal():
+def test_a_superseded_or_applied_change_is_terminal_but_settlement_is_allowed():
     assert m.CATALOG_CHANGE.is_terminal("applied")
     assert m.CATALOG_CHANGE.is_terminal("superseded")
     assert m.CATALOG_CHANGE.successors("applied") == set()
-    assert m.CATALOG_CHANGE.successors("superseded") == set()
+    assert m.CATALOG_CHANGE.successors("superseded") == {"applied"}
 
 
 def test_a_run_cannot_reach_stopped_without_stopping():

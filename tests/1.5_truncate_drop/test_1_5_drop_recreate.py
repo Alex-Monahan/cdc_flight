@@ -103,7 +103,13 @@ def drop_scenario(sandbox):
             "INSERT INTO app.rc_demo VALUES (1, '{\"new\": true}', 42)",
         ]
     )
-    phases["recreated"] = box.run(max_seconds=150, idle_seconds=10, min_records=1)
+    phases["recreated"] = box.run(
+        max_seconds=150,
+        idle_seconds=10,
+        min_records=1,
+        expect_success=False,
+    )
+    phases["recreated_healed"] = box.run(max_seconds=220, idle_seconds=10)
     try:
         yield {"box": box, **phases}
     finally:
@@ -164,6 +170,7 @@ def test_the_recreated_table_lands_with_its_new_shape(drop_scenario):
     """Same name, new relation oid, different columns. Merging the new events into
     the old destination table is the corruption this case exists to rule out."""
     box = drop_scenario["box"]
+    assert drop_scenario["recreated_healed"]["ok"] is True
     columns = {
         row[0]
         for row in box.duck_query(
@@ -180,7 +187,7 @@ def test_the_recreated_table_lands_with_its_new_shape(drop_scenario):
 
 
 def test_every_run_after_the_drop_was_clean(drop_scenario):
-    for name in ("dropped", "recreated"):
+    for name in ("dropped", "recreated", "recreated_healed"):
         assert drop_scenario[name]["ok"] is True, name
 
 
@@ -247,7 +254,7 @@ def test_a_quiet_run_persists_what_it_learned_so_the_next_recreate_is_seen(
             ]
         )
         # Two runs: the first detects and drops, the second rebuilds from the source.
-        box.run(max_seconds=200, idle_seconds=10)
+        box.run(max_seconds=200, idle_seconds=10, expect_success=False)
         healed = box.run(max_seconds=220, idle_seconds=10)
         assert healed["ok"] is True, healed
 

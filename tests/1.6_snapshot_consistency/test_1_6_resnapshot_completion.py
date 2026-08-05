@@ -32,6 +32,7 @@ from applier_lab import DATASET, Lab, snap
 from cdc_flight import destination as dest_mod
 from cdc_flight import resnapshot as resnapshot_mod
 from cdc_flight.assembler import UNIT_SNAPSHOT_CHUNK
+from cdc_flight.config import DROP_LOG, DROP_REPLICATE
 from cdc_flight.errors import EngineFailure
 from cdc_flight.snapshot_completion import SnapshotCompletion
 
@@ -262,6 +263,64 @@ def test_a_verified_empty_table_is_emptied_and_fenced_at_the_verified_lsn(tmp_pa
             [PIPELINE],
         ).fetchall()
         assert events == [("resnapshot_empty", 1000)]
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize(
+    "drop_mode, expected_event_applied, expect_table",
+    [(DROP_LOG, False, True), (DROP_REPLICATE, True, False)],
+)
+def test_final_source_absence_applies_policy_after_quarantine(
+    tmp_path, drop_mode, expected_event_applied, expect_table
+):
+    """A stale recreate plan cannot choose destruction before final source evidence."""
+    con = _destination_with_a_live_table(
+        tmp_path / f"source_missing_{drop_mode}.duckdb", rows=3
+    )
+    try:
+        logged, dropped = resnapshot_mod.finish_source_missing_tables(
+            con,
+            pipeline=PIPELINE,
+            dataset=DATASET,
+            tables=[("app", "orders", "cdcflight_app_orders")],
+            done=set(),
+            evidence=resnapshot_mod.EmptinessEvidence(
+                snapshot_phase_ended=True,
+                tables_seen=set(),
+                source_empty_at={},
+                wal_lsn=123456,
+                source_missing={"app.orders"},
+            ),
+            drop_mode=drop_mode,
+        )
+        assert logged == (["app.orders"] if drop_mode == DROP_LOG else [])
+        assert dropped == (["app.orders"] if drop_mode == DROP_REPLICATE else [])
+        assert (
+            con.execute(
+                "SELECT count(*) FROM information_schema.tables "
+                "WHERE table_schema = ? AND table_name = ?",
+                [DATASET, "cdcflight_app_orders"],
+            ).fetchone()[0]
+            == int(expect_table)
+        )
+        if expect_table:
+            assert con.execute(
+                f"SELECT count(*) FROM {DATASET}.cdcflight_app_orders"
+            ).fetchone()[0] == 3
+            assert con.execute(
+                "SELECT snapshot_state FROM _cdc_flight.table_state WHERE pipeline = ?",
+                [PIPELINE],
+            ).fetchone()[0] == "complete"
+        else:
+            assert con.execute(
+                "SELECT count(*) FROM _cdc_flight.table_state WHERE pipeline = ?",
+                [PIPELINE],
+            ).fetchone()[0] == 0
+        assert con.execute(
+            "SELECT event, applied FROM _cdc_flight.table_events WHERE pipeline = ?",
+            [PIPELINE],
+        ).fetchall() == [("dropped", expected_event_applied)]
     finally:
         con.close()
 

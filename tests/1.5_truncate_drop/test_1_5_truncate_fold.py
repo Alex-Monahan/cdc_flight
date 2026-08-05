@@ -481,8 +481,8 @@ def test_drop_mode_and_baseline_confirmation_matrix(
         successful_polls=1,
     )
     if change_kind == CHANGE_RECREATED:
-        assert confirmed.valid, (drop_mode, baseline_state, confirmed.reason)
-        assert confirmed.state == catalog_baseline.VALID
+        assert not confirmed.valid, (drop_mode, baseline_state, confirmed.reason)
+        assert confirmed.state == catalog_baseline.INVALIDATED
         _assert_recreated_boundary(box, new_relation)
     else:
         assert confirmed.valid, (drop_mode, baseline_state, confirmed.reason)
@@ -511,7 +511,7 @@ def test_drop_mode_and_baseline_confirmation_matrix(
                 "WHERE pipeline = 'lab' AND source_table = 'customers'"
             ) == [(0,)]
         else:
-            assert not box.exists(CUSTOMERS)
+            assert box.exists(CUSTOMERS)
             assert box.q(
                 "SELECT relation_oid FROM _cdc_flight.source_relations "
                 "WHERE pipeline = 'lab' AND source_table = 'customers'"

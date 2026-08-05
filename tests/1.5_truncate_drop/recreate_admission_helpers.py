@@ -92,7 +92,9 @@ def _queue_recreated(
 
 
 def _assert_recreated_boundary(box: Lab, relation: SourceRelation) -> None:
-    assert not box.exists(CUSTOMERS), "the stale image is quarantined until re-snapshot"
+    assert box.exists(CUSTOMERS), (
+        "the retained image remains queryable but untrusted until re-snapshot"
+    )
     assert box.q(
         "SELECT snapshot_state FROM _cdc_flight.table_state "
         "WHERE pipeline = 'lab' AND source_table = 'customers'"
