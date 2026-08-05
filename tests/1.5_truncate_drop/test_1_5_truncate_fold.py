@@ -31,9 +31,9 @@ from cdc_flight import catalog_baseline, faults, table_lifecycle
 from cdc_flight.catalog import (
     CHANGE_DROPPED,
     CHANGE_RECREATED,
+    DESTRUCTIVE,
     CatalogChange,
     CatalogWatcher,
-    DESTRUCTIVE,
     SourceRelation,
 )
 from cdc_flight.config import DROP_IGNORE, DROP_LOG, DROP_MODES, DROP_REPLICATE
