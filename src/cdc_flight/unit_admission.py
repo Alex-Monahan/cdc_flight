@@ -9,6 +9,7 @@ from . import table_lifecycle
 from .assembler import UNIT_SNAPSHOT_CHUNK, UNIT_TXN
 from .catalog_state import CHANGE_RECREATED
 from .config import DROP_LOG
+from .control_schema import CONTROL_SCHEMA
 from .envelope import KIND_SNAPSHOT_BOUNDARY
 from .errors import SchemaShapeUnexplained
 from .snapshot_completion import SnapshotObservationError
@@ -64,18 +65,25 @@ def add_unit(applier, unit) -> None:
 def refuse_log_recreate_tail(applier, unit, *, catalog_plan=None) -> None:
     """Refuse or fence a replacement tail before it can reach the row planner.
 
-    ``CatalogCoordinator`` records a log-mode recreate after the fenced group has
-    applied. A later whole Postgres transaction must not be allowed to append the new
-    relation's rows to that old image before the next run's re-snapshot. Reading the
-    durable lifecycle here makes the boundary survive a restart; the whole unit is
-    refused before it enters a commit group, so no source transaction is partially
-    admitted.
+    A replacement is a *relation identity* boundary, not a WAL-watermark boundary.
+    The Debezium envelope currently exposes the qualified table but not pgoutput's
+    relation OID, so the admission seam asks the catalog watcher for the current OID
+    and compares it with the durable ``source_relations`` identity. A replacement
+    transaction cannot be emitted before its DDL commits; therefore every unit from
+    the new lifecycle sees the new OID, even if the watcher has not yet queued a
+    ``CHANGE_RECREATED`` observation.
+
+    ``CatalogCoordinator`` also records a log-mode recreate after the fenced group has
+    applied. Once that plan is due, every touched unit is fenced regardless of LSN.
+    Reading the durable lifecycle here makes the post-detection boundary survive a
+    restart; the whole unit is refused before it enters a commit group, so no source
+    transaction is partially admitted.
 
     A commit group can contain the catalog plan and the replacement tail before the
-    catalog phase writes its durable lifecycle mark. In that ordering the plan is the
-    only safe identity evidence available before DML. Such a unit is fenced (rather
-    than raising and rolling back the plan), so the catalog obligation and the source
-    resume point commit atomically; the next invocation's re-snapshot owns the rows.
+    catalog phase writes its durable lifecycle mark. In that ordering the plan is a
+    second, durable identity boundary. Such a unit is fenced (rather than raising and
+    rolling back the plan), so the catalog obligation and the source resume point
+    commit atomically; the next invocation's re-snapshot owns the rows.
     """
     if applier.cfg.drop_mode != DROP_LOG or unit.kind != UNIT_TXN:
         return
@@ -89,25 +97,71 @@ def refuse_log_recreate_tail(applier, unit, *, catalog_plan=None) -> None:
             + ", ".join(blocked)
             + "; a replacement snapshot must complete before the new lifecycle streams"
         )
+    identity_blocked = _replacement_identity_mismatches(applier, unit.tables_touched())
     planned = sorted(
         action.change.qualified
         for action in getattr(catalog_plan, "actions", ())
         if (
             action.change.kind == CHANGE_RECREATED
             and action.change.qualified in unit.tables_touched()
-            and (unit.last_lsn or 0) > (action.change.detected_lsn or 0)
         )
     )
-    if not planned:
+    fenced = sorted(set(identity_blocked) | set(planned))
+    if not fenced:
         return
     unit.fenced = True
     applier.fenced_units += 1
     applier.fenced_events += unit.event_count
     log.info(
-        "fencing replacement stream unit %s for catalog plan relation(s) %s before "
-        "row apply; the catalog phase will durably queue a re-snapshot",
+        "fencing replacement stream unit %s for relation(s) %s before row apply; "
+        "the catalog phase will durably queue a re-snapshot",
         unit.txn_id,
-        ", ".join(planned),
+        ", ".join(fenced),
+    )
+
+
+def _replacement_identity_mismatches(applier, names: set[str]) -> list[str]:
+    """Return names whose current source relation is a different lifecycle.
+
+    Only a *present* relation with a different OID is a replacement proof.  ``None``
+    means the relation is currently absent, which remains under the ordinary DROP
+    detector's WAL fence so a log-mode drop does not newly discard an old-lifecycle
+    tail.  A source query error is fail-closed: admitting an unknown relation identity
+    would turn an unavailable catalog into permission to append to a retained image.
+    """
+    if not names or applier.catalog is None:
+        return []
+    relation_oids = getattr(applier.catalog, "relation_oids", None)
+    if relation_oids is None:
+        return []
+
+    durable: dict[str, int] = {}
+    for schema, table, oid in applier.con.execute(
+        f"SELECT source_schema, source_table, relation_oid "
+        f"FROM {CONTROL_SCHEMA}.source_relations WHERE pipeline = ?",
+        [applier.pipeline],
+    ).fetchall():
+        qualified = f"{schema}.{table}"
+        if qualified in names:
+            durable[qualified] = int(oid)
+    if not durable:
+        return []
+
+    pairs = {
+        tuple(qualified.split(".", 1))
+        for qualified in durable
+    }
+    try:
+        current = relation_oids(pairs)
+    except Exception as exc:
+        raise SnapshotObservationError(
+            "cannot establish source relation identity before streaming admission; "
+            "the unit is not safe to append to a retained image"
+        ) from exc
+    return sorted(
+        qualified
+        for qualified, old_oid in durable.items()
+        if current.get(qualified) is not None and int(current[qualified]) != old_oid
     )
 
 

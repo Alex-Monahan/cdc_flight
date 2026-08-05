@@ -539,18 +539,21 @@ def confirm(
         if check.reconciling
         else []
     )
-    # A relation identity is not enough after a same-name recreate in log mode. The
-    # old destination image is still present, and `awaiting_snapshot` is the durable
-    # proof that the new lifecycle has not yet been admitted. Without this check the
-    # coordinator could replace the oid and promote the baseline over both lifecycles.
+    # A relation identity is not enough after a same-name recreate while the old
+    # destination image is still present: `awaiting_snapshot` is the durable proof
+    # that the new lifecycle has not been admitted. Catalog apply quarantines a
+    # recreate by removing that physical image in the same transaction as this state,
+    # so an empty target is safe for the identity baseline to promote. The lifecycle
+    # remains `awaiting_snapshot` and admission still refuses replacement rows until
+    # the re-snapshot supplies the complete image.
     remaining = sorted(set(remaining) | set(
         owing_relations_with_rows(con, pipeline=pipeline, dataset=dataset)
     ))
     if remaining:
         check.unreconciled = remaining
         check.reason = (
-            f"{len(remaining)} relation(s) still hold destination rows with no recorded "
-            "source identity, so nothing has yet rebuilt them: " + ", ".join(remaining)
+            f"{len(remaining)} relation(s) still hold an untrusted destination image, "
+            "so the catalog baseline cannot be confirmed: " + ", ".join(remaining)
         )
         if check.state != INVALIDATED:
             check.state = _write(
@@ -569,8 +572,8 @@ def confirm(
     )
     check.unreconciled = []
     check.reason = (
-        f"{successful_polls} catalog comparison(s) and no relation with destination "
-        "rows and no recorded source identity"
+        f"{successful_polls} catalog comparison(s) and no relation still holds an "
+        "untrusted destination image"
     )
     check.state = _write(
         con, pipeline=pipeline, frm=check.state, to=VALID, reason=check.reason,

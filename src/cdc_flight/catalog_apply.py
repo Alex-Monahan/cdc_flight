@@ -24,11 +24,11 @@ Four guards, in the order they run:
    worst of both.
 
 A `recreated` relation is the one case where the source table *exists* and the
-destination table is still wrong — it holds the rows of a different relation. In
-replicate mode it is dropped; in log mode it is retained as an explicitly stale image.
-Either way it is alerted on and the table is marked `awaiting_snapshot` in
-`table_state`, so the incompleteness is loud rather than silent (Opus Q1); rubric
-2.3/3.4 own the automatic re-snapshot that turns that flag off.
+destination table is still wrong — it holds the rows of a different relation. It is
+quarantined in both drop modes: the physical target and any snapshot shadow are
+removed, and the table is marked `awaiting_snapshot` in `table_state` in the same
+transaction. That makes the incomplete image loud without leaving a mixed table
+queryable; rubric 2.3/3.4 own the automatic re-snapshot that turns the flag off.
 
 Alerts are returned, never written here: they must survive a rollback, which means a
 different connection and a moment after the transaction has settled (Codex 7).
@@ -155,6 +155,7 @@ class CatalogCoordinator:
         self.changes_applied = 0
         self.destructive_refused = 0
         self.awaiting_snapshot: set[str] = set()
+        self.tables_quarantined = 0
 
     @property
     def registry(self):
@@ -286,7 +287,7 @@ class CatalogCoordinator:
                 detail = (
                     f"recreated with oid {change.new_oid} (was {change.old_oid}); the "
                     "destination table held the OLD relation's rows and was "
-                    + ("dropped" if destructive else "retained as a stale log image")
+                    + "quarantined and dropped"
                     + ", and `table_state.snapshot_state` is now "
                     f"{AWAITING_SNAPSHOT!r}: it is INCOMPLETE until a re-snapshot "
                     "runs (rubric 2.3/3.4)"
@@ -322,7 +323,7 @@ class CatalogCoordinator:
                             + (
                                 "destination table was dropped"
                                 if destructive
-                                else f"destination table was KEPT (drop_mode={self.drop_mode})"
+                                else "retained image was quarantined for re-snapshot"
                             )
                         ),
                         "context": change.context(),
@@ -428,25 +429,33 @@ class CatalogCoordinator:
                     )
                     raise
                 stats["tables"].add(action.target)
-            if action.destructive:
+            if action.destructive and change.kind != CHANGE_RECREATED:
                 # The shadow goes too: a table dropped mid-backfill would otherwise
                 # leave `<target>__cdcf_tmp` behind forever.
                 self.registry.drop(naming.shadow_table(action.target))
                 self.registry.drop(action.target)
-                if change.kind != CHANGE_RECREATED:
-                    destination.forget_table_state(
-                        con,
-                        pipeline=self.pipeline,
-                        source_schema=change.schema,
-                        source_table=change.table,
-                    )
+                destination.forget_table_state(
+                    con,
+                    pipeline=self.pipeline,
+                    source_schema=change.schema,
+                    source_table=change.table,
+                )
                 stats["tables"].add(action.target)
                 self.tables_dropped += 1
             if change.kind == CHANGE_RECREATED:
-                # A replacement relation is a new source lifecycle even when log mode
-                # retains the old rows. The retained image is not a valid baseline for
-                # the new oid, so it must enter the same durable re-snapshot queue as
-                # the destructive path before any new-relation stream tail is admitted.
+                # A replacement relation is a new source lifecycle. The retained image
+                # is not a valid baseline for the new oid, and identity admission has
+                # already fenced any replacement tail that could have arrived before
+                # this observation. Quarantine the physical image in the same
+                # destination transaction as the durable owed state: after COMMIT there
+                # is no queryable mixed table for log mode, and the re-snapshot shadow
+                # can be renamed into the now-absent target atomically.
+                self.registry.drop(naming.shadow_table(action.target))
+                self.registry.drop(action.target)
+                stats["tables"].add(action.target)
+                self.tables_quarantined += 1
+                if action.destructive:
+                    self.tables_dropped += 1
                 destination.mark_awaiting_snapshot(
                     con,
                     pipeline=self.pipeline,
@@ -486,7 +495,10 @@ class CatalogCoordinator:
                         "source_schema": change.schema,
                         "source_table": change.table,
                         "target_table": action.target,
-                        "applied": action.destructive or change.kind == CHANGE_SCHEMA,
+                        "applied": (
+                            action.destructive
+                            or change.kind in {CHANGE_RECREATED, CHANGE_SCHEMA}
+                        ),
                         "lsn": change.detected_lsn,
                         "txn_id": None,
                         "detail": detail,
@@ -641,6 +653,7 @@ class CatalogCoordinator:
     def summary(self) -> dict:
         return {
             "tables_dropped": self.tables_dropped,
+            "tables_quarantined": self.tables_quarantined,
             "catalog_changes_applied": self.changes_applied,
             "catalog_destructive_refused": self.destructive_refused,
             "tables_awaiting_snapshot": sorted(self.awaiting_snapshot),

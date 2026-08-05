@@ -843,9 +843,10 @@ def mark_awaiting_snapshot(
     current, and dropping them and letting ordinary CDC re-create a partial table is
     worse still, because the destination then looks healthy while being silently
     incomplete. In either drop policy the row carries `snapshot_state` — the run
-    summary and `inspect` surface it, and rubric 2.3/3.4's re-snapshot clears it. Log
-    mode deliberately keeps the stale image, so its new-relation stream tail is
-    refused until that rebuild.
+    summary and `inspect` surface it, and rubric 2.3/3.4's re-snapshot clears it. The
+    catalog apply phase also removes the physical retained image in the same
+    transaction as this transition, so a replacement can never leave a queryable
+    mixed image while the rebuild is owed.
     """
     table_lifecycle.transition(
         con,
