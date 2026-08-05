@@ -8,8 +8,8 @@ Four things only a real run can show:
 
 1. **The gap, live.** `CDC_TRUNCATE_MODE=ignore` preserves the externally visible
    baseline (the destination rows and marker count do not change), while the pipeline
-   retains the raw TRUNCATE internally as generation-proof evidence — required to
-   distinguish it from a same-OID replacement.
+   retains the raw TRUNCATE internally for the destination policy; lifecycle
+   convergence is owned by the asynchronous catalog token.
 2. **A truncate is replicated** once the default is overridden.
 3. **A crash in the commit→ack window of a truncating group** replays that
    transaction: the destination must end up empty exactly once, never re-populated

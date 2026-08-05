@@ -56,7 +56,7 @@ drop; with a transactional one it applies in about a second.
 |---|---|---|
 | `test_1_5_truncate_key_reuse.py` | default | rubric 1.5 crossed with 1.4, which nothing tested before and where the fold was wrong: both reproduced Opus BLOCKER-1 shapes (a spurious row that never healed; one source row present under two keys with an **ordinary** primary key), Codex 3's cross-transaction zombie, and the same cases under spill and over two tables |
 | `test_1_5_truncate_storage_modes.py` | default | a `{memory, spill} x {replicate, log}` matrix over rows / marker / counters / `rows_removed`, because storage used to change *semantics*: `truncate_mode=log` under spill emptied the table and neither mode wrote a marker. Plus two truncates in one transaction reporting what each removed, and a fault at `spill` / `mid_apply` / `pre_commit` around a **staged** truncate |
-| `test_1_5_catalog_guards.py` | default | the guards between "the table is gone" and `DROP TABLE`: confirmation, supersession, revalidation (fail-closed), the mass-drop circuit breaker, the zero-relations guard, and that an alert about a *refusal* survives a rollback while an alert about an *applied* drop does not |
+| `test_1_5_catalog_guards.py` | default | the guards between "the table is gone" and `DROP TABLE`: confirmation, supersession, durable observation/quarantine, the mass-drop circuit breaker, the zero-relations guard, and that an alert about a *refusal* survives a rollback while an alert about an *applied* drop does not |
 | `test_1_5_ownership_and_honesty.py` | default | `table_state` as the canonical source-to-destination registry (written by whoever first creates the table, kept by `--reset-state`), the synchronous final catalog poll, and that a run with an unresolved destructive change **fails** instead of reporting `ok: true` |
 | `test_1_5_truncate_fold.py` | default | every truncate fold shape and the application of a detected drop, through the shipped `Applier` and a real DuckDB file: multi-table atomicity, rows before/after the truncate, the keyless trap, the marker, `truncate_mode=log`, a spilled truncate, the LSN fence, `recreated`, `unpublished`, `drop_mode=log` with durable identity and baseline confirmation across restart, the declared drop-mode/baseline-state matrix, and a rolled-back drop staying pending |
 | `test_1_5_catalog_detection.py` | default | the comparison and the fence in isolation, including the restart case (a replicated table with no persisted oid that is gone **is** a drop) and that a marker failure leaves the change unapplied rather than forced |
@@ -68,14 +68,13 @@ drop; with a transactional one it applies in about a second.
 
 | variable | default | meaning |
 |---|---|---|
-| `CDC_TRUNCATE_MODE` | `replicate` | `replicate` empties the destination table (=5); `log` keeps the rows and records the marker (=3); `ignore` is a destination no-op while the raw event remains available to generation proofing |
+| `CDC_TRUNCATE_MODE` | `replicate` | `replicate` empties the destination table (=5); `log` keeps the rows and records the marker (=3); `ignore` is a destination no-op while the raw event remains decoded |
 | `CDC_DROP_MODE` | `replicate` | `replicate` drops the destination table (=5); `log` records the marker only; `ignore` disables catalog polling |
 | `CDC_CATALOG_POLL_SECONDS` | `10` | catalog poll interval (also rubric 2.3's discovery interval) |
 | `CDC_CATALOG_MARKER` | `1` | emit the WAL fence marker on the source |
 | `CDC_DROP_CONFIRM_POLLS` | `2` | consecutive polls that must agree before a destructive change is queued |
 | `CDC_DROP_MAX_PER_POLL` | `1` | how many relations one commit group may destroy; the **whole set** is refused above it |
 | `CDC_DROP_ALLOW_MASS` | `0` | authorise a mass drop (an operator who really is replicating a `DROP SCHEMA`) |
-| `CDC_DROP_REVALIDATE` | `1` | re-read the relation immediately before destroying its destination table |
 | `CDC_CATALOG_MARKER_MAX` | `60` | cap on fence markers written to the source per run while a change stays unresolved |
 | `CDC_CATALOG_DRAIN_SECONDS` | `30` | how long a quiet run holds the engine open for a change its final poll just queued |
 | `CDC_CATALOG_GRACE` | `0` | never apply a DDL action the fence has not cleared. **A non-zero value is excluded from the structural correctness guarantee** (ADR §18/A38) |

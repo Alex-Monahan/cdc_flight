@@ -431,7 +431,7 @@ def test_the_watcher_still_refuses_to_adopt_if_the_marking_did_not_take():
     By the time the watcher is built the marking has normally taken every unrelatable
     relation out of scope, so its `unrelatable` set is empty. If one is STILL unrelatable
     then something did not happen that should have, and refusing to adopt its identity —
-    queueing it as `recreated`, which is confirmed, fenced and revalidated like any other
+    queueing it as `recreated`, which is confirmed and WAL-fenced like any other
     destructive change — is the conservative answer rather than the routine one.
     """
     con = _destination()

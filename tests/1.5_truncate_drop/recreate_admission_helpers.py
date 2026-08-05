@@ -4,34 +4,23 @@ from __future__ import annotations
 
 from applier_lab import DATASET, Lab, data, end, keyed
 
-from cdc_flight import table_lifecycle
 from cdc_flight.catalog import (
     CHANGE_RECREATED,
     CatalogChange,
     CatalogWatcher,
     SourceRelation,
 )
-from cdc_flight.machines import (
-    CHANGE_MARKED,
-    LIFECYCLE_AWAITING,
-    LIFECYCLE_COMPLETE,
-    LIFECYCLE_IN_PROGRESS,
-)
+from cdc_flight.machines import CHANGE_MARKED
 
 CUSTOMERS = "cdcflight_app_customers"
 ORDERS = "cdcflight_app_orders"
 
 
 def _watcher(*, present: dict[str, object] | None = None, **kw) -> CatalogWatcher:
-    """A polling-disabled watcher whose source-generation read is supplied by the test."""
+    """A polling-disabled watcher whose durable observations are supplied by the test."""
     watcher = CatalogWatcher(
         dsn="", publication="pub", schema="app", include=set(), poll_seconds=0, **kw
     )
-    oids = dict(present or {})
-    watcher.relation_oids = lambda names: {  # type: ignore[method-assign]
-        f"{schema}.{table}": oids.get(f"{schema}.{table}")
-        for schema, table in names
-    }
     return watcher
 
 
@@ -113,46 +102,3 @@ def _assert_recreated_boundary(box: Lab, relation: SourceRelation) -> None:
         "FROM _cdc_flight.source_relations "
         "WHERE pipeline = 'lab' AND source_table = 'customers'"
     ) == [(relation.oid, relation.relfilenode, relation.relation_type_oid)]
-
-
-def _set_current_relation_oid(watcher: CatalogWatcher, relation: SourceRelation) -> None:
-    watcher.relation_oids = lambda names: {  # type: ignore[method-assign]
-        f"{schema}.{table}": relation.oid for schema, table in names
-    }
-
-
-def _realize_recreate_lifecycle(box: Lab, state: str) -> None:
-    """Materialize a declared retained-image state rather than only naming it."""
-    if state == LIFECYCLE_COMPLETE:
-        table_lifecycle.transition(
-            box.con,
-            pipeline="lab",
-            source_schema="app",
-            source_table="customers",
-            to=LIFECYCLE_IN_PROGRESS,
-            reason="recreate admission matrix setup",
-            target_table=box.target("customers"),
-        )
-        table_lifecycle.transition(
-            box.con,
-            pipeline="lab",
-            source_schema="app",
-            source_table="customers",
-            to=LIFECYCLE_COMPLETE,
-            reason="recreate admission matrix setup",
-            target_table=box.target("customers"),
-            snapshot_lsn=25,
-            last_commit_id=1,
-        )
-    elif state == LIFECYCLE_AWAITING:
-        table_lifecycle.transition(
-            box.con,
-            pipeline="lab",
-            source_schema="app",
-            source_table="customers",
-            to=LIFECYCLE_AWAITING,
-            reason="recreate admission matrix setup",
-            target_table=box.target("customers"),
-        )
-    else:  # pragma: no cover - the caller derives states from TABLE_LIFECYCLE
-        raise AssertionError(f"unhandled recreate lifecycle state {state!r}")

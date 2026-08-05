@@ -118,6 +118,37 @@ def test_an_unchanged_table_produces_nothing():
     assert w._compare({"app.customers": relation("customers", 16384)}, lsn=700) == []
 
 
+def test_a_complete_type_token_makes_a_relfilenode_rewrite_an_ordinary_truncate():
+    """TRUNCATE rewrites the physical file but does not create a new relation."""
+    old = SourceRelation(
+        "app", "customers", 16384, True, "d",
+        relfilenode=90001, relation_type_oid=70001,
+    )
+    truncated = SourceRelation(
+        "app", "customers", 16384, True, "d",
+        relfilenode=90002, relation_type_oid=70001,
+    )
+    w = watcher(known=[old], replicated=["app.customers"])
+    assert w._compare({"app.customers": truncated}, lsn=700) == []
+    assert w.known["app.customers"].relfilenode == 90002
+
+
+def test_a_complete_type_token_change_is_still_a_same_oid_recreate():
+    old = SourceRelation(
+        "app", "customers", 16384, True, "d",
+        relfilenode=90001, relation_type_oid=70001,
+    )
+    replacement = SourceRelation(
+        "app", "customers", 16384, True, "d",
+        relfilenode=90002, relation_type_oid=70002,
+    )
+    w = watcher(known=[old], replicated=["app.customers"], confirm_polls=1)
+    changes = w._compare({"app.customers": replacement}, lsn=700)
+    assert [(change.kind, change.qualified) for change in changes] == [
+        (CHANGE_RECREATED, "app.customers")
+    ]
+
+
 def test_leaving_and_rejoining_the_publication_is_reported_but_not_a_drop():
     w = watcher(known=[relation("customers", 1)], replicated=["app.customers"])
     left = w._compare({"app.customers": relation("customers", 1, published=False)}, lsn=1)
