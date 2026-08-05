@@ -178,6 +178,7 @@ class Applier:
             topic_prefix=topic_prefix,
             drop_mode=config.drop_mode,
             registry_of=lambda: self.registry,
+            lifecycle_con=self.con,
             max_destructive_per_group=config.drop_max_per_group,
             allow_mass_drop=config.drop_allow_mass,
         )

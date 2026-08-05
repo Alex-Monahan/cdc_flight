@@ -248,6 +248,7 @@ class LiveDiscoveryCoordinator:
                     namespace=self.namespace,
                     ownership=self.ownership,
                     new_relations={relation.qualified for relation in newly_discovered},
+                    drop_mode=self.applier_cfg.drop_mode,
                 )
                 self.watcher.complete_discoveries(
                     {relation.qualified for relation in newly_discovered}

@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
-from . import destination, naming
+from . import destination, naming, table_lifecycle
 from .catalog import (
     CHANGE_DROPPED,
     CHANGE_NEW,
@@ -29,7 +29,7 @@ from .catalog import (
 )
 from .config import DROP_IGNORE, DROP_REPLICATE
 from .errors import SchemaEvolutionRefused
-from .machines import CHANGE_APPLIED, CHANGE_REFUSED, require_admission_state
+from .machines import CHANGE_DEFERRED, CHANGE_REFUSED, require_admission_state
 from .schema_evolution import apply_column_changes
 
 log = logging.getLogger("cdc_flight.catalog_apply")
@@ -54,6 +54,9 @@ class CatalogPlan:
 
     actions: tuple[CatalogAction, ...] = ()
     relations: tuple = ()
+    #: Watcher observation epoch at plan time; settlement uses it for diagnostics and
+    #: identity-aware dirty clearing when a newer poll overlaps the commit.
+    catalog_epoch: int = 0
     #: Destructive changes deliberately held back by the circuit breaker.
     refused: tuple[tuple[CatalogChange, str], ...] = ()
     alerts: list = field(default_factory=list)
@@ -74,6 +77,7 @@ class CatalogCoordinator:
         topic_prefix: str,
         drop_mode: str,
         registry_of,
+        lifecycle_con=None,
         max_destructive_per_group: int = 1,
         allow_mass_drop: bool = False,
     ):
@@ -82,6 +86,7 @@ class CatalogCoordinator:
         self.topic_prefix = topic_prefix
         self.drop_mode = drop_mode
         self._registry_of = registry_of
+        self._lifecycle_con = lifecycle_con
         self.max_destructive_per_group = max_destructive_per_group
         self.allow_mass_drop = allow_mass_drop
         self.tables_dropped = 0
@@ -113,6 +118,26 @@ class CatalogCoordinator:
             return CatalogPlan()
 
         due = self.catalog.due(durable_lsn)
+        if self._lifecycle_con is not None:
+            owing = set(table_lifecycle.owing_work(self._lifecycle_con, self.pipeline))
+            eligible: list[CatalogChange] = []
+            for change in due:
+                if change.kind == CHANGE_DROPPED and change.qualified in owing:
+                    # A source-side drop observed while the retained image is still
+                    # awaiting its replacement snapshot is not a final drop policy
+                    # decision. Keep the catalog fact live, but do not let a stale
+                    # CHANGE_DROPPED plan destroy or log the retained image before
+                    # the re-snapshot's final source evidence decides.
+                    change.to(CHANGE_DEFERRED)
+                    log.warning(
+                        "deferring %s for %s while the replacement image is owed; "
+                        "the re-snapshot owns the final source-missing policy",
+                        change.kind,
+                        change.qualified,
+                    )
+                else:
+                    eligible.append(change)
+            due = eligible
         actions: list[CatalogAction] = []
         refused: list[tuple[CatalogChange, str]] = []
         alerts: list[dict] = []
@@ -139,13 +164,14 @@ class CatalogCoordinator:
                 ", ".join(names),
             )
 
-        # The breaker protects explicit DROP_REPLICATE destruction.  Recreates are
-        # always one table-scoped quarantine boundary, including DROP_LOG, because a
-        # retained image is not a valid image of the new generation.
+        # The breaker protects physical DROP_REPLICATE destruction.  A recreate is a
+        # table-scoped quarantine boundary, but its retained image is deliberately kept
+        # until the replacement snapshot's atomic swap (or the final source-missing
+        # policy decision) proves that destruction is safe.
         destructive_changes = [
             change
             for change in due
-            if change.kind in DESTRUCTIVE and self.drop_mode == DROP_REPLICATE
+            if change.kind == CHANGE_DROPPED and self.drop_mode == DROP_REPLICATE
         ]
         blocked: set[int] = set()
         limit = self.max_destructive_per_group
@@ -188,7 +214,7 @@ class CatalogCoordinator:
             if id(change) in blocked:
                 continue
             destructive = (
-                change.kind in DESTRUCTIVE and self.drop_mode == DROP_REPLICATE
+                change.kind == CHANGE_DROPPED and self.drop_mode == DROP_REPLICATE
             )
             target = naming.destination_table(
                 self.topic_prefix, change.schema, change.table
@@ -197,7 +223,8 @@ class CatalogCoordinator:
                 detail = (
                     f"recreated with oid {change.new_oid} (was {change.old_oid}); the "
                     "destination table held the old relation's rows and was "
-                    "quarantined and dropped; `table_state.snapshot_state` is now "
+                    "quarantined while its retained image was preserved; "
+                    "`table_state.snapshot_state` is now "
                     f"{AWAITING_SNAPSHOT!r} until a complete re-snapshot runs"
                 )
             elif change.kind in DESTRUCTIVE and not destructive:
@@ -285,6 +312,7 @@ class CatalogCoordinator:
         return CatalogPlan(
             actions=tuple(actions),
             relations=tuple(relations),
+            catalog_epoch=self.catalog.epoch,
             refused=tuple(refused),
             alerts=alerts,
         )
@@ -321,15 +349,12 @@ class CatalogCoordinator:
                 stats["tables"].add(action.target)
                 self.tables_dropped += 1
             if change.kind == CHANGE_RECREATED:
-                # This is the convergence boundary.  Any rows admitted before the
-                # watcher learned the new generation disappear with the old image and
-                # are recovered by the complete table-scoped resnapshot.
-                self.registry.drop(naming.shadow_table(action.target))
-                self.registry.drop(action.target)
+                # This is the convergence boundary.  Rows admitted before the watcher
+                # learned the new generation remain as a retained recovery image until
+                # the complete replacement is durable.  SnapshotCoordinator.swap()
+                # owns the only normal destruction point, inside its atomic swap.
                 stats["tables"].add(action.target)
                 self.tables_quarantined += 1
-                if action.destructive:
-                    self.tables_dropped += 1
                 destination.mark_awaiting_snapshot(
                     con,
                     pipeline=self.pipeline,
@@ -487,14 +512,25 @@ class CatalogCoordinator:
             return
         changes = [action.change for action in plan.actions]
         if changes:
-            for change in changes:
-                change.to(CHANGE_APPLIED)
-            self.catalog.resolve(changes)
+            # A live watcher can supersede a due plan after the destination COMMIT.
+            # The committed fact is still settled as applied; the newer change remains
+            # in the watcher queue.  The watcher owns this idempotent transition.
+            self.catalog.settle(changes, plan.catalog_epoch)
             for action in plan.actions:
-                if action.change.kind == CHANGE_DROPPED and action.destructive:
+                if (
+                    action.change.kind == CHANGE_DROPPED
+                    and action.destructive
+                    and not any(
+                        change.qualified == action.change.qualified
+                        for change in self.catalog.pending()
+                    )
+                ):
+                    # A newer source generation may already be live in the watcher.
+                    # The committed drop fact is settled, but it must not erase the
+                    # newer generation's known/dirty identity or pending obligation.
                     self.catalog.forget(action.change.qualified)
         if plan.relations:
-            self.catalog.clear_dirty([relation.qualified for relation in plan.relations])
+            self.catalog.clear_dirty_if_current(plan.relations, plan.catalog_epoch)
         if source_tables:
             self.catalog.observe_replicated(source_tables)
 

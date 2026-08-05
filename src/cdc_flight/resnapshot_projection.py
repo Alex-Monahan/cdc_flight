@@ -27,6 +27,7 @@ class ProjectionEvent:
     table_event_detail: str | None = None
     seq: int = 0
     rows_removed: int | None = None
+    applied: bool = True
 
 
 def project_snapshot_completion(
@@ -168,7 +169,7 @@ def _write_table_event(
         source_schema=source_schema,
         source_table=source_table,
         target_table=target_table,
-        applied=True,
+        applied=event.applied,
         lsn=snapshot_lsn,
         rows_removed=event.rows_removed,
         detail=event.table_event_detail or event.audit_detail,

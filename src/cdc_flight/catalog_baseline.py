@@ -237,34 +237,15 @@ def unrebuilt_relations(con, *, pipeline: str, dataset: str) -> list[str]:
 
 
 def owing_relations_with_rows(con, *, pipeline: str, dataset: str) -> list[str]:
-    """Return owed lifecycle names whose retained destination image is non-empty.
+    """Return every owing lifecycle name, including an empty or absent target.
 
-    A replacement relation can already have a durable ``source_relations`` row: the
-    coordinator writes the new oid in the same transaction that records the recreate.
-    That row alone must not discharge the catalog baseline while the old image remains
-    queryable. The lifecycle machine is therefore the boundary, and the destination row
-    count distinguishes a retained log image from a destructive recreate whose table is
-    already gone.
+    Trust belongs to ``TABLE_LIFECYCLE``.  Row presence is only an observation about
+    the retained image; it cannot discharge ``awaiting_snapshot`` or ``in_progress``.
+    The optional ``dataset`` parameter remains for compatibility with callers that used
+    the old row-count helper.
     """
-    owing = set(table_lifecycle.owing_work(con, pipeline))
-    if not owing:
-        return []
-    targets = {
-        f"{schema}.{table}": (str(schema), str(table), str(target))
-        for schema, table, target in con.execute(
-            f"SELECT source_schema, source_table, target_table FROM "
-            f"{CONTROL_SCHEMA}.table_state WHERE pipeline = ?",
-            [pipeline],
-        ).fetchall()
-    }
-    from .destination import destination_holds_rows
-
-    held = destination_holds_rows(
-        con,
-        dataset=dataset,
-        tables=[targets[name] for name in sorted(owing) if name in targets],
-    )
-    return sorted(held)
+    del dataset
+    return table_lifecycle.owing_work(con, pipeline)
 
 
 # --------------------------------------------------------------------------- #
@@ -539,13 +520,9 @@ def confirm(
         if check.reconciling
         else []
     )
-    # A relation identity is not enough after a same-name recreate while the old
-    # destination image is still present: `awaiting_snapshot` is the durable proof
-    # that the new lifecycle has not been admitted. Catalog apply quarantines a
-    # recreate by removing that physical image in the same transaction as this state,
-    # so an empty target is safe for the identity baseline to promote. The lifecycle
-    # remains `awaiting_snapshot` and admission still refuses replacement rows until
-    # the re-snapshot supplies the complete image.
+    # A relation identity and an empty/absent physical target are not completion
+    # evidence.  The durable lifecycle alone is authoritative: an owing table is
+    # untrusted until the replacement image reaches `complete`.
     remaining = sorted(set(remaining) | set(
         owing_relations_with_rows(con, pipeline=pipeline, dataset=dataset)
     ))

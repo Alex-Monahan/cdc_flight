@@ -56,6 +56,7 @@ def apply_catalog_phase(
     phase = CatalogPlan(
         actions=actions,
         relations=relations,
+        catalog_epoch=plan.catalog_epoch,
         refused=plan.refused if not schema_only else (),
         alerts=plan.alerts if not schema_only else [],
     )

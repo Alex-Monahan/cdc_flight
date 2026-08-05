@@ -248,6 +248,10 @@ class CatalogWatcher:
         self.machine_error: str | None = None
         self.last_lsn: int = 0
         self._snapshot_partitions: set[str] = set()
+        #: Monotone watcher epoch used by a destination plan to identify the
+        #: observation set it was built from.  Settlement may still absorb an older
+        #: committed plan, but it must not clear dirty state learned in a later epoch.
+        self._epoch = 0
 
     @property
     def emit_marker(self) -> bool:
@@ -256,6 +260,11 @@ class CatalogWatcher:
     @property
     def markers_emitted(self) -> int:
         return self.marker.writes
+
+    @property
+    def epoch(self) -> int:
+        with self._lock:
+            return self._epoch
 
     # -- lifecycle ---------------------------------------------------------- #
     def start(self) -> CatalogWatcher:
@@ -496,6 +505,7 @@ class CatalogWatcher:
         with self._lock:
             self.polls += 1
             self.last_lsn = lsn
+            self._epoch += 1
             # Pending destructive changes are `interesting` even after their relation
             # was forgotten: the *cancellation* in guard 2 depends on this poll
             # visiting the name at all (Codex 4).
@@ -550,8 +560,21 @@ class CatalogWatcher:
                             current, admission_state=previous.admission_state
                         )
                         observed[name] = current
-                    # A present relation cancels a drop; a newer OID supersedes a recreate.
-                    if catalog_generation.has_newer_recreate(pending_recreates, current):
+                    # A present relation cancels a drop.  A physical rewrite within the
+                    # same lifecycle refreshes an existing recreate obligation; it does
+                    # not supersede it merely because its relfilenode changed.
+                    matching_recreate = catalog_generation.matching_recreate(
+                        pending_recreates, current
+                    )
+                    if matching_recreate is not None:
+                        catalog_generation.refresh_recreate(
+                            matching_recreate, current, lsn
+                        )
+                        self.known[name] = current
+                        self._dirty[name] = current
+                    elif catalog_generation.has_newer_recreate(
+                        pending_recreates, current
+                    ):
                         superseded.extend(self._supersede(name, CHANGE_RECREATED))
                     superseded.extend(self._supersede(name, CHANGE_DROPPED))
                     if previous is not None and catalog_generation.lifecycle_identities_equal(
@@ -567,7 +590,12 @@ class CatalogWatcher:
                             # left in a state nothing will ever advance.
                             stale.to(CHANGE_SUPERSEDED)
                             self.superseded += 1
-                else:
+                elif not pending_recreates:
+                    # A replacement that disappears before its quarantine plan is
+                    # durable is not yet a final DROP decision. Keep the recreate
+                    # obligation so the retained image survives until the next
+                    # re-snapshot can read the source and apply DROP_LOG or
+                    # DROP_REPLICATE from that final fact.
                     superseded.extend(self._supersede(name, CHANGE_RECREATED))
                 # AFTER supersession: a change this poll has just cancelled must not
                 # then suppress the change this poll should queue instead.
@@ -744,83 +772,7 @@ class CatalogWatcher:
         return added
 
     def _confirm(self, name: str, change: CatalogChange) -> CatalogChange | None:
-        """Queue a destructive observation only once enough polls have agreed.
-
-        `CDC_DROP_CONFIRM_POLLS` (default 2). This costs at most one poll interval of
-        extra latency on a real drop and removes a whole class of transient-catalog and
-        mid-DDL false positive at essentially no cost (Opus Q5). Returns the change once
-        the streak is complete, `None` while it is still building; the streak resets
-        whenever the *shape* of the observation changes. Held under `self._lock`.
-
-        **The object that ends up queued is the object the first poll observed**
-        (Codex r1 MAJOR-1). It used to build the streak in a side table of tuples and
-        throw the observation away, so the confirming poll constructed a *second* object
-        that went `observed -> pending` directly and the declared `unconfirmed ->
-        pending` edge described nothing production ever did. Carrying the same object
-        forward is what makes the confirmation half of SM-D a real machine: `detected_lsn`
-        is refreshed to the latest agreeing poll, because that is the LSN the fence has
-        to clear.
-        """
-        shape = (
-            change.kind,
-            change.new_oid,
-            tuple(
-                (
-                    item.kind,
-                    item.attnum,
-                    item.old_name,
-                    item.new_name,
-                    item.type_oid,
-                    item.type_name,
-                    item.nullable,
-                    item.type_changed,
-                )
-                for item in change.column_changes
-            ),
-        )
-        seen = self._unconfirmed.get(name)
-        seen_shape = (
-            seen.kind,
-            seen.new_oid,
-            tuple(
-                (
-                    item.kind,
-                    item.attnum,
-                    item.old_name,
-                    item.new_name,
-                    item.type_oid,
-                    item.type_name,
-                    item.nullable,
-                    item.type_changed,
-                )
-                for item in seen.column_changes
-            ),
-        ) if seen is not None else None
-        if seen is not None and seen_shape != shape:
-            # A different observation: the streak restarts, and the old object is
-            # cancelled rather than left dangling in a state nothing will advance.
-            seen.to(CHANGE_SUPERSEDED)
-            self.superseded += 1
-            seen = None
-        if seen is None:
-            change.to(CHANGE_UNCONFIRMED)
-            tracked = change
-        else:
-            tracked = seen
-            tracked.confirmations += 1
-            tracked.detected_lsn = change.detected_lsn
-            tracked.to(CHANGE_UNCONFIRMED)  # `unconfirmed -> unconfirmed`, declared
-        if tracked.confirmations < self.confirm_polls:
-            self._unconfirmed[name] = tracked
-            log.info(
-                "%s observed for %s (%s/%s confirming polls); not queued yet",
-                tracked.kind, name, tracked.confirmations, self.confirm_polls,
-            )
-            return None
-        self._unconfirmed.pop(name, None)
-        # `unconfirmed -> pending`: the edge an object now really takes. `_compare`
-        # moves it the rest of the way when it extends `_changes`.
-        return tracked
+        return catalog_change_queue.confirm(self, name, change)
 
     def _supersede(self, name: str, *kinds: str) -> list[str]:
         """Cancel live changes of `kinds` for `name`. Caller holds the lock."""
@@ -919,6 +871,9 @@ class CatalogWatcher:
             done = set(map(id, changes))
             self._changes = [c for c in self._changes if id(c) not in done]
 
+    def settle(self, changes: list[CatalogChange], planned_epoch: int | None = None) -> None:
+        catalog_change_queue.settle(self, changes, planned_epoch)
+
     def queue(self, change: CatalogChange) -> CatalogChange:
         """Put a change into the queue by taking the `observed -> pending` EDGE.
 
@@ -931,6 +886,7 @@ class CatalogWatcher:
             if change.state in (CHANGE_OBSERVED, CHANGE_UNCONFIRMED):
                 change.to(CHANGE_PENDING)
             self._changes.append(change)
+            self._epoch += 1
         return change
 
     def _live(self) -> list[CatalogChange]:
@@ -978,6 +934,11 @@ class CatalogWatcher:
         with self._lock:
             for name in names:
                 self._dirty.pop(name, None)
+
+    def clear_dirty_if_current(
+        self, relations, planned_epoch: int | None = None
+    ) -> None:
+        catalog_change_queue.clear_dirty_if_current(self, relations, planned_epoch)
 
     def forget(self, name: str) -> None:
         with self._lock:

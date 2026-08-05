@@ -565,6 +565,7 @@ def run(
                 namespace=namespace,
                 ownership=ownership,
                 new_relations={relation.qualified for relation in discovered},
+                drop_mode=applier_cfg.drop_mode,
             )
             summary_extra.update(resnap.as_dict())
             if watcher is not None and discovered:
@@ -593,15 +594,10 @@ def run(
             # remembers marking: the run that discovers a relation refuses, and so does
             # every later one, until something actually rebuilds it. Keyed on
             # `baseline.unreconciled` the guarantee would last exactly one run.
-            skipped_baseline = sorted(
-                set(unhandled)
-                & set(
-                    baseline_mod.unrelatable_relations(
-                        con, pipeline=dest.pipeline_name, dataset=dest.dataset_name,
-                        include_owed=True,
-                    )
-                )
-            )
+            # An owing lifecycle is itself enough to block a successful run. The
+            # physical target may be empty or already absent after quarantine; row
+            # presence is not a trust signal.
+            skipped_baseline = list(unhandled)
             if skipped_baseline and not will_snapshot_everything:
                 # A QUEUED REBUILD IS NOT A FINISHED ONE (Codex r6 BLOCKER-2, reproduced).
                 #
@@ -666,6 +662,7 @@ def run(
             snapshot_completion=snapshot_completion,
             outcome=outcome,
             base_summary=summary_extra,
+            drop_mode=applier_cfg.drop_mode,
         )
 
         from .discovery_coordinator import LiveDiscoveryCoordinator

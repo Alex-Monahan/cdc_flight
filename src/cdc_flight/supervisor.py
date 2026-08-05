@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from . import table_lifecycle
 from .applier import Applier
 from .config import RunConfig
 from .errors import EngineFailure
@@ -488,6 +489,34 @@ def run_engine_bounded(
                 "marker could not be written to the source (see "
                 f"catalog_marker_error={summary.get('catalog_marker_error')!r}), so no "
                 "LSN past the detection point can be proven to have flowed",
+                summary,
+            )
+
+    is_resnapshot = bool(
+        getattr(getattr(handler, "cfg", None), "resnapshot", False)
+    )
+    snapshot_required = bool(
+        getattr(handler, "snapshot_completion_required", False)
+    )
+    if not intermediate_handoff and not is_resnapshot and not snapshot_required:
+        # Lifecycle trust is independent of row presence and of whether a catalog
+        # watcher was attached to this bounded engine. Do not let a target that is
+        # empty, absent, or merely marked for rebuild pass the engine-level success
+        # gate.
+        con = getattr(handler, "con", None)
+        pipeline = getattr(handler, "pipeline", None)
+        owing = (
+            table_lifecycle.owing_work(con, pipeline)
+            if con is not None and pipeline is not None
+            else []
+        )
+        if owing:
+            outcome.record("catalog_unresolved")
+            summary["stop_reason"] = outcome.value
+            summary["tables_awaiting_snapshot_unhandled"] = owing
+            raise EngineFailure(
+                "the destination still owes a table lifecycle rebuild at engine "
+                "shutdown: " + ", ".join(owing),
                 summary,
             )
 

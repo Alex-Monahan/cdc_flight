@@ -124,6 +124,36 @@ def has_newer_recreate(changes, current) -> bool:
     return False
 
 
+def matching_recreate(changes, current):
+    """Return a pending recreate for the same relation lifecycle, if any.
+
+    A relfilenode rewrite is a new physical token but not a new relation lifecycle
+    when the OID and row-type OID are unchanged.  That distinction matters after a
+    type-token recreate has already established a quarantine obligation: the newer
+    physical token refreshes the obligation; it does not cancel it.
+    """
+    current_identity = coerce_identity(current)
+    if current_identity is None:
+        return None
+    for change in changes:
+        expected = coerce_identity(
+            getattr(change, "new_identity", None) or change.new_oid
+        )
+        if expected is not None and lifecycle_identities_equal(expected, current_identity):
+            return change
+    return None
+
+
+def refresh_recreate(change: CatalogChange, current, lsn: int) -> CatalogChange:
+    """Update a queued recreate to the newest token without changing its state."""
+    identity = identity_for(current)
+    change.new_oid = identity.oid
+    change.new_identity = identity
+    change.new_relation = current
+    change.detected_lsn = lsn
+    return change
+
+
 def pending_for(changes, known, qualified: str, previous):
     """Return live recreate/drop work and the relation whose image is retained."""
     live = [change for change in changes if change.state in LIVE_CHANGE_STATES]

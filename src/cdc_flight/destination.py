@@ -844,9 +844,9 @@ def mark_awaiting_snapshot(
     worse still, because the destination then looks healthy while being silently
     incomplete. In either drop policy the row carries `snapshot_state` — the run
     summary and `inspect` surface it, and rubric 2.3/3.4's re-snapshot clears it. The
-    catalog apply phase also removes the physical retained image in the same
-    transaction as this transition, so a replacement can never leave a queryable
-    mixed image while the rebuild is owed.
+    catalog apply phase preserves the physical retained image in the same
+    transaction as this transition. The replacement snapshot owns the later atomic
+    swap, or the final source-missing policy owns any eventual destruction.
     """
     table_lifecycle.transition(
         con,

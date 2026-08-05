@@ -119,7 +119,7 @@ from . import reconcile as reconcile_mod
 from . import resnapshot_projection as projection
 from . import table_lifecycle
 from .applier import Applier, ApplierConfig
-from .config import ReplicationConfig, RunConfig, SourceConfig
+from .config import DROP_LOG, ReplicationConfig, RunConfig, SourceConfig
 from .debezium_props import build_properties
 from .destination import CONTROL_SCHEMA, ResumePoint
 from .errors import EngineFailure
@@ -128,6 +128,11 @@ from .ownership import DestinationOwnership
 from .resnapshot_compat import completed_tables as _completed_tables
 from .resnapshot_projection import ProjectionEvent
 from .resnapshot_recovery import InterruptionRecovery
+from .resnapshot_source_policy import (
+    EmptinessEvidence,
+    finish_source_missing_tables,
+)
+from .resnapshot_source_policy import gather_emptiness_evidence as _gather_emptiness_evidence
 from .snapshot_completion import SnapshotCompletion
 from .source_health import SourceHealth
 
@@ -145,6 +150,8 @@ class ResnapshotOutcome:
     requested: list[str] = field(default_factory=list)
     swapped: list[str] = field(default_factory=list)
     emptied: list[str] = field(default_factory=list)
+    logged_drops: list[str] = field(default_factory=list)
+    dropped: list[str] = field(default_factory=list)
     consistent_lsn: int | None = None
     slot_consistent_lsn: int | None = None
     snapshot_record_lsn: int | None = None
@@ -161,6 +168,8 @@ class ResnapshotOutcome:
             "resnapshot_requested": self.requested,
             "resnapshot_swapped": self.swapped,
             "resnapshot_emptied": self.emptied,
+            "resnapshot_logged_drops": self.logged_drops,
+            "resnapshot_dropped": self.dropped,
             "resnapshot_consistent_lsn": self.consistent_lsn,
             "resnapshot_slot_consistent_lsn": self.slot_consistent_lsn,
             "resnapshot_snapshot_record_lsn": self.snapshot_record_lsn,
@@ -176,50 +185,13 @@ class ResnapshotOutcome:
     @property
     def still_owed(self) -> list[str]:
         """Requested tables that reached neither terminal state."""
-        return sorted(set(self.requested) - set(self.swapped) - set(self.emptied))
-
-
-@dataclass
-class EmptinessEvidence:
-    """The three independent facts a `verified_empty` classification needs.
-
-    Separated from the code that gathers them so the classification itself is a pure,
-    directly testable function of its evidence — the destructive path in this module
-    had zero test coverage precisely because it could only be reached through a live
-    Debezium engine (Opus BLOCKER-1, "test coverage of this path: zero").
-    """
-
-    #: The closed completion model accepted the per-table and global notifications, so
-    #: the engine reached the end of the WHOLE requested capture set.
-    snapshot_phase_ended: bool
-    #: `"<schema>.<table>"` for every table that produced at least one snapshot record.
-    tables_seen: set[str]
-    #: `"<schema>.<table>" -> current source row count`, read after the engine stopped.
-    source_empty_at: dict[str, int]
-    #: `pg_current_wal_lsn()` sampled BEFORE those counts were taken. The fence for a
-    #: verified-empty table; see the module docstring.
-    wal_lsn: int | None
-
-    def verdict(self, qualified: str) -> tuple[bool, str]:
-        """`(is_verified_empty, why not)` for one requested table."""
-        if not self.snapshot_phase_ended:
-            return False, (
-                "the snapshot completion callbacks never proved the end of the whole "
-                "capture set, so this table may simply not have been reached"
-            )
-        if qualified in self.tables_seen:
-            return False, (
-                "the engine produced snapshot records for this table but no shadow was "
-                "swapped in, so the image is partial, not empty"
-            )
-        if self.wal_lsn is None:
-            return False, "no source WAL position was sampled for the emptiness check"
-        count = self.source_empty_at.get(qualified)
-        if count is None:
-            return False, "the source row count for this table could not be read"
-        if count != 0:
-            return False, f"the source relation holds {count} row(s)"
-        return True, ""
+        return sorted(
+            set(self.requested)
+            - set(self.swapped)
+            - set(self.emptied)
+            - set(self.logged_drops)
+            - set(self.dropped)
+        )
 
 
 def _record_snapshot_swap_audit(
@@ -387,6 +359,7 @@ def run(
     namespace: str,
     ownership: DestinationOwnership,
     new_relations: set[str] | None = None,
+    drop_mode: str = DROP_LOG,
 ) -> ResnapshotOutcome:
     """Re-snapshot `tables` into shadow tables and swap them in, then return.
 
@@ -545,20 +518,36 @@ def run(
             tables_seen=completion.tables_seen,
         )
         outcome.empty_check_lsn = evidence.wal_lsn
-        outcome.emptied = finish_verified_empty_tables(
+        outcome.logged_drops, outcome.dropped = finish_source_missing_tables(
             con,
             pipeline=pipeline,
             dataset=dataset,
             tables=tables,
             done=set(outcome.swapped),
             evidence=evidence,
+            drop_mode=drop_mode,
+            namespace=namespace,
+            snapshot_epoch=epoch_base + len(tables) + 1,
+        )
+        resolved = set(outcome.swapped) | set(outcome.logged_drops) | set(outcome.dropped)
+        outcome.emptied = finish_verified_empty_tables(
+            con,
+            pipeline=pipeline,
+            dataset=dataset,
+            tables=tables,
+            done=resolved,
+            evidence=evidence,
             new_relations=new_relations or set(),
             namespace=namespace,
             snapshot_epoch=epoch_base + len(tables) + 1,
         )
-        if outcome.consistent_lsn is None and sorted(outcome.requested) != sorted(
-            outcome.emptied
-        ):
+        terminal = (
+            set(outcome.swapped)
+            | set(outcome.emptied)
+            | set(outcome.logged_drops)
+            | set(outcome.dropped)
+        )
+        if outcome.consistent_lsn is None and terminal != set(outcome.requested):
             raise EngineFailure(
                 "the re-snapshot produced no consistent point: neither a snapshot "
                 f"record nor the throwaway slot {slot!r} yielded an LSN, so the "
@@ -571,8 +560,13 @@ def run(
         outcome.snapshot_epoch = epoch_base + len(tables) + 1
         recovery.consume()
         log.warning(
-            "RE-SNAPSHOT complete at consistent point %s: swapped %s, emptied %s",
-            outcome.consistent_lsn, outcome.swapped or "-", outcome.emptied or "-",
+            "RE-SNAPSHOT complete at consistent point %s: swapped %s, emptied %s, "
+            "logged drops %s, dropped %s",
+            outcome.consistent_lsn,
+            outcome.swapped or "-",
+            outcome.emptied or "-",
+            outcome.logged_drops or "-",
+            outcome.dropped or "-",
         )
         return outcome
     except BaseException as exc:
@@ -641,7 +635,12 @@ def reassert_owed(
     `awaiting_snapshot` when this function returns, whatever intermediate state the
     engine left it in, or the next run cannot know it is owed.
     """
-    finished = set(terminal.swapped) | set(terminal.emptied)
+    finished = (
+        set(terminal.swapped)
+        | set(terminal.emptied)
+        | set(terminal.logged_drops)
+        | set(terminal.dropped)
+    )
     owed = [t for t in tables if f"{t[0]}.{t[1]}" not in finished]
     if not owed:
         return []
@@ -702,48 +701,6 @@ def agree_on_consistent_point(record_lsn: int | None, slot_lsn: int | None) -> i
             {"snapshot_record_lsn": record_lsn, "slot_consistent_lsn": slot_lsn},
         )
     return record_lsn if record_lsn is not None else slot_lsn
-
-
-def _gather_emptiness_evidence(
-    dsn: str,
-    *,
-    pending: list[tuple[str, str, str]],
-    snapshot_phase_ended: bool,
-    tables_seen: set[str],
-) -> EmptinessEvidence:
-    """Sample the WAL position, then count the pending relations. In that order.
-
-    The order is the whole argument (see the module docstring): `pg_current_wal_lsn()`
-    is read on its own statement **before** the `REPEATABLE READ` snapshot the counts
-    are taken in, so every transaction whose commit LSN is below the sample is visible
-    to those counts. A count of zero then proves that no transaction below the sample
-    left a row behind, which is exactly what fencing at the sample asserts.
-    """
-    if not pending:
-        return EmptinessEvidence(snapshot_phase_ended, tables_seen, {}, None)
-    counts: dict[str, int] = {}
-    wal_lsn: int | None = None
-    try:
-        import psycopg
-
-        with psycopg.connect(dsn, autocommit=True, connect_timeout=10) as conn:
-            row = conn.execute("SELECT (pg_current_wal_lsn() - '0/0')::bigint").fetchone()
-            wal_lsn = int(row[0]) if row and row[0] is not None else None
-        with psycopg.connect(dsn, connect_timeout=10) as conn:
-            conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-            for schema, table, _target in pending:
-                found = conn.execute(
-                    f"SELECT count(*) FROM {quote(schema)}.{quote(table)}"
-                ).fetchone()
-                counts[f"{schema}.{table}"] = int(found[0]) if found else -1
-            conn.commit()
-    except Exception as exc:  # pragma: no cover - the source may be unreachable
-        log.error(
-            "could not verify at the source whether %s is empty: %s",
-            ", ".join(f"{s}.{t}" for s, t, _ in pending), exc,
-        )
-        return EmptinessEvidence(snapshot_phase_ended, tables_seen, counts, None)
-    return EmptinessEvidence(snapshot_phase_ended, tables_seen, counts, wal_lsn)
 
 
 def finish_verified_empty_tables(
@@ -898,6 +855,7 @@ def finish_empty_tables_after_main_snapshot(
     dsn: str,
     owed: list[tuple[str, str, str]],
     completion: SnapshotCompletion,
+    drop_mode: str = DROP_LOG,
 ) -> tuple[list[str], int | None]:
     """Close out the tables a MAIN-engine snapshot left owed because they are empty.
 
@@ -934,12 +892,21 @@ def finish_empty_tables_after_main_snapshot(
         snapshot_phase_ended=completion.phase_ended,
         tables_seen=completion.tables_seen,
     )
-    emptied = finish_verified_empty_tables(
+    logged, dropped = finish_source_missing_tables(
         con,
         pipeline=pipeline,
         dataset=dataset,
         tables=owed,
         done=set(),
         evidence=evidence,
+        drop_mode=drop_mode,
     )
-    return emptied, evidence.wal_lsn
+    emptied = finish_verified_empty_tables(
+        con,
+        pipeline=pipeline,
+        dataset=dataset,
+        tables=owed,
+        done=set(logged) | set(dropped),
+        evidence=evidence,
+    )
+    return emptied + logged + dropped, evidence.wal_lsn

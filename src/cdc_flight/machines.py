@@ -501,6 +501,9 @@ CATALOG_CHANGE = Machine(
         *((s, CHANGE_REFUSED) for s in (*_LIVE_CHANGE_STATES, CHANGE_DUE)),
         # a newer observation cancels this one
         *((s, CHANGE_SUPERSEDED) for s in (*_LIVE_CHANGE_STATES, CHANGE_DUE)),
+        # the destination may already have committed a plan when the watcher
+        # supersedes it; settlement records that applied fact idempotently.
+        (CHANGE_SUPERSEDED, CHANGE_APPLIED),
         (CHANGE_DUE, CHANGE_APPLIED),
     ),
     terminal=(CHANGE_APPLIED, CHANGE_SUPERSEDED),
