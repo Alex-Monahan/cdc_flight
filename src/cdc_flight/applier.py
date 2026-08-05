@@ -46,7 +46,6 @@ import time
 from typing import Any
 
 from . import (
-    ack_protocol,
     apply_sql,
     catalog_commit,
     commit_metadata,
@@ -472,7 +471,10 @@ class Applier:
             maybe_crash("decode", self.data_batch_count)
 
         if not self.group.units:
-            self._ack_discarded_records()
+            # A discard-only re-snapshot poll has no destination transaction. The
+            # handles remain pending until a replacement snapshot/terminal group
+            # reaches the guarded COMMIT -> acknowledgement path below. An empty
+            # Debezium poll is not a durability boundary for the throwaway slot.
             return
         # ADR §3.3 soft triggers, plus one pragmatic rule the ADR's pseudocode
         # needs and does not state: Debezium calls `markBatchFinished()` itself on
@@ -549,7 +551,8 @@ class Applier:
         """
         group = self.group.units
         if not group:
-            self._ack_discarded_records()
+            # In particular, never acknowledge a discard-only re-snapshot tail here:
+            # this method has not opened or committed a MotherDuck transaction.
             return CommitResult.EMPTY
         # Snapshot rows are observations of the same closed protocol as the direct
         # notifications. Validate their state and declared counts before BEGIN/COMMIT;
@@ -647,7 +650,14 @@ class Applier:
             # `run_state._CommitAckWindow` for why that is the only acceptable cost here.
             stage = ["observability_gate"]
             marked = 0
-            pending_discards = list(self._pending_discarded_records)
+            # A non-snapshot group can be durable without containing a replacement
+            # image. Keep discard-only handles pending across that boundary too; the
+            # only group that may discharge them is a snapshot/terminal group.
+            pending_discards = (
+                list(self._pending_discarded_records)
+                if self.group.is_snapshot
+                else []
+            )
             with self_heal.commit_watchdog(
                 self.cfg.commit_timeout, commit_id, stage=lambda: stage[0]
             ):
@@ -756,9 +766,6 @@ class Applier:
             )
         self._reset_group()
         return CommitResult.COMMITTED
-
-    def _ack_discarded_records(self) -> None:
-        ack_protocol.acknowledge_discarded_records(self)
 
     def _request_resnapshot_for(
         self, ambiguous: AmbiguousDelete | DestinationIdentityCollision

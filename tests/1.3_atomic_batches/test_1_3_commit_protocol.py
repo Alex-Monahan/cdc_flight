@@ -20,12 +20,38 @@ from __future__ import annotations
 import json
 
 import pytest
-from applier_lab import DATASET, Lab, begin, data, end, keyed, snap
+from applier_lab import DATASET, Lab, begin, data, end, heartbeat, keyed, snap
 
 from cdc_flight.envelope import KIND_SNAPSHOT_BOUNDARY, PendingRecord
 from cdc_flight.errors import OffsetFlushFailed
 from cdc_flight.run_state import COMMIT_ACK
 from cdc_flight.snapshot_completion import SnapshotCompletion, SnapshotObservationError
+
+
+def _patch_production_handle_for_pending_records(monkeypatch):
+    """Drive ``Applier._handle`` with the lab's decoded records.
+
+    ``Lab.feed`` deliberately bypasses the Debezium envelope boundary. These tests
+    need the production empty-poll branch, so only the two decoders are adapted at
+    the test seam; assembly, admission, commit and acknowledgement remain real.
+    """
+    from cdc_flight import applier as applier_module
+
+    real_decode = applier_module.decode
+    real_decode_notification = applier_module.decode_notification
+
+    def decode(raw, **kwargs):
+        if isinstance(raw, PendingRecord):
+            return raw
+        return real_decode(raw, **kwargs)
+
+    def decode_notification(raw, **kwargs):
+        if isinstance(raw, PendingRecord):
+            return None
+        return real_decode_notification(raw, **kwargs)
+
+    monkeypatch.setattr(applier_module, "decode", decode)
+    monkeypatch.setattr(applier_module, "decode_notification", decode_notification)
 
 
 @pytest.fixture
@@ -628,6 +654,134 @@ def test_resnapshot_fences_streaming_unit_before_empty_group_admission(lab):
     assert box.applier.resnapshot_discarded_events == 1
     assert box.applier.snapshot_completion.state == "callbacks_started"
     assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 0
+    assert box.committer.marked == 0
+    assert box.committer.batches == 0
+    assert len(box.applier._pending_discarded_records) == 1
+
+
+def test_resnapshot_discard_stays_pending_through_empty_poll_until_snapshot_commit(
+    lab, monkeypatch
+):
+    """An empty production poll cannot advance the throwaway slot by itself."""
+    box = lab(
+        full_snapshot=True,
+        resnapshot=True,
+        ack_every_record=True,
+    )
+    _patch_production_handle_for_pending_records(monkeypatch)
+
+    box.applier._handle(_streaming_transaction(), box.committer)
+    assert len(box.applier._pending_discarded_records) == 3
+    assert box.committer.marked == 0
+    assert box.committer.batches == 0
+    assert box.applier.commit_groups == 0
+
+    # This is the reviewed production shape: the next callback is an empty poll.
+    box.applier._handle([], box.committer)
+    assert len(box.applier._pending_discarded_records) == 3
+    assert box.committer.marked == 0
+    assert box.committer.batches == 0
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 0
+
+    # The first replacement snapshot group owns the acknowledgement boundary.
+    box.applier._handle(
+        [snap("customers", 100, ident=1, marker="last")], box.committer
+    )
+    assert box.applier.commit_groups == 1
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 1
+    assert box.applier._pending_discarded_records == []
+    assert box.committer.marked == 4
+    assert box.committer.batches == 1
+
+
+def test_empty_resnapshot_terminal_group_durably_precedes_discard_ack(lab, monkeypatch):
+    """No snapshot rows still get a durable terminal commit before acknowledgement."""
+    box = lab(
+        full_snapshot=True,
+        resnapshot=True,
+        ack_every_record=True,
+    )
+    _patch_production_handle_for_pending_records(monkeypatch)
+    completion = SnapshotCompletion.full_snapshot({"app.customers"})
+    completion.observe_notification("STARTED", {})
+    box.applier.snapshot_completion = completion
+
+    box.applier._handle(_streaming_transaction(), box.committer)
+    box.applier._handle(
+        [
+            _SnapshotNotification(
+                "TABLE_SCAN_COMPLETED",
+                200,
+                {
+                    "scanned_collection": "app.customers",
+                    "status": "SUCCEEDED",
+                    "total_rows_scanned": "0",
+                },
+            ),
+            _SnapshotNotification("COMPLETED", 201),
+        ],
+        box.committer,
+    )
+
+    assert box.applier.commit_groups == 1
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 1
+    assert box.applier.snapshot_completed is True
+    assert box.applier._pending_discarded_records == []
+    # Two raw terminal notifications plus the three raw records of the discarded
+    # whole transaction; the synthetic boundary has no raw handle.
+    assert box.committer.marked == 5
+    assert box.committer.batches == 1
+
+
+def test_non_snapshot_commit_cannot_discharge_pending_resnapshot_handles(
+    lab, monkeypatch
+):
+    """A durable control group is not a replacement image or terminal policy."""
+    box = lab(
+        full_snapshot=True,
+        resnapshot=True,
+        ack_every_record=True,
+    )
+    _patch_production_handle_for_pending_records(monkeypatch)
+    box.applier._handle(_streaming_transaction(), box.committer)
+    box.applier.snapshot_completion = SnapshotCompletion.streaming_only()
+
+    box.applier._handle([heartbeat(400)], box.committer)
+
+    assert box.applier.commit_groups == 1
+    assert box.committer.marked == 1
+    assert box.committer.batches == 1
+    assert len(box.applier._pending_discarded_records) == 3
+
+
+def test_crash_between_snapshot_commit_and_discard_ack_keeps_handles_replayable(
+    lab, monkeypatch
+):
+    """A crash cut before acknowledgement leaves the source records pending."""
+    from cdc_flight import faults
+
+    box = lab(
+        full_snapshot=True,
+        resnapshot=True,
+        ack_every_record=True,
+    )
+    _patch_production_handle_for_pending_records(monkeypatch)
+    box.applier._handle(_streaming_transaction(), box.committer)
+
+    monkeypatch.setenv("CDC_FAULT_INJECT", "post_commit_pre_ack:1:raise")
+    faults.refresh()
+    with pytest.raises(faults.InjectedFault):
+        box.applier._handle(
+            [snap("customers", 100, ident=1, marker="last")], box.committer
+        )
+
+    # The replacement transaction committed, but no source handle crossed the cut.
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 1
+    assert box.committer.marked == 0
+    assert box.committer.batches == 0
+    assert len(box.applier._pending_discarded_records) == 3
+    box.applier.shutdown(reason="simulated_crash")
+    assert len(box.applier._pending_discarded_records) == 3
 
 
 def test_resnapshot_fences_streaming_unit_after_open_snapshot_group(lab):
