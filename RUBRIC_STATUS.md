@@ -66,7 +66,7 @@ conservatively at **5** and **4** — 1.5 deliberately not restored to 5.
 | Codex 1 / Opus B-1, B-2 — the fold asked a group-scoped question about a per-row ambiguity | **fixed.** `table_work` folds physical rows (ADR §18/A35); five orderings closed |
 | Codex 2 — spill bypassed the truncate policy and audit | **fixed.** One dispatcher (`planner.GroupPlan`); a `{memory,spill} x {replicate,log}` matrix; positional audit |
 | Codex 3 — cross-transaction truncate zombie | **fixed** by the same fold |
-| Codex 4 / Opus M-3 — a stale drop could destroy a live replacement | **fixed.** Confirmation, supersession, fail-closed revalidation, a circuit breaker, a zero-relations guard (ADR §18/A38) |
+| Codex 4 / Opus M-3 — a stale drop could destroy a live replacement | **fixed.** Confirmation, supersession, durable watcher state with atomic quarantine/resnapshot, a circuit breaker, and a zero-relations guard (ADR §18/A38) |
 | Codex 5 — no durable source→destination ownership | **fixed.** `table_state` written by whoever creates the table; `--reset-state` keeps it (A39) |
 | Codex 6 — the no-writable-primary fallback reported success | **fixed.** Final synchronous poll, drain barrier, `stop_reason=catalog_unresolved` (A43) |
 | Codex 7 / Opus M-2 — the alert was inside the transaction | **fixed.** `AlertSink` on `con.cursor()`, classified by refusal vs applied action (A40) |
@@ -921,11 +921,11 @@ fenced destination policy and DDL.
 | the zero-relations guard | acting on a poll that saw an empty schema | the wrong-database / mid-`pg_restore` signature |
 | confirmation (`CDC_DROP_CONFIRM_POLLS=2`) | acting on a single observation | a transient catalog read mid-DDL |
 | supersession | acting on an observation a later poll contradicted | dropping the destination table of a **live replacement relation** |
-| revalidation | acting without re-reading the source, and acting when it cannot be read | the same, for a fence that opened long after detection |
+| durable observation | acting from an untrusted synchronous proof or an out-of-band source read | the stale-image window is durably quarantined and baseline/completion refuse until the complete resnapshot swap |
 | the circuit breaker (`CDC_DROP_MAX_PER_POLL=1`) | destroying more than one relation at once | `DROP SCHEMA … CASCADE`, a DSN repointed at an empty database, a failover target |
 
-Revalidation fails **closed**: "I could not ask the source" is never read as "it is
-gone". The breaker refuses the **whole** set, never the first N, and raises a `critical`
+The watcher fails safe on source errors: an observation error creates no commit-path
+authority or acknowledgement. The breaker refuses the **whole** set, never the first N, and raises a `critical`
 alert that survives a rollback. A `recreated` relation is dropped, alerted on, and
 marked `awaiting_snapshot` in `table_state`, which `inspect` and the run summary print.
 
@@ -1001,8 +1001,8 @@ rather than trading one off:
 | `CDC_DROP_CONFIRM_POLLS` | `2` | consecutive polls that must agree before a destructive change is queued |
 | `CDC_DROP_MAX_PER_POLL` | `1` | how many relations one commit group may destroy; the whole set is refused above it |
 | `CDC_DROP_ALLOW_MASS` | `0` | authorise a mass drop (an operator who really is replicating a `DROP SCHEMA`) |
-| `CDC_DROP_REVALIDATE` | `1` | re-read the relation immediately before destroying its destination table |
-| `CDC_CATALOG_MARKER` | `1` | emit the WAL fence marker on the source (writes go to the PRIMARY, per 7.2/D9) |
+| `CDC_PRIMARY_DSN` | unset | primary route for catalog publication admission and transactional fence markers when the read DSN is a replica; unset uses the source DSN |
+| `CDC_CATALOG_MARKER` | `1` | emit the WAL fence marker on the configured PRIMARY, per 7.2/D9 |
 | `CDC_CATALOG_MARKER_MAX` | `60` | cap on fence markers per run while a change stays unresolved |
 | `CDC_CATALOG_DRAIN_SECONDS` | `30` | how long a quiet run holds the engine open for a change it just queued |
 | `CDC_CATALOG_GRACE` | `0` | never apply a DDL action the fence has not cleared. **A non-zero value is excluded from the structural correctness guarantee** (ADR §18/A38) and the run logs that at start-up |

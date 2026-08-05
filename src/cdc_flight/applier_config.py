@@ -53,9 +53,6 @@ class ApplierConfig:
     #: limit is exceeded, never half of it.
     drop_max_per_group: int = 1
     drop_allow_mass: bool = False
-    #: Re-read the source relation immediately before destroying its destination
-    #: table, and fail closed if the source cannot be asked (Codex 4).
-    drop_revalidate: bool = True
     #: How long `COMMIT` may take before the process aborts (rubric 1.7 / 4.5).
     #: 0 disables the watchdog.
     commit_timeout: float = 300.0

@@ -179,7 +179,8 @@ Alongside the data, the applier owns a `_cdc_flight` schema: `debezium_offsets` 
 resume point, written inside the data transaction), `commit_log` (one row per destination
 transaction), `lease` (single-writer, rubric 4.2), `table_state`, `spill_events`,
 `table_events` (one row per TRUNCATE / DROP / recreate / publication change, rubric 1.5),
-`source_relations` (the last-seen source catalog, including each table's relation `oid`)
+`source_relations` (the last-seen source catalog, including each table's relation
+`oid`, `relfilenode`, and row-type token)
 and `alerts`.
 
 **The fold models physical rows, not keys (rubric 1.4).** A key is not a row: inside one
@@ -200,11 +201,11 @@ out of the spill table. `DROP TABLE` is not in the replication stream at all, so
 source catalog is polled (`CDC_CATALOG_POLL_SECONDS`, default 10 s) and a detected drop
 passes six guards before any DDL runs: the LSN fence, a zero-relations guard, two
 confirming polls (`CDC_DROP_CONFIRM_POLLS`), supersession by a newer observation,
-fail-closed revalidation against the source, and a circuit breaker that refuses to destroy
+durable quarantine/resnapshot state, and a circuit breaker that refuses to destroy
 more than `CDC_DROP_MAX_PER_POLL` (default **1**) relations at once. The fence needs an
 LSN past the DDL to flow, so `source_marker.py` writes a transactional
-`pg_logical_emit_message` on the source — the one component that writes there at all,
-shared with D9's idle heartbeat and bounded by a write budget. A destructive change still
+`pg_logical_emit_message` on the configured primary — the one component that writes there
+at all, shared with D9's idle heartbeat and bounded by a write budget. A destructive change still
 unresolved at shutdown makes the run **fail**; it does not report `ok: true`.
 Policy: `CDC_TRUNCATE_MODE` and `CDC_DROP_MODE`, each `replicate` (default) | `log` |
 `ignore`.

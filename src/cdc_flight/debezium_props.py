@@ -233,11 +233,11 @@ def build_properties(
         # source, which is exactly why rubric 1.5's DROP detection has to poll the
         # catalog - see `cdc_flight.catalog`.)
         "include.schema.changes": "false",
-        # Always retain pgoutput TRUNCATE records.  `truncate_mode=ignore` is still
-        # a destination no-op, but the ordered event is the only stream-side proof
-        # that a same-OID relfilenode change came from TRUNCATE rather than DROP/CREATE.
-        # Applying the old Debezium `skipped.operations=t` setting here would make
-        # those two histories indistinguishable to the generation fence.
+        # Always retain pgoutput TRUNCATE records for the destination policy.  They
+        # are not generation authority: the asynchronous catalog token and the
+        # complete-image resnapshot own lifecycle convergence.  Applying the old
+        # Debezium `skipped.operations=t` setting would lose the operation before
+        # the planner sees it.
         "skipped.operations": SKIP_NOTHING,
         # --- resilience -------------------------------------------------------
         "errors.max.retries": "3",

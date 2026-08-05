@@ -54,15 +54,12 @@ GROUP BY n.nspname, c.relname, c.oid, c.relfilenode, c.reltype, c.relreplident,
          pr.prrelid, inh.inhparent, parent_pr.prrelid
 """
 
-OID_SQL = """
-SELECT n.nspname, c.relname, c.oid::bigint, c.relfilenode::bigint,
-       c.reltype::bigint
-FROM pg_class c
-JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE c.relkind IN ('r', 'p') AND (n.nspname, c.relname) IN (SELECT * FROM unnest(%s::text[], %s::text[]))
+# A catalog read may run on a hot standby.  `pg_current_wal_lsn()` is primary-only;
+# the receive position is the corresponding upper bound for the read-side WAL fence.
+LSN_SQL = """
+SELECT ((CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn()
+              ELSE pg_current_wal_lsn() END) - '0/0'::pg_lsn)::bigint
 """
-
-LSN_SQL = "SELECT (pg_current_wal_lsn() - '0/0'::pg_lsn)::bigint"
 
 SCHEMA_LIVENESS_SQL = """
 SELECT n.nspname,

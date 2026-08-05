@@ -81,14 +81,6 @@ class OpenGroup:
     pending_alerts: list[dict] = field(default_factory=list)
     #: source tables this group actually wrote, handed to the watcher after COMMIT
     source_tables: set[str] = field(default_factory=set)
-    #: Non-locking planning observation. It is diagnostic/input to the final proof,
-    #: never an admission authority.
-    source_generation_plan: dict[str, object] | None = None
-    #: Last-moment proof shared by unit admission and catalog planning. The source
-    #: lease itself is local to `Applier.commit_group` so source-lock cleanup cannot
-    #: leak across a group reset.
-    source_generation_final: dict[str, object] | None = None
-
     def __bool__(self) -> bool:
         return bool(self.units)
 

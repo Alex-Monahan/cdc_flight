@@ -416,6 +416,7 @@ def run(
         if catalog_enabled:
             watcher = catalog_mod.CatalogWatcher(
                 dsn=source.dsn,
+                primary_dsn=source.primary_dsn,
                 publication=replication.publication_name,
                 schema=source.schema,
                 schemas=source.schemas,

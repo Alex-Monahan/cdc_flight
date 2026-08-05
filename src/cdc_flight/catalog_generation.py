@@ -1,55 +1,19 @@
-"""Pure generation identities, proof values and catalog-state constructors.
+"""Pure generation identities and catalog-state constructors.
 
-PostgreSQL's relation OID is not enough to identify a source lifecycle: it is a
-four-byte value and can be reused.  The durable token is therefore ``(oid,
-relfilenode, reltype)``.  ``relfilenode`` is zero for partitioned parents, so the
-row-type OID completes that otherwise ambiguous case.  The physical token is
-nullable only for legacy destination rows and test doubles; a real source proof
-always carries it.
-
-This module deliberately does not mutate ``CatalogWatcher``.  The watcher owns its
-change queue and exposes the small state-changing methods used by the coordinator.
-Keeping the generation code pure makes the proof consumed by observation, planning
-and admission one value with one set of classifications, rather than a second state
-owner reaching into watcher private fields.
+PostgreSQL relation OIDs can be reused.  The durable lifecycle token is therefore
+``(oid, relfilenode, reltype_oid)``: ``reltype_oid`` completes the token for
+partitioned parents, whose ``relfilenode`` is zero.  This module deliberately has
+no source I/O and no commit-time authority.  The asynchronous catalog watcher owns
+observation; these helpers compare the durable observations and construct queued
+obligations.
 """
 
 from __future__ import annotations
 
-import contextlib
-from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from .catalog_state import CHANGE_DROPPED, CHANGE_RECREATED, CatalogChange
 from .machines import LIVE_CHANGE_STATES
-
-
-class _Unknown:
-    __slots__ = ()
-
-    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
-        return "UNKNOWN"
-
-
-UNKNOWN = _Unknown()
-
-GENERATION_CURRENT = "current"
-GENERATION_NEWER = "newer"
-GENERATION_ABSENT = "absent"
-GENERATION_UNKNOWN = "unknown"
-GENERATION_AMBIGUOUS = "ambiguous"
-GENERATION_BOUNDARY_UNPROVEN = "boundary_unproven"
-
-# The matrix tests derive their proof dimension from this declaration.  A source
-# read that cannot prove the token or its WAL coverage is never silently current.
-GENERATION_PROOF_STATES = (
-    GENERATION_CURRENT,
-    GENERATION_NEWER,
-    GENERATION_ABSENT,
-    GENERATION_UNKNOWN,
-    GENERATION_AMBIGUOUS,
-    GENERATION_BOUNDARY_UNPROVEN,
-)
 
 
 @dataclass(frozen=True)
@@ -69,73 +33,40 @@ class RelationIdentity:
 
     @property
     def complete(self) -> bool:
-        # PostgreSQL reports 0 for partitioned parents. Their row type is the
-        # additional generation discriminator; ordinary relations need only their
-        # nonzero physical file. Legacy values remain incomplete and fail closed when
-        # a real proof must distinguish them.
+        """Whether this token can distinguish a physical source generation."""
         return self.relfilenode is not None and (
             self.relfilenode != 0 or self.reltype_oid is not None
         )
 
 
-@dataclass(frozen=True)
-class GenerationProof:
-    """One source identity observation and its source-WAL coverage."""
-
-    identity: RelationIdentity | None = None
-    source_lsn: int | None = None
-    error: str | None = None
-    #: Bare integer readers are retained only as a compatibility shape for tests and
-    #: old embedders. Production ``CatalogWatcher`` proofs are never legacy.
-    legacy: bool = False
-
-    @classmethod
-    def unknown(cls, error: str) -> GenerationProof:
-        return cls(error=error)
-
-
-@dataclass(frozen=True)
-class GenerationCheck:
-    """The result of comparing a planned generation with one proof."""
-
-    state: str
-    current_oid: object
-    current_identity: RelationIdentity | None = None
-    source_lsn: int | None = None
-
-
-@dataclass
-class GenerationProofLease:
-    """A proof plus any source lock held until the destination commit boundary."""
-
-    proofs: dict[str, GenerationProof]
-    _release: Callable[[], None] | None = None
-    released: bool = False
-
-    def release(self) -> None:
-        if self.released:
-            return
-        self.released = True
-        if self._release is not None:
-            with contextlib.suppress(Exception):
-                self._release()
-
-    def __enter__(self) -> GenerationProofLease:
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
-        self.release()
-
-
 def identity_for(relation) -> RelationIdentity:
     """Extract a token from a ``SourceRelation``-shaped value."""
-    filenode = getattr(relation, "relfilenode", None)
-    type_oid = getattr(relation, "relation_type_oid", None)
-    return RelationIdentity(relation.oid, filenode, type_oid)
+    if isinstance(relation, RelationIdentity):
+        return relation
+    return RelationIdentity(
+        relation.oid,
+        getattr(relation, "relfilenode", None),
+        getattr(relation, "relation_type_oid", None),
+    )
+
+
+def coerce_identity(value) -> RelationIdentity | None:
+    """Coerce a durable token, source relation, or legacy integer."""
+    if value is None:
+        return None
+    if isinstance(value, RelationIdentity):
+        return value
+    if isinstance(value, (tuple, list)) and len(value) in {2, 3}:
+        return RelationIdentity(value[0], value[1], value[2] if len(value) == 3 else None)
+    if isinstance(value, int):
+        return RelationIdentity(value)
+    if hasattr(value, "oid"):
+        return identity_for(value)
+    return None
 
 
 def with_identity(relation, identity: RelationIdentity):
-    """Project a watcher relation shape onto a newly proven token."""
+    """Project a relation shape onto a durable token."""
     return replace(
         relation,
         oid=identity.oid,
@@ -144,150 +75,67 @@ def with_identity(relation, identity: RelationIdentity):
     )
 
 
-def coerce_identity(value) -> RelationIdentity | None:
-    if value is UNKNOWN or value is None:
-        return None
-    if isinstance(value, RelationIdentity):
-        return value
-    if isinstance(value, GenerationProof):
-        return value.identity
-    if isinstance(value, (tuple, list)) and len(value) in {2, 3}:
-        return RelationIdentity(value[0], value[1], value[2] if len(value) == 3 else None)
-    if hasattr(value, "oid"):
-        return identity_for(value)
-    if isinstance(value, int):
-        return RelationIdentity(value)
-    return None
-
-
-def coerce_proof(value) -> GenerationProof:
-    if isinstance(value, GenerationProof):
-        return value
-    if value is UNKNOWN:
-        return GenerationProof.unknown("the source generation could not be read")
-    if value is None:
-        return GenerationProof()
-    if isinstance(value, (RelationIdentity, tuple, list)):
-        return GenerationProof(identity=coerce_identity(value), legacy=False)
-    if isinstance(value, int):
-        return GenerationProof(identity=RelationIdentity(value), legacy=True)
-    identity = coerce_identity(value)
-    if identity is not None:
-        return GenerationProof(identity=identity, legacy=True)
-    return GenerationProof.unknown(f"unsupported source generation value {value!r}")
-
-
-def normalize_proofs(values: dict[str, object], names) -> dict[str, GenerationProof]:
-    return {name: coerce_proof(values.get(name, UNKNOWN)) for name in names}
-
-
-def check(
-    expected, current, *, minimum_lsn: int | None = None
-) -> GenerationCheck:
-    """Classify a proof, failing closed for incomplete or uncovered evidence."""
-    proof = coerce_proof(current)
-    expected_identity = coerce_identity(expected)
-    if proof.error:
-        return GenerationCheck(GENERATION_UNKNOWN, current, None, proof.source_lsn)
-    if proof.identity is None:
-        return GenerationCheck(GENERATION_ABSENT, current, None, proof.source_lsn)
-    current_identity = proof.identity
-    if expected_identity is None:
-        return GenerationCheck(
-            GENERATION_AMBIGUOUS, current, current_identity, proof.source_lsn
-        )
-
-    if minimum_lsn is not None:
-        if proof.source_lsn is None and not proof.legacy:
-            return GenerationCheck(
-                GENERATION_BOUNDARY_UNPROVEN,
-                current,
-                current_identity,
-                proof.source_lsn,
-            )
-        if proof.source_lsn is not None and proof.source_lsn < int(minimum_lsn):
-            return GenerationCheck(
-                GENERATION_BOUNDARY_UNPROVEN,
-                current,
-                current_identity,
-                proof.source_lsn,
-            )
-
-    same_oid = expected_identity.oid == current_identity.oid
-    same_filenode = expected_identity.relfilenode == current_identity.relfilenode
-    same_type = expected_identity.reltype_oid == current_identity.reltype_oid
-    if same_oid and same_filenode and same_type:
-        if (
-            not proof.legacy
-            and (not expected_identity.complete or not current_identity.complete)
-        ):
-            return GenerationCheck(
-                GENERATION_AMBIGUOUS, current, current_identity, proof.source_lsn
-            )
-        return GenerationCheck(
-            GENERATION_CURRENT, current, current_identity, proof.source_lsn
-        )
-    if same_oid and same_filenode and not same_type:
-        # A nonzero relfilenode is already a complete physical-generation proof, so a
-        # missing row-type value on one side is legacy-compatible. With relfilenode=0,
-        # however, a changed or missing row type is genuinely ambiguous/newer.
-        if expected_identity.relfilenode not in (None, 0) and (
-            expected_identity.reltype_oid is None or current_identity.reltype_oid is None
-        ):
-            return GenerationCheck(
-                GENERATION_CURRENT, current, current_identity, proof.source_lsn
-            )
-        state = (
-            GENERATION_NEWER
-            if expected_identity.complete and current_identity.complete
-            else GENERATION_AMBIGUOUS
-        )
-        return GenerationCheck(state, current, current_identity, proof.source_lsn)
-    if same_oid and expected_identity.relfilenode != current_identity.relfilenode:
-        # A complete token versus a legacy token is not an equality proof. Two
-        # complete tokens with different relfilenodes are a newer generation.
-        state = (
-            GENERATION_AMBIGUOUS
-            if not expected_identity.complete or not current_identity.complete
-            else GENERATION_NEWER
-        )
-        return GenerationCheck(state, current, current_identity, proof.source_lsn)
-    if not same_oid:
-        return GenerationCheck(GENERATION_NEWER, current, current_identity, proof.source_lsn)
-
-    if not expected_identity.complete and not current_identity.complete and not proof.legacy:
-        return GenerationCheck(
-            GENERATION_AMBIGUOUS, current, current_identity, proof.source_lsn
-        )
-
-    return GenerationCheck(GENERATION_CURRENT, current, current_identity, proof.source_lsn)
-
-
 def identities_equal(left, right) -> bool:
-    return identity_for(left) == identity_for(right)
+    """Compare complete or legacy-compatible tokens without source I/O."""
+    left_identity = coerce_identity(left)
+    right_identity = coerce_identity(right)
+    return left_identity is not None and left_identity == right_identity
+
+
+def lifecycle_identities_equal(left, right) -> bool:
+    """Compare present relations without mistaking TRUNCATE for DROP/CREATE.
+
+    PostgreSQL rewrites ``relfilenode`` for an ordinary TRUNCATE while the relation
+    and its row type remain the same.  A real catalog observation includes the row
+    type OID, so that complete type identity is the lifecycle discriminator for a
+    present relation.  Legacy/test-shaped rows without a type token fail closed to
+    the full physical-token comparison, preserving the same-OID guard for incomplete
+    historical state.
+
+    The durable token still stores all three fields.  This helper only defines the
+    present-relation comparison used by the asynchronous watcher; it is not proof
+    that a row from one generation belongs to another.
+    """
+    left_identity = coerce_identity(left)
+    right_identity = coerce_identity(right)
+    if left_identity is None or right_identity is None:
+        return False
+    if left_identity.oid != right_identity.oid:
+        return False
+    if (
+        left_identity.reltype_oid is not None
+        and right_identity.reltype_oid is not None
+    ):
+        return left_identity.reltype_oid == right_identity.reltype_oid
+    return left_identity == right_identity
 
 
 def has_newer_recreate(changes, current) -> bool:
-    return any(
-        check(
-            getattr(change, "new_identity", None) or change.new_oid,
-            current,
-        ).state
-        == GENERATION_NEWER
-        for change in changes
-    )
+    """Return true when a queued recreate is older than the observed token."""
+    current_identity = coerce_identity(current)
+    if current_identity is None:
+        return False
+    for change in changes:
+        expected = coerce_identity(
+            getattr(change, "new_identity", None) or change.new_oid
+        )
+        if expected is not None and expected != current_identity:
+            return True
+    return False
 
 
 def pending_for(changes, known, qualified: str, previous):
     """Return live recreate/drop work and the relation whose image is retained."""
     live = [change for change in changes if change.state in LIVE_CHANGE_STATES]
     recreates = [
-        change for change in live
+        change
+        for change in live
         if change.qualified == qualified and change.kind == CHANGE_RECREATED
     ]
     drop = next(
         (
-            change for change in live
+            change
+            for change in live
             if change.qualified == qualified and change.kind == CHANGE_DROPPED
         ),
         None,

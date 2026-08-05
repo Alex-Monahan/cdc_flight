@@ -55,12 +55,24 @@ class SourceConfig:
         )
     )
     schema: str = field(default_factory=lambda: _env("CDC_SCHEMA", "app"))
+    #: Optional write route for catalog admission and transactional markers when
+    #: ``dsn`` points at a hot standby.  An unset value deliberately falls back to
+    #: the ordinary source DSN, so existing primary-only deployments keep one
+    #: configuration surface.
+    primary_dsn_override: str | None = field(
+        default_factory=lambda: os.environ.get("CDC_PRIMARY_DSN"), repr=False
+    )
 
     @property
     def dsn(self) -> str:
         return (
             f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.dbname}"
         )
+
+    @property
+    def primary_dsn(self) -> str:
+        """DSN used for source writes; defaults to the source/read endpoint."""
+        return self.primary_dsn_override or self.dsn
 
     @property
     def tables(self) -> list[str]:
@@ -230,7 +242,7 @@ def applier_settings() -> dict:
         #: group, exactly as Postgres emptied the source, and records a marker in
         #: `_cdc_flight.table_events`. `log` records the marker and keeps the rows
         #: (the rubric's "tombstone/soft delete" behaviour, =3). `ignore` is a
-        #: destination no-op; the raw event remains decoded for generation proofing.
+        #: destination no-op; the raw event remains decoded for truncate semantics.
         "truncate_mode": _env("CDC_TRUNCATE_MODE", TRUNCATE_REPLICATE).strip().lower(),
         #: rubric 1.5. `replicate` drops the destination table when the source table
         #: is gone; `log` records the marker only; `ignore` disables detection.
@@ -244,9 +256,6 @@ def applier_settings() -> dict:
         #: refused, never half of it.
         "drop_max_per_group": int(_env("CDC_DROP_MAX_PER_POLL", "1")),
         "drop_allow_mass": _flag("CDC_DROP_ALLOW_MASS", False),
-        #: Disable only the plain-drop DDL revalidation. Replacement generations still
-        #: require the final proof because bypassing that fence can merge lifecycles.
-        "drop_revalidate": _flag("CDC_DROP_REVALIDATE", True),
         #: rubric 4.7. An undecidable fold used to be a PERMANENT failure: the group
         #: rolls back (correctly), the transaction replays, the same ambiguity is hit,
         #: for ever. That is a manual-intervention case, which 4.7 scores. Default ON:

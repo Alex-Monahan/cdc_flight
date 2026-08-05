@@ -22,13 +22,13 @@ shape as `source_health.py` - and answers four questions per replicated table:
 The watcher owns safe discovery admission (`ALTER PUBLICATION ... ADD TABLE` for a
 table-scoped publication); `cdc_flight.catalog_apply` still owns destructive policy,
 schema DDL, the circuit breaker and all destination actions.  The observation and any
-destructive action remain separated in time by the fence, which is where a stale fact
-could become a wrong drop.
+destructive action remain separated in time by the WAL fence, which is where a stale
+fact could become a wrong drop.
 
 **The fence.** A detected drop must not be applied before the destination has
 consumed every event that happened *before* it. The drop is discovered after the
-fact, so the poll records `pg_current_wal_lsn()` as `detected_lsn` and the applier
-holds the action until its durable resume point reaches that LSN. On a quiet source
+fact, so the poll records a standby-safe source WAL position as `detected_lsn` and
+the applier holds the action until its durable resume point reaches that LSN. On a quiet source
 nothing would ever advance it, so a **transactional** logical-decoding message is
 written on the source (`cdc_flight.source_marker` explains why transactional is
 load-bearing and why that component is shared with D9's heartbeat).
@@ -62,7 +62,6 @@ from . import (
 from . import (
     catalog_change_queue,
     catalog_generation,
-    catalog_generation_source,
     catalog_poll,
     catalog_reporting,
     catalog_state,
@@ -131,6 +130,7 @@ class CatalogWatcher:
         self,
         *,
         dsn: str,
+        primary_dsn: str | None = None,
         publication: str,
         schema: str,
         include: set[str],
@@ -150,6 +150,10 @@ class CatalogWatcher:
         marker_max_writes: int | None = 60,
     ):
         self.dsn = dsn
+        # Catalog queries may use a hot standby, but publication admission and
+        # transactional logical-decoding markers are writes and must use the
+        # configured primary.  The default preserves the primary-only topology.
+        self.primary_dsn = primary_dsn or dsn
         self.publication = publication
         self.schema = schema
         #: qualified names the configuration says we replicate (`table.include.list`)
@@ -335,11 +339,6 @@ class CatalogWatcher:
 
     def _ensure_published(self, conn, observed, changes: list[CatalogChange]) -> None:
         admission_mod.ensure_published(self, conn, observed, changes)
-
-    def relation_oids(self, names: set[tuple[str, str]]) -> dict[str, object]:
-        return catalog_generation_source.relation_oids(self, names)
-    def generation_proof_lease(self, names):
-        return catalog_generation_source.acquire(self, names)
 
     def captured_relations(self) -> tuple[SourceRelation, ...]:
         """Published relations from the latest successful catalog observation."""
@@ -555,7 +554,7 @@ class CatalogWatcher:
                     if catalog_generation.has_newer_recreate(pending_recreates, current):
                         superseded.extend(self._supersede(name, CHANGE_RECREATED))
                     superseded.extend(self._supersede(name, CHANGE_DROPPED))
-                    if previous is not None and catalog_generation.identities_equal(
+                    if previous is not None and catalog_generation.lifecycle_identities_equal(
                         current, previous
                     ):
                         column_diff = diff_columns(previous.columns, current.columns)
@@ -612,8 +611,8 @@ class CatalogWatcher:
                         # It is queued as `recreated` because that is exactly what it
                         # may be, and because `recreated` is the existing machinery for
                         # "the destination table holds a different relation's rows":
-                        # confirmed over `confirm_polls`, fenced on the WAL, revalidated
-                        # immediately before the DDL, and it leaves the table
+                        # confirmed over `confirm_polls`, fenced on the WAL, and it
+                        # leaves the table
                         # `awaiting_snapshot` so the rebuild is owed durably by
                         # `TABLE_LIFECYCLE` rather than by this run's memory.
                         change = self._confirm(
@@ -661,7 +660,7 @@ class CatalogWatcher:
                     if change is not None:
                         added.append(change)
                     continue
-                if not catalog_generation.identities_equal(current, previous):
+                if not catalog_generation.lifecycle_identities_equal(current, previous):
                     if queued:
                         continue
                     change = self._confirm(

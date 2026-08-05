@@ -21,11 +21,11 @@ from .states import IllegalTransition, UnknownState
 log = logging.getLogger("cdc_flight.catalog_poll")
 
 
-def connect(watcher, *, autocommit: bool = True):
+def connect(watcher, *, autocommit: bool = True, dsn: str | None = None):
     import psycopg
 
     return psycopg.connect(
-        watcher.dsn,
+        dsn or watcher.dsn,
         autocommit=autocommit,
         connect_timeout=watcher.connect_timeout,
         options=f"-c statement_timeout={watcher.query_timeout_ms}",
@@ -149,13 +149,17 @@ def poll(watcher):
                 f"{row[0]}.{row[1]}" for row in partition_rows
             }
         added = watcher._compare(observed, lsn)
-        watcher._ensure_published(conn, observed, added)
+    # Keep source writes off the catalog read connection.  In replica mode this
+    # route is the primary; in a primary-only deployment it is the same DSN as the
+    # read side.  The connection is opened only after the read transaction is closed.
+    with connect(watcher, dsn=watcher.primary_dsn) as write_conn:
+        watcher._ensure_published(write_conn, observed, added)
         with watcher._lock:
             watcher.successful_polls += 1
         unfenced = [change for change in watcher.pending() if change.kind in FENCED]
         if unfenced:
             watcher._emit_marker(
-                conn,
+                write_conn,
                 [change for change in added if change.kind in FENCED] or unfenced,
             )
     if watcher.marker.last_error is None and not watcher._admission_errors:

@@ -180,7 +180,6 @@ class Applier:
             registry_of=lambda: self.registry,
             max_destructive_per_group=config.drop_max_per_group,
             allow_mass_drop=config.drop_allow_mass,
-            revalidate=config.drop_revalidate,
         )
         self._schema_epochs = schema_epoch.SchemaEpochCoordinator(
             spill=self.spill,
@@ -568,7 +567,6 @@ class Applier:
         # the wrapper inferred from the SQL it happened to see (rubric 1.7).
         fault_group = self.data_commit_groups + 1
         arm_group(fault_group)
-        generation_lease = None
         if not self.group.txn_open:
             self.con.execute("BEGIN TRANSACTION")
             self.group.txn_open = True
@@ -581,9 +579,6 @@ class Applier:
                 snapshot_epoch=self.snapshots.epoch,
             )
             catalog_plan = self._plan_catalog_changes(new_point.last_lsn)
-            catalog_plan, generation_lease = catalog_commit.refresh_generation_boundary(self, new_point.last_lsn, catalog_plan)
-            for unit in group:
-                unit_admission.refuse_log_recreate_tail(self, unit, catalog_plan=catalog_plan, generation_proof=self.group.source_generation_final)
             # NOT `or spill.rows > 0`: staged rows belonging only to *fenced*
             # units are about to be discarded, and counting them made a group with no
             # applicable content a "data group", which shifts every `<nth>`-indexed
@@ -723,11 +718,6 @@ class Applier:
         except BaseException:
             self._rollback_quietly()
             raise
-        finally:
-            # Keep source-lock cleanup outside the MD commit->ack critical path.
-            if generation_lease is not None:
-                generation_lease.release()
-
         if fault_enabled:
             maybe_crash("post_ack", fault_group)
         # next poll() -> performCommit() -> flushLsn(new)  ── nothing between ──

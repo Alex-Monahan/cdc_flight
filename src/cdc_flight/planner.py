@@ -250,10 +250,11 @@ class GroupPlan:
         """
         # Keep the pgoutput TRUNCATE in the assembled transaction even for the
         # compatibility opt-out.  The applier deliberately performs no destination
-        # mutation or audit write in this mode, but the streamed fact is still the
-        # ordered proof that a same-OID relfilenode change was a truncate, not a
-        # replacement.  Dropping the event in Debezium (`skipped.operations=t`) made
-        # those two source histories indistinguishable to the catalog fence.
+        # mutation or audit write in this mode.  The event is useful policy/audit
+        # input, but it is deliberately not generation authority: a later catalog
+        # token change still goes through the durable watcher quarantine path.
+        # Dropping the event in Debezium (`skipped.operations=t`) would erase the
+        # source fact from the destination log without making it a lifecycle proof.
         if self.truncate_mode == TRUNCATE_IGNORE:
             return
         replicate = self.truncate_mode == TRUNCATE_REPLICATE
