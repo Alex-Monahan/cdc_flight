@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from . import destination
+from . import destination, unit_admission
 from .catalog import CHANGE_SCHEMA
 from .catalog_apply import CatalogPlan
 
@@ -24,7 +24,11 @@ def plan_catalog_changes(applier, durable_lsn: int):
     coordinator = applier.catalog_coordinator
     if not coordinator.enabled:
         return None
-    plan = coordinator.plan(durable_lsn)
+    unit_admission.prepare_source_identity_cache(applier)
+    plan = coordinator.plan(
+        durable_lsn,
+        source_oids=applier.group.source_identity_oids,
+    )
     if not plan.actions and not plan.relations and not plan.alerts:
         return None
     applier.group.catalog_plan = plan

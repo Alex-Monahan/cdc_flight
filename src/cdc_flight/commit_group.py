@@ -81,6 +81,11 @@ class OpenGroup:
     pending_alerts: list[dict] = field(default_factory=list)
     #: source tables this group actually wrote, handed to the watcher after COMMIT
     source_tables: set[str] = field(default_factory=set)
+    #: One fail-closed source-generation read shared by admission and catalog planning
+    #: for this group. It is deliberately group-owned so it cannot leak across a
+    #: COMMIT/ROLLBACK boundary or turn a later group into a stale identity decision.
+    source_identity_oids: dict[str, object] | None = None
+    source_identity_error: str | None = None
 
     def __bool__(self) -> bool:
         return bool(self.units)

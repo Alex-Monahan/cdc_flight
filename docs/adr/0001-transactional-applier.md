@@ -4478,3 +4478,28 @@ the already-declared `pending -> due -> applied` catalog-change edges and retain
 dirty relation for the normal post-engine `source_relations` flush. That prevents the
 resumed stream from emitting a second false `new` marker and adds no new
 consistency-affecting state machine.
+
+### A72 — rev 23: recreate generations are monotonic at every boundary
+
+Round 8 found two coupled races in the catalog watcher: a queued A->B recreate could
+be refused after B had already become C and then suppress C discovery, and a stale
+recreate could quarantine a retained image after the source had dropped B without a
+replacement. The policy is now one generation decision shared by observation, planning
+and admission:
+
+* every queued recreate is re-read against the current source OID in both `DROP_LOG`
+  and `DROP_REPLICATE`; a present different OID supersedes the old obligation and the
+  only action is a quarantine for the newest OID;
+* an absent source supersedes the recreate with a genuine drop, so `DROP_LOG` retains
+  and audits the old image while `DROP_REPLICATE` applies its destructive drop policy;
+* the replacement identity fence runs before any drop-mode branch, and its one source
+  identity snapshot is cached for the whole commit group and reused by catalog planning;
+* the data, quarantine/lifecycle state, source identity and resume point remain in the
+  one destination transaction, with settlement only after COMMIT.
+
+The generation token is the source relation OID. PostgreSQL OIDs are four-byte values
+and may wrap or be reused, so a same-name drop/recreate that receives the same OID is
+outside this identity model's supported lifetime. A stronger source generation token
+would be required to close that boundary; it is documented at the identity fence in
+`src/cdc_flight/unit_admission.py` and tracked as R8-M3 in
+`reviews/p2_review_r8.md`.

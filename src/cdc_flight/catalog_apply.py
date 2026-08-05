@@ -39,7 +39,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
-from . import destination, naming
+from . import catalog_generation, destination, naming
 from .catalog import (
     CHANGE_DROPPED,
     CHANGE_NEW,
@@ -64,20 +64,17 @@ log = logging.getLogger("cdc_flight.catalog_apply")
 AWAITING_SNAPSHOT = destination.AWAITING_SNAPSHOT
 
 
-class _Sentinel:
-    __slots__ = ("name",)
-
-    def __init__(self, name: str) -> None:
-        self.name = name
+#: the source could not be re-read, which is NOT evidence that anything is gone
+UNKNOWN = catalog_generation.UNKNOWN
+#: revalidation is switched off (`CDC_DROP_REVALIDATE=0`)
+class _Skipped:
+    __slots__ = ()
 
     def __repr__(self) -> str:  # pragma: no cover - diagnostics
-        return self.name
+        return "SKIPPED"
 
 
-#: the source could not be re-read, which is NOT evidence that anything is gone
-UNKNOWN = _Sentinel("UNKNOWN")
-#: revalidation is switched off (`CDC_DROP_REVALIDATE=0`)
-SKIPPED = _Sentinel("SKIPPED")
+SKIPPED = _Skipped()
 
 
 def _stale(change: CatalogChange, oid) -> str | None:
@@ -168,7 +165,9 @@ class CatalogCoordinator:
     # ------------------------------------------------------------------ #
     # planning
     # ------------------------------------------------------------------ #
-    def plan(self, durable_lsn: int) -> CatalogPlan:
+    def plan(
+        self, durable_lsn: int, *, source_oids: dict[str, object] | None = None
+    ) -> CatalogPlan:
         if not self.enabled:
             return CatalogPlan()
         due = self.catalog.due(durable_lsn)
@@ -258,8 +257,59 @@ class CatalogCoordinator:
                 len(names), ", ".join(names),
             )
 
-        oids = self._source_oids([c for c in destructive_changes if id(c) not in blocked])
+        revalidation_changes = [
+            c
+            for c in due
+            if c.kind == CHANGE_RECREATED
+            or (c.kind == CHANGE_DROPPED and self.drop_mode == DROP_REPLICATE)
+        ]
+        oids = self._source_oids(
+            [c for c in revalidation_changes if id(c) not in blocked],
+            source_oids=source_oids,
+        )
         for change in due:
+            if change.kind == CHANGE_RECREATED:
+                generation = catalog_generation.check(
+                    change.new_oid, oids.get(change.qualified, UNKNOWN)
+                )
+                if generation.state == catalog_generation.GENERATION_NEWER:
+                    # The source advanced again while the queued action was waiting.
+                    # Replace the obligation and apply only the newest generation.
+                    replacement = catalog_generation.supersede_recreated(
+                        self.catalog,
+                        change, int(generation.current_oid)
+                    )
+                    if replacement is None:
+                        # No full relation observation exists to construct a safe
+                        # newest-generation action. Keep the stale obligation live and
+                        # fail closed until the watcher supplies that observation.
+                        # (The normal watcher path never reaches this legacy-shape cell.)
+                        reason = (
+                            "the newer source generation was observed without a full "
+                            "relation shape; waiting for catalog discovery"
+                        )
+                        change.to(CHANGE_REFUSED)  # rubric 1.9 (SM-D)
+                        refused.append((change, reason))
+                        log.warning("not applying %s: %s", change.qualified, reason)
+                        continue
+                    change = replacement
+                elif generation.state == catalog_generation.GENERATION_ABSENT:
+                    # A->B was never applied and B is now gone. It is a genuine final
+                    # drop, not a replacement quarantine; the configured drop mode now
+                    # owns the outcome (DROP_LOG retains A, DROP_REPLICATE removes it).
+                    change = catalog_generation.reclassify_recreated_as_drop(
+                        self.catalog, change
+                    )
+                elif generation.state == catalog_generation.GENERATION_UNKNOWN:
+                    reason = _stale(change, generation.current_oid)
+                    change.to(CHANGE_REFUSED)  # rubric 1.9 (SM-D)
+                    refused.append((change, reason or "source generation is unknown"))
+                    log.warning(
+                        "not applying %s: %s (the change stays pending)",
+                        change.qualified,
+                        reason,
+                    )
+                    continue
             destructive = (
                 change.kind in DESTRUCTIVE and self.drop_mode == DROP_REPLICATE
             )
@@ -355,7 +405,12 @@ class CatalogCoordinator:
             for change in self.catalog.pending()
             if change.kind in FENCED and id(change) not in applied
         }
-        relations = list(self.catalog.dirty(exclude=remaining))
+        dropped = {
+            action.change.qualified
+            for action in actions
+            if action.change.kind == CHANGE_DROPPED and action.destructive
+        }
+        relations = list(self.catalog.dirty(exclude=remaining | dropped))
         known_relations = {relation.qualified for relation in relations}
         # A schema action carries the post-DDL relation explicitly. Persisting it in
         # this same transaction is what makes a restart see the new column baseline
@@ -384,7 +439,12 @@ class CatalogCoordinator:
             alerts=alerts,
         )
 
-    def _source_oids(self, changes: list[CatalogChange]) -> dict[str, object]:
+    def _source_oids(
+        self,
+        changes: list[CatalogChange],
+        *,
+        source_oids: dict[str, object] | None = None,
+    ) -> dict[str, object]:
         """The relations' oids *right now*, read on the watcher's own connection.
 
         `UNKNOWN` for every relation when the source cannot be asked, which
@@ -394,8 +454,25 @@ class CatalogCoordinator:
         if not changes:
             return {}
         names = {(c.schema, c.table) for c in changes}
+        if source_oids is not None:
+            return {
+                f"{schema}.{table}": source_oids.get(
+                    f"{schema}.{table}", UNKNOWN
+                )
+                for schema, table in names
+            }
         if not self.revalidate:
-            return dict.fromkeys((f"{s}.{t}" for s, t in names), SKIPPED)
+            # Recreates are never allowed to opt out of the generation check.  The
+            # switch remains a drop-only compatibility escape hatch.
+            recreate_names = {c.qualified for c in changes if c.kind == CHANGE_RECREATED}
+            return {
+                f"{schema}.{table}": (
+                    SKIPPED
+                    if f"{schema}.{table}" not in recreate_names
+                    else UNKNOWN
+                )
+                for schema, table in names
+            }
         try:
             return dict(self.catalog.relation_oids(names))
         except Exception as exc:  # pragma: no cover - fail closed on any source error

@@ -73,6 +73,11 @@ class CatalogChange:
     detected_at: float = field(default_factory=time.monotonic)
     old_oid: int | None = None
     new_oid: int | None = None
+    #: The relation whose destination image this action still represents.  A queued
+    #: A->B recreate may be superseded by B->C before its destination action commits;
+    #: carrying A here lets a later final drop retain the correct log image rather than
+    #: accidentally persisting B as history.
+    old_relation: SourceRelation | None = None
     new_relation: SourceRelation | None = None
     column_changes: tuple[ColumnChange, ...] = ()
     deferrals: int = 0

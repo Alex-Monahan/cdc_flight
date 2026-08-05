@@ -57,8 +57,8 @@ import time
 from dataclasses import replace
 
 from . import catalog_admission as admission_mod
+from . import catalog_generation, catalog_poll, catalog_reporting, catalog_state, state_interactions
 from . import catalog_observation as observation_mod
-from . import catalog_poll, catalog_reporting, catalog_state, state_interactions
 from . import source_marker as marker_mod
 from .machines import (
     ADMISSION_ADMITTED,
@@ -544,6 +544,9 @@ class CatalogWatcher:
                     # Publication-root snapshots may report child partitions, but a
                     # child is not an independent discovery target.
                     continue
+                pending_recreates, retained_relation = catalog_generation.pending_for(
+                    self, name, previous
+                )
                 if current is not None:
                     if previous is not None:
                         # Preserve the durable admission state while projecting this
@@ -553,10 +556,9 @@ class CatalogWatcher:
                             current, admission_state=previous.admission_state
                         )
                         observed[name] = current
-                    # Guard 2: the relation is there, so a pending `dropped` for it
-                    # describes a world that no longer exists. A pending `recreated`
-                    # is NOT superseded by the relation being present - that is what a
-                    # recreate looks like.
+                    # A present relation cancels a drop; a newer OID supersedes a recreate.
+                    if catalog_generation.has_newer_recreate(pending_recreates, current.oid):
+                        superseded.extend(self._supersede(name, CHANGE_RECREATED))
                     superseded.extend(self._supersede(name, CHANGE_DROPPED))
                     if previous is not None and current.oid == previous.oid:
                         column_diff = diff_columns(previous.columns, current.columns)
@@ -570,8 +572,6 @@ class CatalogWatcher:
                             stale.to(CHANGE_SUPERSEDED)
                             self.superseded += 1
                 else:
-                    # And symmetrically: a relation that has since gone away makes a
-                    # pending `recreated` stale. Its own drop is confirmed below.
                     superseded.extend(self._supersede(name, CHANGE_RECREATED))
                 # AFTER supersession: a change this poll has just cancelled must not
                 # then suppress the change this poll should queue instead.
@@ -654,9 +654,12 @@ class CatalogWatcher:
                         # be refused or superseded, and forgetting them made a
                         # cancelled drop indistinguishable from a table we never had.
                         continue
+                    drop_relation = retained_relation or previous
+                    if drop_relation is not None and drop_relation is not previous:
+                        self.known[name] = retained_relation
+                        self._dirty[name] = retained_relation
                     change = self._confirm(
-                        name,
-                        self._change(CHANGE_DROPPED, previous, lsn, old_oid=previous.oid),
+                        name, catalog_generation.dropped_change(self, drop_relation, lsn)
                     )
                     if change is not None:
                         added.append(change)
@@ -666,9 +669,8 @@ class CatalogWatcher:
                         continue
                     change = self._confirm(
                         name,
-                        self._change(
-                            CHANGE_RECREATED, current, lsn,
-                            old_oid=previous.oid, new_oid=current.oid,
+                        catalog_generation.recreated_change(
+                            self, current, retained_relation or previous, lsn
                         ),
                     )
                     if change is not None:

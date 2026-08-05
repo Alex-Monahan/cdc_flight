@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import time
 
-from . import table_lifecycle
+from . import catalog_generation, table_lifecycle
 from .assembler import UNIT_SNAPSHOT_CHUNK, UNIT_TXN
 from .catalog_state import CHANGE_RECREATED
 from .config import DROP_LOG
@@ -20,7 +20,7 @@ log = logging.getLogger("cdc_flight.unit_admission")
 def add_unit(applier, unit) -> None:
     if discard_resnapshot_unit(applier, unit):
         return
-    refuse_log_recreate_tail(applier, unit)
+    reject_log_owed_tail(applier, unit)
     if applier.catalog is not None:
         try:
             applier.catalog.observe_unit(unit)
@@ -62,6 +62,27 @@ def add_unit(applier, unit) -> None:
     append_unit(applier, unit, is_snapshot=is_snapshot)
 
 
+def reject_log_owed_tail(applier, unit) -> None:
+    """Reject a log-mode tail already known to require a replacement snapshot.
+
+    This pre-admission ownership check is deliberately separate from the source
+    identity fence below. It preserves the existing DROP_LOG fail-fast behavior for
+    an already durable ``awaiting_snapshot`` row without reading source identity
+    early; the complete generation check runs once, at commit-group planning time,
+    for every drop mode.
+    """
+    if applier.catalog is None or unit.kind != UNIT_TXN:
+        return
+    owing = set(table_lifecycle.owing_work(applier.con, applier.pipeline))
+    blocked = sorted(unit.tables_touched() & owing)
+    if blocked and applier.cfg.drop_mode == DROP_LOG:
+        raise SnapshotObservationError(
+            "streaming admission refused for relation(s) awaiting_snapshot: "
+            + ", ".join(blocked)
+            + "; a replacement snapshot must complete before the new lifecycle streams"
+        )
+
+
 def refuse_log_recreate_tail(applier, unit, *, catalog_plan=None) -> None:
     """Refuse or fence a replacement tail before it can reach the row planner.
 
@@ -73,8 +94,15 @@ def refuse_log_recreate_tail(applier, unit, *, catalog_plan=None) -> None:
     the new lifecycle sees the new OID, even if the watcher has not yet queued a
     ``CHANGE_RECREATED`` observation.
 
-    ``CatalogCoordinator`` also records a log-mode recreate after the fenced group has
-    applied. Once that plan is due, every touched unit is fenced regardless of LSN.
+    The fence's identity signal is PostgreSQL's four-byte relation OID.  OID
+    wraparound/reuse can make a drop-and-recreate reuse the same OID, which this model
+    cannot distinguish from the original lifecycle; that is an explicit supported-
+    lifetime limitation, not a claim of database-wide uniqueness.  See ADR 0001 A72
+    and ``reviews/p2_review_r8.md`` R8-M3 for the contract boundary.
+
+    ``CatalogCoordinator`` also records a recreate after the fenced group has applied.
+    Once that plan is due, every touched unit is fenced regardless of LSN in either drop
+    mode.
     Reading the durable lifecycle here makes the post-detection boundary survive a
     restart; the whole unit is refused before it enters a commit group, so no source
     transaction is partially admitted.
@@ -85,13 +113,14 @@ def refuse_log_recreate_tail(applier, unit, *, catalog_plan=None) -> None:
     rolling back the plan), so the catalog obligation and the source resume point
     commit atomically; the next invocation's re-snapshot owns the rows.
     """
-    if applier.cfg.drop_mode != DROP_LOG or unit.kind != UNIT_TXN:
+    if applier.catalog is None or unit.kind != UNIT_TXN:
         return
     if unit.fenced:
         return
+    prepare_source_identity_cache(applier)
     owing = set(table_lifecycle.owing_work(applier.con, applier.pipeline))
     blocked = sorted(unit.tables_touched() & owing)
-    if blocked:
+    if blocked and applier.cfg.drop_mode == DROP_LOG:
         raise SnapshotObservationError(
             "streaming admission refused for relation(s) awaiting_snapshot: "
             + ", ".join(blocked)
@@ -107,6 +136,10 @@ def refuse_log_recreate_tail(applier, unit, *, catalog_plan=None) -> None:
         )
     )
     fenced = sorted(set(identity_blocked) | set(planned))
+    if blocked:
+        # Replicate mode must not create an untrusted partial table after quarantine;
+        # its final image is owned by the automatic snapshot just like log mode's.
+        fenced = sorted(set(fenced) | set(blocked))
     if not fenced:
         return
     unit.fenced = True
@@ -131,38 +164,77 @@ def _replacement_identity_mismatches(applier, names: set[str]) -> list[str]:
     """
     if not names or applier.catalog is None:
         return []
-    relation_oids = getattr(applier.catalog, "relation_oids", None)
-    if relation_oids is None:
-        return []
-
-    durable: dict[str, int] = {}
-    for schema, table, oid in applier.con.execute(
-        f"SELECT source_schema, source_table, relation_oid "
-        f"FROM {CONTROL_SCHEMA}.source_relations WHERE pipeline = ?",
-        [applier.pipeline],
-    ).fetchall():
-        qualified = f"{schema}.{table}"
-        if qualified in names:
-            durable[qualified] = int(oid)
+    prepare_source_identity_cache(applier)
+    durable = {
+        qualified: oid
+        for qualified, oid in _durable_source_oids(applier).items()
+        if qualified in names
+    }
     if not durable:
         return []
-
-    pairs = {
-        tuple(qualified.split(".", 1))
-        for qualified in durable
-    }
-    try:
-        current = relation_oids(pairs)
-    except Exception as exc:
+    if applier.group.source_identity_error is not None:
         raise SnapshotObservationError(
             "cannot establish source relation identity before streaming admission; "
             "the unit is not safe to append to a retained image"
-        ) from exc
+        )
+    current = applier.group.source_identity_oids or {}
     return sorted(
         qualified
         for qualified, old_oid in durable.items()
-        if current.get(qualified) is not None and int(current[qualified]) != old_oid
+        if current.get(qualified) is not None
+        and current.get(qualified) is not catalog_generation.UNKNOWN
+        and int(current[qualified]) != old_oid
     )
+
+
+def _durable_source_oids(applier) -> dict[str, int]:
+    return {
+        f"{schema}.{table}": int(oid)
+        for schema, table, oid in applier.con.execute(
+            f"SELECT source_schema, source_table, relation_oid "
+            f"FROM {CONTROL_SCHEMA}.source_relations WHERE pipeline = ?",
+            [applier.pipeline],
+        ).fetchall()
+    }
+
+
+def prepare_source_identity_cache(applier) -> None:
+    """Read source identities once for this commit group, fail closed on errors.
+
+    Admission and catalog planning deliberately share this snapshot.  It keeps the
+    synchronous source dependency outside the MotherDuck transaction where possible,
+    avoids one source connection/query per unit, and still makes an unreadable source
+    an explicit ``SnapshotObservationError`` for a touched durable relation.
+    """
+    if applier.catalog is None or applier.group.source_identity_oids is not None:
+        return
+    durable = _durable_source_oids(applier)
+    names = set(durable)
+    names.update(
+        change.qualified
+        for change in applier.catalog.pending()
+        if change.kind == CHANGE_RECREATED
+    )
+    if not names:
+        # Leave the cache uninitialised. A first group can materialise its first
+        # source-relations rows; a later catalog plan in the same lifecycle must still
+        # be able to discover a newly queued recreate and read its identity.
+        return
+    relation_oids = getattr(applier.catalog, "relation_oids", None)
+    if relation_oids is None:
+        applier.group.source_identity_oids = dict.fromkeys(names, catalog_generation.UNKNOWN)
+        applier.group.source_identity_error = "catalog watcher has no identity reader"
+        return
+    pairs = {tuple(qualified.split(".", 1)) for qualified in names}
+    try:
+        current = relation_oids(pairs)
+    except Exception as exc:
+        applier.group.source_identity_oids = dict.fromkeys(
+            names, catalog_generation.UNKNOWN
+        )
+        applier.group.source_identity_error = str(exc)
+        return
+    applier.group.source_identity_oids = dict(current)
 
 
 def append_unit(applier, unit, *, is_snapshot: bool) -> None:
