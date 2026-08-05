@@ -595,6 +595,10 @@ class Applier:
             # pre-fence unit and the first post-fence unit, while retaining one
             # destination transaction and one resume-point commit.
             catalog_plan = self._plan_catalog_changes(new_point.last_lsn)
+            for unit in group:
+                unit_admission.refuse_log_recreate_tail(
+                    self, unit, catalog_plan=catalog_plan
+                )
             catalog_stats = {"tables": set()}
             stats = self._apply_units_by_schema_epoch(
                 group,

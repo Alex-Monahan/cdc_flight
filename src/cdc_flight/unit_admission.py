@@ -7,6 +7,7 @@ import time
 
 from . import table_lifecycle
 from .assembler import UNIT_SNAPSHOT_CHUNK, UNIT_TXN
+from .catalog_state import CHANGE_RECREATED
 from .config import DROP_LOG
 from .envelope import KIND_SNAPSHOT_BOUNDARY
 from .errors import SchemaShapeUnexplained
@@ -60,8 +61,8 @@ def add_unit(applier, unit) -> None:
     append_unit(applier, unit, is_snapshot=is_snapshot)
 
 
-def refuse_log_recreate_tail(applier, unit) -> None:
-    """Do not stream into a retained image that owes a replacement snapshot.
+def refuse_log_recreate_tail(applier, unit, *, catalog_plan=None) -> None:
+    """Refuse or fence a replacement tail before it can reach the row planner.
 
     ``CatalogCoordinator`` records a log-mode recreate after the fenced group has
     applied. A later whole Postgres transaction must not be allowed to append the new
@@ -69,8 +70,16 @@ def refuse_log_recreate_tail(applier, unit) -> None:
     durable lifecycle here makes the boundary survive a restart; the whole unit is
     refused before it enters a commit group, so no source transaction is partially
     admitted.
+
+    A commit group can contain the catalog plan and the replacement tail before the
+    catalog phase writes its durable lifecycle mark. In that ordering the plan is the
+    only safe identity evidence available before DML. Such a unit is fenced (rather
+    than raising and rolling back the plan), so the catalog obligation and the source
+    resume point commit atomically; the next invocation's re-snapshot owns the rows.
     """
     if applier.cfg.drop_mode != DROP_LOG or unit.kind != UNIT_TXN:
+        return
+    if unit.fenced:
         return
     owing = set(table_lifecycle.owing_work(applier.con, applier.pipeline))
     blocked = sorted(unit.tables_touched() & owing)
@@ -80,6 +89,26 @@ def refuse_log_recreate_tail(applier, unit) -> None:
             + ", ".join(blocked)
             + "; a replacement snapshot must complete before the new lifecycle streams"
         )
+    planned = sorted(
+        action.change.qualified
+        for action in getattr(catalog_plan, "actions", ())
+        if (
+            action.change.kind == CHANGE_RECREATED
+            and action.change.qualified in unit.tables_touched()
+            and (unit.last_lsn or 0) > (action.change.detected_lsn or 0)
+        )
+    )
+    if not planned:
+        return
+    unit.fenced = True
+    applier.fenced_units += 1
+    applier.fenced_events += unit.event_count
+    log.info(
+        "fencing replacement stream unit %s for catalog plan relation(s) %s before "
+        "row apply; the catalog phase will durably queue a re-snapshot",
+        unit.txn_id,
+        ", ".join(planned),
+    )
 
 
 def append_unit(applier, unit, *, is_snapshot: bool) -> None:

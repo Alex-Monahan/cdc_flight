@@ -93,6 +93,9 @@ class CompleteUnit:
     nbytes: int = 0
     table: str | None = None
     schema: str | None = None
+    #: source-qualified relations observed by this unit, including events that were
+    #: staged to spill before the unit was closed
+    touched_tables: set[str] = field(default_factory=set)
     snapshot_last_for_table: bool = False
     snapshot_last: bool = False
     #: set by the applier when the unit is at or below the durable resume point
@@ -118,15 +121,18 @@ class CompleteUnit:
         return len(self.events) + self.spilled_events + self.discarded_events
 
     def tables_touched(self) -> set[str]:
-        return {
+        touched = set(self.touched_tables)
+        touched.update(
             f"{e.schema}.{e.table}" for e in self.events if e.schema and e.table
-        }
+        )
+        return touched
 
 
 class _OpenTxn:
     __slots__ = (
         "begin_seen", "count", "events", "last_lsn", "mem_bytes", "message_count",
-        "nbytes", "orders", "per_table", "records", "spill_unit_seq", "spilled", "txn_id",
+        "nbytes", "orders", "per_table", "records", "spill_unit_seq", "spilled",
+        "touched_tables", "txn_id",
     )
 
     def __init__(self, txn_id: str, begin_seen: bool):
@@ -145,6 +151,9 @@ class _OpenTxn:
         #: (Codex 2). `len(events)` is not a count of the transaction.
         self.count = 0
         self.per_table: dict[str, int] = {}
+        #: relation names are retained independently of the event payloads so admission
+        #: remains correct after the payload prefix is moved to `spill_events`
+        self.touched_tables: set[str] = set()
         #: every `transaction.total_order` seen, so a duplicate or a gap is loud
         self.orders: set[int] = set()
         #: counted events that belong to no captured table (logical-decoding
@@ -160,7 +169,7 @@ class _OpenTxn:
 class _OpenChunk:
     __slots__ = (
         "count", "events", "mem_bytes", "nbytes", "records", "saw_last", "schema",
-        "spill_unit_seq", "spilled", "table",
+        "spill_unit_seq", "spilled", "table", "touched_tables",
     )
 
     def __init__(self, schema: str | None, table: str | None):
@@ -173,6 +182,7 @@ class _OpenChunk:
         self.count = 0
         self.spilled = 0
         self.spill_unit_seq: int | None = None
+        self.touched_tables: set[str] = set()
         #: True once Debezium actually said `snapshot=last` for this chunk. Only
         #: then may the chunk claim the whole snapshot ended (Opus M-7).
         self.saw_last = False
@@ -393,6 +403,7 @@ class TransactionAssembler:
         table = rec.qualified_table
         if table:
             self._txn.per_table[table] = self._txn.per_table.get(table, 0) + 1
+            self._txn.touched_tables.add(table)
         if not self.discard_streaming:
             self._txn.events.append(rec)
             self._txn.mem_bytes += rec.nbytes
@@ -427,6 +438,7 @@ class TransactionAssembler:
             commit_lsn=commit_lsn,
             last_lsn=max(commit_lsn or 0, *( [0] + [e.lsn or 0 for e in txn.events])),
             nbytes=txn.nbytes,
+            touched_tables=set(txn.touched_tables),
             spilled=bool(spilled),
             spilled_events=spilled,
             spill_unit_seq=txn.spill_unit_seq,
@@ -575,6 +587,8 @@ class TransactionAssembler:
             units.extend(self._close_chunk(last_for_table=True))
         if self._chunk is None:
             self._chunk = _OpenChunk(rec.schema, rec.table)
+        if rec.qualified_table:
+            self._chunk.touched_tables.add(rec.qualified_table)
         # Assigned HERE, on arrival, so the ordinal is arrival order whether the
         # record is later spilled or kept in memory. Deriving it at apply time made
         # a spilled snapshot chunk take a *streaming* identity (Codex 1).
@@ -612,6 +626,7 @@ class TransactionAssembler:
             records=chunk.records,
             schema=chunk.schema,
             table=chunk.table,
+            touched_tables=set(chunk.touched_tables),
             last_lsn=max((e.lsn or 0 for e in chunk.events), default=0),
             nbytes=chunk.nbytes,
             snapshot_last_for_table=last_for_table,
