@@ -117,10 +117,8 @@ def test_the_snapshot_landed_the_rows_the_truncate_will_remove(truncate_scenario
 
 
 def test_a_truncate_reaches_the_applier_at_all(truncate_scenario):
-    """Debezium's default is `skipped.operations=t`: truncates are skipped, and the
-    pgoutput decoder drops the 'T' message before decoding it. The baseline's
-    `skipped` counter did not even increment. This is the assertion that the default
-    is overridden."""
+    """The pipeline pins `skipped.operations=none` so the ordered TRUNCATE reaches
+    the applier; destination policy still decides whether it mutates or logs it."""
     box = truncate_scenario["box"]
     truncates = _events(box, "truncate")
     assert {(row[1], row[2]) for row in truncates} == {
@@ -201,7 +199,7 @@ def test_the_dropped_table_leaves_no_state_behind(truncate_scenario):
 
 
 def test_the_catalog_watcher_recorded_the_relations_it_is_watching(truncate_scenario):
-    """The persisted `relation_oid` is what makes a drop (or a drop-and-recreate)
+    """The persisted generation token makes a drop (or a drop-and-recreate)
     detectable across a restart."""
     box = truncate_scenario["box"]
     rows = box.duck_query(

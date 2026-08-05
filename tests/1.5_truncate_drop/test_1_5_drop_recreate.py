@@ -6,9 +6,10 @@ properties are `test_1_5_truncate_fold.py` (in-process, exact interleavings) and
 
 Four things only a real run can show:
 
-1. **The gap, live.** `CDC_TRUNCATE_MODE=ignore` restores Debezium's own default
-   (`skipped.operations=t`) and the TRUNCATE becomes invisible again — the exact
-   baseline behaviour `RUBRIC_STATUS.md` scored 1 for, reproduced on demand.
+1. **The gap, live.** `CDC_TRUNCATE_MODE=ignore` preserves the externally visible
+   baseline (the destination rows and marker count do not change), while the pipeline
+   retains the raw TRUNCATE internally as generation-proof evidence — required to
+   distinguish it from a same-OID replacement.
 2. **A truncate is replicated** once the default is overridden.
 3. **A crash in the commit→ack window of a truncating group** replays that
    transaction: the destination must end up empty exactly once, never re-populated
@@ -49,7 +50,8 @@ def drop_scenario(sandbox):
     )
     phases = {"snapshot": box.run(reset_state=True, max_seconds=150)}
 
-    # 1. the baseline gap: Debezium's own default skips truncates outright.
+    # 1. the baseline gap: ignore is still a destination no-op, but the raw event is
+    #    retained internally so a relfilenode rewrite cannot be mistaken for a recreate.
     box.sql("TRUNCATE TABLE app.tr_demo")
     phases["ignored"] = box.run(
         max_seconds=150, idle_seconds=8, extra_env={"CDC_TRUNCATE_MODE": "ignore"}
@@ -111,9 +113,8 @@ def drop_scenario(sandbox):
 # 1 + 2: the gap, and the fix
 # --------------------------------------------------------------------------- #
 def test_ignore_mode_reproduces_the_baseline_gap(drop_scenario):
-    """`skipped.operations=t` is Debezium's default, and it is the whole of the
-    baseline's 1 for truncate: Postgres emptied the table, the destination did not
-    notice, and no counter moved."""
+    """Ignore preserves the baseline destination behavior: Postgres emptied the
+    table, the destination did not notice, and no truncate marker was published."""
     assert drop_scenario["rows_after_ignored"] == [(1,), (2,)]
     assert drop_scenario["markers_after_ignored"] == 0, (
         "nothing was even recorded, which is exactly the baseline behaviour"

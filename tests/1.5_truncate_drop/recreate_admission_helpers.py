@@ -22,8 +22,8 @@ CUSTOMERS = "cdcflight_app_customers"
 ORDERS = "cdcflight_app_orders"
 
 
-def _watcher(*, present: dict[str, int] | None = None, **kw) -> CatalogWatcher:
-    """A polling-disabled watcher whose source OID read is supplied by the test."""
+def _watcher(*, present: dict[str, object] | None = None, **kw) -> CatalogWatcher:
+    """A polling-disabled watcher whose source-generation read is supplied by the test."""
     watcher = CatalogWatcher(
         dsn="", publication="pub", schema="app", include=set(), poll_seconds=0, **kw
     )
@@ -109,9 +109,10 @@ def _assert_recreated_boundary(box: Lab, relation: SourceRelation) -> None:
         "WHERE pipeline = 'lab' AND source_table = 'customers'"
     ) == [("awaiting_snapshot",)]
     assert box.q(
-        "SELECT relation_oid FROM _cdc_flight.source_relations "
+        "SELECT relation_oid, relation_filenode, relation_type_oid "
+        "FROM _cdc_flight.source_relations "
         "WHERE pipeline = 'lab' AND source_table = 'customers'"
-    ) == [(relation.oid,)]
+    ) == [(relation.oid, relation.relfilenode, relation.relation_type_oid)]
 
 
 def _set_current_relation_oid(watcher: CatalogWatcher, relation: SourceRelation) -> None:

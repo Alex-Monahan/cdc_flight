@@ -240,8 +240,8 @@ def test_a_recreate_whose_oid_changed_again_is_not_applied(lab):
 
 
 def test_revalidation_can_be_switched_off(lab):
-    """`CDC_DROP_REVALIDATE=0` is for a deployment that cannot afford the extra source
-    read; it removes guard 3 and nothing else."""
+    """`CDC_DROP_REVALIDATE=0` remains the documented plain-drop opt-out; replacement
+    generations still use the final proof fence."""
     w = watcher(present={"app.customers": 4711})
     box = lab(catalog=w, drop_revalidate=False)
     preload(box)

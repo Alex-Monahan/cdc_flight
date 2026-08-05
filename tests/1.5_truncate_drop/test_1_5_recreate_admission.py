@@ -21,7 +21,7 @@ from recreate_admission_helpers import (
     txn,
 )
 
-from cdc_flight import table_lifecycle
+from cdc_flight import catalog_generation, table_lifecycle
 from cdc_flight.catalog import CHANGE_DROPPED, CatalogChange
 from cdc_flight.config import DROP_LOG, DROP_REPLICATE
 from cdc_flight.machines import (
@@ -467,8 +467,8 @@ def test_stale_recreate_after_source_drop_is_logged_without_quarantining_log_ima
     ) != [(LIFECYCLE_AWAITING,)]
 
 
-def test_replacement_identity_is_read_once_for_all_units_in_a_commit_group(lab):
-    """Admission and plan share one fail-closed source identity snapshot."""
+def test_replacement_identity_uses_bounded_plan_and_final_proofs(lab):
+    """Admission and plan share the same last-moment proof, not a stale cache."""
     old = _catalog_relation("customers", 16384)
     replacement = _catalog_relation("customers", 16385)
     current = {old.qualified: old.oid}
@@ -496,12 +496,184 @@ def test_replacement_identity_is_read_once_for_all_units_in_a_commit_group(lab):
         + txn("3", [keyed("3", 1, 310, 5, "second")])
     )
 
-    assert len(calls) == 1
+    assert len(calls) == 2
     assert calls[0] == {("app", "customers")}
     assert box.applier.fenced_units == 2
 
 
-RECREATE_GENERATION_OUTCOMES = ("current", "newer", "absent")
+@pytest.mark.parametrize("drop_mode", [DROP_LOG, DROP_REPLICATE])
+def test_r9_m1_source_flip_after_cached_identity_fences_normal_tail(lab, drop_mode):
+    """R9-M1(a): A->B after the cached read must not append B rows to A."""
+    old = _catalog_relation("customers", 16384)
+    replacement = _catalog_relation("customers", 16385)
+    current = {old.qualified: old.oid}
+    watcher = _watcher(
+        present=current,
+        known={old.qualified: old},
+        replicated={old.qualified},
+        confirm_polls=1,
+    )
+    watcher._dirty[old.qualified] = old
+    box = lab(catalog=watcher, drop_mode=drop_mode)
+    preload(box)
+
+    cached = False
+
+    def read_after_cached(names):
+        nonlocal cached
+        result = {
+            f"{schema}.{table}": current.get(f"{schema}.{table}")
+            for schema, table in names
+        }
+        if not cached:
+            cached = True
+            current[old.qualified] = replacement.oid
+        return result
+
+    watcher.relation_oids = read_after_cached  # type: ignore[method-assign]
+    box.run(txn("2", [keyed("2", 1, 300, 4, "new-lifecycle")]))
+
+    assert rows(box, CUSTOMERS) == [(1,), (2,), (3,)]
+    assert box.applier.fenced_units == 1
+
+
+@pytest.mark.parametrize("drop_mode", [DROP_LOG, DROP_REPLICATE])
+def test_r9_m1_short_lived_replacement_that_is_absent_at_read_is_fenced(lab, drop_mode):
+    """R9-M1(b): A->B->absent before polling cannot make a tail belong to A."""
+    old = _catalog_relation("customers", 16384)
+    replacement = _catalog_relation("customers", 16385)
+    lifecycle = [replacement.oid, None]
+    current = {old.qualified: lifecycle[-1]}
+    watcher = _watcher(
+        present={old.qualified: old.oid},
+        known={old.qualified: old},
+        replicated={old.qualified},
+        confirm_polls=1,
+    )
+    watcher._dirty[old.qualified] = old
+    box = lab(catalog=watcher, drop_mode=drop_mode)
+    preload(box)
+
+    def read_after_short_lived_replacement(names):
+        return {
+            f"{schema}.{table}": current.get(f"{schema}.{table}")
+            for schema, table in names
+        }
+
+    watcher.relation_oids = read_after_short_lived_replacement  # type: ignore[method-assign]
+    box.run(txn("2", [keyed("2", 1, 300, 4, "new-lifecycle")]))
+
+    assert rows(box, CUSTOMERS) == [(1,), (2,), (3,)]
+    assert box.applier.fenced_units == 1
+
+
+@pytest.mark.parametrize("drop_mode", [DROP_LOG, DROP_REPLICATE])
+def test_r9_m1_final_proof_cannot_quarantine_after_queued_b_disappears(lab, drop_mode):
+    """R9-M1(c): a B->absent flip before apply must retain the A image."""
+    old = _catalog_relation("customers", 16384)
+    replacement = _catalog_relation("customers", 16385)
+    current = {old.qualified: replacement.oid}
+    watcher = _watcher(
+        present=current,
+        known={old.qualified: old},
+        replicated={old.qualified},
+        confirm_polls=1,
+    )
+    watcher._dirty[old.qualified] = old
+    box = lab(catalog=watcher, drop_mode=drop_mode)
+    preload(box)
+    _queue_recreated(watcher, replacement)
+
+    cached = False
+
+    def read_then_drop(names):
+        nonlocal cached
+        result = {
+            f"{schema}.{table}": current.get(f"{schema}.{table}")
+            for schema, table in names
+        }
+        if not cached:
+            cached = True
+            current[old.qualified] = None
+        return result
+
+    watcher.relation_oids = read_then_drop  # type: ignore[method-assign]
+    box.run([heartbeat(175)])
+
+    assert box.exists(CUSTOMERS)
+    assert rows(box, CUSTOMERS) == [(1,), (2,), (3,)]
+    assert box.q(
+        "SELECT event, applied FROM _cdc_flight.table_events "
+        "WHERE source_table = 'customers'"
+    ) == []
+
+
+def _with_filenode(relation: object, filenode: int):
+    """Attach the R9 stronger generation token to a test relation."""
+    object.__setattr__(relation, "relfilenode", filenode)
+    return relation
+
+
+def _with_partition_type(relation: object, type_oid: int):
+    """Complete the generation token for a partitioned parent (relfilenode=0)."""
+    object.__setattr__(relation, "relfilenode", 0)
+    object.__setattr__(relation, "relation_type_oid", type_oid)
+    return relation
+
+
+@pytest.mark.parametrize("drop_mode", [DROP_LOG, DROP_REPLICATE])
+def test_r9_m2_same_oid_different_filenode_is_a_recreate(lab, drop_mode):
+    """R9-M2: OID reuse with a new relfilenode cannot be current-generation data."""
+    old = _with_filenode(_catalog_relation("customers", 16384), 90001)
+    replacement = _with_filenode(_catalog_relation("customers", 16384), 90002)
+    orders = _catalog_relation("orders", 16390)
+    watcher = _watcher(
+        present={
+            old.qualified: (replacement.oid, replacement.relfilenode),
+            orders.qualified: orders.oid,
+        },
+        known={old.qualified: old, orders.qualified: orders},
+        replicated={old.qualified, orders.qualified},
+        confirm_polls=1,
+    )
+    watcher._dirty[old.qualified] = old
+    box = lab(catalog=watcher, drop_mode=drop_mode)
+    preload(box)
+    added = watcher._compare(
+        {replacement.qualified: replacement, orders.qualified: orders}, lsn=100
+    )
+
+    customer_changes = [change for change in added if change.qualified == old.qualified]
+    assert [change.kind for change in customer_changes] == ["recreated"]
+    box.run(txn("2", [keyed("2", 1, 300, 4, "recreated-lifecycle")]))
+    _assert_recreated_boundary(box, replacement)
+
+
+@pytest.mark.parametrize("drop_mode", [DROP_LOG, DROP_REPLICATE])
+def test_r9_m2_same_oid_partitioned_parent_type_is_a_recreate(lab, drop_mode):
+    """A partitioned parent has relfilenode=0; its row type still fences OID reuse."""
+    old = _with_partition_type(_catalog_relation("customers", 16384), 91001)
+    replacement = _with_partition_type(_catalog_relation("customers", 16384), 91002)
+    orders = _catalog_relation("orders", 16390)
+    watcher = _watcher(
+        present={old.qualified: replacement, orders.qualified: orders},
+        known={old.qualified: old, orders.qualified: orders},
+        replicated={old.qualified, orders.qualified},
+        confirm_polls=1,
+    )
+    watcher._dirty[old.qualified] = old
+    box = lab(catalog=watcher, drop_mode=drop_mode)
+    preload(box)
+    added = watcher._compare(
+        {replacement.qualified: replacement, orders.qualified: orders}, lsn=100
+    )
+
+    assert [change.kind for change in added] == ["recreated"]
+    box.run(txn("2", [keyed("2", 1, 300, 4, "recreated-partitioned-parent")]))
+    _assert_recreated_boundary(box, replacement)
+
+
+RECREATE_GENERATION_OUTCOMES = catalog_generation.GENERATION_PROOF_STATES
 RECREATE_GENERATION_MODES = (DROP_LOG, DROP_REPLICATE)
 RECREATE_GENERATION_CELLS = tuple(
     (lifecycle, plan_state, generation, drop_mode, spilled)
@@ -528,8 +700,30 @@ def test_recreate_generation_supersession_drop_mode_matrix(
         "current": replacement_b,
         "newer": replacement_c,
         "absent": None,
+        "unknown": None,
+        "ambiguous": replacement_b,
+        "boundary_unproven": replacement_b,
     }[generation]
-    current = {old.qualified: expected.oid if expected else None}
+    if generation == "boundary_unproven":
+        # Make the identity itself complete so the first (non-final) plan can be
+        # current; only the missing source-WAL coverage should refuse the final plan.
+        object.__setattr__(replacement_b, "relfilenode", 90001)
+    current = {
+        old.qualified: {
+            "current": replacement_b.oid,
+            "newer": replacement_c.oid,
+            "absent": None,
+            "unknown": catalog_generation.UNKNOWN,
+            "ambiguous": (replacement_b.oid, 90002),
+            "boundary_unproven": catalog_generation.GenerationProof(
+                identity=catalog_generation.RelationIdentity(
+                    replacement_b.oid, replacement_b.relfilenode
+                ),
+                source_lsn=None,
+                legacy=False,
+            ),
+        }[generation]
+    }
     watcher = _watcher(
         present=current,
         known={old.qualified: old},
@@ -558,9 +752,11 @@ def test_recreate_generation_supersession_drop_mode_matrix(
         _assert_recreated_boundary(box, expected)
         assert not box.exists(CUSTOMERS)
         assert watcher.pending() == []
-    elif drop_mode == DROP_LOG:
+    elif generation == "absent" and drop_mode == DROP_LOG:
         assert box.exists(CUSTOMERS)
-        assert rows(box, CUSTOMERS) == [(1,), (2,), (3,), (4,)]
+        # An absent final proof is ambiguous for admission, so the tail is fenced;
+        # only the retained A image remains in the drop marker path.
+        assert rows(box, CUSTOMERS) == [(1,), (2,), (3,)]
         assert box.q(
             "SELECT event, applied FROM _cdc_flight.table_events "
             "WHERE source_table = 'customers'"
@@ -570,13 +766,24 @@ def test_recreate_generation_supersession_drop_mode_matrix(
             "WHERE source_table = 'customers'"
         ) == [(old.oid,)]
         assert watcher.pending() == []
-    else:
+    elif generation == "absent":
         assert not box.exists(CUSTOMERS)
         assert box.q(
             "SELECT count(*) FROM _cdc_flight.source_relations "
             "WHERE source_table = 'customers'"
         ) == [(0,)]
         assert watcher.pending() == []
+    else:
+        # UNKNOWN, AMBIGUOUS and BOUNDARY_UNPROVEN are explicit fail-closed cells:
+        # the unit is fenced and no quarantine/reclassification is allowed. The
+        # refused change remains the automatic watcher obligation.
+        assert box.exists(CUSTOMERS)
+        assert rows(box, CUSTOMERS) == [(1,), (2,), (3,)]
+        assert box.q(
+            "SELECT event FROM _cdc_flight.table_events "
+            "WHERE source_table = 'customers'"
+        ) == []
+        assert watcher.pending() != []
     if spilled:
         assert box.applier.spilled_events >= 1
 

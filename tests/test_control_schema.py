@@ -50,7 +50,12 @@ def test_legacy_source_relations_migration_backfills_and_is_idempotent(tmp_path)
                 "WHERE table_schema = '_cdc_flight' AND table_name = 'source_relations'"
             ).fetchall()
         }
-        assert {"columns_json", "admission_state"} <= columns
+        assert {
+            "columns_json",
+            "relation_filenode",
+            "relation_type_oid",
+            "admission_state",
+        } <= columns
         assert con.execute(
             "SELECT admission_state FROM _cdc_flight.source_relations"
         ).fetchall() == [("external",)]

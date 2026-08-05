@@ -5,14 +5,12 @@ just like Postgres handles them=5`.
 
 ## TRUNCATE
 
-pgoutput carries it and Postgres makes it transactional, so the only thing standing
-between the baseline's 1 and a faithful replication was **Debezium's own default**:
-`skipped.operations` defaults to `"t"`, and the pgoutput decoder then drops the `'T'`
-message before it is ever decoded (`PgOutputMessageDecoder.isTruncateEventsIncluded`).
-That is why the baseline's `skipped` counter did not even increment.
-`CDC_TRUNCATE_MODE=ignore` restores that default on demand, and
-`test_1_5_drop_recreate.py::test_ignore_mode_reproduces_the_baseline_gap` uses it to
-reproduce the gap against a live cluster.
+pgoutput carries it and Postgres makes it transactional. The pipeline pins
+`skipped.operations` to `"none"` so the ordered `'T'` event reaches the generation
+fence; `CDC_TRUNCATE_MODE=ignore` remains a destination no-op, preserving the baseline
+rows/marker behavior while retaining the raw event internally. The
+`test_1_5_drop_recreate.py::test_ignore_mode_reproduces_the_baseline_gap` test verifies
+that external gap against a live cluster.
 
 Once the events arrive, three things matter:
 
@@ -70,7 +68,7 @@ drop; with a transactional one it applies in about a second.
 
 | variable | default | meaning |
 |---|---|---|
-| `CDC_TRUNCATE_MODE` | `replicate` | `replicate` empties the destination table (=5); `log` keeps the rows and records the marker (=3); `ignore` restores Debezium's skip |
+| `CDC_TRUNCATE_MODE` | `replicate` | `replicate` empties the destination table (=5); `log` keeps the rows and records the marker (=3); `ignore` is a destination no-op while the raw event remains available to generation proofing |
 | `CDC_DROP_MODE` | `replicate` | `replicate` drops the destination table (=5); `log` records the marker only; `ignore` disables catalog polling |
 | `CDC_CATALOG_POLL_SECONDS` | `10` | catalog poll interval (also rubric 2.3's discovery interval) |
 | `CDC_CATALOG_MARKER` | `1` | emit the WAL fence marker on the source |
