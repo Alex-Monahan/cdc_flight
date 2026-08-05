@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import random
+
 import pytest
 from applier_lab import Lab, data, heartbeat, keyed
 from recreate_admission_helpers import (
@@ -21,7 +23,7 @@ from recreate_admission_helpers import (
 
 from cdc_flight import table_lifecycle
 from cdc_flight.catalog import CHANGE_DROPPED, CatalogChange
-from cdc_flight.config import DROP_LOG
+from cdc_flight.config import DROP_LOG, DROP_REPLICATE
 from cdc_flight.machines import (
     CATALOG_CHANGE,
     CHANGE_APPLIED,
@@ -247,6 +249,12 @@ RECREATE_PLAN_STATES = (None, *sorted(CATALOG_CHANGE.reachable_states()))
 RECREATE_NO_PLAN_CATALOG_STATES = frozenset(
     CATALOG_CHANGE.reachable_states() - {CHANGE_DUE}
 )
+RECREATE_GENERATION_PLAN_STATES = tuple(
+    state for state in RECREATE_PLAN_STATES if state == CHANGE_DUE
+)
+RECREATE_GENERATION_MACHINE_REFUSED_STATES = frozenset(
+    state for state in RECREATE_PLAN_STATES if state != CHANGE_DUE
+)
 RECREATE_ADMISSION_CELLS = tuple(
     (lifecycle, catalog_plan_state, spilled)
     for lifecycle in RECREATE_IMAGE_LIFECYCLE_STATES
@@ -258,6 +266,10 @@ RECREATE_ADMISSION_CELLS = tuple(
 def test_recreate_matrix_documents_non_image_lifecycle_ownership():
     assert {"absent", "none", "in_progress"} == RECREATE_OUT_OF_SCOPE_LIFECYCLE_STATES
     assert CHANGE_DUE not in RECREATE_NO_PLAN_CATALOG_STATES
+    assert RECREATE_GENERATION_PLAN_STATES == (CHANGE_DUE,)
+    assert (
+        RECREATE_NO_PLAN_CATALOG_STATES | {None}
+    ) == RECREATE_GENERATION_MACHINE_REFUSED_STATES
 
 
 @pytest.mark.parametrize(
@@ -366,3 +378,249 @@ def test_log_mode_recreate_while_flight_is_stopped_keeps_the_boundary(lab):
         assert not restarted.exists(CUSTOMERS)
     finally:
         restarted.close()
+
+
+def _mutable_source_oids(watcher, current: dict[str, int | None]) -> None:
+    watcher.relation_oids = lambda names: {  # type: ignore[method-assign]
+        f"{schema}.{table}": current.get(f"{schema}.{table}")
+        for schema, table in names
+    }
+
+
+@pytest.mark.parametrize("drop_mode", [DROP_LOG, DROP_REPLICATE])
+def test_queued_intermediate_recreate_is_superseded_by_the_final_generation(
+    lab, drop_mode
+):
+    """A queued B generation cannot fence or apply ahead of a newer C generation."""
+    old = _catalog_relation("customers", 16384)
+    replacement_b = _catalog_relation("customers", 16385)
+    replacement_c = _catalog_relation("customers", 16386)
+    orders = _catalog_relation("orders", 16390)
+    current = {old.qualified: old.oid}
+    watcher = _watcher(
+        present=current,
+        known={old.qualified: old},
+        replicated={old.qualified},
+        confirm_polls=1,
+    )
+    _mutable_source_oids(watcher, current)
+    watcher._dirty[old.qualified] = old
+    box = lab(catalog=watcher, drop_mode=drop_mode)
+    preload(box)
+
+    current[old.qualified] = replacement_b.oid
+    queued_b = watcher._compare(
+        {old.qualified: replacement_b, orders.qualified: orders}, lsn=100
+    )[0]
+    current[old.qualified] = replacement_c.oid
+    added_c = watcher._compare(
+        {old.qualified: replacement_c, orders.qualified: orders}, lsn=110
+    )
+
+    assert [change.kind for change in added_c] == ["recreated"]
+    assert added_c[0].new_oid == replacement_c.oid
+    assert queued_b.state == CHANGE_SUPERSEDED
+    assert [
+        (change.qualified, change.new_oid)
+        for change in watcher.pending_destructive()
+        if change.qualified == old.qualified
+    ] == [(old.qualified, replacement_c.oid)]
+
+    box.run(txn("2", [keyed("2", 1, 300, 4, "c-generation")]))
+    _assert_recreated_boundary(box, replacement_c)
+    assert not box.exists(CUSTOMERS)
+    assert box.applier.fenced_units == 1
+
+
+def test_stale_recreate_after_source_drop_is_logged_without_quarantining_log_image(lab):
+    """A final drop reclassifies A->B instead of deleting the retained A image."""
+    old = _catalog_relation("customers", 16384)
+    replacement = _catalog_relation("customers", 16385)
+    current = {old.qualified: None}
+    watcher = _watcher(
+        present=current,
+        known={old.qualified: old},
+        replicated={old.qualified},
+        confirm_polls=1,
+    )
+    _mutable_source_oids(watcher, current)
+    watcher._dirty[old.qualified] = old
+    box = lab(catalog=watcher, drop_mode=DROP_LOG)
+    preload(box)
+    _queue_recreated(watcher, replacement)
+
+    box.run([heartbeat(175)])
+
+    assert box.exists(CUSTOMERS)
+    assert rows(box, CUSTOMERS) == [(1,), (2,), (3,)]
+    assert box.q(
+        "SELECT event, applied FROM _cdc_flight.table_events "
+        "WHERE source_table = 'customers'"
+    ) == [("dropped", False)]
+    assert box.q(
+        "SELECT relation_oid FROM _cdc_flight.source_relations "
+        "WHERE source_table = 'customers'"
+    ) == [(old.oid,)]
+    assert box.q(
+        "SELECT snapshot_state FROM _cdc_flight.table_state "
+        "WHERE source_table = 'customers'"
+    ) != [(LIFECYCLE_AWAITING,)]
+
+
+def test_replacement_identity_is_read_once_for_all_units_in_a_commit_group(lab):
+    """Admission and plan share one fail-closed source identity snapshot."""
+    old = _catalog_relation("customers", 16384)
+    replacement = _catalog_relation("customers", 16385)
+    current = {old.qualified: old.oid}
+    watcher = _watcher(
+        present=current,
+        known={old.qualified: old},
+        replicated={old.qualified},
+        confirm_polls=1,
+    )
+    calls: list[set[tuple[str, str]]] = []
+
+    def relation_oids(names):
+        calls.append(set(names))
+        return {f"{schema}.{table}": current.get(f"{schema}.{table}") for schema, table in names}
+
+    watcher.relation_oids = relation_oids  # type: ignore[method-assign]
+    watcher._dirty[old.qualified] = old
+    box = lab(catalog=watcher, drop_mode=DROP_LOG)
+    preload(box)
+    current[old.qualified] = replacement.oid
+    _queue_recreated(watcher, replacement)
+
+    box.run(
+        txn("2", [keyed("2", 1, 300, 4, "first")])
+        + txn("3", [keyed("3", 1, 310, 5, "second")])
+    )
+
+    assert len(calls) == 1
+    assert calls[0] == {("app", "customers")}
+    assert box.applier.fenced_units == 2
+
+
+RECREATE_GENERATION_OUTCOMES = ("current", "newer", "absent")
+RECREATE_GENERATION_MODES = (DROP_LOG, DROP_REPLICATE)
+RECREATE_GENERATION_CELLS = tuple(
+    (lifecycle, plan_state, generation, drop_mode, spilled)
+    for lifecycle in (LIFECYCLE_COMPLETE,)
+    for plan_state in RECREATE_GENERATION_PLAN_STATES
+    for generation in RECREATE_GENERATION_OUTCOMES
+    for drop_mode in RECREATE_GENERATION_MODES
+    for spilled in (False, True)
+)
+
+
+@pytest.mark.parametrize(
+    "lifecycle_state, plan_state, generation, drop_mode, spilled",
+    RECREATE_GENERATION_CELLS,
+)
+def test_recreate_generation_supersession_drop_mode_matrix(
+    lab, lifecycle_state, plan_state, generation, drop_mode, spilled
+):
+    """Every feasible due-generation x drop-mode x spill cell realizes its state."""
+    old = _catalog_relation("customers", 16384)
+    replacement_b = _catalog_relation("customers", 16385)
+    replacement_c = _catalog_relation("customers", 16386)
+    expected = {
+        "current": replacement_b,
+        "newer": replacement_c,
+        "absent": None,
+    }[generation]
+    current = {old.qualified: expected.oid if expected else None}
+    watcher = _watcher(
+        present=current,
+        known={old.qualified: old},
+        replicated={old.qualified},
+        confirm_polls=1,
+    )
+    _mutable_source_oids(watcher, current)
+    watcher._dirty[old.qualified] = old
+    box = lab(
+        catalog=watcher,
+        drop_mode=drop_mode,
+        **({"unit_spill_events": 1, "unit_spill_bytes": 1} if spilled else {}),
+    )
+    preload(box)
+    _queue_recreated(
+        watcher,
+        replacement_b,
+        state=plan_state,
+        detected_lsn=150,
+    )
+
+    box.run(txn("2", [keyed("2", 1, 300, 4, "generation-matrix")]))
+
+    if generation in {"current", "newer"}:
+        assert expected is not None
+        _assert_recreated_boundary(box, expected)
+        assert not box.exists(CUSTOMERS)
+        assert watcher.pending() == []
+    elif drop_mode == DROP_LOG:
+        assert box.exists(CUSTOMERS)
+        assert rows(box, CUSTOMERS) == [(1,), (2,), (3,), (4,)]
+        assert box.q(
+            "SELECT event, applied FROM _cdc_flight.table_events "
+            "WHERE source_table = 'customers'"
+        ) == [("dropped", False)]
+        assert box.q(
+            "SELECT relation_oid FROM _cdc_flight.source_relations "
+            "WHERE source_table = 'customers'"
+        ) == [(old.oid,)]
+        assert watcher.pending() == []
+    else:
+        assert not box.exists(CUSTOMERS)
+        assert box.q(
+            "SELECT count(*) FROM _cdc_flight.source_relations "
+            "WHERE source_table = 'customers'"
+        ) == [(0,)]
+        assert watcher.pending() == []
+    if spilled:
+        assert box.applier.spilled_events >= 1
+
+
+def test_log_mode_rapid_recreate_drop_sequences_converge_without_image_loss(lab):
+    """A deterministic bounded rapid sequence leaves only the final source fact live."""
+    rng = random.Random(0xA81)  # fixed seed for a bounded reproducible sequence
+    old = _catalog_relation("customers", 16384)
+    current = {old.qualified: old.oid}
+    watcher = _watcher(
+        present=current,
+        known={old.qualified: old},
+        replicated={old.qualified},
+        confirm_polls=1,
+    )
+    _mutable_source_oids(watcher, current)
+    watcher._dirty[old.qualified] = old
+    box = lab(catalog=watcher, drop_mode=DROP_LOG)
+    preload(box)
+
+    next_oid = 16385
+    for step in range(12):
+        if rng.randrange(4) == 0:
+            current[old.qualified] = None
+            observed = {}
+        else:
+            current[old.qualified] = next_oid
+            observed = {
+                old.qualified: _catalog_relation("customers", next_oid)
+            }
+            next_oid += 1
+        watcher._compare(observed, lsn=100 + step * 10)
+
+    # Make the terminal source fact a drop so the property includes DROP_LOG's
+    # no-data-loss branch after several queued replacement generations.
+    current[old.qualified] = None
+    watcher._compare({}, lsn=300)
+    box.run([heartbeat(400)])
+
+    assert box.exists(CUSTOMERS)
+    assert rows(box, CUSTOMERS) == [(1,), (2,), (3,)]
+    assert box.q(
+        "SELECT event, applied FROM _cdc_flight.table_events "
+        "WHERE source_table = 'customers' ORDER BY commit_id, seq"
+    )[-1:] == [("dropped", False)]
+    assert watcher.pending() == []
+    assert watcher.superseded >= 1
