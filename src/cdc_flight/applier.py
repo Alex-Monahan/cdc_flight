@@ -568,21 +568,10 @@ class Applier:
         # the wrapper inferred from the SQL it happened to see (rubric 1.7).
         fault_group = self.data_commit_groups + 1
         arm_group(fault_group)
-        # NOT `or spill.rows > 0`: staged rows belonging only to *fenced*
-        # units are about to be discarded, and counting them made a group with no
-        # applicable content a "data group", which shifts every `<nth>`-indexed
-        # fault anchor by one (Codex 5).
-        has_data = any(
-            not u.fenced and (u.events or u.spilled_events) for u in group
-        )
-        fault_enabled = has_data
-
         if not self.group.txn_open:
             self.con.execute("BEGIN TRANSACTION")
             self.group.txn_open = True
         try:
-            if has_data:
-                maybe_crash("begin", fault_group)
             self.lease.renew(self.con)
             new_point = resume.point_for(
                 group,
@@ -599,6 +588,18 @@ class Applier:
                 unit_admission.refuse_log_recreate_tail(
                     self, unit, catalog_plan=catalog_plan
                 )
+            # NOT `or spill.rows > 0`: staged rows belonging only to *fenced*
+            # units are about to be discarded, and counting them made a group with no
+            # applicable content a "data group", which shifts every `<nth>`-indexed
+            # fault anchor by one (Codex 5). Compute this AFTER the plan fence so a
+            # same-group replacement unit cannot make a fenced-only group look like
+            # data merely because it arrived before catalog planning.
+            has_data = any(
+                not u.fenced and (u.events or u.spilled_events) for u in group
+            )
+            fault_enabled = has_data
+            if has_data:
+                maybe_crash("begin", fault_group)
             catalog_stats = {"tables": set()}
             stats = self._apply_units_by_schema_epoch(
                 group,

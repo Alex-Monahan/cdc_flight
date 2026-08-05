@@ -25,7 +25,20 @@ from __future__ import annotations
 
 import duckdb
 import pytest
-from applier_lab import DATASET, Lab, data, end, heartbeat, keyed, truncate
+from applier_lab import DATASET, Lab, heartbeat, keyed, truncate
+from recreate_admission_helpers import (
+    CUSTOMERS,
+    ORDERS,
+    _assert_recreated_boundary,
+    _catalog_relation,
+    _queue,
+    _queue_recreated,
+    _watcher,
+    markers,
+    preload,
+    rows,
+    txn,
+)
 
 from cdc_flight import catalog_baseline, faults, table_lifecycle
 from cdc_flight.catalog import (
@@ -33,24 +46,14 @@ from cdc_flight.catalog import (
     CHANGE_RECREATED,
     DESTRUCTIVE,
     CatalogChange,
-    CatalogWatcher,
     SourceRelation,
 )
 from cdc_flight.config import DROP_IGNORE, DROP_LOG, DROP_MODES, DROP_REPLICATE
 from cdc_flight.destination import upsert_source_relation
 from cdc_flight.machines import (
     CATALOG_BASELINE,
-    CATALOG_CHANGE,
-    CHANGE_DUE,
     CHANGE_MARKED,
-    LIFECYCLE_AWAITING,
-    LIFECYCLE_COMPLETE,
-    TABLE_LIFECYCLE,
 )
-from cdc_flight.snapshot_completion import SnapshotObservationError
-
-CUSTOMERS = "cdcflight_app_customers"
-ORDERS = "cdcflight_app_orders"
 
 
 @pytest.fixture
@@ -65,56 +68,6 @@ def lab(tmp_path):
     yield _make
     for box in boxes:
         box.close()
-
-
-def _watcher(*, present: dict[str, int] | None = None, **kw) -> CatalogWatcher:
-    """A watcher with polling disabled: the tests hand it changes directly.
-
-    `present` is what guard 3's revalidation should see (`{"app.customers": 4711}`),
-    defaulting to "the relation really is gone". A watcher with no DSN cannot re-read
-    the source, and failing closed then refuses every drop - which is correct
-    behaviour and useless for testing the apply path, so the query is stubbed here and
-    exercised for real in `test_1_5_catalog_guards.py` and the e2e suite.
-    """
-    watcher = CatalogWatcher(
-        dsn="", publication="pub", schema="app", include=set(), poll_seconds=0, **kw
-    )
-    oids = dict(present or {})
-    watcher.relation_oids = lambda names: {  # type: ignore[method-assign]
-        f"{s}.{t}": oids.get(f"{s}.{t}") for s, t in names
-    }
-    return watcher
-
-
-def txn(number: str, events: list, per_table: dict[str, int] | None = None) -> list:
-    counts: dict[str, int] = {}
-    for event in events:
-        counts[f"{event.schema}.{event.table}"] = counts.get(f"{event.schema}.{event.table}", 0) + 1
-    commit_lsn = max(e.lsn or 0 for e in events) + 1
-    return [*events, end(number, len(events), commit_lsn, per_table or counts)]
-
-
-def preload(box: Lab, *, customers=(1, 2, 3), orders=(7, 8)) -> None:
-    events = [keyed("1", i + 1, 10 + i, ident, f"c{ident}") for i, ident in enumerate(customers)]
-    events += [
-        data(
-            "1", len(customers) + i + 1, 20 + i, table="orders",
-            key={"id": ident}, after={"id": ident, "note": f"o{ident}"},
-        )
-        for i, ident in enumerate(orders)
-    ]
-    box.run(txn("1", events))
-
-
-def rows(box: Lab, table: str) -> list[tuple]:
-    return box.q(f'SELECT id FROM "{DATASET}"."{table}" ORDER BY id')
-
-
-def markers(box: Lab) -> list[tuple]:
-    return box.q(
-        "SELECT event, source_table, applied, rows_removed FROM _cdc_flight.table_events "
-        "ORDER BY commit_id, seq"
-    )
 
 
 # --------------------------------------------------------------------------- #
@@ -260,8 +213,6 @@ def test_an_unknown_truncate_mode_is_refused(tmp_path):
 # --------------------------------------------------------------------------- #
 # applying a detected drop
 # --------------------------------------------------------------------------- #
-def _queue(watcher: CatalogWatcher, change: CatalogChange) -> None:
-    watcher.queue(change)
 
 
 def test_a_dropped_table_is_dropped_at_the_destination(lab):
@@ -306,34 +257,6 @@ def test_a_drop_is_not_applied_before_the_destination_reaches_the_detected_lsn(l
     box.run([heartbeat(10_500)])
     assert not box.exists(CUSTOMERS)
     assert markers(box) == [("dropped", "customers", True, None)]
-
-
-def test_a_recreated_table_drops_the_destination_and_says_why(lab):
-    """Same name, new relation oid: the destination table holds the OLD table's rows
-    and nothing about them is recoverable, so it goes. The marker records the oid
-    change and that a re-snapshot is required (rubric 2.3/3.4)."""
-    watcher = _watcher(present={"app.customers": 99999})
-    box = lab(catalog=watcher)
-    preload(box)
-    _queue(
-        watcher,
-        CatalogChange(
-            kind=CHANGE_RECREATED, schema="app", table="customers",
-            detected_lsn=50, old_oid=16384, new_oid=99999, state=CHANGE_MARKED,
-        ),
-    )
-    box.run(txn("2", [keyed("2", 1, 300, 9, "unrelated", table="orders")]))
-    assert not box.exists(CUSTOMERS)
-    detail = box.q(
-        "SELECT detail FROM _cdc_flight.table_events WHERE event = 'recreated'"
-    )[0][0]
-    assert "re-snapshot" in detail and "99999" in detail
-    # Opus Q1: the table is not silently re-accumulated by ordinary CDC. Its
-    # `table_state` row survives the drop carrying "this is incomplete".
-    assert box.q(
-        "SELECT snapshot_state FROM _cdc_flight.table_state WHERE source_table = 'customers'"
-    ) == [("awaiting_snapshot",)]
-    assert box.applier.stats()["tables_awaiting_snapshot"] == ["app.customers"]
 
 
 def test_a_dropped_table_raises_an_alert(lab):
@@ -392,283 +315,6 @@ def test_drop_mode_log_keeps_the_destination_table(lab):
     box.run(txn("2", [keyed("2", 1, 300, 9, "unrelated", table="orders")]))
     assert box.exists(CUSTOMERS)
     assert markers(box) == [("dropped", "customers", False, None)]
-
-
-def _queue_recreated(
-    watcher: CatalogWatcher,
-    relation: SourceRelation,
-    *,
-    state: str = CHANGE_MARKED,
-    detected_lsn: int = 150,
-) -> None:
-    _queue(
-        watcher,
-        CatalogChange(
-            kind=CHANGE_RECREATED,
-            schema=relation.schema,
-            table=relation.table,
-            detected_lsn=detected_lsn,
-            old_oid=16384,
-            new_oid=relation.oid,
-            new_relation=relation,
-            state=state,
-        ),
-    )
-
-
-def _assert_recreated_boundary(
-    box: Lab, relation: SourceRelation, expected_ids=(1, 2, 3)
-) -> None:
-    assert rows(box, CUSTOMERS) == [(ident,) for ident in expected_ids]
-    assert box.q(
-        "SELECT snapshot_state FROM _cdc_flight.table_state "
-        "WHERE pipeline = 'lab' AND source_table = 'customers'"
-    ) == [("awaiting_snapshot",)]
-    assert box.q(
-        "SELECT relation_oid FROM _cdc_flight.source_relations "
-        "WHERE pipeline = 'lab' AND source_table = 'customers'"
-    ) == [(relation.oid,)]
-
-
-def test_log_mode_recreate_refuses_new_relation_stream_until_resnapshot(lab):
-    """A retained log target must not accept the replacement relation's stream tail."""
-    old = _catalog_relation("customers", 16384)
-    new = _catalog_relation("customers", 16385)
-    watcher = _watcher(present={new.qualified: new.oid})
-    watcher._dirty[old.qualified] = old
-    box = lab(catalog=watcher, drop_mode=DROP_LOG)
-    preload(box)
-
-    _queue(
-        watcher,
-        CatalogChange(
-            kind=CHANGE_DROPPED,
-            schema="app",
-            table="customers",
-            detected_lsn=100,
-            old_oid=old.oid,
-            new_relation=old,
-            state=CHANGE_MARKED,
-        ),
-    )
-    box.run([heartbeat(125)])
-    assert rows(box, CUSTOMERS) == [(1,), (2,), (3,)]
-
-    _queue_recreated(watcher, new)
-    box.run([heartbeat(175)])
-    _assert_recreated_boundary(box, new)
-
-    with pytest.raises(SnapshotObservationError, match="awaiting_snapshot"):
-        box.run(txn("3", [keyed("3", 1, 300, 4, "new-lifecycle")]))
-    assert rows(box, CUSTOMERS) == [(1,), (2,), (3,)]
-
-
-def test_log_mode_recreate_same_group_fences_before_catalog_apply(lab):
-    """A replacement tail in the catalog group is fenced before any row write."""
-    old = _catalog_relation("customers", 16384)
-    new = _catalog_relation("customers", 16385)
-    watcher = _watcher(present={new.qualified: new.oid})
-    watcher._dirty[old.qualified] = old
-    box = lab(catalog=watcher, drop_mode=DROP_LOG)
-    preload(box)
-
-    _queue(
-        watcher,
-        CatalogChange(
-            kind=CHANGE_DROPPED,
-            schema="app",
-            table="customers",
-            detected_lsn=100,
-            old_oid=old.oid,
-            new_relation=old,
-            state=CHANGE_MARKED,
-        ),
-    )
-    box.run([heartbeat(125)])
-
-    _queue_recreated(watcher, new)
-    box.run(txn("3", [keyed("3", 1, 300, 4, "new-lifecycle")]))
-    _assert_recreated_boundary(box, new)
-    assert box.applier.fenced_units == 1
-    assert box.q(
-        "SELECT event_count FROM _cdc_flight.commit_log "
-        "ORDER BY commit_id DESC LIMIT 1"
-    ) == [(0,)]
-
-
-def test_log_mode_recreate_spilled_same_group_fences_before_apply(lab):
-    """Spill pressure must not hide the replacement relation from admission."""
-    old = _catalog_relation("customers", 16384)
-    new = _catalog_relation("customers", 16385)
-    watcher = _watcher(present={new.qualified: new.oid})
-    watcher._dirty[old.qualified] = old
-    box = lab(
-        catalog=watcher,
-        drop_mode=DROP_LOG,
-        unit_spill_events=1,
-        unit_spill_bytes=1,
-    )
-    preload(box)
-
-    _queue(
-        watcher,
-        CatalogChange(
-            kind=CHANGE_DROPPED,
-            schema="app",
-            table="customers",
-            detected_lsn=100,
-            old_oid=old.oid,
-            new_relation=old,
-            state=CHANGE_MARKED,
-        ),
-    )
-    box.run([heartbeat(125)])
-
-    _queue_recreated(watcher, new)
-    box.feed(txn("3", [keyed("3", 1, 300, 4, "new-lifecycle")]))
-    unit = box.applier.group.units[-1]
-    assert unit.spilled_events >= 1, "the replacement transaction did not spill"
-    assert unit.tables_touched() == {"app.customers"}
-    box.commit()
-    _assert_recreated_boundary(box, new)
-    assert unit.fenced
-    assert box.applier.fenced_spilled_events >= 1
-
-
-# R6's product is the retained-image admission surface: `complete` admits an
-# ordinary stream, while `awaiting_snapshot` refuses it. The other reachable
-# TableLifecycle states are deliberately outside this product: `absent`/`none` are
-# not a retained image, and `in_progress` belongs to SnapshotCompletion's gate.
-RECREATE_IMAGE_LIFECYCLE_STATES = tuple(
-    state
-    for state in sorted(TABLE_LIFECYCLE.reachable_states())
-    if state in {LIFECYCLE_COMPLETE, LIFECYCLE_AWAITING}
-)
-RECREATE_OUT_OF_SCOPE_LIFECYCLE_STATES = frozenset(
-    TABLE_LIFECYCLE.reachable_states() - set(RECREATE_IMAGE_LIFECYCLE_STATES)
-)
-
-# A CatalogChange contributes a replacement action to a CatalogPlan only after its
-# declared WAL fence opens at `due`. Every other reachable catalog state is therefore
-# exercised as the documented no-plan side of this product; it is not silently treated
-# as a plan. `None` is the genuinely empty-plan cell.
-RECREATE_PLAN_STATES = (None, *sorted(CATALOG_CHANGE.reachable_states()))
-RECREATE_NO_PLAN_CATALOG_STATES = frozenset(
-    CATALOG_CHANGE.reachable_states() - {CHANGE_DUE}
-)
-RECREATE_ADMISSION_CELLS = tuple(
-    (lifecycle, catalog_plan_state, spilled)
-    for lifecycle in RECREATE_IMAGE_LIFECYCLE_STATES
-    for catalog_plan_state in RECREATE_PLAN_STATES
-    for spilled in (False, True)
-)
-
-
-@pytest.mark.parametrize(
-    "lifecycle_state, catalog_plan_state, spilled", RECREATE_ADMISSION_CELLS
-)
-def test_log_recreate_admission_catalog_plan_spill_matrix(
-    lab, lifecycle_state, catalog_plan_state, spilled
-):
-    """Exercise every feasible retained-image x plan x storage cell.
-
-    `CATALOG_CHANGE` states not equal to `due` are documented above as the no-plan
-    projection, and the non-image `TABLE_LIFECYCLE` states are owned by their other
-    admission machines. Every feasible retained-image cell uses the production applier
-    and assert either the ordinary write, the pre-apply plan fence, or the durable
-    awaiting-snapshot refusal.
-    """
-    if catalog_plan_state not in {None, CHANGE_DUE}:
-        assert catalog_plan_state in RECREATE_NO_PLAN_CATALOG_STATES
-    old = _catalog_relation("customers", 16384)
-    replacement = _catalog_relation(
-        "customers", 16385 if lifecycle_state == LIFECYCLE_COMPLETE else 16386
-    )
-    watcher = _watcher(present={replacement.qualified: replacement.oid})
-    watcher._dirty[old.qualified] = old
-    spill_config = {"unit_spill_events": 1, "unit_spill_bytes": 1} if spilled else {}
-    box = lab(catalog=watcher, drop_mode=DROP_LOG, **spill_config)
-    preload(box)
-
-    if lifecycle_state == LIFECYCLE_AWAITING:
-        _queue_recreated(watcher, _catalog_relation("customers", 16385))
-        box.run([heartbeat(175)])
-        if catalog_plan_state is not None:
-            _queue_recreated(
-                watcher,
-                replacement,
-                state=catalog_plan_state,
-                detected_lsn=150 if catalog_plan_state == CHANGE_DUE else 1_000,
-            )
-    elif catalog_plan_state is not None:
-        _queue_recreated(
-            watcher,
-            replacement,
-            state=catalog_plan_state,
-            detected_lsn=150 if catalog_plan_state == CHANGE_DUE else 1_000,
-        )
-
-    stream = txn("3", [keyed("3", 1, 300, 4, "new-lifecycle")])
-    if lifecycle_state == LIFECYCLE_AWAITING:
-        with pytest.raises(SnapshotObservationError, match="awaiting_snapshot"):
-            box.run(stream)
-        assert rows(box, CUSTOMERS) == [(1,), (2,), (3,)]
-        return
-
-    box.run(stream)
-    if catalog_plan_state == CHANGE_DUE:
-        _assert_recreated_boundary(box, replacement)
-        assert rows(box, CUSTOMERS) == [(1,), (2,), (3,)]
-    else:
-        assert rows(box, CUSTOMERS) == [(1,), (2,), (3,), (4,)]
-
-
-def test_log_mode_recreate_while_flight_is_stopped_keeps_the_boundary(lab):
-    """The same refusal survives a restart between the drop and recreation."""
-    old = _catalog_relation("customers", 16384)
-    new = _catalog_relation("customers", 16385)
-    first_watcher = _watcher()
-    first_watcher._dirty[old.qualified] = old
-    box = lab(catalog=first_watcher, drop_mode=DROP_LOG)
-    preload(box)
-    _queue(
-        first_watcher,
-        CatalogChange(
-            kind=CHANGE_DROPPED,
-            schema="app",
-            table="customers",
-            detected_lsn=100,
-            old_oid=old.oid,
-            new_relation=old,
-            state=CHANGE_MARKED,
-        ),
-    )
-    box.run([heartbeat(125)])
-    path = box.path
-    box.lease.release(box.con)
-    box.close()
-
-    restarted_watcher = _watcher(
-        present={new.qualified: new.oid},
-        known={old.qualified: old},
-        replicated={old.qualified},
-    )
-    restarted = Lab(path, catalog=restarted_watcher, drop_mode=DROP_LOG, resume_lsn=125)
-    try:
-        _queue_recreated(restarted_watcher, new)
-        restarted.run([heartbeat(175)])
-        _assert_recreated_boundary(restarted, new)
-        with pytest.raises(SnapshotObservationError, match="awaiting_snapshot"):
-            restarted.run(txn("3", [keyed("3", 1, 300, 4, "new-lifecycle")]))
-        assert rows(restarted, CUSTOMERS) == [(1,), (2,), (3,)]
-    finally:
-        restarted.close()
-
-
-def _catalog_relation(table: str, oid: int) -> SourceRelation:
-    return SourceRelation(
-        schema="app", table=table, oid=oid, published=True, replica_identity="d"
-    )
 
 
 def _baseline_state_for_matrix(box: Lab, relation: SourceRelation, state: str):
@@ -778,8 +424,8 @@ def test_drop_mode_and_baseline_confirmation_matrix(
     ``ignore`` has no catalog watcher in the real pipeline, so its confirmation cells
     are deliberate machine refusals (zero successful polls), not an untested allow path.
     ``replicate`` destroys the destination for both destructive changes; ``log`` keeps a
-    plain drop's identity and destination, but a recreate retains the rows only while its
-    new lifecycle is durably owed a re-snapshot.
+    plain drop's identity and destination, but a recreate quarantines the stale image
+    while its new lifecycle is durably owed a re-snapshot.
     """
     old_relation = _catalog_relation("customers", 16384)
     new_relation = _catalog_relation("customers", 16385)
@@ -834,10 +480,10 @@ def test_drop_mode_and_baseline_confirmation_matrix(
         check=check,
         successful_polls=1,
     )
-    if change_kind == CHANGE_RECREATED and drop_mode == DROP_LOG:
-        assert not confirmed.valid, (drop_mode, baseline_state, confirmed.reason)
-        assert confirmed.state == catalog_baseline.INVALIDATED
-        _assert_recreated_boundary(box, new_relation, expected_ids=(1,))
+    if change_kind == CHANGE_RECREATED:
+        assert confirmed.valid, (drop_mode, baseline_state, confirmed.reason)
+        assert confirmed.state == catalog_baseline.VALID
+        _assert_recreated_boundary(box, new_relation)
     else:
         assert confirmed.valid, (drop_mode, baseline_state, confirmed.reason)
 
@@ -875,7 +521,12 @@ def test_drop_mode_and_baseline_confirmation_matrix(
                 "WHERE pipeline = 'lab' AND source_table = 'customers'"
             ) == [("awaiting_snapshot",)]
     assert markers(box) == [
-        (change_kind, "customers", drop_mode == DROP_REPLICATE, None)
+        (
+            change_kind,
+            "customers",
+            drop_mode == DROP_REPLICATE or change_kind == CHANGE_RECREATED,
+            None,
+        )
     ]
 
 
