@@ -51,7 +51,8 @@ def drop_scenario(sandbox):
     phases = {"snapshot": box.run(reset_state=True, max_seconds=150)}
 
     # 1. the baseline gap: ignore is still a destination no-op, but the raw event is
-    #    retained internally so a relfilenode rewrite cannot be mistaken for a recreate.
+    #    retained for policy/audit while the complete catalog token distinguishes an
+    #    ordinary relfilenode rewrite from a replacement lifecycle.
     box.sql("TRUNCATE TABLE app.tr_demo")
     phases["ignored"] = box.run(
         max_seconds=150, idle_seconds=8, extra_env={"CDC_TRUNCATE_MODE": "ignore"}
