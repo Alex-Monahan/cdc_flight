@@ -75,7 +75,7 @@ conservatively at **5** and **4** — 1.5 deliberately not restored to 5.
 | Opus M-1 — a rolled-back group was folded twice | **fixed.** `_reset_group()` on the rollback path, with a test that measures the loss (A41) |
 | Opus M-4 — `--reset-state` made a permanent zombie | **fixed** by A39 |
 | Opus M-5 — the recorded falsifier named a case that works | **fixed.** A31 marked superseded; the real shapes are named |
-| Opus Q1 — recreated-table policy | **drop + alert + persistent `awaiting_snapshot`**, surfaced by `inspect` and the run summary. Automatic re-snapshot is 2.3/3.4, and it is why 1.5 is 4 |
+| Opus Q1 — recreated-table policy | **retained-image quarantine + alert + persistent `awaiting_snapshot`**, surfaced by `inspect` and the run summary. Automatic re-snapshot is 2.3/3.4, and the replacement or final source-missing policy owns destruction |
 | Opus Q2, Q5 — mass-drop breaker, confirm polls | **built**, defaults 1 and 2 |
 | Opus Q3 — unify the fence marker with D9 | **`source_marker.SourceMarker`**: the interface and the reasons, not the heartbeat loop (4.4 owns the cadence) |
 | Opus Q4 — `rows_removed` must not degrade to NULL | **asserted** on DuckDB and MotherDuck |
@@ -363,7 +363,7 @@ correct assumptions in the notes below:
 | 1.2 | Delivery guarantees, tables WITHOUT a primary key | ~~3~~ → **5** | Keyless rows are keyed on a connector-derived `cdcf_event_id` whose ordinal contract is enforced at the boundary, so two identical source rows survive and a replay does not. |
 | 1.3 | CDC changes atomic in MotherDuck | ~~1~~ → **5** | A commit group is an integral number of whole multi-table Postgres transactions, proven whole in every storage mode; a concurrent MotherDuck observer never sees a partial one, including across an injected crash. |
 | 1.4 | Primary-key update handled correctly | ~~2~~ → **5** | The `d(old)`/`c(new)` pair is one transaction and a commit group holds whole transactions, so the move is atomic by construction. The fold models **physical rows** rather than keys, so a key worn by two rows inside a transaction (or freed and re-taken across two transactions of one group) is expressible; where the before-image cannot attribute a delete the group is refused rather than folded. Five reproduced silent-loss/duplication orderings are now equality tests. |
-| 1.5 | TRUNCATE / DROP propagate | ~~1~~ → **5** | `skipped.operations=none` brings truncates through; **one** dispatcher applies them in every storage mode and each truncate's audit records what *it* removed. `DROP TABLE` is not in the stream, so the source catalog is polled and the action passes six guards before any DDL. A dropped-and-recreated relation is dropped, marked `awaiting_snapshot` and **re-snapshotted automatically on the next run**. Held at 4 through the 1.6-1.8 review because the rebuild machinery could delete a live destination table it had merely not reached; that is closed with positive-evidence emptiness and multi-table proof (ADR §19/A52). A mass drop still needs an operator, deliberately. |
+| 1.5 | TRUNCATE / DROP propagate | ~~1~~ → **5** | `skipped.operations=none` brings truncates through; **one** dispatcher applies them in every storage mode and each truncate's audit records what *it* removed. `DROP TABLE` is not in the stream, so the source catalog is polled and the action passes six guards before any DDL. A dropped-and-recreated relation retains its old image, is marked `awaiting_snapshot`, and is **re-snapshotted automatically on the next run**; the replacement or final source-missing policy owns any destruction. Held at 4 through the 1.6-1.8 review because the rebuild machinery could delete a live destination table it had merely not reached; that is closed with positive-evidence emptiness and multi-table proof (ADR §19/A52). A mass drop still needs an operator, deliberately. |
 | 1.6 | Snapshot/backfill consistent with CDC | ~~3~~ → **5** | Postgres's **exported snapshot** makes the boundary an iff, and the fence is on the transaction's **commit** LSN, so a transaction straddling `C` is applied in full rather than lost. Proven with ~200 transactions committing throughout a snapshot — every row on exactly one side. A re-snapshot is complete only when **every requested table** reaches a terminal state: swapped, or verified empty on three independent facts (Debezium's own end-of-snapshot marker, zero records for that table, and a source count of zero). A disagreement between the two readings of `C` is fatal. Proven against a four-table re-snapshot with a keyless table, a genuinely empty table and a concurrent writer. |
 | 1.7 | Failures do not cause correctness issues | ~~1~~ ~~4~~ → **3** | **Twenty-one in-process anchors**: eight protocol, five destination (including the genuinely ambiguous `destination_commit_late`), seven recovery/catalog-baseline, and one source-catalog fault, plus a real network blackhole injected from outside the process. The matrix is enumerated from `faults.ALL_POINTS`, every anchor writes a machine-readable fired record, and the chaos harness asserts each workload affected source rows before arming. Round 7 still scores this 3/5: substantial evidence, but repeated adversarial compositions were found outside the suite, so the 5-band's “robust injection” is not yet the reviewer's verdict. |
 | 1.8 | Externally-advanced slot detected → backfill | ~~1~~ → **5** | Checked on every slot acquisition. Seven decisions trigger an **automatic** re-snapshot: slot ahead, slot missing, slot recreated, source identity changed, **source timeline forked**, source WAL rewound, and an empty destination with a positioned slot. The recovery is a **journalled state machine**: the intent is durable before any mutation, every step is idempotent and re-entrant after a crash at any phase, and a slot that will not drop fails the recovery rather than being logged and stepped over. A **populated** destination with no resume point refuses instead of being rebuilt. Proven by comparing the whole destination against the whole source after a real `pg_replication_slot_advance` and a real `pg_drop_replication_slot`, and by cutting the recovery at every phase boundary. |
@@ -926,8 +926,10 @@ fenced destination policy and DDL.
 
 The watcher fails safe on source errors: an observation error creates no commit-path
 authority or acknowledgement. The breaker refuses the **whole** set, never the first N, and raises a `critical`
-alert that survives a rollback. A `recreated` relation is dropped, alerted on, and
-marked `awaiting_snapshot` in `table_state`, which `inspect` and the run summary print.
+alert that survives a rollback. A `recreated` relation retains its old image, is
+quarantined and marked `awaiting_snapshot` in `table_state`, which `inspect` and the
+run summary print; the replacement snapshot or final source-missing policy owns any
+later destruction.
 
 **Ownership.** "A replicated table absent from `pg_class` is always detected" was not
 durably true: the watcher seeds itself from `_cdc_flight.table_state`, and that row was
@@ -1067,8 +1069,8 @@ cannot silently restore "truncates are skipped".
 #### Falsifiers (what would drop this score — and what keeps it off 5)
 
 * ~~**No automatic re-snapshot for a recreated relation. This is why the score is 4.**~~
-  **Closed 2026-07-31.** A recreated relation is dropped, marked `awaiting_snapshot` and
-  rebuilt automatically on the next run through `cdc_flight.resnapshot`, proven end to
+  **Closed 2026-07-31.** A recreated relation retains its old image, is marked
+  `awaiting_snapshot` and rebuilt automatically on the next run through `cdc_flight.resnapshot`, proven end to
   end against a relation recreated with rows that produce no change events at all
   (`test_1_6_recreated_relation.py`). The stale text that still argued for a 4 lived here
   and in the section heading while the summary table said 5 — the file's own preamble

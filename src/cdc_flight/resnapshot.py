@@ -1,9 +1,10 @@
 """Re-snapshotting a table that CDC cannot rebuild (rubric 1.6, 1.8, and 1.5's last mark).
 
 Three separate items need the same thing and none of them had it: rubric 1.5's
-`recreated` relation is dropped and left `awaiting_snapshot`; rubric 1.8's answer to an
-externally advanced slot is "trigger a backfill automatically"; rubric 1.6 cannot claim
-consistency for a re-snapshot it does not perform. This module is that one thing.
+`recreated` relation retains its old image while it is left `awaiting_snapshot`; rubric
+1.8's answer to an externally advanced slot is "trigger a backfill automatically";
+rubric 1.6 cannot claim consistency for a re-snapshot it does not perform. This module
+is that one thing.
 
 ## The mechanism, and why this one
 

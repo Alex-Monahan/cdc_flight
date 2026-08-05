@@ -14,8 +14,8 @@ shape as `source_health.py` - and answers four questions per replicated table:
 
 | observation | change | what 1.5 does with it |
 |---|---|---|
-| the name is gone from `pg_class` | `dropped` | drop the destination table |
-| the name is back with a different `oid` | `recreated` | drop the destination table and mark it `awaiting_snapshot` (rubric 2.3/3.4 owns rebuilding it) |
+| the name is gone from `pg_class` | `dropped` | apply the configured source-missing policy (`DROP_LOG` retains/audits; `DROP_REPLICATE` removes) |
+| the name is back with a different `oid` | `recreated` | retain the old destination image, mark it `awaiting_snapshot`, and let the replacement snapshot or final source-missing policy own destruction |
 | the name is there but no longer in the publication | `unpublished` | nothing but a marker + alert: Postgres still holds the rows, so dropping the destination would destroy data the source has |
 | a table in the watched schemas we have never seen | `new` | add it to a table-scoped publication, audit it, and hand it to the existing single-table re-snapshot path (rubric 2.3) |
 
@@ -41,12 +41,13 @@ timer would drop a table whose in-flight events then re-create it as a zombie.
 non-zero grace is **excluded from the structural correctness claim** - it applies a
 destructive action before the fence that makes it safe.
 
-**Confirmation.** A destructive change is queued only after the relation has been
-absent (or the oid changed) on `CDC_DROP_CONFIRM_POLLS` consecutive polls (default 2),
-and a relation that reappears **cancels** any pending destructive action for it. A
-poll that observes *zero* relations in the schema is discarded outright: that is the
-wrong-database / mid-restore signature and can never legitimately mean "drop
-everything" (Opus Q2/Q5).
+**Confirmation.** A catalog change is queued only after the relation has been absent
+(or its oid changed) on `CDC_DROP_CONFIRM_POLLS` consecutive polls (default 2). A
+newer observed generation supersedes the stale observation while preserving the
+`awaiting_snapshot` obligation; it never turns a retained recreate image into an
+unquarantined drop. A poll that observes *zero* relations in the schema is discarded
+outright: that is the wrong-database / mid-restore signature and can never legitimately
+mean "drop everything" (Opus Q2/Q5).
 """
 
 from __future__ import annotations
@@ -653,9 +654,9 @@ class CatalogWatcher:
                         if change is not None:
                             added.append(change)
                             # Recorded only now, and `dirty()` excludes it while the
-                            # destructive action is still pending, so the oid becomes
-                            # history in the SAME transaction that drops the table and
-                            # marks it owed - never before.
+                            # replacement obligation is still pending, so the oid
+                            # becomes history in the SAME transaction that records the
+                            # lifecycle quarantine and marks it owed - never before.
                             self.known[name] = current
                             self._dirty[name] = current
                         continue
@@ -766,8 +767,8 @@ class CatalogWatcher:
             )
         for name in superseded:
             log.warning(
-                "cancelling a pending destructive action for %s: the relation is "
-                "present at the source again", name,
+                "superseding a stale catalog action for %s: the relation is present "
+                "at the source again", name,
             )
         return added
 
@@ -797,9 +798,6 @@ class CatalogWatcher:
 
     def supersede_recreated(self, change: CatalogChange, current) -> CatalogChange | None:
         return catalog_change_queue.supersede_recreated(self, change, current)
-
-    def reclassify_recreated_as_drop(self, change: CatalogChange) -> CatalogChange:
-        return catalog_change_queue.reclassify_recreated_as_drop(self, change)
 
     def _emit_marker(self, conn, changes: list[CatalogChange]) -> None:
         """Write a WAL record past the detected change, so the fence can open.
