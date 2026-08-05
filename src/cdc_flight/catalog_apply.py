@@ -13,10 +13,11 @@ Four guards, in the order they run:
 2. **supersession** — a newer observation cancels an older pending action for the
    same relation, so a table that came back before its drop was applied is never
    dropped (`CatalogWatcher._supersede`, Codex 4);
-3. **revalidation** — the relation is re-queried on the watcher's own connection
-   immediately before the DDL, and a relation that exists is not dropped no matter
-   how old the queued observation is. Fails **closed**: if the source cannot be
-   asked, nothing is destroyed;
+3. **revalidation** — the source generation proof is acquired on a separate source
+   transaction at the last moment, with an `ACCESS SHARE` lease held through the
+   destination commit. A relation that exists is not dropped when the proof says the
+   queued fact is stale. Fails **closed**: if the source cannot be proved, nothing is
+   destroyed;
 4. **the circuit breaker** — one poll may destroy at most `CDC_DROP_MAX_PER_POLL`
    relations (default 1). Every plural case is a schema migration or a
    misconfiguration, and both want a human (Opus MAJOR-3 / Q2). None of the set is
@@ -77,27 +78,55 @@ class _Skipped:
 SKIPPED = _Skipped()
 
 
-def _stale(change: CatalogChange, oid) -> str | None:
+def _stale(change: CatalogChange, generation) -> str | None:
     """Why this destructive change must not be applied, or None if it still holds."""
-    if oid is SKIPPED:
+    if generation is SKIPPED:
         return None
-    if oid is UNKNOWN:
-        return "the source could not be re-read to confirm it"
+    if generation is None:
+        return "the source generation proof is absent"
+    if generation.state in {
+        catalog_generation.GENERATION_UNKNOWN,
+        catalog_generation.GENERATION_AMBIGUOUS,
+        catalog_generation.GENERATION_BOUNDARY_UNPROVEN,
+    }:
+        return f"the source generation proof is {generation.state}"
     if change.kind == CHANGE_DROPPED:
-        if oid is not None:
-            return f"the relation exists at the source again (oid {oid})"
-        return None
-    # CHANGE_RECREATED: the source relation exists, and the destination table is only
-    # wrong because it holds a DIFFERENT relation's rows. That is still true only if
-    # the oid we observed is the oid that is there now.
-    if oid is None:
-        return "the relation has since been dropped; the drop will be detected on its own"
-    if change.new_oid is not None and oid != change.new_oid:
+        if generation.state == catalog_generation.GENERATION_ABSENT:
+            return None
         return (
-            f"the relation was replaced again (oid {oid}, not the observed "
-            f"{change.new_oid}); a newer observation supersedes this one"
+            "the relation exists at the source again "
+            f"(identity {generation.current_identity})"
         )
-    return None
+    # A recreated action is safe only when the same complete token is still present.
+    if generation.state == catalog_generation.GENERATION_ABSENT:
+        return "the relation has since been dropped; the drop will be detected on its own"
+    if generation.state == catalog_generation.GENERATION_NEWER:
+        return (
+            "the relation was replaced again "
+            f"(identity {generation.current_identity}); a newer observation supersedes this one"
+        )
+    return None if generation.state == catalog_generation.GENERATION_CURRENT else (
+        f"the source generation proof is {generation.state}"
+    )
+
+
+def _same_oid_rewrite(change: CatalogChange) -> bool:
+    """Whether the observed change differs only in PostgreSQL's physical token."""
+    old = catalog_generation.coerce_identity(
+        change.old_identity or change.old_oid or change.old_relation
+    )
+    new = catalog_generation.coerce_identity(
+        change.new_identity or change.new_oid or change.new_relation
+    )
+    return bool(
+        old
+        and new
+        and old.oid == new.oid
+        and old.relfilenode != new.relfilenode
+        and old.reltype_oid == new.reltype_oid
+        and old.complete
+        and new.complete
+    )
 
 
 @dataclass(frozen=True)
@@ -119,6 +148,11 @@ class CatalogPlan:
     #: destructive changes deliberately held back, with the reason
     refused: tuple[tuple[CatalogChange, str], ...] = ()
     alerts: list = field(default_factory=list)
+    #: The exact proof consumed to make the revalidation decisions in this plan.
+    generation_proof: dict = field(default_factory=dict)
+    #: Same-OID physical rewrites proven by a streamed TRUNCATE. They refresh the
+    #: durable token but do not quarantine the destination image.
+    generation_refreshes: tuple[CatalogChange, ...] = ()
 
     @property
     def destructive(self) -> tuple[CatalogAction, ...]:
@@ -166,7 +200,13 @@ class CatalogCoordinator:
     # planning
     # ------------------------------------------------------------------ #
     def plan(
-        self, durable_lsn: int, *, source_oids: dict[str, object] | None = None
+        self,
+        durable_lsn: int,
+        *,
+        source_proof: dict[str, object] | None = None,
+        strict_boundary: bool = False,
+        streamed_truncates: set[str] | None = None,
+        streamed_rows: set[str] | None = None,
     ) -> CatalogPlan:
         if not self.enabled:
             return CatalogPlan()
@@ -185,6 +225,9 @@ class CatalogCoordinator:
         actions: list[CatalogAction] = []
         refused: list[tuple[CatalogChange, str]] = []
         alerts: list[dict] = []
+        generation_refreshes: list[CatalogChange] = []
+        streamed_truncates = streamed_truncates or set()
+        streamed_rows = streamed_rows or set()
 
         new_changes = [change for change in due if change.kind == CHANGE_NEW]
         if len(new_changes) > 1:
@@ -212,7 +255,12 @@ class CatalogCoordinator:
         destructive_changes = [
             c
             for c in due
-            if c.kind in DESTRUCTIVE and self.drop_mode == DROP_REPLICATE
+            if c.kind in DESTRUCTIVE
+            and self.drop_mode == DROP_REPLICATE
+            and not (
+                _same_oid_rewrite(c)
+                and c.qualified in streamed_truncates
+            )
         ]
         limit = self.max_destructive_per_group
         blocked: set[int] = set()
@@ -263,21 +311,63 @@ class CatalogCoordinator:
             if c.kind == CHANGE_RECREATED
             or (c.kind == CHANGE_DROPPED and self.drop_mode == DROP_REPLICATE)
         ]
-        oids = self._source_oids(
+        proofs = self._source_proofs(
             [c for c in revalidation_changes if id(c) not in blocked],
-            source_oids=source_oids,
+            source_proof=source_proof,
         )
         for change in due:
             if change.kind == CHANGE_RECREATED:
-                generation = catalog_generation.check(
-                    change.new_oid, oids.get(change.qualified, UNKNOWN)
+                raw_proof = proofs.get(change.qualified, UNKNOWN)
+                same_oid_rewrite = _same_oid_rewrite(change)
+                expected_identity = (
+                    (change.old_identity or change.old_oid)
+                    if same_oid_rewrite
+                    else (change.new_identity or change.new_oid)
+                )
+                generation = (
+                    raw_proof
+                    if raw_proof is SKIPPED
+                    else catalog_generation.check(
+                        expected_identity,
+                        raw_proof,
+                        minimum_lsn=durable_lsn if strict_boundary else None,
+                    )
                 )
                 if generation.state == catalog_generation.GENERATION_NEWER:
+                    if same_oid_rewrite:
+                        observed_generation = catalog_generation.check(
+                            change.new_identity or change.new_oid,
+                            raw_proof,
+                            minimum_lsn=durable_lsn if strict_boundary else None,
+                        )
+                        if (
+                            observed_generation.state
+                            == catalog_generation.GENERATION_CURRENT
+                            and change.qualified in streamed_truncates
+                        ):
+                            generation_refreshes.append(change)
+                            continue
+                        if (
+                            observed_generation.state
+                            == catalog_generation.GENERATION_CURRENT
+                            and change.qualified not in streamed_rows
+                        ):
+                            reason = (
+                                "same-OID relfilenode change is ambiguous without a "
+                                "streamed TRUNCATE or replacement row at this boundary"
+                            )
+                            change.to(CHANGE_REFUSED)
+                            refused.append((change, reason))
+                            log.warning(
+                                "not applying %s: %s (the change stays pending)",
+                                change.qualified,
+                                reason,
+                            )
+                            continue
                     # The source advanced again while the queued action was waiting.
                     # Replace the obligation and apply only the newest generation.
-                    replacement = catalog_generation.supersede_recreated(
-                        self.catalog,
-                        change, int(generation.current_oid)
+                    replacement = self.catalog.supersede_recreated(
+                        change, generation.current_identity or generation.current_oid
                     )
                     if replacement is None:
                         # No full relation observation exists to construct a safe
@@ -294,14 +384,21 @@ class CatalogCoordinator:
                         continue
                     change = replacement
                 elif generation.state == catalog_generation.GENERATION_ABSENT:
+                    if strict_boundary:
+                        reason = (
+                            "the final source proof is absent; the replacement may have "
+                            "come and gone, so its retained image is fenced"
+                        )
+                        change.to(CHANGE_REFUSED)
+                        refused.append((change, reason))
+                        log.warning("not applying %s: %s", change.qualified, reason)
+                        continue
                     # A->B was never applied and B is now gone. It is a genuine final
                     # drop, not a replacement quarantine; the configured drop mode now
                     # owns the outcome (DROP_LOG retains A, DROP_REPLICATE removes it).
-                    change = catalog_generation.reclassify_recreated_as_drop(
-                        self.catalog, change
-                    )
-                elif generation.state == catalog_generation.GENERATION_UNKNOWN:
-                    reason = _stale(change, generation.current_oid)
+                    change = self.catalog.reclassify_recreated_as_drop(change)
+                elif generation.state != catalog_generation.GENERATION_CURRENT:
+                    reason = _stale(change, generation)
                     change.to(CHANGE_REFUSED)  # rubric 1.9 (SM-D)
                     refused.append((change, reason or "source generation is unknown"))
                     log.warning(
@@ -319,7 +416,18 @@ class CatalogCoordinator:
                 self.topic_prefix, change.schema, change.table
             )
             if destructive:
-                reason = _stale(change, oids.get(change.qualified, UNKNOWN))
+                expected = (
+                    (change.new_identity or change.new_oid)
+                    if change.kind == CHANGE_RECREATED
+                    else (change.old_identity or change.old_oid)
+                )
+                raw_proof = proofs.get(change.qualified, UNKNOWN)
+                generation = (
+                    raw_proof
+                    if raw_proof is SKIPPED
+                    else catalog_generation.check(expected, raw_proof)
+                )
+                reason = _stale(change, generation)
                 if reason is not None:
                     # Guard 3, fail-closed. The queued observation and the DDL are
                     # separated by the fence, and the fence can be arbitrarily wide on
@@ -400,6 +508,7 @@ class CatalogCoordinator:
         # opposite case: the destination table remains, so its durable pre-drop
         # identity must remain with it for catalog-baseline confirmation.
         applied = {id(a.change) for a in actions}
+        applied.update(id(change) for change in generation_refreshes)
         remaining = {
             change.qualified
             for change in self.catalog.pending()
@@ -437,29 +546,85 @@ class CatalogCoordinator:
             relations=tuple(relations),
             refused=tuple(refused),
             alerts=alerts,
+            generation_proof=proofs,
+            generation_refreshes=tuple(generation_refreshes),
         )
 
-    def _source_oids(
+    def read_generation_proof(self, names) -> dict[str, catalog_generation.GenerationProof]:
+        """Read a non-locking planning proof; the commit boundary uses a lease."""
+        names = set(names)
+        if not names:
+            return {}
+        if self.catalog is None or not hasattr(self.catalog, "relation_oids"):
+            return {
+                f"{schema}.{table}": catalog_generation.GenerationProof.unknown(
+                    "catalog watcher has no generation reader"
+                )
+                for schema, table in names
+            }
+        try:
+            values = self.catalog.relation_oids(names)
+        except Exception as exc:  # fail closed
+            log.warning("could not read source generations: %s", exc)
+            return {
+                f"{schema}.{table}": catalog_generation.GenerationProof.unknown(str(exc))
+                for schema, table in names
+            }
+        return {
+            f"{schema}.{table}": catalog_generation.coerce_proof(
+                values.get(f"{schema}.{table}")
+            )
+            for schema, table in names
+        }
+
+    def acquire_generation_proof(self, names) -> catalog_generation.GenerationProofLease:
+        """Acquire the last-moment proof and source DDL lease."""
+        names = set(names)
+        if not names:
+            return catalog_generation.GenerationProofLease({})
+        if self.catalog is None:
+            return catalog_generation.GenerationProofLease(
+                {
+                    f"{schema}.{table}": catalog_generation.GenerationProof.unknown(
+                        "catalog watcher is unavailable"
+                    )
+                    for schema, table in names
+                }
+            )
+        method = getattr(self.catalog, "generation_proof_lease", None)
+        if method is not None:
+            return method(names)
+        return catalog_generation.GenerationProofLease(
+            self.read_generation_proof(names)
+        )
+
+    def _source_proofs(
         self,
         changes: list[CatalogChange],
         *,
-        source_oids: dict[str, object] | None = None,
+        source_proof: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        """The relations' oids *right now*, read on the watcher's own connection.
+        """Return the proof used by every revalidation decision in this plan.
 
-        `UNKNOWN` for every relation when the source cannot be asked, which
-        `_stale()` turns into a refusal: "I could not ask" must never be read as
-        "it is gone".
+        Plain drops retain the documented ``CDC_DROP_REVALIDATE=0`` escape hatch.
+        Recreates never do: a replacement action always needs a generation proof.
         """
         if not changes:
             return {}
         names = {(c.schema, c.table) for c in changes}
-        if source_oids is not None:
+        if source_proof is not None:
             return {
-                f"{schema}.{table}": source_oids.get(
-                    f"{schema}.{table}", UNKNOWN
+                f"{schema}.{table}": (
+                    SKIPPED
+                    if (
+                        not self.revalidate
+                        and c.kind == CHANGE_DROPPED
+                    )
+                    else source_proof.get(f"{schema}.{table}", UNKNOWN)
                 )
                 for schema, table in names
+                for c in changes
+                if c.qualified == f"{schema}.{table}"
             }
         if not self.revalidate:
             # Recreates are never allowed to opt out of the generation check.  The
@@ -467,17 +632,11 @@ class CatalogCoordinator:
             recreate_names = {c.qualified for c in changes if c.kind == CHANGE_RECREATED}
             return {
                 f"{schema}.{table}": (
-                    SKIPPED
-                    if f"{schema}.{table}" not in recreate_names
-                    else UNKNOWN
+                    UNKNOWN if f"{schema}.{table}" in recreate_names else SKIPPED
                 )
                 for schema, table in names
             }
-        try:
-            return dict(self.catalog.relation_oids(names))
-        except Exception as exc:  # pragma: no cover - fail closed on any source error
-            log.warning("could not revalidate %s before dropping: %s", sorted(names), exc)
-            return dict.fromkeys((f"{s}.{t}" for s, t in names), UNKNOWN)
+        return self.read_generation_proof(names)
 
     # ------------------------------------------------------------------ #
     # applying, inside the commit group's transaction
@@ -590,6 +749,8 @@ class CatalogCoordinator:
                 source_schema=relation.schema,
                 source_table=relation.table,
                 relation_oid=relation.oid,
+                relation_filenode=relation.relfilenode,
+                relation_type_oid=relation.relation_type_oid,
                 published=relation.published,
                 admission_state=require_admission_state(relation.admission_state),
                 replica_identity=relation.replica_identity,
@@ -708,6 +869,7 @@ class CatalogCoordinator:
         if self.catalog is None:
             return
         changes = [action.change for action in plan.actions]
+        changes.extend(plan.generation_refreshes)
         if changes:
             # rubric 1.9 (SM-D): `due -> applied` is terminal, and it is recorded only
             # AFTER the COMMIT for the same reason `resolve()` is - a change marked

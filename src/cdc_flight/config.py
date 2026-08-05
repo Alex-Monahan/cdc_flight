@@ -229,8 +229,8 @@ def applier_settings() -> dict:
         #: rubric 1.5. `replicate` empties the destination table inside the commit
         #: group, exactly as Postgres emptied the source, and records a marker in
         #: `_cdc_flight.table_events`. `log` records the marker and keeps the rows
-        #: (the rubric's "tombstone/soft delete" behaviour, =3). `ignore` restores
-        #: Debezium's default of not even decoding the event.
+        #: (the rubric's "tombstone/soft delete" behaviour, =3). `ignore` is a
+        #: destination no-op; the raw event remains decoded for generation proofing.
         "truncate_mode": _env("CDC_TRUNCATE_MODE", TRUNCATE_REPLICATE).strip().lower(),
         #: rubric 1.5. `replicate` drops the destination table when the source table
         #: is gone; `log` records the marker only; `ignore` disables detection.
@@ -244,9 +244,8 @@ def applier_settings() -> dict:
         #: refused, never half of it.
         "drop_max_per_group": int(_env("CDC_DROP_MAX_PER_POLL", "1")),
         "drop_allow_mass": _flag("CDC_DROP_ALLOW_MASS", False),
-        #: Re-read the relation immediately before destroying its destination table,
-        #: and fail closed if the source cannot be asked (Codex 4). Off only for tests
-        #: that drive the coordinator without a real source.
+        #: Disable only the plain-drop DDL revalidation. Replacement generations still
+        #: require the final proof because bypassing that fence can merge lifecycles.
         "drop_revalidate": _flag("CDC_DROP_REVALIDATE", True),
         #: rubric 4.7. An undecidable fold used to be a PERMANENT failure: the group
         #: rolls back (correctly), the transaction replays, the same ambiguity is hit,

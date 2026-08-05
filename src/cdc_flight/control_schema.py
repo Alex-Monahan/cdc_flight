@@ -127,14 +127,17 @@ CONTROL_DDL = [
             detail          VARCHAR
         )""",
     # rubric 1.5 / 2.3. What the source catalog looked like the last time we saw it.
-    # The `relation_oid` is the load-bearing column: it is the only thing that tells a
-    # dropped-and-recreated table from the one we were replicating, and persisting it
-    # is what makes that detection survive a restart.
+    # The `(relation_oid, relation_filenode, relation_type_oid)` tuple is the
+    # load-bearing generation token. OIDs can be reused, while a recreate gets a new
+    # relfilenode; partitioned parents keep relfilenode=0, so their row type completes
+    # the proof.
     f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.source_relations (
             pipeline          VARCHAR     NOT NULL,
             source_schema     VARCHAR     NOT NULL,
             source_table      VARCHAR     NOT NULL,
             relation_oid      BIGINT      NOT NULL,
+            relation_filenode BIGINT,
+            relation_type_oid BIGINT,
             published         BOOLEAN     NOT NULL,
             -- Publication membership and admission ownership are separate facts.
             -- `admission_state` is the durable PUBLICATION_ADMISSION machine: a
@@ -371,6 +374,8 @@ _ADDED_COLUMNS = {
     ),
     "source_relations": (
         ("columns_json", "VARCHAR"),
+        ("relation_filenode", "BIGINT"),
+        ("relation_type_oid", "BIGINT"),
         # MotherDuck/DuckDB reject constraints in ALTER TABLE ... ADD COLUMN.
         # The state is backfilled and checked below in this same transaction; the
         # application/state-machine boundary is the invariant for already-created

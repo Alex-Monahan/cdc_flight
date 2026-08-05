@@ -22,17 +22,66 @@ def flush_table_events(applier, commit_id: int) -> None:
 
 def plan_catalog_changes(applier, durable_lsn: int):
     coordinator = applier.catalog_coordinator
+    if applier.catalog is None:
+        return None
+    streamed_truncates, streamed_rows = unit_admission.generation_stream_evidence(applier)
+    names = unit_admission.source_generation_names(applier)
+    applier.group.source_generation_plan = coordinator.read_generation_proof(
+        {tuple(name.split(".", 1)) for name in names}
+    )
     if not coordinator.enabled:
         return None
-    unit_admission.prepare_source_identity_cache(applier)
     plan = coordinator.plan(
         durable_lsn,
-        source_oids=applier.group.source_identity_oids,
+        source_proof=applier.group.source_generation_plan,
+        streamed_truncates=streamed_truncates,
+        streamed_rows=streamed_rows,
     )
-    if not plan.actions and not plan.relations and not plan.alerts:
+    if (
+        not plan.actions
+        and not plan.relations
+        and not plan.alerts
+        and not plan.generation_refreshes
+    ):
         return None
     applier.group.catalog_plan = plan
     return plan
+
+
+def refresh_generation_boundary(applier, durable_lsn: int, plan):
+    """Acquire the one final proof shared by admission and catalog apply.
+
+    The lease is intentionally returned to the commit protocol rather than stored in
+    ``OpenGroup``. It is released after destination COMMIT and acknowledgement cleanup,
+    outside the MotherDuck commit-to-ack window, and on every rollback path.
+    """
+    if applier.catalog is None:
+        return plan, None
+    streamed_truncates, streamed_rows = unit_admission.generation_stream_evidence(applier)
+    names = unit_admission.source_generation_names(applier, catalog_plan=plan)
+    lease = applier.catalog_coordinator.acquire_generation_proof(
+        {tuple(name.split(".", 1)) for name in names}
+    )
+    applier.group.source_generation_final = lease.proofs
+    if not applier.catalog_coordinator.enabled:
+        return plan, lease
+    final_plan = applier.catalog_coordinator.plan(
+        durable_lsn,
+        source_proof=lease.proofs,
+        strict_boundary=True,
+        streamed_truncates=streamed_truncates,
+        streamed_rows=streamed_rows,
+    )
+    if (
+        final_plan.actions
+        or final_plan.relations
+        or final_plan.refused
+        or final_plan.alerts
+        or final_plan.generation_refreshes
+    ):
+        applier.group.catalog_plan = final_plan
+        return final_plan, lease
+    return plan, lease
 
 
 def apply_catalog_phase(
@@ -60,8 +109,15 @@ def apply_catalog_phase(
         actions=actions,
         relations=relations,
         refused=plan.refused if not schema_only else (),
+        generation_proof=plan.generation_proof,
+        generation_refreshes=plan.generation_refreshes if not schema_only else (),
     )
-    if not phase.actions and not phase.relations and not phase.refused:
+    if (
+        not phase.actions
+        and not phase.relations
+        and not phase.refused
+        and not phase.generation_refreshes
+    ):
         return
     applier.group.table_events.extend(
         applier.catalog_coordinator.apply(applier.con, phase, stats)
@@ -84,6 +140,7 @@ def settle_catalog(applier, group_obj) -> None:
     if applier.catalog is None:
         return
     plan = group_obj.catalog_plan
+    unit_admission.settle_generation_stream_evidence(applier, group_obj, plan)
     if plan is not None:
         applier.catalog_coordinator.settle(plan, group_obj.source_tables)
         group_obj.catalog_plan = None

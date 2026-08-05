@@ -116,9 +116,9 @@ def run(
 
     replication.state_dir.mkdir(parents=True, exist_ok=True)
     settings = applier_settings()
-    # `skipped.operations` is what decides whether a TRUNCATE is decoded at all, so
-    # the truncate policy has to be known before the engine properties are built
-    # (rubric 1.5).
+    # `skipped.operations` decides whether a TRUNCATE is decoded at all. The pipeline
+    # always retains it so the generation fence can distinguish a physical rewrite
+    # from a replacement; the destination truncate policy is applied later.
     props = build_properties(
         source,
         replication,
@@ -610,7 +610,7 @@ def run(
                 # are owed a rebuild *because this run could not relate the rows they
                 # hold to any identity at the source*, so continuing would stream the
                 # replacement relation's events onto the old relation's rows and — worse
-                # — let the watcher adopt the replacement oid, after which nothing can
+                # — let the watcher adopt the replacement generation, after which nothing can
                 # ever detect it again. Measured: source `[999]`, destination
                 # `[1, 2, 999]`, lifecycle `awaiting_snapshot`, registry at the new oid,
                 # baseline `valid`, exit 0.

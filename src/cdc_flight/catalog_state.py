@@ -48,6 +48,12 @@ class SourceRelation:
     published: bool
     replica_identity: str
     columns: tuple[SourceColumn, ...] = ()
+    # OIDs can be reused after DROP/CREATE.  The source catalog's relfilenode is
+    # the physical half of the durable lifecycle token; relation_type_oid completes
+    # it for partitioned parents, whose relfilenode is always 0.  Both are nullable
+    # only for legacy destination rows and lightweight test doubles.
+    relfilenode: int | None = None
+    relation_type_oid: int | None = None
     publication_all_tables: bool = False
     is_partition: bool = False
     admission_state: str | _AdmissionStateUnset | None = _ADMISSION_STATE_UNSET
@@ -73,6 +79,10 @@ class CatalogChange:
     detected_at: float = field(default_factory=time.monotonic)
     old_oid: int | None = None
     new_oid: int | None = None
+    # Strong generation tokens carried alongside the old integer fields for
+    # compatibility with existing audit consumers.
+    old_identity: object | None = None
+    new_identity: object | None = None
     #: The relation whose destination image this action still represents.  A queued
     #: A->B recreate may be superseded by B->C before its destination action commits;
     #: carrying A here lets a later final drop retain the correct log image rather than
@@ -113,6 +123,8 @@ class CatalogChange:
             "detected_lsn": self.detected_lsn,
             "old_oid": self.old_oid,
             "new_oid": self.new_oid,
+            "old_identity": repr(self.old_identity),
+            "new_identity": repr(self.new_identity),
             "columns": [
                 {
                     "kind": change.kind,
@@ -159,13 +171,24 @@ def _missing_value(raw: str | None, type_name: str) -> object | None:
 
 def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
     rows = con.execute(
-        f"SELECT source_schema, source_table, relation_oid, published, replica_identity, "
-        "columns_json, admission_state "
+        f"SELECT source_schema, source_table, relation_oid, relation_filenode, "
+        "relation_type_oid, "
+        "published, replica_identity, columns_json, admission_state "
         f"FROM {CONTROL_SCHEMA}.source_relations WHERE pipeline = ?",
         [pipeline],
     ).fetchall()
     known: dict[str, SourceRelation] = {}
-    for schema, table, oid, published, identity, columns_json, admission_state in rows:
+    for (
+        schema,
+        table,
+        oid,
+        relfilenode,
+        relation_type_oid,
+        published,
+        identity,
+        columns_json,
+        admission_state,
+    ) in rows:
         try:
             raw_columns = json.loads(columns_json or "[]")
         except (TypeError, ValueError):
@@ -188,6 +211,10 @@ def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
             schema=schema,
             table=table,
             oid=int(oid or 0),
+            relfilenode=(int(relfilenode) if relfilenode is not None else None),
+            relation_type_oid=(
+                int(relation_type_oid) if relation_type_oid is not None else None
+            ),
             published=bool(published),
             replica_identity=identity or "d",
             columns=columns,

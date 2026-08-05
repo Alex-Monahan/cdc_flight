@@ -11,6 +11,8 @@ CATALOG_SQL = """
 SELECT n.nspname                                  AS source_schema,
        c.relname                                  AS source_table,
        c.oid::bigint                              AS relation_oid,
+       c.relfilenode::bigint                      AS relation_filenode,
+       c.reltype::bigint                          AS relation_type_oid,
        c.relreplident                             AS replica_identity,
        (
            COALESCE(p.puballtables, false)
@@ -47,12 +49,14 @@ WHERE c.relkind IN ('r', 'p')
       (%s::text[] IS NULL AND n.nspname NOT IN ('pg_catalog', 'information_schema', '_cdc_flight'))
       OR n.nspname = ANY(%s::text[])
   )
-GROUP BY n.nspname, c.relname, c.oid, c.relreplident, p.puballtables,
+GROUP BY n.nspname, c.relname, c.oid, c.relfilenode, c.reltype, c.relreplident,
+         p.puballtables,
          pr.prrelid, inh.inhparent, parent_pr.prrelid
 """
 
 OID_SQL = """
-SELECT n.nspname, c.relname, c.oid::bigint
+SELECT n.nspname, c.relname, c.oid::bigint, c.relfilenode::bigint,
+       c.reltype::bigint
 FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE c.relkind IN ('r', 'p') AND (n.nspname, c.relname) IN (SELECT * FROM unnest(%s::text[], %s::text[]))

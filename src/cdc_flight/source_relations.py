@@ -4,12 +4,13 @@ Split out of `destination.py`, which crossed the thermo-nuclear review's 1,000-l
 giant-file threshold. This is a coherent piece rather than an arbitrary cut: three
 functions, one table, one job — `_cdc_flight.source_relations` is the **only** thing that
 makes a `DROP TABLE` or a drop-and-recreate detectable across a restart, because the
-persisted `relation_oid` is what the next run compares against.
+persisted `(relation_oid, relation_filenode, relation_type_oid)` token is what the
+next run compares against.
 
 That is also why the flush below exists at all. The registry used to be written
 exclusively inside a commit group, so a run that committed **no groups** persisted
 nothing it had learned — and after an offline drop-and-recreate the next run accepted the
-replacement oid as though it had always owned that relation, leaving the old relation's
+replacement generation token as though it had always owned that relation, leaving the old relation's
 rows beside the new one's for ever (Codex r3 BLOCKER-1, reproduced end to end).
 """
 
@@ -40,6 +41,8 @@ def upsert_source_relation(
     source_schema: str,
     source_table: str,
     relation_oid: int,
+    relation_filenode: int | None = None,
+    relation_type_oid: int | None = None,
     published: bool,
     replica_identity: str | None,
     admission_state: str = "external",
@@ -65,11 +68,12 @@ def upsert_source_relation(
     )
     con.execute(
         f"INSERT INTO {CONTROL_SCHEMA}.source_relations "
-        "(pipeline, source_schema, source_table, relation_oid, published, "
-        " admission_state, replica_identity, columns_json, first_seen_at, last_seen_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "(pipeline, source_schema, source_table, relation_oid, relation_filenode, "
+        " relation_type_oid, published, admission_state, replica_identity, "
+        " columns_json, first_seen_at, last_seen_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         [
-            pipeline, source_schema, source_table, relation_oid, published,
+            pipeline, source_schema, source_table, relation_oid, relation_filenode,
+            relation_type_oid, published,
             admission_state,
             replica_identity,
             json.dumps(
@@ -110,13 +114,13 @@ def flush_learned_relations(
     """Persist what the catalog watcher learned, in its own transaction. Returns names.
 
     `source_relations` is the ONLY thing that makes a `DROP TABLE` or a
-    drop-and-recreate detectable across a restart: without the persisted
-    `relation_oid` the next run has nothing to compare against. It was written
+    drop-and-recreate detectable across a restart: without the persisted generation
+    token the next run has nothing to compare against. It was written
     exclusively through `CatalogCoordinator.apply()`, which runs inside a commit group —
     so a run that committed **no groups at all** persisted nothing, and everything the
     watcher had learned vanished at shutdown (Codex r3 BLOCKER-1). The measured
     consequence: a quiet run, then an offline drop-and-recreate, and the next run
-    accepts the replacement oid as though it had always owned that relation — leaving
+    accepts the replacement token as though it had always owned that relation — leaving
     the old relation's rows beside the new one's, permanently, because from then on the
     persisted oid agrees with the source.
 
@@ -155,6 +159,8 @@ def flush_learned_relations(
                 source_schema=relation.schema,
                 source_table=relation.table,
                 relation_oid=relation.oid,
+                relation_filenode=relation.relfilenode,
+                relation_type_oid=relation.relation_type_oid,
                 published=relation.published,
                 replica_identity=relation.replica_identity,
                 admission_state=require_admission_state(relation.admission_state),

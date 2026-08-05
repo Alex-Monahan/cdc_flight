@@ -233,12 +233,12 @@ def build_properties(
         # source, which is exactly why rubric 1.5's DROP detection has to poll the
         # catalog - see `cdc_flight.catalog`.)
         "include.schema.changes": "false",
-        # rubric 1.5: TRUNCATE reaches the applier because we ask for it. `none`
-        # means "skip no operation at all"; the connector's default `t` is what made
-        # a TRUNCATE invisible even to the skipped-record counter.
-        "skipped.operations": (
-            SKIP_TRUNCATE if truncate_mode == "ignore" else SKIP_NOTHING
-        ),
+        # Always retain pgoutput TRUNCATE records.  `truncate_mode=ignore` is still
+        # a destination no-op, but the ordered event is the only stream-side proof
+        # that a same-OID relfilenode change came from TRUNCATE rather than DROP/CREATE.
+        # Applying the old Debezium `skipped.operations=t` setting here would make
+        # those two histories indistinguishable to the generation fence.
+        "skipped.operations": SKIP_NOTHING,
         # --- resilience -------------------------------------------------------
         "errors.max.retries": "3",
         "errors.retry.delay.initial.ms": "300",

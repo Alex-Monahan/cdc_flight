@@ -81,11 +81,13 @@ class OpenGroup:
     pending_alerts: list[dict] = field(default_factory=list)
     #: source tables this group actually wrote, handed to the watcher after COMMIT
     source_tables: set[str] = field(default_factory=set)
-    #: One fail-closed source-generation read shared by admission and catalog planning
-    #: for this group. It is deliberately group-owned so it cannot leak across a
-    #: COMMIT/ROLLBACK boundary or turn a later group into a stale identity decision.
-    source_identity_oids: dict[str, object] | None = None
-    source_identity_error: str | None = None
+    #: Non-locking planning observation. It is diagnostic/input to the final proof,
+    #: never an admission authority.
+    source_generation_plan: dict[str, object] | None = None
+    #: Last-moment proof shared by unit admission and catalog planning. The source
+    #: lease itself is local to `Applier.commit_group` so source-lock cleanup cannot
+    #: leak across a group reset.
+    source_generation_final: dict[str, object] | None = None
 
     def __bool__(self) -> bool:
         return bool(self.units)

@@ -10,7 +10,7 @@ from .assembler import UNIT_SNAPSHOT_CHUNK, UNIT_TXN
 from .catalog_state import CHANGE_RECREATED
 from .config import DROP_LOG
 from .control_schema import CONTROL_SCHEMA
-from .envelope import KIND_SNAPSHOT_BOUNDARY
+from .envelope import KIND_DATA, KIND_SNAPSHOT_BOUNDARY, KIND_TRUNCATE
 from .errors import SchemaShapeUnexplained
 from .snapshot_completion import SnapshotObservationError
 
@@ -83,41 +83,20 @@ def reject_log_owed_tail(applier, unit) -> None:
         )
 
 
-def refuse_log_recreate_tail(applier, unit, *, catalog_plan=None) -> None:
-    """Refuse or fence a replacement tail before it can reach the row planner.
+def refuse_log_recreate_tail(
+    applier, unit, *, catalog_plan=None, generation_proof=None
+) -> None:
+    """Fence a unit unless the final source-generation proof is current.
 
-    A replacement is a *relation identity* boundary, not a WAL-watermark boundary.
-    The Debezium envelope currently exposes the qualified table but not pgoutput's
-    relation OID, so the admission seam asks the catalog watcher for the current OID
-    and compares it with the durable ``source_relations`` identity. A replacement
-    transaction cannot be emitted before its DDL commits; therefore every unit from
-    the new lifecycle sees the new OID, even if the watcher has not yet queued a
-    ``CHANGE_RECREATED`` observation.
-
-    The fence's identity signal is PostgreSQL's four-byte relation OID.  OID
-    wraparound/reuse can make a drop-and-recreate reuse the same OID, which this model
-    cannot distinguish from the original lifecycle; that is an explicit supported-
-    lifetime limitation, not a claim of database-wide uniqueness.  See ADR 0001 A72
-    and ``reviews/p2_review_r8.md`` R8-M3 for the contract boundary.
-
-    ``CatalogCoordinator`` also records a recreate after the fenced group has applied.
-    Once that plan is due, every touched unit is fenced regardless of LSN in either drop
-    mode.
-    Reading the durable lifecycle here makes the post-detection boundary survive a
-    restart; the whole unit is refused before it enters a commit group, so no source
-    transaction is partially admitted.
-
-    A commit group can contain the catalog plan and the replacement tail before the
-    catalog phase writes its durable lifecycle mark. In that ordering the plan is a
-    second, durable identity boundary. Such a unit is fenced (rather than raising and
-    rolling back the plan), so the catalog obligation and the source resume point
-    commit atomically; the next invocation's re-snapshot owns the rows.
+    The proof is acquired by the catalog coordinator inside the destination commit
+    protocol. This function only consumes that value; it never performs an out-of-band
+    source read of its own. A missing, changed, absent, ambiguous, or WAL-uncovered
+    proof is a fence, so no unit can append a new lifecycle to a retained image.
     """
     if applier.catalog is None or unit.kind != UNIT_TXN:
         return
     if unit.fenced:
         return
-    prepare_source_identity_cache(applier)
     owing = set(table_lifecycle.owing_work(applier.con, applier.pipeline))
     blocked = sorted(unit.tables_touched() & owing)
     if blocked and applier.cfg.drop_mode == DROP_LOG:
@@ -126,7 +105,13 @@ def refuse_log_recreate_tail(applier, unit, *, catalog_plan=None) -> None:
             + ", ".join(blocked)
             + "; a replacement snapshot must complete before the new lifecycle streams"
         )
-    identity_blocked = _replacement_identity_mismatches(applier, unit.tables_touched())
+    identity_blocked = _replacement_identity_mismatches(
+        applier,
+        unit.tables_touched(),
+        unit.last_lsn,
+        generation_proof=generation_proof,
+        truncate_names=generation_unit_evidence(applier, unit)[0],
+    )
     planned = sorted(
         action.change.qualified
         for action in getattr(catalog_plan, "actions", ())
@@ -153,88 +138,157 @@ def refuse_log_recreate_tail(applier, unit, *, catalog_plan=None) -> None:
     )
 
 
-def _replacement_identity_mismatches(applier, names: set[str]) -> list[str]:
-    """Return names whose current source relation is a different lifecycle.
-
-    Only a *present* relation with a different OID is a replacement proof.  ``None``
-    means the relation is currently absent, which remains under the ordinary DROP
-    detector's WAL fence so a log-mode drop does not newly discard an old-lifecycle
-    tail.  A source query error is fail-closed: admitting an unknown relation identity
-    would turn an unavailable catalog into permission to append to a retained image.
-    """
+def _replacement_identity_mismatches(
+    applier,
+    names: set[str],
+    minimum_lsn: int | None,
+    *,
+    generation_proof=None,
+    truncate_names: set[str] | None = None,
+) -> list[str]:
+    """Return durable names not proven current at this unit's WAL boundary."""
     if not names or applier.catalog is None:
         return []
-    prepare_source_identity_cache(applier)
     durable = {
-        qualified: oid
-        for qualified, oid in _durable_source_oids(applier).items()
+        qualified: identity
+        for qualified, identity in _durable_source_identities(applier).items()
         if qualified in names
     }
     if not durable:
         return []
-    if applier.group.source_identity_error is not None:
-        raise SnapshotObservationError(
-            "cannot establish source relation identity before streaming admission; "
-            "the unit is not safe to append to a retained image"
-        )
-    current = applier.group.source_identity_oids or {}
+    current = generation_proof
+    if current is None:
+        current = applier.group.source_generation_final or {}
+    ignored = truncate_names or set()
     return sorted(
         qualified
-        for qualified, old_oid in durable.items()
-        if current.get(qualified) is not None
-        and current.get(qualified) is not catalog_generation.UNKNOWN
-        and int(current[qualified]) != old_oid
+        for qualified, expected in durable.items()
+        if qualified not in ignored
+        if catalog_generation.check(
+            expected,
+            current.get(qualified, catalog_generation.UNKNOWN),
+            minimum_lsn=minimum_lsn,
+        ).state
+        != catalog_generation.GENERATION_CURRENT
     )
 
 
-def _durable_source_oids(applier) -> dict[str, int]:
+def _unit_stream_events(applier, unit):
+    events = list(unit.events)
+    if unit.spill_unit_seq is not None:
+        events.extend(
+            staged.event
+            for staged in applier.spill.load(
+                commit_id=applier.group.spill_commit_id or applier._next_commit_id,
+                unit_seq=unit.spill_unit_seq,
+            )
+        )
+    return events
+
+
+def generation_unit_evidence(applier, unit) -> tuple[set[str], set[str]]:
+    """Return generation evidence for one unit, including its spilled prefix."""
+    truncates: set[str] = set()
+    normal_rows: set[str] = set()
+    for record in _unit_stream_events(applier, unit):
+        qualified = record.qualified_table
+        if not qualified:
+            continue
+        if record.kind == KIND_TRUNCATE:
+            truncates.add(qualified)
+        elif record.kind == KIND_DATA:
+            normal_rows.add(qualified)
+    return truncates, normal_rows
+
+
+def generation_stream_evidence(applier) -> tuple[set[str], set[str]]:
+    """Return committed and current ``(truncates, normal_rows)`` evidence.
+
+    A same-OID relfilenode change is ambiguous in the source catalog because PostgreSQL
+    also rewrites a table's physical file for TRUNCATE.  The decoded transaction is
+    the ordered discriminator: a TRUNCATE authorizes refreshing the durable token,
+    while ordinary rows prove that a replacement generation is trying to enter.
+    """
+    remembered = getattr(applier, "_generation_stream_evidence", {})
+    truncates: set[str] = set(remembered.get("truncates", ()))
+    normal_rows: set[str] = set(remembered.get("normal_rows", ()))
+    for unit in applier.group.units:
+        if unit.kind != UNIT_TXN:
+            continue
+        unit_truncates, unit_rows = generation_unit_evidence(applier, unit)
+        truncates.update(unit_truncates)
+        normal_rows.update(unit_rows)
+    # Catalog polling can observe a relfilenode change after the transaction carrying
+    # its TRUNCATE/rows has already committed. Keep the evidence attached to this
+    # group until COMMIT; rollback then discards it with the rest of the group.
+    applier.group._generation_stream_evidence = (set(truncates), set(normal_rows))
+    return truncates, normal_rows
+
+
+def settle_generation_stream_evidence(applier, group, plan=None) -> None:
+    """Retain committed stream evidence until its catalog rewrite is settled."""
+    observed = getattr(group, "_generation_stream_evidence", (set(), set()))
+    remembered = getattr(
+        applier, "_generation_stream_evidence", {"truncates": set(), "normal_rows": set()}
+    )
+    remembered.setdefault("truncates", set()).update(observed[0])
+    remembered.setdefault("normal_rows", set()).update(observed[1])
+    if plan is not None:
+        resolved = {
+            action.change.qualified
+            for action in plan.actions
+            if action.change.kind in {"dropped", CHANGE_RECREATED}
+        }
+        resolved.update(change.qualified for change in plan.generation_refreshes)
+        remembered["truncates"].difference_update(resolved)
+        remembered["normal_rows"].difference_update(resolved)
+    applier._generation_stream_evidence = remembered
+
+
+def _durable_source_identities(applier) -> dict[str, catalog_generation.RelationIdentity]:
     return {
-        f"{schema}.{table}": int(oid)
-        for schema, table, oid in applier.con.execute(
-            f"SELECT source_schema, source_table, relation_oid "
+        f"{schema}.{table}": catalog_generation.RelationIdentity(
+            int(oid),
+            int(relfilenode) if relfilenode is not None else None,
+            int(relation_type_oid) if relation_type_oid is not None else None,
+        )
+        for schema, table, oid, relfilenode, relation_type_oid in applier.con.execute(
+            f"SELECT source_schema, source_table, relation_oid, relation_filenode, "
+            f"relation_type_oid "
             f"FROM {CONTROL_SCHEMA}.source_relations WHERE pipeline = ?",
             [applier.pipeline],
         ).fetchall()
     }
 
 
-def prepare_source_identity_cache(applier) -> None:
-    """Read source identities once for this commit group, fail closed on errors.
+def source_generation_names(applier, catalog_plan=None) -> set[str]:
+    """Names for the plan read and the final proof lease.
 
-    Admission and catalog planning deliberately share this snapshot.  It keeps the
-    synchronous source dependency outside the MotherDuck transaction where possible,
-    avoids one source connection/query per unit, and still makes an unreadable source
-    an explicit ``SnapshotObservationError`` for a touched durable relation.
+    Every durable relation touched by a streaming unit is included, even when the
+    catalog action is a plain drop. That is what makes an unobserved A->B transition
+    fail closed; the drop revalidation switch only controls whether a plain drop is
+    allowed to use the proof for its DDL decision.
     """
-    if applier.catalog is None or applier.group.source_identity_oids is not None:
-        return
-    durable = _durable_source_oids(applier)
-    names = set(durable)
+    if applier.catalog is None:
+        return set()
+    names = set(_durable_source_identities(applier))
     names.update(
         change.qualified
         for change in applier.catalog.pending()
         if change.kind == CHANGE_RECREATED
+        or (change.kind == "dropped" and applier.cfg.drop_revalidate)
     )
-    if not names:
-        # Leave the cache uninitialised. A first group can materialise its first
-        # source-relations rows; a later catalog plan in the same lifecycle must still
-        # be able to discover a newly queued recreate and read its identity.
-        return
-    relation_oids = getattr(applier.catalog, "relation_oids", None)
-    if relation_oids is None:
-        applier.group.source_identity_oids = dict.fromkeys(names, catalog_generation.UNKNOWN)
-        applier.group.source_identity_error = "catalog watcher has no identity reader"
-        return
-    pairs = {tuple(qualified.split(".", 1)) for qualified in names}
-    try:
-        current = relation_oids(pairs)
-    except Exception as exc:
-        applier.group.source_identity_oids = dict.fromkeys(
-            names, catalog_generation.UNKNOWN
+    if catalog_plan is not None:
+        names.update(
+            action.change.qualified
+            for action in catalog_plan.actions
+            if action.change.kind == CHANGE_RECREATED
+            or (
+                action.change.kind == "dropped"
+                and applier.cfg.drop_revalidate
+            )
         )
-        applier.group.source_identity_error = str(exc)
-        return
-    applier.group.source_identity_oids = dict(current)
+    return names
 
 
 def append_unit(applier, unit, *, is_snapshot: bool) -> None:

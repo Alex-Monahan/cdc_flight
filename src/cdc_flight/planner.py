@@ -25,7 +25,7 @@ import logging
 
 from . import apply_sql, destination, naming, table_work
 from .assembler import UNIT_CONTROL, UNIT_SNAPSHOT_CHUNK, CompleteUnit
-from .config import TRUNCATE_REPLICATE
+from .config import TRUNCATE_IGNORE, TRUNCATE_REPLICATE
 from .envelope import KIND_TRUNCATE, PendingRecord
 from .snapshot import SnapshotTable
 from .table_work import TableWork
@@ -248,6 +248,14 @@ class GroupPlan:
         tombstones / soft delete" behaviour, and it is the only sane setting for a
         destination whose consumers treat the table as an append-only log.
         """
+        # Keep the pgoutput TRUNCATE in the assembled transaction even for the
+        # compatibility opt-out.  The applier deliberately performs no destination
+        # mutation or audit write in this mode, but the streamed fact is still the
+        # ordered proof that a same-OID relfilenode change was a truncate, not a
+        # replacement.  Dropping the event in Debezium (`skipped.operations=t`) made
+        # those two source histories indistinguishable to the catalog fence.
+        if self.truncate_mode == TRUNCATE_IGNORE:
+            return
         replicate = self.truncate_mode == TRUNCATE_REPLICATE
         marker = {
             "event": "truncate",

@@ -21,12 +21,12 @@ from .states import IllegalTransition, UnknownState
 log = logging.getLogger("cdc_flight.catalog_poll")
 
 
-def connect(watcher):
+def connect(watcher, *, autocommit: bool = True):
     import psycopg
 
     return psycopg.connect(
         watcher.dsn,
-        autocommit=True,
+        autocommit=autocommit,
         connect_timeout=watcher.connect_timeout,
         options=f"-c statement_timeout={watcher.query_timeout_ms}",
         keepalives=1,
@@ -101,7 +101,7 @@ def poll(watcher):
         lsn = int(conn.execute(observation_mod.LSN_SQL).fetchone()[0])
         observed: dict[str, SourceRelation] = {}
         for row in rows:
-            raw_columns = row[7] if len(row) > 7 else []
+            raw_columns = row[9] if len(row) > 9 else []
             if isinstance(raw_columns, str):
                 try:
                     raw_columns = json.loads(raw_columns)
@@ -125,11 +125,13 @@ def poll(watcher):
                 schema=row[0],
                 table=row[1],
                 oid=int(row[2]),
-                replica_identity=str(row[3]),
-                published=bool(row[4]),
+                relfilenode=(int(row[3]) if row[3] is not None else None),
+                relation_type_oid=(int(row[4]) if row[4] is not None else None),
+                replica_identity=str(row[5]),
+                published=bool(row[6]),
                 columns=columns,
-                publication_all_tables=bool(row[5]) if len(row) > 5 else False,
-                is_partition=bool(row[6]) if len(row) > 6 else False,
+                publication_all_tables=bool(row[7]) if len(row) > 7 else False,
+                is_partition=bool(row[8]) if len(row) > 8 else False,
             )
         if not observed:
             with watcher._lock:

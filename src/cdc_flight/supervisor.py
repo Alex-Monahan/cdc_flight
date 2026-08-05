@@ -434,7 +434,7 @@ def run_engine_bounded(
         # consequence was measured (Codex r4 BLOCKER-2): with every poll timing out, a
         # quiet run returned `ok=true` and learned zero relations; an offline
         # drop-and-recreate then left the old relation's rows beside the new one's for
-        # ever, because the following runs adopted the replacement oid as the baseline
+        # ever, because the following runs adopted the replacement generation as the baseline
         # they had never had. Proving the poller is DEAD is not the same as proving it
         # ever SPOKE.
         outcome.record("engine_error")

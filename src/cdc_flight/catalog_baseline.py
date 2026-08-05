@@ -162,7 +162,7 @@ def unrelatable_tables(
       discharged. `CDC_RESNAPSHOT=0` queues the rebuild, skips it and logs it as
       unhandled, and the relation then looked *finished* to the confirmation precisely
       because it was still owed — which is how a successful run came to persist a
-      replacement oid over another relation's rows.
+      replacement generation over another relation's rows.
     """
     states = table_lifecycle.read_all(con, pipeline)
     protected = {

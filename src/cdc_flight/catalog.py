@@ -56,9 +56,18 @@ import threading
 import time
 from dataclasses import replace
 
-from . import catalog_admission as admission_mod
-from . import catalog_generation, catalog_poll, catalog_reporting, catalog_state, state_interactions
-from . import catalog_observation as observation_mod
+from . import (
+    catalog_admission as admission_mod,
+)
+from . import (
+    catalog_change_queue,
+    catalog_generation,
+    catalog_generation_source,
+    catalog_poll,
+    catalog_reporting,
+    catalog_state,
+    state_interactions,
+)
 from . import source_marker as marker_mod
 from .machines import (
     ADMISSION_ADMITTED,
@@ -325,26 +334,12 @@ class CatalogWatcher:
         return catalog_poll.poll(self)
 
     def _ensure_published(self, conn, observed, changes: list[CatalogChange]) -> None:
-        """Run the explicit publication-admission state machine."""
         admission_mod.ensure_published(self, conn, observed, changes)
 
-    def relation_oids(self, names: set[tuple[str, str]]) -> dict[str, int | None]:
-        """Current oid of each `(schema, table)`, `None` when it does not exist.
-
-        Guard 3 of `catalog_apply`: read on this watcher's own connection immediately
-        before anything is destroyed. Raises on a source error, because "I could not
-        ask" must never be read as "it is gone".
-        """
-        if not self.dsn:
-            # An empty DSN makes libpq connect to ITS defaults, which is a different
-            # cluster on a different port. Refusing is what makes "fail closed" true.
-            raise ValueError("this watcher has no DSN, so the source cannot be re-read")
-        schemas = [s for s, _ in names]
-        tables = [t for _, t in names]
-        with self._connect() as conn:
-            rows = conn.execute(observation_mod.OID_SQL, (schemas, tables)).fetchall()
-        found = {f"{schema}.{table}": int(oid) for schema, table, oid in rows}
-        return {f"{s}.{t}": found.get(f"{s}.{t}") for s, t in names}
+    def relation_oids(self, names: set[tuple[str, str]]) -> dict[str, object]:
+        return catalog_generation_source.relation_oids(self, names)
+    def generation_proof_lease(self, names):
+        return catalog_generation_source.acquire(self, names)
 
     def captured_relations(self) -> tuple[SourceRelation, ...]:
         """Published relations from the latest successful catalog observation."""
@@ -545,7 +540,7 @@ class CatalogWatcher:
                     # child is not an independent discovery target.
                     continue
                 pending_recreates, retained_relation = catalog_generation.pending_for(
-                    self, name, previous
+                    self._changes, self.known, name, previous
                 )
                 if current is not None:
                     if previous is not None:
@@ -557,10 +552,12 @@ class CatalogWatcher:
                         )
                         observed[name] = current
                     # A present relation cancels a drop; a newer OID supersedes a recreate.
-                    if catalog_generation.has_newer_recreate(pending_recreates, current.oid):
+                    if catalog_generation.has_newer_recreate(pending_recreates, current):
                         superseded.extend(self._supersede(name, CHANGE_RECREATED))
                     superseded.extend(self._supersede(name, CHANGE_DROPPED))
-                    if previous is not None and current.oid == previous.oid:
+                    if previous is not None and catalog_generation.identities_equal(
+                        current, previous
+                    ):
                         column_diff = diff_columns(previous.columns, current.columns)
                         stale = self._unconfirmed.get(name)
                         if stale is not None and not column_diff:
@@ -659,18 +656,18 @@ class CatalogWatcher:
                         self.known[name] = retained_relation
                         self._dirty[name] = retained_relation
                     change = self._confirm(
-                        name, catalog_generation.dropped_change(self, drop_relation, lsn)
+                        name, catalog_generation.dropped_change(drop_relation, lsn)
                     )
                     if change is not None:
                         added.append(change)
                     continue
-                if current.oid != previous.oid:
+                if not catalog_generation.identities_equal(current, previous):
                     if queued:
                         continue
                     change = self._confirm(
                         name,
                         catalog_generation.recreated_change(
-                            self, current, retained_relation or previous, lsn
+                            current, retained_relation or previous, lsn
                         ),
                     )
                     if change is not None:
@@ -845,10 +842,13 @@ class CatalogWatcher:
         return [name]
 
     def _change(self, kind, relation: SourceRelation, lsn: int, **oids) -> CatalogChange:
-        oids.setdefault("new_relation", relation)
-        return CatalogChange(
-            kind=kind, schema=relation.schema, table=relation.table, detected_lsn=lsn, **oids
-        )
+        return catalog_change_queue.make_change(self, kind, relation, lsn, **oids)
+
+    def supersede_recreated(self, change: CatalogChange, current) -> CatalogChange | None:
+        return catalog_change_queue.supersede_recreated(self, change, current)
+
+    def reclassify_recreated_as_drop(self, change: CatalogChange) -> CatalogChange:
+        return catalog_change_queue.reclassify_recreated_as_drop(self, change)
 
     def _emit_marker(self, conn, changes: list[CatalogChange]) -> None:
         """Write a WAL record past the detected change, so the fence can open.
