@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from .config import ReplicationConfig, SourceConfig
 from .errors import UnsafeDebeziumProperty
-from .snapshot_notifications import notification_topic
+from .snapshot_completion import notification_topic
 
 # Debezium's marker for a TOASTed column whose value was not present in the WAL.
 UNAVAILABLE_VALUE_PLACEHOLDER = "__debezium_unavailable_value"

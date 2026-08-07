@@ -53,3 +53,15 @@ def test_catalog_helpers_share_one_public_module():
     assert state_matrix.catalog_support is catalog_support
     for removed in ("catalog_observation", "catalog_reporting", "catalog_runtime"):
         assert importlib.util.find_spec(f"cdc_flight.{removed}") is None
+
+
+def test_snapshot_protocol_and_notifications_share_one_public_module():
+    import importlib.util
+
+    from cdc_flight import snapshot_completion
+
+    assert callable(snapshot_completion.notification_topic)
+    assert callable(snapshot_completion.decode_notification)
+    assert snapshot_completion.SnapshotNotification
+    assert snapshot_completion.SnapshotCompletion
+    assert importlib.util.find_spec("cdc_flight.snapshot_notifications") is None

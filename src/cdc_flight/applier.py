@@ -72,8 +72,11 @@ from .errors import (
 from .faults import arm_group, maybe_crash
 from .run_state import COMMIT_ACK
 from .snapshot import SnapshotCoordinator
-from .snapshot_completion import SnapshotCompletion, SnapshotObservationError
-from .snapshot_notifications import decode_notification
+from .snapshot_completion import (
+    SnapshotCompletion,
+    SnapshotObservationError,
+    decode_notification,
+)
 from .spill import SpillBuffer
 
 log = logging.getLogger("cdc_flight.applier")
