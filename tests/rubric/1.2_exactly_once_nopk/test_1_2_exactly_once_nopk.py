@@ -1,6 +1,7 @@
 """Rubric 1.2 - exactly-once delivery for tables WITHOUT a primary key.
 
-See README.md for the failure mode and the test conventions.
+See `tests/rubric/README.md#rubric-1-2-exactly-once-nopk` for the failure mode
+and the test conventions.
 
 Review note (Opus M6 / Codex 8). Every assertion of the form "count(*) == N"
 over rows whose values happen to be distinct is satisfiable by a `SELECT

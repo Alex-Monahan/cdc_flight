@@ -1,6 +1,7 @@
 """TODO 1.0(b): Debezium engine failures must not be reported as success.
 
-See README.md in this directory for the defect and the test conventions.
+See `tests/rubric/README.md#rubric-1-0-engine-error-propagation` for the defect
+and the test conventions.
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 """Rubric 1.3 - a Postgres transaction must land in MotherDuck atomically.
 
-See README.md for the failure mode, the observation technique and the test
-conventions.
+See `tests/rubric/README.md#rubric-1-3-atomic-batches` for the failure mode,
+the observation technique and the test conventions.
 """
 
 from __future__ import annotations

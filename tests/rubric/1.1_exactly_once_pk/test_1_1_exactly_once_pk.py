@@ -1,6 +1,7 @@
 """Rubric 1.1 - exactly-once delivery for tables WITH a primary key.
 
-See README.md for the failure mode and the test conventions.
+See `tests/rubric/README.md#rubric-1-1-exactly-once-pk` for the failure mode
+and the test conventions.
 
 Review note (Opus M6 / Codex 8), and the reason the TARGET tests below look the
 way they do: for a primary-keyed table, `count(*) == 50 AND count(DISTINCT id)
