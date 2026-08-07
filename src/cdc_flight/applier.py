@@ -58,10 +58,10 @@ from . import (
     unit_admission,
     unit_apply,
 )
-from .applier_config import ApplierConfig
 from .assembler import CompleteUnit, TransactionAssembler
 from .catalog_apply import CatalogCoordinator, CatalogPlan
 from .commit_group import CommitResult, OpenGroup
+from .config import ApplierConfig
 from .destination import AlertSink, Lease, ResumePoint
 from .envelope import KIND_SNAPSHOT_BOUNDARY, PendingRecord, decode
 from .errors import (

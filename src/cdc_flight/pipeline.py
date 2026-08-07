@@ -44,9 +44,9 @@ from . import reconcile as reconcile_mod
 from . import recovery as recovery_mod
 from . import resnapshot as resnapshot_mod
 from . import resnapshot_recovery as resnapshot_recovery_mod
-from .applier import ApplierConfig
 from .completion_stage import PostEngineCompletion
 from .config import (
+    ApplierConfig,
     CatalogConfig,
     DestinationConfig,
     ReplicationConfig,

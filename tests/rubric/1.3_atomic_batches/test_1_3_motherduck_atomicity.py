@@ -33,8 +33,8 @@ import pytest
 from support.applier_lab import FakeCommitter, begin, end, keyed, snap
 
 from cdc_flight import destination as dest_mod
-from cdc_flight.applier import Applier, ApplierConfig
-from cdc_flight.config import motherduck_token
+from cdc_flight.applier import Applier
+from cdc_flight.config import ApplierConfig, motherduck_token
 from cdc_flight.destination import Lease, ResumePoint
 from cdc_flight.envelope import KIND_SNAPSHOT_BOUNDARY, PendingRecord
 from cdc_flight.snapshot_completion import SnapshotCompletion

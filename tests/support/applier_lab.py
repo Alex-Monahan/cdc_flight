@@ -30,7 +30,8 @@ from typing import Any
 import duckdb
 
 from cdc_flight import destination as dest_mod
-from cdc_flight.applier import Applier, ApplierConfig
+from cdc_flight.applier import Applier
+from cdc_flight.config import ApplierConfig
 from cdc_flight.destination import Lease, ResumePoint
 from cdc_flight.envelope import (
     KIND_DATA,

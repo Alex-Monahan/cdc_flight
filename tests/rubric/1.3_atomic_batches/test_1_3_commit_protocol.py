@@ -977,7 +977,8 @@ def test_two_pipelines_on_one_destination_do_not_contend_for_commit_ids(tmp_path
     import duckdb
 
     from cdc_flight import destination as dest_mod
-    from cdc_flight.applier import Applier, ApplierConfig
+    from cdc_flight.applier import Applier
+    from cdc_flight.config import ApplierConfig
     from cdc_flight.destination import Lease, ResumePoint
 
     con = duckdb.connect(str(tmp_path / "shared.duckdb"))

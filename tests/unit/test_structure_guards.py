@@ -65,3 +65,13 @@ def test_snapshot_protocol_and_notifications_share_one_public_module():
     assert snapshot_completion.SnapshotNotification
     assert snapshot_completion.SnapshotCompletion
     assert importlib.util.find_spec("cdc_flight.snapshot_notifications") is None
+
+
+def test_applier_config_has_one_canonical_module_and_compatibility_surface():
+    import importlib.util
+
+    from cdc_flight.applier import ApplierConfig as ApplierPublicConfig
+    from cdc_flight.config import ApplierConfig
+
+    assert ApplierPublicConfig is ApplierConfig
+    assert importlib.util.find_spec("cdc_flight.applier_config") is None
