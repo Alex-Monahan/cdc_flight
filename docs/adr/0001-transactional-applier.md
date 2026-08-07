@@ -1536,7 +1536,7 @@ that differs between the spilled and in-memory paths would be worse than either.
 The implementation therefore (a) writes the file itself when reconciliation says
 so, byte-compatibly with Kafka's `FileOffsetBackingStore` — the format was read
 off a live file and is round-tripped byte-identically in
-`tests/unit/test_offset_file.py` — and (b) asserts after every acknowledgement that
+`tests/unit/test_offsets.py` — and (b) asserts after every acknowledgement that
 `file_lsn <= durable_lsn`, raising `ResumePointDrift` otherwise. That is
 strictly the Invariant-O direction and cannot false-fire on a lagging flush.
 
@@ -2435,7 +2435,7 @@ redistributed:
 | `table_work.py` | the physical-row fold and the merge for one table |
 | `catalog.py` | observing the source catalog. It never decides |
 | `catalog_apply.py` | the destructive-DDL policy and the four guards, as an immutable plan |
-| `resume.py` | the resume point and the `offsets.dat` forensics |
+| `offsets.py` | the offset codec, resume point, and `offsets.dat` forensics |
 | `source_marker.py` | the only writes cdc_flight makes to the source |
 
 ---
@@ -3576,7 +3576,7 @@ replace. Rev 10 is the answer, and every item below is a behaviour change.
 
 #### A58.1 — `--accept-orphan-offsets` journals before it destroys (BLOCKER)
 
-`offset_reconcile.reconcile()` dropped the replication slot and unlinked `offsets.dat`,
+`offsets.reconcile()` dropped the replication slot and unlinked `offsets.dat`,
 and `pipeline.run()` wrote the recovery journal **after** it returned. The comment saying
 so called the placement deliberate. It is the B3/A53 shape recreated on the one route an
 operator reaches for when something has already gone wrong:

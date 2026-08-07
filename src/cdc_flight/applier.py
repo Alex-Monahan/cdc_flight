@@ -50,7 +50,7 @@ from . import (
     catalog_commit,
     commit_metadata,
     destination,
-    resume,
+    offsets,
     schema_epoch,
     self_heal,
     spill_protocol,
@@ -579,7 +579,7 @@ class Applier:
             self.group.txn_open = True
         try:
             self.lease.renew(self.con)
-            new_point = resume.point_for(
+            new_point = offsets.point_for(
                 group,
                 previous=self.resume_point,
                 commit_id=commit_id,
@@ -765,7 +765,7 @@ class Applier:
         # temporary point would manufacture an Invariant-O drift (r15 acceptance).
         if self.cfg.verify_offset_file and not self.cfg.resnapshot:
             self._pending_offset_key_blob, self._pending_offset_blob = (
-                resume.capture_offset_file(self.offset_path, new_point)
+                offsets.capture_offset_file(self.offset_path, new_point)
             )
         self._reset_group()
         return CommitResult.COMMITTED
@@ -846,7 +846,7 @@ class Applier:
         for alert in alerts:
             self._raise_alert(alert)
 
-    # -- resume point (ADR §4.3, `resume.py`) ------------------------------- #
+    # -- resume point (ADR §4.3, `offsets.py`) ------------------------------- #
     def _run_pending_verification(self) -> None:
         """Check a deferred offset flush, now that the connector has polled again.
 

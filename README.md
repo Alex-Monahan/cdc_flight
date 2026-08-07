@@ -471,13 +471,12 @@ cdc_flight/
 │   ├── table_work.py            # the physical-row fold + the merge, per table
 │   ├── snapshot.py              # epochs, shadow tables, the swap
 │   ├── spill.py                 # the staging buffer for an oversized unit
-│   ├── resume.py                # the resume point + offsets.dat forensics
+│   ├── offsets.py               # offsets.dat codec, reconciliation, and resume point
 │   ├── catalog.py               # observing the source catalog (DROP detection)
 │   ├── catalog_apply.py         # the destructive-DDL policy and its guards
 │   ├── source_marker.py         # the only writes cdc_flight makes to the source
 │   ├── apply_sql.py              # merge/DDL SQL inside the caller's transaction
 │   ├── destination.py            # _cdc_flight control schema + lease
-│   ├── offset_file.py            # read/write Debezium's offsets.dat
 │   ├── reconcile.py              # start-up decision table + Invariant-O guard
 │   ├── naming.py                 # dlt-as-a-library identifier normalisation
 │   ├── pipeline.py               # bounded runner + CLI entrypoint

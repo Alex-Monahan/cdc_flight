@@ -75,3 +75,25 @@ def test_applier_config_has_one_canonical_module_and_compatibility_surface():
 
     assert ApplierPublicConfig is ApplierConfig
     assert importlib.util.find_spec("cdc_flight.applier_config") is None
+
+
+def test_offset_codec_reconciliation_and_resume_share_one_module():
+    import importlib.util
+
+    from cdc_flight import offsets
+
+    for name in (
+        "encode_key",
+        "read",
+        "write",
+        "parse_offsets",
+        "lsn_of",
+        "file_lsn",
+        "capture_offset_file",
+        "point_for",
+        "reconcile",
+    ):
+        assert callable(getattr(offsets, name))
+    assert offsets.Reconciliation
+    for removed in ("offset_file", "offset_reconcile", "resume"):
+        assert importlib.util.find_spec(f"cdc_flight.{removed}") is None

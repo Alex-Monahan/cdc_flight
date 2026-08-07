@@ -20,7 +20,7 @@ import duckdb
 import pytest
 
 from cdc_flight import destination as dest_mod
-from cdc_flight import offset_file, reconcile
+from cdc_flight import offsets, reconcile
 from cdc_flight.destination import ResumePoint
 from cdc_flight.errors import NoDurableDestinationRow
 
@@ -45,15 +45,15 @@ def _write_row(con, offset: dict, last_lsn: int) -> None:
         point=ResumePoint(partition=dict(PARTITION), offset=dict(offset), last_lsn=last_lsn),
         commit_id=1,
         offset_blob=None,
-        offset_key_blob=offset_file.encode_key(NAMESPACE, PARTITION),
+        offset_key_blob=offsets.encode_key(NAMESPACE, PARTITION),
     )
 
 
 def _write_file(path, offset: dict, *, namespace: str = NAMESPACE, partition=None) -> None:
-    offset_file.write(
+    offsets.write(
         path,
         {
-            offset_file.encode_key(namespace, partition or PARTITION): offset_file.encode_value(
+            offsets.encode_key(namespace, partition or PARTITION): offsets.encode_value(
                 offset
             )
         },
@@ -87,7 +87,7 @@ def test_a_file_ahead_within_one_shared_lsn_is_rebuilt(con, tmp_path):
     outcome = _reconcile(con, path)
     assert outcome.decision == "file_offset_mismatch_rebuilt", outcome
     assert outcome.repaired is True
-    (_partition, offset), = offset_file.parse_offsets(offset_file.read(path))
+    (_partition, offset), = offsets.parse_offsets(offsets.read(path))
     assert offset == {"lsn": 100, "lsn_proc": 1}, "the file was not rewritten from the destination"
 
 
@@ -104,11 +104,11 @@ def test_a_file_with_extra_entries_is_rebuilt(con, tmp_path):
     path = tmp_path / "offsets.dat"
     offset = {"lsn": 100, "lsn_proc": 100}
     _write_row(con, offset, 100)
-    offset_file.write(
+    offsets.write(
         path,
         {
-            offset_file.encode_key(NAMESPACE, PARTITION): offset_file.encode_value(offset),
-            offset_file.encode_key("another-engine", PARTITION): offset_file.encode_value(offset),
+            offsets.encode_key(NAMESPACE, PARTITION): offsets.encode_value(offset),
+            offsets.encode_key("another-engine", PARTITION): offsets.encode_value(offset),
         },
     )
     assert _reconcile(con, path).decision == "file_offset_mismatch_rebuilt"
