@@ -465,7 +465,7 @@ def test_a_fault_around_a_multi_table_truncate_keeps_both_tables(lab, monkeypatc
     `COMMIT`. A fault at any anchor must leave BOTH tables full — a group torn between
     table A and table B is the one interleaving rubric 1.3 is about, and `mid_apply`
     fires between two `table_work.write()` calls precisely to reach it."""
-    from applier_lab import truncate
+    from support.applier_lab import truncate
 
     box = lab()
     preload(box)

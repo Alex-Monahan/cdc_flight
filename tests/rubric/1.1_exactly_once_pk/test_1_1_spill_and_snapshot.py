@@ -273,7 +273,7 @@ def test_mid_apply_really_fires_between_two_table_writes(lab, monkeypatch):
 
 def test_the_mid_apply_anchor_does_not_fire_on_a_control_only_group(lab, monkeypatch):
     """`faults.<nth>` counts data-carrying groups (`faults.py:35-41`)."""
-    from applier_lab import heartbeat
+    from support.applier_lab import heartbeat
 
     monkeypatch.setenv(faults.ENV_VAR, "mid_apply:1:raise")
     faults.refresh()

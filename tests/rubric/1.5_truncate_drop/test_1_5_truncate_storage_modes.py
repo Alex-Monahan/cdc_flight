@@ -179,7 +179,7 @@ def test_rows_removed_is_never_unknown_for_a_replicated_truncate(lab, storage):
 def test_a_keyless_table_truncate_records_how_many_rows_it_removed(lab):
     """A keyless table is a changelog; a truncate empties it, and the marker is the
     only surviving statement of what was lost (rubric 8.2 will replay it)."""
-    from applier_lab import data
+    from support.applier_lab import data
 
     box = lab()
     box.run(

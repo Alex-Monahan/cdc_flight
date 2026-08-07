@@ -318,7 +318,7 @@ def test_hidden_intermediate_column_shape_is_refused_instead_of_folded(tmp_path)
 
 def test_hidden_shape_refusal_at_applier_callback_is_durable(tmp_path, monkeypatch):
     """The callback boundary must leave a rebuild obligation, not only an exception."""
-    from applier_lab import Lab
+    from support.applier_lab import Lab
 
     old_columns = (col(1, "id", 20, "bigint"), col(2, "name"))
     watcher = CatalogWatcher(
