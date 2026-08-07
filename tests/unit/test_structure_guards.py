@@ -7,6 +7,8 @@ allowing later module-surface guards in this file to be counted explicitly.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 _BASELINE_SELECTED = {
@@ -97,3 +99,18 @@ def test_offset_codec_reconciliation_and_resume_share_one_module():
     assert offsets.Reconciliation
     for removed in ("offset_file", "offset_reconcile", "resume"):
         assert importlib.util.find_spec(f"cdc_flight.{removed}") is None
+
+
+def test_runtime_state_filesystem_module_owns_atomic_publication():
+    import importlib.util
+    import sys
+
+    root = Path(__file__).resolve().parents[2]
+    path = root / "scripts" / "runtime_state_fs.py"
+    spec = importlib.util.spec_from_file_location("runtime_state_fs_guard", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    assert callable(module.rename_noreplace)
+    assert not (root / "scripts" / "runtime_state_publish.py").exists()

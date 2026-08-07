@@ -49,8 +49,8 @@ from runtime_state_fs import (
     validate_tree as _validate_tree_impl,
     write as _write,
     write_exclusive as _write_exclusive,
+    rename_noreplace,
 )
-from runtime_state_publish import rename_noreplace
 
 from cdc_flight.machines import (
     ROOT_ABSENT,
