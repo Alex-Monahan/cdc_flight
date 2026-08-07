@@ -37,3 +37,19 @@ def test_slow_lane_composition(request):
 @pytest.mark.motherduck
 def test_motherduck_lane_composition(request):
     _assert_lane_baseline(request, "motherduck")
+
+
+def test_catalog_helpers_share_one_public_module():
+    import importlib.util
+
+    from cdc_flight import catalog, catalog_poll, catalog_support, state_matrix
+
+    assert catalog_support.CATALOG_SQL
+    assert callable(catalog_support.summary)
+    assert callable(catalog_support.observe_unit)
+    assert callable(catalog_support.read_columns)
+    assert catalog.catalog_support is catalog_support
+    assert catalog_poll.observation_mod is catalog_support
+    assert state_matrix.catalog_support is catalog_support
+    for removed in ("catalog_observation", "catalog_reporting", "catalog_runtime"):
+        assert importlib.util.find_spec(f"cdc_flight.{removed}") is None

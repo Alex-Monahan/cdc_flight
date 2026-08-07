@@ -64,8 +64,8 @@ from . import (
     catalog_change_queue,
     catalog_generation,
     catalog_poll,
-    catalog_reporting,
     catalog_state,
+    catalog_support,
     state_interactions,
 )
 from . import source_marker as marker_mod
@@ -465,9 +465,9 @@ class CatalogWatcher:
             )
 
     def observe_unit(self, unit) -> None:
-        from . import catalog_runtime
+        from . import catalog_support
 
-        catalog_runtime.observe_unit(self, unit)
+        catalog_support.observe_unit(self, unit)
 
     def allowed_event_fields(self, qualified: str) -> set[str]:
         """Return the union of the current and every fenced schema epoch."""
@@ -494,9 +494,9 @@ class CatalogWatcher:
         key_columns: tuple[str, ...],
         value_columns: tuple[str, ...],
     ) -> list[tuple]:
-        from . import catalog_runtime
+        from . import catalog_support
 
-        return catalog_runtime.read_columns(
+        return catalog_support.read_columns(
             self, relation, key_columns, value_columns
         )
 
@@ -954,4 +954,4 @@ class CatalogWatcher:
             self.replicated |= names
 
     def summary(self) -> dict:
-        return catalog_reporting.summary(self)
+        return catalog_support.summary(self)
