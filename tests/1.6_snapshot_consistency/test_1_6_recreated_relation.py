@@ -60,10 +60,15 @@ def recreated(tmp_path_factory, postgres_cluster):
                 f"INSERT INTO app.{TABLE} SELECT i, 'new-' || i FROM generate_series(1, 9) i",
             ]
         )
-        detected = box.run(max_seconds=200, idle_seconds=10)
+        detected = box.run(
+            max_seconds=200, idle_seconds=10, expect_success=False
+        )
         state_after_detection = box.duck_query(
             "SELECT snapshot_state FROM _cdc_flight.table_state WHERE source_table = ?",
             [TABLE],
+        )
+        retained_after_detection = box.duck_query(
+            f"SELECT label FROM {box.table(TARGET)} ORDER BY id"
         )
         healed = box.run(max_seconds=220, idle_seconds=10)
         yield {
@@ -72,6 +77,7 @@ def recreated(tmp_path_factory, postgres_cluster):
             "landed_old": landed_old,
             "detected": detected,
             "state_after_detection": state_after_detection,
+            "retained_after_detection": retained_after_detection,
             "healed": healed,
         }
     finally:
@@ -85,20 +91,16 @@ def test_the_first_run_replicated_the_old_relation(recreated):
     assert recreated["landed_old"] == 5, recreated["landed_old"]
 
 
-def test_the_recreation_is_detected_and_the_stale_table_removed(recreated):
-    box = recreated["box"]
+def test_the_recreation_is_detected_and_the_stale_table_is_quarantined(recreated):
     detected = recreated["detected"]
-    assert detected["tables_dropped"] >= 1, detected
+    assert detected["tables_dropped"] == 0, detected
+    assert detected["tables_quarantined"] >= 1, detected
     assert detected["tables_awaiting_snapshot"] == [f"app.{TABLE}"], detected
-    # Either the table is gone, or (if streaming re-created it) it no longer holds the
-    # OLD relation's rows. What must never be true is that `old-*` rows survive.
-    if box.duck_query(
-        "SELECT 1 FROM information_schema.tables WHERE table_name = ?", [TARGET]
-    ):
-        labels = {
-            str(r[0]) for r in box.duck_query(f"SELECT label FROM {box.table(TARGET)}")
-        }
-        assert not {label for label in labels if label.startswith("old-")}, labels
+    # The old image is retained as a recovery image until the replacement snapshot
+    # commits its atomic swap. It is untrusted and cannot be admitted as success.
+    assert recreated["retained_after_detection"], (
+        "the physical recovery image must still exist at quarantine time"
+    )
 
 
 def test_the_incompleteness_was_recorded_before_it_was_repaired(recreated):

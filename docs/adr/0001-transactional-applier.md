@@ -1,6 +1,6 @@
 # ADR 0001 — The transactional applier
 
-* **Status:** accepted (revision 21, 2026-08-01 — implemented through the rubric 1.9 round-12 recovery-preparation guard)
+* **Status:** accepted (revision 22, 2026-08-02 — schema evolution and live catalog discovery)
 * **Date:** 2026-07-30
 * **Task:** TODO 1.0(a); revised under TODO 1.0(feedback)
 * **Decides rubric items:** 1.1, 1.2, 1.3, 1.7 (directly), and 1.4, 1.6, 1.8, 3.2,
@@ -30,6 +30,7 @@
 | 19 | 2026-08-01 | **Round-10 sticky recovery handoff.** Failed callback quiescence is now the terminal `destination_ownership: active -> callback_owned` transition; a later callback exit cannot let an enclosing finalizer revoke it. The filesystem recovery marker is the durable `absent -> armed -> consumed` machine, and cleanup requires `consumed`, not a fresh quiescence read. In-process simulations cover all three durable marker configurations and the exact live-at-catch/quiescent-at-finally race. `pipeline.run()` enforces a process-terminal exit after transfer, so an in-process caller cannot outlive the lease and start beside retained ownership (A68). |
 | 20 | 2026-08-01 | **Round-11 fail-closed publication and recovery boundary.** The supervisor now publishes one typed quiescence proof from inside its `finally`, so a pending `KeyboardInterrupt`, `SystemExit`, or other `BaseException` cannot bypass `active -> callback_owned` by skipping later summary construction. Ownership retirement independently transfers any unretired active callback fail-closed. Marker retirement declares `consumed -> absent`, removes the sibling offset directory, and lives with restart discharge and slot cleanup in `resnapshot_recovery.py`; the summaryless interrupt composition and process-terminal outer teardown are pinned (A69). |
 | 21 | 2026-08-01 | **Round-12 recovery preparation guard.** `InterruptionRecovery.prepare()` now reads the durable marker before cleanup, refuses and preserves `armed`, retires `consumed` only through the declared `consumed -> absent` edge, and directly removes sibling state only when the logical marker is `absent`. Required cleanup errors propagate. Regressions pin the old cleanup-to-arm interruption cut and byte-for-byte preservation of armed marker/offset state (A70). |
+| 22 | 2026-08-02 | **Rubric 2.1–2.3 schema evolution and discovery.** `pg_attribute.attnum`/type identity drives transactional add/drop/rename actions; added values are backfilled behind the catalog fence, dropped destination columns are physically removed, and late renames merge the two names atomically. The watcher polls all non-system schemas by default, admits new relations to table-scoped publications, and performs an in-process main-slot-preserving single-table re-snapshot hand-off for existing rows without restart. The live discovery hand-off adds `streaming -> snapshotting -> streaming` to `run_phase` (A71). |
 
 ---
 
@@ -2742,6 +2743,7 @@ persistence: `_cdc_flight.heartbeat.phase` · initial: `starting` · terminal: `
 | `stopping` | `failed` | yes |
 | `stopping` | `stopped` | yes |
 | `stopping` | `stopping` | no |
+| `streaming` | `snapshotting` | no |
 | `streaming` | `draining` | no |
 | `streaming` | `failed` | yes |
 | `streaming` | `stopping` | no |
@@ -2869,9 +2871,75 @@ persistence: **memory only** · initial: `observed` · terminal: `applied`, `sup
 | `refused` | `marked` | no |
 | `refused` | `refused` | no |
 | `refused` | `superseded` | yes |
+| `superseded` | `applied` | yes |
 | `unconfirmed` | `pending` | no |
 | `unconfirmed` | `superseded` | yes |
 | `unconfirmed` | `unconfirmed` | no |
+
+**`publication_admission`** — Has a newly discovered relation been admitted to the source publication, and who owns the admission decision?
+
+persistence: `_cdc_flight.source_relations.admission_state` · initial: `absent` · terminal: none
+
+| from | to | terminal |
+|---|---|---|
+| `absent` | `pending` | no |
+| `admitted` | `admitted` | no |
+| `admitted` | `error` | no |
+| `admitted` | `external` | no |
+| `admitted` | `pending` | no |
+| `admitted` | `refused` | no |
+| `error` | `admitted` | no |
+| `error` | `error` | no |
+| `error` | `external` | no |
+| `error` | `pending` | no |
+| `error` | `refused` | no |
+| `external` | `error` | no |
+| `external` | `external` | no |
+| `external` | `pending` | no |
+| `external` | `refused` | no |
+| `pending` | `admitted` | no |
+| `pending` | `error` | no |
+| `pending` | `external` | no |
+| `pending` | `pending` | no |
+| `pending` | `refused` | no |
+| `refused` | `external` | no |
+| `refused` | `pending` | no |
+| `refused` | `refused` | no |
+
+**`catalog_schema_liveness`** — Does this watched schema provide positive catalog visibility before a relation absence may be interpreted as a drop?
+
+persistence: `memory only` · initial: `unavailable` · terminal: none
+
+| from | to | terminal |
+|---|---|---|
+| `empty` | `empty` | no |
+| `empty` | `error` | no |
+| `empty` | `unavailable` | no |
+| `empty` | `visible` | no |
+| `error` | `empty` | no |
+| `error` | `error` | no |
+| `error` | `unavailable` | no |
+| `error` | `visible` | no |
+| `unavailable` | `empty` | no |
+| `unavailable` | `error` | no |
+| `unavailable` | `unavailable` | no |
+| `unavailable` | `visible` | no |
+| `visible` | `empty` | no |
+| `visible` | `error` | no |
+| `visible` | `unavailable` | no |
+| `visible` | `visible` | no |
+
+**`schema_refusal`** — Has a schema transition been refused with a durable remediation obligation, and has that obligation been discharged?
+
+persistence: `_cdc_flight.schema_refusals.state` · initial: `absent` · terminal: resolved
+
+| from | to | terminal |
+|---|---|---|
+| `absent` | `pending` | no |
+| `pending` | `pending` | no |
+| `pending` | `resolved` | yes |
+| `resolved` | `pending` | no |
+| `resolved` | `resolved` | yes |
 
 **`catalog_baseline`** — Can the relation identities this run observes be related to the rows the destination already holds, or must they be reconciled before they are adopted?
 
@@ -2966,7 +3034,7 @@ persistence: `.cdc_instances/{instance}` plus its parent completion record · in
 | 18 | table_lifecycle: in_progress -> awaiting_snapshot | crash mid-snapshot | process death; the durable state is `in_progress` | the shadow is dropped and rebuilt; start-up promotes the row to owed work | before: the row still says `in_progress`, which the owed queue now SELECTS · after: `awaiting_snapshot` | AUTO |
 | 19 | table_lifecycle: in_progress -> complete | crash between a swap's DROP and RENAME | process death | transactional DDL rolls back; the table is still owed | before: old table intact, still `in_progress` · after: the swap and the state committed together | AUTO |
 | 20 | table_lifecycle: in_progress -> awaiting_snapshot | crash mid-re-snapshot | process death | every non-terminal table is re-asserted `awaiting_snapshot`; next run redoes it | as 18 | AUTO |
-| 21 | table_lifecycle: complete -> awaiting_snapshot | source relation dropped and recreated | catalog poller | destination dropped, `awaiting_snapshot`, then auto re-snapshot | the drop and the marking are in one commit group | AUTO |
+| 21 | table_lifecycle: complete -> awaiting_snapshot | source relation dropped and recreated | catalog poller | retained destination image quarantined as `awaiting_snapshot`, then auto re-snapshot; the final source-missing policy owns any destruction | the lifecycle mark and retained image remain in one commit group | AUTO |
 | 22 | table_lifecycle: complete -> awaiting_snapshot | undecidable fold (`AmbiguousDelete`) | fold refuses | auto re-snapshot of that table, terminating (A47) | the request is written on the independent connection, so it survives the rollback | AUTO |
 | 23 | table_lifecycle: complete -> awaiting_snapshot | destination identity collision | post-apply assertion | as 22 | as 22 | AUTO |
 | 24 | table_lifecycle: awaiting_snapshot -> complete | source table emptied at the source during a re-snapshot | end-of-snapshot marker **and** zero records for the table **and** a source count of zero | destination table emptied + audited, fenced at the WAL position sampled before the count | before: still owed · after: emptied and fenced in one transaction | AUTO |
@@ -2980,7 +3048,7 @@ persistence: `.cdc_instances/{instance}` plus its parent completion record · in
 | 31 | — | inconsistent Debezium transaction metadata (`TransactionAssemblyError`) | the assembler's own guarded state machine refuses | as 30 | as 30 | **UNDEFINED** — 4.3 |
 | 32 | — | `ResumePointDrift`: the offsets file disagrees with the durable point after COMMIT | assertion | run fails; the next run's reconciliation rebuilds the file from the destination | the data is already durable | AUTO |
 | 32b | — | `ResumePointDrift`: a snapshot record with no arrival ordinal | assertion | none — an internal invariant, not a repairable state | nothing wrong is written | **UNDEFINED** |
-| 33 | — | publication dropped / privileges revoked at the source | connector fails to start | run fails and repeats | nothing wrong is written | **MANUAL** (correctly — but 4.1 may want auto-recreate) |
+| 33 | publication_admission: admitted -> error | publication dropped / privileges revoked at the source | connector fails to start | run fails and repeats | nothing wrong is written | **MANUAL** (correctly — but 4.1 may want auto-recreate) |
 | 35 | table_lifecycle: in_progress -> awaiting_snapshot | re-snapshot yields no consistent point on ONE attempt | `resnapshot` refuses | run fails; tables stay owed; next run retries | nothing swapped | AUTO |
 | 35b | table_lifecycle: in_progress -> awaiting_snapshot | re-snapshot **persistently** yields no consistent point | the same failure every run | none; it repeats for ever | nothing swapped | **UNDEFINED** |
 | 36 | run_outcome: max_seconds -> hung | engine `close()` hangs / engine thread will not stop | `close_timeout`, 60 s join | run fails; process exits via the JVM watchdog | n/a (memory) — and it can no longer overwrite `source_dark` | AUTO |
@@ -2989,7 +3057,7 @@ persistence: `.cdc_instances/{instance}` plus its parent completion record · in
 | 39 | — | WAL retained until the slot is consumed (source disk pressure) | not detected here | — | — | **UNDEFINED** — 3.6/4.4 |
 | 40 | — | throwaway `_rs` slot leaked by ANY failure of a re-snapshot | swept by name at **every** start-up of the owning pipeline, plus a `try/finally` | dropped | no WAL held beyond the next run of that pipeline | AUTO |
 | 41 | slot_verdict (domain) | `CDC_RESNAPSHOT=0` | the operator set it | rows 12-17 and 21-24 stop being automatic and raise instead | nothing mutated | **MANUAL** (deliberate: the rubric's 4 instead of its 5) |
-| 42 | table_lifecycle: complete -> awaiting_snapshot | `CDC_AMBIGUOUS_RESNAPSHOT=0`, or an undecidable fold that did not name a table, or a re-snapshot request that could not be recorded | the fold refuses and the queue write fails or is disabled | none; the same transaction replays and fails identically for ever | nothing wrong is written | **MANUAL** |
+| 42 | schema_refusal: absent -> pending | `CDC_AMBIGUOUS_RESNAPSHOT=0`, or an undecidable fold that did not name a table, or a re-snapshot request that could not be recorded | the fold refuses and the queue write fails or is disabled | none; the same transaction replays and fails identically for ever | nothing wrong is written | **MANUAL** |
 | 43 | table_lifecycle: in_progress -> awaiting_snapshot | the two readings of the re-snapshot's consistent point disagree | `agree_on_consistent_point` | run fails; the tables are re-marked `awaiting_snapshot`; next run takes a fresh `C` | nothing swapped, nothing fenced | AUTO |
 | 44 | acquisition_recovery: resume_point_deleted -> armed | the load-bearing slot cannot be dropped on ONE attempt (another backend holds it) | `drop_slot` neither returns `dropped` nor `absent` | `RecoveryFailed`; the journal is intact and the next run retries the same phase | before: the journal stays at `resume_point_deleted` and the slot survives · after: `armed` | AUTO |
 | 44b | acquisition_recovery: resume_point_deleted -> armed | the load-bearing slot can **never** be dropped (the holder never lets go) | the same `RecoveryFailed` every run | none; a human has to free the slot | nothing snapshotted against a surviving slot | **MANUAL** |
@@ -3319,17 +3387,20 @@ machine is ceremony — worse than ceremony, because it advertises recoverable i
 states that do not exist. If yes, the state needs a name, a persisted value and a
 transition table.
 
-#### What was built (nine focused machines + one precedence)
+#### What was built (twelve focused machines + one precedence)
 
 | machine | owns | states | edges | persistence |
 |---|---|---|---|---|
 | `table_lifecycle` | is this destination table a trustworthy image, and who owes the work | 5 | 21 | `_cdc_flight.table_state.snapshot_state` |
-| `run_phase` | where is this run, readable from the destination while it runs | 9 | 23 | `_cdc_flight.heartbeat.phase` |
+| `run_phase` | where is this run, readable from the destination while it runs | 9 | 24 | `_cdc_flight.heartbeat.phase` |
 | `run_outcome` | why did this run stop — cause before symptom | 10 | 45 (a **precedence**: escalations only) | `heartbeat.terminal_reason`, `last_run.json` |
 | `acquisition_recovery` | what has this destructive recovery already done | 5 | 9 | `_cdc_flight.recovery_state.phase` |
 | `interruption_marker` | has filesystem recovery intent been armed, safely discharged, and retired | 3 | 3 | `<state_dir>/resnapshot/interrupted.json.state` |
 | `destination_ownership` | who owns the destination after callback admission or failed quiescence | 4 | 5 | **memory only** |
-| `catalog_change` | where is one DDL fact in observe → confirm → fence → apply | 9 | 30 | **memory only** |
+| `catalog_change` | where is one DDL fact in observe → confirm → fence → apply | 9 | 31 | **memory only** |
+| `publication_admission` | has a discovered relation been admitted to the publication, and who owns that decision | 6 | 23 | `_cdc_flight.source_relations.admission_state` |
+| `catalog_schema_liveness` | is a watched schema visibly queryable before absence can mean a drop | 4 | 16 | **memory only** |
+| `schema_refusal` | has a refused schema transition acquired a durable remediation obligation | 3 | 5 | `_cdc_flight.schema_refusals.state` |
 | `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
 | `snapshot_completion` | have all ordered snapshot callbacks arrived | 6 | 9 | **memory only** |
 | `runtime_root_lifecycle` | is the disposable root reusable or committed to cleanup | 6 | 10 | project-local root and parent markers |
@@ -4361,3 +4432,75 @@ preserves marker and offsets byte-for-byte. From logical `absent`, the cut can l
 `absent`, and the next preparation is re-entrant. Machine guards explicitly reject both
 `armed -> absent` and `armed -> armed`; the generated inventory remains three states and
 three declared edges.
+
+### A71 — rev 22: schema evolution is a catalog-fenced action, and discovery is a live hand-off
+
+The Postgres logical stream carries row images, not DDL. A relation's `oid` therefore
+continues to identify the table, while `pg_attribute.attnum` and the source type
+identity identify a logical column. The catalog watcher records the ordered column
+shape in `source_relations.columns_json` and emits one fenced `schema_changed` action
+for an attnum-preserving rename, an add, a drop, or a type-plus-rename combination.
+
+The destination policy for rubric 2.1 is **current-state physical schema**: an added
+column is created with the catalog-derived destination type and existing source values
+are copied before the commit is durable; a dropped source column is physically dropped
+from the destination. The add backfill uses destination primary-key values for keyed
+tables. Keyless tables have only connector event identity, so a non-uniform source
+value cannot be joined honestly to historical rows; the common uniform ADD default/NULL
+case is applied to all keyless changelog rows, and a non-uniform case fails the group
+rather than silently writing the wrong rows. Schema DDL runs before row DML in the
+same transaction because DuckDB/MotherDuck can otherwise validate an old primary-key
+version at commit; table drops remain after row DML.
+
+For rubric 2.2, a rename is a true destination `ALTER TABLE ... RENAME COLUMN`, never
+a drop/add pair. If a row with the new name arrives before the catalog poll, the row
+path may temporarily create the new physical column; the fenced action then merges
+`COALESCE(new, old)` and drops the old column in that same transaction. This preserves
+old values, prefers already-arrived new values, and records one `column_renamed` audit
+event. A synchronous `pg_attribute` probe before appending an unknown-shape unit and
+the normal WAL fence cover late detection; unrelated adds/drops in the same source
+DDL are applied from the same attnum diff.
+
+For rubric 2.3, auto-discovery is enabled by default with a 10-second configurable
+catalog interval (the supported default is at most 60 seconds). With no schema include
+list the watcher scans every non-system schema; `CDC_SCHEMA_INCLUDE_LIST`/`CDC_SCHEMAS`
+can narrow that scope. A table-scoped publication receives `ALTER PUBLICATION ... ADD
+TABLE` automatically. A `FOR ALL TABLES` publication already captures the relation and
+needs no ALTER; publication failure leaves the `new` action pending and is surfaced.
+The running process quiesces the main callback, keeps the main slot and durable resume
+point, runs the existing single-table re-snapshot for pre-existing rows, advances the
+snapshot epoch, and starts a no-data engine on the same main slot. This is the declared
+`run_phase: streaming -> snapshotting -> streaming` hand-off, so no restart or config
+edit is required and WAL is not lost between the image and resumed stream. Multiple
+new relations are safe by default but produce a warning (`mass_add_observed`) for
+operator visibility; unlike mass drops, additions cannot remove destination data.
+After the image is committed, the watcher closes the existing discovery object through
+the already-declared `pending -> due -> applied` catalog-change edges and retains its
+dirty relation for the normal post-engine `source_relations` flush. That prevents the
+resumed stream from emitting a second false `new` marker and adds no new
+consistency-affecting state machine.
+
+### A72 — rev 23: recreate generations are monotonic at every boundary
+
+Round 8 found two coupled races in the catalog watcher: a queued A->B recreate could
+be refused after B had already become C and then suppress C discovery, and a stale
+recreate could quarantine a retained image after the source had dropped B without a
+replacement. The policy is now one generation decision shared by observation, planning
+and admission:
+
+* every queued recreate is re-read against the current source OID in both `DROP_LOG`
+  and `DROP_REPLICATE`; a present different OID supersedes the old obligation and the
+  only action is a quarantine for the newest OID;
+* an absent source supersedes the recreate with a genuine drop, so `DROP_LOG` retains
+  and audits the old image while `DROP_REPLICATE` applies its destructive drop policy;
+* the replacement identity fence runs before any drop-mode branch, and its one source
+  identity snapshot is cached for the whole commit group and reused by catalog planning;
+* the data, quarantine/lifecycle state, source identity and resume point remain in the
+  one destination transaction, with settlement only after COMMIT.
+
+The generation token is the source relation OID. PostgreSQL OIDs are four-byte values
+and may wrap or be reused, so a same-name drop/recreate that receives the same OID is
+outside this identity model's supported lifetime. A stronger source generation token
+would be required to close that boundary; it is documented at the identity fence in
+`src/cdc_flight/unit_admission.py` and tracked as R8-M3 in
+`reviews/p2_review_r8.md`.

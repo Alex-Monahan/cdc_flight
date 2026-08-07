@@ -35,7 +35,7 @@ from pathlib import Path
 # different proven-safe pool; the production default is the Arrow system allocator.
 os.environ.setdefault("ARROW_DEFAULT_MEMORY_POOL", "system")
 
-from . import acquisition
+from . import acquisition, naming
 from . import catalog as catalog_mod
 from . import catalog_baseline as baseline_mod
 from . import destination as dest_mod
@@ -44,7 +44,7 @@ from . import reconcile as reconcile_mod
 from . import recovery as recovery_mod
 from . import resnapshot as resnapshot_mod
 from . import resnapshot_recovery as resnapshot_recovery_mod
-from .applier import Applier, ApplierConfig
+from .applier import ApplierConfig
 from .completion_stage import PostEngineCompletion
 from .config import (
     CatalogConfig,
@@ -64,13 +64,11 @@ from .machines import (
     PHASE_RECOVERING,
     PHASE_SNAPSHOTTING,
     PHASE_STOPPING,
-    PHASE_STREAMING,
 )
 from .ownership import DestinationOwnership
 from .run_state import RunOutcome, RunPhaseWriter
 from .snapshot_completion import SnapshotCompletion
-from .source_health import SourceHealth
-from .supervisor import run_engine_bounded
+from .supervisor import run_engine_bounded  # noqa: F401 - compatibility re-export
 
 log = logging.getLogger("cdc_flight.pipeline")
 
@@ -118,9 +116,9 @@ def run(
 
     replication.state_dir.mkdir(parents=True, exist_ok=True)
     settings = applier_settings()
-    # `skipped.operations` is what decides whether a TRUNCATE is decoded at all, so
-    # the truncate policy has to be known before the engine properties are built
-    # (rubric 1.5).
+    # `skipped.operations` decides whether a TRUNCATE is decoded at all. The pipeline
+    # always retains it so the generation fence can distinguish a physical rewrite
+    # from a replacement; the destination truncate policy is applied later.
     props = build_properties(
         source,
         replication,
@@ -132,6 +130,7 @@ def run(
     # pinned topic-naming strategy, and asserted rather than reasoned about
     # (Opus MINOR-6).
     assert_no_internal_topic_collision(replication.topic_prefix, source.tables)
+    snapshot_capture_names = tuple(source.tables)
     namespace = props["name"]
     runner_id = uuid.uuid4().hex
 
@@ -150,7 +149,6 @@ def run(
     lease: Lease | None = None
     lease_held = False
     phases: RunPhaseWriter | None = None
-    applier: Applier | None = None
     ownership = DestinationOwnership()
     run_ok = False
     #: The run's ONE outcome, shared by the supervisor, the terminal `RUN_PHASE`
@@ -394,11 +392,111 @@ def run(
         # rebuild, and rebuilding every run would re-snapshot the world for ever.
         catalog_cfg = CatalogConfig()
         catalog_enabled = applier_cfg.drop_mode != "ignore" and catalog_cfg.poll_seconds > 0
+        if source.auto_discovery and not catalog_enabled:
+            # Publication-driven discovery requires a live catalog watcher to narrow
+            # the initial snapshot and to hand new relations through admission. When
+            # catalog polling is explicitly disabled (for example DROP_MODE=ignore),
+            # keep the configured capture bounded instead of letting Debezium snapshot
+            # every table in the publication while completion still expects CDC_TABLES.
+            props["schema.include.list"] = source.schema
+            props["table.include.list"] = ",".join(source.tables)
         baseline = baseline_mod.mark_unconfirmed(
             con, pipeline=dest.pipeline_name, dataset=dest.dataset_name,
             runner_id=runner_id, reconcile=catalog_enabled,
         )
         summary_extra.update(baseline.as_dict())
+
+        # Discovery is observed before the owed queue is read.  A newly visible
+        # relation is immediately routed through the existing durable table lifecycle;
+        # its single-table re-snapshot then runs before the main slot starts consuming
+        # it.  This is the same hand-over used for recreated relations, so pre-existing
+        # rows are never mistaken for a stream tail.
+        watcher = None
+        discovered = ()
+        if catalog_enabled:
+            watcher = catalog_mod.CatalogWatcher(
+                dsn=source.dsn,
+                primary_dsn=source.primary_dsn,
+                publication=replication.publication_name,
+                schema=source.schema,
+                schemas=source.schemas,
+                all_schemas=source.auto_discovery and source.schemas is None,
+                auto_discover=source.auto_discovery,
+                publication_ownership=source.publication_ownership,
+                include={t if "." in t else f"{source.schema}.{t}" for t in source.tables},
+                known=catalog_mod.read_known_relations(con, dest.pipeline_name),
+                replicated=catalog_mod.seed_from_table_state(con, dest.pipeline_name),
+                # `unmarked`, NOT a recomputation. By here the marking above has put
+                # every unrelatable relation in the owed queue and the blocking
+                # re-snapshot has already rebuilt it from the current source relation.
+                unrelatable=set(baseline.unmarked),
+                poll_seconds=catalog_cfg.poll_seconds,
+                emit_marker=catalog_cfg.emit_marker,
+                marker_prefix=catalog_cfg.marker_prefix,
+                grace_seconds=catalog_cfg.grace_seconds,
+                confirm_polls=catalog_cfg.confirm_polls,
+                marker_max_writes=catalog_cfg.marker_max_writes or None,
+            ).start()
+            discovered = watcher.new_relations()
+            if discovered:
+                dest_mod.request_snapshot(
+                    con,
+                    pipeline=dest.pipeline_name,
+                    tables=[
+                        (
+                            relation.schema,
+                            relation.table,
+                            naming.destination_table(
+                                replication.topic_prefix, relation.schema, relation.table
+                            ),
+                        )
+                        for relation in discovered
+                    ],
+                    detail="a new source relation was discovered by the catalog watcher",
+                )
+                summary_extra["discovered_relations"] = [
+                    relation.qualified for relation in discovered
+                ]
+            observed = watcher.captured_relations()
+            if observed and source.auto_discovery:
+                # Debezium is publication-driven in discovery mode. Snapshot completion
+                # therefore expects the relations observed at the run's start, including
+                # a relation that was not in CDC_TABLES.
+                # Keep an explicit current relation list on the initial engine as well:
+                # it preserves publication-root partition semantics (the publication
+                # contains the parent, while a broad no-filter snapshot can enumerate
+                # each child separately). Subsequent no-data engines use the
+                # publication directly, so a relation added during this run is
+                # automatically eligible without rebuilding this list.
+                props["table.include.list"] = ",".join(
+                    sorted(
+                        relation.qualified
+                        for relation in observed
+                        if not relation.is_partition
+                    )
+                )
+                captured_tables = [
+                    (
+                        relation.schema,
+                        relation.table,
+                        naming.destination_table(
+                            replication.topic_prefix, relation.schema, relation.table
+                        ),
+                    )
+                    for relation in observed
+                    if not relation.is_partition
+                ]
+                snapshot_capture_names = watcher.snapshot_names()
+            if catalog_cfg.grace_seconds:
+                log.warning(
+                    "CDC_CATALOG_GRACE=%.0fs: a destructive catalog action will be "
+                    "applied after that long even though the destination has not "
+                    "reached the LSN at which it was detected. In-flight events for "
+                    "the table can then re-create it as a zombie holding pre-drop "
+                    "rows, so this mode is EXPLICITLY EXCLUDED from the structural "
+                    "correctness guarantee (ADR 0001 §18/A38).",
+                    catalog_cfg.grace_seconds,
+                )
 
         interrupted_resnapshot = resnapshot_recovery_mod.requeue_interrupted(
             con,
@@ -466,20 +564,21 @@ def run(
                 reason=f"{len(owed)} table(s) marked awaiting_snapshot",
                 namespace=namespace,
                 ownership=ownership,
+                new_relations={relation.qualified for relation in discovered},
+                drop_mode=applier_cfg.drop_mode,
             )
             summary_extra.update(resnap.as_dict())
-            # The main applier's snapshot identities must stay disjoint from the ones the
-            # re-snapshot just wrote, and the epoch is what makes them disjoint.
-            con.execute(
-                f"UPDATE {CONTROL_SCHEMA}.debezium_offsets SET snapshot_epoch = "
-                "greatest(snapshot_epoch, ?) WHERE pipeline = ? AND namespace = ?",
-                [
-                    reconciliation.resume_point.snapshot_epoch + len(owed) + 1,
-                    dest.pipeline_name,
-                    namespace,
-                ],
+            if watcher is not None and discovered:
+                watcher.complete_discoveries(
+                    {relation.qualified for relation in discovered}
+                )
+            # The re-snapshot callback advanced the durable epoch in the same
+            # transaction as each completed image.  Keep the in-memory point aligned
+            # for the main applier without reopening a post-image write window.
+            reconciliation.resume_point.snapshot_epoch = max(
+                reconciliation.resume_point.snapshot_epoch,
+                resnap.snapshot_epoch,
             )
-            reconciliation.resume_point.snapshot_epoch += len(owed) + 1
         elif owed:
             log.warning(
                 "%s table(s) are marked awaiting_snapshot and are NOT being "
@@ -495,15 +594,10 @@ def run(
             # remembers marking: the run that discovers a relation refuses, and so does
             # every later one, until something actually rebuilds it. Keyed on
             # `baseline.unreconciled` the guarantee would last exactly one run.
-            skipped_baseline = sorted(
-                set(unhandled)
-                & set(
-                    baseline_mod.unrelatable_relations(
-                        con, pipeline=dest.pipeline_name, dataset=dest.dataset_name,
-                        include_owed=True,
-                    )
-                )
-            )
+            # An owing lifecycle is itself enough to block a successful run. The
+            # physical target may be empty or already absent after quarantine; row
+            # presence is not a trust signal.
+            skipped_baseline = list(unhandled)
             if skipped_baseline and not will_snapshot_everything:
                 # A QUEUED REBUILD IS NOT A FINISHED ONE (Codex r6 BLOCKER-2, reproduced).
                 #
@@ -513,7 +607,7 @@ def run(
                 # are owed a rebuild *because this run could not relate the rows they
                 # hold to any identity at the source*, so continuing would stream the
                 # replacement relation's events onto the old relation's rows and — worse
-                # — let the watcher adopt the replacement oid, after which nothing can
+                # — let the watcher adopt the replacement generation, after which nothing can
                 # ever detect it again. Measured: source `[999]`, destination
                 # `[1, 2, 999]`, lifecycle `awaiting_snapshot`, registry at the new oid,
                 # baseline `valid`, exit 0.
@@ -532,56 +626,13 @@ def run(
                     dict(summary_extra),
                 )
 
+        # The refusal above is intentionally before the coordinator's
+        # `phases.to(PHASE_STREAMING)` transition.
+
         # rubric 1.6: the per-table snapshot watermark, read AFTER any re-snapshot so it
         # carries the image the main stream now has to hand over from.
         watermarks = resnapshot_mod.read_watermarks(con, dest.pipeline_name)
         summary_extra["snapshot_watermarks"] = len(watermarks)
-
-        # rubric 1.5: `DROP TABLE` is not in the replication stream, so the source
-        # catalog is polled on its own connection. Started BEFORE the engine, so a
-        # table dropped while this pipeline was down is detected on this run rather
-        # than one poll interval into it.
-        watcher = None
-        if catalog_enabled:
-            watcher = catalog_mod.CatalogWatcher(
-                dsn=source.dsn,
-                publication=replication.publication_name,
-                schema=source.schema,
-                include={t if "." in t else f"{source.schema}.{t}" for t in source.tables},
-                known=catalog_mod.read_known_relations(con, dest.pipeline_name),
-                replicated=catalog_mod.seed_from_table_state(con, dest.pipeline_name),
-                # `unmarked`, NOT a recomputation. By here the marking above has put
-                # every unrelatable relation in the owed queue and the blocking
-                # re-snapshot has already rebuilt it from the current source relation —
-                # so adopting that relation's oid is now the *correct* thing to do, and
-                # re-asking "is it unrelatable?" would say yes for the wrong reason (the
-                # registry row is written by the flush at the end of this very run) and
-                # send a freshly rebuilt table down the destructive path. MEASURED: it
-                # did, and the mass-drop breaker then wedged the pipeline.
-                #
-                # A fail-safe, not the mechanism: this is non-empty only when a relation
-                # could not be put in the owed queue at all.
-                unrelatable=set(baseline.unmarked),
-                poll_seconds=catalog_cfg.poll_seconds,
-                emit_marker=catalog_cfg.emit_marker,
-                marker_prefix=catalog_cfg.marker_prefix,
-                grace_seconds=catalog_cfg.grace_seconds,
-                confirm_polls=catalog_cfg.confirm_polls,
-                marker_max_writes=catalog_cfg.marker_max_writes or None,
-            ).start()
-            if catalog_cfg.grace_seconds:
-                log.warning(
-                    "CDC_CATALOG_GRACE=%.0fs: a destructive catalog action will be "
-                    "applied after that long even though the destination has not "
-                    "reached the LSN at which it was detected. In-flight events for "
-                    "the table can then re-create it as a zombie holding pre-drop "
-                    "rows, so this mode is EXPLICITLY EXCLUDED from the structural "
-                    "correctness guarantee (ADR 0001 §18/A38).",
-                    catalog_cfg.grace_seconds,
-                )
-
-        # Imported late: importing pydbzengine boots a JVM.
-        from .engine import SupervisedDebeziumEngine
 
         # A journalled recovery forces the MAIN engine into a data-reading snapshot even
         # when the interrupted run already committed a durable first group. In that case
@@ -591,48 +642,10 @@ def run(
         # streaming run remains `not_required` here.
         snapshot_completion_required = will_snapshot_everything or journal is not None
         snapshot_completion = SnapshotCompletion.for_capture(
-            snapshot_completion_required, schema=source.schema, tables=source.tables)
-        applier = Applier(
-            con,
-            pipeline=dest.pipeline_name,
-            namespace=namespace,
-            dataset=dest.dataset_name,
-            topic_prefix=replication.topic_prefix,
-            offset_path=replication.offset_file,
-            resume_point=reconciliation.resume_point,
-            config=applier_cfg,
-            lease=lease,
-            runner_id=runner_id,
-            transactional_ddl=transactional_ddl,
-            catalog=watcher,
-            watermarks=watermarks,
-            completion=snapshot_completion,
+            snapshot_completion_required,
+            schema=source.schema,
+            tables=snapshot_capture_names,
         )
-        ownership.attach(applier)
-        engine = SupervisedDebeziumEngine(
-            properties=props,
-            handler=applier,
-            offset_file=replication.offset_file,
-            always_commit_offsets=props.get("offset.flush.interval.ms") == "0",
-        )
-        # Wired EXPLICITLY. It used to be attached as a side effect of
-        # `engine.consumer`'s `cached_property` being evaluated before `engine`'s,
-        # which is a third-party property-evaluation order (Opus B2 note): correct
-        # today, invisible if it ever changes. Touching `engine.consumer` here makes
-        # the dependency a statement, and the assertion makes it a checked one.
-        applier.verifier = None
-        engine.consumer  # noqa: B018 - builds the consumer and attaches the verifier
-        if applier.cfg.verify_offset_file:
-            assert applier.verifier is not None, (
-                "the offset-flush verifier was not attached to the applier; a silently "
-                "failed markBatchFinished() would be invisible (ADR 0001 §4.2)"
-            )
-        health = SourceHealth(
-            dsn=source.dsn,
-            slot_name=replication.slot_name,
-            max_lag_bytes=run_cfg.idle_max_lag_bytes,
-        ).start()
-
         completion_stage = PostEngineCompletion(
             con=con,
             source_dsn=source.dsn,
@@ -649,45 +662,55 @@ def run(
             snapshot_completion=snapshot_completion,
             outcome=outcome,
             base_summary=summary_extra,
+            drop_mode=applier_cfg.drop_mode,
         )
 
+        from .discovery_coordinator import LiveDiscoveryCoordinator
+
+        # Construction invariant retained across the coordinator boundary:
+        # `ownership.attach(applier)` must precede `engine.consumer`, so a
+        # consumer-construction failure retires an idle owner rather than
+        # exposing an unowned callback.
+
+        coordinator = LiveDiscoveryCoordinator(
+            con=con,
+            source=source,
+            replication=replication,
+            destination=dest,
+            namespace=namespace,
+            run_cfg=run_cfg,
+            applier_cfg=applier_cfg,
+            props=props,
+            settings=settings,
+            watcher=watcher,
+            discovered=discovered,
+            catalog_cfg=catalog_cfg,
+            phases=phases,
+            lease=lease,
+            runner_id=runner_id,
+            transactional_ddl=transactional_ddl,
+            ownership=ownership,
+            snapshot_completion=snapshot_completion,
+            completion_stage=completion_stage,
+            main_resume=reconciliation.resume_point,
+            watermarks=watermarks,
+            outcome=outcome,
+            summary_extra=summary_extra,
+            resnapshot_enabled=acquisition.resnapshot_enabled(),
+            catalog_flush_exclude=set(
+                baseline_mod.unrebuilt_relations(
+                    con, pipeline=dest.pipeline_name, dataset=dest.dataset_name
+                )
+            ),
+        )
         try:
-            phases.to(PHASE_STREAMING)
-            ownership.activate(applier)
-            result = run_engine_bounded(
-                engine, applier, run_cfg, health,
-                engine_terminates_normally=(
-                    props["snapshot.mode"] in {"initial_only", "recovery_only"}
-                ),
-                catalog=watcher,
-                catalog_drain_seconds=catalog_cfg.drain_seconds,
-                phases=phases,
-                # ONE outcome per run (Codex r1 MAJOR-2). The supervisor used to build
-                # its own and the phase writer another, so `last_run.json` shipped
-                # `stop_reason="idle"` beside `run_outcome="max_seconds"` on every
-                # ordinary run and a severe result could be published as the mild
-                # default.
-                outcome=outcome,
-                completion=snapshot_completion,
-                quiescence_observer=ownership.quiescence_observer(applier),
-            )
-            # QUIESCE, VALIDATE, FLUSH, REPORT — in that order. The completion stage
-            # owns every durable post-engine discharge and returns a complete summary;
-            # this loop only supervises the callback runtime.
-            report = completion_stage.finish(result)
-            run_ok = report.run_ok
-            outcome.record(report.summary.get("stop_reason") or outcome.value)
-            reported = report.summary
+            reported = coordinator.run()
+            run_ok = coordinator.run_ok
             return reported
         except EngineFailure as failure:
             outcome.record(failure.summary.get("stop_reason") or "engine_error")
             reported = failure.summary
             raise
-        finally:
-            health.stop()
-            if watcher is not None:
-                watcher.stop()
-            applier.shutdown()
     except BaseException as exc:
         # Anything that unwound before (or around) the engine: a refusal, a lease loss,
         # a control-schema failure. It used to leave `terminal_reason=None`, so the

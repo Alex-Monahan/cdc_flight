@@ -55,6 +55,13 @@ class SourceConfig:
         )
     )
     schema: str = field(default_factory=lambda: _env("CDC_SCHEMA", "app"))
+    #: Optional write route for catalog admission and transactional markers when
+    #: ``dsn`` points at a hot standby.  An unset value deliberately falls back to
+    #: the ordinary source DSN, so existing primary-only deployments keep one
+    #: configuration surface.
+    primary_dsn_override: str | None = field(
+        default_factory=lambda: os.environ.get("CDC_PRIMARY_DSN"), repr=False
+    )
 
     @property
     def dsn(self) -> str:
@@ -63,12 +70,46 @@ class SourceConfig:
         )
 
     @property
+    def primary_dsn(self) -> str:
+        """DSN used for source writes; defaults to the source/read endpoint."""
+        return self.primary_dsn_override or self.dsn
+
+    @property
     def tables(self) -> list[str]:
         raw = _env(
             "CDC_TABLES",
             "customers,orders,sensor_readings,documents,wide_types,audit_log",
         )
         return [f"{self.schema}.{t.strip()}" for t in raw.split(",") if t.strip()]
+
+    @property
+    def schemas(self) -> set[str] | None:
+        """Optional catalog scope; ``None`` means all non-system schemas."""
+        raw = os.environ.get("CDC_SCHEMA_INCLUDE_LIST") or os.environ.get("CDC_SCHEMAS")
+        if not raw:
+            return None
+        return {item.strip() for item in raw.split(",") if item.strip()}
+
+    @property
+    def auto_discovery(self) -> bool:
+        return _flag("CDC_AUTO_DISCOVERY", True)
+
+    @property
+    def publication_ownership(self) -> str:
+        """Who may admit an auto-discovered table to the publication.
+
+        The default is deliberately explicit: the Flight owns the table-scoped
+        publication admission it performs. Deployments whose publication is managed
+        outside this process set ``CDC_PUBLICATION_OWNERSHIP=external``; in that mode
+        discovery waits for membership and never issues an ALTER.
+        """
+        value = _env("CDC_PUBLICATION_OWNERSHIP", "flight").strip().lower()
+        if value not in {"flight", "external"}:
+            raise ValueError(
+                "CDC_PUBLICATION_OWNERSHIP must be 'flight' or 'external', "
+                f"got {value!r}"
+            )
+        return value
 
 
 @dataclass(frozen=True)
@@ -200,8 +241,8 @@ def applier_settings() -> dict:
         #: rubric 1.5. `replicate` empties the destination table inside the commit
         #: group, exactly as Postgres emptied the source, and records a marker in
         #: `_cdc_flight.table_events`. `log` records the marker and keeps the rows
-        #: (the rubric's "tombstone/soft delete" behaviour, =3). `ignore` restores
-        #: Debezium's default of not even decoding the event.
+        #: (the rubric's "tombstone/soft delete" behaviour, =3). `ignore` is a
+        #: destination no-op; the raw event remains decoded for truncate semantics.
         "truncate_mode": _env("CDC_TRUNCATE_MODE", TRUNCATE_REPLICATE).strip().lower(),
         #: rubric 1.5. `replicate` drops the destination table when the source table
         #: is gone; `log` records the marker only; `ignore` disables detection.
@@ -215,10 +256,6 @@ def applier_settings() -> dict:
         #: refused, never half of it.
         "drop_max_per_group": int(_env("CDC_DROP_MAX_PER_POLL", "1")),
         "drop_allow_mass": _flag("CDC_DROP_ALLOW_MASS", False),
-        #: Re-read the relation immediately before destroying its destination table,
-        #: and fail closed if the source cannot be asked (Codex 4). Off only for tests
-        #: that drive the coordinator without a real source.
-        "drop_revalidate": _flag("CDC_DROP_REVALIDATE", True),
         #: rubric 4.7. An undecidable fold used to be a PERMANENT failure: the group
         #: rolls back (correctly), the transaction replays, the same ambiguity is hit,
         #: for ever. That is a manual-intervention case, which 4.7 scores. Default ON:

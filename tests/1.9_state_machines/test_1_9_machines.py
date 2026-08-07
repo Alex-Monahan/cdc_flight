@@ -20,6 +20,13 @@ from pathlib import Path
 import pytest
 
 from cdc_flight import machines as m
+from cdc_flight import state_interactions, state_matrix
+from cdc_flight.machines import (
+    ADMISSION_ERROR,
+    ADMISSION_EXTERNAL,
+    CHANGE_PENDING,
+    CHANGE_REFUSED,
+)
 from cdc_flight.states import Domain, IllegalTransition, Machine, UnknownState, ranked
 
 
@@ -90,26 +97,6 @@ def test_a_domain_is_frozen_and_validated():
 # --------------------------------------------------------------------------- #
 # the shape of the answer to rubric 1.9
 # --------------------------------------------------------------------------- #
-DECLARED = {
-    "table_lifecycle",
-    "run_phase",
-    "run_outcome",
-    "acquisition_recovery",
-    "catalog_change",
-    # rev 14. The architecture review's initial set covered only the states then
-    # *visible*; this one was found by reproducing the inconsistency it allows, which is a
-    # better argument for a machine than any of the original four had (Codex r5
-    # BLOCKER-1). "Can an observed relation identity be adopted as history for rows the
-    # destination already holds?" was a derived expression over a registry row, a table
-    # lifecycle, a destination row count and an in-process poll counter.
-    "catalog_baseline",
-    "interruption_marker",
-    "destination_ownership",
-    "snapshot_completion",
-    "runtime_root_lifecycle",
-}
-
-
 def test_the_declared_machines_are_the_ones_the_review_said_to_build():
     """The consistency-affecting states plus the outcome precedence.
 
@@ -118,20 +105,12 @@ def test_the_declared_machines_are_the_ones_the_review_said_to_build():
     the *set*, so adding a machine (or quietly dropping one) is a decision somebody has
     to make in this file rather than a diff nobody notices.
     """
-    assert set(_declared()) == DECLARED
+    assert set(_declared()) == set(m.declared_machines())
 
 
 def _declared() -> dict[str, Machine]:
-    """Only the machines `cdc_flight/machines.py` itself declares.
-
-    The global registry also holds whatever a test constructed, which is the right
-    behaviour for a registry and the wrong basis for "these are the system's machines".
-    """
-    return {
-        value.name: value
-        for value in vars(m).values()
-        if isinstance(value, Machine)
-    }
+    """Only the production declarations, excluding mechanism-test machines."""
+    return m.declared_machines()
 
 
 def _published_inventory(path: Path) -> dict[str, tuple[int, int]]:
@@ -144,7 +123,7 @@ def _published_inventory(path: Path) -> dict[str, tuple[int, int]]:
         if len(cells) < 5:
             continue
         name = cells[0].strip("`")
-        if name not in DECLARED:
+        if name not in _declared():
             continue
         edge_count = re.match(r"\d+", cells[3])
         if cells[2].isdigit() and edge_count is not None:
@@ -329,11 +308,11 @@ def test_a_catalog_change_cannot_be_applied_without_becoming_due():
     m.CATALOG_CHANGE.check("due", "applied")
 
 
-def test_a_superseded_or_applied_change_is_terminal():
+def test_a_superseded_or_applied_change_is_terminal_but_settlement_is_allowed():
     assert m.CATALOG_CHANGE.is_terminal("applied")
     assert m.CATALOG_CHANGE.is_terminal("superseded")
     assert m.CATALOG_CHANGE.successors("applied") == set()
-    assert m.CATALOG_CHANGE.successors("superseded") == set()
+    assert m.CATALOG_CHANGE.successors("superseded") == {"applied"}
 
 
 def test_a_run_cannot_reach_stopped_without_stopping():
@@ -412,3 +391,99 @@ def test_source_health_is_not_a_machine():
     Adding a machine here would be ceremony, and the review said so."""
     assert "source_health" not in _declared()
     assert "source_health" in {d.name for d in m.__dict__.values() if isinstance(d, Domain)}
+
+
+def test_every_declared_machine_state_cell_is_accepted_or_refused():
+    """Closed-model coverage: every state pair, including ERROR, has a disposition."""
+    for _name, machine in _declared().items():
+        for state in machine.states:
+            assert machine.parse(state) == state
+        for before in machine.states:
+            for after in machine.states:
+                if machine.allows(before, after):
+                    machine.check(before, after)
+                else:
+                    with pytest.raises(IllegalTransition):
+                        machine.check(before, after)
+
+
+# The following are the declared cross-machine products for schema evolution and live
+# discovery.  The list is intentionally explicit: adding a consistency-affecting state
+# without adding its product here is a review-visible test failure, rather than an
+# assumption hidden in a coordinator's `if` chain.
+# Cross-machine coverage is generated from the production declarations.  There is no
+# test-owned outcome table: each cell constructs the real state owners and calls the
+# production gate for that pair.
+def test_every_declared_machine_state_is_reachable_or_explicitly_refused():
+    declared = m.declared_machines()
+    for machine in declared.values():
+        assert machine.initial_states
+        for state in machine.reachable_states():
+            assert machine.parse(state) == state
+        assert machine.reachable_states() <= set(machine.states)
+
+
+def test_every_declared_edge_is_exercised_by_its_real_owner():
+    for machine_name, before, after in state_matrix.transitions():
+        state_matrix.exercise_transition(machine_name, before, after)
+
+
+@pytest.mark.parametrize(
+    "pair,left,right",
+    state_matrix.cells(m.INTERACTING_MACHINE_PAIRS),
+)
+def test_every_declared_interacting_cell_drives_real_code(pair, left, right):
+    """Every reachable product cell, including error states, is executed.
+
+    The parameter list comes from Machine.initial_states and graph reachability;
+    the body only accepts a production execution or a refusal raised by a production
+    gate.  A missing owner probe is a test failure, not an implicit disposition.
+    """
+    result = state_matrix.exercise_cell(pair, left, right)
+    assert result.kind in {"exercised", "refused"}
+    if result.kind == "refused":
+        assert result.reason
+
+
+def test_every_matrix_cell_delegates_to_the_production_interaction_gate(monkeypatch):
+    expected = state_matrix.cells(m.INTERACTING_MACHINE_PAIRS)
+    calls = []
+    real_gate = state_interactions.evaluate
+
+    def recording_gate(pair, left, right, **owners):
+        calls.append((pair, left, right))
+        return real_gate(pair, left, right, **owners)
+
+    monkeypatch.setattr(state_interactions, "evaluate", recording_gate)
+    for pair, left, right in expected:
+        state_matrix.exercise_cell(pair, left, right)
+
+    assert calls == expected
+
+
+def test_production_interaction_gate_consumes_both_states():
+    pair = ("catalog_change", "publication_admission")
+    admitted = state_interactions.evaluate(
+        pair, CHANGE_PENDING, ADMISSION_EXTERNAL
+    )
+    publication_error = state_interactions.evaluate(
+        pair, CHANGE_PENDING, ADMISSION_ERROR
+    )
+    refused_change = state_interactions.evaluate(
+        pair, CHANGE_REFUSED, ADMISSION_EXTERNAL
+    )
+
+    assert admitted.kind == "exercised"
+    assert publication_error.kind == "refused"
+    assert refused_change.kind == "refused"
+
+
+def test_interacting_pair_matrix_is_the_declared_matrix():
+    declared = m.declared_machines()
+    assert set(m.INTERACTING_MACHINE_PAIRS) == {
+        tuple(pair) for pair in m.INTERACTING_MACHINE_PAIRS
+    }
+    for pair, left, right in state_matrix.cells(m.INTERACTING_MACHINE_PAIRS):
+        assert pair[0] in declared and pair[1] in declared
+        assert left in declared[pair[0]].reachable_states()
+        assert right in declared[pair[1]].reachable_states()

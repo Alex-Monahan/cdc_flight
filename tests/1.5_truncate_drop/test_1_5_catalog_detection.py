@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import pytest
 
+from cdc_flight import catalog_generation
 from cdc_flight.catalog import (
     CHANGE_DROPPED,
     CHANGE_NEW,
@@ -116,6 +117,63 @@ def test_the_same_name_with_a_new_oid_is_a_recreate():
 def test_an_unchanged_table_produces_nothing():
     w = watcher(known=[relation("customers", 16384)], replicated=["app.customers"])
     assert w._compare({"app.customers": relation("customers", 16384)}, lsn=700) == []
+
+
+def test_a_complete_type_token_makes_a_relfilenode_rewrite_an_ordinary_truncate():
+    """TRUNCATE rewrites the physical file but does not create a new relation."""
+    old = SourceRelation(
+        "app", "customers", 16384, True, "d",
+        relfilenode=90001, relation_type_oid=70001,
+    )
+    truncated = SourceRelation(
+        "app", "customers", 16384, True, "d",
+        relfilenode=90002, relation_type_oid=70001,
+    )
+    w = watcher(known=[old], replicated=["app.customers"])
+    assert w._compare({"app.customers": truncated}, lsn=700) == []
+    assert w.known["app.customers"].relfilenode == 90002
+
+
+def test_a_complete_type_token_change_is_still_a_same_oid_recreate():
+    old = SourceRelation(
+        "app", "customers", 16384, True, "d",
+        relfilenode=90001, relation_type_oid=70001,
+    )
+    replacement = SourceRelation(
+        "app", "customers", 16384, True, "d",
+        relfilenode=90002, relation_type_oid=70002,
+    )
+    w = watcher(known=[old], replicated=["app.customers"], confirm_polls=1)
+    changes = w._compare({"app.customers": replacement}, lsn=700)
+    assert [(change.kind, change.qualified) for change in changes] == [
+        (CHANGE_RECREATED, "app.customers")
+    ]
+
+
+def test_confirmation_streak_tracks_the_complete_same_oid_lifecycle_token():
+    old = SourceRelation(
+        "app", "customers", 16384, True, "d", relfilenode=90001,
+        relation_type_oid=70001,
+    )
+    replacement_b = SourceRelation(
+        "app", "customers", 16384, True, "d", relfilenode=90002,
+        relation_type_oid=70002,
+    )
+    replacement_c = SourceRelation(
+        "app", "customers", 16384, True, "d", relfilenode=90003,
+        relation_type_oid=70003,
+    )
+    w = watcher(
+        known=[old], replicated=["app.customers"], confirm_polls=2
+    )
+
+    assert w._compare({"app.customers": replacement_b}, lsn=700) == []
+    assert w._compare({"app.customers": replacement_c}, lsn=701) == []
+    tracked = w._unconfirmed["app.customers"]
+    assert tracked.new_identity == catalog_generation.identity_for(replacement_c)
+    confirmed_change = w._compare({"app.customers": replacement_c}, lsn=702)
+    assert len(confirmed_change) == 1
+    assert confirmed_change[0].new_identity == tracked.new_identity
 
 
 def test_leaving_and_rejoining_the_publication_is_reported_but_not_a_drop():

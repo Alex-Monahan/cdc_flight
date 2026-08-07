@@ -162,7 +162,7 @@ def unrelatable_tables(
       discharged. `CDC_RESNAPSHOT=0` queues the rebuild, skips it and logs it as
       unhandled, and the relation then looked *finished* to the confirmation precisely
       because it was still owed — which is how a successful run came to persist a
-      replacement oid over another relation's rows.
+      replacement generation over another relation's rows.
     """
     states = table_lifecycle.read_all(con, pipeline)
     protected = {
@@ -234,6 +234,18 @@ def unrebuilt_relations(con, *, pipeline: str, dataset: str) -> list[str]:
         )
         if name in owing
     ]
+
+
+def owing_relations_with_rows(con, *, pipeline: str, dataset: str) -> list[str]:
+    """Return every owing lifecycle name, including an empty or absent target.
+
+    Trust belongs to ``TABLE_LIFECYCLE``.  Row presence is only an observation about
+    the retained image; it cannot discharge ``awaiting_snapshot`` or ``in_progress``.
+    The optional ``dataset`` parameter remains for compatibility with callers that used
+    the old row-count helper.
+    """
+    del dataset
+    return table_lifecycle.owing_work(con, pipeline)
 
 
 # --------------------------------------------------------------------------- #
@@ -508,11 +520,17 @@ def confirm(
         if check.reconciling
         else []
     )
+    # A relation identity and an empty/absent physical target are not completion
+    # evidence.  The durable lifecycle alone is authoritative: an owing table is
+    # untrusted until the replacement image reaches `complete`.
+    remaining = sorted(set(remaining) | set(
+        owing_relations_with_rows(con, pipeline=pipeline, dataset=dataset)
+    ))
     if remaining:
         check.unreconciled = remaining
         check.reason = (
-            f"{len(remaining)} relation(s) still hold destination rows with no recorded "
-            "source identity, so nothing has yet rebuilt them: " + ", ".join(remaining)
+            f"{len(remaining)} relation(s) still hold an untrusted destination image, "
+            "so the catalog baseline cannot be confirmed: " + ", ".join(remaining)
         )
         if check.state != INVALIDATED:
             check.state = _write(
@@ -531,8 +549,8 @@ def confirm(
     )
     check.unreconciled = []
     check.reason = (
-        f"{successful_polls} catalog comparison(s) and no relation with destination "
-        "rows and no recorded source identity"
+        f"{successful_polls} catalog comparison(s) and no relation still holds an "
+        "untrusted destination image"
     )
     check.state = _write(
         con, pipeline=pipeline, frm=check.state, to=VALID, reason=check.reason,

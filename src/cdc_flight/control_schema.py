@@ -12,6 +12,7 @@ a commit message.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 
 log = logging.getLogger("cdc_flight.control_schema")
@@ -126,19 +127,70 @@ CONTROL_DDL = [
             detail          VARCHAR
         )""",
     # rubric 1.5 / 2.3. What the source catalog looked like the last time we saw it.
-    # The `relation_oid` is the load-bearing column: it is the only thing that tells a
-    # dropped-and-recreated table from the one we were replicating, and persisting it
-    # is what makes that detection survive a restart.
+    # The `(relation_oid, relation_filenode, relation_type_oid)` tuple is the
+    # load-bearing generation token. OIDs can be reused, while a recreate gets a new
+    # relfilenode; partitioned parents keep relfilenode=0, so their row type completes
+    # the proof.
     f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.source_relations (
             pipeline          VARCHAR     NOT NULL,
             source_schema     VARCHAR     NOT NULL,
             source_table      VARCHAR     NOT NULL,
             relation_oid      BIGINT      NOT NULL,
+            relation_filenode BIGINT,
+            relation_type_oid BIGINT,
             published         BOOLEAN     NOT NULL,
+            -- Publication membership and admission ownership are separate facts.
+            -- `admission_state` is the durable PUBLICATION_ADMISSION machine: a
+            -- failed or policy-refused discovery must remain visible across a quiet
+            -- run and a restart rather than looking like a completed snapshot.
+            admission_state  VARCHAR     NOT NULL DEFAULT 'external',
             replica_identity  VARCHAR,
+            columns_json      VARCHAR,
             first_seen_at     TIMESTAMPTZ NOT NULL,
             last_seen_at      TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (pipeline, source_schema, source_table)
+        )""",
+    # A late rename can be observed after a row with the new name has already been
+    # applied.  NULL in that physical column is ambiguous: it may be an explicit
+    # source NULL or an absent field in a partial Debezium image.  The row path records
+    # field presence here inside the same destination transaction; the fenced rename
+    # consumes it before dropping the old physical name.
+    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.column_presence (
+            target_dataset  VARCHAR NOT NULL,
+            target_table    VARCHAR NOT NULL,
+            event_id        VARCHAR NOT NULL,
+            column_name     VARCHAR NOT NULL,
+            present         BOOLEAN NOT NULL,
+            PRIMARY KEY (target_dataset, target_table, event_id, column_name)
+        )""",
+    # A schema fold can be safely refused but must not become an infinite invisible
+    # retry.  This row is written after the failed data transaction rolls back and
+    # remains the operator/resnapshot obligation until explicitly discharged.
+    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.schema_refusals (
+            pipeline        VARCHAR NOT NULL,
+            source_schema   VARCHAR NOT NULL,
+            source_table    VARCHAR NOT NULL,
+            target_table    VARCHAR,
+            detected_lsn    BIGINT,
+            reason          VARCHAR NOT NULL,
+            state           VARCHAR NOT NULL DEFAULT 'pending',
+            refused_at      TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (pipeline, source_schema, source_table)
+        )""",
+    # Idempotency key for snapshot completion audits.  Production re-snapshots write
+    # these rows in the shadow-swap transaction; the key also makes recovery and the
+    # compatibility projection replayable without duplicate "new" or "resnapshot"
+    # facts.
+    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.snapshot_audits (
+            pipeline        VARCHAR NOT NULL,
+            source_schema   VARCHAR NOT NULL,
+            source_table    VARCHAR NOT NULL,
+            snapshot_lsn    BIGINT NOT NULL,
+            event           VARCHAR NOT NULL,
+            target_table    VARCHAR NOT NULL,
+            detail          VARCHAR,
+            recorded_at     TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (pipeline, source_schema, source_table, snapshot_lsn, event)
         )""",
     # rubric 1.9 / 1.5. Whether the pipeline can RELATE what it observes at the source
     # to the rows the destination already holds — `machines.CATALOG_BASELINE`.
@@ -320,15 +372,46 @@ _ADDED_COLUMNS = {
         ("verdict_message", "VARCHAR"),
         ("verdict_at", "TIMESTAMPTZ"),
     ),
+    "source_relations": (
+        ("columns_json", "VARCHAR"),
+        ("relation_filenode", "BIGINT"),
+        ("relation_type_oid", "BIGINT"),
+        # MotherDuck/DuckDB reject constraints in ALTER TABLE ... ADD COLUMN.
+        # The state is backfilled and checked below in this same transaction; the
+        # application/state-machine boundary is the invariant for already-created
+        # destinations whose additive column is necessarily nullable.
+        ("admission_state", "VARCHAR"),
+    ),
+}
+
+# Defaults for additive columns are deliberately values, not SQL fragments. They are
+# bound as parameters by `_backfill_added_column`, which keeps the migration portable
+# across DuckDB and MotherDuck and avoids reintroducing an inline ADD COLUMN constraint.
+_ADDED_COLUMN_DEFAULTS = {
+    ("source_relations", "admission_state"): "external",
 }
 
 
 def ensure_control_schema(con) -> None:
-    _migrate_commit_log_key(con)
-    for statement in CONTROL_DDL:
-        con.execute(statement)
-    for table, columns in _ADDED_COLUMNS.items():
-        _migrate_added_columns(con, table, columns)
+    """Create and migrate the control schema as one idempotent transaction.
+
+    MotherDuck supports the DDL used here transactionally, but does not support an
+    inline constraint on ``ALTER TABLE ... ADD COLUMN``. Keeping the DDL, additive
+    columns, and their backfills in one transaction means a failed migration cannot
+    leave a half-created control schema that later writers mistake for a valid one.
+    """
+    con.execute("BEGIN TRANSACTION")
+    try:
+        _migrate_commit_log_key(con)
+        for statement in CONTROL_DDL:
+            con.execute(statement)
+        for table, columns in _ADDED_COLUMNS.items():
+            _migrate_added_columns(con, table, columns)
+        con.execute("COMMIT")
+    except BaseException:
+        with contextlib.suppress(Exception):
+            con.execute("ROLLBACK")
+        raise
 
 
 def _table_columns(con, table: str) -> set[str]:
@@ -342,14 +425,25 @@ def _table_columns(con, table: str) -> set[str]:
     table genuinely has no columns we can see, and that is worth failing on too.
     """
     try:
-        return {
-            str(row[0])
-            for row in con.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema = ? AND table_name = ?",
-                [CONTROL_SCHEMA, table],
-            ).fetchall()
-        }
+        # MotherDuck's information_schema can expose the columns from a
+        # `CREATE TABLE IF NOT EXISTS` definition even when that definition did not
+        # alter an already-existing table. It is useful as a connectivity check (and
+        # remains part of the loud introspection contract), but PRAGMA table_info is
+        # the actual physical shape used to decide whether an ALTER is needed.
+        con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = ? AND table_name = ?",
+            [CONTROL_SCHEMA, table],
+        ).fetchall()
+        rows = con.execute(
+            f"PRAGMA table_info('{CONTROL_SCHEMA}.{table}')"
+        ).fetchall()
+        actual = {str(row[1]) for row in rows}
+        if not actual:
+            raise RuntimeError(
+                f"{CONTROL_SCHEMA}.{table} has no introspectable physical columns"
+            )
+        return actual
     except Exception as exc:
         raise ControlSchemaFailed(
             f"could not read the columns of {CONTROL_SCHEMA}.{table} ({exc}), so the "
@@ -370,6 +464,7 @@ def _migrate_added_columns(con, table: str, columns: tuple[tuple[str, str], ...]
     existing = _table_columns(con, table)
     for column, sql_type in columns:
         if column in existing:
+            _backfill_added_column(con, table, column)
             continue
         log.warning("adding %s.%s.%s", CONTROL_SCHEMA, table, column)
         try:
@@ -385,6 +480,7 @@ def _migrate_added_columns(con, table: str, columns: tuple[tuple[str, str], ...]
                     "%s.%s.%s already existed by the time the ALTER ran (a concurrent "
                     "runner won the race)", CONTROL_SCHEMA, table, column,
                 )
+                _backfill_added_column(con, table, column)
                 continue
             raise ControlSchemaFailed(
                 f"could not add {CONTROL_SCHEMA}.{table}.{column} ({exc}), and it is "
@@ -392,6 +488,34 @@ def _migrate_added_columns(con, table: str, columns: tuple[tuple[str, str], ...]
                 "would fail silently for the life of this destination. Grant the DDL "
                 f"privilege, or drop {CONTROL_SCHEMA}.{table} if it is empty."
             ) from exc
+        _backfill_added_column(con, table, column)
+
+
+def _backfill_added_column(con, table: str, column: str) -> None:
+    """Fill an additive column's logical default without relying on DDL constraints."""
+    default = _ADDED_COLUMN_DEFAULTS.get((table, column))
+    if default is None:
+        return
+    try:
+        con.execute(
+            f"UPDATE {CONTROL_SCHEMA}.{table} SET {column} = ? "
+            f"WHERE {column} IS NULL",
+            [default],
+        )
+        remaining = con.execute(
+            f"SELECT count(*) FROM {CONTROL_SCHEMA}.{table} WHERE {column} IS NULL"
+        ).fetchone()[0]
+    except Exception as exc:
+        raise ControlSchemaFailed(
+            f"could not backfill {CONTROL_SCHEMA}.{table}.{column} ({exc}); the "
+            "control-schema transaction is being rolled back"
+        ) from exc
+    if remaining:
+        raise ControlSchemaFailed(
+            f"backfill left {remaining} NULL value(s) in "
+            f"{CONTROL_SCHEMA}.{table}.{column}; refusing to publish a partially "
+            "initialized state column"
+        )
 
 
 def _commit_log_primary_key(con) -> tuple[str, ...] | None:

@@ -2,7 +2,7 @@
 
 Rubric 1.9 asks that *any state that can affect consistency is managed with a state
 machine approach*, and grades **an appropriate number of machines (more than one)** at
-5. This file is what "appropriate" means here: nine focused machines, each owning one state,
+5. This file is what "appropriate" means here: twelve focused machines, each owning one state,
 each with a declared edge set — plus the frozen decision domains, which are
 classifications rather than states and are deliberately **not** dressed up as machines.
 The count is not the claim; coverage is. See SM-G for `CatalogBaseline`, the fifth
@@ -17,6 +17,9 @@ RunPhase                (per process,   _cdc_flight.heartbeat.phase)
  ├── TableLifecycle     (per table,     _cdc_flight.table_state.snapshot_state) [N, spans runs]
  ├── InterruptionMarker (per re-snapshot, interrupted.json)                    [0..1, spans runs]
  ├── CatalogChangeState (per relation,  memory only)                        [N, per run]
+ ├── PublicationAdmission(per relation, source_relations.admission_state)    [N, spans runs]
+ ├── CatalogSchemaLiveness(per schema, memory only)                          [N, per run]
+ ├── SchemaRefusal      (per relation, schema_refusals.state)                [N, spans runs]
  ├── DestinationOwnership(per connection, memory only)                       [1, per run]
  └── CommitGroup        (memory only, NO machine — see below)               [1 at a time]
 ```
@@ -44,7 +47,7 @@ over external state) — appear below only as frozen **domains** where they have
 
 from __future__ import annotations
 
-from .states import Domain, Machine, ranked
+from .states import Domain, Machine, UnknownState, ranked
 
 # --------------------------------------------------------------------------- #
 # SM-A · TableLifecycle — durable, `_cdc_flight.table_state.snapshot_state`
@@ -173,6 +176,9 @@ RUN_PHASE = Machine(
         (PHASE_RECOVERING, PHASE_RECONCILING),
         (PHASE_RECONCILING, PHASE_SNAPSHOTTING),  # the blocking re-snapshot (1.6)
         (PHASE_RECONCILING, PHASE_STREAMING),
+        # A live catalog discovery briefly quiesces streaming, rebuilds only the new
+        # relation while the main slot retains WAL, then resumes the same run.
+        (PHASE_STREAMING, PHASE_SNAPSHOTTING),
         (PHASE_SNAPSHOTTING, PHASE_STREAMING),
         (PHASE_STREAMING, PHASE_DRAINING),
         (PHASE_DRAINING, PHASE_STOPPING),
@@ -268,6 +274,10 @@ SNAPSHOT_COMPLETION = Machine(
         SNAPSHOT_STREAMING,
     ),
     initial=SNAPSHOT_AWAITING_CALLBACKS,
+    # Streaming-only acquisition legitimately starts in ``not_required``; it is
+    # not an edge from the callback protocol.  Declaring both starts keeps the
+    # matrix and runtime model honest without inventing a fake transition.
+    initial_states=(SNAPSHOT_AWAITING_CALLBACKS, SNAPSHOT_NOT_REQUIRED),
     durable=None,
     purpose=(
         "Has Debezium's ordered callback queue delivered every per-table terminal "
@@ -491,6 +501,9 @@ CATALOG_CHANGE = Machine(
         *((s, CHANGE_REFUSED) for s in (*_LIVE_CHANGE_STATES, CHANGE_DUE)),
         # a newer observation cancels this one
         *((s, CHANGE_SUPERSEDED) for s in (*_LIVE_CHANGE_STATES, CHANGE_DUE)),
+        # the destination may already have committed a plan when the watcher
+        # supersedes it; settlement records that applied fact idempotently.
+        (CHANGE_SUPERSEDED, CHANGE_APPLIED),
         (CHANGE_DUE, CHANGE_APPLIED),
     ),
     terminal=(CHANGE_APPLIED, CHANGE_SUPERSEDED),
@@ -500,6 +513,136 @@ CATALOG_CHANGE = Machine(
         "Where in the observe -> confirm -> fence -> apply pipeline is one DDL fact "
         "about one relation? Memory only: a lost pending change is re-detected, which "
         "is correct, so persisting it would buy nothing."
+    ),
+)
+
+
+# --------------------------------------------------------------------------- #
+# SM-F2 · PublicationAdmission — durable, `_cdc_flight.source_relations.admission_state`
+# --------------------------------------------------------------------------- #
+# Publication membership is a consistency boundary for discovery: a relation is not
+# eligible for a snapshot hand-off until the source will actually stream it.  The
+# state is separate from `published` because membership alone does not say whether the
+# Flight or an external operator owns the admission decision, and an ALTER failure is
+# an ERROR state that must remain retryable rather than looking like an ordinary poll.
+ADMISSION_ABSENT = "absent"
+ADMISSION_PENDING = "pending"
+ADMISSION_ERROR = "error"
+ADMISSION_ADMITTED = "admitted"
+ADMISSION_EXTERNAL = "external"
+ADMISSION_REFUSED = "refused"
+
+PUBLICATION_ADMISSION = Machine(
+    "publication_admission",
+    states=(
+        ADMISSION_ABSENT,
+        ADMISSION_PENDING,
+        ADMISSION_ERROR,
+        ADMISSION_ADMITTED,
+        ADMISSION_EXTERNAL,
+        ADMISSION_REFUSED,
+    ),
+    edges=(
+        (ADMISSION_ABSENT, ADMISSION_PENDING),
+        (ADMISSION_PENDING, ADMISSION_PENDING),
+        (ADMISSION_PENDING, ADMISSION_ERROR),
+        (ADMISSION_PENDING, ADMISSION_ADMITTED),
+        (ADMISSION_PENDING, ADMISSION_EXTERNAL),
+        (ADMISSION_PENDING, ADMISSION_REFUSED),
+        (ADMISSION_ADMITTED, ADMISSION_ERROR),
+        (ADMISSION_ADMITTED, ADMISSION_REFUSED),
+        (ADMISSION_ADMITTED, ADMISSION_EXTERNAL),
+        (ADMISSION_ERROR, ADMISSION_ERROR),
+        (ADMISSION_ERROR, ADMISSION_PENDING),
+        (ADMISSION_ERROR, ADMISSION_ADMITTED),
+        (ADMISSION_ERROR, ADMISSION_EXTERNAL),
+        (ADMISSION_ERROR, ADMISSION_REFUSED),
+        (ADMISSION_ADMITTED, ADMISSION_ADMITTED),
+        (ADMISSION_ADMITTED, ADMISSION_PENDING),
+        (ADMISSION_EXTERNAL, ADMISSION_EXTERNAL),
+        (ADMISSION_EXTERNAL, ADMISSION_PENDING),
+        (ADMISSION_EXTERNAL, ADMISSION_ERROR),
+        (ADMISSION_EXTERNAL, ADMISSION_REFUSED),
+        (ADMISSION_REFUSED, ADMISSION_REFUSED),
+        (ADMISSION_REFUSED, ADMISSION_PENDING),
+        # External ownership can become true after a previous refusal once the
+        # operator adds the relation to the publication; no Flight ALTER is needed.
+        (ADMISSION_REFUSED, ADMISSION_EXTERNAL),
+    ),
+    terminal=(),
+    initial=ADMISSION_ABSENT,
+    durable="_cdc_flight.source_relations.admission_state",
+    purpose=(
+        "Has a newly discovered relation been admitted to the source publication, "
+        "and who owns the admission decision?"
+    ),
+)
+
+
+def require_admission_state(value: str | None) -> str:
+    """Validate the persisted publication-admission state at the state boundary.
+
+    MotherDuck cannot add ``NOT NULL`` to an existing column. A NULL therefore has to
+    be refused by the machine that owns the value, rather than treated as a convenient
+    synonym for ``pending`` or ``external`` and allowed to change the recovery path.
+    """
+    if value is None:
+        raise UnknownState(
+            "publication_admission: NULL is not a declared state; refusing to use a "
+            "source_relations row whose admission decision is not machine-checkable"
+        )
+    return PUBLICATION_ADMISSION.parse(value)
+
+
+# --------------------------------------------------------------------------- #
+# SM-F3 · CatalogSchemaLiveness — memory, refreshed per catalog observation
+# --------------------------------------------------------------------------- #
+SCHEMA_VISIBLE = "visible"
+SCHEMA_EMPTY = "empty"
+SCHEMA_UNAVAILABLE = "unavailable"
+SCHEMA_ERROR = "error"
+
+CATALOG_SCHEMA_LIVENESS = Machine(
+    "catalog_schema_liveness",
+    states=(SCHEMA_VISIBLE, SCHEMA_EMPTY, SCHEMA_UNAVAILABLE, SCHEMA_ERROR),
+    edges=tuple(
+        (before, after)
+        for before in (SCHEMA_VISIBLE, SCHEMA_EMPTY, SCHEMA_UNAVAILABLE, SCHEMA_ERROR)
+        for after in (SCHEMA_VISIBLE, SCHEMA_EMPTY, SCHEMA_UNAVAILABLE, SCHEMA_ERROR)
+    ),
+    terminal=(),
+    initial=SCHEMA_UNAVAILABLE,
+    durable=None,
+    purpose=(
+        "Does this watched schema provide positive catalog visibility before a "
+        "relation absence may be interpreted as a drop?"
+    ),
+)
+
+
+# --------------------------------------------------------------------------- #
+# SM-F4 · SchemaRefusal — durable, `_cdc_flight.schema_refusals.state`
+# --------------------------------------------------------------------------- #
+REFUSAL_ABSENT = "absent"
+REFUSAL_PENDING = "pending"
+REFUSAL_RESOLVED = "resolved"
+
+SCHEMA_REFUSAL = Machine(
+    "schema_refusal",
+    states=(REFUSAL_ABSENT, REFUSAL_PENDING, REFUSAL_RESOLVED),
+    edges=(
+        (REFUSAL_ABSENT, REFUSAL_PENDING),
+        (REFUSAL_PENDING, REFUSAL_PENDING),
+        (REFUSAL_PENDING, REFUSAL_RESOLVED),
+        (REFUSAL_RESOLVED, REFUSAL_RESOLVED),
+        (REFUSAL_RESOLVED, REFUSAL_PENDING),
+    ),
+    terminal=(REFUSAL_RESOLVED,),
+    initial=REFUSAL_ABSENT,
+    durable="_cdc_flight.schema_refusals.state",
+    purpose=(
+        "Has a schema transition been refused with a durable remediation obligation, "
+        "and has that obligation been discharged?"
     ),
 )
 
@@ -599,6 +742,41 @@ CATALOG_BASELINE = Machine(
 BASELINE_UNTRUSTED = frozenset(
     s for s in CATALOG_BASELINE.states if s != BASELINE_VALID
 )
+
+
+# Products whose state owners make a consistency decision together.  This is part of
+# the declaration, not a test fixture: the matrix harness imports it and derives every
+# cell from these machine objects.  Pairs are unordered at the design level but kept in
+# the owner order used by the production gates and their tests.
+INTERACTING_MACHINE_PAIRS = (
+    ("catalog_change", "publication_admission"),
+    ("catalog_change", "catalog_schema_liveness"),
+    ("catalog_change", "schema_refusal"),
+    ("catalog_change", "table_lifecycle"),
+    ("publication_admission", "catalog_schema_liveness"),
+    ("publication_admission", "schema_refusal"),
+    ("publication_admission", "table_lifecycle"),
+    ("catalog_schema_liveness", "schema_refusal"),
+    ("catalog_schema_liveness", "table_lifecycle"),
+    ("schema_refusal", "table_lifecycle"),
+    ("snapshot_completion", "table_lifecycle"),
+    ("destination_ownership", "snapshot_completion"),
+)
+
+
+def declared_machines() -> dict[str, Machine]:
+    """Return only this module's system declarations.
+
+    ``states.machines()`` is intentionally a process-wide registry and therefore also
+    includes small machines constructed by mechanism tests.  Product coverage needs
+    the declarations that ship with Flight, so this accessor is the production-owned
+    boundary rather than a test-maintained name set.
+    """
+    return {
+        value.name: value
+        for value in globals().values()
+        if isinstance(value, Machine) and value.name != "t_basic"
+    }
 
 
 # --------------------------------------------------------------------------- #

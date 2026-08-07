@@ -23,20 +23,37 @@ destination DDL, and the marker row. The detection itself is
 
 from __future__ import annotations
 
+import duckdb
 import pytest
-from applier_lab import DATASET, Lab, data, end, heartbeat, keyed, truncate
+from applier_lab import DATASET, Lab, heartbeat, keyed, truncate
+from recreate_admission_helpers import (
+    CUSTOMERS,
+    ORDERS,
+    _assert_recreated_boundary,
+    _catalog_relation,
+    _queue,
+    _queue_recreated,
+    _watcher,
+    markers,
+    preload,
+    rows,
+    txn,
+)
 
-from cdc_flight import faults
+from cdc_flight import catalog_baseline, faults, table_lifecycle
 from cdc_flight.catalog import (
     CHANGE_DROPPED,
     CHANGE_RECREATED,
+    DESTRUCTIVE,
     CatalogChange,
-    CatalogWatcher,
+    SourceRelation,
 )
-from cdc_flight.machines import CHANGE_MARKED
-
-CUSTOMERS = "cdcflight_app_customers"
-ORDERS = "cdcflight_app_orders"
+from cdc_flight.config import DROP_IGNORE, DROP_LOG, DROP_MODES, DROP_REPLICATE
+from cdc_flight.destination import upsert_source_relation
+from cdc_flight.machines import (
+    CATALOG_BASELINE,
+    CHANGE_MARKED,
+)
 
 
 @pytest.fixture
@@ -51,56 +68,6 @@ def lab(tmp_path):
     yield _make
     for box in boxes:
         box.close()
-
-
-def _watcher(*, present: dict[str, int] | None = None, **kw) -> CatalogWatcher:
-    """A watcher with polling disabled: the tests hand it changes directly.
-
-    `present` is what guard 3's revalidation should see (`{"app.customers": 4711}`),
-    defaulting to "the relation really is gone". A watcher with no DSN cannot re-read
-    the source, and failing closed then refuses every drop - which is correct
-    behaviour and useless for testing the apply path, so the query is stubbed here and
-    exercised for real in `test_1_5_catalog_guards.py` and the e2e suite.
-    """
-    watcher = CatalogWatcher(
-        dsn="", publication="pub", schema="app", include=set(), poll_seconds=0, **kw
-    )
-    oids = dict(present or {})
-    watcher.relation_oids = lambda names: {  # type: ignore[method-assign]
-        f"{s}.{t}": oids.get(f"{s}.{t}") for s, t in names
-    }
-    return watcher
-
-
-def txn(number: str, events: list, per_table: dict[str, int] | None = None) -> list:
-    counts: dict[str, int] = {}
-    for event in events:
-        counts[f"{event.schema}.{event.table}"] = counts.get(f"{event.schema}.{event.table}", 0) + 1
-    commit_lsn = max(e.lsn or 0 for e in events) + 1
-    return [*events, end(number, len(events), commit_lsn, per_table or counts)]
-
-
-def preload(box: Lab, *, customers=(1, 2, 3), orders=(7, 8)) -> None:
-    events = [keyed("1", i + 1, 10 + i, ident, f"c{ident}") for i, ident in enumerate(customers)]
-    events += [
-        data(
-            "1", len(customers) + i + 1, 20 + i, table="orders",
-            key={"id": ident}, after={"id": ident, "note": f"o{ident}"},
-        )
-        for i, ident in enumerate(orders)
-    ]
-    box.run(txn("1", events))
-
-
-def rows(box: Lab, table: str) -> list[tuple]:
-    return box.q(f'SELECT id FROM "{DATASET}"."{table}" ORDER BY id')
-
-
-def markers(box: Lab) -> list[tuple]:
-    return box.q(
-        "SELECT event, source_table, applied, rows_removed FROM _cdc_flight.table_events "
-        "ORDER BY commit_id, seq"
-    )
 
 
 # --------------------------------------------------------------------------- #
@@ -246,8 +213,6 @@ def test_an_unknown_truncate_mode_is_refused(tmp_path):
 # --------------------------------------------------------------------------- #
 # applying a detected drop
 # --------------------------------------------------------------------------- #
-def _queue(watcher: CatalogWatcher, change: CatalogChange) -> None:
-    watcher.queue(change)
 
 
 def test_a_dropped_table_is_dropped_at_the_destination(lab):
@@ -292,34 +257,6 @@ def test_a_drop_is_not_applied_before_the_destination_reaches_the_detected_lsn(l
     box.run([heartbeat(10_500)])
     assert not box.exists(CUSTOMERS)
     assert markers(box) == [("dropped", "customers", True, None)]
-
-
-def test_a_recreated_table_drops_the_destination_and_says_why(lab):
-    """Same name, new relation oid: the destination table holds the OLD table's rows
-    and nothing about them is recoverable, so it goes. The marker records the oid
-    change and that a re-snapshot is required (rubric 2.3/3.4)."""
-    watcher = _watcher(present={"app.customers": 99999})
-    box = lab(catalog=watcher)
-    preload(box)
-    _queue(
-        watcher,
-        CatalogChange(
-            kind=CHANGE_RECREATED, schema="app", table="customers",
-            detected_lsn=50, old_oid=16384, new_oid=99999, state=CHANGE_MARKED,
-        ),
-    )
-    box.run(txn("2", [keyed("2", 1, 300, 9, "unrelated", table="orders")]))
-    assert not box.exists(CUSTOMERS)
-    detail = box.q(
-        "SELECT detail FROM _cdc_flight.table_events WHERE event = 'recreated'"
-    )[0][0]
-    assert "re-snapshot" in detail and "99999" in detail
-    # Opus Q1: the table is not silently re-accumulated by ordinary CDC. Its
-    # `table_state` row survives the drop carrying "this is incomplete".
-    assert box.q(
-        "SELECT snapshot_state FROM _cdc_flight.table_state WHERE source_table = 'customers'"
-    ) == [("awaiting_snapshot",)]
-    assert box.applier.stats()["tables_awaiting_snapshot"] == ["app.customers"]
 
 
 def test_a_dropped_table_raises_an_alert(lab):
@@ -378,6 +315,295 @@ def test_drop_mode_log_keeps_the_destination_table(lab):
     box.run(txn("2", [keyed("2", 1, 300, 9, "unrelated", table="orders")]))
     assert box.exists(CUSTOMERS)
     assert markers(box) == [("dropped", "customers", False, None)]
+
+
+def _baseline_state_for_matrix(box: Lab, relation: SourceRelation, state: str):
+    """Reach a declared baseline state, then return the next run's mark.
+
+    The invalidated cell models a previous run that rebuilt its table but died before
+    confirming the baseline: the source identity and complete lifecycle are restored,
+    while the durable baseline remains invalidated until this run proves it again.
+    """
+    kwargs = {"pipeline": "lab", "dataset": DATASET}
+    if state == catalog_baseline.ABSENT:
+        upsert_source_relation(
+            box.con,
+            pipeline="lab",
+            source_schema=relation.schema,
+            source_table=relation.table,
+            relation_oid=relation.oid,
+            published=relation.published,
+            replica_identity=relation.replica_identity,
+            columns=relation.columns,
+        )
+    elif state == catalog_baseline.STALE:
+        upsert_source_relation(
+            box.con,
+            pipeline="lab",
+            source_schema=relation.schema,
+            source_table=relation.table,
+            relation_oid=relation.oid,
+            published=relation.published,
+            replica_identity=relation.replica_identity,
+            columns=relation.columns,
+        )
+        catalog_baseline.mark_unconfirmed(box.con, **kwargs)
+    elif state == catalog_baseline.VALID:
+        upsert_source_relation(
+            box.con,
+            pipeline="lab",
+            source_schema=relation.schema,
+            source_table=relation.table,
+            relation_oid=relation.oid,
+            published=relation.published,
+            replica_identity=relation.replica_identity,
+            columns=relation.columns,
+        )
+        prior = catalog_baseline.mark_unconfirmed(box.con, **kwargs)
+        catalog_baseline.confirm(
+            box.con, **kwargs, check=prior, successful_polls=1
+        )
+    elif state == catalog_baseline.INVALIDATED:
+        prior = catalog_baseline.mark_unconfirmed(box.con, **kwargs)
+        assert prior.state == catalog_baseline.INVALIDATED
+        table_lifecycle.transition(
+            box.con,
+            pipeline="lab",
+            source_schema=relation.schema,
+            source_table=relation.table,
+            to=table_lifecycle.IN_PROGRESS,
+            reason="matrix repair",
+            target_table=box.target(relation.table),
+        )
+        table_lifecycle.transition(
+            box.con,
+            pipeline="lab",
+            source_schema=relation.schema,
+            source_table=relation.table,
+            to=table_lifecycle.COMPLETE,
+            reason="matrix repair",
+            target_table=box.target(relation.table),
+        )
+        upsert_source_relation(
+            box.con,
+            pipeline="lab",
+            source_schema=relation.schema,
+            source_table=relation.table,
+            relation_oid=relation.oid,
+            published=relation.published,
+            replica_identity=relation.replica_identity,
+            columns=relation.columns,
+        )
+    else:  # pragma: no cover - the parameter list comes from the machine
+        raise AssertionError(f"unhandled baseline state {state!r}")
+
+    return catalog_baseline.mark_unconfirmed(
+        box.con,
+        **kwargs,
+        reconcile=box.config.drop_mode != DROP_IGNORE,
+    )
+
+
+# Keep this matrix coupled to the declared destructive catalog domain. If a new
+# destructive lifecycle is added, the drop-mode matrix must grow with it.
+DROP_CHANGE_KINDS = tuple(DESTRUCTIVE)
+DROP_BASELINE_CELLS = tuple(
+    (drop_mode, baseline_state, change_kind)
+    for drop_mode in DROP_MODES
+    for baseline_state in sorted(CATALOG_BASELINE.reachable_states())
+    for change_kind in DROP_CHANGE_KINDS
+)
+
+
+@pytest.mark.parametrize("drop_mode, baseline_state, change_kind", DROP_BASELINE_CELLS)
+def test_drop_mode_and_baseline_confirmation_matrix(
+    lab, drop_mode, baseline_state, change_kind
+):
+    """Every baseline/change cell has an explicit outcome for every drop mode.
+
+    ``ignore`` has no catalog watcher in the real pipeline, so its confirmation cells
+    are deliberate machine refusals (zero successful polls), not an untested allow path.
+    ``replicate`` destroys the destination for both destructive changes; ``log`` keeps a
+    plain drop's identity and destination, but a recreate quarantines the stale image
+    while its new lifecycle is durably owed a re-snapshot.
+    """
+    old_relation = _catalog_relation("customers", 16384)
+    new_relation = _catalog_relation("customers", 16385)
+    watcher = _watcher(
+        present={new_relation.qualified: new_relation.oid}
+        if change_kind == CHANGE_RECREATED
+        else None
+    )
+    box = lab(catalog=watcher, drop_mode=drop_mode)
+    box.run(txn("1", [keyed("1", 1, 10, 1, "before")]))
+    check = _baseline_state_for_matrix(box, old_relation, baseline_state)
+
+    if drop_mode == DROP_IGNORE:
+        box.run([heartbeat(200)])
+        refused = catalog_baseline.confirm(
+            box.con,
+            pipeline="lab",
+            dataset=DATASET,
+            check=check,
+            successful_polls=0,
+        )
+        assert not refused.valid
+        assert refused.state == catalog_baseline.STALE
+        assert box.exists(CUSTOMERS)
+        assert box.q(
+            "SELECT relation_oid FROM _cdc_flight.source_relations "
+            "WHERE pipeline = 'lab' AND source_table = 'customers'"
+        ) == [(old_relation.oid,)]
+        return
+
+    if change_kind == CHANGE_RECREATED:
+        _queue_recreated(watcher, new_relation)
+    else:
+        _queue(
+            watcher,
+            CatalogChange(
+                kind=CHANGE_DROPPED,
+                schema="app",
+                table="customers",
+                detected_lsn=100,
+                old_oid=old_relation.oid,
+                new_relation=old_relation,
+                state=CHANGE_MARKED,
+            ),
+        )
+    box.run([heartbeat(200)])
+
+    confirmed = catalog_baseline.confirm(
+        box.con,
+        pipeline="lab",
+        dataset=DATASET,
+        check=check,
+        successful_polls=1,
+    )
+    if change_kind == CHANGE_RECREATED:
+        assert not confirmed.valid, (drop_mode, baseline_state, confirmed.reason)
+        assert confirmed.state == catalog_baseline.INVALIDATED
+        _assert_recreated_boundary(box, new_relation)
+    else:
+        assert confirmed.valid, (drop_mode, baseline_state, confirmed.reason)
+
+    if drop_mode == DROP_LOG:
+        if change_kind == CHANGE_DROPPED:
+            assert box.exists(CUSTOMERS)
+            assert box.q(
+                "SELECT relation_oid FROM _cdc_flight.source_relations "
+                "WHERE pipeline = 'lab' AND source_table = 'customers'"
+            ) == [(old_relation.oid,)]
+            assert box.q(
+                "SELECT count(*) FROM _cdc_flight.table_state "
+                "WHERE pipeline = 'lab' AND source_table = 'customers'"
+            ) == [(1,)]
+    else:
+        assert drop_mode == DROP_REPLICATE
+        if change_kind == CHANGE_DROPPED:
+            assert not box.exists(CUSTOMERS)
+            assert box.q(
+                "SELECT count(*) FROM _cdc_flight.source_relations "
+                "WHERE pipeline = 'lab' AND source_table = 'customers'"
+            ) == [(0,)]
+            assert box.q(
+                "SELECT count(*) FROM _cdc_flight.table_state "
+                "WHERE pipeline = 'lab' AND source_table = 'customers'"
+            ) == [(0,)]
+        else:
+            assert box.exists(CUSTOMERS)
+            assert box.q(
+                "SELECT relation_oid FROM _cdc_flight.source_relations "
+                "WHERE pipeline = 'lab' AND source_table = 'customers'"
+            ) == [(new_relation.oid,)]
+            assert box.q(
+                "SELECT snapshot_state FROM _cdc_flight.table_state "
+                "WHERE pipeline = 'lab' AND source_table = 'customers'"
+            ) == [("awaiting_snapshot",)]
+    assert markers(box) == [
+        (
+            change_kind,
+            "customers",
+            drop_mode == DROP_REPLICATE or change_kind == CHANGE_RECREATED,
+            None,
+        )
+    ]
+
+
+def test_drop_mode_log_persists_identity_and_confirms_after_restart(lab):
+    """A logged drop is durable catalog history, not a half-applied deletion."""
+    watcher = _watcher()
+    customers = _catalog_relation("customers", 16384)
+    orders = _catalog_relation("orders", 16385)
+    watcher._dirty.update({customers.qualified: customers, orders.qualified: orders})
+    box = lab(catalog=watcher, drop_mode=DROP_LOG)
+    preload(box)
+    assert box.q(
+        "SELECT source_schema, source_table, relation_oid "
+        "FROM _cdc_flight.source_relations WHERE pipeline = 'lab' "
+        "ORDER BY source_table"
+    ) == [("app", "customers", 16384), ("app", "orders", 16385)]
+
+    check = catalog_baseline.mark_unconfirmed(
+        box.con, pipeline="lab", dataset=DATASET
+    )
+    assert check.was == catalog_baseline.ABSENT
+    _queue(
+        watcher,
+        CatalogChange(
+            kind=CHANGE_DROPPED,
+            schema="app",
+            table="customers",
+            detected_lsn=100,
+            old_oid=customers.oid,
+            new_relation=customers,
+            state=CHANGE_MARKED,
+        ),
+    )
+    box.run([heartbeat(200)])
+    assert box.exists(CUSTOMERS)
+    assert box.q(
+        "SELECT count(*) FROM _cdc_flight.table_state "
+        "WHERE pipeline = 'lab' AND source_table = 'customers'"
+    ) == [(1,)]
+    assert box.q(
+        "SELECT relation_oid FROM _cdc_flight.source_relations "
+        "WHERE pipeline = 'lab' AND source_table = 'customers'"
+    ) == [(16384,)]
+    assert markers(box) == [("dropped", "customers", False, None)]
+
+    confirmed = catalog_baseline.confirm(
+        box.con,
+        pipeline="lab",
+        dataset=DATASET,
+        check=check,
+        successful_polls=1,
+    )
+    assert confirmed.valid, confirmed.reason
+    box.close()
+
+    restarted = duckdb.connect(str(box.path))
+    try:
+        after_restart = catalog_baseline.mark_unconfirmed(
+            restarted, pipeline="lab", dataset=DATASET
+        )
+        after_restart = catalog_baseline.confirm(
+            restarted,
+            pipeline="lab",
+            dataset=DATASET,
+            check=after_restart,
+            successful_polls=1,
+        )
+        assert after_restart.valid, after_restart.reason
+        assert restarted.execute(
+            "SELECT relation_oid FROM _cdc_flight.source_relations "
+            "WHERE pipeline = 'lab' AND source_table = 'customers'"
+        ).fetchall() == [(16384,)]
+        assert restarted.execute(
+            f'SELECT count(*) FROM "{DATASET}"."{CUSTOMERS}"'
+        ).fetchone() == (3,)
+    finally:
+        restarted.close()
 
 
 def test_an_unpublished_table_is_never_dropped(lab):

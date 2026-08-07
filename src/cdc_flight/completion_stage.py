@@ -18,6 +18,8 @@ from . import destination as dest_mod
 from . import reconcile as reconcile_mod
 from . import recovery as recovery_mod
 from . import resnapshot as resnapshot_mod
+from . import table_lifecycle
+from .config import DROP_LOG
 from .errors import EngineFailure
 from .run_state import RunOutcome
 from .snapshot_completion import SnapshotCompletion
@@ -50,6 +52,7 @@ class PostEngineCompletion:
     snapshot_completion: SnapshotCompletion
     outcome: RunOutcome
     base_summary: Mapping[str, Any]
+    drop_mode: str = DROP_LOG
 
     def finish(self, engine_result: Mapping[str, Any]) -> CompletionReport:
         """Run the post-engine proof and return the final, publishable summary."""
@@ -82,8 +85,36 @@ class PostEngineCompletion:
         if self.journal is not None:
             self._discharge_recovery(result, extra)
 
+        owing = table_lifecycle.owing_work(self.con, self.pipeline)
+        if owing:
+            extra["tables_awaiting_snapshot_unhandled"] = owing
+            self.outcome.record("catalog_unresolved")
+            result["stop_reason"] = self.outcome.value
+            raise EngineFailure(
+                "the destination still has table-lifecycle work owed at shutdown: "
+                + ", ".join(owing)
+                + ". A table is not trusted merely because its physical target is "
+                "empty or absent; a complete replacement image is required",
+                self._summary(result, extra),
+            )
+
         if self.watcher is not None:
             self._confirm_baseline(result, extra)
+
+        pending_refusals = dest_mod.pending_schema_refusals(
+            self.con, self.pipeline
+        )
+        if pending_refusals:
+            names = [f"{schema}.{table}" for schema, table, _reason in pending_refusals]
+            extra["schema_refusals_pending"] = names
+            self.outcome.record("catalog_unresolved")
+            result["stop_reason"] = self.outcome.value
+            raise EngineFailure(
+                "schema evolution refusal(s) remain unresolved at shutdown: "
+                + ", ".join(names)
+                + ". A complete replacement snapshot is required before success",
+                self._summary(result, extra),
+            )
 
         summary = self._summary(result, extra)
         return CompletionReport(summary=summary, run_ok=bool(result.get("ok")))
@@ -97,6 +128,7 @@ class PostEngineCompletion:
             dsn=self.source_dsn,
             owed=dest_mod.tables_awaiting_snapshot(self.con, self.pipeline),
             completion=self.snapshot_completion,
+            drop_mode=self.drop_mode,
         )
         if emptied:
             extra["verified_empty_after_snapshot"] = emptied

@@ -81,7 +81,6 @@ class OpenGroup:
     pending_alerts: list[dict] = field(default_factory=list)
     #: source tables this group actually wrote, handed to the watcher after COMMIT
     source_tables: set[str] = field(default_factory=set)
-
     def __bool__(self) -> bool:
         return bool(self.units)
 

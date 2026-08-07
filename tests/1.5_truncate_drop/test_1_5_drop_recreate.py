@@ -6,9 +6,10 @@ properties are `test_1_5_truncate_fold.py` (in-process, exact interleavings) and
 
 Four things only a real run can show:
 
-1. **The gap, live.** `CDC_TRUNCATE_MODE=ignore` restores Debezium's own default
-   (`skipped.operations=t`) and the TRUNCATE becomes invisible again — the exact
-   baseline behaviour `RUBRIC_STATUS.md` scored 1 for, reproduced on demand.
+1. **The gap, live.** `CDC_TRUNCATE_MODE=ignore` preserves the externally visible
+   baseline (the destination rows and marker count do not change), while the pipeline
+   retains the raw TRUNCATE internally for the destination policy; lifecycle
+   convergence is owned by the asynchronous catalog token.
 2. **A truncate is replicated** once the default is overridden.
 3. **A crash in the commit→ack window of a truncating group** replays that
    transaction: the destination must end up empty exactly once, never re-populated
@@ -49,7 +50,9 @@ def drop_scenario(sandbox):
     )
     phases = {"snapshot": box.run(reset_state=True, max_seconds=150)}
 
-    # 1. the baseline gap: Debezium's own default skips truncates outright.
+    # 1. the baseline gap: ignore is still a destination no-op, but the raw event is
+    #    retained for policy/audit while the complete catalog token distinguishes an
+    #    ordinary relfilenode rewrite from a replacement lifecycle.
     box.sql("TRUNCATE TABLE app.tr_demo")
     phases["ignored"] = box.run(
         max_seconds=150, idle_seconds=8, extra_env={"CDC_TRUNCATE_MODE": "ignore"}
@@ -100,7 +103,13 @@ def drop_scenario(sandbox):
             "INSERT INTO app.rc_demo VALUES (1, '{\"new\": true}', 42)",
         ]
     )
-    phases["recreated"] = box.run(max_seconds=150, idle_seconds=10, min_records=1)
+    phases["recreated"] = box.run(
+        max_seconds=150,
+        idle_seconds=10,
+        min_records=1,
+        expect_success=False,
+    )
+    phases["recreated_healed"] = box.run(max_seconds=220, idle_seconds=10)
     try:
         yield {"box": box, **phases}
     finally:
@@ -111,9 +120,8 @@ def drop_scenario(sandbox):
 # 1 + 2: the gap, and the fix
 # --------------------------------------------------------------------------- #
 def test_ignore_mode_reproduces_the_baseline_gap(drop_scenario):
-    """`skipped.operations=t` is Debezium's default, and it is the whole of the
-    baseline's 1 for truncate: Postgres emptied the table, the destination did not
-    notice, and no counter moved."""
+    """Ignore preserves the baseline destination behavior: Postgres emptied the
+    table, the destination did not notice, and no truncate marker was published."""
     assert drop_scenario["rows_after_ignored"] == [(1,), (2,)]
     assert drop_scenario["markers_after_ignored"] == 0, (
         "nothing was even recorded, which is exactly the baseline behaviour"
@@ -162,6 +170,7 @@ def test_the_recreated_table_lands_with_its_new_shape(drop_scenario):
     """Same name, new relation oid, different columns. Merging the new events into
     the old destination table is the corruption this case exists to rule out."""
     box = drop_scenario["box"]
+    assert drop_scenario["recreated_healed"]["ok"] is True
     columns = {
         row[0]
         for row in box.duck_query(
@@ -178,7 +187,7 @@ def test_the_recreated_table_lands_with_its_new_shape(drop_scenario):
 
 
 def test_every_run_after_the_drop_was_clean(drop_scenario):
-    for name in ("dropped", "recreated"):
+    for name in ("dropped", "recreated", "recreated_healed"):
         assert drop_scenario[name]["ok"] is True, name
 
 
@@ -245,7 +254,7 @@ def test_a_quiet_run_persists_what_it_learned_so_the_next_recreate_is_seen(
             ]
         )
         # Two runs: the first detects and drops, the second rebuilds from the source.
-        box.run(max_seconds=200, idle_seconds=10)
+        box.run(max_seconds=200, idle_seconds=10, expect_success=False)
         healed = box.run(max_seconds=220, idle_seconds=10)
         assert healed["ok"] is True, healed
 

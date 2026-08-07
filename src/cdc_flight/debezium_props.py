@@ -169,8 +169,6 @@ def build_properties(
         # so Debezium must not invent its own.
         "publication.autocreate.mode": "disabled",
         "topic.prefix": replication.topic_prefix,
-        "schema.include.list": source.schema,
-        "table.include.list": ",".join(source.tables),
         "snapshot.mode": snapshot,
         # --- offsets ----------------------------------------------------------
         # File-backed offsets: the simplest Kafka-less store. This is a known
@@ -235,12 +233,12 @@ def build_properties(
         # source, which is exactly why rubric 1.5's DROP detection has to poll the
         # catalog - see `cdc_flight.catalog`.)
         "include.schema.changes": "false",
-        # rubric 1.5: TRUNCATE reaches the applier because we ask for it. `none`
-        # means "skip no operation at all"; the connector's default `t` is what made
-        # a TRUNCATE invisible even to the skipped-record counter.
-        "skipped.operations": (
-            SKIP_TRUNCATE if truncate_mode == "ignore" else SKIP_NOTHING
-        ),
+        # Always retain pgoutput TRUNCATE records for the destination policy.  They
+        # are not generation authority: the asynchronous catalog token and the
+        # complete-image resnapshot own lifecycle convergence.  Applying the old
+        # Debezium `skipped.operations=t` setting would lose the operation before
+        # the planner sees it.
+        "skipped.operations": SKIP_NOTHING,
         # --- resilience -------------------------------------------------------
         "errors.max.retries": "3",
         "errors.retry.delay.initial.ms": "300",
@@ -249,4 +247,11 @@ def build_properties(
         # yet. Rubric 4.4/4.5/4.6 require an idle-slot heartbeat; that is Phase 4
         # work and is deliberately absent from the baseline so the gap is visible.
     }
+    # In discovery mode the publication is the capture contract. A static table or
+    # schema include list would make a catalog watcher capable of observing a new
+    # relation but Debezium incapable of delivering its rows. The explicit opt-out
+    # retains the old bounded-capture behaviour for deployments that want it.
+    if not source.auto_discovery:
+        props["schema.include.list"] = source.schema
+        props["table.include.list"] = ",".join(source.tables)
     return props

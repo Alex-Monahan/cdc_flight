@@ -22,9 +22,17 @@ from cdc_flight.naming import destination_table, normalize, shadow_table
 def test_source_dsn_and_table_list():
     src = SourceConfig()
     assert src.dsn.startswith("postgresql://")
+    assert src.primary_dsn == src.dsn
     assert f":{src.port}/" in src.dsn
     assert "app.customers" in src.tables
     assert all("." in t for t in src.tables)
+
+
+def test_source_primary_dsn_is_an_explicit_write_route(monkeypatch):
+    monkeypatch.setenv("CDC_PRIMARY_DSN", "postgresql://writer:pw@primary:15432/db")
+    source = SourceConfig()
+    assert source.dsn != source.primary_dsn
+    assert source.primary_dsn == "postgresql://writer:pw@primary:15432/db"
 
 
 def test_default_runtime_artifacts_are_disjoint_per_instance(monkeypatch):

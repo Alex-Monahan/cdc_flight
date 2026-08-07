@@ -9,7 +9,8 @@ acknowledged **after** it commits.
 BEGIN TRANSACTION
     renew lease                       # 4.2 - the loser fails before it writes
     apply whole units, all tables     # 1.3 - multi-table atomicity
-    apply due catalog DDL             # 1.5 - fenced on this group's resume point
+    apply schema DDL before row DML   # 2.1/2.2 - avoid mixed DDL/DML version checks
+    apply due table DDL after rows    # 1.5 - fenced on this group's resume point
     write _cdc_flight.commit_log      # 1.7 / 6.1 audit trail
     write _cdc_flight.debezium_offsets# (4) data ∧ state atomic
 COMMIT                                # <- the only durability event
@@ -44,26 +45,36 @@ import threading
 import time
 from typing import Any
 
-from . import apply_sql, destination, resume, self_heal, table_work
-from .applier_config import ApplierConfig
-from .assembler import (
-    UNIT_SNAPSHOT_CHUNK,
-    UNIT_TXN,
-    CompleteUnit,
-    TransactionAssembler,
+from . import (
+    apply_sql,
+    catalog_commit,
+    commit_metadata,
+    destination,
+    resume,
+    schema_epoch,
+    self_heal,
+    spill_protocol,
+    table_work,
+    unit_admission,
+    unit_apply,
 )
-from .catalog_apply import CatalogCoordinator
+from .applier_config import ApplierConfig
+from .assembler import CompleteUnit, TransactionAssembler
+from .catalog_apply import CatalogCoordinator, CatalogPlan
 from .commit_group import CommitResult, OpenGroup
 from .destination import AlertSink, Lease, ResumePoint
 from .envelope import KIND_SNAPSHOT_BOUNDARY, PendingRecord, decode
-from .errors import AmbiguousDelete, DestinationIdentityCollision
+from .errors import (
+    AmbiguousDelete,
+    DestinationIdentityCollision,
+    SchemaEvolutionRefused,
+)
 from .faults import arm_group, maybe_crash
-from .planner import GroupPlan, stream_event_id
 from .run_state import COMMIT_ACK
 from .snapshot import SnapshotCoordinator
 from .snapshot_completion import SnapshotCompletion, SnapshotObservationError
 from .snapshot_notifications import decode_notification
-from .spill import SpillBuffer, StagedEvent
+from .spill import SpillBuffer
 
 log = logging.getLogger("cdc_flight.applier")
 
@@ -89,6 +100,7 @@ class Applier:
         catalog=None,
         watermarks: dict[str, int] | None = None,
         completion: SnapshotCompletion | None = None,
+        snapshot_audit=None,
     ):
         self.con = con
         self.pipeline = pipeline
@@ -152,6 +164,7 @@ class Applier:
             get_registry=lambda: self.registry,
             epoch=resume_point.snapshot_epoch,
             transactional_ddl=transactional_ddl,
+            on_swap=snapshot_audit,
         )
         self.spill = SpillBuffer(con)
         self.alerts = AlertSink(con, pipeline=pipeline)
@@ -164,9 +177,18 @@ class Applier:
             topic_prefix=topic_prefix,
             drop_mode=config.drop_mode,
             registry_of=lambda: self.registry,
+            lifecycle_con=self.con,
             max_destructive_per_group=config.drop_max_per_group,
             allow_mass_drop=config.drop_allow_mass,
-            revalidate=config.drop_revalidate,
+        )
+        self._schema_epochs = schema_epoch.SchemaEpochCoordinator(
+            spill=self.spill,
+            apply_units=self._apply_units,
+            apply_catalog_phase=self._apply_catalog_phase,
+            backfill_schema=lambda phase: self.catalog_coordinator.backfill_schema(
+                self.con, phase
+            ),
+            clear_spill=self.spill.clear,
         )
 
         self._committer = None
@@ -449,7 +471,10 @@ class Applier:
             maybe_crash("decode", self.data_batch_count)
 
         if not self.group.units:
-            self._ack_discarded_records()
+            # A discard-only re-snapshot poll has no destination transaction. The
+            # handles remain pending until a replacement snapshot/terminal group
+            # reaches the guarded COMMIT -> acknowledgement path below. An empty
+            # Debezium poll is not a durability boundary for the throwaway slot.
             return
         # ADR §3.3 soft triggers, plus one pragmatic rule the ADR's pseudocode
         # needs and does not state: Debezium calls `markBatchFinished()` itself on
@@ -488,131 +513,7 @@ class Applier:
     # group assembly
     # ------------------------------------------------------------------ #
     def _add_unit(self, unit: CompleteUnit) -> None:
-        if self._discard_resnapshot_unit(unit):
-            return
-        is_snapshot = self._is_snapshot_unit(unit)
-        was_snapshot = self.group.is_snapshot
-        if not is_snapshot:
-            # This must happen before an open snapshot group is committed or the
-            # incoming streaming unit is appended. The completion machine, not the
-            # current group's row shape, owns the phase barrier.
-            if (
-                self.group.units
-                and self.group.is_snapshot
-                and self._has_snapshot_boundary(self.group.units)
-            ):
-                # A terminal boundary is itself the proof-bearing phase barrier. If
-                # its projected rows are ready, commit that snapshot group first;
-                # `observe_committed_group()` then takes completion_notified ->
-                # callbacks_complete, after which the stream edge can be checked.
-                result = self.commit_group("snapshot_chunk")
-                if result is not CommitResult.COMMITTED:
-                    self.snapshot_completion.check_streaming_admission()
-                    raise SnapshotObservationError(
-                        "cannot cross the snapshot phase boundary with commit result "
-                        f"{result.value}"
-                    )
-            else:
-                # An open snapshot group without its terminal boundary must never be
-                # committed merely because a stream unit arrived.
-                self.snapshot_completion.check_streaming_admission()
-        # ADR §3.5: snapshot units are never mixed with streaming units, so a
-        # commit_log row unambiguously says which phase it belongs to. The explicit
-        # terminal boundary is control-shaped but belongs to the snapshot group so its
-        # offset commits atomically with the final snapshot rows.
-        if (
-            self.group.units
-            and is_snapshot != self.group.is_snapshot
-        ):
-            result = self.commit_group(
-                "snapshot_chunk" if was_snapshot else "phase"
-            )
-            if result is not CommitResult.COMMITTED:
-                raise SnapshotObservationError(
-                    f"cannot cross the snapshot phase boundary with commit result "
-                    f"{result.value}"
-                )
-        if not is_snapshot:
-            # For a phase mismatch this runs only after the prior snapshot group has
-            # committed. For an empty group it is the admission edge that used to be
-            # skipped entirely.
-            self.snapshot_completion.enter_streaming()
-        self._append_unit(unit, is_snapshot=is_snapshot)
-
-    def _append_unit(
-        self, unit: CompleteUnit, *, is_snapshot: bool
-    ) -> None:
-        if not self.group.units:
-            self.group.is_snapshot = is_snapshot
-            self.group.opened_at = time.monotonic()
-
-        if unit.kind == UNIT_TXN and unit.last_lsn and unit.last_lsn <= self.resume_point.last_lsn:
-            # ADR §4.4 idempotency fence. Correctness does not depend on it - the
-            # resume point already excludes these - but it is the difference
-            # between "a replay is dropped" and "a replay is trusted", and it is
-            # what makes the `CDC_OFFSET_FILE_REPAIR=0` mode safe.
-            unit.fenced = True
-            self.fenced_units += 1
-            self.fenced_events += unit.event_count
-            log.info(
-                "fencing already-durable transaction %s (lsn %s <= durable %s)",
-                unit.txn_id, unit.last_lsn, self.resume_point.last_lsn,
-            )
-
-        if not self.cfg.ack_every_record and len(unit.records) > 1:
-            # Keep the terminal record (that is what carries the offset) and let
-            # go of every other Java reference in the unit. This is what bounds
-            # JVM memory for a large transaction; see ApplierConfig.
-            for record in unit.records[:-1]:
-                record.raw = None
-            unit.records = [unit.records[-1]]
-
-        self.group.units.append(unit)
-        self.group.events += unit.event_count
-        self.group.nbytes += unit.nbytes
-
-    def _discard_resnapshot_unit(self, unit: CompleteUnit) -> bool:
-        """Drop throwaway-slot streaming before it reaches phase or commit logic.
-
-        A re-snapshot's slot is temporary and its streaming records are duplicates of
-        records the real slot will deliver after the replacement image is handed off.
-        The assembler has already proven the transaction whole, but this unit has no
-        destination owner: no ``OpenGroup``, spill table, commit log, or resume point.
-        Its acknowledgeable handles wait until any preceding snapshot group is durable.
-        """
-        if not self.cfg.resnapshot or unit.kind != UNIT_TXN:
-            return False
-        unit.fenced = True
-        self.fenced_units += 1
-        self.fenced_events += unit.event_count
-        self.resnapshot_discarded_events += unit.event_count
-        self._pending_discarded_records.extend(unit.records)
-        if unit.spilled_events:
-            # Compatibility counter for ordinary observability. The re-snapshot
-            # assembler discard path does not populate this field because it never
-            # writes the destination spill table.
-            self.fenced_spilled_events += unit.spilled_events
-        log.debug(
-            "discarding %s streaming events from throwaway re-snapshot transaction %s",
-            unit.event_count,
-            unit.txn_id,
-        )
-        return True
-
-    @staticmethod
-    def _is_snapshot_unit(unit: CompleteUnit) -> bool:
-        """Classify row and synthetic control units by their source phase."""
-        return unit.kind == UNIT_SNAPSHOT_CHUNK or any(
-            record.kind == KIND_SNAPSHOT_BOUNDARY for record in unit.records
-        )
-
-    @staticmethod
-    def _has_snapshot_boundary(units: list[CompleteUnit]) -> bool:
-        return any(
-            record.kind == KIND_SNAPSHOT_BOUNDARY
-            for unit in units
-            for record in unit.records
-        )
+        unit_admission.add_unit(self, unit)
 
     def _reset_group(self) -> None:
         """One assignment, and that is the whole point (rubric 1.9).
@@ -650,7 +551,8 @@ class Applier:
         """
         group = self.group.units
         if not group:
-            self._ack_discarded_records()
+            # In particular, never acknowledge a discard-only re-snapshot tail here:
+            # this method has not opened or committed a MotherDuck transaction.
             return CommitResult.EMPTY
         # Snapshot rows are observations of the same closed protocol as the direct
         # notifications. Validate their state and declared counts before BEGIN/COMMIT;
@@ -669,32 +571,44 @@ class Applier:
         # the wrapper inferred from the SQL it happened to see (rubric 1.7).
         fault_group = self.data_commit_groups + 1
         arm_group(fault_group)
-        # NOT `or spill.rows > 0`: staged rows belonging only to *fenced*
-        # units are about to be discarded, and counting them made a group with no
-        # applicable content a "data group", which shifts every `<nth>`-indexed
-        # fault anchor by one (Codex 5).
-        has_data = any(
-            not u.fenced and (u.events or u.spilled_events) for u in group
-        )
-        fault_enabled = has_data
-
         if not self.group.txn_open:
             self.con.execute("BEGIN TRANSACTION")
             self.group.txn_open = True
         try:
-            if has_data:
-                maybe_crash("begin", fault_group)
             self.lease.renew(self.con)
-            stats = self._apply_units(group, commit_id, has_data=has_data)
             new_point = resume.point_for(
                 group,
                 previous=self.resume_point,
                 commit_id=commit_id,
                 snapshot_epoch=self.snapshots.epoch,
             )
-            # rubric 1.5: DDL the stream cannot carry, fenced on the resume point this
-            # group is about to make durable.
-            self._apply_catalog_changes(commit_id, new_point.last_lsn, stats)
+            catalog_plan = self._plan_catalog_changes(new_point.last_lsn)
+            # NOT `or spill.rows > 0`: staged rows belonging only to *fenced*
+            # units are about to be discarded, and counting them made a group with no
+            # applicable content a "data group", which shifts every `<nth>`-indexed
+            # fault anchor by one (Codex 5). Compute this AFTER the plan fence so a
+            # same-group replacement unit cannot make a fenced-only group look like
+            # data merely because it arrived before catalog planning.
+            has_data = any(
+                not u.fenced and (u.events or u.spilled_events) for u in group
+            )
+            fault_enabled = has_data
+            if has_data:
+                maybe_crash("begin", fault_group)
+            catalog_stats = {"tables": set()}
+            stats = self._apply_units_by_schema_epoch(
+                group,
+                commit_id,
+                has_data=has_data,
+                catalog_plan=catalog_plan,
+                catalog_stats=catalog_stats,
+            )
+            stats["tables"].update(catalog_stats["tables"])
+            if catalog_plan is not None:
+                self._apply_catalog_phase(
+                    commit_id, catalog_plan, stats, schema_only=False
+                )
+                self.group.pending_alerts.extend(catalog_plan.alerts)
             destination.write_commit_log(
                 self.con,
                 commit_id=commit_id,
@@ -711,7 +625,7 @@ class Applier:
                 last_txn_id=stats["last_txn_id"],
                 first_lsn=stats["first_lsn"],
                 last_lsn=stats["last_lsn"],
-                max_source_ts=_epoch_ms(stats["max_source_ts"]),
+                max_source_ts=commit_metadata.epoch_ms(stats["max_source_ts"]),
                 tables_touched=sorted(table_work.live_names(stats["tables"])),
             )
             destination.write_resume_point(
@@ -736,7 +650,14 @@ class Applier:
             # `run_state._CommitAckWindow` for why that is the only acceptable cost here.
             stage = ["observability_gate"]
             marked = 0
-            pending_discards = list(self._pending_discarded_records)
+            # A non-snapshot group can be durable without containing a replacement
+            # image. Keep discard-only handles pending across that boundary too; the
+            # only group that may discharge them is a snapshot/terminal group.
+            pending_discards = (
+                list(self._pending_discarded_records)
+                if self.group.is_snapshot
+                else []
+            )
             with self_heal.commit_watchdog(
                 self.cfg.commit_timeout, commit_id, stage=lambda: stage[0]
             ):
@@ -786,6 +707,10 @@ class Applier:
                     # A mark call can raise; a stuck window would silently drop every
                     # later phase write, so the gate is closed in all cases.
                     COMMIT_ACK.leave()
+        except SchemaEvolutionRefused as refused:
+            self._rollback_quietly()
+            self._record_schema_refusal(refused)
+            raise
         except (AmbiguousDelete, DestinationIdentityCollision) as ambiguous:
             # Rubric 4.7. The group still rolls back - a fold that cannot be decided is
             # never committed - but a bare rollback here is a *permanent* failure: the
@@ -804,7 +729,6 @@ class Applier:
         except BaseException:
             self._rollback_quietly()
             raise
-
         if fault_enabled:
             maybe_crash("post_ack", fault_group)
         # next poll() -> performCommit() -> flushLsn(new)  ── nothing between ──
@@ -843,39 +767,6 @@ class Applier:
         self._reset_group()
         return CommitResult.COMMITTED
 
-    def _ack_discarded_records(self) -> None:
-        """Acknowledge a discard-only re-snapshot unit without a destination commit.
-
-        The temporary re-snapshot offset store is disposable and is never used for the
-        main handoff. If a snapshot group is open, these handles are held until that
-        group commits; when no destination group exists, this is the only safe progress
-        action. The acknowledgement remains inside the same exclusion/watchdog used by
-        the normal post-COMMIT acknowledgement window, but it does not write destination
-        state or a resume point.
-        """
-        pending = list(self._pending_discarded_records)
-        if not pending:
-            return
-        offset_fingerprint = self.verifier.before() if self.verifier else None
-        stage = ["discard_ack"]
-        marked = 0
-        with self_heal.commit_watchdog(
-            self.cfg.commit_timeout, self.last_commit_id, stage=lambda: stage[0]
-        ):
-            COMMIT_ACK.enter()
-            try:
-                for record in pending:
-                    if record.raw is None:
-                        continue
-                    self._committer.markProcessed(record.raw)
-                    marked += 1
-                self._committer.markBatchFinished()
-            finally:
-                COMMIT_ACK.leave()
-        del self._pending_discarded_records[: len(pending)]
-        if self.verifier is not None and marked:
-            self._pending_verification = (offset_fingerprint, marked)
-
     def _request_resnapshot_for(
         self, ambiguous: AmbiguousDelete | DestinationIdentityCollision
     ) -> None:
@@ -890,6 +781,19 @@ class Applier:
         if alert is not None:
             self.group.pending_alerts.append(alert)
         self.ambiguous_resnapshots_queued += int(recorded)
+
+    def _record_schema_refusal(self, refused: SchemaEvolutionRefused) -> None:
+        if not refused.source_schema or not refused.source_table:
+            return
+        destination.record_schema_refusal(
+            self.con,
+            pipeline=self.pipeline,
+            source_schema=refused.source_schema,
+            source_table=refused.source_table,
+            target_table=refused.target,
+            detected_lsn=refused.detected_lsn,
+            reason=str(refused),
+        )
 
     def _rollback_quietly(self) -> None:
         if not self.group.txn_open:
@@ -959,129 +863,69 @@ class Applier:
     # ------------------------------------------------------------------ #
     # applying units — one ordered pass, delegated to the planner
     # ------------------------------------------------------------------ #
+    def _apply_units_by_schema_epoch(
+        self,
+        group: list[CompleteUnit],
+        commit_id: int,
+        *,
+        has_data: bool,
+        catalog_plan: CatalogPlan | None,
+        catalog_stats: dict,
+    ) -> dict:
+        return self._schema_epochs.apply(
+            group,
+            commit_id,
+            has_data=has_data,
+            catalog_plan=catalog_plan,
+            catalog_stats=catalog_stats,
+            created_in_txn=self.group.created_in_txn,
+        )
+
+    @staticmethod
+    def _refuse_mixed_schema_epoch(events: list, actions: list) -> None:
+        schema_epoch.refuse_mixed_schema_epoch(events, actions)
+
     def _apply_units(
         self,
         group: list[CompleteUnit],
         commit_id: int,
         *,
         has_data: bool,
+        clear_spill: bool = True,
+        created_in_txn: set[str] | None = None,
     ) -> dict:
-        plan = GroupPlan(
-            self.con,
-            commit_id=commit_id,
-            registry_of=lambda: self.registry,
-            snapshots=self.snapshots,
-            spill=self.spill,
-            truncate_mode=self.cfg.truncate_mode,
-            created_in_txn=self.group.created_in_txn,
-            watermarks=self.watermarks,
+        return unit_apply.apply_units(
+            self,
+            group,
+            commit_id,
+            has_data=has_data,
+            clear_spill=clear_spill,
+            created_in_txn=created_in_txn,
         )
-        for unit in group:
-            if unit.fenced:
-                # This is retained for ordinary idempotency-fenced units. A
-                # re-snapshot overlap is discarded before admission and therefore
-                # cannot reach this apply pass.
-                if unit.spill_unit_seq is not None:
-                    self.fenced_spilled_events += unit.spilled_events
-                    plan.staged_units = True
-                continue
-            if unit.kind == UNIT_SNAPSHOT_CHUNK:
-                self.group.is_snapshot = True
-            plan.add_unit(unit)
-
-        # The `mid_apply` anchor is documented as "some tables written, others not".
-        # It has to fire BETWEEN two table writes, or it cannot detect a transaction
-        # torn between table A and table B - the one interleaving rubric 1.3 is about
-        # (Codex 6) - and it is gated on `has_data` like every other anchor, because
-        # `<nth>` counts data-carrying groups (Opus MINOR-2).
-        anchor = None
-        if has_data:
-            def anchor() -> None:
-                maybe_crash("mid_apply", self.data_commit_groups + 1)
-        stats = plan.write(after_first_table=anchor)
-        for target, (schema, table) in plan.created_tables.items():
-            destination.register_table(
-                self.con,
-                pipeline=self.pipeline,
-                source_schema=schema,
-                source_table=table,
-                target_table=target,
-            )
-        with self._lock:
-            for target, count in plan.table_counts.items():
-                self.table_counts[target] = self.table_counts.get(target, 0) + count
-        self.truncates_applied += plan.truncates_applied
-        self.truncates_logged += plan.truncates_logged
-        self.watermark_fenced_events += plan.watermark_fenced_events
-        if self.group.is_snapshot and stats.get("last_lsn"):
-            # Every snapshot record of one snapshot carries the exported snapshot's
-            # consistent point, so this is `C` (rubric 1.6, `cdc_flight.resnapshot`).
-            self.last_snapshot_lsn = stats["last_lsn"]
-        self.group.source_tables |= plan.source_tables
-        self.group.table_events.extend(plan.markers())
-        self._flush_table_events(commit_id)
-        return stats
 
     # ------------------------------------------------------------------ #
     # table-level events and catalog DDL (rubric 1.5)
     # ------------------------------------------------------------------ #
     def _flush_table_events(self, commit_id: int) -> None:
-        """Write this group's `table_events` rows, inside its transaction.
+        catalog_commit.flush_table_events(self, commit_id)
 
-        Deliberately transactional with the data: "the destination table was emptied"
-        and "here is the source event that emptied it" must become true together, or
-        the audit trail can outlive a rolled-back apply and describe something that
-        never happened.
-        """
-        for marker in self.group.table_events:
-            destination.write_table_event(
-                self.con,
-                pipeline=self.pipeline,
-                commit_id=commit_id,
-                seq=self.group.next_table_event_seq(),
-                **marker,
-            )
-        self.group.table_events = []
+    def _plan_catalog_changes(self, durable_lsn: int) -> CatalogPlan | None:
+        return catalog_commit.plan_catalog_changes(self, durable_lsn)
 
-    def _apply_catalog_changes(
+    def _apply_catalog_phase(
         self,
         commit_id: int,
-        durable_lsn: int,
+        plan: CatalogPlan,
         stats: dict,
+        *,
+        schema_only: bool,
     ) -> None:
-        """Apply the source-catalog changes whose fence has opened (rubric 1.5).
-
-        Runs inside the commit group's transaction, *after* the group's events, so a
-        `DROP` cannot remove rows that an event of this same group had still to add,
-        and a crash between the drop and the resume-point write replays both. The
-        policy - supersession, revalidation, the circuit breaker, `awaiting_snapshot` -
-        is `catalog_apply.CatalogCoordinator`'s; this is only where it is executed.
-        """
-        coordinator = self.catalog_coordinator
-        if not coordinator.enabled:
-            return
-        plan = coordinator.plan(durable_lsn)
-        if not plan.actions and not plan.relations and not plan.alerts:
-            return
-        self.group.catalog_plan = plan
-        self.group.table_events.extend(coordinator.apply(self.con, plan, stats))
-        # A destructive action that could not be applied is exactly the signal an
-        # operator must still get when the group rolls back; one that describes an
-        # applied action must NOT outlive the rollback that undid it (Codex 7).
-        self.group.pending_alerts.extend(plan.alerts)
-        if self.group.table_events:
-            self._flush_table_events(commit_id)
+        catalog_commit.apply_catalog_phase(
+            self, commit_id, plan, stats, schema_only=schema_only
+        )
 
     def _settle_catalog(self, group_obj: OpenGroup) -> None:
-        """Forget the catalog work this group made durable. Runs after COMMIT."""
-        if self.catalog is None:
-            return
-        plan = group_obj.catalog_plan
-        if plan is not None:
-            self.catalog_coordinator.settle(plan, group_obj.source_tables)
-            group_obj.catalog_plan = None
-        elif group_obj.source_tables:
-            self.catalog.observe_replicated(group_obj.source_tables)
+        catalog_commit.settle_catalog(self, group_obj)
 
     def _flush_alerts(self, group_obj: OpenGroup) -> None:
         for alert in group_obj.pending_alerts:
@@ -1106,66 +950,9 @@ class Applier:
         unit_seq: int,
         snapshot: tuple[str | None, str | None] | None = None,
     ) -> int:
-        """Stage one unit's events inside the group's own transaction (ADR §3.4).
-
-        `unit_seq` and `snapshot` are **inputs**, not inferences. This callback used
-        to look the phase up in the applier's snapshot mapping, which the apply pass
-        populates only later, so on the first spilled chunk of every snapshot it
-        concluded "streaming" and staged the rows into the **live** table with a
-        `<lsn>:None:None` identity; a consumer could then see a partial snapshot, and
-        the swap dropped those rows (Codex 1). Resolving the shadow *here*, through
-        the coordinator, is what makes that impossible; `unit_seq` is what lets the
-        drain order and fence per unit (Opus B-1, Codex 5).
-        """
-        if not events:
-            return 0
-        if self.cfg.resnapshot and snapshot is None:
-            # The assembler is configured to discard these events before invoking this
-            # callback. Keep this defensive branch side-effect free if a caller invokes
-            # the callback directly: a throwaway stream must never open a destination
-            # transaction merely because it crossed a memory threshold.
-            log.debug("discarding %s throwaway re-snapshot events before destination spill", len(events))
-            return len(events)
-        if not self.group.txn_open:
-            self.con.execute("BEGIN TRANSACTION")
-            self.group.txn_open = True
-            self.group.spill_commit_id = self._reserve_commit_id()
-        commit_id = self.group.spill_commit_id or self._next_commit_id
-        # Creates the shadow table, its `table_state` row and the snapshot epoch
-        # BEFORE any record of this table can be staged.
-        state = self.snapshots.state_for(*snapshot) if snapshot is not None else None
-
-        prepared: list[StagedEvent] = []
-        for event in events:
-            if not event.schema or not event.table:
-                continue
-            if state is not None:
-                prepared.append(
-                    StagedEvent(
-                        event=event,
-                        event_id=self.snapshots.event_id(event),
-                        target=state.shadow,
-                        seq=event.snapshot_ordinal,
-                    )
-                )
-            else:
-                prepared.append(
-                    StagedEvent(
-                        event=event,
-                        event_id=stream_event_id(event),
-                        target=self.snapshots.target_table(event.schema, event.table),
-                        # Mandatory and validated by the assembler, so there is
-                        # nothing to substitute a local sequence for: doing that gave
-                        # a replay a different identity (Codex 4).
-                        seq=event.total_order,
-                    )
-                )
-        staged = self.spill.stage(
-            commit_id=commit_id, unit_seq=unit_seq, prepared=prepared
+        return spill_protocol.stage_events(
+            self, events, unit_seq=unit_seq, snapshot=snapshot
         )
-        self.spilled_events += staged
-        maybe_crash("spill", self.data_commit_groups + 1)
-        return len(events)
 
     # ------------------------------------------------------------------ #
     # shutdown
@@ -1206,13 +993,3 @@ class Applier:
             if self.error is None:
                 self.error = exc
         return self.assembler.discard_open_unit()
-
-
-def _epoch_ms(value) -> Any:
-    """Debezium's `source.ts_ms` as a timestamp, so end-to-end lag is a SQL
-    subtraction rather than an arithmetic puzzle for whoever writes rubric 6.1."""
-    if value is None:
-        return None
-    from datetime import UTC, datetime
-
-    return datetime.fromtimestamp(value / 1000.0, tz=UTC)

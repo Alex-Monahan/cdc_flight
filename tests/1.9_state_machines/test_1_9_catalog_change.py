@@ -110,6 +110,13 @@ def test_applied_is_reachable_only_through_due():
     assert change.state == CHANGE_APPLIED
 
 
+def test_a_superseded_due_change_can_be_settled_as_applied():
+    """Settlement records a committed stale plan without deleting newer work."""
+    from cdc_flight.machines import CATALOG_CHANGE
+
+    assert CATALOG_CHANGE.allows(CHANGE_SUPERSEDED, CHANGE_APPLIED)
+
+
 def test_a_refused_change_can_come_back_round():
     """A refusal is not terminal: the mass-drop breaker and the staleness guard both
     leave the change pending so a later poll can resolve it."""

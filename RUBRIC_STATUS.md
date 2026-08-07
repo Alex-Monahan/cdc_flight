@@ -66,7 +66,7 @@ conservatively at **5** and **4** — 1.5 deliberately not restored to 5.
 | Codex 1 / Opus B-1, B-2 — the fold asked a group-scoped question about a per-row ambiguity | **fixed.** `table_work` folds physical rows (ADR §18/A35); five orderings closed |
 | Codex 2 — spill bypassed the truncate policy and audit | **fixed.** One dispatcher (`planner.GroupPlan`); a `{memory,spill} x {replicate,log}` matrix; positional audit |
 | Codex 3 — cross-transaction truncate zombie | **fixed** by the same fold |
-| Codex 4 / Opus M-3 — a stale drop could destroy a live replacement | **fixed.** Confirmation, supersession, fail-closed revalidation, a circuit breaker, a zero-relations guard (ADR §18/A38) |
+| Codex 4 / Opus M-3 — a stale drop could destroy a live replacement | **fixed.** Confirmation, supersession, durable watcher state with atomic quarantine/resnapshot, a circuit breaker, and a zero-relations guard (ADR §18/A38) |
 | Codex 5 — no durable source→destination ownership | **fixed.** `table_state` written by whoever creates the table; `--reset-state` keeps it (A39) |
 | Codex 6 — the no-writable-primary fallback reported success | **fixed.** Final synchronous poll, drain barrier, `stop_reason=catalog_unresolved` (A43) |
 | Codex 7 / Opus M-2 — the alert was inside the transaction | **fixed.** `AlertSink` on `con.cursor()`, classified by refusal vs applied action (A40) |
@@ -75,7 +75,7 @@ conservatively at **5** and **4** — 1.5 deliberately not restored to 5.
 | Opus M-1 — a rolled-back group was folded twice | **fixed.** `_reset_group()` on the rollback path, with a test that measures the loss (A41) |
 | Opus M-4 — `--reset-state` made a permanent zombie | **fixed** by A39 |
 | Opus M-5 — the recorded falsifier named a case that works | **fixed.** A31 marked superseded; the real shapes are named |
-| Opus Q1 — recreated-table policy | **drop + alert + persistent `awaiting_snapshot`**, surfaced by `inspect` and the run summary. Automatic re-snapshot is 2.3/3.4, and it is why 1.5 is 4 |
+| Opus Q1 — recreated-table policy | **retained-image quarantine + alert + persistent `awaiting_snapshot`**, surfaced by `inspect` and the run summary. Automatic re-snapshot is 2.3/3.4, and the replacement or final source-missing policy owns destruction |
 | Opus Q2, Q5 — mass-drop breaker, confirm polls | **built**, defaults 1 and 2 |
 | Opus Q3 — unify the fence marker with D9 | **`source_marker.SourceMarker`**: the interface and the reasons, not the heartbeat loop (4.4 owns the cadence) |
 | Opus Q4 — `rows_removed` must not degrade to NULL | **asserted** on DuckDB and MotherDuck |
@@ -363,14 +363,14 @@ correct assumptions in the notes below:
 | 1.2 | Delivery guarantees, tables WITHOUT a primary key | ~~3~~ → **5** | Keyless rows are keyed on a connector-derived `cdcf_event_id` whose ordinal contract is enforced at the boundary, so two identical source rows survive and a replay does not. |
 | 1.3 | CDC changes atomic in MotherDuck | ~~1~~ → **5** | A commit group is an integral number of whole multi-table Postgres transactions, proven whole in every storage mode; a concurrent MotherDuck observer never sees a partial one, including across an injected crash. |
 | 1.4 | Primary-key update handled correctly | ~~2~~ → **5** | The `d(old)`/`c(new)` pair is one transaction and a commit group holds whole transactions, so the move is atomic by construction. The fold models **physical rows** rather than keys, so a key worn by two rows inside a transaction (or freed and re-taken across two transactions of one group) is expressible; where the before-image cannot attribute a delete the group is refused rather than folded. Five reproduced silent-loss/duplication orderings are now equality tests. |
-| 1.5 | TRUNCATE / DROP propagate | ~~1~~ → **5** | `skipped.operations=none` brings truncates through; **one** dispatcher applies them in every storage mode and each truncate's audit records what *it* removed. `DROP TABLE` is not in the stream, so the source catalog is polled and the action passes six guards before any DDL. A dropped-and-recreated relation is dropped, marked `awaiting_snapshot` and **re-snapshotted automatically on the next run**. Held at 4 through the 1.6-1.8 review because the rebuild machinery could delete a live destination table it had merely not reached; that is closed with positive-evidence emptiness and multi-table proof (ADR §19/A52). A mass drop still needs an operator, deliberately. |
+| 1.5 | TRUNCATE / DROP propagate | ~~1~~ → **5** | `skipped.operations=none` brings truncates through; **one** dispatcher applies them in every storage mode and each truncate's audit records what *it* removed. `DROP TABLE` is not in the stream, so the source catalog is polled and the action passes six guards before any DDL. A dropped-and-recreated relation retains its old image, is marked `awaiting_snapshot`, and is **re-snapshotted automatically on the next run**; the replacement or final source-missing policy owns any destruction. Held at 4 through the 1.6-1.8 review because the rebuild machinery could delete a live destination table it had merely not reached; that is closed with positive-evidence emptiness and multi-table proof (ADR §19/A52). A mass drop still needs an operator, deliberately. |
 | 1.6 | Snapshot/backfill consistent with CDC | ~~3~~ → **5** | Postgres's **exported snapshot** makes the boundary an iff, and the fence is on the transaction's **commit** LSN, so a transaction straddling `C` is applied in full rather than lost. Proven with ~200 transactions committing throughout a snapshot — every row on exactly one side. A re-snapshot is complete only when **every requested table** reaches a terminal state: swapped, or verified empty on three independent facts (Debezium's own end-of-snapshot marker, zero records for that table, and a source count of zero). A disagreement between the two readings of `C` is fatal. Proven against a four-table re-snapshot with a keyless table, a genuinely empty table and a concurrent writer. |
 | 1.7 | Failures do not cause correctness issues | ~~1~~ ~~4~~ → **3** | **Twenty-one in-process anchors**: eight protocol, five destination (including the genuinely ambiguous `destination_commit_late`), seven recovery/catalog-baseline, and one source-catalog fault, plus a real network blackhole injected from outside the process. The matrix is enumerated from `faults.ALL_POINTS`, every anchor writes a machine-readable fired record, and the chaos harness asserts each workload affected source rows before arming. Round 7 still scores this 3/5: substantial evidence, but repeated adversarial compositions were found outside the suite, so the 5-band's “robust injection” is not yet the reviewer's verdict. |
 | 1.8 | Externally-advanced slot detected → backfill | ~~1~~ → **5** | Checked on every slot acquisition. Seven decisions trigger an **automatic** re-snapshot: slot ahead, slot missing, slot recreated, source identity changed, **source timeline forked**, source WAL rewound, and an empty destination with a positioned slot. The recovery is a **journalled state machine**: the intent is durable before any mutation, every step is idempotent and re-entrant after a crash at any phase, and a slot that will not drop fails the recovery rather than being logged and stepped over. A **populated** destination with no resume point refuses instead of being rebuilt. Proven by comparing the whole destination against the whole source after a real `pg_replication_slot_advance` and a real `pg_drop_replication_slot`, and by cutting the recovery at every phase boundary. |
 | 1.9 | Consistency-affecting state managed with state machines | **5** (new item) | Nine focused machines plus one precedence are declared together in `cdc_flight/machines.py`, including the closed `snapshot_completion` and durable `runtime_root_lifecycle` models. The inventories are generated from those declarations. Failed quiescence is published inside the supervisor's `finally`; marker preparation refuses `armed` and retires `consumed` only through its declared edge. This satisfies the literal 5 band (“an appropriate number of state machines, over 1”). |
-| 2.1 | Added / dropped columns handled | 2 | Adds work correctly; a dropped column silently lingers and reads NULL, indistinguishable from a real NULL. |
-| 2.2 | Renamed columns handled well | 1 | Rename lands as "new column + old column silently goes NULL". No tombstone, no linkage. |
-| 2.3 | New tables and schemas auto-discovered | 1 | Needs `ALTER PUBLICATION` + config change + restart, and pre-existing rows are silently never snapshotted. |
+| 2.1 | Added / dropped columns handled | **5** | Catalog-fenced attnum diffs add and backfill existing rows, physically drop destination columns, and continue through live CDC; the add/drop E2E compares source and destination before and after both DDLs. |
+| 2.2 | Renamed columns handled well | **5** | Same-attnum/type changes use a true destination rename, including a late-row merge/fence path; the E2E has one logical column, one rename audit event, and no data loss. |
+| 2.3 | New tables and schemas auto-discovered | **5** | A 10-second (configurable) all-schema watcher admits table-scoped publication members and performs an in-process targeted re-snapshot on the same main slot; new-table and new-schema existing rows arrive without config edit or restart. |
 | 2.4 | Postgres types → native MotherDuck types | 1 | numeric→base64 VARCHAR, date/time/timestamp/interval→BIGINT, NaN/Inf degrade the column to VARCHAR, `col_numeric_nan` dropped entirely. |
 | 2.5 | Data type changes supported | 3 | dlt adds a `__v_text` variant column beside the old one; no widening logic, no UNION type. |
 | 2.6 | TOAST columns handled well | 1 | Unchanged TOAST arrives as the literal `__debezium_unavailable_value` — silent corruption, not an error. |
@@ -405,9 +405,9 @@ correct assumptions in the notes below:
 **Baseline average: 66 / 40 = 1.65 out of 5.** Items at 5 in the baseline:
 **1 of 40** (7.1).
 
-**Current average (this branch): 97 / 42 = 2.31 out of 5.** Items at 5: **9 of 42**.
-Rubric 1.7 remains 3 while 1.9 is 5. Distribution: 22 at 1, 3 at 2, 8 at 3,
-0 at 4, 9 at 5. Distance to target: **113 rubric points**.
+**Current average (this branch): 108 / 42 = 2.57 out of 5.** Items at 5: **12 of 42**.
+Rubric 1.7 remains 3 while 1.9 is 5. Distribution: 20 at 1, 2 at 2, 8 at 3,
+0 at 4, 12 at 5. Distance to target: **102 rubric points**.
 
 **Correction (2026-07-31).** This paragraph previously read `100 / 41 = 2.44` with a
 distribution of `21/3/8/0/9`, and neither matched the summary table above it — the block
@@ -905,14 +905,13 @@ and a rolled-back group leaves every row in place.
 
 Not in the replication stream at all: pgoutput carries no DDL and the Postgres
 connector has no DDL event source. `src/cdc_flight/catalog.py` polls the source
-catalog on its own connection (default 10 s, `CDC_CATALOG_POLL_SECONDS`) for the two
-facts logical decoding cannot give us - the relation `oid` and publication membership
-- and reports four things: `dropped`, `recreated` (same name, new oid),
-`unpublished` (**never** destructive: Postgres still holds those rows) and `new`
-(rubric 2.3's hook, recorded only). It **observes and never decides**:
-`src/cdc_flight/catalog_apply.py` owns the policy, because the observation and the DDL
-are separated in time by the fence and that gap is where a stale fact becomes a wrong
-drop.
+catalog on its own connection (default 10 s, `CDC_CATALOG_POLL_SECONDS`) across all
+non-system schemas by default for the relation `oid`, publication membership and the
+full `pg_attribute` column shape. It reports `dropped`, `recreated` (same name, new
+oid), `unpublished` (**never** destructive: Postgres still holds those rows), `new`
+(rubric 2.3), and `schema_changed` (add/drop/rename/type identity). The watcher owns
+safe publication admission for a newly observed relation; `catalog_apply.py` owns the
+fenced destination policy and DDL.
 
 **Six guards** (ADR §18/A38), in the order they run:
 
@@ -922,13 +921,15 @@ drop.
 | the zero-relations guard | acting on a poll that saw an empty schema | the wrong-database / mid-`pg_restore` signature |
 | confirmation (`CDC_DROP_CONFIRM_POLLS=2`) | acting on a single observation | a transient catalog read mid-DDL |
 | supersession | acting on an observation a later poll contradicted | dropping the destination table of a **live replacement relation** |
-| revalidation | acting without re-reading the source, and acting when it cannot be read | the same, for a fence that opened long after detection |
+| durable observation | acting from an untrusted synchronous proof or an out-of-band source read | the stale-image window is durably quarantined and baseline/completion refuse until the complete resnapshot swap |
 | the circuit breaker (`CDC_DROP_MAX_PER_POLL=1`) | destroying more than one relation at once | `DROP SCHEMA … CASCADE`, a DSN repointed at an empty database, a failover target |
 
-Revalidation fails **closed**: "I could not ask the source" is never read as "it is
-gone". The breaker refuses the **whole** set, never the first N, and raises a `critical`
-alert that survives a rollback. A `recreated` relation is dropped, alerted on, and
-marked `awaiting_snapshot` in `table_state`, which `inspect` and the run summary print.
+The watcher fails safe on source errors: an observation error creates no commit-path
+authority or acknowledgement. The breaker refuses the **whole** set, never the first N, and raises a `critical`
+alert that survives a rollback. A `recreated` relation retains its old image, is
+quarantined and marked `awaiting_snapshot` in `table_state`, which `inspect` and the
+run summary print; the replacement snapshot or final source-missing policy owns any
+later destruction.
 
 **Ownership.** "A replicated table absent from `pg_class` is always detected" was not
 durably true: the watcher seeds itself from `_cdc_flight.table_state`, and that row was
@@ -996,12 +997,14 @@ rather than trading one off:
 |---|---|---|
 | `CDC_TRUNCATE_MODE` | `replicate` | `replicate` empties the destination (=5); `log` keeps the rows and records the marker (the rubric's "tombstone/soft delete" =3); `ignore` restores Debezium's skip |
 | `CDC_DROP_MODE` | `replicate` | `replicate` drops the destination table (=5); `log` records the marker only; `ignore` disables catalog polling |
-| `CDC_CATALOG_POLL_SECONDS` | `10` | poll interval (also 2.3's discovery interval) |
+| `CDC_CATALOG_POLL_SECONDS` | `10` | catalog/discovery poll interval; the default is within 2.3's <=60-second target |
+| `CDC_AUTO_DISCOVERY` | `1` | discover relations in the watched schemas and hand them to the live targeted re-snapshot path |
+| `CDC_SCHEMA_INCLUDE_LIST` / `CDC_SCHEMAS` | unset | optional comma-separated schema scope; unset means all non-system schemas |
 | `CDC_DROP_CONFIRM_POLLS` | `2` | consecutive polls that must agree before a destructive change is queued |
 | `CDC_DROP_MAX_PER_POLL` | `1` | how many relations one commit group may destroy; the whole set is refused above it |
 | `CDC_DROP_ALLOW_MASS` | `0` | authorise a mass drop (an operator who really is replicating a `DROP SCHEMA`) |
-| `CDC_DROP_REVALIDATE` | `1` | re-read the relation immediately before destroying its destination table |
-| `CDC_CATALOG_MARKER` | `1` | emit the WAL fence marker on the source (writes go to the PRIMARY, per 7.2/D9) |
+| `CDC_PRIMARY_DSN` | unset | primary route for catalog publication admission and transactional fence markers when the read DSN is a replica; unset uses the source DSN |
+| `CDC_CATALOG_MARKER` | `1` | emit the WAL fence marker on the configured PRIMARY, per 7.2/D9 |
 | `CDC_CATALOG_MARKER_MAX` | `60` | cap on fence markers per run while a change stays unresolved |
 | `CDC_CATALOG_DRAIN_SECONDS` | `30` | how long a quiet run holds the engine open for a change it just queued |
 | `CDC_CATALOG_GRACE` | `0` | never apply a DDL action the fence has not cleared. **A non-zero value is excluded from the structural correctness guarantee** (ADR §18/A38) and the run logs that at start-up |
@@ -1066,8 +1069,8 @@ cannot silently restore "truncates are skipped".
 #### Falsifiers (what would drop this score — and what keeps it off 5)
 
 * ~~**No automatic re-snapshot for a recreated relation. This is why the score is 4.**~~
-  **Closed 2026-07-31.** A recreated relation is dropped, marked `awaiting_snapshot` and
-  rebuilt automatically on the next run through `cdc_flight.resnapshot`, proven end to
+  **Closed 2026-07-31.** A recreated relation retains its old image, is marked
+  `awaiting_snapshot` and rebuilt automatically on the next run through `cdc_flight.resnapshot`, proven end to
   end against a relation recreated with rows that produce no change events at all
   (`test_1_6_recreated_relation.py`). The stale text that still argued for a 4 lived here
   and in the section heading while the summary table said 5 — the file's own preamble
@@ -1098,9 +1101,13 @@ cannot silently restore "truncates are skipped".
 * Partition DETACH/DROP is still 7.3's item: a detached partition leaves the
   publication as `unpublished` (non-destructive), which is not the same as replicating
   the detach.
-* **Multi-schema capture is guarded, not supported.** A replicated name outside the
-  polled schema is never reported as `dropped` (Opus MINOR-4), which is what stops 2.3/3.x
-  from destroying those tables — but one poller still polls one schema.
+* **Schema scope is explicit.** With no `CDC_SCHEMA_INCLUDE_LIST`/`CDC_SCHEMAS`, the
+  watcher scans every non-system schema and discovers new schemas as soon as their
+  relations appear. The environment variables narrow the scope for deployments that
+  do not want all schemas. A table-scoped publication is amended automatically; a
+  `FOR ALL TABLES` publication already captures new relations and needs no ALTER.
+  Discovery additions are safe by default, but a multi-relation discovery emits the
+  `mass_add_observed` warning so an unexpected migration is visible.
 
 **Baseline (historical).** `TRUNCATE TABLE app.orders` in `p01`: the destination still
 showed `{'r': 5}`, `any_op_t == 0`, and the run's `skipped` counter was 0 - the event
@@ -1511,17 +1518,20 @@ therefore mutated by a path the design did not enumerate.**
 Explicit machines do not make the system correct. They make the **unenumerated path** a
 run-time error instead of a review finding.
 
-#### What was built — nine focused machines and one precedence
+#### What was built — twelve focused machines and one precedence
 
 | machine | owns | states | edges | persistence |
 |---|---|---|---|---|
 | `table_lifecycle` | is this destination table a trustworthy image, and who owes the work | 5 | 21 | `_cdc_flight.table_state.snapshot_state` |
-| `run_phase` | where is this run, readable from the destination *while it runs* | 9 | 23 | `_cdc_flight.heartbeat.phase` |
+| `run_phase` | where is this run, readable from the destination *while it runs* | 9 | 24 | `_cdc_flight.heartbeat.phase` |
 | `run_outcome` | why did this run stop — cause before symptom | 10 | 45 (escalations only) | `heartbeat.terminal_reason`, `last_run.json` |
 | `acquisition_recovery` | what has this destructive recovery already done | 5 | 9 | `_cdc_flight.recovery_state.phase` |
 | `interruption_marker` | has filesystem recovery intent been armed, safely discharged, and retired | 3 | 3 | `<state_dir>/resnapshot/interrupted.json.state` |
 | `destination_ownership` | who owns the destination after callback admission or failed quiescence | 4 | 5 | **memory only** |
-| `catalog_change` | where is one DDL fact in observe → confirm → fence → apply | 9 | 30 | **memory only** |
+| `catalog_change` | where is one DDL fact in observe → confirm → fence → apply | 9 | 31 | **memory only** |
+| `publication_admission` | has a discovered relation been admitted to the publication, and who owns that decision | 6 | 23 | `_cdc_flight.source_relations.admission_state` |
+| `catalog_schema_liveness` | is a watched schema visibly queryable before absence can mean a drop | 4 | 16 | **memory only** |
+| `schema_refusal` | has a refused schema transition acquired a durable remediation obligation | 3 | 5 | `_cdc_flight.schema_refusals.state` |
 | `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
 | `snapshot_completion` | have all ordered snapshot callbacks arrived | 6 | 9 | **memory only** |
 | `runtime_root_lifecycle` | is the disposable root reusable or committed to cleanup | 6 | 10 | project-local root and parent markers |
@@ -1703,69 +1713,63 @@ Held-open items a reviewer should still treat as the honest edges of the claim:
 
 ## 2. Schema Evolution & Type Handling
 
-### 2.1 Added or dropped columns must be handled — **2 / 5**
+### 2.1 Added or dropped columns must be handled — **5 / 5**
 
 `no=1, yes=5`
 
-**Evidence** (`probes/p02_schema_evolution.py`).
-*Add*: `ALTER TABLE app.customers ADD COLUMN loyalty_tier text DEFAULT 'bronze'`
-→ `loyalty_tier VARCHAR` appears at the destination and carries correct values
-(`'gold'` on the insert, `'silver'` on the update). Clean.
-*Drop*: `ALTER TABLE app.customers DROP COLUMN is_active` → the destination
-column **stays** and subsequent rows read `is_active = NULL`
-(`valuesB_is_active` shows `('c', null, 1)` after the drop alongside
-`('c', true, 1)` before it). Nothing marks the column as dropped.
+The catalog watcher compares PostgreSQL `pg_attribute` rows by `attnum` and type
+identity, and queues the result behind the same WAL fence as table DDL. The chosen
+destination semantics are current-state physical schema: an added column is created
+with its catalog-derived type and existing source values are backfilled before the
+commit; a dropped source column is physically dropped from the destination. Keyed
+tables use their primary keys for the copy. Keyless tables use an all-row update only
+when the newly added source values are uniform; a non-uniform case fails closed because
+there is no honest source row identity.
 
-Scored 2 rather than 5 because half the item is not handled, and rather than 1
-because adds provably are. A dropped column silently reading NULL is
-indistinguishable from a genuinely NULL value — a correctness problem, not just
-cosmetics.
+**Evidence.** `tests/2.1_added_dropped_columns/test_2_1_schema_evolution.py` pins the
+identity diff, dlt schema model, add backfill, physical drop, and keyless safety.
+`tests/2.1_added_dropped_columns/test_2_1_added_dropped_columns_e2e.py` runs live CDC
+before the DDL, performs an ADD with a default plus update/insert, compares every
+source row with the destination, then performs a DROP and post-drop update. It also
+asserts one applied `column_added` and one applied `column_dropped` audit event.
 
-**Gap to 5.** Detect the drop (the Debezium schema change / relation message has
-it) and either drop the destination column or mark it dropped in a schema-history
-table with the LSN at which it disappeared, so consumers can tell "no longer
-exists" from "NULL". Add a test pinning both directions.
-
-### 2.2 Renamed columns must be handled well — **1 / 5**
+### 2.2 Renamed columns must be handled well — **5 / 5**
 
 `no=1, old column renamed with tombstone=3, seamless rename=5`
 
-**Evidence** (`p02`). `ALTER TABLE app.customers RENAME COLUMN name TO
-full_name` → the destination gains `full_name VARCHAR`, keeps `name VARCHAR`,
-and rows written after the rename have `name = NULL`, `full_name = 'Renamed
-Col'`. Rows written before have the opposite. No tombstone, no mapping, no
-warning. Score 1: this is exactly the "add + stale column" non-handling.
+pgoutput emits the same relation identity with the old column gone and the new name
+at the same `attnum`. The watcher therefore emits a logical rename and the applier
+executes a true destination `ALTER TABLE ... RENAME COLUMN`, not a drop/add. If the
+new-name row arrives before the poll, the late path merges the two physical columns
+with `COALESCE` and drops the old name inside the fenced commit. Rename plus unrelated
+add/drop changes are applied from one attnum diff.
 
-**Gap to 5.** pgoutput does not expose renames as renames — the relation message
-just has different column names at the same attribute numbers. Seamless rename
-therefore needs attribute-number tracking (`pg_attribute.attnum` via a catalog
-diff or an event trigger writing to a signal table) so old and new names can be
-identified as the same column, then a destination `ALTER TABLE … RENAME COLUMN`
-and backfill of the historical rows.
+**Evidence.** `tests/2.2_renamed_columns/test_2_2_renamed_columns.py` pins attnum
+continuity, type identity, true rename, late-row merge, and a rename combined with an
+unrelated add/drop. The E2E performs live CDC before and after `name -> full_name`,
+verifies one logical destination column and source-equivalent values, and asserts
+exactly one applied `column_renamed` event with no add/drop history.
 
-### 2.3 New tables and schemas auto-discovered — **1 / 5**
+### 2.3 New tables and schemas auto-discovered — **5 / 5**
 
 `no=1, infrequently or requiring restart=4, automatically on short interval=5`
 
-**Evidence** (`probes/p03_table_lifecycle.py`). Three stages:
+The watcher polls at 10 seconds by default (configurable, with the acceptance target
+bounded at 60 seconds), scans all non-system schemas unless explicitly narrowed, and
+classifies first-sight relations as live `new` work. In a table-scoped publication it
+adds the relation to the publication; `FOR ALL TABLES` needs no ALTER. The running
+pipeline then quiesces the main callback, retains its main slot/WAL boundary, invokes
+the existing single-table re-snapshot machinery for pre-existing rows, and resumes a
+no-data engine in the same process. Multiple additions are safe by default and emit
+a mass-add warning.
 
-| stage | action | records |
-|---|---|---|
-| A | `CREATE TABLE app.newcomer` + 2 rows (not published, not in include list) | 0 |
-| B | `ALTER PUBLICATION … ADD TABLE app.newcomer` + 1 row (still not in include list) | 0 |
-| C | `CDC_TABLES` widened + process restart | 2 |
-
-Stage C delivered rows 3 and 4 (row 3 was replayed from the WAL once the table
-was included), but rows **1 and 2 are permanently lost** — no snapshot is ever
-taken for a newly included table, so all pre-existing data is silently missing.
-Discovery requires a `PUBLICATION` change *and* a config change *and* a restart,
-and is lossy. That is 1, not 4.
-
-**Gap to 5.** Poll `pg_class`/`pg_publication_tables` on a short interval; add
-new tables to the publication and the include list automatically; trigger a
-targeted snapshot for each new table (3.4) so pre-existing rows arrive. New
-*schemas* are equally undiscovered — `schema.include.list` is a single value in
-`src/cdc_flight/debezium_props.py:68`.
+**Evidence.** `tests/2.3_new_table_discovery/test_2_3_new_table_discovery.py` pins the
+all-schema candidate set, <=60-second default, and mass-add policy. The E2E keeps one
+bounded process alive while creating `app.discovered_rows` and
+`discovered_schema.rows`, then asserts `live_discovery_handoffs >= 1`, publication
+membership, both tables' pre-existing rows, post-snapshot CDC rows, and one applied
+`new` audit event per relation. No config edit or second process run is used for the
+discovery itself.
 
 ### 2.4 Postgres types accurately converted to native MotherDuck types — **1 / 5**
 

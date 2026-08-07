@@ -11,7 +11,7 @@ destroy every destination table it owned. So:
 | the zero-relations guard | acting on a poll that saw an empty schema | Opus Q2 |
 | confirmation | acting on a single observation | Opus Q5 |
 | supersession | acting on an observation a later poll contradicted | Codex 4 |
-| revalidation | acting without re-reading the source, and acting when it cannot be read | Codex 4 |
+| durable observation | acting only on watcher state that is WAL-fenced and superseded by later polls | this round |
 | the circuit breaker | destroying more than one relation at once | Opus MAJOR-3 / Q2 |
 
 The last section is Codex's 9-point item 9: a catalog action combined with a fault at
@@ -20,8 +20,8 @@ the marker, the ownership rows and the resume point are one transaction, and the
 way to know that is to tear the group at each anchor and look.
 
 Everything here drives the shipped `CatalogWatcher` and `CatalogCoordinator`; the
-source query itself is stubbed, because a watcher with no DSN must never fall back to
-libpq defaults (that would reach `:5432`, which this project never touches).
+source query itself is stubbed, because a watcher with no DSN is an observation-only
+test double and the commit path never falls back to libpq defaults.
 """
 
 from __future__ import annotations
@@ -63,18 +63,10 @@ def relation(table: str, oid: int, *, published: bool = True) -> SourceRelation:
     )
 
 
-def watcher(*, present=None, fail_revalidation: bool = False, **kw) -> CatalogWatcher:
+def watcher(*, present=None, **kw) -> CatalogWatcher:
     w = CatalogWatcher(
         dsn="", publication="pub", schema="app", include=set(), poll_seconds=0, **kw
     )
-    oids = dict(present or {})
-
-    def relation_oids(names):
-        if fail_revalidation:
-            raise RuntimeError("the source could not be reached")
-        return {f"{s}.{t}": oids.get(f"{s}.{t}") for s, t in names}
-
-    w.relation_oids = relation_oids  # type: ignore[method-assign]
     return w
 
 
@@ -190,7 +182,7 @@ def test_a_relation_that_comes_back_unchanged_leaves_nothing_pending():
     assert "app.customers" in w.replicated, "and it is still ours"
 
 
-def test_a_relation_that_goes_away_cancels_its_pending_recreate():
+def test_a_relation_that_goes_away_keeps_its_pending_recreate_owed():
     w = watcher(confirm_polls=1)
     w.known = {"app.customers": relation("customers", 1)}
     w.replicated = {"app.customers"}
@@ -198,66 +190,49 @@ def test_a_relation_that_goes_away_cancels_its_pending_recreate():
         CHANGE_RECREATED
     ]
     added = w._compare({"app.orders": relation("orders", 9)}, lsn=20)
-    assert [c.kind for c in added] == [CHANGE_DROPPED]
-    assert [c.kind for c in w.pending_destructive()] == [CHANGE_DROPPED]
+    assert [
+        c.kind for c in added if c.qualified == "app.customers"
+    ] == []
+    assert [
+        c.kind for c in w.pending_destructive() if c.qualified == "app.customers"
+    ] == [CHANGE_RECREATED]
 
 
 # --------------------------------------------------------------------------- #
-# guard: revalidation (Codex 4)
+# durable observation replaces the deleted commit-time revalidation (Codex 4)
 # --------------------------------------------------------------------------- #
-def test_a_relation_that_exists_again_is_never_dropped(lab):
-    """The queued fact is stale by the time the fence opens. The destination table now
-    belongs to a LIVE relation, and dropping it would destroy rows this pipeline has
-    already captured for it."""
+def test_a_durable_drop_observation_is_applied_without_commit_revalidation(lab):
+    """The watcher, not a second source read, owns a durable queued decision."""
     w = watcher(present={"app.customers": 4711})
     box = lab(catalog=w)
     preload(box)
     queue(w, "customers", old_oid=1)
     tick(box)
-    assert box.exists(CUSTOMERS), "a live relation's destination table must survive"
-    assert len(w.pending_destructive()) == 1, "and the change stays pending"
-    assert ("warning", "destructive_change_deferred") in alerts(box)
+    assert not box.exists(CUSTOMERS)
+    assert w.pending_destructive() == []
 
 
-def test_a_source_that_cannot_be_re_read_fails_closed(lab):
-    w = watcher(fail_revalidation=True)
+def test_a_source_that_cannot_be_re_read_does_not_block_durable_catalog_apply(lab):
+    w = watcher()
     box = lab(catalog=w)
     preload(box)
     queue(w, "customers", old_oid=1)
     tick(box)
-    assert box.exists(CUSTOMERS), "'I could not ask' is not 'it is gone'"
-    assert len(w.pending_destructive()) == 1
+    assert not box.exists(CUSTOMERS)
+    assert w.pending_destructive() == []
 
 
-def test_a_recreate_whose_oid_changed_again_is_not_applied(lab):
+def test_a_durable_recreate_observation_quarantines_without_revalidation(lab):
     w = watcher(present={"app.customers": 12345})
     box = lab(catalog=w)
     preload(box)
     queue(w, "customers", kind=CHANGE_RECREATED, old_oid=1, new_oid=99999)
     tick(box)
     assert box.exists(CUSTOMERS)
-    assert len(w.pending_destructive()) == 1
-
-
-def test_revalidation_can_be_switched_off(lab):
-    """`CDC_DROP_REVALIDATE=0` is for a deployment that cannot afford the extra source
-    read; it removes guard 3 and nothing else."""
-    w = watcher(present={"app.customers": 4711})
-    box = lab(catalog=w, drop_revalidate=False)
-    preload(box)
-    queue(w, "customers", old_oid=1)
-    tick(box)
-    assert not box.exists(CUSTOMERS)
-
-
-def test_a_watcher_with_no_dsn_refuses_to_query_rather_than_using_libpq_defaults():
-    """An empty DSN makes libpq connect to its own defaults, which on this machine is
-    `:5432` - a cluster this project must never touch."""
-    w = CatalogWatcher(
-        dsn="", publication="pub", schema="app", include=set(), poll_seconds=0
-    )
-    with pytest.raises(ValueError, match="no DSN"):
-        w.relation_oids({("app", "customers")})
+    assert box.q(
+        "SELECT snapshot_state FROM _cdc_flight.table_state "
+        "WHERE source_table = 'customers'"
+    ) == [("awaiting_snapshot",)]
 
 
 # --------------------------------------------------------------------------- #
@@ -335,6 +310,63 @@ def test_a_poll_that_sees_an_empty_schema_is_discarded(lab):
     assert w.pending() == []
     assert w.empty_polls == 1
     assert "no tables at all" in (w.last_error or "")
+
+
+def test_catalog_reads_can_use_a_replica_and_writes_use_the_primary(monkeypatch):
+    """7.2: standby-safe observation never turns a marker/publication write into a
+    write on the read endpoint.  The real catalog query is represented by a small
+    connection double; the DSN split is the state under test.
+    """
+    w = watcher(
+        known={"app.customers": relation("customers", 1)},
+        replicated=["app.customers"],
+    )
+    w.dsn = "postgresql://replica:15432/db"
+    w.primary_dsn = "postgresql://primary:15432/db"
+
+    class Result:
+        def __init__(self, rows=None, row=None):
+            self.rows = rows or []
+            self.row = row
+
+        def fetchall(self):
+            return self.rows
+
+        def fetchone(self):
+            return self.row
+
+    class Conn:
+        def __init__(self, dsn):
+            self.dsn = dsn
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def execute(self, sql, params=None):
+            if "relation_count" in sql:
+                return Result(rows=[("app", 1)])
+            if "FROM pg_inherits" in sql:
+                return Result()
+            if "pg_current_wal_lsn" in sql:
+                return Result(row=(777,))
+            return Result(
+                rows=[("app", "customers", 1, 10, 11, "d", True, False, False, [])]
+            )
+
+    seen = []
+
+    def connect(dsn, **_kwargs):
+        seen.append(dsn)
+        return Conn(dsn)
+
+    import psycopg
+
+    monkeypatch.setattr(psycopg, "connect", connect)
+    assert w.poll() == []
+    assert seen == [w.dsn, w.primary_dsn]
 
 
 # --------------------------------------------------------------------------- #

@@ -1,9 +1,10 @@
 """Re-snapshotting a table that CDC cannot rebuild (rubric 1.6, 1.8, and 1.5's last mark).
 
 Three separate items need the same thing and none of them had it: rubric 1.5's
-`recreated` relation is dropped and left `awaiting_snapshot`; rubric 1.8's answer to an
-externally advanced slot is "trigger a backfill automatically"; rubric 1.6 cannot claim
-consistency for a re-snapshot it does not perform. This module is that one thing.
+`recreated` relation retains its old image while it is left `awaiting_snapshot`; rubric
+1.8's answer to an externally advanced slot is "trigger a backfill automatically";
+rubric 1.6 cannot claim consistency for a re-snapshot it does not perform. This module
+is that one thing.
 
 ## The mechanism, and why this one
 
@@ -116,15 +117,23 @@ from dataclasses import dataclass, field
 
 from . import destination as dest_mod
 from . import reconcile as reconcile_mod
+from . import resnapshot_projection as projection
 from . import table_lifecycle
 from .applier import Applier, ApplierConfig
-from .config import ReplicationConfig, RunConfig, SourceConfig
+from .config import DROP_LOG, ReplicationConfig, RunConfig, SourceConfig
 from .debezium_props import build_properties
 from .destination import CONTROL_SCHEMA, ResumePoint
 from .errors import EngineFailure
 from .naming import quote
 from .ownership import DestinationOwnership
+from .resnapshot_compat import completed_tables as _completed_tables
+from .resnapshot_projection import ProjectionEvent
 from .resnapshot_recovery import InterruptionRecovery
+from .resnapshot_source_policy import (
+    EmptinessEvidence,
+    finish_source_missing_tables,
+)
+from .resnapshot_source_policy import gather_emptiness_evidence as _gather_emptiness_evidence
 from .snapshot_completion import SnapshotCompletion
 from .source_health import SourceHealth
 
@@ -142,6 +151,8 @@ class ResnapshotOutcome:
     requested: list[str] = field(default_factory=list)
     swapped: list[str] = field(default_factory=list)
     emptied: list[str] = field(default_factory=list)
+    logged_drops: list[str] = field(default_factory=list)
+    dropped: list[str] = field(default_factory=list)
     consistent_lsn: int | None = None
     slot_consistent_lsn: int | None = None
     snapshot_record_lsn: int | None = None
@@ -151,12 +162,15 @@ class ResnapshotOutcome:
     events: int = 0
     reason: str = ""
     engine_stop_reason: str = ""
+    snapshot_epoch: int = 0
 
     def as_dict(self) -> dict:
         return {
             "resnapshot_requested": self.requested,
             "resnapshot_swapped": self.swapped,
             "resnapshot_emptied": self.emptied,
+            "resnapshot_logged_drops": self.logged_drops,
+            "resnapshot_dropped": self.dropped,
             "resnapshot_consistent_lsn": self.consistent_lsn,
             "resnapshot_slot_consistent_lsn": self.slot_consistent_lsn,
             "resnapshot_snapshot_record_lsn": self.snapshot_record_lsn,
@@ -166,55 +180,82 @@ class ResnapshotOutcome:
             "resnapshot_events": self.events,
             "resnapshot_reason": self.reason,
             "resnapshot_engine_stop_reason": self.engine_stop_reason,
+            "resnapshot_snapshot_epoch": self.snapshot_epoch,
         }
 
     @property
     def still_owed(self) -> list[str]:
         """Requested tables that reached neither terminal state."""
-        return sorted(set(self.requested) - set(self.swapped) - set(self.emptied))
+        return sorted(
+            set(self.requested)
+            - set(self.swapped)
+            - set(self.emptied)
+            - set(self.logged_drops)
+            - set(self.dropped)
+        )
 
 
-@dataclass
-class EmptinessEvidence:
-    """The three independent facts a `verified_empty` classification needs.
+def _record_snapshot_swap_audit(
+    con,
+    *,
+    pipeline: str,
+    state,
+    snapshot_lsn: int | None,
+    commit_id: int,
+    reason: str,
+    new_relations: set[str],
+    namespace: str | None = None,
+    snapshot_epoch: int | None = None,
+) -> None:
+    """Project a swapped image's audit and refusal discharge inside its COMMIT.
 
-    Separated from the code that gathers them so the classification itself is a pure,
-    directly testable function of its evidence — the destructive path in this module
-    had zero test coverage precisely because it could only be reached through a live
-    Debezium engine (Opus BLOCKER-1, "test coverage of this path: zero").
+    ``SnapshotCoordinator.swap`` invokes this callback while the image transaction is
+    still open.  The post-swap completion projection remains as a read-only compatibility
+    check; it is no longer the transaction that makes a discovery look complete.
     """
-
-    #: The closed completion model accepted the per-table and global notifications, so
-    #: the engine reached the end of the WHOLE requested capture set.
-    snapshot_phase_ended: bool
-    #: `"<schema>.<table>"` for every table that produced at least one snapshot record.
-    tables_seen: set[str]
-    #: `"<schema>.<table>" -> current source row count`, read after the engine stopped.
-    source_empty_at: dict[str, int]
-    #: `pg_current_wal_lsn()` sampled BEFORE those counts were taken. The fence for a
-    #: verified-empty table; see the module docstring.
-    wal_lsn: int | None
-
-    def verdict(self, qualified: str) -> tuple[bool, str]:
-        """`(is_verified_empty, why not)` for one requested table."""
-        if not self.snapshot_phase_ended:
-            return False, (
-                "the snapshot completion callbacks never proved the end of the whole "
-                "capture set, so this table may simply not have been reached"
+    qualified = f"{state.schema}.{state.table}"
+    detail = (
+        f"re-snapshotted at consistent point {snapshot_lsn} ({reason}). "
+        "The table holds exact current state; change events of transactions "
+        "that committed before this LSN are fenced rather than applied, so "
+        "per-event history for that span is the snapshot image and not the "
+        "individual events (rubric 8.2's changelog is discontinuous here)."
+    )
+    events = [ProjectionEvent("resnapshot", detail, table_event="resnapshot", seq=0)]
+    if qualified in new_relations:
+        events.append(
+            ProjectionEvent(
+                "new",
+                "new source relation discovered by the catalog watcher and "
+                "snapshotted before streaming",
+                table_event="new",
+                seq=1,
             )
-        if qualified in self.tables_seen:
-            return False, (
-                "the engine produced snapshot records for this table but no shadow was "
-                "swapped in, so the image is partial, not empty"
-            )
-        if self.wal_lsn is None:
-            return False, "no source WAL position was sampled for the emptiness check"
-        count = self.source_empty_at.get(qualified)
-        if count is None:
-            return False, "the source row count for this table could not be read"
-        if count != 0:
-            return False, f"the source relation holds {count} row(s)"
-        return True, ""
+        )
+    projection.project_snapshot_completion(
+        con,
+        pipeline=pipeline,
+        source_schema=state.schema,
+        source_table=state.table,
+        target_table=state.target,
+        snapshot_lsn=snapshot_lsn,
+        commit_id=commit_id,
+        events=tuple(events),
+        namespace=namespace,
+        snapshot_epoch=snapshot_epoch,
+    )
+
+
+def _advance_snapshot_epoch(
+    con, *, pipeline: str, namespace: str | None, snapshot_epoch: int | None
+) -> None:
+    """Compatibility wrapper for callers that only need the epoch projection."""
+    projection.advance_snapshot_epoch(
+        con,
+        pipeline=pipeline,
+        namespace=namespace,
+        snapshot_epoch=snapshot_epoch,
+    )
 
 
 class _SlotWatcher:
@@ -318,6 +359,8 @@ def run(
     reason: str,
     namespace: str,
     ownership: DestinationOwnership,
+    new_relations: set[str] | None = None,
+    drop_mode: str = DROP_LOG,
 ) -> ResnapshotOutcome:
     """Re-snapshot `tables` into shadow tables and swap them in, then return.
 
@@ -375,6 +418,18 @@ def run(
     applier = None
     source_stopped = False
     completion = SnapshotCompletion.full_snapshot(include)
+    def snapshot_audit(state, snapshot_lsn, commit_id):
+        _record_snapshot_swap_audit(
+            con,
+            pipeline=pipeline,
+            state=state,
+            snapshot_lsn=snapshot_lsn,
+            commit_id=commit_id,
+            reason=reason,
+            new_relations=new_relations or set(),
+            namespace=namespace,
+            snapshot_epoch=epoch_base + len(tables) + 1,
+        )
     try:
         applier = Applier(
             con,
@@ -390,10 +445,14 @@ def run(
             transactional_ddl=transactional_ddl,
             catalog=None,
             completion=completion,
+            snapshot_audit=snapshot_audit,
         )
         ownership.attach(applier)
+        # Keep the historical pipeline seam: tests and embedding callers replace
+        # the bounded runner there, while production still resolves to the
+        # supervisor implementation re-exported by pipeline.py.
+        from . import pipeline as pipeline_mod
         from .engine import SupervisedDebeziumEngine
-        from .pipeline import run_engine_bounded
 
         engine = SupervisedDebeziumEngine(
             properties=props,
@@ -408,7 +467,7 @@ def run(
         ).start()
         ownership.activate(applier)
         try:
-            summary = run_engine_bounded(
+            summary = pipeline_mod.run_engine_bounded(
                 engine,
                 applier,
                 dataclasses.replace(
@@ -444,7 +503,13 @@ def run(
 
         if outcome.consistent_lsn is not None:
             outcome.swapped = _completed_tables(
-                con, pipeline, tables, outcome.consistent_lsn, reason=reason
+                con,
+                pipeline,
+                tables,
+                outcome.consistent_lsn,
+                reason=reason,
+                new_relations=new_relations or set(),
+                write_audit=False,
             )
         pending = [t for t in tables if f"{t[0]}.{t[1]}" not in set(outcome.swapped)]
         evidence = _gather_emptiness_evidence(
@@ -454,17 +519,36 @@ def run(
             tables_seen=completion.tables_seen,
         )
         outcome.empty_check_lsn = evidence.wal_lsn
-        outcome.emptied = finish_verified_empty_tables(
+        outcome.logged_drops, outcome.dropped = finish_source_missing_tables(
             con,
             pipeline=pipeline,
             dataset=dataset,
             tables=tables,
             done=set(outcome.swapped),
             evidence=evidence,
+            drop_mode=drop_mode,
+            namespace=namespace,
+            snapshot_epoch=epoch_base + len(tables) + 1,
         )
-        if outcome.consistent_lsn is None and sorted(outcome.requested) != sorted(
-            outcome.emptied
-        ):
+        resolved = set(outcome.swapped) | set(outcome.logged_drops) | set(outcome.dropped)
+        outcome.emptied = finish_verified_empty_tables(
+            con,
+            pipeline=pipeline,
+            dataset=dataset,
+            tables=tables,
+            done=resolved,
+            evidence=evidence,
+            new_relations=new_relations or set(),
+            namespace=namespace,
+            snapshot_epoch=epoch_base + len(tables) + 1,
+        )
+        terminal = (
+            set(outcome.swapped)
+            | set(outcome.emptied)
+            | set(outcome.logged_drops)
+            | set(outcome.dropped)
+        )
+        if outcome.consistent_lsn is None and terminal != set(outcome.requested):
             raise EngineFailure(
                 "the re-snapshot produced no consistent point: neither a snapshot "
                 f"record nor the throwaway slot {slot!r} yielded an LSN, so the "
@@ -474,10 +558,16 @@ def run(
                 outcome.as_dict(),
             )
         assert_every_requested_table_completed(outcome)
+        outcome.snapshot_epoch = epoch_base + len(tables) + 1
         recovery.consume()
         log.warning(
-            "RE-SNAPSHOT complete at consistent point %s: swapped %s, emptied %s",
-            outcome.consistent_lsn, outcome.swapped or "-", outcome.emptied or "-",
+            "RE-SNAPSHOT complete at consistent point %s: swapped %s, emptied %s, "
+            "logged drops %s, dropped %s",
+            outcome.consistent_lsn,
+            outcome.swapped or "-",
+            outcome.emptied or "-",
+            outcome.logged_drops or "-",
+            outcome.dropped or "-",
         )
         return outcome
     except BaseException as exc:
@@ -546,7 +636,12 @@ def reassert_owed(
     `awaiting_snapshot` when this function returns, whatever intermediate state the
     engine left it in, or the next run cannot know it is owed.
     """
-    finished = set(terminal.swapped) | set(terminal.emptied)
+    finished = (
+        set(terminal.swapped)
+        | set(terminal.emptied)
+        | set(terminal.logged_drops)
+        | set(terminal.dropped)
+    )
     owed = [t for t in tables if f"{t[0]}.{t[1]}" not in finished]
     if not owed:
         return []
@@ -609,104 +704,6 @@ def agree_on_consistent_point(record_lsn: int | None, slot_lsn: int | None) -> i
     return record_lsn if record_lsn is not None else slot_lsn
 
 
-def _gather_emptiness_evidence(
-    dsn: str,
-    *,
-    pending: list[tuple[str, str, str]],
-    snapshot_phase_ended: bool,
-    tables_seen: set[str],
-) -> EmptinessEvidence:
-    """Sample the WAL position, then count the pending relations. In that order.
-
-    The order is the whole argument (see the module docstring): `pg_current_wal_lsn()`
-    is read on its own statement **before** the `REPEATABLE READ` snapshot the counts
-    are taken in, so every transaction whose commit LSN is below the sample is visible
-    to those counts. A count of zero then proves that no transaction below the sample
-    left a row behind, which is exactly what fencing at the sample asserts.
-    """
-    if not pending:
-        return EmptinessEvidence(snapshot_phase_ended, tables_seen, {}, None)
-    counts: dict[str, int] = {}
-    wal_lsn: int | None = None
-    try:
-        import psycopg
-
-        with psycopg.connect(dsn, autocommit=True, connect_timeout=10) as conn:
-            row = conn.execute("SELECT (pg_current_wal_lsn() - '0/0')::bigint").fetchone()
-            wal_lsn = int(row[0]) if row and row[0] is not None else None
-        with psycopg.connect(dsn, connect_timeout=10) as conn:
-            conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-            for schema, table, _target in pending:
-                found = conn.execute(
-                    f"SELECT count(*) FROM {quote(schema)}.{quote(table)}"
-                ).fetchone()
-                counts[f"{schema}.{table}"] = int(found[0]) if found else -1
-            conn.commit()
-    except Exception as exc:  # pragma: no cover - the source may be unreachable
-        log.error(
-            "could not verify at the source whether %s is empty: %s",
-            ", ".join(f"{s}.{t}" for s, t, _ in pending), exc,
-        )
-        return EmptinessEvidence(snapshot_phase_ended, tables_seen, counts, None)
-    return EmptinessEvidence(snapshot_phase_ended, tables_seen, counts, wal_lsn)
-
-
-def _completed_tables(
-    con,
-    pipeline: str,
-    tables: list[tuple[str, str, str]],
-    consistent_lsn: int,
-    *,
-    reason: str = "",
-) -> list[str]:
-    """The requested tables whose shadow has been swapped in, per `table_state`.
-
-    Also pins `snapshot_lsn` to the consistent point, and records a `table_events` row
-    saying where the per-event history is discontinuous.
-
-    The pinning: the swap records the group's last event LSN, which for a snapshot group
-    *is* `C` — but "is, because every snapshot record carries the same LSN" is a
-    derivation, and the watermark that fences the whole main stream should not rest on one.
-
-    The marker: a re-snapshot replaces **current state**, and the change events of every
-    transaction below `C` for this table are fenced rather than applied. Current state is
-    exact; a changelog (rubric 8.2) has a gap there, and rubric 8.2 needs to be able to
-    *find* the gap rather than be told about it in a docstring.
-    """
-    done: list[str] = []
-    for schema, table, target in tables:
-        state = table_lifecycle.read(
-            con, pipeline=pipeline, source_schema=schema, source_table=table
-        )
-        if state == table_lifecycle.COMPLETE:
-            con.execute(
-                f"UPDATE {CONTROL_SCHEMA}.table_state SET snapshot_lsn = ? "
-                "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
-                [consistent_lsn, pipeline, schema, table],
-            )
-            dest_mod.write_table_event(
-                con,
-                pipeline=pipeline,
-                commit_id=0,
-                seq=0,
-                event="resnapshot",
-                source_schema=schema,
-                source_table=table,
-                target_table=target,
-                applied=True,
-                lsn=consistent_lsn,
-                detail=(
-                    f"re-snapshotted at consistent point {consistent_lsn} ({reason}). "
-                    "The table holds exact current state; change events of transactions "
-                    "that committed before this LSN are fenced rather than applied, so "
-                    "per-event history for that span is the snapshot image and not the "
-                    "individual events (rubric 8.2's changelog is discontinuous here)."
-                ),
-            )
-            done.append(f"{schema}.{table}")
-    return done
-
-
 def finish_verified_empty_tables(
     con,
     *,
@@ -715,6 +712,9 @@ def finish_verified_empty_tables(
     tables: list[tuple[str, str, str]],
     done: set[str],
     evidence: EmptinessEvidence,
+    new_relations: set[str] | None = None,
+    namespace: str | None = None,
+    snapshot_epoch: int | None = None,
 ) -> list[str]:
     """Empty the destination for the tables PROVEN empty at the source. Nothing else.
 
@@ -735,6 +735,7 @@ def finish_verified_empty_tables(
     fails the run through `assert_every_requested_table_completed`.
     """
     emptied: list[str] = []
+    discovered = new_relations or set()
     pending: list[tuple[str, str, str]] = []
     for schema, table, target in tables:
         qualified = f"{schema}.{table}"
@@ -778,27 +779,50 @@ def finish_verified_empty_tables(
                 reason="verified empty at the source; the destination table was emptied",
                 snapshot_lsn=consistent_lsn,
             )
-            dest_mod.write_table_event(
+            audit_detail = (
+                f"re-snapshot verified the source relation empty at consistent point "
+                f"{consistent_lsn}; the destination image was emptied atomically "
+                "and fenced at that point."
+            )
+            empty_detail = (
+                "the source relation was VERIFIED to hold no rows: the ordered "
+                "per-table and global snapshot callbacks completed, and no record "
+                "was produced for this table, and a REPEATABLE READ count taken after "
+                f"pg_current_wal_lsn()={consistent_lsn} returned zero. The "
+                "destination table was emptied rather than swapped, and is fenced "
+                "at that LSN so every later transaction is applied on top."
+            )
+            audit_events = [
+                ProjectionEvent(
+                    "resnapshot",
+                    audit_detail,
+                    table_event="resnapshot_empty",
+                    table_event_detail=empty_detail,
+                    seq=0,
+                    rows_removed=removed,
+                )
+            ]
+            if qualified in discovered:
+                audit_events.append(
+                    ProjectionEvent(
+                        "new",
+                        "new source relation discovered by the catalog watcher and "
+                        "verified empty before streaming",
+                        table_event="new",
+                        seq=1,
+                    )
+                )
+            projection.project_snapshot_completion(
                 con,
                 pipeline=pipeline,
-                commit_id=0,
-                seq=0,
-                event="resnapshot_empty",
+                namespace=namespace,
                 source_schema=schema,
                 source_table=table,
                 target_table=target,
-                applied=True,
-                lsn=consistent_lsn,
-                rows_removed=removed,
-                detail=(
-                    "the source relation was VERIFIED to hold no rows: the ordered "
-                    "per-table and global snapshot callbacks completed, and no record "
-                    "was produced for "
-                    "this table, and a REPEATABLE READ count taken after "
-                    f"pg_current_wal_lsn()={consistent_lsn} returned zero. The "
-                    "destination table was emptied rather than swapped, and is fenced "
-                    "at that LSN so every later transaction is applied on top."
-                ),
+                snapshot_lsn=consistent_lsn,
+                commit_id=0,
+                events=tuple(audit_events),
+                snapshot_epoch=snapshot_epoch,
             )
             emptied.append(f"{schema}.{table}")
         con.execute("COMMIT")
@@ -832,6 +856,7 @@ def finish_empty_tables_after_main_snapshot(
     dsn: str,
     owed: list[tuple[str, str, str]],
     completion: SnapshotCompletion,
+    drop_mode: str = DROP_LOG,
 ) -> tuple[list[str], int | None]:
     """Close out the tables a MAIN-engine snapshot left owed because they are empty.
 
@@ -868,12 +893,21 @@ def finish_empty_tables_after_main_snapshot(
         snapshot_phase_ended=completion.phase_ended,
         tables_seen=completion.tables_seen,
     )
-    emptied = finish_verified_empty_tables(
+    logged, dropped = finish_source_missing_tables(
         con,
         pipeline=pipeline,
         dataset=dataset,
         tables=owed,
         done=set(),
         evidence=evidence,
+        drop_mode=drop_mode,
     )
-    return emptied, evidence.wal_lsn
+    emptied = finish_verified_empty_tables(
+        con,
+        pipeline=pipeline,
+        dataset=dataset,
+        tables=owed,
+        done=set(logged) | set(dropped),
+        evidence=evidence,
+    )
+    return emptied + logged + dropped, evidence.wal_lsn
