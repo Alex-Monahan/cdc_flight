@@ -30,7 +30,12 @@ OFFSET = {
 #: `.cdc_state/offsets.dat` on 2026-07-30. The previous "byte identical to one
 #: Debezium wrote" test created both files with our own writer and was therefore
 #: tautological (Codex 3); this fixture is the evidence it claimed to be.
-DEBEZIUM_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "offsets_debezium_3.6.dat"
+DEBEZIUM_FIXTURE = (
+    Path(__file__).resolve().parent
+    / "support"
+    / "fixtures"
+    / "offsets_debezium_3.6.dat"
+)
 
 
 def test_key_and_value_encoding_match_the_observed_bytes():

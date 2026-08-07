@@ -1,6 +1,6 @@
 """Start-up reconciliation, unit level (ADR 0001 §4.5, §4.7).
 
-The subprocess suite in `tests/1.1_exactly_once_pk/test_1_1_reconciliation.py`
+The subprocess suite in `tests/rubric/1.1_exactly_once_pk/test_1_1_reconciliation.py`
 covers the end-to-end decisions. These tests cover the two cells the reviews
 found wrong, which need a *constructed* offset map rather than a real run:
 

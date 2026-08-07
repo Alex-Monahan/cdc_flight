@@ -987,7 +987,7 @@ Per-table identity comes from `table_state.key_strategy`:
 
 **The decisive keyless test** (Opus M6, Codex 8) is not "no duplicates": it is
 that two *genuinely identical* source rows both survive while a crash-replay copy
-does not. `tests/1.2_exactly_once_nopk/` now contains that case explicitly
+does not. `tests/rubric/1.2_exactly_once_nopk/` now contains that case explicitly
 (`test_target_identical_source_rows_both_survive`), because every count/DISTINCT
 assertion is otherwise satisfiable by a `SELECT DISTINCT` that is *wrong* for
 keyless tables.
@@ -1633,7 +1633,7 @@ append-keyed-on-event-identity table cannot). Keyless current state belongs to
 `decode`, `begin`, `spill` and `mid_apply` join `pre_commit`,
 `post_commit_pre_ack` and `post_ack`; `<nth>` now counts **data-carrying commit
 groups** rather than data batches, because the commit group is the unit the
-protocol is about. `tests/1.1_exactly_once_pk/test_1_1_fault_matrix.py` crashes
+protocol is about. `tests/rubric/1.1_exactly_once_pk/test_1_1_fault_matrix.py` crashes
 at all five commit-group anchors and asserts no loss, no duplicates and
 Invariant O at each.
 
@@ -1656,9 +1656,9 @@ This is not a performance footnote. A commit group holds an integral number of
 *whole* Postgres transactions (Invariant B), so a single 200 000-row transaction
 is a single group and a single `COMMIT`; at 410 s that group cannot finish inside
 any sane deadline, and the run is killed with the transaction open. The first
-symptom was `tests/1.1_exactly_once_pk::test_slow_real_sigkill_loses_nothing`
+symptom was `tests/rubric/1.1_exactly_once_pk::test_slow_real_sigkill_loses_nothing`
 timing out at 300 s, and the second was
-`tests/1.3_atomic_batches/test_1_3_motherduck_atomicity.py` reaching its deadline
+`tests/rubric/1.3_atomic_batches/test_1_3_motherduck_atomicity.py` reaching its deadline
 with **zero** commit groups. `pyarrow` is therefore a hard dependency, and
 §14.2's "measured MotherDuck commit latency for a 200 000-row group" is now
 partly answered: the write path, not the commit, was the cost.
@@ -1758,7 +1758,7 @@ The uncomfortable fact this section exists to record: **all four blockers
 coexisted with 110 default, 3 slow and 5 MotherDuck tests passing, and lint
 clean.** The suite could not see them because each needs a specific interleaving
 of assembler and applier state. That is why every fix below ships with a
-default-suite guard driven through `tests/applier_lab.py`, which runs the real
+default-suite guard driven through `tests/support/applier_lab.py`, which runs the real
 `Applier` against a real DuckDB file with a faked `ChangeEvent` and
 `RecordCommitter` — the interleaving becomes an argument to a function instead of
 a race to win.
@@ -1769,7 +1769,7 @@ The two reviews disagreed. Codex 4 called keyless identity a **blocker** and
 reproduced two accepted events colliding on `cdcf_event_id`; Opus's attack log
 concluded keyless identity is **structurally immune** and signed 1.2 off. The
 decisive tests are
-`tests/1.2_exactly_once_nopk/test_1_2_keyless_identity.py`, and they show both
+`tests/rubric/1.2_exactly_once_nopk/test_1_2_keyless_identity.py`, and they show both
 reviews were right about different halves of the question:
 
 * **Opus is right about the identity.** `<event lsn>:<source.txId>:<total_order>`
@@ -1958,7 +1958,7 @@ a readable terminal Connect offset is now refused; a rollback replays, which is
 free.
 
 The codec tests keep a **real Debezium-written `offsets.dat`** as a committed
-fixture (`tests/fixtures/offsets_debezium_3.6.dat`). The previous
+fixture (`tests/support/fixtures/offsets_debezium_3.6.dat`). The previous
 "byte identical to one Debezium wrote" test created both files with our own
 writer, so it proved only that our writer is deterministic.
 
@@ -2317,8 +2317,8 @@ therefore has two halves, and only one of them was ever proven:
 
 A green crash suite cannot falsify (2): a deterministic fold commits the same wrong
 answer before and after a replay. What falsifies it is adversarial *orderings*, which
-is why the counterexample suites (`tests/1.4_pk_updates/test_1_4_fold_counterexamples.py`,
-`tests/1.5_truncate_drop/test_1_5_truncate_key_reuse.py`,
+is why the counterexample suites (`tests/rubric/1.4_pk_updates/test_1_4_fold_counterexamples.py`,
+`tests/rubric/1.5_truncate_drop/test_1_5_truncate_key_reuse.py`,
 `test_1_5_truncate_storage_modes.py`) assert source/destination equality rather than
 mere uniqueness, and why the module boundaries below exist: every blocker of the last
 two review rounds was a second code path doing one job.
@@ -2555,13 +2555,13 @@ refused the write". Two mechanisms are added:
   `destination_write` / `destination_commit` / `destination_hang` / `destination_close` at
   a data group the **applier declares** (`faults.arm_group`) rather than one the wrapper
   infers from the SQL it sees — an inferred index is how a fault test goes vacuously green;
-* `tests/tcp_relay.py` blackholes the *source* from outside the process: bytes stop being
+* `tests/support/tcp_relay.py` blackholes the *source* from outside the process: bytes stop being
   forwarded and both sockets stay open, which no in-process anchor can simulate and which
   is the shape rubric 4.6 calls "silently-dead-connection".
 
 Every anchor must land in one of exactly two classes — a clean recovery with the ledger
 intact, or a non-zero exit with an accurate `last_run.json` — and
-`tests/1.7_fault_injection/test_1_7_fault_matrix.py` enumerates them **from
+`tests/rubric/1.7_fault_injection/test_1_7_fault_matrix.py` enumerates them **from
 `faults.ALL_POINTS`**, so a new anchor with no declared outcome fails the suite.
 
 Two defects this found:
@@ -2669,7 +2669,7 @@ and nothing in the tree could have found the ninth.
 
 Every row now names the **machine and the edge** it belongs to, and the machines'
 transition tables below are *generated from `machine.table()`* rather than transcribed
-(`tests/4.7_self_healing/test_4_7_inventory.py` regenerates them and fails on any
+(`tests/rubric/4.7_self_healing/test_4_7_inventory.py` regenerates them and fails on any
 difference — MAJOR-3's arithmetic drift, one level up). That makes three things
 mechanical rather than remembered:
 
@@ -3706,7 +3706,7 @@ split, with 51a stating the policy this machine actually has.
 #### A58.7 — the 1.7 evidence, made non-vacuous (MAJOR)
 
 * All four recovery boundaries are now cut by a **real `os._exit`** in a child process
-  (`tests/recovery_crash_driver.py`), not by exception unwinding; the `:raise` variants
+  (`tests/support/recovery_crash_driver.py`), not by exception unwinding; the `:raise` variants
   stay as the *error-teardown* path, which is a different lifecycle (§1.2).
 * `table_rebuild_queued` fires after the **first** captured table has taken its
   `-> awaiting_snapshot` edge, so it proves a torn queue rather than a pre-write rollback.

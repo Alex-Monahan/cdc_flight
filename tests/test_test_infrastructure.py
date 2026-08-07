@@ -10,9 +10,9 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
-import conftest
 import pytest
-from postgres_test_instance import PostgresTestInstance
+from support import fixtures as conftest
+from support.postgres_test_instance import PostgresTestInstance
 
 
 def test_run_lock_takes_over_stale_metadata_after_kernel_release(tmp_path: Path):

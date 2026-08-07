@@ -46,5 +46,5 @@ probes/.out/
 hs_err_pid*.log
 replay_pid*.log
 
-# Per-instance test-session mutexes (see tests/conftest.py)
+# Per-instance test-session mutexes (see tests/support/fixtures.py)
 .pytest-source-*.lock

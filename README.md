@@ -302,9 +302,9 @@ raised.
 What that cost, and what paid for it, is enumerated in `RUBRIC_STATUS.md` under "Suite
 partition". The short version: every anchor and every `check_slot` decision cell now has
 a default-suite guard, most of them **in-process** and costing milliseconds
-(`tests/1.7_fault_injection/test_1_7_anchor_guards.py` covers the thirteen protocol and
+(`tests/rubric/1.7_fault_injection/test_1_7_anchor_guards.py` covers the thirteen protocol and
 destination anchors in 0.8 s and
-`tests/1.7_fault_injection/test_1_7_recovery_anchors.py` the five recovery anchors in
+`tests/rubric/1.7_fault_injection/test_1_7_recovery_anchors.py` the five recovery anchors in
 0.3 s), while the expensive end-to-end matrices stay `slow`. Two modules whose claims are
 now covered more cheaply elsewhere moved out (`test_1_6_resnapshot.py`,
 `test_1_5_truncate_drop_e2e.py`). Nothing was deleted.
@@ -325,7 +325,7 @@ share one scenario per module.
 
 The 1.4/1.5 **review round** then added 80 more default tests for **+7 s**, which is the
 same reason: every one of them drives the shipped `Applier` against a real DuckDB file
-through `tests/applier_lab.py`. That is deliberate rather than lucky — the five defects
+through `tests/support/applier_lab.py`. That is deliberate rather than lucky — the five defects
 those reviews reproduced each need one *specific* interleaving of assembler and applier
 state, and a subprocess suite cannot construct them at all, let alone in milliseconds.
 `test-slow` measured 4:28 again on a quiet machine, which settles the one figure a
@@ -333,7 +333,7 @@ reviewer could not reproduce (their 9:52 was a contended run).
 
 The default suite grew from 110 tests to 168 and got *faster*, which is worth
 explaining because it looks wrong. The 58 new tests are almost all in-process: they
-drive the real `Applier` against a real DuckDB file through `tests/applier_lab.py`
+drive the real `Applier` against a real DuckDB file through `tests/support/applier_lab.py`
 with a faked `ChangeEvent` and `RecordCommitter`, so they cost milliseconds instead
 of the ~12 s a pipeline subprocess costs. That was not a performance choice - the
 four blockers the 1.1-1.3 review round reproduced each need an exact interleaving of
@@ -366,16 +366,17 @@ logical instance id, so independent ports do not collide.
 
 ### Test layout and conventions
 
-Rubric work lives in `tests/<item>_<slug>/`, each with a README explaining the gap:
+Rubric work lives in `tests/rubric/<item>_<slug>/`, with one shared index documenting
+each gap:
 
 | directory | rubric item |
 |---|---|
-| `tests/1.0_engine_error_propagation/` | TODO 1.0(b) — engine failures must not exit 0 |
-| `tests/1.1_exactly_once_pk/` | 1.1 delivery guarantees, tables with a PK |
-| `tests/1.2_exactly_once_nopk/` | 1.2 delivery guarantees, tables without a PK |
-| `tests/1.3_atomic_batches/` | 1.3 multi-table transactional atomicity |
-| `tests/1.4_pk_updates/` | 1.4 primary-key updates |
-| `tests/1.5_truncate_drop/` | 1.5 TRUNCATE and DROP TABLE |
+| `tests/rubric/1.0_engine_error_propagation/` | TODO 1.0(b) — engine failures must not exit 0 |
+| `tests/rubric/1.1_exactly_once_pk/` | 1.1 delivery guarantees, tables with a PK |
+| `tests/rubric/1.2_exactly_once_nopk/` | 1.2 delivery guarantees, tables without a PK |
+| `tests/rubric/1.3_atomic_batches/` | 1.3 multi-table transactional atomicity |
+| `tests/rubric/1.4_pk_updates/` | 1.4 primary-key updates |
+| `tests/rubric/1.5_truncate_drop/` | 1.5 TRUNCATE and DROP TABLE |
 
 Three naming conventions carry meaning:
 
@@ -424,7 +425,7 @@ The five `destination_*` points are injected by wrapping the single connection t
 applier writes through (`faults.wrap_destination`), and they fire at the data group the
 applier *declares* rather than one inferred from the SQL. The fault the process cannot
 inject at all — a source whose packets stop arriving with the sockets left open — is
-injected from outside by `tests/tcp_relay.py`.
+injected from outside by `tests/support/tcp_relay.py`.
 
 The five `recovery_*` points added in rubric 1.9's round sit at the
 boundaries of the one durable sequence nothing can make atomic — the to-do list,
@@ -506,7 +507,7 @@ The single most important finding was a bug rather than a rubric item:
 `run_engine_bounded` reported **exit 0** when the Debezium engine failed to start
 (dropped slot, unusable offset), so several catastrophic failure modes looked like
 successful no-op runs. **Fixed** — see `src/cdc_flight/engine.py` and
-`tests/1.0_engine_error_propagation/`. Debezium reports such failures through a
+`tests/rubric/1.0_engine_error_propagation/`. Debezium reports such failures through a
 `CompletionCallback` and then returns normally from `run()`; the engine now
 registers one, and the CLI exits non-zero with the Debezium message and writes a
 `last_run.json` carrying `ok: false` and `error`.

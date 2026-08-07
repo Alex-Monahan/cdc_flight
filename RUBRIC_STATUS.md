@@ -103,7 +103,7 @@ implementation.
 | **Codex B5** — the persisted timeline never participated in the decision | **fixed.** `source_timeline_changed`, ordered after identity and before LSN regression, with the catalog discarded (which also closes **Codex M1**) |
 | **Codex B6** — the four giant modules regrew | **fixed, and re-fixed at Codex r1 MINOR-5.** The 1.6-1.8 round split `applier_config.py`, `self_heal.py`, `supervisor.py` and `control_schema.py` out; the 1.9 rounds put the growth back, so `OpenGroup` is now `commit_group.py` and the four pre-engine decisions are `acquisition.py`. Measured after round 4: `applier.py` 928, `resnapshot.py` 926, `destination.py` 914, `catalog.py` 875, `pipeline.py` 806, `reconcile.py` 611, `recovery.py` 609. `destination.py` crossed 1,000 in round 4 and the source-relation registry became `source_relations.py`; `applier.py` and `resnapshot.py` are the ones to watch and are a **carry-forward** |
 | **Codex M2 / M3, Opus MAJOR-5 / MAJOR-6, MINOR-1** — the fault matrix proved declared labels, not outcomes; four tautologies; the hung-commit test accepted any death; `hang_seconds` was the exit code; the chaos harness did not compose | **fixed.** Every anchor writes a fsynced `fault_fired.json`; the outcome class is derived from the run; exact exit codes; `CDC_FAULT_HANG_SECONDS`; `destination_commit_late` for genuine ambiguity; chaos injects during recovery over a shuffled cover with a per-iteration fired assertion. ADR §19/A54 |
-| **Codex M5, Opus MAJOR-3** — the A51 counts were arithmetically false and the inventory incomplete | **fixed.** 67 rows, one failure and one class each, **43/15/9**, with `tests/4.7_self_healing/test_4_7_inventory.py` parsing the table so the headline cannot drift again. The missing modes (`CDC_RESNAPSHOT=0`, the unqueueable folds, drop-failure, `C` disagreement, the startup-dark fail-open, and more) are rows |
+| **Codex M5, Opus MAJOR-3** — the A51 counts were arithmetically false and the inventory incomplete | **fixed.** 67 rows, one failure and one class each, **43/15/9**, with `tests/rubric/4.7_self_healing/test_4_7_inventory.py` parsing the table so the headline cannot drift again. The missing modes (`CDC_RESNAPSHOT=0`, the unqueueable folds, drop-failure, `C` disagreement, the startup-dark fail-open, and more) are rows |
 | **Codex M6, Opus MINOR-7** — `write_slot_state` was a non-atomic DELETE+INSERT | **fixed.** One transaction. "Typed record" is a **carry-forward**: it is still a dict |
 | **Opus MAJOR-4** — `RUBRIC_STATUS` contradicted itself on 1.5 and 4.6 and had no 4.7 detail | **fixed.** Headings reconciled, 1.5's stale falsifier struck through with what replaced it, 4.6's "no test exists" replaced by what the test measures, 4.7 has a detail section |
 | **Opus Q5, Codex m3** — 57 of 91 new tests and 10 of 12 fault anchors were slow-only | **fixed.** Every anchor and every reconciliation cell now has a default-suite guard; see "Suite partition" below |
@@ -225,14 +225,14 @@ Evidence:
 
 | claim | test |
 |---|---|
-| exactly-once, keyed tables | `tests/1.1_exactly_once_pk/test_1_1_exactly_once_pk.py` (4 target tests, xfail markers removed) |
-| exactly-once, keyless tables | `tests/1.2_exactly_once_nopk/` (5 target tests, markers removed) — including two byte-identical source rows that both survive while crash-replay copies do not |
-| no loss / no duplicates at **every** protocol anchor | `tests/1.1_exactly_once_pk/test_1_1_fault_matrix.py` — crashes at `begin`, `mid_apply`, `pre_commit`, `post_commit_pre_ack`, `post_ack` |
+| exactly-once, keyed tables | `tests/rubric/1.1_exactly_once_pk/test_1_1_exactly_once_pk.py` (4 target tests, xfail markers removed) |
+| exactly-once, keyless tables | `tests/rubric/1.2_exactly_once_nopk/` (5 target tests, markers removed) — including two byte-identical source rows that both survive while crash-replay copies do not |
+| no loss / no duplicates at **every** protocol anchor | `tests/rubric/1.1_exactly_once_pk/test_1_1_fault_matrix.py` — crashes at `begin`, `mid_apply`, `pre_commit`, `post_commit_pre_ack`, `post_ack` |
 | Invariant O (`slot.confirmed_flush_lsn <= debezium_offsets.last_lsn`) | asserted at start-up and shutdown of every run, and after every crash in the matrix |
-| multi-table atomicity in MotherDuck | `tests/1.3_atomic_batches/test_1_3_motherduck_atomicity.py` — a second MotherDuck connection polling both tables never observes a partial Postgres transaction, and is required to have seen both the before and after states |
-| start-up reconciliation, incl. the refuse-to-start case | `tests/1.1_exactly_once_pk/test_1_1_reconciliation.py` |
+| multi-table atomicity in MotherDuck | `tests/rubric/1.3_atomic_batches/test_1_3_motherduck_atomicity.py` — a second MotherDuck connection polling both tables never observes a partial Postgres transaction, and is required to have seen both the before and after states |
+| start-up reconciliation, incl. the refuse-to-start case | `tests/rubric/1.1_exactly_once_pk/test_1_1_reconciliation.py` |
 | correctness without the offsets-file repair | same file, `CDC_OFFSET_FILE_REPAIR=0` |
-| exactly-once across a **real** `kill -9` | `tests/1.1_exactly_once_pk::test_slow_real_sigkill_is_exactly_once` (`slow`) - 40 transactions x 5 000 rows, SIGKILL mid-stream, restart: **200 000 rows / 200 000 distinct, 0 duplicates, 0 lost**, and the recovery run genuinely re-applied 95 000 events |
+| exactly-once across a **real** `kill -9` | `tests/rubric/1.1_exactly_once_pk::test_slow_real_sigkill_is_exactly_once` (`slow`) - 40 transactions x 5 000 rows, SIGKILL mid-stream, restart: **200 000 rows / 200 000 distinct, 0 duplicates, 0 lost**, and the recovery run genuinely re-applied 95 000 events |
 
 Measurements made while implementing it, recorded because they contradict
 assumptions elsewhere in this document and in the ADR:
@@ -296,14 +296,14 @@ Two things had already moved underneath the baseline before that:
   detected by the watchdog is also a non-zero exit now. This does **not** change
   any score by itself — 4.1/4.3 still have no recovery, and 6.2 still has no
   alerts — but it is the precondition for measuring 1.8, 4.1, 4.2, 4.3 and 6.2 at
-  all. Pinned by `tests/1.0_engine_error_propagation/`.
+  all. Pinned by `tests/rubric/1.0_engine_error_propagation/`.
 * **Deterministic fault injection exists** (`src/cdc_flight/faults.py`,
   `CDC_FAULT_INJECT`). 1.7's "robust injection of failures in testing" now has
   machinery behind it; the score stays at 1 until the applier makes duplication
-  impossible, which is what `tests/1.1_*` and `tests/1.2_*` measure.
+  impossible, which is what `tests/rubric/1.1_*` and `tests/rubric/1.2_*` measure.
   A real `kill -9` at 200 000 rows reproduced the at-least-once behaviour again
   under the new harness: **205 706 rows / 200 000 distinct = 5 706 duplicates**,
-  zero rows lost (`tests/1.1_exactly_once_pk::test_slow_real_sigkill_loses_nothing`).
+  zero rows lost (`tests/rubric/1.1_exactly_once_pk::test_slow_real_sigkill_loses_nothing`).
   An immediately preceding run of the same test killed outside the flush window
   and produced 0 duplicates — which is precisely why the default suite relies on
   the deterministic crash point rather than the race.
@@ -329,7 +329,7 @@ Two things had already moved underneath the baseline before that:
      exactly like an idle stream. `src/cdc_flight/source_health.py` now requires
      the slot to have been *continuously* held for the whole quiet window before
      a run may be called idle. Pinned by
-     `tests/1.0_engine_error_propagation/test_1_0_supervisor_liveness.py`
+     `tests/rubric/1.0_engine_error_propagation/test_1_0_supervisor_liveness.py`
      (`slow`), which fails on the pre-fix code and passes on the fixed code.
   3. An engine thread that returns on its own in streaming mode is now a
      non-zero exit rather than `stop_reason: engine_finished, ok: true`.
@@ -387,7 +387,7 @@ correct assumptions in the notes below:
 | 4.4 | Idle-slot heartbeat | 1 | `heartbeat.interval.ms` unset, no `heartbeat.action.query`. |
 | 4.5 | Errors must not hang or lock | 2 | Bounded runner + JVM watchdog make hangs survivable (one observed in p09), but nothing systematic prevents them. |
 | 4.6 | Detect silently-dead Postgres connection | ~~1~~ → **3** | TODO 4.6(b) closed: a blackholed Postgres used to exit `ok: true` on a partial delivery, because `unknown` slot health licensed an idle declaration *and* reset the not-streaming clock. A source that was answering and goes dark now fails the run within `CDC_SOURCE_DARK_SECONDS` (45 s), proven against a real TCP blackhole. Not 5: there is still no heartbeat (4.4) and no bounded JDBC socket timeout (4.6(c)), so detection depends on our 0.5 s sampler rather than on the connection itself. |
-| 4.7 | Self-heal without human intervention | **1** (new item; claimed 3, rescored 1) | The rubric's 1-band is a **count**: "more than 2 cases that cause manual human intervention". The corrected inventory (ADR §19/A51, 67 rows, parsed by `tests/4.7_self_healing/test_4_7_inventory.py`) is **43 AUTO / 15 MANUAL / 9 UNDEFINED**. Fifteen is more than two, so it is a 1 under every defensible reading. The direction is right — automatic recovery now covers forty-three enumerated cases, including the Flight's own half-finished recovery — while the mechanical inventory keeps the remaining exceptions explicit. See the detail section. |
+| 4.7 | Self-heal without human intervention | **1** (new item; claimed 3, rescored 1) | The rubric's 1-band is a **count**: "more than 2 cases that cause manual human intervention". The corrected inventory (ADR §19/A51, 67 rows, parsed by `tests/rubric/4.7_self_healing/test_4_7_inventory.py`) is **43 AUTO / 15 MANUAL / 9 UNDEFINED**. Fifteen is more than two, so it is a 1 under every defensible reading. The direction is right — automatic recovery now covers forty-three enumerated cases, including the Flight's own half-finished recovery — while the mechanical inventory keeps the remaining exceptions explicit. See the detail section. |
 | 5.1 | CDC fast on large changes | 3 | 50 k-row transaction absorbed at ~3.5 k rows/s into local DuckDB; no failure, but a full `dlt.run()` per 2048-row batch is the ceiling. |
 | 5.2 | Low latency on small changes | 1 | Capture latency is 83 ms, but the deliverable is a bounded batch job with no defined cadence — end-to-end latency is the schedule interval. |
 | 5.3 | Keep up with high Postgres TPS | 2 | ~1 k events/s inside the engine, but ~17 s of per-run JVM/connect overhead drops the shipped bounded job to ~157 events/s to MotherDuck. |
@@ -413,7 +413,7 @@ Rubric 1.7 remains 3 while 1.9 is 5. Distribution: 20 at 1, 2 at 2, 8 at 3,
 distribution of `21/3/8/0/9`, and neither matched the summary table above it — the block
 was not updated when 1.7 fell from 5 to 4 and 4.7 from 3 to 1 in the previous round. The
 numbers here are now **parsed from the table** by
-`tests/4.7_self_healing/test_4_7_inventory.py`'s sibling reasoning: read the Score column,
+`tests/rubric/4.7_self_healing/test_4_7_inventory.py`'s sibling reasoning: read the Score column,
 take the last bolded digit, sum. It is the same class of defect as MAJOR-3 (a headline
 drifting from the rows it summarises) and it is recorded rather than quietly fixed.
 
@@ -439,7 +439,7 @@ by a test that fails on the previous implementation.
 **1.5 goes from 4 to 5** (2026-07-31). It was deliberately held at 4 with one
 stated condition — "automatic re-snapshot of a recreated relation" — and that
 condition is now met and tested end to end
-(`tests/1.6_snapshot_consistency/test_1_6_recreated_relation.py`): a relation
+(`tests/rubric/1.6_snapshot_consistency/test_1_6_recreated_relation.py`): a relation
 dropped and recreated **with rows that produce no change events at all** is
 detected, marked `awaiting_snapshot`, and rebuilt automatically on the next run,
 with the destination proven equal to the source afterwards.
@@ -482,13 +482,13 @@ point, which cannot happen because that point is what we hand it.
 
 | claim | where |
 |---|---|
-| the acknowledgement is after `COMMIT` and the window contains nothing else | `tests/1.3_atomic_batches/test_1_3_commit_protocol.py::test_the_acknowledgement_happens_after_the_commit_and_only_after_it` |
-| a crash at six protocol anchors (`begin`, `mid_apply`, `spill`, `pre_commit`, `post_commit_pre_ack`, `post_ack`) loses nothing and duplicates nothing | `tests/1.1_exactly_once_pk/test_1_1_fault_matrix.py`, with a per-anchor vacuity guard asserting the fault really fired |
-| `mid_apply` genuinely fires between two table writes | `tests/1.1_exactly_once_pk/test_1_1_spill_and_snapshot.py::test_mid_apply_really_fires_between_two_table_writes` |
+| the acknowledgement is after `COMMIT` and the window contains nothing else | `tests/rubric/1.3_atomic_batches/test_1_3_commit_protocol.py::test_the_acknowledgement_happens_after_the_commit_and_only_after_it` |
+| a crash at six protocol anchors (`begin`, `mid_apply`, `spill`, `pre_commit`, `post_commit_pre_ack`, `post_ack`) loses nothing and duplicates nothing | `tests/rubric/1.1_exactly_once_pk/test_1_1_fault_matrix.py`, with a per-anchor vacuity guard asserting the fault really fired |
+| `mid_apply` genuinely fires between two table writes | `tests/rubric/1.1_exactly_once_pk/test_1_1_spill_and_snapshot.py::test_mid_apply_really_fires_between_two_table_writes` |
 | a spilled transaction applies in source order, and a fenced one's staged prefix is discarded | `test_1_1_spill_and_snapshot.py` (5 tests) |
 | the fence alone prevents duplication with `CDC_OFFSET_FILE_REPAIR=0`, asserting `fenced_units > 0` so it cannot pass vacuously | `test_1_1_reconciliation.py::test_the_fence_alone_prevents_duplication_with_repair_disabled` |
 | a real `kill -9` over 40 transactions: 200 000 keyed rows and 1 000 keyless change events, 0 duplicates, 0 lost | `test_1_1_exactly_once_pk.py::test_slow_real_sigkill_is_exactly_once` (slow) |
-| the same, against real MotherDuck, across an injected crash at `mid_apply` and `post_commit_pre_ack` | `tests/1.3_atomic_batches/test_1_3_motherduck_fault.py` |
+| the same, against real MotherDuck, across an injected crash at `mid_apply` and `post_commit_pre_ack` | `tests/rubric/1.3_atomic_batches/test_1_3_motherduck_fault.py` |
 | the destination itself rejects a duplicate identity (`PRIMARY KEY` on the key columns), verified on MotherDuck and not only DuckDB | `test_1_3_motherduck_fault.py::test_motherduck_accepts_the_destination_side_primary_key` |
 
 **Why the previous claim of 5 was premature, and what changed.** The
@@ -552,7 +552,7 @@ on it, which is what `CDC_OFFSET_FILE_REPAIR=0` exists to demonstrate.
 
 **Pointers (current).** `src/cdc_flight/applier.py`,
 `src/cdc_flight/table_work.py`, `src/cdc_flight/reconcile.py`,
-`src/cdc_flight/destination.py`, `tests/1.1_exactly_once_pk/`.
+`src/cdc_flight/destination.py`, `tests/rubric/1.1_exactly_once_pk/`.
 
 ### 1.2 Delivery guarantees for tables WITHOUT a primary key — **5 / 5**
 
@@ -569,7 +569,7 @@ different events with two different ids. Nothing that deduplicates by row
 
 | claim | where |
 |---|---|
-| two byte-identical source rows both survive, and their replay copies do not | `tests/1.2_exactly_once_nopk/test_1_2_exactly_once_nopk.py::test_target_identical_source_rows_both_survive` |
+| two byte-identical source rows both survive, and their replay copies do not | `tests/rubric/1.2_exactly_once_nopk/test_1_2_exactly_once_nopk.py::test_target_identical_source_rows_both_survive` |
 | the identity is a function of the envelope, asserted separately for streaming and snapshot rows | `test_1_2_exactly_once_nopk.py::test_target_event_identity_is_derived_not_random` |
 | a replay of the same transaction recomputes identical ids and cannot duplicate, with the fence disabled | `test_1_2_keyless_identity.py::test_a_replay_recomputes_the_same_identity_and_cannot_duplicate` |
 | several events sharing one LSN get distinct identities | `test_1_2_keyless_identity.py::test_identity_is_unique_for_distinct_events_sharing_one_lsn` |
@@ -625,8 +625,8 @@ whether the unit stayed in memory or spilled to disk.
 
 | claim | where |
 |---|---|
-| an independent MotherDuck connection never observes a partial Postgres transaction, with a vacuity guard requiring it to have seen both `(0,0)` and `(N,N)` | `tests/1.3_atomic_batches/test_1_3_motherduck_atomicity.py` (motherduck) |
-| the same across an injected crash between two table writes: the torn state was never visible and the recovery run put both tables there in ONE commit group | `tests/1.3_atomic_batches/test_1_3_motherduck_fault.py::test_a_torn_group_was_never_visible_in_motherduck` |
+| an independent MotherDuck connection never observes a partial Postgres transaction, with a vacuity guard requiring it to have seen both `(0,0)` and `(N,N)` | `tests/rubric/1.3_atomic_batches/test_1_3_motherduck_atomicity.py` (motherduck) |
+| the same across an injected crash between two table writes: the torn state was never visible and the recovery run put both tables there in ONE commit group | `tests/rubric/1.3_atomic_batches/test_1_3_motherduck_fault.py::test_a_torn_group_was_never_visible_in_motherduck` |
 | a group spanning three tables is one transaction, and `commit_log` agrees | `test_1_3_commit_protocol.py::test_a_group_spanning_three_tables_is_one_destination_transaction` |
 | the boundary rule is unconditional: missing `event_count`, spill-mode per-table counts, an undeclared observed table, a non-contiguous ordinal set are each fatal | `tests/test_assembler.py` (10 tests) |
 | a transaction's events never straddle two commit groups, after a crash at every anchor | `test_1_1_fault_matrix.py::test_uncommitted_anchors_leave_nothing_behind` |
@@ -699,7 +699,7 @@ The pair is inside one `CompleteUnit`, a commit group holds an integral number o
 *whole* transactions (1.3), and the merge deletes every key the group touched before
 inserting the group's final row per key. So no consumer can see the row under both
 keys or under neither.
-`tests/1.4_pk_updates/test_1_4_pk_update_fold.py::test_the_delete_and_the_insert_cannot_be_split_across_commit_groups`
+`tests/rubric/1.4_pk_updates/test_1_4_pk_update_fold.py::test_the_delete_and_the_insert_cannot_be_split_across_commit_groups`
 drives the shipped applier with `commit_max_events=1`, `commit_max_bytes=1`,
 `commit_max_age=0` - a commit trigger on **every single event** - and shows the group
 still cannot close between the two.
@@ -754,23 +754,23 @@ pins that, including that the destination still holds the pre-group state afterw
 
 #### Evidence
 
-* `tests/1.4_pk_updates/test_1_4_fold_counterexamples.py` - **14 tests, default suite**,
+* `tests/rubric/1.4_pk_updates/test_1_4_fold_counterexamples.py` - **14 tests, default suite**,
   the reproduced counterexamples plus the orderings both reviews verified as *correct*
   and which the rewrite must not break: 3-ring and 4-ring rotations, a swap through a
   temporary key, a delete matching two transiently identical rows, the ambiguous shape
   under **spill**, over **two tables**, and **re-folded with fresh LSNs** so the fence
   cannot help (a fold that is only correct once is not correct).
-* `tests/1.4_pk_updates/test_1_4_pk_update_fold.py` - 20 tests: the plain move, mixed
+* `tests/rubric/1.4_pk_updates/test_1_4_pk_update_fold.py` - 20 tests: the plain move, mixed
   with other changes to the same row, the freed-key collision, the chain, the deferred
   permutation, both `u`-shaped variants, composite keys (`app.audit_log`), two
   transactions in one group, a spilled unit whose `d` is staged and whose `c` is in
   memory, and a fault at `begin` / `mid_apply` / `pre_commit` around the move.
-* `tests/1.3_atomic_batches/test_1_3_rollback_resets_the_group.py` - **6 tests**: a
+* `tests/rubric/1.3_atomic_batches/test_1_3_rollback_resets_the_group.py` - **6 tests**: a
   rolled-back group must not be folded a second time (Opus M-1, measured to lose a row
   through exactly the ambiguous shape), must not contaminate the next group, and must
   not leave `_created_in_txn` behind — which independently makes `write()` skip the
   DELETE half of the merge.
-* `tests/1.4_pk_updates/test_1_4_pk_update_e2e.py` - one 19 s scenario against real
+* `tests/rubric/1.4_pk_updates/test_1_4_pk_update_e2e.py` - one 19 s scenario against real
   Postgres and real Debezium, **six** transactions: row-for-row agreement with the
   source, no duplicate key, the old key gone, the moved row keeping its post-move
   values (`replace.null.with.default=false` matters here), the deferred permutation,
@@ -781,7 +781,7 @@ pins that, including that the destination still holds the pre-group state afterw
   `[(2,'a'),(3,'b'),(11,'y'),(12,'x'),(30,'q')]` and the destination is asserted
   **equal to it**, because the defects this replaces produced destinations that were
   perfectly unique and wrong.
-* `tests/1.4_pk_updates/test_1_4_pk_update_crash.py` (`slow`) - a `SIGKILL`-equivalent
+* `tests/rubric/1.4_pk_updates/test_1_4_pk_update_crash.py` (`slow`) - a `SIGKILL`-equivalent
   in the commit->ack window of the group carrying the PK update, then recovery: one
   row under the new key, no duplicate key anywhere, destination equals source.
 
@@ -834,7 +834,7 @@ conditional:
 
 * the 1.4/1.5 round scored it **4**, with one stated condition — "no automatic
   re-snapshot for a recreated relation" — and that condition was met by
-  `cdc_flight.resnapshot` (`tests/1.6_snapshot_consistency/test_1_6_recreated_relation.py`);
+  `cdc_flight.resnapshot` (`tests/rubric/1.6_snapshot_consistency/test_1_6_recreated_relation.py`);
 * the 1.6-1.8 round then found that the *machinery* the new 5 rested on could delete a
   live destination table: `_finish_empty_tables` inferred "the source relation is empty"
   from "our engine did not reach this table", and the guard meant to catch a partial
@@ -857,7 +857,7 @@ is why the baseline's `skipped` counter did not even increment.
 `skipped.operations=none` is now set from the truncate policy, and
 `CDC_TRUNCATE_MODE=ignore` restores the old default so the gap can be reproduced on
 demand - which
-`tests/1.5_truncate_drop/test_1_5_drop_recreate.py::test_ignore_mode_reproduces_the_baseline_gap`
+`tests/rubric/1.5_truncate_drop/test_1_5_drop_recreate.py::test_ignore_mode_reproduces_the_baseline_gap`
 does, live.
 
 Three properties the events then need:
@@ -1014,18 +1014,18 @@ cannot silently restore "truncates are skipped".
 
 #### Evidence
 
-* `tests/1.5_truncate_drop/test_1_5_truncate_key_reuse.py` - **10 tests, default
+* `tests/rubric/1.5_truncate_drop/test_1_5_truncate_key_reuse.py` - **10 tests, default
   suite**: both reproduced Opus BLOCKER-1 shapes (a spurious row that never healed; a
   row present under two keys with an **ordinary** primary key), Codex 3's
   cross-transaction zombie, the reverse orders, and the cross-transaction case under
   **spill** and over **two tables**.
-* `tests/1.5_truncate_drop/test_1_5_truncate_storage_modes.py` - **15 tests**: the
+* `tests/rubric/1.5_truncate_drop/test_1_5_truncate_storage_modes.py` - **15 tests**: the
   `{memory, spill} x {replicate, log}` matrix over rows / marker / counters /
   `rows_removed`, a lone spilled truncate, two truncates in one transaction reporting
   `3` then `1`, per-table counts for a multi-table truncate, a keyless-table truncate,
   and a fault at `spill` / `mid_apply` / `pre_commit` around a **staged** truncate
   (every row kept, no marker, the staging table empty, and the replay exact).
-* `tests/1.5_truncate_drop/test_1_5_catalog_guards.py` - **18 tests**: one observation
+* `tests/rubric/1.5_truncate_drop/test_1_5_catalog_guards.py` - **18 tests**: one observation
   is not enough; a relation that reappears cancels its pending drop (and a different
   oid replaces it with a `recreated`); a relation that goes away cancels a pending
   recreate; a live relation is never dropped; a source that cannot be re-read fails
@@ -1033,36 +1033,36 @@ cannot silently restore "truncates are skipped".
   defaults; two drops in one group are both refused with a `critical` alert; a poll that
   saw an empty schema is discarded; **an alert about a refusal survives a rollback and
   an alert about an applied drop does not**.
-* `tests/1.5_truncate_drop/test_1_5_ownership_and_honesty.py` - **10 tests**: streaming
+* `tests/rubric/1.5_truncate_drop/test_1_5_ownership_and_honesty.py` - **10 tests**: streaming
   DML registers ownership in the same transaction that creates the table, a rolled-back
   group leaves neither, a watcher seeded from `table_state` detects a drop it never saw,
   `--reset-state` keeps ownership and drops only the oids, the final catalog poll
   happens, an unresolved destructive change fails the run, a marker failure is preserved
   in the summary, and the marker write budget is bounded.
-* `tests/1.5_truncate_drop/test_1_5_truncate_fold.py` - 19 tests: multi-table
+* `tests/rubric/1.5_truncate_drop/test_1_5_truncate_fold.py` - 19 tests: multi-table
   atomicity, rows before/after the truncate, the keyless trap, the marker and its row
   count, `truncate_mode=log`, a truncate of a table the destination never held, a
   rolled-back truncate leaving every row *and* no marker, the LSN fence, `recreated`
   (with its `awaiting_snapshot` flag), `unpublished`, `drop_mode=log`, the alert, and a
   rolled-back drop staying pending.
-* `tests/1.5_truncate_drop/test_1_5_catalog_detection.py` - 21 tests: the comparison in
+* `tests/rubric/1.5_truncate_drop/test_1_5_catalog_detection.py` - 21 tests: the comparison in
   isolation, including the restart case (a replicated table absent from `pg_class` **is**
   a drop even with no persisted oid), that partitions are not discovery events, that
   `dirty` state is not forgotten until the caller commits, and that a marker failure
   leaves the change unapplied rather than forced.
-* `tests/1.5_truncate_drop/test_1_5_truncate_drop_e2e.py` - one 33 s scenario against
+* `tests/rubric/1.5_truncate_drop/test_1_5_truncate_drop_e2e.py` - one 33 s scenario against
   real Postgres: `TRUNCATE parent CASCADE` plus inserts in one transaction (both
   tables emptied in **one** commit group, the inserts surviving), a real `DROP TABLE`
   detected/fenced/applied with its `source_relations` and `table_state` rows gone, the
   audit trail, the rest of the stream unaffected, and the fence marker not breaking
   the assembler.
-* `tests/1.5_truncate_drop/test_1_5_motherduck.py` (`motherduck`) - the truncate and the
+* `tests/rubric/1.5_truncate_drop/test_1_5_motherduck.py` (`motherduck`) - the truncate and the
   drop against real MotherDuck, that `DELETE FROM` reports its row count there, that
   the alert sink really is an independent connection on a server-side transaction
   implementation, that ownership survives — **and a second scenario** injecting
   `pre_commit` on a truncating group: every row kept, no marker, then a replay landing
   it exactly once (Codex's 9-point item 9).
-* `tests/1.5_truncate_drop/test_1_5_drop_recreate.py` (`slow`) - the live gap under
+* `tests/rubric/1.5_truncate_drop/test_1_5_drop_recreate.py` (`slow`) - the live gap under
   `ignore`, the same truncate replicated, a `SIGKILL`-equivalent in the commit->ack
   window of a truncating group, and drop-then-recreate with a **different schema**.
 
@@ -1233,7 +1233,7 @@ substantial; the reviewer still does not classify it as the rubric's “robust i
 | `faults.FaultyConnection` — the destination misbehaves | `destination_write`, `destination_commit`, `destination_commit_late` (the genuinely ambiguous one), `destination_hang`, `destination_close` |
 | `faults.maybe_crash` at a durable recovery/baseline boundary | `recovery_requested`, `recovery_offsets_file_deleted`, `recovery_resume_point_deleted`, `recovery_armed`, `table_rebuild_queued`, `catalog_baseline_marked`, `catalog_baseline_pre_valid` |
 | source-side injected fault | `catalog_poll` |
-| `tests/tcp_relay.py` — the source stops answering with the sockets left open | the network blackhole |
+| `tests/support/tcp_relay.py` — the source stops answering with the sockets left open | the network blackhole |
 
 The destination anchors fire at the data group the **applier declares**
 (`faults.arm_group`), not one the wrapper infers from the SQL it happens to see: an
@@ -1337,12 +1337,12 @@ this a closure rather than a claim:
    needs a shadow), and a new test asserts that every excluded anchor names the module
    that does prove it **and that the module exists** — a comment would not have failed if
    the file were renamed;
-2. **a default-suite guard** — `tests/1.7_fault_injection/test_1_7_recovery_anchors.py`,
+2. **a default-suite guard** — `tests/rubric/1.7_fault_injection/test_1_7_recovery_anchors.py`,
    13 tests in **0.3 s**: each anchor parses, fires where it says it fires, writes its
    fsynced record, and leaves a journal the next attempt finishes from. `<nth>` is
    per-boundary-arrival, and a test drives a second recovery in one process to prove the
    index addresses it;
-3. **an exact-count recovery proof** — `tests/1.8_slot_mismatch/test_1_8_recovery_crash_e2e.py`
+3. **an exact-count recovery proof** — `tests/rubric/1.8_slot_mismatch/test_1_8_recovery_crash_e2e.py`
    (slow lane) advances a **real** slot, kills a **real** `cdc-flight` process at
    `recovery_armed` with `os._exit`, and then asserts the fired record names that anchor,
    the next run resumed *from `resume_point_deleted`*, the journal was cleared, no table is
@@ -1377,7 +1377,7 @@ grounds. Each is now closed by a test rather than by an argument (ADR §A58.7):
 
 | finding | what it was | what it is now |
 |---|---|---|
-| the four cuts used **exception unwinding**, not hard death | `test_1_7_recovery_anchors.py` armed `:raise`, so `recovery_requested`, offsets-file-deleted and resume-row-deleted were proven by a Python exception that unwinds `finally`, closes the connection and lets the interpreter tidy up. Only `recovery_armed` had an `os._exit` pairing, in the slow lane | all four are cut by a real `os._exit` in a **child process** (`tests/recovery_crash_driver.py`) against the same DuckDB file and the same offsets file — milliseconds, no JVM, no Postgres, and the fired record's `pid` is asserted not to be the test runner's. The `:raise` variants remain as the *error-teardown* lifecycle, which is a different path (§1.2) |
+| the four cuts used **exception unwinding**, not hard death | `test_1_7_recovery_anchors.py` armed `:raise`, so `recovery_requested`, offsets-file-deleted and resume-row-deleted were proven by a Python exception that unwinds `finally`, closes the connection and lets the interpreter tidy up. Only `recovery_armed` had an `os._exit` pairing, in the slow lane | all four are cut by a real `os._exit` in a **child process** (`tests/support/recovery_crash_driver.py`) against the same DuckDB file and the same offsets file — milliseconds, no JVM, no Postgres, and the fired record's `pid` is asserted not to be the test runner's. The `:raise` variants remain as the *error-teardown* lifecycle, which is a different path (§1.2) |
 | `table_rebuild_queued` fired **before the first table write** despite being documented "mid-write" | it proved a pre-write rollback | it fires after the FIRST captured table has taken its `-> awaiting_snapshot` edge and before the second has, so the queue really is torn when the process dies |
 | the composed chaos fault was **allowed not to fire** | armed at `<nth>=2` so the random walk terminates, and the shuffled-cover assertion could be satisfied entirely by the first faults — so "the anchors compose" rested on nothing that had to happen | the seeded harness keeps its terminating draw, and a **bounded** scenario now requires one: a hard death at `post_commit_pre_ack`, then `pre_commit:1` during the recovery run, which the replay of the un-acknowledged group necessarily reaches |
 | the two **operator routes** had no anchors at all | `--accept-orphan-offsets` and `--reset-state` were durable multi-step sequences absent from the enumeration, so `ALL_POINTS` could not prove completeness | both are journalled recoveries and therefore reach the same five anchors. `test_1_8_operator_route_crash_e2e.py` kills a real process mid-sequence on each, restarts **without repeating the flag** under `--snapshot-mode no_data`, and asserts exact source/destination equality. `no_data` is load-bearing: a run that forgot the obligation would stream instead of rebuild |
@@ -1546,7 +1546,7 @@ one file a reviewer reads to see every consistency-affecting state in the system
 
 #### Five measured bugs are now edges that do not exist
 
-Each of these is a test in `tests/1.9_state_machines/`, named after the finding:
+Each of these is a test in `tests/rubric/1.9_state_machines/`, named after the finding:
 
 * `RUN_OUTCOME.check("source_dark", "hung")` **raises**. A dark source makes
   `engine.close()` hang almost by definition; the old `finally` overwrote the diagnosis
@@ -1619,14 +1619,14 @@ a count. Full table in ADR §20/A55.
 
 | what | where | cost |
 |---|---|---|
-| the mechanism, and the five bugs as illegal edges | `tests/1.9_state_machines/test_1_9_machines.py` | ms |
-| interruption preparation at `armed`, terminal replacement, and cleanup-to-arm cuts | `tests/1.9_state_machines/test_1_9_destination_ownership.py` | ms |
-| one writer, the `in_progress` residue, the owed queue, `--reset-state`, alerts | `tests/1.9_state_machines/test_1_9_table_lifecycle.py` | ms |
-| the durable phase row, the precedence, the migration, the independent connection | `tests/1.9_state_machines/test_1_9_run_state.py` | ms |
-| the per-relation state and the fence | `tests/1.9_state_machines/test_1_9_catalog_change.py` | ms |
-| the durable identity-adoption baseline and rebuild discharge | `tests/1.9_state_machines/test_1_9_catalog_baseline.py` | ms |
-| `OpenGroup` — the object is replaced, not edited | `tests/1.3_atomic_batches/test_1_3_rollback_resets_the_group.py` | ms |
-| the ADR's transition tables are generated from `machine.table()` | `tests/4.7_self_healing/test_4_7_inventory.py` | ms |
+| the mechanism, and the five bugs as illegal edges | `tests/rubric/1.9_state_machines/test_1_9_machines.py` | ms |
+| interruption preparation at `armed`, terminal replacement, and cleanup-to-arm cuts | `tests/rubric/1.9_state_machines/test_1_9_destination_ownership.py` | ms |
+| one writer, the `in_progress` residue, the owed queue, `--reset-state`, alerts | `tests/rubric/1.9_state_machines/test_1_9_table_lifecycle.py` | ms |
+| the durable phase row, the precedence, the migration, the independent connection | `tests/rubric/1.9_state_machines/test_1_9_run_state.py` | ms |
+| the per-relation state and the fence | `tests/rubric/1.9_state_machines/test_1_9_catalog_change.py` | ms |
+| the durable identity-adoption baseline and rebuild discharge | `tests/rubric/1.9_state_machines/test_1_9_catalog_baseline.py` | ms |
+| `OpenGroup` — the object is replaced, not edited | `tests/rubric/1.3_atomic_batches/test_1_3_rollback_resets_the_group.py` | ms |
+| the ADR's transition tables are generated from `machine.table()` | `tests/rubric/4.7_self_healing/test_4_7_inventory.py` | ms |
 
 The default lane includes the state-machine guards and all seven recovery/baseline anchor
 guards. The round-7 fixes measure **608 passed / 9:14** (9:15 wall), under the 10-minute
@@ -1726,9 +1726,9 @@ tables use their primary keys for the copy. Keyless tables use an all-row update
 when the newly added source values are uniform; a non-uniform case fails closed because
 there is no honest source row identity.
 
-**Evidence.** `tests/2.1_added_dropped_columns/test_2_1_schema_evolution.py` pins the
+**Evidence.** `tests/rubric/2.1_added_dropped_columns/test_2_1_schema_evolution.py` pins the
 identity diff, dlt schema model, add backfill, physical drop, and keyless safety.
-`tests/2.1_added_dropped_columns/test_2_1_added_dropped_columns_e2e.py` runs live CDC
+`tests/rubric/2.1_added_dropped_columns/test_2_1_added_dropped_columns_e2e.py` runs live CDC
 before the DDL, performs an ADD with a default plus update/insert, compares every
 source row with the destination, then performs a DROP and post-drop update. It also
 asserts one applied `column_added` and one applied `column_dropped` audit event.
@@ -1744,7 +1744,7 @@ new-name row arrives before the poll, the late path merges the two physical colu
 with `COALESCE` and drops the old name inside the fenced commit. Rename plus unrelated
 add/drop changes are applied from one attnum diff.
 
-**Evidence.** `tests/2.2_renamed_columns/test_2_2_renamed_columns.py` pins attnum
+**Evidence.** `tests/rubric/2.2_renamed_columns/test_2_2_renamed_columns.py` pins attnum
 continuity, type identity, true rename, late-row merge, and a rename combined with an
 unrelated add/drop. The E2E performs live CDC before and after `name -> full_name`,
 verifies one logical destination column and source-equivalent values, and asserts
@@ -1763,7 +1763,7 @@ the existing single-table re-snapshot machinery for pre-existing rows, and resum
 no-data engine in the same process. Multiple additions are safe by default and emit
 a mass-add warning.
 
-**Evidence.** `tests/2.3_new_table_discovery/test_2_3_new_table_discovery.py` pins the
+**Evidence.** `tests/rubric/2.3_new_table_discovery/test_2_3_new_table_discovery.py` pins the
 all-schema candidate set, <=60-second default, and mass-add policy. The E2E keeps one
 bounded process alive while creating `app.discovered_rows` and
 `discovered_schema.rows`, then asserts `live_discovery_handoffs >= 1`, publication
@@ -2095,7 +2095,7 @@ The `wal_sender_timeout = 60s` in `scripts/pg.sh` protects the *server* from a
 dead client, not us from a dead server.
 
 **Now (2026-07-31) — 3/5.** TODO 4.6(b) is closed and the probe the baseline asked for
-exists. `tests/tcp_relay.py` is an out-of-process TCP relay that accepts the pipeline's
+exists. `tests/support/tcp_relay.py` is an out-of-process TCP relay that accepts the pipeline's
 connections and then stops forwarding packets with the sockets left open — a real
 silently-dead source, not a killed process. What it found: `unknown` slot health used to
 license an idle declaration *and* reset the not-streaming clock, so a blackholed Postgres
@@ -2142,7 +2142,7 @@ ADR §19/A51 enumerates every raise site, fatal log, refusal and `stop_reason` i
 tree: **67 rows, 43 AUTO / 15 MANUAL / 9 UNDEFINED**. Fifteen manual cases is more than
 two, so the 1-band's test is met on our own evidence.
 
-The count is not recalled: `tests/4.7_self_healing/test_4_7_inventory.py` re-parses the
+The count is not recalled: `tests/rubric/4.7_self_healing/test_4_7_inventory.py` re-parses the
 ADR table and fails if the headline stops matching the rows, or if any row carries two
 terminal classes in one cell. That test exists because the previous headline —
 `24 AUTO / 9 MANUAL / 6 UNDEFINED` — totalled 39 against a 40-row table and matched no
