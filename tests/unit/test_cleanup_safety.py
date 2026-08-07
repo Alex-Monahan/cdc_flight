@@ -55,7 +55,7 @@ def _runtime_state(
 
 
 def _load_runtime_state(project: Path) -> ModuleType:
-    helper = project / "scripts" / "runtime_state.py"
+    helper = project / "scripts" / "runtime_state_cli.py"
     module_name = f"runtime_state_{project.parent.name}"
     spec = importlib.util.spec_from_file_location(module_name, helper)
     assert spec is not None and spec.loader is not None
@@ -100,7 +100,7 @@ def test_python_cli_rejects_a_caller_selected_project_root(
     proc = subprocess.run(
         [
             sys.executable,
-            str(isolated_project / "scripts" / "runtime_state.py"),
+            str(isolated_project / "scripts" / "runtime_state_cli.py"),
             "--project-dir",
             str(victim),
             "clean",
@@ -905,7 +905,7 @@ def test_hard_exit_private_root_is_reconciled_by_the_next_invocation(
     isolated_project: Path,
 ):
     instance = "cleanup_private_hard_exit"
-    helper = isolated_project / "scripts" / "runtime_state.py"
+    helper = isolated_project / "scripts" / "runtime_state_cli.py"
     code = (
         "import importlib.util, os, sys; "
         f"p={str(helper)!r}; "

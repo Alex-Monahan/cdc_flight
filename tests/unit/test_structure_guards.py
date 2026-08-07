@@ -7,6 +7,7 @@ allowing later module-surface guards in this file to be counted explicitly.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -114,3 +115,18 @@ def test_runtime_state_filesystem_module_owns_atomic_publication():
     spec.loader.exec_module(module)
     assert callable(module.rename_noreplace)
     assert not (root / "scripts" / "runtime_state_publish.py").exists()
+
+
+def test_runtime_state_wrapper_executes_the_renamed_cli():
+    root = Path(__file__).resolve().parents[2]
+    wrapper = root / "scripts" / "runtime_state.sh"
+    text = wrapper.read_text()
+    assert "runtime_state_cli.py" in text
+    assert "runtime_state.py" not in text
+    result = subprocess.run(
+        [str(wrapper), "--help"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
