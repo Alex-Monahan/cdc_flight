@@ -15,7 +15,7 @@ The one boundary rule:
 > `transaction.total_order` ordinals are exactly `1..event_count`.
 
 Consequences, enforced here and asserted by `tests/rubric/1.3_atomic_batches/` and
-`tests/test_assembler.py`:
+`tests/unit/test_assembler.py`:
 
 * a `txId` change without an intervening `END` is fatal, not a fallback;
 * an `event_count` mismatch is fatal, and so is a **missing** `event_count`: the

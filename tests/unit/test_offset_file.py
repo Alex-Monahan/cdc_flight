@@ -31,7 +31,7 @@ OFFSET = {
 #: Debezium wrote" test created both files with our own writer and was therefore
 #: tautological (Codex 3); this fixture is the evidence it claimed to be.
 DEBEZIUM_FIXTURE = (
-    Path(__file__).resolve().parent
+    Path(__file__).resolve().parents[1]
     / "support"
     / "fixtures"
     / "offsets_debezium_3.6.dat"

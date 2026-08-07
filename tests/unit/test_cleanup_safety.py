@@ -13,7 +13,7 @@ from types import ModuleType
 
 import pytest
 
-PROJECT_DIR = Path(__file__).resolve().parents[1]
+PROJECT_DIR = Path(__file__).resolve().parents[2]
 RUNTIME_STATE = PROJECT_DIR / "scripts" / "runtime_state.sh"
 
 

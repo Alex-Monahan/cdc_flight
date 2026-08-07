@@ -14,7 +14,7 @@ ObjectOutputStream.writeObject(HashMap<byte[], byte[]>)
 (`org.apache.kafka.connect.storage.FileOffsetBackingStore.save()`; the key is
 `OffsetStorageWriter`'s `[namespace, partition]` pair rendered by a
 `JsonConverter` with `schemas.enable=false`.) Verified empirically against a
-live `.cdc_state/offsets.dat` on 2026-07-30 - see `tests/test_offset_file.py`,
+live `.cdc_state/offsets.dat` on 2026-07-30 - see `tests/unit/test_offset_file.py`,
 which round-trips a real file.
 
 Byte-exactness matters for the **key** and not for the value: Kafka looks the

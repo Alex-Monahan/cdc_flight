@@ -53,7 +53,7 @@ from Phase 0 constrain every design choice below:
 | One 400 000-row PG transaction became **174 Debezium batches**; the baseline calls `dlt.run()` **once per Debezium batch** (`handler.py`), and dlt then opens **one transaction per table** inside each load package | `probes/p13`, `probes/p06`, `repos/dlt/dlt/destinations/insert_job_client.py:24` | Postgres transaction boundaries are invisible at the destination. *(rev 2: the "one load package per 2048 rows" is our handler's choice, not a dlt property — Opus m7.)* |
 | **~17 s** of JVM start + MotherDuck connect per process (wall 31.9 s for 15.1 s of engine time) | `probes/p12` | a per-run process model cannot meet 5.2 (<30 s) or 5.3 (>2000 TPS) |
 | Slot dropped / advanced externally / offset corrupted ⇒ `{"records": 0}`, **exit 0** | `probes/p04`, `p10`, `p11` | failures were invisible; partly fixed by TODO 1.0(b), fully by TODO 1.0(feedback) (see §11) |
-| `numeric`→base64, dates→BIGINT, a NaN column **dropped entirely**, TOAST→`__debezium_unavailable_value` | `probes/p02`, `tests/test_e2e_duckdb.py` | the `ExtractNewRecordState` + JSON payload is lossy before we ever see it |
+| `numeric`→base64, dates→BIGINT, a NaN column **dropped entirely**, TOAST→`__debezium_unavailable_value` | `probes/p02`, `tests/e2e/test_e2e_duckdb.py` | the `ExtractNewRecordState` + JSON payload is lossy before we ever see it |
 
 ### 1.1 The user's binding design principles
 
@@ -1488,7 +1488,7 @@ its first real transaction. The stable identifier is the **prefix**, which
 equals `source.txId` and equals the offset's `transaction_id`. The assembler
 therefore keys on `source.txId` for data events and on the prefix of
 `transaction.id` for the markers. `envelope._txn_id()` is that one line, and
-`tests/test_assembler.py` pins the behaviour.
+`tests/unit/test_assembler.py` pins the behaviour.
 
 Everything else §3.2 relies on was confirmed exactly as documented:
 `event_count`, per-`data_collection` counts, `total_order` as a 1-based ordinal,
@@ -1510,7 +1510,7 @@ inference the applier deliberately does not do, per §10). `numeric` is still
 base64, `date`/`interval` still integers. Two things did improve for free:
 arrays are a native `JSON` column instead of a dlt child table, and the all-NaN
 `numeric` column that dlt dropped entirely now exists.
-`tests/test_e2e_duckdb.py::test_documented_type_gaps` pins all of it.
+`tests/e2e/test_e2e_duckdb.py::test_documented_type_gaps` pins all of it.
 
 ### A3 — `cdcf_event_id` uses the event's own LSN, not the commit LSN
 
@@ -1536,7 +1536,7 @@ that differs between the spilled and in-memory paths would be worse than either.
 The implementation therefore (a) writes the file itself when reconciliation says
 so, byte-compatibly with Kafka's `FileOffsetBackingStore` — the format was read
 off a live file and is round-tripped byte-identically in
-`tests/test_offset_file.py` — and (b) asserts after every acknowledgement that
+`tests/unit/test_offset_file.py` — and (b) asserts after every acknowledgement that
 `file_lsn <= durable_lsn`, raising `ResumePointDrift` otherwise. That is
 strictly the Invariant-O direction and cannot false-fire on a lagging flush.
 
@@ -1681,7 +1681,7 @@ immediately see what another *process* committed. The applier is unaffected (eac
 run is its own process), but a test that verifies a MotherDuck write from the
 parent process will read an empty schema and conclude nothing was written. It is
 recorded here because the same trap will catch anyone writing 6.1's observability
-queries. `tests/test_motherduck.py::wait_for_tables` handles it.
+queries. `tests/e2e/test_motherduck.py::wait_for_tables` handles it.
 
 ### A16 — the throughput bugs the whole-transaction design exposes
 
@@ -1739,7 +1739,7 @@ staging table, not in the group.
 
 The applier therefore refuses to close a group while
 `TransactionAssembler.open_unit_has_spilled` is true, and
-`tests/test_assembler.py::test_an_open_unit_that_has_spilled_blocks_the_group_from_closing`
+`tests/unit/test_assembler.py::test_an_open_unit_that_has_spilled_blocks_the_group_from_closing`
 pins it. The cost is that the destination transaction stays open until the large
 unit completes, which is inherent to §3.4's in-transaction staging and is the
 trade §3.4 already records.

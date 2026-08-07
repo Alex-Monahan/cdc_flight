@@ -249,7 +249,7 @@ assumptions elsewhere in this document and in the ADR:
    MotherDuck's catalog snapshot rides on it, so a reader that has already opened
    `md:<db>` cannot immediately see what another *process* committed. This is a
    test-harness hazard (each pipeline run is its own process) but it can make a
-   MotherDuck assertion pass vacuously; `tests/test_motherduck.py::wait_for_tables`
+   MotherDuck assertion pass vacuously; `tests/e2e/test_motherduck.py::wait_for_tables`
    documents and handles it.
 4. **MotherDuck honours `DROP TABLE` + `ALTER TABLE … RENAME` inside a
    transaction** — the shadow-table swap works as ADR §7 specifies, and the run
@@ -573,7 +573,7 @@ different events with two different ids. Nothing that deduplicates by row
 | the identity is a function of the envelope, asserted separately for streaming and snapshot rows | `test_1_2_exactly_once_nopk.py::test_target_event_identity_is_derived_not_random` |
 | a replay of the same transaction recomputes identical ids and cannot duplicate, with the fence disabled | `test_1_2_keyless_identity.py::test_a_replay_recomputes_the_same_identity_and_cannot_duplicate` |
 | several events sharing one LSN get distinct identities | `test_1_2_keyless_identity.py::test_identity_is_unique_for_distinct_events_sharing_one_lsn` |
-| a missing or duplicated `total_order` is refused at the boundary | `test_1_2_keyless_identity.py`, `tests/test_assembler.py` |
+| a missing or duplicated `total_order` is refused at the boundary | `test_1_2_keyless_identity.py`, `tests/unit/test_assembler.py` |
 | every keyless change event is one destination row, and `GROUP BY cdcf_event_id HAVING count(*) > 1` is empty after a crash at every anchor | `test_1_1_fault_matrix.py::test_no_duplicates_at_anchor` |
 | duplicates are rejected by the destination, not just by us | `PRIMARY KEY (cdcf_event_id)`, verified on MotherDuck |
 
@@ -595,7 +595,7 @@ work.
 
 Same mechanism as baseline 1.1, same score. `app.sensor_readings` has `REPLICA IDENTITY FULL`,
 so Debezium *does* deliver complete before-images for updates and deletes
-(`tests/test_e2e_duckdb.py` asserts `{"r": 4, "c": 6, "u": 4, "d": 2}`), but
+(`tests/e2e/test_e2e_duckdb.py` asserts `{"r": 4, "c": 6, "u": 4, "d": 2}`), but
 there is no key to deduplicate on afterwards — a replayed batch is
 indistinguishable from six genuinely identical readings.
 
@@ -628,7 +628,7 @@ whether the unit stayed in memory or spilled to disk.
 | an independent MotherDuck connection never observes a partial Postgres transaction, with a vacuity guard requiring it to have seen both `(0,0)` and `(N,N)` | `tests/rubric/1.3_atomic_batches/test_1_3_motherduck_atomicity.py` (motherduck) |
 | the same across an injected crash between two table writes: the torn state was never visible and the recovery run put both tables there in ONE commit group | `tests/rubric/1.3_atomic_batches/test_1_3_motherduck_fault.py::test_a_torn_group_was_never_visible_in_motherduck` |
 | a group spanning three tables is one transaction, and `commit_log` agrees | `test_1_3_commit_protocol.py::test_a_group_spanning_three_tables_is_one_destination_transaction` |
-| the boundary rule is unconditional: missing `event_count`, spill-mode per-table counts, an undeclared observed table, a non-contiguous ordinal set are each fatal | `tests/test_assembler.py` (10 tests) |
+| the boundary rule is unconditional: missing `event_count`, spill-mode per-table counts, an undeclared observed table, a non-contiguous ordinal set are each fatal | `tests/unit/test_assembler.py` (10 tests) |
 | a transaction's events never straddle two commit groups, after a crash at every anchor | `test_1_1_fault_matrix.py::test_uncommitted_anchors_leave_nothing_behind` |
 | `DROP` + `RENAME` is transactional at this destination, probed per run rather than assumed | `destination.probe_transactional_ddl`, ADR §15/A8 |
 
@@ -1775,7 +1775,7 @@ discovery itself.
 
 `most types text/json=1, core scalars well (nested as text)=3, (nested as json)=4, full=5`
 
-**Evidence** (`p02` `colsD_wide_types`, `tests/test_e2e_duckdb.py::test_documented_baseline_gaps`).
+**Evidence** (`p02` `colsD_wide_types`, `tests/e2e/test_e2e_duckdb.py::test_documented_baseline_gaps`).
 Observed destination types for `app.wide_types`:
 
 | Postgres | destination | verdict |
@@ -1830,7 +1830,7 @@ what happens to downstream views.
 
 `errors on TOAST=1, handled but inefficiently=4, handled efficiently=5`
 
-**Evidence.** `tests/test_e2e_duckdb.py::test_documented_baseline_gaps` asserts
+**Evidence.** `tests/e2e/test_e2e_duckdb.py::test_documented_baseline_gaps` asserts
 that after an UPDATE that does not touch the TOASTed `body` column, the
 destination row contains the literal string `__debezium_unavailable_value`.
 
@@ -2415,7 +2415,7 @@ primary settings (`synchronized_standby_slots`, `hot_standby_feedback`).
 
 **Evidence.** `app.audit_log` (range-partitioned by month) arrives as one logical
 table thanks to `publish_via_partition_root = true` (`sql/01_schema.sql:150`);
-`tests/test_e2e_duckdb.py` asserts `{"r": 3, "c": 2}` on it. In `p03`:
+`tests/e2e/test_e2e_duckdb.py` asserts `{"r": 3, "c": 2}` on it. In `p03`:
 
 * `ALTER TABLE app.audit_log DETACH PARTITION app.audit_log_2026_06` — a row
   inserted into the detached table afterwards did **not** arrive (correct, since
@@ -2475,7 +2475,7 @@ test.
 `deleted='true'`, and `write_disposition="append"` keeps them. There is no hard
 delete, no configuration switch, and no current-state view — the destination is
 purely a changelog, so a "deleted" row is still present as its earlier insert
-(pinned by `tests/test_e2e_duckdb.py::test_documented_baseline_gaps`).
+(pinned by `tests/e2e/test_e2e_duckdb.py::test_documented_baseline_gaps`).
 
 **Gap to 5.** Materialise current state (a merge keyed on the source PK) and
 offer, per table, `hard` (delete the row) or `soft` (keep it with a
