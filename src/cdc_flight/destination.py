@@ -47,10 +47,15 @@ __all__ = ["CONTROL_DDL", "ensure_control_schema"]
 log = logging.getLogger("cdc_flight.destination")
 
 # DuckDB 1.5.4 supports VARIANT in persistent databases only when the file is
-# created with the v1.5 storage compatibility level.  The same connection option
-# is accepted by MotherDuck, keeping the resolver/encoder and destination setup
-# on one runtime-neutral contract.
-DUCKDB_CONNECT_CONFIG = {"storage_compatibility_version": "v1.5.0"}
+# created with the v1.5 storage compatibility level.  Its default VARIANT
+# shredding path also refuses to append after a large object-heavy row group;
+# disabling that optimization keeps the native VARIANT contract intact.  The
+# same settings are accepted by MotherDuck, keeping destination setup on one
+# runtime-neutral contract.
+DUCKDB_CONNECT_CONFIG = {
+    "storage_compatibility_version": "v1.5.0",
+    "variant_minimum_shredding_size": "-1",
+}
 
 CONTROL_SCHEMA = "_cdc_flight"
 
