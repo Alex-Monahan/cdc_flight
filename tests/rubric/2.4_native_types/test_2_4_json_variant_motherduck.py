@@ -158,3 +158,85 @@ def test_motherduck_json_variant_nested_round_trip_and_union_shadow():
             assert changed[2][1] is None
         finally:
             con.close()
+
+
+def test_motherduck_json_variant_edge_states_and_multidimensional_lists():
+    token = motherduck_token()
+    if not token:
+        pytest.skip("`motherduck_token` not set")
+
+    integer = _source("int4", 23)
+    text = _source("text", 25)
+    json_source = _source("json", 114)
+    jsonb_source = _source("jsonb", 3802)
+    jsonb_array = SourceTypeDescriptor(
+        3803, "app.jsonb_array", "array", array_element=jsonb_source
+    )
+    jsonb_matrix = SourceTypeDescriptor(
+        3804, "app.jsonb_matrix", "array", array_element=jsonb_array
+    )
+    attrs = SourceTypeDescriptor(
+        9002, "public.hstore", "map", map_key=text, map_value=text
+    )
+
+    with scratch_database(token, "cdc_p2b_json_variant_edges") as database:
+        con = connect(token, database)
+        try:
+            assert_runtime(con)
+            con.execute("CREATE SCHEMA typed")
+            registry = SchemaRegistry(con, "typed")
+            registry.ensure_typed(
+                "edge_values",
+                columns={
+                    "id": integer,
+                    "json_value": json_source,
+                    "jsonb_value": jsonb_source,
+                    "jsonb_array": jsonb_array,
+                    "jsonb_matrix": jsonb_matrix,
+                    "attrs": attrs,
+                },
+                key_columns=("id",),
+            )
+            large = "é🙂" * 2_000
+            deep = '{"level1":{"level2":{"level3":[{"level4":"深"}]}}}'
+            large_json = '{"payload":"' + large + '"}'
+            large_variant = '{"payload":"' + large + '","deep":' + deep + '}'
+            insert_rows(
+                con,
+                registry.get("edge_values"),
+                ["id", "json_value", "jsonb_value", "jsonb_array", "jsonb_matrix", "attrs"],
+                [
+                    [1, large_json, large_variant, [deep, "null", None], [[deep], []], {"ü": large, "null": None}],
+                    [2, '[{"x":1},null,[]]', "{}", [], [], {}],
+                    [3, "{}", "[]", None, None, {}],
+                    [4, "[]", "null", None, None, None],
+                    [5, None, None, None, None, None],
+                ],
+            )
+            types = dict(
+                con.execute(
+                    "SELECT column_name, data_type FROM information_schema.columns "
+                    "WHERE table_schema='typed' AND table_name='edge_values'"
+                ).fetchall()
+            )
+            assert types["json_value"] == "JSON"
+            assert types["jsonb_value"] == "VARIANT"
+            assert types["jsonb_array"] == "VARIANT[]"
+            assert types["jsonb_matrix"] == "VARIANT[][]"
+            rows = con.execute(
+                "SELECT id, json_value, jsonb_value, variant_typeof(jsonb_value), "
+                "jsonb_array, jsonb_matrix, attrs FROM typed.edge_values ORDER BY id"
+            ).fetchall()
+            assert rows[0][1] == large_json
+            assert len(rows[0][2]["payload"]) == len(large)
+            assert rows[0][2]["deep"]["level1"]["level2"]["level3"][0]["level4"] == "深"
+            assert rows[0][3] == "OBJECT(deep, payload)"
+            assert rows[0][4][1] is None and rows[0][5][1] == []
+            assert rows[0][6]["ü"] == large and rows[0][6]["null"] is None
+            assert rows[1][1] == '[{"x":1},null,[]]' and rows[1][2] == {}
+            assert rows[1][4] == [] and rows[1][5] == [] and rows[1][6] == {}
+            assert rows[2][1] == "{}" and rows[2][2] == [] and rows[2][4] is None
+            assert rows[3][1] == "[]" and rows[3][2] is None and rows[3][6] is None
+            assert rows[4][1] is None and rows[4][2] is None
+        finally:
+            con.close()
