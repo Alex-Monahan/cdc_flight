@@ -373,7 +373,7 @@ correct assumptions in the notes below:
 | 2.3 | New tables and schemas auto-discovered | **5** | A 10-second (configurable) all-schema watcher admits table-scoped publication members and performs an in-process targeted re-snapshot on the same main slot; new-table and new-schema existing rows arrive without config edit or restart. |
 | 2.4 | Postgres types → native MotherDuck types | 1 | numeric→base64 VARCHAR, date/time/timestamp/interval→BIGINT, NaN/Inf degrade the column to VARCHAR, `col_numeric_nan` dropped entirely. |
 | 2.5 | Data type changes supported | 3 | dlt adds a `__v_text` variant column beside the old one; no widening logic, no UNION type. |
-| 2.6 | TOAST columns handled well | 1 | Unchanged TOAST arrives as the literal `__debezium_unavailable_value` — silent corruption, not an error. |
+| 2.6 | TOAST columns handled well | 4 | The configured `hex:00` marker is recognized only for the structural type allowlist; residual TOAST shapes automatically use verified table-scoped `REPLICA IDENTITY FULL` or refetch/resnapshot recovery. |
 | 3.1 | Backfill scalable / parallelized | 3 | 120 k rows in ~28 s single-threaded (`snapshot.max.threads=1`); works but does not scale, untested past 120 k. |
 | 3.2 | Backfills atomic | 1 | Snapshot rows are appended straight into the live table; no shadow table, no swap. |
 | 3.3 | Existing tables keep receiving CDC during snapshot | 1 | Debezium's initial snapshot blocks streaming entirely; everything goes stale for the snapshot's duration. |
@@ -1826,26 +1826,34 @@ intact, and migrate the existing values into the union on the DDL event. Needs a
 dlt destination-level type hint or a post-load `ALTER TABLE`, and a decision on
 what happens to downstream views.
 
-### 2.6 TOAST columns handled well — **1 / 5**
+### 2.6 TOAST columns handled well — **4 / 5**
 
 `errors on TOAST=1, handled but inefficiently=4, handled efficiently=5`
 
-**Evidence.** `tests/e2e/test_e2e_duckdb.py::test_documented_baseline_gaps` asserts
-that after an UPDATE that does not touch the TOASTed `body` column, the
-destination row contains the literal string `__debezium_unavailable_value`.
+**Evidence.** The current-runtime implementation configures Debezium's
+`unavailable.value.placeholder` as `hex:00`, treats the decoded NUL as an
+unchanged disposition only for the tested PostgreSQL text-like scalar/array and
+hstore-map shapes, and composes that disposition through memory, spill, replay,
+delete, and key-move folds without binding it. A residual field switches the
+whole table to verified `REPLICA IDENTITY FULL` where possible, otherwise the
+existing automatic refetch/resnapshot recovery path refuses the unit safely.
+The gate2 fixture measured 12/15 tested TOAST-capable shapes on the efficient
+structural path (80%); this is a constructed fixture measurement, not a fleet
+prevalence claim.
 
-Scored 1 rather than 4: it does not error, but it is *worse* than an error —
-it writes a plausible-looking string over real data with no marker, so the
-destination silently disagrees with the source. "Handled inefficiently" implies
-the correct value eventually arrives; here it never does.
+This is 4 rather than 5 because the unmodified current Debezium runtime still
+delivers the unchanged value at the SourceRecord boundary as an ordinary
+converted value; the efficient path is therefore structurally gated and some
+realistic schemas must take the intentionally inefficient table-scoped fallback.
+The fallback is automatic and safe, but it is not universal efficient marker
+preservation.
 
-**Gap to 5.** Options, cheapest first: (a) `REPLICA IDENTITY FULL` on TOAST-heavy
-tables — correct but multiplies WAL volume; (b) detect the placeholder in the
-handler and carry forward the previous value from the destination (requires
-current-state materialisation, 8.2); (c) re-read the row from Postgres on demand
-(costs a point lookup per affected row, and is racy against later updates).
-Whatever is chosen must be configurable per table and must never write the
-placeholder string.
+**Exact future work for 5.** Build and pin a marker-preserving Debezium
+artifact/runtime that exposes unchanged TOAST as a typed disposition (or an
+equivalent raw marker channel) before ordinary conversion, prove it on every
+residual type/mode, and then remove the table-wide inefficient fallback where
+that runtime makes complete marker semantics sound. No patched/custom artifact
+is included in this implementation.
 
 ---
 
