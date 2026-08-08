@@ -239,7 +239,7 @@ def test_second_run_is_incremental(fresh_seed, run_pipeline, duck, dataset):
     serialised by the `exclusive_source` lock; this fingerprint check catches
     anything that still slips past and says so plainly.
     """
-    from conftest import source_fingerprint
+    from support.fixtures import source_fingerprint
 
     first = run_pipeline(reset_state=True, max_seconds=120, idle_seconds=6)
     assert first["records"] == 20

@@ -755,7 +755,7 @@ def test_a_pre_engine_failure_agrees_with_the_heartbeat(tmp_path_factory, postgr
     import json
     import uuid as _uuid
 
-    from conftest import Sandbox
+    from support.fixtures import Sandbox
 
     box = Sandbox("pre_engine", tmp_path_factory.mktemp("sbx_pre_engine"), postgres_cluster)
     try:

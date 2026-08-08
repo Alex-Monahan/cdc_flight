@@ -105,7 +105,7 @@ def test_the_advance_triggers_an_automatic_resnapshot_of_every_captured_table(ad
     # increment once per input tuple whatever happened, so the old assertion restated
     # this test's own configuration (Opus MINOR-1). It now counts `table_state` rows
     # verified to carry `awaiting_snapshot`, so the number is evidence.
-    from conftest import CAPTURED_TABLES
+    from support.fixtures import CAPTURED_TABLES
 
     assert recovery["tables_marked"] == len(CAPTURED_TABLES), recovery
     assert recovery["slot"] == "dropped", recovery
