@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from cdc_flight.apply_sql import _union_members
@@ -11,7 +13,7 @@ pytestmark = [pytest.mark.slow, pytest.mark.e2e]
 
 def test_real_postgres_type_change_keeps_old_and_new_members(sandbox):
     """The source DDL/data epoch crosses one atomic typed shadow swap."""
-    assert sandbox.source.port == 15432
+    assert sandbox.source.port == int(os.environ["CDC_TEST_PGPORT"])
     sandbox.reseed()
     initial = sandbox.run(reset_state=True, max_seconds=150, idle_seconds=6)
     assert initial["ok"] is True, initial

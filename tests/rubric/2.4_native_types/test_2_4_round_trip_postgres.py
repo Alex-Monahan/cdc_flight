@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 pytestmark = [pytest.mark.slow, pytest.mark.e2e]
@@ -9,7 +11,7 @@ pytestmark = [pytest.mark.slow, pytest.mark.e2e]
 
 def test_real_postgres_native_arrays_specials_and_obscure_text(sandbox):
     """A real schema-bearing stream reaches native nested destinations."""
-    assert sandbox.source.port == 15432
+    assert sandbox.source.port == int(os.environ["CDC_TEST_PGPORT"])
     sandbox.reseed()
     initial = sandbox.run(reset_state=True, max_seconds=150, idle_seconds=6)
     assert initial["ok"] is True, initial
@@ -41,7 +43,7 @@ def test_real_postgres_native_arrays_specials_and_obscure_text(sandbox):
     assert types["col_text_array"] == "VARCHAR[]"
     assert types["col_numeric_array"].endswith("[]")
     assert types["col_numeric_array"].startswith("UNION(")
-    assert types["col_jsonb"] == "JSON"
+    assert types["col_jsonb"] == "VARIANT"
     assert types["col_inet"] == "VARCHAR"
     assert types["col_money"] == "VARCHAR"
 

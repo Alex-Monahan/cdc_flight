@@ -25,6 +25,16 @@ from cdc_flight.typed_types import (
 )
 
 
+def test_json_and_jsonb_have_distinct_native_targets():
+    json_source = SourceTypeDescriptor(114, "pg_catalog.json", "json")
+    jsonb_source = SourceTypeDescriptor(3802, "pg_catalog.jsonb", "jsonb")
+
+    assert native_type(json_source).kind == "JSON"
+    assert native_type(json_source).sql == "JSON"
+    assert native_type(jsonb_source).kind == "VARIANT"
+    assert native_type(jsonb_source).sql == "VARIANT"
+
+
 def test_descriptor_is_recursive_and_has_stable_fingerprint():
     original = nested_matrix()[2]
     restored = SourceTypeDescriptor.from_dict(original.to_dict())
