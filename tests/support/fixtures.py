@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -391,6 +392,43 @@ class Sandbox:
     def pg_query(self, stmt: str, params: tuple | None = None) -> list[tuple]:
         with psycopg.connect(self.source.dsn, autocommit=True) as conn:
             return conn.execute(stmt, params).fetchall()
+
+    def wait_for_slot_active(
+        self,
+        *,
+        process: subprocess.Popen | None = None,
+        timeout: float = 30.0,
+        poll_seconds: float = 0.1,
+    ) -> None:
+        """Wait until this sandbox's live pipeline owns its replication slot.
+
+        A live-discovery scenario must issue its DDL after the main engine has
+        connected; otherwise the same assertions could accidentally exercise
+        restart-time discovery.  Polling ``pg_replication_slots.active`` is the
+        predicate that proves that condition.  The catalog watcher is started
+        before the engine in the pipeline, and the scenario separately waits for
+        its throwaway snapshot slot to start and retire, so this replaces only
+        the old arbitrary startup sleep.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            if process is not None and process.poll() is not None:
+                raise AssertionError(
+                    "live-discovery pipeline exited before its main replication slot "
+                    f"became active (returncode={process.returncode})"
+                )
+            if self.pg_query(
+                "SELECT 1 FROM pg_replication_slots "
+                "WHERE slot_name = %s AND active",
+                (self.slot,),
+            ):
+                return
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"replication slot {self.slot!r} did not become active within "
+                    f"{timeout:.1f}s"
+                )
+            time.sleep(poll_seconds)
 
     # -- pipeline ----------------------------------------------------------- #
     def run(self, *, extra_env: dict[str, str] | None = None, **kwargs) -> dict:

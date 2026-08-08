@@ -52,6 +52,11 @@ PYTEST_XDIST_ARGS ?= -n $(PYTEST_WORKERS) --dist=loadscope --max-worker-restart=
 # the post-change run; eight/ten workers exposed timing-proof and DuckDB failures.
 PYTEST_SLOW_WORKERS ?= 6
 PYTEST_SLOW_XDIST_ARGS ?= -n $(PYTEST_SLOW_WORKERS) --dist=loadscope --max-worker-restart=0
+# MotherDuck scenarios use UUID-named datasets, but the cloud catalog and its
+# connections are still shared. Two workers stayed green; four exposed a real
+# constraint-observation failure under concurrent catalog activity.
+PYTEST_MD_WORKERS ?= 2
+PYTEST_MD_XDIST_ARGS ?= -n $(PYTEST_MD_WORKERS) --dist=loadscope --max-worker-restart=0
 
 .DEFAULT_GOAL := help
 
@@ -145,7 +150,7 @@ test-all: ## run everything: MotherDuck smoke test + slow fault injection
 
 .PHONY: test-md
 test-md: ## run only the MotherDuck tests
-	$(UV) run pytest -m motherduck --durations=20
+	$(UV) run pytest $(PYTEST_MD_XDIST_ARGS) -m motherduck --durations=20
 
 .PHONY: test-slow
 test-slow: ## run only the slow fault-injection tests (real SIGKILL, big loads)
