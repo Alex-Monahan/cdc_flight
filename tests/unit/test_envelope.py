@@ -20,6 +20,25 @@ from cdc_flight.envelope import (
     KIND_TXN_END,
     decode,
 )
+
+
+def test_schema_enabled_envelope_and_key_retain_connect_descriptors():
+    from support.typed_events import schema_enabled_event, schema_enabled_key
+
+    record = FakeEvent(
+        topic="cdc.app.typed_rows",
+        value=schema_enabled_event(value="__debezium_unavailable_value"),
+        key=schema_enabled_key(),
+    )
+    decoded = decode(record, topic_prefix="cdc")
+
+    assert decoded.after == {"id": 1, "payload": "__debezium_unavailable_value"}
+    assert decoded.after_descriptors["id"].kind == "int4"
+    assert decoded.after_descriptors["payload"].kind == "text"
+    assert decoded.key_descriptors["id"].kind == "int4"
+    # The 2.6 marker identity gate is deliberately not inferred here: an ordinary
+    # source string equal to the configured token remains a normal VALUE.
+    assert decoded.typed_after.field("payload").state.value == "value"
 from cdc_flight.errors import EnvelopeDecodeError
 
 TOPIC_PREFIX = "cdcflight"

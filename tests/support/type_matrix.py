@@ -37,6 +37,11 @@ def scalar_matrix() -> tuple[SourceTypeDescriptor, ...]:
         descriptor("interval", oid=1186),
         descriptor("uuid", oid=2950),
         descriptor("jsonb", oid=3802),
+        descriptor("numeric", oid=1700, precision=12, scale=4),
+        descriptor("numeric", oid=1700, precision=50, scale=8),
+        descriptor("enum", oid=9100, kind="enum", enum_labels=("pending", "paid")),
+        descriptor("inet", oid=869),
+        descriptor("money", oid=790),
     )
 
 
@@ -47,6 +52,12 @@ def nested_matrix() -> tuple[SourceTypeDescriptor, ...]:
         ("id", integer),
         ("label", text),
     ))
+    domain_array = descriptor(
+        "app.int_list_domain",
+        oid=9200,
+        kind="domain",
+        domain_base=descriptor("_int4", oid=1007, kind="array", array_element=integer),
+    )
     return (
         descriptor("_int4", oid=1007, kind="array", array_element=integer),
         descriptor("_int4", oid=1007, kind="array", array_element=descriptor(
@@ -54,5 +65,5 @@ def nested_matrix() -> tuple[SourceTypeDescriptor, ...]:
         )),
         descriptor("hstore", oid=9999, kind="map", map_key=text, map_value=text),
         item,
+        domain_array,
     )
-

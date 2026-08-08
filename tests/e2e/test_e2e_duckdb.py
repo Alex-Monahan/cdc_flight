@@ -74,14 +74,15 @@ def test_baseline_end_to_end(fresh_seed, run_pipeline, generate_changes, duck, d
         names = {r[0] for r in _rows(con, dataset, "cdcflight_app_customers", "name")}
         assert "Ada Lovelace" in names
 
-        # Arrays are a JSON column now, not a dlt child table.
+        # Arrays are native DuckDB LIST columns, not JSON or child tables.
         assert "cdcflight_app_customers__tags" not in landed
         tags_type = con.execute(
             "SELECT data_type FROM information_schema.columns WHERE table_schema = ? "
             "AND table_name = 'cdcflight_app_customers' AND column_name = 'tags'",
             [dataset],
         ).fetchone()[0]
-        assert tags_type == "JSON", tags_type
+        assert tags_type.endswith("[]"), tags_type
+        assert tags_type != "JSON", tags_type
     finally:
         con.close()
 
@@ -183,23 +184,16 @@ def test_commit_log_accounts_for_the_whole_run(fresh_seed, run_pipeline, generat
         con.close()
 
 
-def test_documented_type_gaps(fresh_seed, run_pipeline, generate_changes, duck, dataset):
-    """Pin the *known* type-mapping weaknesses so rubric 2.4 can prove it closed them.
-
-    These are deliberately still open: ADR 0001 D5 lands the full envelope here,
-    but keeps `value.converter.schemas.enable=false`, so the Connect schema that
-    carries the semantic type (`io.debezium.time.Date`,
-    `org.apache.kafka.connect.data.Decimal`) is still not available. Turning it on
-    inflates every payload 3-5x, which ADR §5.1 flags as an unmeasured throughput
-    risk owned by rubric 5.3. If one of these starts failing, something improved.
-    """
+def test_native_types_round_trip(fresh_seed, run_pipeline, generate_changes, duck, dataset):
+    """The source catalog drives native destination types and special values."""
     run_pipeline(reset_state=True, max_seconds=120, idle_seconds=6)
     generate_changes(scale=1, seed=7)
     run_pipeline(max_seconds=120, idle_seconds=6)
 
     con = duck()
     try:
-        # GAP (rubric 2.6): unchanged TOAST columns arrive as a placeholder string.
+        # Rubric 2.6 remains deliberately unchanged: this is still the ordinary
+        # configured Debezium placeholder, with no marker identity interpretation here.
         toast = con.execute(
             f'SELECT count(*) FROM "{dataset}"."cdcflight_app_documents" '
             f"WHERE body = '{TOAST_PLACEHOLDER}'"
@@ -213,19 +207,28 @@ def test_documented_type_gaps(fresh_seed, run_pipeline, generate_changes, duck, 
                 [dataset],
             ).fetchall()
         )
-        # GAP (rubric 2.4): numeric arrives base64-encoded, dates as raw integers.
-        assert types["col_numeric"] == "VARCHAR", types["col_numeric"]
-        assert types["col_date"] == "BIGINT"
-        assert types["col_interval"] == "BIGINT"
-        # GAP (rubric 2.4): timestamptz arrives as an ISO string. The baseline
-        # mapped it natively only because dlt *inferred* from the value; the
-        # applier deliberately does not infer, so this is a knowing regression
-        # that 2.4 fixes properly from the Connect schema.
-        assert types["col_timestamptz"] == "VARCHAR"
-        # IMPROVEMENT over the baseline: the all-NaN numeric column no longer
-        # disappears (dlt dropped it), and arrays are native JSON.
+        assert types["col_numeric"].startswith("UNION("), types["col_numeric"]
+        assert "DECIMAL(30,10)" in types["col_numeric"], types["col_numeric"]
+        assert types["col_numeric_nan"].startswith("STRUCT("), types["col_numeric_nan"]
+        assert types["col_date"] == "DATE"
+        assert types["col_interval"] == "INTERVAL"
+        assert "TIMESTAMP" in types["col_timestamptz"]
         assert "col_numeric_nan" in types
-        assert types["col_int_array"] == "JSON"
+        assert types["col_int_array"] == "INTEGER[]"
+        assert types["col_numeric_array"].endswith("[]")
+        assert types["col_numeric_array"].startswith("UNION(")
+        assert types["col_enum"].startswith("ENUM(")
+        assert types["col_point"].startswith("STRUCT(")
+        assert types["col_int4range"].startswith("STRUCT(")
+        values = con.execute(
+            f'SELECT col_numeric_nan, col_double_inf, col_double_nan '
+            f'FROM "{dataset}"."cdcflight_app_wide_types"'
+        ).fetchone()
+        assert values[0]["special"] != 0 or values[0]["coefficient"] is None
+        assert con.execute(
+            f'SELECT isinf(col_double_inf), isnan(col_double_nan) '
+            f'FROM "{dataset}"."cdcflight_app_wide_types"'
+        ).fetchone() == (True, True)
     finally:
         con.close()
 

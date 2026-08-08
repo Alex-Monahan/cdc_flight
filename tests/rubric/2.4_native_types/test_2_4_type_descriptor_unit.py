@@ -5,8 +5,14 @@ from __future__ import annotations
 from datetime import date, datetime, time
 from decimal import Decimal
 
+import duckdb
 import pytest
+from support.type_matrix import nested_matrix, scalar_matrix
 
+from cdc_flight.apply_sql import SchemaRegistry, insert_rows
+from cdc_flight.control_schema import ensure_control_schema
+from cdc_flight.envelope import KIND_DATA, PendingRecord
+from cdc_flight.spill import SpillBuffer, StagedEvent
 from cdc_flight.typed_types import (
     FieldState,
     FieldValue,
@@ -17,7 +23,6 @@ from cdc_flight.typed_types import (
     native_type,
     numeric_value,
 )
-from support.type_matrix import nested_matrix, scalar_matrix
 
 
 def test_descriptor_is_recursive_and_has_stable_fingerprint():
@@ -85,7 +90,147 @@ def test_typed_image_distinguishes_null_from_absent_and_round_trips():
     assert FieldValue.unchanged_toast().state is FieldState.UNCHANGED_TOAST
 
 
+def test_typed_spill_round_trip_preserves_descriptor_and_raw_toast_like_string():
+    con = duckdb.connect()
+    ensure_control_schema(con)
+    integer = SourceTypeDescriptor(oid=23, qualified_name="pg_catalog.int4", kind="int4")
+    text = SourceTypeDescriptor(oid=25, qualified_name="pg_catalog.text", kind="text")
+    placeholder = "__debezium_unavailable_value"
+    event = PendingRecord(
+        raw=object(),
+        kind=KIND_DATA,
+        topic="app.events",
+        nbytes=1,
+        op="u",
+        schema="app",
+        table="events",
+        lsn=11,
+        txn_id="7",
+        total_order=1,
+        key={"id": 1},
+        before={"id": 1, "payload": placeholder},
+        after={"id": 1, "payload": placeholder},
+        key_descriptors={"id": integer},
+        before_descriptors={"id": integer, "payload": text},
+        after_descriptors={"id": integer, "payload": text},
+        typed_key=TypedImage.from_mapping({"id": 1}, {"id": integer}),
+        typed_before=TypedImage.from_mapping(
+            {"id": 1, "payload": placeholder},
+            {"id": integer, "payload": text},
+        ),
+        typed_after=TypedImage.from_mapping(
+            {"id": 1, "payload": placeholder},
+            {"id": integer, "payload": text},
+        ),
+    )
+    spill = SpillBuffer(con)
+    spill.stage(
+        commit_id=1,
+        unit_seq=1,
+        prepared=[StagedEvent(event=event, event_id="11:7:1", target="events", seq=1)],
+    )
+    restored = spill.load(commit_id=1, unit_seq=1)[0].event
+
+    assert restored.after == event.after
+    assert restored.typed_after is not None
+    assert restored.typed_after.field("payload").state is FieldState.VALUE
+    assert restored.typed_after.field("payload").value == placeholder
+    assert restored.after_descriptors["id"].fingerprint == integer.fingerprint
+    assert restored.after_descriptors["payload"].fingerprint == text.fingerprint
+
+
 def test_unknown_types_fail_closed_instead_of_becoming_text():
     with pytest.raises(UnsupportedType):
         native_type(SourceTypeDescriptor(oid=999999, qualified_name="ext.secret", kind="unknown"))
 
+
+def test_recursive_struct_map_and_numeric_union_write_native_values():
+    con = duckdb.connect()
+    con.execute("CREATE SCHEMA d")
+    registry = SchemaRegistry(con, "d")
+    integer = SourceTypeDescriptor(23, "pg_catalog.int4", "int4")
+    text = SourceTypeDescriptor(25, "pg_catalog.text", "text")
+    bounded_numeric = SourceTypeDescriptor(
+        1700, "pg_catalog.numeric", "numeric", precision=12, scale=4
+    )
+    row = SourceTypeDescriptor(
+        9000,
+        "app.row_type",
+        "composite",
+        composite_fields=(("n", integer), ("amount", bounded_numeric)),
+    )
+    attrs = SourceTypeDescriptor(
+        9001, "public.hstore", "map", map_key=text, map_value=text
+    )
+    registry.ensure_typed(
+        "native_rows",
+        columns={"id": integer, "payload": row, "attrs": attrs},
+        key_columns=("id",),
+    )
+    insert_rows(
+        con,
+        registry.get("native_rows"),
+        ["id", "payload", "attrs"],
+        [[1, {"n": 7, "amount": "12.3400"}, {"site": "hq", "tier": None}]],
+    )
+
+    types = dict(
+        con.execute(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_schema = 'd' AND table_name = 'native_rows'"
+        ).fetchall()
+    )
+    assert types["payload"].startswith("STRUCT(")
+    assert "JSON" not in types["payload"].upper()
+    assert types["attrs"].startswith("MAP(")
+    assert con.execute(
+        "SELECT payload.n, union_tag(payload.amount), attrs['site'], attrs['tier'] "
+        "FROM d.native_rows"
+    ).fetchone() == (7, "finite", "hq", None)
+
+
+def test_keyless_event_identity_remains_the_destination_primary_key():
+    con = duckdb.connect()
+    con.execute("CREATE SCHEMA d")
+    registry = SchemaRegistry(con, "d")
+    text = SourceTypeDescriptor(25, "pg_catalog.text", "text")
+    registry.ensure_typed(
+        "changelog",
+        columns={"cdcf_event_id": "VARCHAR", "value": text},
+        key_columns=("cdcf_event_id",),
+    )
+    assert registry.get("changelog").primary_key_columns == ("cdcf_event_id",)
+
+
+def test_bounded_numeric_null_and_specials_are_explicitly_tagged():
+    con = duckdb.connect()
+    con.execute("CREATE SCHEMA d")
+    registry = SchemaRegistry(con, "d")
+    integer = SourceTypeDescriptor(23, "pg_catalog.int4", "int4")
+    numeric = SourceTypeDescriptor(
+        1700, "pg_catalog.numeric", "numeric", precision=12, scale=4
+    )
+    registry.ensure_typed("numbers", columns={"id": integer, "value": numeric}, key_columns=("id",))
+    insert_rows(
+        con,
+        registry.get("numbers"),
+        ["id", "value"],
+        [[1, None], [2, "NaN"], [3, "Infinity"], [4, "-Infinity"], [5, "1.2500"]],
+    )
+    rows = con.execute(
+        "SELECT id, union_tag(value), value FROM d.numbers ORDER BY id"
+    ).fetchall()
+    assert [(row[0], row[1]) for row in rows] == [
+        (1, "finite"),
+        (2, "special"),
+        (3, "special"),
+        (4, "special"),
+        (5, "finite"),
+    ]
+    assert rows[0][2] is None
+    assert rows[4][2] == Decimal("1.2500")
+    assert con.execute(
+        "SELECT isnan(value.special), isinf(value.special), "
+        "isinf(value.special) AND value.special < 0 FROM d.numbers "
+        "WHERE id IN (2, 3, 4) ORDER BY id"
+    ).fetchall() == [(True, False, False), (False, True, False), (False, True, True)]

@@ -175,7 +175,7 @@ def test_the_moved_row_keeps_the_values_it_had_after_the_move(pk_scenario):
     rows = box.duck_query(
         f"SELECT name, tags FROM {box.table(CUSTOMERS)} WHERE id = 9001"
     )
-    assert rows == [("Renamed", '["moved"]')]
+    assert rows == [("Renamed", ["moved"])]
 
 
 def test_a_deferred_key_permutation_lands_both_rows(pk_scenario):
@@ -231,7 +231,7 @@ def test_a_key_update_on_a_table_with_an_array_column_stays_one_table(pk_scenari
     """`app.customers.tags` is `text[]`.
 
     ADR §7 note 1 anticipates child tables (`<root>__tags`) for arrays; this applier
-    lands an array as one JSON column instead, so a PK update touches exactly one
+    lands an array as one native LIST column instead, so a PK update touches exactly one
     destination table. Asserted rather than assumed, because "the row must move in
     every child table too" is a real 1.4 failure mode the moment child tables exist.
     """
@@ -249,7 +249,7 @@ def test_a_key_update_on_a_table_with_an_array_column_stays_one_table(pk_scenari
             [box.DATASET, CUSTOMERS],
         )
     )
-    assert types == {"tags": "JSON"}
+    assert types == {"tags": "VARCHAR[]"}
 
 
 def test_the_run_reported_no_error(pk_scenario):
