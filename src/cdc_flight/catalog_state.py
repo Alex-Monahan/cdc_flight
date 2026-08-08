@@ -70,6 +70,17 @@ class SourceRelation:
     def qualified(self) -> str:
         return f"{self.schema}.{self.table}"
 
+    @property
+    def toast_policy(self):
+        """Current-runtime TOAST route for this catalog epoch."""
+        from .toast import classify_relation
+
+        return classify_relation(
+            self.qualified,
+            self.columns,
+            replica_identity=self.replica_identity,
+        )
+
 
 @dataclass
 class CatalogChange:
@@ -206,6 +217,7 @@ def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
                 missing_value=_missing_value(
                     raw.get("missing_value_text"), str(raw["type_name"])
                 ),
+                attstorage=(str(raw["attstorage"]) if raw.get("attstorage") else None),
                 descriptor=(
                     SourceTypeDescriptor.from_dict(raw["descriptor"])
                     if raw.get("descriptor")

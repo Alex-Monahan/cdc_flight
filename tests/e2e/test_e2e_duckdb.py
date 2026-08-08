@@ -192,13 +192,18 @@ def test_native_types_round_trip(fresh_seed, run_pipeline, generate_changes, duc
 
     con = duck()
     try:
-        # Rubric 2.6 remains deliberately unchanged: this is still the ordinary
-        # configured Debezium placeholder, with no marker identity interpretation here.
+        # Gate2 structural-marker handling keeps the real TOAST body in place; the
+        # legacy printable token must never be materialised as the destination value.
         toast = con.execute(
             f'SELECT count(*) FROM "{dataset}"."cdcflight_app_documents" '
             f"WHERE body = '{TOAST_PLACEHOLDER}'"
         ).fetchone()[0]
-        assert toast >= 1, "expected at least one unchanged-TOAST placeholder"
+        assert toast == 0, "the legacy printable token is not a TOAST disposition"
+        body = con.execute(
+            f'SELECT body FROM "{dataset}"."cdcflight_app_documents" '
+            "WHERE title = 'gen-doc-7-0'"
+        ).fetchone()
+        assert body is not None and body[0] is not None and len(body[0]) > 10_000
 
         types = dict(
             con.execute(

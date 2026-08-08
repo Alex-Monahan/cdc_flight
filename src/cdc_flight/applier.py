@@ -104,6 +104,7 @@ class Applier:
         watermarks: dict[str, int] | None = None,
         completion: SnapshotCompletion | None = None,
         snapshot_audit=None, descriptor_provider=None,
+        binary_handling_mode: str = "base64", hstore_handling_mode: str = "map",
     ):
         self.con = con
         self.pipeline = pipeline
@@ -121,6 +122,7 @@ class Applier:
         #: (rubric 1.5): logical decoding does not carry DDL at all.
         self.catalog = catalog
         self.descriptor_provider = descriptor_provider
+        self.binary_handling_mode, self.hstore_handling_mode = str(binary_handling_mode), str(hstore_handling_mode)
         #: rubric 1.6: `"<schema>.<table>" -> snapshot_lsn`. A source transaction whose
         #: **commit** LSN is below a table's watermark is already inside that table's
         #: snapshot image, so its events for that table are dropped. Per table, because
@@ -128,9 +130,7 @@ class Applier:
         #: transaction that straddles the consistent point is in no image at all and
         #: must be applied in full (`cdc_flight.resnapshot`).
         self.watermarks: dict[str, int] = dict(watermarks or {})
-        #: The one owner of this invocation's snapshot completion state. The default
-        #: keeps the in-process laboratory's full-snapshot behaviour; production callers
-        #: pass the policy selected during acquisition.
+        #: The one owner of this invocation's snapshot completion state; production callers pass the acquisition policy.
         self.snapshot_completion = completion or SnapshotCompletion.full_snapshot()
         #: the consistent point of the snapshot this run applied, if any
         self.last_snapshot_lsn: int | None = None
@@ -155,9 +155,7 @@ class Applier:
         #: NEXT batch, so it outlives the group it belongs to (Codex 7).
         self._pending_verification: tuple | None = None
 
-        # ADR §3.5 / D7, §3.4, the fold and the catalog policy all live in their own
-        # modules (ADR §15/A29, §18/A37): every blocker of the last two review rounds
-        # was a consequence of two paths doing one job inside one file.
+        # ADR §3.5 / D7: the fold and catalog policy live in dedicated modules.
         self.snapshots = SnapshotCoordinator(
             con,
             dataset=dataset,
@@ -170,7 +168,7 @@ class Applier:
             transactional_ddl=transactional_ddl,
             on_swap=snapshot_audit,
         )
-        self.spill = SpillBuffer(con)
+        self.spill = SpillBuffer(con, binary_mode=self.binary_handling_mode, hstore_mode=self.hstore_handling_mode)
         self.alerts = AlertSink(con, pipeline=pipeline)
         # rubric 1.9: an illegal table-lifecycle transition must reach an operator, and
         # the only connection that survives this group's rollback is the sink's.

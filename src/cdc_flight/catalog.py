@@ -149,6 +149,8 @@ class CatalogWatcher:
         grace_seconds: float = 0.0,
         confirm_polls: int = 2,
         marker_max_writes: int | None = 60,
+        binary_handling_mode: str = "base64",
+        hstore_handling_mode: str = "map",
     ):
         self.dsn = dsn
         # Catalog queries may use a hot standby, but publication admission and
@@ -206,6 +208,8 @@ class CatalogWatcher:
         self.marker = marker_mod.SourceMarker(
             prefix=marker_prefix, enabled=emit_marker, max_writes=marker_max_writes
         )
+        self.binary_handling_mode = str(binary_handling_mode)
+        self.hstore_handling_mode = str(hstore_handling_mode)
 
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -383,6 +387,22 @@ class CatalogWatcher:
                 for column in relation.columns
                 if column.descriptor is not None
             }
+
+    def toast_policy_for(self, qualified: str):
+        """Return the table-scoped marker/fallback route for the latest epoch."""
+        from .toast import classify_relation
+
+        with self._lock:
+            relation = self.known.get(str(qualified))
+            if relation is None:
+                return None
+            return classify_relation(
+                relation.qualified,
+                relation.columns,
+                replica_identity=relation.replica_identity,
+                binary_mode=self.binary_handling_mode,
+                hstore_mode=self.hstore_handling_mode,
+            )
 
     def snapshot_names(self) -> tuple[str, ...]:
         """Logical relations whose snapshot callbacks are expected at startup.

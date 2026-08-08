@@ -345,6 +345,8 @@ class LiveDiscoveryCoordinator:
             catalog=self.watcher,
             watermarks=self.watermarks,
             completion=completion,
+            binary_handling_mode=self.props.get("binary.handling.mode", "base64"),
+            hstore_handling_mode=self.props.get("hstore.handling.mode", "map"),
         )
         self.ownership.attach(applier)
         return applier

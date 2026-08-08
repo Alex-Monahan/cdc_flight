@@ -55,6 +55,9 @@ class SourceColumn:
     #: supersedes the legacy OID/name pair for type identity.
     descriptor: SourceTypeDescriptor | None = None
     typmod: int | None = None
+    #: PostgreSQL ``pg_attribute.attstorage``.  ``p`` is the only column-level
+    #: exclusion from the TOAST classification; table ``reltoastrelid`` is not.
+    attstorage: str | None = None
 
     def __post_init__(self) -> None:
         if self.descriptor is None:

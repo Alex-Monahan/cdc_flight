@@ -129,6 +129,15 @@ class AmbiguousDelete(RuntimeError):
         self.target = target
 
 
+class ToastBaseMissing(AmbiguousDelete):
+    """A sparse TOAST patch has no verified physical row to update.
+
+    This is deliberately an ``AmbiguousDelete`` subclass so the existing automatic
+    recovery path queues the table-scoped refetch/resnapshot and never turns a
+    missing sparse base into a manual repair or a fabricated NULL/value.
+    """
+
+
 class DestinationIdentityCollision(RuntimeError):
     """Two destination rows share one identity (ADR 0001 §15/A21, Opus M-2).
 

@@ -27,8 +27,10 @@ from . import apply_sql, destination, naming, table_work
 from .assembler import UNIT_CONTROL, UNIT_SNAPSHOT_CHUNK, CompleteUnit
 from .config import TRUNCATE_IGNORE, TRUNCATE_REPLICATE
 from .envelope import KIND_TRUNCATE, PendingRecord
+from .errors import ToastBaseMissing
 from .snapshot import SnapshotTable
 from .table_work import TableWork
+from .toast import ToastRoute
 
 log = logging.getLogger("cdc_flight.planner")
 
@@ -53,6 +55,9 @@ class GroupPlan:
         created_in_txn: set[str],
         watermarks: dict[str, int] | None = None,
         descriptor_provider=None,
+        toast_policy_provider=None,
+        binary_handling_mode: str = "base64",
+        hstore_handling_mode: str = "map",
     ):
         self.con = con
         self.commit_id = commit_id
@@ -66,7 +71,16 @@ class GroupPlan:
         #: rubric 1.6, per-table snapshot watermarks. See `add_unit`.
         self.watermarks = watermarks or {}
         self.descriptor_provider = descriptor_provider
+        self.toast_policy_provider = toast_policy_provider
+        self.binary_handling_mode = binary_handling_mode
+        self.hstore_handling_mode = hstore_handling_mode
         self.watermark_fenced_events = 0
+        #: A GroupPlan is built within one catalog/schema epoch.  Policy admission is
+        #: catalog work, so classify each source relation once rather than taking the
+        #: watcher lock and rebuilding the column matrix for every row in a large
+        #: transaction.
+        self._toast_policy_cache: dict[str, object] = {}
+        self._catalog_descriptor_cache: dict[str, dict] = {}
 
         self.work: dict[str, TableWork] = {}
         self.stats: dict = {
@@ -86,7 +100,7 @@ class GroupPlan:
         self.created_tables: dict[str, tuple[str, str]] = {}
         #: source-image field presence for the late-rename NULL distinction.  Written
         #: in the same destination transaction as the row plan.
-        self.column_presence: list[tuple[str, str, tuple[str, ...]]] = []
+        self.column_presence: list[tuple[str, str, tuple[str, ...], str]] = []
         self.truncates_applied = 0
         self.truncates_logged = 0
         self.staged_units = False
@@ -210,40 +224,82 @@ class GroupPlan:
                 else stream_event_id(event)
             )
         self._enrich_descriptors(event)
+        if self.toast_policy_provider is not None and snapshot is None:
+            policy = self._toast_policy_cache.get(event.qualified_table)
+            if policy is None:
+                policy = self.toast_policy_provider(event.qualified_table)
+                self._toast_policy_cache[event.qualified_table] = policy
+            if policy is not None and policy.route is ToastRoute.FALLBACK:
+                raise ToastBaseMissing(
+                    f"{event.qualified_table}: residual TOAST column(s) have no "
+                    "verified REPLICA IDENTITY FULL; automatic refetch/resnapshot "
+                    "is required before admitting row events",
+                    source_schema=event.schema,
+                    source_table=event.table,
+                    target=target,
+                )
         item = table_work.work_for(self.work, target, event, snapshot is not None)
-        row = table_work.row_for(event, self.commit_id, event_id, snapshot=item.snapshot)
-        table_work.collect(item, event, row, event_id, probe=self)
-        image = event.after if event.op != "d" else event.before
-        self.column_presence.append(
-            (
-                target,
-                event_id,
-                tuple(sorted(naming.normalize(column) for column in (image or {}))),
-            )
+        patch = table_work.patch_for(
+            event,
+            self.commit_id,
+            event_id,
+            snapshot=item.snapshot,
+            binary_mode=self.binary_handling_mode,
+            hstore_mode=self.hstore_handling_mode,
         )
+        row = patch.encoded_values()
+        table_work.collect(item, event, row, event_id, probe=self, patch=patch)
+        image = event.after if event.op != "d" else event.before
+        # Complete INSERT/snapshot images cannot create the late-rename NULL vs
+        # ABSENT ambiguity; only sparse images need the durable presence journal.
+        # Their RowPatch digest still includes every field disposition, including
+        # unchanged-TOAST, and is written atomically with the update.
+        if not patch.complete:
+            self.column_presence.append(
+                (
+                    target,
+                    event_id,
+                    tuple(sorted(naming.normalize(column) for column in (image or {}))),
+                    patch.digest,
+                )
+            )
         self.source_tables.add(f"{event.schema}.{event.table}")
 
     def _enrich_descriptors(self, event: PendingRecord) -> None:
         """Merge one memoized catalog descriptor map into a row envelope."""
         if self.descriptor_provider is None or not event.qualified_table:
             return
-        try:
-            catalog_descriptors = self.descriptor_provider(event.qualified_table)
-        except Exception:
-            # The catalog watcher is an observation aid, not a second transaction
-            # boundary.  A missing map leaves the schema-enabled envelope path in
-            # charge; the strict resolver still refuses an actually unsupported type.
-            log.debug("could not obtain catalog descriptors for %s", event.qualified_table, exc_info=True)
-            return
+        qualified = event.qualified_table
+        if qualified not in self._catalog_descriptor_cache:
+            try:
+                catalog_descriptors = self.descriptor_provider(qualified)
+            except Exception:
+                # The catalog watcher is an observation aid, not a second transaction
+                # boundary.  A missing map leaves the schema-enabled envelope path in
+                # charge; the strict resolver still refuses an actually unsupported type.
+                log.debug("could not obtain catalog descriptors for %s", qualified, exc_info=True)
+                catalog_descriptors = {}
+            self._catalog_descriptor_cache[qualified] = dict(catalog_descriptors or {})
+        catalog_descriptors = self._catalog_descriptor_cache[qualified]
         if not catalog_descriptors:
             return
         for attribute in ("key_descriptors", "before_descriptors", "after_descriptors"):
             descriptors = getattr(event, attribute)
+            if len(descriptors) >= len(catalog_descriptors) and all(
+                name in descriptors
+                and descriptors[name].fingerprint == descriptor.fingerprint
+                for name, descriptor in catalog_descriptors.items()
+            ):
+                continue
             for name, descriptor in catalog_descriptors.items():
                 # The source catalog is authoritative for physical PostgreSQL
                 # identity and typmod.  Connect may intentionally flatten a value
                 # to STRING (decimal/interval) while retaining no logical name.
-                descriptors[name] = descriptor
+                if (
+                    name not in descriptors
+                    or descriptors[name].fingerprint != descriptor.fingerprint
+                ):
+                    descriptors[name] = descriptor
 
     def _count_event(self, event: PendingRecord) -> None:
         """Group-level bookkeeping every event contributes to, whatever it is.
@@ -406,8 +462,8 @@ class GroupPlan:
                 )
 
         presence_rows = [
-            (self.registry.dataset, target, event_id, column, True)
-            for target, event_id, columns in self.column_presence
+            (self.registry.dataset, target, event_id, column, True, digest)
+            for target, event_id, columns, digest in self.column_presence
             for column in columns
         ]
         destination.write_column_presence_batch(self.con, presence_rows)

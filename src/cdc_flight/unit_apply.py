@@ -44,6 +44,21 @@ def apply_units(
                 else None
             )
         ),
+        toast_policy_provider=(
+            getattr(applier.catalog, "toast_policy_for", None)
+            if applier.catalog is not None
+            else None
+        ),
+        binary_handling_mode=(
+            getattr(applier.catalog, "binary_handling_mode", applier.binary_handling_mode)
+            if applier.catalog is not None
+            else applier.binary_handling_mode
+        ),
+        hstore_handling_mode=(
+            getattr(applier.catalog, "hstore_handling_mode", applier.hstore_handling_mode)
+            if applier.catalog is not None
+            else applier.hstore_handling_mode
+        ),
     )
     for unit in group:
         if unit.fenced:

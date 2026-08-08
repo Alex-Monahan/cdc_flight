@@ -161,6 +161,7 @@ CONTROL_DDL = [
             event_id        VARCHAR NOT NULL,
             column_name     VARCHAR NOT NULL,
             present         BOOLEAN NOT NULL,
+            patch_digest    VARCHAR,
             PRIMARY KEY (target_dataset, target_table, event_id, column_name)
         )""",
     # A schema fold can be safely refused but must not become an infinite invisible
@@ -381,6 +382,9 @@ _ADDED_COLUMNS = {
         # application/state-machine boundary is the invariant for already-created
         # destinations whose additive column is necessarily nullable.
         ("admission_state", "VARCHAR"),
+    ),
+    "column_presence": (
+        ("patch_digest", "VARCHAR"),
     ),
 }
 

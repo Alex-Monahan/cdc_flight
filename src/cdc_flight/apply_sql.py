@@ -1167,14 +1167,26 @@ def delete_keys(con, table: TableSchema, key_columns: tuple[str, ...], keys: lis
         defs = ", ".join(f"{quote(c)} {t}" for c, t in zip(key_columns, types, strict=True))
         con.execute(f"CREATE OR REPLACE TEMP TABLE {staging} ({defs})")
         if table.native_types and any(column in table.native_types for column in key_columns):
-            insert_typed_rows(
-                con,
-                table,
-                list(key_columns),
-                [list(k) for k in keys],
-                [table.native_types.get(column) for column in key_columns],
-                target=staging,
+            key_rows = [list(k) for k in keys]
+            native_types = [table.native_types.get(column) for column in key_columns]
+            from .typed_types import UnionValue
+
+            arrow_safe = all(
+                _arrow_native_supported(native, native.sql if native is not None else types[index])
+                and all(not _contains_union(row[index], UnionValue) for row in key_rows)
+                for index, native in enumerate(native_types)
             )
+            if arrow_safe:
+                bulk_insert(con, staging, list(key_columns), key_rows, types)
+            else:
+                insert_typed_rows(
+                    con,
+                    table,
+                    list(key_columns),
+                    key_rows,
+                    native_types,
+                    target=staging,
+                )
         else:
             bulk_insert(con, staging, list(key_columns), [list(k) for k in keys], types)
         con.execute(
@@ -1209,6 +1221,96 @@ def _key_parameter(value: Any, table: TableSchema, column: str) -> tuple[str, li
     return "?", [value]
 
 
+def update_rows(
+    con,
+    table: TableSchema,
+    key_columns: tuple[str, ...],
+    updates: list[tuple[tuple, dict[str, Any]]],
+) -> int | None:
+    """Apply sparse row patches without materialising unchanged columns.
+
+    Each item is ``(source_key, assignments)``.  Rows with the same assignment
+    shape share one parameterised ``UPDATE .. FROM (VALUES ...)`` statement; a
+    physical key move simply includes the new key in ``assignments`` while the
+    old key remains ``source_key``.  ``RETURNING`` makes a missing destination
+    base observable, which is required before accepting a sparse update.
+    """
+    if not updates:
+        return 0
+    if not key_columns:
+        raise ValueError("sparse updates require at least one identity column")
+
+    groups: dict[tuple[str, ...], list[tuple[tuple, dict[str, Any]]]] = {}
+    for source_key, assignments in updates:
+        shape = tuple(sorted(str(column) for column in assignments))
+        if not shape:
+            continue
+        groups.setdefault(shape, []).append((tuple(source_key), assignments))
+
+    affected = 0
+    for assignment_columns, group in groups.items():
+        source_aliases = tuple(f"__cdcf_src_{index}" for index in range(len(key_columns)))
+        assignment_aliases = tuple(
+            f"__cdcf_set_{index}" for index in range(len(assignment_columns))
+        )
+        aliases = source_aliases + assignment_aliases
+        alias_sql = ", ".join(quote(alias) for alias in aliases)
+        predicate = " AND ".join(
+            f"t.{quote(column)} IS NOT DISTINCT FROM v.{quote(alias)}"
+            for column, alias in zip(key_columns, source_aliases, strict=True)
+        )
+        set_sql = ", ".join(
+            f"{quote(column)} = v.{quote(alias)}"
+            for column, alias in zip(assignment_columns, assignment_aliases, strict=True)
+        )
+
+        value_rows: list[str] = []
+        params: list[Any] = []
+
+        def flush(
+            *,
+            rows=value_rows,
+            bound=params,
+            update_sql=set_sql,
+            values_alias_sql=alias_sql,
+            where_sql=predicate,
+        ) -> None:
+            nonlocal affected
+            if not rows:
+                return
+            result = con.execute(
+                f"UPDATE {table.qualified} AS t SET {update_sql} FROM "
+                f"(VALUES {', '.join(rows)}) AS v({values_alias_sql}) "
+                f"WHERE {where_sql} RETURNING 1",
+                bound,
+            )
+            returned = result.fetchall()
+            affected += len(returned)
+            rows.clear()
+            bound.clear()
+
+        for source_key, assignments in group:
+            expressions: list[str] = []
+            row_params: list[Any] = []
+            for column, value in zip(key_columns, source_key, strict=True):
+                expression, bound = _key_parameter(value, table, column)
+                expressions.append(expression)
+                row_params.extend(bound)
+            for column in assignment_columns:
+                expression, bound = _typed_assignment(table, column, assignments[column])
+                expressions.append(expression)
+                row_params.extend(bound)
+            if value_rows and (
+                len(value_rows) >= MAX_ROWS_PER_STATEMENT
+                or len(params) + len(row_params) > MAX_PARAMS_PER_STATEMENT
+            ):
+                flush()
+            value_rows.append("(" + ", ".join(expressions) + ")")
+            params.extend(row_params)
+        flush()
+    return affected
+
+
 def rows_per_statement(n_columns: int) -> int:
     if n_columns <= 0:  # pragma: no cover - defensive
         return MAX_ROWS_PER_STATEMENT
@@ -1218,11 +1320,34 @@ def rows_per_statement(n_columns: int) -> int:
 def _arrow_type(sql_type: str):
     import pyarrow as pa
 
-    return {
-        BIGINT: pa.int64(),
-        DOUBLE: pa.float64(),
-        BOOLEAN: pa.bool_(),
-    }.get(sql_type, pa.string())
+    upper = str(sql_type).upper()
+    if upper.startswith(("STRUCT(", "MAP(", "LIST(", "UNION(")) or upper.endswith("[]"):
+        return None
+    if upper.startswith("VARCHAR") or upper in {"TEXT", "STRING", JSON_T, "UUID"}:
+        return pa.string()
+    if upper in {"BLOB", "BYTEA"}:
+        return pa.binary()
+    if upper in {"SMALLINT", "INT16"}:
+        return pa.int16()
+    if upper in {"INTEGER", "INT", "INT32"}:
+        return pa.int32()
+    if upper in {BIGINT, "INT64", "HUGEINT"}:
+        return pa.int64()
+    if upper in {"FLOAT", "REAL", "FLOAT4"}:
+        return pa.float32()
+    if upper in {DOUBLE, "FLOAT8"}:
+        return pa.float64()
+    if upper == BOOLEAN:
+        return pa.bool_()
+    if upper in {"TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE"}:
+        return pa.timestamp("us", tz="UTC")
+    if upper == "TIMESTAMP":
+        return pa.timestamp("us")
+    if upper == "DATE":
+        return pa.date32()
+    if upper == "TIME":
+        return pa.time64("us")
+    return pa.string()
 
 
 def bulk_insert(
@@ -1301,6 +1426,17 @@ def insert_rows(
     con, table: TableSchema, columns: list[str], rows: list[list]
 ) -> None:
     if table.native_types:
+        # Scalar native columns already have their exact physical declaration and
+        # their values have been source-encoded by ``table_work``.  UNION, map,
+        # and arbitrary struct paths stay on the typed SQL encoder.  The bounded
+        # numeric UNION used for ordinary PostgreSQL NUMERIC is represented by two
+        # Arrow staging fields and reconstructed in one INSERT ... SELECT.
+        if _native_arrow_safe(table, columns, rows):
+            _bulk_insert_typed_rows(con, table, columns, rows)
+            return
+        if _native_numeric_union_arrow_safe(table, columns, rows):
+            _bulk_insert_typed_rows(con, table, columns, rows)
+            return
         insert_typed_rows(
             con,
             table,
@@ -1316,6 +1452,137 @@ def insert_rows(
         rows,
         [table.columns.get(c, VARCHAR) for c in columns],
     )
+
+
+def _arrow_native_supported(native: Any, physical: str) -> bool:
+    kind = getattr(native, "kind", None)
+    if kind in {"UNION", "MAP", "STRUCT", "NUMERIC_VARIABLE", "INTERVAL", "TIMETZ"}:
+        return False
+    if kind == "LIST":
+        return bool(native.children) and _arrow_native_supported(
+            native.children[0], native.children[0].sql
+        )
+    if kind == "NUMERIC_UNION":
+        return False
+    normalized = _normalise_type(physical)
+    return normalized in {
+        "SMALLINT", "INTEGER", BIGINT, "FLOAT", DOUBLE, BOOLEAN, VARCHAR,
+        JSON_T, "UUID", "DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ", "BLOB",
+    }
+
+
+def _native_arrow_safe(table: TableSchema, columns: list[str], rows: list[list]) -> bool:
+    from .typed_types import UnionValue
+
+    for index, column in enumerate(columns):
+        native = table.native_types.get(column)
+        physical = table.raw_types.get(column, table.columns.get(column, VARCHAR))
+        if native is not None and native.kind == "NUMERIC_UNION":
+            return False
+        if not _arrow_native_supported(native, physical):
+            return False
+        for row in rows:
+            if _contains_union(row[index], UnionValue):
+                return False
+    return True
+
+
+def _native_numeric_union_arrow_safe(
+    table: TableSchema, columns: list[str], rows: list[list]
+) -> bool:
+    from .typed_types import UnionValue
+
+    found_numeric_union = False
+    for index, column in enumerate(columns):
+        native = table.native_types.get(column)
+        physical = table.raw_types.get(column, table.columns.get(column, VARCHAR))
+        if native is not None and native.kind == "NUMERIC_UNION":
+            found_numeric_union = True
+            for row in rows:
+                value = row[index]
+                if not isinstance(value, UnionValue) or value.member not in {"finite", "special"}:
+                    return False
+                if value.value is None:
+                    return False
+            continue
+        if not _arrow_native_supported(native, physical):
+            return False
+        for row in rows:
+            if _contains_union(row[index], UnionValue):
+                return False
+    return found_numeric_union
+
+
+def _bulk_insert_typed_rows(con, table: TableSchema, columns: list[str], rows: list[list]) -> None:
+    """Bulk-load native rows, rebuilding bounded numeric UNIONs in SQL.
+
+    A normal source table can combine JSON, UUID, timestamps, lists, and a bounded
+    NUMERIC UNION.  Passing every field through a parameterized struct/UNION
+    expression made a 200k-row replay spend minutes in the DuckDB binder.  Arrow
+    carries the ordinary fields in bulk; only the typed UNION disposition remains
+    an explicit SQL expression.  Unsupported nested UNIONs keep the strict path.
+    """
+    import pyarrow as pa
+
+    from .typed_types import UnionValue
+
+    prepared = [
+        [
+            _prepare_typed_value(value, table.native_types.get(column))
+            for column, value in zip(columns, row, strict=True)
+        ]
+        for row in rows
+    ]
+    arrays: dict[str, Any] = {}
+    select_expressions: list[str] = []
+    for index, column in enumerate(columns):
+        native = table.native_types.get(column)
+        physical = native.sql if native is not None else table.raw_types.get(
+            column, table.columns.get(column, VARCHAR)
+        )
+        if native is not None and native.kind == "NUMERIC_UNION":
+            member_name = f"__cdcf_union_{index}_member"
+            value_name = f"__cdcf_union_{index}_value"
+            members = {member.name.lower(): member.type for member in native.members}
+            member_values: list[str] = []
+            value_values: list[str | None] = []
+            for row in prepared:
+                value = row[index]
+                if not isinstance(value, UnionValue) or value.member.lower() not in members:
+                    raise ValueError(f"invalid numeric UNION value for {column}: {value!r}")
+                member = value.member.lower()
+                member_type = members[member]
+                member_values.append(member)
+                value_values.append(None if value.value is None else str(value.value))
+                if member_type is None:  # pragma: no cover - NativeType invariant
+                    raise ValueError(f"numeric UNION member {member!r} has no type")
+            arrays[member_name] = pa.array(member_values, type=pa.string())
+            arrays[value_name] = pa.array(value_values, type=pa.string())
+            arms = []
+            for member, member_type in members.items():
+                arms.append(
+                    f"WHEN v.{quote(member_name)} = '{member}' THEN "
+                    f"CAST(union_value({quote(member)} := "
+                    f"CAST(v.{quote(value_name)} AS {member_type.sql})) AS {native.sql})"
+                )
+            select_expressions.append("CASE " + " ".join(arms) + " END")
+            continue
+        values = [row[index] for row in prepared]
+        arrow_type = _arrow_type(physical)
+        arrays[column] = pa.array(values, type=arrow_type)
+        select_expressions.append(f"v.{quote(column)}")
+
+    view = "cdcf_typed_bulk_rows"
+    arrow_table = pa.table(arrays)
+    con.register(view, arrow_table)
+    try:
+        collist = ", ".join(quote(column) for column in columns)
+        con.execute(
+            f"INSERT INTO {table.qualified} ({collist}) SELECT "
+            f"{', '.join(select_expressions)} FROM {view} AS v"
+        )
+    finally:
+        con.unregister(view)
 
 
 def insert_typed_rows(
@@ -1406,6 +1673,11 @@ def _typed_parameter(value: Any, native: Any) -> tuple[str, list[Any]]:
                 if member_native is None
                 else member_native,
             )
+            if member_native is not None and inner_expression == "?":
+                # DuckDB infers a common parameter type across a VALUES relation.
+                # Without this cast, a first value such as 120.00 fixes DECIMAL(5,2)
+                # and a later valid 1999.99 is rejected before the UNION receives it.
+                inner_expression = f"CAST(? AS {member_native.sql})"
             return (
                 f"union_value({quote(value.member)} := {inner_expression})",
                 inner_params,
@@ -1537,5 +1809,6 @@ __all__ = [
     "insert_rows",
     "insert_typed_rows",
     "sql_type",
+    "update_rows",
     "widen",
 ]

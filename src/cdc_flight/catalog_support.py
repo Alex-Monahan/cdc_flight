@@ -7,9 +7,11 @@ prevents publication policy from being mixed into catalog reads.
 
 from __future__ import annotations
 
+from . import naming
 from .catalog_state import CHANGE_NEW, CHANGE_SCHEMA, CHANGE_UNPUBLISHED, DESTRUCTIVE
 from .errors import SchemaShapeUnexplained
 from .machines import ADMISSION_ADMITTED, ADMISSION_EXTERNAL
+from .toast import ToastRoute, classify_relation
 
 CATALOG_SQL = """
 SELECT n.nspname                                  AS source_schema,
@@ -33,6 +35,7 @@ SELECT n.nspname                                  AS source_schema,
                    'type_oid', a.atttypid::bigint,
                    'type_name', format_type(a.atttypid, a.atttypmod),
                    'typmod', a.atttypmod,
+                   'attstorage', a.attstorage,
                    'type_schema', typ_ns.nspname,
                    'type_kind', typ.typtype,
                    'typelem', typ.typelem::bigint,
@@ -123,6 +126,16 @@ def summary(watcher) -> dict:
         ]
         admission_errors = dict(watcher._admission_errors)
         schema_liveness = dict(watcher._schema_liveness)
+        toast_policies = [
+            classify_relation(
+                relation.qualified,
+                relation.columns,
+                replica_identity=relation.replica_identity,
+                binary_mode=getattr(watcher, "binary_handling_mode", "base64"),
+                hstore_mode=getattr(watcher, "hstore_handling_mode", "map"),
+            )
+            for relation in watcher.known.values()
+        ]
     return {
         "catalog_polls": watcher.polls,
         "catalog_successful_polls": watcher.successful_polls,
@@ -145,6 +158,9 @@ def summary(watcher) -> dict:
         "catalog_pending_admission": sorted(pending_admission),
         "catalog_admission_errors": admission_errors,
         "catalog_schema_liveness": schema_liveness,
+        "toast_efficient_tables": sum(policy.efficient for policy in toast_policies),
+        "toast_fallback_tables": sum(policy.route is ToastRoute.FALLBACK for policy in toast_policies),
+        "toast_residual_columns": sum(len(policy.residual_columns) for policy in toast_policies),
     }
 
 
@@ -168,7 +184,20 @@ def observe_unit(watcher, unit) -> None:
                 if relation
                 else set()
             )
-        if fields - known_names:
+            known_descriptors = {
+                column.destination_name: column.descriptor
+                for column in relation.columns
+                if relation and column.descriptor is not None
+            } if relation else {}
+        descriptor_changed = any(
+            _descriptor_changed(known_descriptors, record_descriptors, fields)
+            for record_descriptors in (
+                getattr(record, "key_descriptors", {}),
+                getattr(record, "before_descriptors", {}),
+                getattr(record, "after_descriptors", {}),
+            )
+        )
+        if fields - known_names or descriptor_changed:
             candidates.append(name)
     if candidates and watcher.dsn:
         # Never suppress a second probe after a failed or empty observation. A source
@@ -200,6 +229,20 @@ def observe_unit(watcher, unit) -> None:
                 source_table=table,
                 target=name,
             )
+
+
+def _descriptor_changed(known: dict, incoming: dict, fields: set[str]) -> bool:
+    """Detect a same-name type epoch change before row admission."""
+    for raw_name, descriptor in (incoming or {}).items():
+        name = naming.normalize(str(raw_name))
+        if name not in fields or descriptor is None or name not in known:
+            continue
+        previous = known[name]
+        if previous is not None and getattr(previous, "fingerprint", None) != getattr(
+            descriptor, "fingerprint", None
+        ):
+            return True
+    return False
 
 
 def read_columns(watcher, relation, key_columns, value_columns) -> list[tuple]:

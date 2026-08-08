@@ -84,6 +84,7 @@ def upsert_source_relation(
                         "type_oid": column.type_oid,
                         "type_name": column.type_name,
                         "typmod": column.typmod,
+                        "attstorage": column.attstorage,
                         "descriptor": (
                             column.descriptor.to_dict() if column.descriptor is not None else None
                         ),

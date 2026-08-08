@@ -444,7 +444,61 @@ def _schema_for_field(schema: dict[str, Any] | None, name: str) -> dict[str, Any
     return None
 
 
+_FIELD_DESCRIPTOR_CACHE: dict[tuple, dict[str, SourceTypeDescriptor]] = {}
+_FIELD_DESCRIPTOR_CACHE_MAX = 128
+
+
+def _schema_cache_key(schema: dict[str, Any]) -> tuple:
+    """Stable, type-bearing key that avoids serialising the full envelope schema."""
+    nested = {"fields", "items", "value_schema", "keys", "key_schema", "values"}
+    scalar = tuple(
+        sorted(
+            (str(name), json.dumps(value, sort_keys=True, separators=(",", ":")))
+            for name, value in schema.items()
+            if name not in nested and not isinstance(value, (dict, list))
+        )
+    )
+    fields = tuple(
+        (
+            str(field_schema.get("field", field_schema.get("name", ""))),
+            _schema_cache_key(
+                field_schema.get("schema")
+                if isinstance(field_schema.get("schema"), dict)
+                else field_schema.get("type")
+                if isinstance(field_schema.get("type"), dict)
+                else field_schema,
+            ),
+        )
+        for field_schema in schema.get("fields", ()) or ()
+        if isinstance(field_schema, dict)
+    )
+    children = tuple(
+        (name, _schema_cache_key(value))
+        for name in ("items", "value_schema", "keys", "key_schema", "values")
+        if isinstance((value := schema.get(name)), dict)
+    )
+    enum_values = schema.get("values", schema.get("enum"))
+    return scalar, fields, children, tuple(enum_values or ()) if isinstance(enum_values, list) else enum_values
+
+
 def _field_descriptors(schema: dict[str, Any] | None) -> dict[str, SourceTypeDescriptor]:
+    if not schema:
+        return {}
+    key = _schema_cache_key(schema)
+    cached = _FIELD_DESCRIPTOR_CACHE.get(key)
+    if cached is None:
+        cached = _field_descriptors_uncached(schema)
+        if len(_FIELD_DESCRIPTOR_CACHE) >= _FIELD_DESCRIPTOR_CACHE_MAX:
+            _FIELD_DESCRIPTOR_CACHE.pop(next(iter(_FIELD_DESCRIPTOR_CACHE)))
+        _FIELD_DESCRIPTOR_CACHE[key] = cached
+    # Catalog enrichment may add fields to an event-local mapping; share only the
+    # immutable descriptor objects across repeated schema instances.
+    return dict(cached)
+
+
+def _field_descriptors_uncached(
+    schema: dict[str, Any] | None,
+) -> dict[str, SourceTypeDescriptor]:
     if not schema:
         return {}
     result: dict[str, SourceTypeDescriptor] = {}

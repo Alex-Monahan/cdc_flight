@@ -334,6 +334,7 @@ def write_column_presence(
     event_id: str,
     column_name: str,
     present: bool = True,
+    patch_digest: str | None = None,
 ) -> None:
     """Record row-image field presence atomically with the row write.
 
@@ -342,8 +343,9 @@ def write_column_presence(
     """
     con.execute(
         f"INSERT OR REPLACE INTO {CONTROL_SCHEMA}.column_presence "
-        "(target_dataset, target_table, event_id, column_name, present) VALUES (?,?,?,?,?)",
-        [target_dataset, target_table, event_id, column_name, present],
+        "(target_dataset, target_table, event_id, column_name, present, patch_digest) "
+        "VALUES (?,?,?,?,?,?)",
+        [target_dataset, target_table, event_id, column_name, present, patch_digest],
     )
 
 
@@ -359,12 +361,20 @@ def write_column_presence_batch(con, rows: list[tuple]) -> None:
         return
     from .apply_sql import BOOLEAN, VARCHAR, bulk_insert
 
+    normalized = [
+        [*row, None] if len(row) == 4 else list(row)
+        for row in rows
+    ]
+
     bulk_insert(
         con,
         f"{CONTROL_SCHEMA}.column_presence",
-        ["target_dataset", "target_table", "event_id", "column_name", "present"],
-        [list(row) for row in rows],
-        [VARCHAR, VARCHAR, VARCHAR, VARCHAR, BOOLEAN],
+        [
+            "target_dataset", "target_table", "event_id", "column_name", "present",
+            "patch_digest",
+        ],
+        normalized,
+        [VARCHAR, VARCHAR, VARCHAR, VARCHAR, BOOLEAN, VARCHAR],
         replace=True,
     )
 

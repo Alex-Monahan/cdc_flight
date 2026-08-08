@@ -59,8 +59,16 @@ from typing import Any
 
 from . import apply_sql, naming
 from .envelope import KIND_TRUNCATE, PendingRecord
-from .errors import AmbiguousDelete, DestinationIdentityCollision, SchemaEvolutionRefused
+from .errors import (
+    AmbiguousDelete,
+    DestinationIdentityCollision,
+    SchemaEvolutionRefused,
+    ToastBaseMissing,
+)
 from .naming import CDCF_COMMIT_ID, CDCF_EVENT_ID, CDCF_TOTAL_ORDER
+from .row_patch import RowPatch
+from .toast import UNAVAILABLE_VALUE_PLACEHOLDER, is_structural_marker
+from .typed_types import FieldState, FieldValue
 
 log = logging.getLogger("cdc_flight.table_work")
 
@@ -82,10 +90,10 @@ APPLIER_COLUMN_TYPES = {
     **DBZ_COLUMN_TYPES,
 }
 
-#: Debezium's placeholder for an unchanged TOAST column in a before/after image
-#: (`unavailable.value.placeholder`). It carries no information, so it can never
-#: distinguish two rows and must be excluded from every comparison (rubric 2.6).
-TOAST_PLACEHOLDER = "__debezium_unavailable_value"
+# Re-exported for existing callers.  The configured marker is single-sourced in
+# ``toast.py``; this name is retained as a compatibility alias, not a value-equality
+# classifier.
+TOAST_PLACEHOLDER = UNAVAILABLE_VALUE_PLACEHOLDER
 
 
 class _Start:
@@ -107,6 +115,15 @@ START = _Start()
 
 
 @dataclass
+class RowMove:
+    """A sparse key move that can update the old physical row in place."""
+
+    source_key: tuple
+    target_key: tuple
+    patch: RowPatch
+
+
+@dataclass
 class TableWork:
     """Everything one destination table needs from one commit group."""
 
@@ -119,6 +136,9 @@ class TableWork:
     #: callers; a non-empty map selects the strict native creation/bind path.
     descriptors: dict[str, Any] = field(default_factory=dict)
     native_columns: dict[str, Any] = field(default_factory=dict)
+    #: Native descriptors are recursive and immutable; resolve each catalog
+    #: fingerprint once per table/group instead of once per event field.
+    native_fingerprints: dict[str, str] = field(default_factory=dict)
     #: identity key -> the rows that currently wear it, in source order. See the
     #: module docstring: this is the whole fold.
     live: dict[tuple, list] = field(default_factory=dict)
@@ -154,6 +174,10 @@ class TableWork:
     #: (Codex 5).
     source_schema: str | None = None
     source_table: str | None = None
+    #: A DELETE makes a key unavailable for a later sparse UPDATE in the same source
+    #: transaction.  A following INSERT clears the tombstone and is a legal physical
+    #: key reuse; an UPDATE must never silently reuse the destination's START row.
+    deleted_keys: set[tuple] = field(default_factory=set)
 
 
 def work_for(
@@ -190,35 +214,32 @@ def work_for(
 def row_for(
     event: PendingRecord, commit_id: int, event_id: str, *, snapshot: bool
 ) -> dict[str, Any]:
-    """The destination row for one change event, plus the applier's own columns."""
-    image = event.after if event.op != "d" else event.before
-    row: dict[str, Any] = {}
-    descriptors = (
-        event.before_descriptors if event.op == "d" else event.after_descriptors
-    )
-    for column, value in (image or {}).items():
-        name = naming.normalize(column)
-        descriptor = descriptors.get(column) or descriptors.get(name)
-        if descriptor is not None:
-            from .typed_types import encode_value
+    """The bindable compatibility view of one typed sparse image."""
+    return patch_for(event, commit_id, event_id, snapshot=snapshot).encoded_values()
 
-            # The configured TOAST placeholder is an ordinary source string in the
-            # current connector contract.  Encoding it as declared text preserves
-            # today's behavior; marker identity is intentionally left to rubric 2.6.
-            value = encode_value(value, descriptor)
-        row[name] = value
-    row[CDCF_COMMIT_ID] = commit_id
-    row[CDCF_EVENT_ID] = event_id
-    # A snapshot record has no transaction, so it has no ordinal. Leaving it NULL is
-    # what tells a consumer "this identity is not txn-derived".
-    row[CDCF_TOTAL_ORDER] = None if snapshot else event.total_order
-    row["dbz_op"] = event.op
-    row["dbz_lsn"] = event.lsn
-    row["dbz_tx_id"] = None if snapshot else _as_int(event.txn_id)
-    row["dbz_schema"] = event.schema
-    row["dbz_table"] = event.table
-    row["dbz_source_ts_ms"] = event.source_ts_ms
-    return row
+
+def patch_for(
+    event: PendingRecord,
+    commit_id: int,
+    event_id: str,
+    *,
+    snapshot: bool,
+    binary_mode: str = "base64",
+    hstore_mode: str = "map",
+) -> RowPatch:
+    """Decode an event into a RowPatch before any destination conversion.
+
+    The patch retains marker/absent state for folding and spill digests, while its
+    bindable view omits unchanged TOAST fields entirely.
+    """
+    return RowPatch.from_event(
+        event,
+        commit_id=commit_id,
+        event_id=event_id,
+        snapshot=snapshot,
+        binary_mode=binary_mode,
+        hstore_mode=hstore_mode,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -231,6 +252,7 @@ def collect(
     event_id: str,
     *,
     probe=None,
+    patch: RowPatch | None = None,
 ) -> None:
     """Fold one event's physical operation into the table's plan.
 
@@ -243,33 +265,50 @@ def collect(
     if event.kind == KIND_TRUNCATE:
         truncate(item)
         return
+    patch = patch or patch_for(event, 0, event_id, snapshot=item.snapshot)
     descriptors = event.before_descriptors if event.op == "d" else event.after_descriptors
-    for column, value in row.items():
+    for column, field_value_item in patch.fields.items():
         source_name = column
-        descriptor = descriptors.get(source_name)
-        if descriptor is not None:
+        descriptor = field_value_item.descriptor or descriptors.get(source_name)
+        if (
+            descriptor is not None
+            and field_value_item.state is not FieldState.ABSENT
+            and source_name not in APPLIER_COLUMN_TYPES
+        ):
             from .typed_types import native_type
 
-            item.descriptors[column] = descriptor
-            item.native_columns[column] = native_type(descriptor)
+            fingerprint = descriptor.fingerprint
+            if item.native_fingerprints.get(column) != fingerprint:
+                item.descriptors[column] = descriptor
+                item.native_columns[column] = native_type(descriptor)
+                item.native_fingerprints[column] = fingerprint
             item.columns[column] = item.native_columns[column].sql
-        else:
+        elif source_name in APPLIER_COLUMN_TYPES:
+            item.columns[column] = APPLIER_COLUMN_TYPES[source_name]
+        elif field_value_item.state in {FieldState.VALUE, FieldState.EXPLICIT_NULL}:
             item.columns[column] = apply_sql.widen(
-                item.columns.get(column), apply_sql.sql_type(value)
+                item.columns.get(column), apply_sql.sql_type(field_value_item.value)
             )
+    for column, value in patch.encoded_values().items():
+        if column not in item.columns:
+            item.columns[column] = apply_sql.sql_type(value)
     item.events += 1
+    if patch.has_marker() and event.op in {"c", "r"}:
+        _missing_toast_base(item, event)
     if item.keyless:
         # A keyless table is a changelog (ADR §15/A12): one row per event, identified
         # by `cdcf_event_id`, and a delete is a row like any other. The identity is
         # unique per event, so no attribution question can arise and no `START` is
         # needed - the keyed DELETE of that one event id is what makes a replay
         # idempotent.
-        item.live[(event_id,)] = [row]
+        if patch.has_marker():
+            _missing_toast_base(item, event, reason="keyless sparse change has no safe base")
+        item.live[(event_id,)] = [patch.encoded_values()]
         return
 
     key = tuple(event.key[k] for k in event.key)
     if event.op == "d":
-        _remove(item, key, event.before, probe)
+        _remove(item, key, event.before, probe, descriptors=event.before_descriptors)
         return
 
     if event.op == "u":
@@ -282,15 +321,40 @@ def collect(
         if event.before and all(k in event.before for k in event.key):
             old = tuple(event.before[k] for k in event.key)
             if old != key:
-                _remove(item, old, event.before, probe)
-                _place(item, key, row)
+                removed = _remove(
+                    item,
+                    old,
+                    event.before,
+                    probe,
+                    descriptors=event.before_descriptors,
+                )
+                if isinstance(removed, RowMove):
+                    _place(
+                        item,
+                        key,
+                        patch.encoded_values(),
+                        patch=removed.patch.compose(patch),
+                        move_from=removed.source_key,
+                    )
+                elif removed is not None and removed is not START:
+                    source = removed if isinstance(removed, RowPatch) else RowPatch(
+                        {name: FieldValue.of(value) for name, value in removed.items()},
+                        complete=True,
+                    )
+                    combined = source.compose(patch)
+                    _place(item, key, combined.encoded_values(), patch=combined)
+                else:
+                    _place(item, key, patch.encoded_values(), patch=patch, move_from=old)
                 return
         # An `u` with an unchanged key REPLACES a row; it never adds one, whether or
         # not a before-image came with it. Treating an image-less `u` as a place is
         # how three updates of one key inside one transaction became three live rows.
-        _update(item, key, row, event.before, probe)
+        _update(
+            item, key, patch.encoded_values(), event.before, probe,
+            patch=patch, descriptors=event.before_descriptors,
+        )
         return
-    _place(item, key, row)
+    _place(item, key, patch.encoded_values(), patch=patch)
 
 
 def truncate(item: TableWork) -> None:
@@ -311,6 +375,7 @@ def truncate(item: TableWork) -> None:
     item.live.clear()
     item.multi.clear()
     item.start_present.clear()
+    item.deleted_keys.clear()
 
 
 def end_transaction(item: TableWork) -> None:
@@ -351,30 +416,62 @@ def _entries(item: TableWork, key: tuple) -> list:
     return entries
 
 
-def _place(item: TableWork, key: tuple, row: dict) -> None:
+def _place(
+    item: TableWork,
+    key: tuple,
+    row: dict,
+    *,
+    patch: RowPatch | None = None,
+    move_from: tuple | None = None,
+) -> None:
+    item.deleted_keys.discard(key)
     entries = _entries(item, key)
-    entries.append(row)
+    entries.append(
+        RowMove(move_from, key, patch)
+        if move_from is not None and patch is not None
+        else (patch if patch is not None else row)
+    )
     _track(item, key, entries)
 
 
-def _update(item: TableWork, key: tuple, row: dict, before, probe) -> None:
+def _update(
+    item: TableWork,
+    key: tuple,
+    row: dict,
+    before,
+    probe,
+    *,
+    patch: RowPatch | None = None,
+    descriptors=None,
+) -> None:
     """An UPDATE with an unchanged key: the same physical row, with new values."""
+    if key in item.deleted_keys:
+        _missing_toast_base(item, None, reason="UPDATE follows DELETE for the same physical key")
     entries = _entries(item, key)
-    index = _target_entry(item, key, entries, before, probe, "update")
+    if entries == [START]:
+        _resolve_start(item, key, entries, probe)
+    if not entries:
+        _missing_toast_base(item, None, reason="UPDATE has no destination base row")
+    index = _target_entry(
+        item, key, entries, before, probe, "update", descriptors=descriptors
+    )
+    patch = patch or RowPatch({name: FieldValue.of(value) for name, value in row.items()})
     if index is None:
-        # The before-image cannot pick one of the candidates, which (see
-        # `_target_entry`) only happens where at most one row can really wear the key.
-        # An UPDATE says "after this, exactly one row wears this key and it looks like
-        # `row`", so that is what the plan records.
-        entries[:] = [row]
+        entries[:] = [patch]
     else:
-        # Replacing `START` is the ordinary case: the destination's row becomes this
-        # row, deleted by the keyed DELETE and re-inserted with the new values.
-        entries[index] = row
+        current = entries[index]
+        if isinstance(current, RowPatch):
+            entries[index] = current.compose(patch)
+        elif current is START:
+            entries[index] = patch
+        elif isinstance(current, RowMove):
+            current.patch = current.patch.compose(patch)
+        else:
+            current.update(row)
     _track(item, key, entries)
 
 
-def _remove(item: TableWork, key: tuple, before, probe) -> None:
+def _remove(item: TableWork, key: tuple, before, probe, *, descriptors=None):
     """Rubric 1.4's hard case: which of the rows wearing `key` did this delete take?
 
     The two orderings below are byte-identical event streams with opposite answers,
@@ -391,17 +488,27 @@ def _remove(item: TableWork, key: tuple, before, probe) -> None:
     row the transaction itself put there.
     """
     entries = _entries(item, key)
-    index = _target_entry(item, key, entries, before, probe, "delete")
+    if entries == [START]:
+        _resolve_start(item, key, entries, probe)
+    index = _target_entry(
+        item, key, entries, before, probe, "delete", descriptors=descriptors
+    )
+    removed = None
     if index is None:
         # Nothing left under the key that we know of. The keyed DELETE still runs, so
         # a destination row we never modelled is removed either way.
         entries.clear()
     else:
-        entries.pop(index)
+        removed = entries.pop(index)
+    if not entries:
+        item.deleted_keys.add(key)
     _track(item, key, entries)
+    return removed
 
 
-def _target_entry(item, key: tuple, entries: list, before, probe, what: str) -> int | None:
+def _target_entry(
+    item, key: tuple, entries: list, before, probe, what: str, *, descriptors=None
+) -> int | None:
     """Index of the entry `before` describes, or None for "collapse the key".
 
     Raises `AmbiguousDelete` when two entries could be it and nothing can choose.
@@ -412,7 +519,7 @@ def _target_entry(item, key: tuple, entries: list, before, probe, what: str) -> 
         return None
     if len(entries) == 1:
         return 0
-    image = _distinguishing(item, before)
+    image = _distinguishing(item, before, descriptors=descriptors)
     concrete = _concrete(entries)
     if not image:
         # Nothing in the before-image separates the candidates. That is only ever the
@@ -468,17 +575,33 @@ def _matches(item, key, entry, image: dict, probe) -> bool:
         if answer is None:
             return False
         return answer
+    if isinstance(entry, RowMove):
+        entry = entry.patch
+    if isinstance(entry, RowPatch):
+        for column, value in image.items():
+            observed = entry.field(column)
+            if observed.state is FieldState.EXPLICIT_NULL:
+                if value is not None:
+                    return False
+            elif observed.state is FieldState.VALUE:
+                if observed.value != value:
+                    return False
+            else:
+                return False
+        return True
     return all(entry.get(column) == value for column, value in image.items())
 
 
-def _distinguishing(item: TableWork, before) -> dict:
+def _distinguishing(item: TableWork, before, *, descriptors=None) -> dict:
     """The before-image columns that can tell two rows under one key apart."""
     if not before:
         return {}
     out = {}
+    descriptors = descriptors or {}
     for column, value in before.items():
         name = naming.normalize(column)
-        if name in item.key_columns or value == TOAST_PLACEHOLDER:
+        descriptor = descriptors.get(column) or descriptors.get(name) or item.descriptors.get(name)
+        if name in item.key_columns or is_structural_marker(value, descriptor):
             continue
         out[name] = value
     return out
@@ -492,6 +615,17 @@ def _unattributable(item, key, entries, before, what, why) -> AmbiguousDelete:
         "Folding a guess would durably commit a wrong answer, so the commit group is "
         "refused and replays instead (ADR 0001 §18/A35). A deferred unique constraint "
         "requires REPLICA IDENTITY FULL, which supplies the image this needs.",
+        source_schema=item.source_schema,
+        source_table=item.source_table,
+        target=item.target,
+    )
+
+
+def _missing_toast_base(item: TableWork, event: PendingRecord | None, *, reason: str = "") -> None:
+    detail = reason or "a sparse TOAST patch has no verified physical-row base"
+    raise ToastBaseMissing(
+        f"{item.target}: {detail}; refusing the commit group so automatic "
+        "table-scoped refetch/resnapshot can repair the base",
         source_schema=item.source_schema,
         source_table=item.source_table,
         target=item.target,
@@ -562,7 +696,7 @@ def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
     ]
     column_order = list(dict.fromkeys(column_order))
 
-    delete_keys, rows = _plan(item)
+    delete_keys, rows, partial_updates, moves = _plan(item)
 
     if item.truncated:
         # Rubric 1.5, "replicated just like Postgres handles them": the destination
@@ -581,6 +715,36 @@ def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
         ]
         apply_sql.delete_keys(con, table, item.key_columns, keys)
     _finish_truncate_audit(item)
+
+    updates: list[tuple[tuple, dict[str, Any]]] = []
+    for key, patch in partial_updates:
+        source_key = tuple(
+            _key_value(table, column, value)
+            for column, value in zip(item.key_columns, key, strict=False)
+        )
+        updates.append((source_key, patch.bindable_values()))
+    for move in moves:
+        assignments = move.patch.bindable_values()
+        for column, value in zip(item.key_columns, move.target_key, strict=False):
+            assignments[column] = value
+        source_key = tuple(
+            _key_value(table, column, value)
+            for column, value in zip(item.key_columns, move.source_key, strict=False)
+        )
+        updates.append((source_key, assignments))
+    if updates:
+        affected = 0 if fresh else apply_sql.update_rows(
+            con, table, item.key_columns, updates
+        )
+        if fresh or affected != len(updates):
+            _missing_toast_base(
+                item,
+                None,
+                reason=(
+                    f"sparse update matched {affected} of {len(updates)} "
+                    "destination base row(s)"
+                ),
+            )
 
     apply_sql.insert_rows(
         con,
@@ -652,8 +816,13 @@ def _key_value(table, column: str, value):
     return encoded
 
 
-def _plan(item: TableWork) -> tuple[list[tuple], list[dict]]:
-    """`(keys to delete, rows to insert)` — the group-end reading of `live`.
+def _plan(item: TableWork) -> tuple[
+    list[tuple],
+    list[dict],
+    list[tuple[tuple, RowPatch]],
+    list[RowMove],
+]:
+    """Read the physical fold into full inserts, sparse updates, and key moves.
 
     A key whose only live entry is `START` is deliberately **absent from both**: the
     row the destination holds is the row the source holds, nothing in the group
@@ -661,12 +830,23 @@ def _plan(item: TableWork) -> tuple[list[tuple], list[dict]]:
     """
     delete_keys: list[tuple] = []
     rows: list[dict] = []
+    partial_updates: list[tuple[tuple, RowPatch]] = []
+    moves: list[RowMove] = []
     for key, entries in item.live.items():
         if len(entries) == 1 and entries[0] is START:
             continue
-        delete_keys.append(key)
+        if not entries:
+            delete_keys.append(key)
+            continue
         if len(entries) == 1:
-            rows.append(entries[0])
+            entry = entries[0]
+            if isinstance(entry, RowMove):
+                moves.append(entry)
+            elif isinstance(entry, RowPatch) and not entry.complete:
+                partial_updates.append((key, entry))
+            else:
+                delete_keys.append(key)
+                rows.append(entry.encoded_values() if isinstance(entry, RowPatch) else entry)
         elif entries:
             concrete = [entry for entry in entries if entry is not START]
             if len(concrete) > 1:  # pragma: no cover - `end_transaction` catches it
@@ -677,8 +857,19 @@ def _plan(item: TableWork) -> tuple[list[tuple], list[dict]]:
                     source_table=item.source_table,
                     target=item.target,
                 )
-            rows.extend(concrete)
-    return delete_keys, rows
+            for entry in concrete:
+                if isinstance(entry, RowPatch) and not entry.complete:
+                    partial_updates.append((key, entry))
+                elif isinstance(entry, RowMove):
+                    moves.append(entry)
+                else:
+                    delete_keys.append(key)
+                    rows.append(
+                        entry.encoded_values() if isinstance(entry, RowPatch) else entry
+                    )
+    move_sources = {move.source_key for move in moves}
+    delete_keys = [key for key in delete_keys if key not in move_sources]
+    return delete_keys, rows, partial_updates, moves
 
 
 def _finish_truncate_audit(item: TableWork) -> None:

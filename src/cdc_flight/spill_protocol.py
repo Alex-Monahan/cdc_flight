@@ -41,6 +41,7 @@ def stage_events(
     for event in events:
         if not event.schema or not event.table:
             continue
+        _enrich_descriptors(applier, event)
         if state is not None:
             prepared.append(
                 StagedEvent(
@@ -65,3 +66,23 @@ def stage_events(
     applier.spilled_events += staged
     maybe_crash("spill", applier.data_commit_groups + 1)
     return len(events)
+
+
+def _enrich_descriptors(applier, event: PendingRecord) -> None:
+    """Apply the catalog epoch before a raw image crosses the spill boundary."""
+    provider = applier.descriptor_provider or (
+        getattr(applier.catalog, "descriptors_for", None)
+        if applier.catalog is not None
+        else None
+    )
+    if provider is None or not event.qualified_table:
+        return
+    try:
+        descriptors = provider(event.qualified_table)
+    except Exception:
+        log.debug("could not enrich spilled event descriptors", exc_info=True)
+        return
+    if not descriptors:
+        return
+    for attribute in ("key_descriptors", "before_descriptors", "after_descriptors"):
+        getattr(event, attribute).update(descriptors)

@@ -19,6 +19,7 @@ from .machines import (
 )
 from .schema_evolution import SourceColumn, descriptor_from_type_name
 from .states import IllegalTransition, UnknownState
+from .toast import classify_relation
 from .typed_types import SourceTypeDescriptor
 
 log = logging.getLogger("cdc_flight.catalog_poll")
@@ -74,6 +75,52 @@ def connect(watcher, *, autocommit: bool = True, dsn: str | None = None):
         keepalives_count=2,
         tcp_user_timeout=watcher.query_timeout_ms,
     )
+
+
+def _ensure_toast_policies(watcher, conn, observed: dict[str, SourceRelation]):
+    """Make residual TOAST tables FULL before this catalog epoch is admitted."""
+    updated = dict(observed)
+    for qualified, relation in observed.items():
+        policy = classify_relation(
+            qualified,
+            relation.columns,
+            replica_identity=relation.replica_identity,
+            binary_mode=watcher.binary_handling_mode,
+            hstore_mode=watcher.hstore_handling_mode,
+        )
+        if not policy.residual_columns or str(relation.replica_identity).lower() == "f":
+            continue
+        try:
+            schema, _, table = qualified.partition(".")
+            if not schema or not table:
+                raise ValueError(f"unqualified source relation {qualified!r}")
+            from .naming import quote
+
+            conn.execute(
+                f"ALTER TABLE {quote(schema)}.{quote(table)} "
+                "REPLICA IDENTITY FULL"
+            )
+            verified = conn.execute(
+                "SELECT relreplident FROM pg_class WHERE oid = %s", [relation.oid]
+            ).fetchone()
+            if not verified or str(verified[0]).lower() != "f":
+                raise RuntimeError(
+                    f"source reported replica identity {verified[0] if verified else None!r}"
+                )
+            updated[qualified] = replace(relation, replica_identity="f")
+            log.info(
+                "TOAST residual table %s admitted with verified REPLICA IDENTITY FULL: %s",
+                qualified,
+                ", ".join(policy.residual_columns),
+            )
+        except Exception as exc:
+            log.warning(
+                "could not establish REPLICA IDENTITY FULL for residual TOAST table %s; "
+                "events will take automatic refetch/resnapshot recovery: %s",
+                qualified,
+                exc,
+            )
+    return updated
 
 
 def poll_quietly(watcher):
@@ -175,6 +222,7 @@ def poll(watcher):
                     missing_value=_missing_value(
                         raw.get("missing_value_text"), str(raw["type_name"])
                     ),
+                    attstorage=(str(raw["attstorage"]) if raw.get("attstorage") else None),
                     descriptor=(
                         SourceTypeDescriptor.from_dict(raw["descriptor"])
                         if raw.get("descriptor")
@@ -210,11 +258,16 @@ def poll(watcher):
             watcher._snapshot_partitions = {
                 f"{row[0]}.{row[1]}" for row in partition_rows
             }
-        added = watcher._compare(observed, lsn)
     # Keep source writes off the catalog read connection.  In replica mode this
     # route is the primary; in a primary-only deployment it is the same DSN as the
     # read side.  The connection is opened only after the read transaction is closed.
     with connect(watcher, dsn=watcher.primary_dsn) as write_conn:
+        # Reclassify this exact catalog epoch before `_compare` can admit its events.
+        # A residual table is either verified FULL or remains explicitly on the
+        # automatic refetch/resnapshot route; an unverified ALTER is never treated as
+        # success.
+        observed = _ensure_toast_policies(watcher, write_conn, observed)
+        added = watcher._compare(observed, lsn)
         watcher._ensure_published(write_conn, observed, added)
         with watcher._lock:
             watcher.successful_polls += 1

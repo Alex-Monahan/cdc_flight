@@ -436,6 +436,8 @@ def run(
                 grace_seconds=catalog_cfg.grace_seconds,
                 confirm_polls=catalog_cfg.confirm_polls,
                 marker_max_writes=catalog_cfg.marker_max_writes or None,
+                binary_handling_mode=props.get("binary.handling.mode", "base64"),
+                hstore_handling_mode=props.get("hstore.handling.mode", "map"),
             ).start()
             discovered = watcher.new_relations()
             if discovered:

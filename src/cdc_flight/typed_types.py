@@ -20,7 +20,7 @@ import json
 import math
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
@@ -78,6 +78,7 @@ class SourceTypeDescriptor:
     connect_parameters: tuple[tuple[str, str], ...] = ()
     nullable: bool = True
     metadata: tuple[tuple[str, str], ...] = ()
+    _fingerprint_cache: str | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "qualified_name", str(self.qualified_name or "unknown"))
@@ -250,8 +251,12 @@ class SourceTypeDescriptor:
 
     @property
     def fingerprint(self) -> str:
+        if self._fingerprint_cache is not None:
+            return self._fingerprint_cache
         payload = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        fingerprint = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        object.__setattr__(self, "_fingerprint_cache", fingerprint)
+        return fingerprint
 
     @property
     def type_identity(self) -> str:
@@ -326,9 +331,7 @@ class FieldValue:
 
     @classmethod
     def unchanged_toast(cls, descriptor: SourceTypeDescriptor | None = None) -> FieldValue:
-        # The current connector path does not identify this marker.  This constructor
-        # exists for the versioned codec and tests; envelope decoding deliberately does
-        # not call it, so rubric 2.6's current placeholder behavior remains unchanged.
+        # The row-patch boundary owns this disposition; it is never a bindable value.
         return cls(FieldState.UNCHANGED_TOAST, descriptor=descriptor)
 
     @classmethod

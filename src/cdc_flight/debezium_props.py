@@ -11,9 +11,10 @@ from __future__ import annotations
 from .config import ReplicationConfig, SourceConfig
 from .errors import UnsafeDebeziumProperty
 from .snapshot_completion import notification_topic
+from .toast import UNAVAILABLE_VALUE_PLACEHOLDER
 
-# Debezium's marker for a TOASTed column whose value was not present in the WAL.
-UNAVAILABLE_VALUE_PLACEHOLDER = "__debezium_unavailable_value"
+# Re-exported for configuration callers.  The value is owned by ``toast.py`` so
+# the connector property and the decoder cannot drift apart.
 
 # Prefix applied to the CDC metadata fields injected by ExtractNewRecordState.
 METADATA_PREFIX = "dbz_"
@@ -214,6 +215,11 @@ def build_properties(
         "interval.handling.mode": "string",
         "binary.handling.mode": "base64",
         "hstore.handling.mode": "map",
+        # Gate2 Option N: Debezium accepts the documented hex form and emits a
+        # U+0000 marker.  PostgreSQL text-like domains cannot contain that code
+        # point, so the Python decoder may recognize it only with a matching
+        # source descriptor.
+        "unavailable.value.placeholder": UNAVAILABLE_VALUE_PLACEHOLDER,
         "topic.naming.strategy": "io.debezium.schema.DefaultTopicNamingStrategy",
         # ADR 0001 §3.2: MANDATORY, not optional. Without it there is no `END`
         # marker and therefore no way to prove a Postgres transaction whole, so
