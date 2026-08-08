@@ -79,9 +79,9 @@ the process"; with the record it can assert the exact anchor that fired (Codex M
 
 The *network* fault that matters most cannot be injected from inside the process at
 all - a source whose packets simply stop arriving, with the sockets left open - so it
-is injected from outside by a TCP relay the test owns (`tests/tcp_relay.py`).
+is injected from outside by a TCP relay the test owns (`tests/support/tcp_relay.py`).
 
-Every one of these must end in exactly one of two states, and `tests/1.7_fault_
+Every one of these must end in exactly one of two states, and `tests/rubric/1.7_fault_
 injection/` asserts which for each: a clean recovery with the ledger unchanged, or a
 non-zero exit with an accurate `last_run.json`. Silence, `ok: true`, a hang or a
 duplicate are all failures of the item.

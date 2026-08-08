@@ -271,7 +271,7 @@ def ranked(
 class Domain:
     """A frozen set of values with no transition structure.
 
-    For decision tables (`check_slot`, `offset_reconcile.reconcile`) whose output
+    For decision tables (`check_slot`, `offsets.reconcile`) whose output
     classifies an *external* configuration rather than naming a state something moves
     through. `RESNAPSHOT_DECISIONS` and `RECONCILE_DECISIONS` were both declared and
     consumed only by a test; freezing them here makes them the shared vocabulary the

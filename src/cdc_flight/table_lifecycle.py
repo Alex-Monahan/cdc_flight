@@ -12,7 +12,7 @@ log *"recovery COMPLETE: every captured table has a fresh image"*.
 The 1.6—1.8 fix round closed the hole with `promote_interrupted_snapshots()`. This
 module closes the *class*: there is now exactly one `UPDATE ... SET snapshot_state` and
 one `INSERT ... snapshot_state` in `src/`, both here, both preceded by
-`TABLE_LIFECYCLE.check(from, to)`. `tests/1.9_state_machines/test_1_9_table_lifecycle.py`
+`TABLE_LIFECYCLE.check(from, to)`. `tests/rubric/1.9_state_machines/test_1_9_table_lifecycle.py`
 greps the tree and fails if a second writer appears — because a machine with two
 writers is a machine with one writer and one bug waiting to be written.
 

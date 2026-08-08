@@ -1,0 +1,470 @@
+"""Rubric 1.5 — who owns a destination table, and when a run may call itself ok.
+
+Two findings that are not about the fold and not about DDL, but about *bookkeeping*,
+and both make a zombie destination table possible or a failure invisible.
+
+**Ownership (Codex 5, ADR §18/A39).** "A replicated table absent from `pg_class` is
+always detected" was not durably true. The watcher learns which names it owns from
+`_cdc_flight.table_state`, and that row was written only by the snapshot coordinator —
+so a table first materialised by streaming DML had no durable row at all, and a
+`DROP TABLE` while the pipeline was down left an orphan destination table that no later
+poll could ever report (`_compare` skips a name it has no oid for and does not believe
+is replicated). `--reset-state` DELETEing the same table made the zombie **permanent**:
+a source-dropped table produces no events, so nothing re-teaches the watcher.
+
+**Honesty (Codex 6, ADR §18/A43).** Deferring a destructive action whose fence has not
+opened is the correct safety choice. Calling that run successful is not: `poll()`
+cleared `last_error` unconditionally and the alert was raised only when a change was
+*applied*, so a run could report `ok: true`, `catalog_error: null` and
+`catalog_pending > 0` together.
+"""
+
+from __future__ import annotations
+
+import threading
+
+import pytest
+from support.applier_lab import Lab, end, keyed
+
+from cdc_flight import catalog as catalog_mod
+from cdc_flight import destination as dest_mod
+from cdc_flight.catalog import CHANGE_DROPPED, CatalogChange, CatalogWatcher, SourceRelation
+from cdc_flight.config import RunConfig
+from cdc_flight.errors import EngineFailure
+from cdc_flight.pipeline import run_engine_bounded
+
+
+@pytest.fixture
+def lab(tmp_path):
+    boxes: list[Lab] = []
+
+    def _make(**cfg) -> Lab:
+        box = Lab(tmp_path / f"lab{len(boxes)}.duckdb", **cfg)
+        boxes.append(box)
+        return box
+
+    yield _make
+    for box in boxes:
+        box.close()
+
+
+def txn(number: str, events: list) -> list:
+    counts: dict[str, int] = {}
+    for event in events:
+        counts[f"{event.schema}.{event.table}"] = (
+            counts.get(f"{event.schema}.{event.table}", 0) + 1
+        )
+    return [*events, end(number, len(events), max(e.lsn or 0 for e in events) + 1, counts)]
+
+
+# --------------------------------------------------------------------------- #
+# ownership
+# --------------------------------------------------------------------------- #
+def test_streaming_dml_that_creates_a_table_records_the_ownership(lab):
+    """No snapshot anywhere in this run: the table exists only because a change event
+    created it, and that is exactly the case that had no durable row."""
+    box = lab()
+    box.run(txn("1", [keyed("1", 1, 10, 1, "a"), keyed("1", 2, 11, 7, "o", table="orders")]))
+    owned = box.q(
+        "SELECT source_schema, source_table, target_table FROM _cdc_flight.table_state "
+        "ORDER BY source_table"
+    )
+    assert owned == [
+        ("app", "customers", "cdcflight_app_customers"),
+        ("app", "orders", "cdcflight_app_orders"),
+    ]
+
+
+def test_the_ownership_row_is_written_in_the_same_transaction_as_the_table(lab, monkeypatch):
+    """A rolled-back group must leave neither the table nor the claim on it."""
+    from cdc_flight import faults
+
+    box = lab()
+    nth = box.applier.data_commit_groups + 1
+    monkeypatch.setenv("CDC_FAULT_INJECT", f"pre_commit:{nth}:raise")
+    faults.refresh()
+    with pytest.raises(faults.InjectedFault):
+        box.run(txn("1", [keyed("1", 1, 10, 1, "a")]))
+    monkeypatch.delenv("CDC_FAULT_INJECT")
+    faults.refresh()
+    assert not box.exists("cdcflight_app_customers")
+    assert box.q("SELECT count(*) FROM _cdc_flight.table_state") == [(0,)]
+
+
+def test_the_ownership_row_is_not_duplicated_by_later_groups(lab):
+    box = lab()
+    box.run(txn("1", [keyed("1", 1, 10, 1, "a")]))
+    box.run(txn("2", [keyed("2", 1, 20, 2, "b")]))
+    assert box.q("SELECT count(*) FROM _cdc_flight.table_state") == [(1,)]
+
+
+def test_a_watcher_seeded_from_table_state_can_detect_a_drop_it_never_saw(lab):
+    """The restart path end to end, in miniature: a run creates a table by streaming
+    only, a *later* process seeds its watcher from the destination, and the drop that
+    happened while nothing was running is detected."""
+    box = lab()
+    box.run(txn("1", [keyed("1", 1, 10, 1, "a")]))
+    replicated = catalog_mod.seed_from_table_state(box.con, "lab")
+    assert replicated == {"app.customers"}
+
+    w = CatalogWatcher(
+        dsn="", publication="pub", schema="app", include=set(),
+        known=catalog_mod.read_known_relations(box.con, "lab"),
+        replicated=replicated, poll_seconds=0, confirm_polls=1,
+    )
+    added = w._compare({"app.orders": SourceRelation("app", "orders", 9, True, "d")}, lsn=99)
+    assert [(c.kind, c.qualified) for c in added] == [(CHANGE_DROPPED, "app.customers")]
+
+
+def test_reset_state_keeps_the_ownership_and_resets_only_the_snapshot_state(lab):
+    """Opus MAJOR-4. `--reset-state` used to DELETE `table_state`, which permanently
+    disabled drop detection for any table the source had already dropped: it produces
+    no events, so `observe_replicated` never re-learns it and `_compare` skips it.
+
+    Asserted against the statements `pipeline.run` issues, so the fix cannot drift
+    apart from the test.
+    """
+    box = lab()
+    box.run(txn("1", [keyed("1", 1, 10, 1, "a")]))
+    box.con.execute(
+        "UPDATE _cdc_flight.table_state SET snapshot_state = 'complete', "
+        "snapshot_epoch = 4, snapshot_lsn = 1234, last_commit_id = 7"
+    )
+    dest_mod.upsert_source_relation(
+        box.con, pipeline="lab", source_schema="app", source_table="customers",
+        relation_oid=16384, published=True, replica_identity="d",
+    )
+
+    # exactly what `pipeline.run(reset_state=True)` does to these two tables
+    box.con.execute(
+        "UPDATE _cdc_flight.table_state SET snapshot_state = 'none', snapshot_epoch = 0, "
+        "snapshot_lsn = NULL, last_commit_id = NULL WHERE pipeline = ?",
+        ["lab"],
+    )
+    box.con.execute("DELETE FROM _cdc_flight.source_relations WHERE pipeline = ?", ["lab"])
+
+    assert catalog_mod.seed_from_table_state(box.con, "lab") == {"app.customers"}, (
+        "ownership must survive --reset-state, or a source-dropped table is a "
+        "permanent zombie"
+    )
+    assert catalog_mod.read_known_relations(box.con, "lab") == {}, (
+        "the oids must NOT survive: a rebuilt source would otherwise read as a "
+        "recreate of every table"
+    )
+    assert box.q(
+        "SELECT snapshot_state, snapshot_epoch, snapshot_lsn, last_commit_id "
+        "FROM _cdc_flight.table_state"
+    ) == [("none", 0, None, None)]
+
+
+# --------------------------------------------------------------------------- #
+# honesty: the run summary and the drain barrier
+# --------------------------------------------------------------------------- #
+class _Handler:
+    """The two things `run_engine_bounded` asks of the applier."""
+
+    def __init__(self) -> None:
+        self.record_count = 5
+        self.error = None
+        self.busy = False
+        self.batch_count = 1
+        self.data_batch_count = 1
+        self.skipped_count = 0
+        self.seconds_since_last_batch = 999.0
+
+    def snapshot_counts(self) -> dict:
+        return {}
+
+    def stats(self) -> dict:
+        return {}
+
+    def drain_on_shutdown(self) -> int:
+        return 0
+
+    def shutdown(self, *, reason="supervisor_shutdown") -> None:
+        pass
+
+    def wait_for_quiescence(self, timeout: float) -> bool:
+        return True
+
+
+class _Engine:
+    failure = None
+    offset_flushes_verified = 0
+    suppressed_message = None
+    completed_success = True
+
+    def run(self) -> None:
+        import time
+
+        time.sleep(1.0)
+
+    def close(self, intentional: bool = True) -> None:
+        pass
+
+
+def _watcher_with_pending(polls: list) -> CatalogWatcher:
+    w = CatalogWatcher(
+        dsn="", publication="pub", schema="app", include=set(), poll_seconds=0
+    )
+    w.queue(
+        CatalogChange(kind=CHANGE_DROPPED, schema="app", table="gone", detected_lsn=10**9)
+    )
+    w.poll_quietly = lambda: polls.append(1) or []  # type: ignore[method-assign]
+    return w
+
+
+def test_a_quiet_run_polls_the_catalog_once_more_before_shutting_down():
+    """Codex 6: the watcher polls every 10 s while the idle window is 8 s, so a DROP on
+    a quiet source normally could not be seen until the *next* scheduled run. The final
+    synchronous poll is also what completes `CDC_DROP_CONFIRM_POLLS` on a short run."""
+    polls: list = []
+    w = _watcher_with_pending(polls)
+    with pytest.raises(EngineFailure):
+        run_engine_bounded(
+            _Engine(), _Handler(), RunConfig(max_seconds=6, idle_seconds=0.1),
+            catalog=w, catalog_drain_seconds=0.2,
+        )
+    assert polls, "the final catalog poll did not happen"
+
+
+def test_an_unresolved_destructive_change_makes_the_run_fail():
+    """`ok: true` with `catalog_pending > 0` is the dishonest combination."""
+    w = _watcher_with_pending([])
+    with pytest.raises(EngineFailure) as excinfo:
+        run_engine_bounded(
+            _Engine(), _Handler(), RunConfig(max_seconds=6, idle_seconds=0.1),
+            catalog=w, catalog_drain_seconds=0.2,
+        )
+    assert "unresolved" in str(excinfo.value)
+    summary = excinfo.value.summary
+    assert summary["stop_reason"] == "catalog_unresolved"
+    assert summary["catalog_unresolved_tables"] == ["app.gone"]
+    assert summary.get("ok") is not True
+
+
+def test_a_run_with_nothing_pending_still_succeeds():
+    w = CatalogWatcher(
+        dsn="", publication="pub", schema="app", include=set(), poll_seconds=0
+    )
+    w.poll_quietly = lambda: []  # type: ignore[method-assign]
+    summary = run_engine_bounded(
+        _Engine(), _Handler(), RunConfig(max_seconds=6, idle_seconds=0.1),
+        catalog=w, catalog_drain_seconds=0.2,
+    )
+    assert summary["ok"] is True
+    assert summary["stop_reason"] == "idle"
+
+
+def test_a_marker_failure_is_preserved_in_the_summary():
+    """`poll()` used to clear `last_error` unconditionally, so the one state in which a
+    destructive change *cannot* be applied reported no error at all."""
+    w = CatalogWatcher(
+        dsn="", publication="pub", schema="app", include=set(), poll_seconds=0
+    )
+    w.queue(
+        CatalogChange(kind=CHANGE_DROPPED, schema="app", table="gone", detected_lsn=1)
+    )
+
+    class Broken:
+        def execute(self, *_args):
+            raise RuntimeError("cannot write to a read-only source")
+
+    w._emit_marker(Broken(), w.pending())
+    summary = w.summary()
+    assert summary["catalog_marker_error"]
+    assert summary["catalog_marker_capable"] is False
+    assert summary["catalog_pending_destructive"] == 1
+    assert summary["catalog_error"]
+
+
+def test_the_marker_write_budget_is_bounded():
+    """Opus MINOR-1: a fence that never opens would otherwise write one WAL record per
+    poll for ever against a source cdc_flight otherwise only reads."""
+    from cdc_flight.source_marker import CATALOG_FENCE, SourceMarker
+
+    class Fine:
+        def execute(self, *_args):
+            return None
+
+    marker = SourceMarker(prefix="cdcf", max_writes=3)
+    conn = Fine()
+    assert [marker.emit(conn, CATALOG_FENCE, {}) for _ in range(5)] == [
+        True, True, True, False, False,
+    ]
+    assert marker.writes == 3
+    assert marker.suppressed == 2
+    assert "budget exhausted" in marker.last_error
+
+
+def test_a_poll_that_finishes_at_shutdown_still_fails_the_run():
+    """`stop()` must MEAN quiesced, not "we waited a bit" (Codex r3 MAJOR-3).
+
+    Production joins for a bounded time and used to return whatever happened, so a poll
+    that outlived the join could take an undeclared transition — or learn a relation —
+    after the run had already been judged a success. The first cut of this test used a
+    fake whose `stop()` synchronously set `machine_error`, which never exercised the
+    timed join at all. This holds a REAL background poll at a barrier and lets the
+    supervisor's own synchronous final poll answer cleanly.
+    """
+    supervisor_thread = threading.current_thread()
+
+    class _StuckPoller(CatalogWatcher):
+        def __init__(self):
+            super().__init__(
+                dsn="", publication="pub", schema="app", include=set(), poll_seconds=0.05
+            )
+            self.quiesce_timeout = 0.3
+            self.release = threading.Event()
+            self.stopped = False
+
+        def poll_quietly(self):
+            if threading.current_thread() is supervisor_thread:
+                return []          # the synchronous final poll: clean and prompt
+            self.release.wait(30)  # the background poll: wedged on a dead socket
+            self.machine_error = "IllegalTransition: catalog_change: 'due' -> 'marked'"
+            return []
+
+        def stop(self):
+            self.stopped = True
+            return super().stop()
+
+    w = _StuckPoller()
+    w._thread = threading.Thread(target=w.poll_quietly, daemon=True)
+    w._thread.start()
+    try:
+        with pytest.raises(EngineFailure) as excinfo:
+            run_engine_bounded(
+                _Engine(), _Handler(), RunConfig(max_seconds=6, idle_seconds=0.1),
+                catalog=w, catalog_drain_seconds=0.2,
+            )
+        assert w.stopped, "the supervisor must try to quiesce the watcher"
+        # It could NOT quiesce, and that alone is a failed run: every check after it
+        # reads state the live poller can still mutate, including the relations the
+        # caller is about to persist.
+        assert "did not stop" in str(excinfo.value), str(excinfo.value)
+        assert excinfo.value.summary["stop_reason"] == "engine_error"
+        assert excinfo.value.summary["catalog_quiesced"] is False
+        assert excinfo.value.summary.get("ok") is not True
+    finally:
+        w.release.set()
+
+
+def test_a_watcher_that_really_stops_lets_the_verdict_stand():
+    """The other half: quiescence is proved, so the machine-error check is trustworthy."""
+
+    class _CleanPoller(CatalogWatcher):
+        def __init__(self):
+            super().__init__(
+                dsn="", publication="pub", schema="app", include=set(), poll_seconds=0.05
+            )
+            self.quiesce_timeout = 2.0
+
+        def poll_quietly(self):
+            self.successful_polls += 1
+            return []
+
+    w = _CleanPoller().start()
+    w.machine_error = "IllegalTransition: catalog_change: 'due' -> 'marked'"
+    with pytest.raises(EngineFailure) as excinfo:
+        run_engine_bounded(
+            _Engine(), _Handler(), RunConfig(max_seconds=6, idle_seconds=0.1),
+            catalog=w, catalog_drain_seconds=0.2,
+        )
+    assert w.quiesced is True
+    assert "undeclared transition" in str(excinfo.value)
+
+
+def test_what_the_watcher_learned_is_persisted_even_when_nothing_is_due():
+    """`source_relations` is what makes a drop detectable ACROSS a restart.
+
+    It was written only as a side effect of a `CatalogPlan` that had at least one *due*
+    change, because `plan()` returned an empty plan the moment `due` was empty. A
+    pipeline whose catalog is simply quiet therefore never persisted the `relation_oid`
+    it had learned — and the first run after `--reset-state`, which discards
+    `source_relations` deliberately, left the destination permanently unable to notice
+    the next drop-and-recreate. MEASURED: the 1.5 recreated-relation E2E stopped
+    detecting anything the moment reset began registering every captured table, because
+    a registered table produces no `new` change and nothing else was due.
+    """
+    from cdc_flight.catalog import SourceRelation
+    from cdc_flight.catalog_apply import CatalogCoordinator
+
+    w = CatalogWatcher(
+        dsn="", publication="pub", schema="app", include={"app.customers"},
+        replicated={"app.customers"}, poll_seconds=0,
+    )
+    relation = SourceRelation(
+        schema="app", table="customers", oid=16384, published=True, replica_identity="d"
+    )
+    w._dirty["app.customers"] = relation
+
+    coordinator = CatalogCoordinator(
+        catalog=w, pipeline="p", topic_prefix="cdcflight", drop_mode="replicate",
+        registry_of=lambda: None,
+    )
+    plan = coordinator.plan(durable_lsn=0)
+    assert plan.actions == (), "nothing was due, so nothing may be applied"
+    assert plan.relations == (relation,), (
+        "the learned relation was not carried into the plan, so nothing will persist "
+        "its oid and the next run cannot tell a recreate from a quiet table"
+    )
+
+
+def test_a_run_that_never_read_the_catalog_is_not_a_success():
+    """Proving the poller is DEAD is not proving it ever SPOKE (Codex r4 BLOCKER-2).
+
+    `poll_quietly()` catches a query failure into `last_error` and returns nothing, which
+    is right for a transient source. But a run in which EVERY poll failed has no
+    baseline: it cannot have noticed a `DROP TABLE`, and it has nothing to persist — so
+    reporting success says "I checked and everything is fine" when nothing was checked.
+    Measured consequence: with every poll timing out, a quiet run returned `ok=true` and
+    learned zero relations; an offline drop-and-recreate then left the old relation's
+    rows beside the new one's for ever, because the following runs adopted the
+    replacement oid as the baseline they had never had.
+    """
+
+    class _AlwaysFails(CatalogWatcher):
+        def __init__(self):
+            super().__init__(
+                dsn="", publication="pub", schema="app", include=set(), poll_seconds=0.05
+            )
+            self.quiesce_timeout = 2.0
+
+        def poll_quietly(self):
+            self.last_error = "TimeoutError: canceling statement due to statement timeout"
+            return []
+
+    w = _AlwaysFails().start()
+    with pytest.raises(EngineFailure) as excinfo:
+        run_engine_bounded(
+            _Engine(), _Handler(), RunConfig(max_seconds=6, idle_seconds=0.1),
+            catalog=w, catalog_drain_seconds=0.2,
+        )
+    assert "could not be read even once" in str(excinfo.value), str(excinfo.value)
+    assert excinfo.value.summary["stop_reason"] == "engine_error"
+    assert excinfo.value.summary["catalog_successful_polls"] == 0
+    assert excinfo.value.summary.get("ok") is not True
+
+
+def test_one_successful_poll_is_enough_to_have_a_baseline():
+    """The other half: a poll that read the catalog once gives the run something to say."""
+
+    class _OneGoodPoll(CatalogWatcher):
+        def __init__(self):
+            super().__init__(
+                dsn="", publication="pub", schema="app", include=set(), poll_seconds=0.05
+            )
+            self.quiesce_timeout = 2.0
+
+        def poll_quietly(self):
+            self.successful_polls += 1
+            self.last_error = "TimeoutError: a later poll failed, which is transient"
+            return []
+
+    w = _OneGoodPoll().start()
+    summary = run_engine_bounded(
+        _Engine(), _Handler(), RunConfig(max_seconds=6, idle_seconds=0.1),
+        catalog=w, catalog_drain_seconds=0.2,
+    )
+    assert summary["ok"] is True, summary

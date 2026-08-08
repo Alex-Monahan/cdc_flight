@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 
-from . import catalog_observation as observation_mod
+from . import catalog_support as observation_mod
 from . import faults as faults_mod
 from .catalog_state import FENCED, SourceRelation, _missing_value
 from .machines import (

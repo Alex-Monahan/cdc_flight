@@ -235,7 +235,7 @@ class RunOutcome:
         raised: the callers are `finally` blocks and shutdown paths where raising would
         replace a real failure with a bookkeeping one. The *machine* still calls it
         illegal — `RUN_OUTCOME.check('source_dark', 'hung')` raises — and that is what
-        `tests/1.9_state_machines/` asserts against, so the rule is checked in one place
+        `tests/rubric/1.9_state_machines/` asserts against, so the rule is checked in one place
         rather than trusted in eight.
         """
         reason = RUN_OUTCOME.parse(reason)

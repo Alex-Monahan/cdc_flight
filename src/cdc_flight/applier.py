@@ -50,7 +50,7 @@ from . import (
     catalog_commit,
     commit_metadata,
     destination,
-    resume,
+    offsets,
     schema_epoch,
     self_heal,
     spill_protocol,
@@ -58,10 +58,10 @@ from . import (
     unit_admission,
     unit_apply,
 )
-from .applier_config import ApplierConfig
 from .assembler import CompleteUnit, TransactionAssembler
 from .catalog_apply import CatalogCoordinator, CatalogPlan
 from .commit_group import CommitResult, OpenGroup
+from .config import ApplierConfig
 from .destination import AlertSink, Lease, ResumePoint
 from .envelope import KIND_SNAPSHOT_BOUNDARY, PendingRecord, decode
 from .errors import (
@@ -72,8 +72,11 @@ from .errors import (
 from .faults import arm_group, maybe_crash
 from .run_state import COMMIT_ACK
 from .snapshot import SnapshotCoordinator
-from .snapshot_completion import SnapshotCompletion, SnapshotObservationError
-from .snapshot_notifications import decode_notification
+from .snapshot_completion import (
+    SnapshotCompletion,
+    SnapshotObservationError,
+    decode_notification,
+)
 from .spill import SpillBuffer
 
 log = logging.getLogger("cdc_flight.applier")
@@ -576,7 +579,7 @@ class Applier:
             self.group.txn_open = True
         try:
             self.lease.renew(self.con)
-            new_point = resume.point_for(
+            new_point = offsets.point_for(
                 group,
                 previous=self.resume_point,
                 commit_id=commit_id,
@@ -762,7 +765,7 @@ class Applier:
         # temporary point would manufacture an Invariant-O drift (r15 acceptance).
         if self.cfg.verify_offset_file and not self.cfg.resnapshot:
             self._pending_offset_key_blob, self._pending_offset_blob = (
-                resume.capture_offset_file(self.offset_path, new_point)
+                offsets.capture_offset_file(self.offset_path, new_point)
             )
         self._reset_group()
         return CommitResult.COMMITTED
@@ -843,7 +846,7 @@ class Applier:
         for alert in alerts:
             self._raise_alert(alert)
 
-    # -- resume point (ADR §4.3, `resume.py`) ------------------------------- #
+    # -- resume point (ADR §4.3, `offsets.py`) ------------------------------- #
     def _run_pending_verification(self) -> None:
         """Check a deferred offset flush, now that the connector has polled again.
 

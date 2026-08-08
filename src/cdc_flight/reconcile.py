@@ -8,7 +8,7 @@ consequence: the destructive sequence had no journal because nothing owned it.
 
 What lives where now:
 
-* `cdc_flight.offset_reconcile` — `offsets.dat` versus the durable resume point. The
+* `cdc_flight.offsets` — `offsets.dat` versus the durable resume point. The
   file is never a source of truth; that module's docstring is the decision table.
 * `cdc_flight.recovery` — the acquisition-recovery state machine (A53).
 * **here** — observing the slot and the cluster it lives in, the pure `check_slot`
@@ -30,7 +30,7 @@ from .errors import (
     SlotAheadOfDestination,
 )
 from .machines import SLOT_VERDICTS
-from .offset_reconcile import Reconciliation, reconcile
+from .offsets import Reconciliation, reconcile
 
 __all__ = ["Reconciliation", "reconcile"]
 

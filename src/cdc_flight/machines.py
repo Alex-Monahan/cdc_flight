@@ -803,7 +803,7 @@ SLOT_VERDICTS = Domain(
     purpose="What did the last acquisition conclude about the slot?",
 )
 
-#: `offset_reconcile.reconcile`'s ten outcomes against the documented decision table.
+#: `offsets.reconcile`'s ten outcomes against the documented decision table.
 RECONCILE_DECISIONS = Domain(
     "reconcile_decision",
     values=(

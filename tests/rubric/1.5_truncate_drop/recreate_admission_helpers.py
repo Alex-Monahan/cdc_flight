@@ -1,0 +1,106 @@
+"""Small fixtures and state constructors shared by the 1.5 fold and recreate tests."""
+
+from __future__ import annotations
+
+from support.applier_lab import DATASET, Lab, data, end, keyed
+
+from cdc_flight.catalog import (
+    CHANGE_RECREATED,
+    CatalogChange,
+    CatalogWatcher,
+    SourceRelation,
+)
+from cdc_flight.machines import CHANGE_MARKED
+
+CUSTOMERS = "cdcflight_app_customers"
+ORDERS = "cdcflight_app_orders"
+
+
+def _watcher(*, present: dict[str, object] | None = None, **kw) -> CatalogWatcher:
+    """A polling-disabled watcher whose durable observations are supplied by the test."""
+    watcher = CatalogWatcher(
+        dsn="", publication="pub", schema="app", include=set(), poll_seconds=0, **kw
+    )
+    return watcher
+
+
+def txn(number: str, events: list, per_table: dict[str, int] | None = None) -> list:
+    counts: dict[str, int] = {}
+    for event in events:
+        qualified = f"{event.schema}.{event.table}"
+        counts[qualified] = counts.get(qualified, 0) + 1
+    commit_lsn = max(e.lsn or 0 for e in events) + 1
+    return [*events, end(number, len(events), commit_lsn, per_table or counts)]
+
+
+def preload(box: Lab, *, customers=(1, 2, 3), orders=(7, 8)) -> None:
+    events = [
+        keyed("1", i + 1, 10 + i, ident, f"c{ident}")
+        for i, ident in enumerate(customers)
+    ]
+    events += [
+        data(
+            "1", len(customers) + i + 1, 20 + i, table="orders",
+            key={"id": ident}, after={"id": ident, "note": f"o{ident}"},
+        )
+        for i, ident in enumerate(orders)
+    ]
+    box.run(txn("1", events))
+
+
+def rows(box: Lab, table: str) -> list[tuple]:
+    return box.q(f'SELECT id FROM "{DATASET}"."{table}" ORDER BY id')
+
+
+def markers(box: Lab) -> list[tuple]:
+    return box.q(
+        "SELECT event, source_table, applied, rows_removed FROM _cdc_flight.table_events "
+        "ORDER BY commit_id, seq"
+    )
+
+
+def _queue(watcher: CatalogWatcher, change: CatalogChange) -> None:
+    watcher.queue(change)
+
+
+def _catalog_relation(table: str, oid: int) -> SourceRelation:
+    return SourceRelation(
+        schema="app", table=table, oid=oid, published=True, replica_identity="d"
+    )
+
+
+def _queue_recreated(
+    watcher: CatalogWatcher,
+    relation: SourceRelation,
+    *,
+    state: str = CHANGE_MARKED,
+    detected_lsn: int = 150,
+) -> None:
+    _queue(
+        watcher,
+        CatalogChange(
+            kind=CHANGE_RECREATED,
+            schema=relation.schema,
+            table=relation.table,
+            detected_lsn=detected_lsn,
+            old_oid=16384,
+            new_oid=relation.oid,
+            new_relation=relation,
+            state=state,
+        ),
+    )
+
+
+def _assert_recreated_boundary(box: Lab, relation: SourceRelation) -> None:
+    assert box.exists(CUSTOMERS), (
+        "the retained image remains queryable but untrusted until re-snapshot"
+    )
+    assert box.q(
+        "SELECT snapshot_state FROM _cdc_flight.table_state "
+        "WHERE pipeline = 'lab' AND source_table = 'customers'"
+    ) == [("awaiting_snapshot",)]
+    assert box.q(
+        "SELECT relation_oid, relation_filenode, relation_type_oid "
+        "FROM _cdc_flight.source_relations "
+        "WHERE pipeline = 'lab' AND source_table = 'customers'"
+    ) == [(relation.oid, relation.relfilenode, relation.relation_type_oid)]

@@ -88,7 +88,7 @@ from .machines import (
 log = logging.getLogger("cdc_flight.recovery")
 
 #: The decision an operator's `--accept-orphan-offsets` writes. It is a recovery like
-#: any other now (Codex r1 BLOCKER-1): `offset_reconcile` used to drop the slot and
+#: any other now (Codex r1 BLOCKER-1): `offsets` used to drop the slot and
 #: unlink the file and only *then* journal what it had done, so a hard exit in that gap
 #: lost the durable obligation to rebuild and the next run called the leftovers an
 #: ordinary fresh start - the exact B3/A53 state the journal exists to prevent.

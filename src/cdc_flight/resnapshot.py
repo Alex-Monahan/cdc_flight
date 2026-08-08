@@ -119,8 +119,8 @@ from . import destination as dest_mod
 from . import reconcile as reconcile_mod
 from . import resnapshot_projection as projection
 from . import table_lifecycle
-from .applier import Applier, ApplierConfig
-from .config import DROP_LOG, ReplicationConfig, RunConfig, SourceConfig
+from .applier import Applier
+from .config import DROP_LOG, ApplierConfig, ReplicationConfig, RunConfig, SourceConfig
 from .debezium_props import build_properties
 from .destination import CONTROL_SCHEMA, ResumePoint
 from .errors import EngineFailure

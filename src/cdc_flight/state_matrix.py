@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, replace
 
-from . import catalog_admission, catalog_reporting, destination, state_interactions, table_lifecycle
+from . import catalog_admission, catalog_support, destination, state_interactions, table_lifecycle
 from .catalog import CatalogWatcher
 from .catalog_state import CHANGE_NEW, CHANGE_SCHEMA, CatalogChange, SourceRelation
 from .control_schema import ensure_control_schema
@@ -215,7 +215,7 @@ def _schema_liveness(target: str):
     # This is the real absence gate used by catalog polling.  A non-visible state
     # must not manufacture a destructive change from an empty observation.
     watcher._compare({}, 1)
-    catalog_reporting.summary(watcher)
+    catalog_support.summary(watcher)
     return watcher
 
 

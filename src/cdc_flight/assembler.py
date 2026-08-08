@@ -14,8 +14,8 @@ The one boundary rule:
 > the observed per-table counts *in both directions*, **and** the observed
 > `transaction.total_order` ordinals are exactly `1..event_count`.
 
-Consequences, enforced here and asserted by `tests/1.3_atomic_batches/` and
-`tests/test_assembler.py`:
+Consequences, enforced here and asserted by `tests/rubric/1.3_atomic_batches/` and
+`tests/unit/test_assembler.py`:
 
 * a `txId` change without an intervening `END` is fatal, not a fallback;
 * an `event_count` mismatch is fatal, and so is a **missing** `event_count`: the

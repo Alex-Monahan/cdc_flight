@@ -44,9 +44,9 @@ from . import reconcile as reconcile_mod
 from . import recovery as recovery_mod
 from . import resnapshot as resnapshot_mod
 from . import resnapshot_recovery as resnapshot_recovery_mod
-from .applier import ApplierConfig
 from .completion_stage import PostEngineCompletion
 from .config import (
+    ApplierConfig,
     CatalogConfig,
     DestinationConfig,
     ReplicationConfig,
@@ -292,7 +292,7 @@ def run(
         # `--accept-orphan-offsets` has authorised a rebuild, and the rebuild is now a
         # journalled recovery like every other one — **journal first, destroy second**.
         #
-        # It used to be the other way round. `offset_reconcile` dropped the slot and
+        # It used to be the other way round. `offsets` dropped the slot and
         # unlinked the file and only then did this block record why, which put a crash
         # window between destroying the evidence and writing the obligation: a hard exit
         # there left no row, no file, no slot and no journal, the next run called that an
