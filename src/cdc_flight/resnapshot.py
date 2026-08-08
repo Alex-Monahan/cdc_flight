@@ -430,7 +430,20 @@ def run(
             namespace=namespace,
             snapshot_epoch=epoch_base + len(tables) + 1,
         )
+    descriptor_connection = None
     try:
+        # The throwaway applier deliberately has no live CatalogWatcher, but its
+        # snapshot shadow must use the same catalog-authoritative descriptors as the
+        # main stream.  Read only the requested relation/type facts once; no source
+        # row values are fetched and no TOAST behavior is involved here.
+        import psycopg
+
+        from .catalog_descriptors import RelationDescriptorProvider
+
+        descriptor_connection = psycopg.connect(source.dsn, autocommit=True)
+        descriptor_provider = RelationDescriptorProvider.from_tables(
+            descriptor_connection, tables
+        ).descriptors_for
         applier = Applier(
             con,
             pipeline=pipeline,
@@ -446,6 +459,7 @@ def run(
             catalog=None,
             completion=completion,
             snapshot_audit=snapshot_audit,
+            descriptor_provider=descriptor_provider,
         )
         ownership.attach(applier)
         # Keep the historical pipeline seam: tests and embedding callers replace
@@ -601,6 +615,8 @@ def run(
             recovery.consume()
         raise
     finally:
+        if descriptor_connection is not None:
+            descriptor_connection.close()
         if not source_stopped:
             if health is not None:
                 health.stop()

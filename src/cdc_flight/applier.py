@@ -103,7 +103,7 @@ class Applier:
         catalog=None,
         watermarks: dict[str, int] | None = None,
         completion: SnapshotCompletion | None = None,
-        snapshot_audit=None,
+        snapshot_audit=None, descriptor_provider=None,
     ):
         self.con = con
         self.pipeline = pipeline
@@ -120,6 +120,7 @@ class Applier:
         #: `catalog.CatalogWatcher` or None. The only source of DROP TABLE knowledge
         #: (rubric 1.5): logical decoding does not carry DDL at all.
         self.catalog = catalog
+        self.descriptor_provider = descriptor_provider
         #: rubric 1.6: `"<schema>.<table>" -> snapshot_lsn`. A source transaction whose
         #: **commit** LSN is below a table's watermark is already inside that table's
         #: snapshot image, so its events for that table are dropped. Per table, because

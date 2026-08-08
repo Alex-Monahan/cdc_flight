@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from . import apply_sql
 from .destination import CONTROL_SCHEMA
 from .envelope import KIND_DATA, KIND_TRUNCATE, OP_TRUNCATE, PendingRecord
+from .typed_types import SourceTypeDescriptor, TypedImage
 
 log = logging.getLogger("cdc_flight.spill")
 
@@ -77,7 +78,21 @@ class SpillBuffer:
                 staged.event.schema, staged.event.table, staged.event.lsn,
                 staged.event.txn_id, staged.event.total_order, staged.event_id,
                 staged.event.op, staged.event.source_ts_ms,
-                _json(staged.event.before), _json(staged.event.after), _json(staged.event.key),
+                _image_json(
+                    staged.event.before,
+                    staged.event.typed_before,
+                    staged.event.before_descriptors,
+                ),
+                _image_json(
+                    staged.event.after,
+                    staged.event.typed_after,
+                    staged.event.after_descriptors,
+                ),
+                _image_json(
+                    staged.event.key,
+                    staged.event.typed_key,
+                    staged.event.key_descriptors,
+                ),
             ]
             for staged in prepared
         ]
@@ -108,6 +123,9 @@ class SpillBuffer:
                 target, schema, table, lsn, txn_id, total_order, event_id, op,
                 source_ts_ms, before_json, after_json, key_json, event_seq,
             ) = row
+            before, typed_before = _image_from_json(before_json)
+            after, typed_after = _image_from_json(after_json)
+            key, typed_key = _image_from_json(key_json)
             out.append(
                 StagedEvent(
                     event=PendingRecord(
@@ -120,9 +138,15 @@ class SpillBuffer:
                         topic="", nbytes=0, op=op, schema=schema,
                         table=table, lsn=lsn, txn_id=txn_id, total_order=total_order,
                         source_ts_ms=source_ts_ms,
-                        key=json.loads(key_json) if key_json else None,
-                        before=json.loads(before_json) if before_json else None,
-                        after=json.loads(after_json) if after_json else None,
+                        key=key,
+                        before=before,
+                        after=after,
+                        key_descriptors=_image_descriptors(typed_key),
+                        before_descriptors=_image_descriptors(typed_before),
+                        after_descriptors=_image_descriptors(typed_after),
+                        typed_key=typed_key,
+                        typed_before=typed_before,
+                        typed_after=typed_after,
                     ),
                     event_id=event_id,
                     target=target,
@@ -144,5 +168,58 @@ class SpillBuffer:
         self.rows = 0
 
 
-def _json(value) -> str | None:
-    return json.dumps(value, default=str) if value else None
+_TYPED_IMAGE_VERSION = 1
+
+
+def _image_json(
+    raw: object,
+    image: TypedImage | None,
+    descriptors: dict[str, SourceTypeDescriptor] | None,
+) -> str | None:
+    """Serialize a typed image without changing the legacy raw image.
+
+    The raw mapping remains in the envelope so the current full-row/TOAST path is
+    byte-for-byte compatible.  The typed sidecar is optional and versioned; old spill
+    rows continue to decode through ``_image_from_json``.  In particular, the current
+    placeholder is not interpreted here as an unchanged-TOAST disposition.
+    """
+    if raw is None and image is None:
+        return None
+    if image is None and not descriptors:
+        return json.dumps(raw, default=str) if raw is not None else None
+    typed = image or TypedImage.from_mapping(raw, descriptors)
+    return json.dumps(
+        {
+            "__cdcf_typed_image__": _TYPED_IMAGE_VERSION,
+            "raw": raw,
+            "image": typed.to_dict(),
+        },
+        default=str,
+        sort_keys=True,
+    )
+
+
+def _image_from_json(value: str | None) -> tuple[dict | None, TypedImage | None]:
+    if not value:
+        return None, None
+    parsed = json.loads(value)
+    if not isinstance(parsed, dict) or "__cdcf_typed_image__" not in parsed:
+        return parsed, None
+    if parsed.get("__cdcf_typed_image__") != _TYPED_IMAGE_VERSION:
+        raise ValueError(
+            "unsupported typed spill image version "
+            f"{parsed.get('__cdcf_typed_image__')!r}"
+        )
+    raw = parsed.get("raw")
+    image = TypedImage.from_dict(parsed.get("image") or {})
+    return raw, image
+
+
+def _image_descriptors(image: TypedImage | None) -> dict[str, SourceTypeDescriptor]:
+    if image is None:
+        return {}
+    return {
+        name: field.descriptor
+        for name, field in image.fields
+        if field.descriptor is not None
+    }

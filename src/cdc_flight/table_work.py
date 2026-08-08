@@ -59,7 +59,7 @@ from typing import Any
 
 from . import apply_sql, naming
 from .envelope import KIND_TRUNCATE, PendingRecord
-from .errors import AmbiguousDelete, DestinationIdentityCollision
+from .errors import AmbiguousDelete, DestinationIdentityCollision, SchemaEvolutionRefused
 from .naming import CDCF_COMMIT_ID, CDCF_EVENT_ID, CDCF_TOTAL_ORDER
 
 log = logging.getLogger("cdc_flight.table_work")
@@ -114,6 +114,11 @@ class TableWork:
     key_columns: tuple[str, ...] = ()
     keyless: bool = False
     columns: dict[str, str] = field(default_factory=dict)
+    #: Source descriptors observed on the schema-bearing envelope.  Values in
+    #: `columns` are still kept for the legacy metadata fields and compatibility
+    #: callers; a non-empty map selects the strict native creation/bind path.
+    descriptors: dict[str, Any] = field(default_factory=dict)
+    native_columns: dict[str, Any] = field(default_factory=dict)
     #: identity key -> the rows that currently wear it, in source order. See the
     #: module docstring: this is the whole fold.
     live: dict[tuple, list] = field(default_factory=dict)
@@ -188,8 +193,20 @@ def row_for(
     """The destination row for one change event, plus the applier's own columns."""
     image = event.after if event.op != "d" else event.before
     row: dict[str, Any] = {}
+    descriptors = (
+        event.before_descriptors if event.op == "d" else event.after_descriptors
+    )
     for column, value in (image or {}).items():
-        row[naming.normalize(column)] = value
+        name = naming.normalize(column)
+        descriptor = descriptors.get(column) or descriptors.get(name)
+        if descriptor is not None:
+            from .typed_types import encode_value
+
+            # The configured TOAST placeholder is an ordinary source string in the
+            # current connector contract.  Encoding it as declared text preserves
+            # today's behavior; marker identity is intentionally left to rubric 2.6.
+            value = encode_value(value, descriptor)
+        row[name] = value
     row[CDCF_COMMIT_ID] = commit_id
     row[CDCF_EVENT_ID] = event_id
     # A snapshot record has no transaction, so it has no ordinal. Leaving it NULL is
@@ -226,10 +243,20 @@ def collect(
     if event.kind == KIND_TRUNCATE:
         truncate(item)
         return
+    descriptors = event.before_descriptors if event.op == "d" else event.after_descriptors
     for column, value in row.items():
-        item.columns[column] = apply_sql.widen(
-            item.columns.get(column), apply_sql.sql_type(value)
-        )
+        source_name = column
+        descriptor = descriptors.get(source_name)
+        if descriptor is not None:
+            from .typed_types import native_type
+
+            item.descriptors[column] = descriptor
+            item.native_columns[column] = native_type(descriptor)
+            item.columns[column] = item.native_columns[column].sql
+        else:
+            item.columns[column] = apply_sql.widen(
+                item.columns.get(column), apply_sql.sql_type(value)
+            )
     item.events += 1
     if item.keyless:
         # A keyless table is a changelog (ADR §15/A12): one row per event, identified
@@ -508,9 +535,21 @@ def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
     for column in item.key_columns:
         columns.setdefault(column, apply_sql.VARCHAR)
 
-    table, created = registry.ensure(
-        item.target, columns=columns, key_columns=item.key_columns
-    )
+    if item.native_columns:
+        typed_columns = {**columns, **item.native_columns}
+        try:
+            table, created = registry.ensure_typed(
+                item.target, columns=typed_columns, key_columns=item.key_columns
+            )
+        except SchemaEvolutionRefused as refused:
+            refused.source_schema = refused.source_schema or item.source_schema
+            refused.source_table = refused.source_table or item.source_table
+            refused.target = refused.target or item.target
+            raise
+    else:
+        table, created = registry.ensure(
+            item.target, columns=columns, key_columns=item.key_columns
+        )
     if created:
         created_in_txn.add(item.target)
     # A table this transaction created is empty, so the DELETE half of the merge
@@ -535,7 +574,7 @@ def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
     elif not item.snapshot and not fresh and delete_keys:
         keys = [
             tuple(
-                apply_sql.bind(value, table.columns.get(col, apply_sql.VARCHAR))
+                _key_value(table, col, value)
                 for col, value in zip(item.key_columns, key, strict=False)
             )
             for key in delete_keys
@@ -549,7 +588,11 @@ def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
         column_order,
         [
             [
-                apply_sql.bind(row.get(col), table.columns.get(col, apply_sql.VARCHAR))
+                (
+                    _typed_value(table, col, row.get(col))
+                    if table.native_types and col in table.native_types
+                    else apply_sql.bind(row.get(col), table.columns.get(col, apply_sql.VARCHAR))
+                )
                 for col in column_order
             ]
             for row in rows
@@ -570,6 +613,43 @@ def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
         collision.source_table = item.source_table
         collision.target = item.target
         raise
+
+
+def _typed_value(table, column: str, value):
+    """Bind a source value to the current physical native declaration."""
+    from .typed_types import UnionValue, union_member_name
+
+    native = table.native_types.get(column)
+    source = table.source_descriptors.get(column)
+    if native is None or source is None:
+        return value
+    if native.kind in {"UNION", "NUMERIC_UNION"}:
+        member = union_member_name(source) if native.kind == "UNION" else "finite"
+        if isinstance(value, UnionValue) and value.member == member:
+            return value
+        from .typed_types import native_type
+
+        return UnionValue(member, value, native=native_type(source))
+    if isinstance(value, UnionValue):
+        return value
+    return value
+
+
+def _key_value(table, column: str, value):
+    """Encode a key using the same source descriptor as the row path."""
+    from .typed_types import UnionValue, encode_value, union_member_name
+
+    native = table.native_types.get(column)
+    source = table.source_descriptors.get(column)
+    if native is None or source is None:
+        return apply_sql.bind(value, table.columns.get(column, apply_sql.VARCHAR))
+    encoded = encode_value(value, source)
+    if native.kind in {"UNION", "NUMERIC_UNION"}:
+        member = union_member_name(source) if native.kind == "UNION" else "finite"
+        if isinstance(encoded, UnionValue) and encoded.member == member:
+            return encoded
+        return UnionValue(member, encoded, native=native)
+    return encoded
 
 
 def _plan(item: TableWork) -> tuple[list[tuple], list[dict]]:

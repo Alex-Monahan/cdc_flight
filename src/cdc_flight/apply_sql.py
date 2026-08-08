@@ -97,6 +97,16 @@ def bind(value: Any, column_type: str) -> Any:
     """Coerce a JSON-decoded value for a bound parameter of `column_type`."""
     if value is None:
         return None
+    # Typed UNION values are lowered by `insert_typed_rows`, which needs the member
+    # name to construct `union_value(member := ?)`; a plain bind remains useful for
+    # destination probes and keeps the underlying value available there.
+    try:
+        from .typed_types import UnionValue
+
+        if isinstance(value, UnionValue):
+            value = value.value
+    except ImportError:  # pragma: no cover - import cycle during interpreter startup
+        pass
     if column_type == JSON_T:
         return value if isinstance(value, str) else json.dumps(value, default=str)
     if column_type == VARCHAR:
@@ -117,7 +127,7 @@ def bind(value: Any, column_type: str) -> Any:
             except ValueError:
                 return None
         return float(value)
-    if column_type == BIGINT:
+    if column_type in {"SMALLINT", "INTEGER", "INT", "INT32", BIGINT, "INT64", "HUGEINT"}:
         if isinstance(value, bool):
             return int(value)
         if isinstance(value, str):
@@ -130,6 +140,8 @@ def bind(value: Any, column_type: str) -> Any:
         if isinstance(value, str):
             return value.strip().lower() in ("true", "t", "1")
         return bool(value)
+    if column_type in {"BLOB", "BYTEA"}:
+        return value if isinstance(value, (bytes, bytearray)) else str(value).encode()
     return value  # pragma: no cover
 
 
@@ -146,10 +158,20 @@ class TableSchema:
         #: TIMESTAMP column to VARCHAR is destructive-by-accident.
         self.raw_types: dict[str, str] = {}
         self.key_columns: tuple[str, ...] = ()
+        #: Source identity, separate from a generated destination key used when a
+        #: UNION/LIST/STRUCT/MAP cannot be indexed.
+        self.source_key_columns: tuple[str, ...] = ()
         self.exists = False
         #: True when the table carries a destination-side PRIMARY KEY on its
         #: identity columns (Opus M-2).
         self.constrained = False
+        #: Exact source descriptors used to construct the physical columns.  They are
+        #: process-local cache only; the durable source_relations descriptor and the
+        #: destination's UNION declaration remain the two durable truths.
+        self.source_descriptors: dict[str, Any] = {}
+        self.native_types: dict[str, Any] = {}
+        self.primary_key_columns: tuple[str, ...] = ()
+        self.internal_identity = False
 
     @property
     def qualified(self) -> str:
@@ -199,7 +221,10 @@ class SchemaRegistry:
         if rows:
             table.exists = True
             table.columns = {name: _normalise_type(dtype) for name, dtype in rows}
-            table.raw_types = {name: str(dtype).upper() for name, dtype in rows}
+            # Preserve DuckDB's physical declaration (especially UNION member
+            # names); normalisation is only for comparison, never for rebuilding a
+            # shadow table.
+            table.raw_types = {name: str(dtype) for name, dtype in rows}
             key_rows = self.con.execute(
                 "SELECT k.column_name "
                 "FROM information_schema.key_column_usage k "
@@ -213,7 +238,9 @@ class SchemaRegistry:
                 [self.dataset, table.name],
             ).fetchall()
             if key_rows:
-                table.key_columns = tuple(row[0] for row in key_rows)
+                table.primary_key_columns = tuple(row[0] for row in key_rows)
+                table.internal_identity = "cdcf_internal_id" in table.primary_key_columns
+                table.key_columns = table.source_key_columns or table.primary_key_columns
 
     # -- DDL ---------------------------------------------------------------- #
     def ensure(
@@ -268,7 +295,7 @@ class SchemaRegistry:
                     )
                 continue
             raw = table.raw_types.get(col, existing)
-            if raw not in _RECOGNISED_TYPES:
+            if raw.upper() not in _RECOGNISED_TYPES:
                 # `_normalise_type` collapses TIMESTAMP / DECIMAL / DATE / BLOB / LIST
                 # to VARCHAR, so an "upgrade" computed from that lattice can narrow a
                 # real TIMESTAMP column to text. Refuse explicitly instead of doing it
@@ -299,6 +326,312 @@ class SchemaRegistry:
                 log.warning(message)
         return table, False
 
+    def ensure_typed(
+        self,
+        name: str,
+        *,
+        columns: dict[str, Any],
+        key_columns: tuple[str, ...],
+    ) -> tuple[TableSchema, bool]:
+        """Create a table from source descriptors, never from observed Python values.
+
+        This is the 2.4 creation path.  ``columns`` may contain
+        ``SourceTypeDescriptor`` or ``NativeType`` objects.  A UNION/list/struct/map
+        key cannot be indexed by DuckDB, so the physical table receives a generated
+        internal identity primary key; the source key columns remain ordinary typed
+        columns and are retained for source attribution.
+        """
+        from .typed_types import NativeType, SourceTypeDescriptor, native_type
+
+        table = self.get(name)
+        resolved: dict[str, NativeType] = {}
+        descriptors: dict[str, SourceTypeDescriptor] = {}
+        physical_columns: dict[str, str] = {}
+        for column, descriptor in columns.items():
+            if isinstance(descriptor, str):
+                physical_columns[column] = descriptor
+                continue
+            target = native_type(descriptor)
+            resolved[column] = target
+            physical_columns[column] = target.sql
+            source_descriptor = target.source if isinstance(descriptor, NativeType) else descriptor
+            if source_descriptor is not None:
+                descriptors[column] = source_descriptor
+        if table.exists:
+            for column, physical_type in physical_columns.items():
+                target = resolved.get(column)
+                if column in table.columns:
+                    existing_type = table.raw_types.get(column, table.columns[column])
+                    if (
+                        target is not None
+                        and _is_numeric_inner_union(existing_type)
+                        and target.kind != "NUMERIC_UNION"
+                    ):
+                        raise SchemaEvolutionRefused(
+                            f"cannot write {name}.{column}: the source descriptor "
+                            f"resolves to {physical_type} (kind={target.kind}), but the destination is "
+                            f"the bounded numeric inner UNION {existing_type}; a "
+                            "typed shadow conversion must run before post-change "
+                            "events are admitted",
+                            target=name,
+                        )
+                    if not _type_sql_equal(existing_type, physical_type) and not str(
+                        existing_type
+                    ).upper().startswith("UNION("):
+                        raise SchemaEvolutionRefused(
+                            f"cannot reinterpret existing destination {name}.{column} "
+                            f"from {existing_type} as {physical_type}; a typed shadow "
+                            "repair is required",
+                            target=name,
+                        )
+                    continue
+                try:
+                    self.con.execute(
+                        f"ALTER TABLE {table.qualified} ADD COLUMN {quote(column)} "
+                        f"{physical_type}"
+                    )
+                except Exception as exc:
+                    raise SchemaEvolutionRefused(
+                        f"cannot add typed source column {name}.{column}: destination "
+                        "DDL failed, so the catalog baseline cannot be persisted",
+                        target=name,
+                    ) from exc
+                table.columns[column] = _normalise_type(physical_type)
+                table.raw_types[column] = physical_type
+            table.source_descriptors.update(descriptors)
+            for column, target in resolved.items():
+                physical = table.raw_types.get(column, "")
+                if _is_top_level_union(physical):
+                    # A bounded PostgreSQL NUMERIC is itself represented by an
+                    # inner UNION(finite DECIMAL, special DOUBLE).  That is the
+                    # numeric value representation, not the 2.5 source-type
+                    # history UNION.  Rehydrate it as the recursive numeric type
+                    # so the next value uses ``finite``/``special`` directly
+                    # instead of inventing an outer fingerprint member.
+                    if target.kind == "NUMERIC_UNION" and _is_numeric_inner_union(physical):
+                        if not _type_sql_equal(physical, target.sql):
+                            raise SchemaEvolutionRefused(
+                                f"cannot reinterpret existing numeric destination "
+                                f"{name}.{column} from {physical} as {target.sql}; "
+                                "a typed shadow conversion is required",
+                                target=name,
+                            )
+                        table.native_types[column] = target
+                    else:
+                        table.native_types[column] = _physical_union_native(
+                            physical, source=descriptors.get(column)
+                        )
+                else:
+                    table.native_types[column] = target
+            if key_columns:
+                table.key_columns = key_columns
+                table.source_key_columns = key_columns
+            return table, False
+
+        indexable = all(
+            (
+                column == CDCF_EVENT_ID
+                and physical_columns.get(column, "").upper() == VARCHAR
+            )
+            or (column in resolved and resolved[column].indexable)
+            for column in key_columns
+        )
+        primary = tuple(key_columns) if indexable else ("cdcf_internal_id",)
+        if not indexable:
+            physical_columns = {
+                **physical_columns,
+                "cdcf_internal_id": 'VARCHAR DEFAULT uuid()',
+            }
+        self._create_strict(table, physical_columns, primary)
+        table.key_columns = tuple(key_columns)
+        table.source_key_columns = tuple(key_columns)
+        table.primary_key_columns = primary
+        table.internal_identity = not indexable
+        table.source_descriptors = descriptors
+        table.native_types = resolved
+        return table, True
+
+    def _create_strict(
+        self, table: TableSchema, columns: dict[str, str], primary_key_columns: tuple[str, ...]
+    ) -> None:
+        definitions = ", ".join(f"{quote(column)} {ctype}" for column, ctype in columns.items())
+        constraint = (
+            ", PRIMARY KEY (" + ", ".join(quote(column) for column in primary_key_columns) + ")"
+            if self.constraints and primary_key_columns
+            else ""
+        )
+        try:
+            self.con.execute(
+                f"CREATE TABLE {table.qualified} ({definitions}{constraint})"
+            )
+        except Exception as exc:
+            raise SchemaEvolutionRefused(
+                f"cannot create typed destination {table.name}: {exc}", target=table.name
+            ) from exc
+        table.columns = {column: _normalise_type(ctype) for column, ctype in columns.items()}
+        table.raw_types = dict(columns)
+        table.exists = True
+        table.constrained = bool(constraint)
+        table.primary_key_columns = primary_key_columns
+
+    def convert_column_to_union(
+        self,
+        name: str,
+        column: str,
+        old_descriptor: Any,
+        new_descriptor: Any,
+    ) -> TableSchema:
+        """Convert one source column through the sole typed shadow-swap path.
+
+        The copy is performed before the live table is dropped.  DuckDB's cast from a
+        UNION to an expanded UNION preserves existing member tags, while a scalar is
+        wrapped explicitly with its stable fingerprinted member.  No direct ALTER and
+        no text/JSON fallback is permitted here.
+        """
+        from .typed_types import (
+            SourceTypeDescriptor,
+            native_type,
+            union_member_name,
+        )
+
+        table = self.get(name)
+        if not table.exists:
+            raise SchemaEvolutionRefused(
+                f"cannot convert {name}.{column}: destination table does not exist", target=name
+            )
+        old_source = old_descriptor if isinstance(old_descriptor, SourceTypeDescriptor) else SourceTypeDescriptor.from_dict(old_descriptor)
+        new_source = new_descriptor if isinstance(new_descriptor, SourceTypeDescriptor) else SourceTypeDescriptor.from_dict(new_descriptor)
+        old_native = native_type(old_source)
+        new_native = native_type(new_source)
+        source_key_columns = tuple(table.source_key_columns or table.key_columns)
+        cached_descriptors = dict(table.source_descriptors)
+        cached_native_types = dict(table.native_types)
+        physical = str(table.raw_types.get(column, table.columns.get(column, old_native.sql)))
+
+        # If a previous change already introduced the member, the catalog observation
+        # is a repeated same-type observation; reusing the existing declaration is
+        # idempotent and does not create a duplicate member.
+        current_members = _union_member_names(physical)
+        wanted_name = union_member_name(new_source)
+        if wanted_name in current_members:
+            declared = dict(_union_members(physical)).get(wanted_name)
+            if declared is None or _type_sql_equal(declared, new_native.sql) is False:
+                raise SchemaEvolutionRefused(
+                    f"cannot reuse UNION member {wanted_name} on {name}.{column}: "
+                    f"physical type {declared!r} disagrees with descriptor type "
+                    f"{new_native.sql!r}",
+                    target=name,
+                )
+            table.source_descriptors[column] = new_source
+            table.native_types[column] = _physical_union_native(
+                physical, source=new_source
+            )
+            return table
+
+        if _is_numeric_inner_union(physical):
+            # The existing bounded NUMERIC declaration is the old source type's
+            # inner value UNION.  Source-type evolution adds one stable outer
+            # member for that complete representation; it must not append a
+            # fingerprint member beside ``finite`` and ``special``.
+            if old_native.kind != "NUMERIC_UNION":
+                raise SchemaEvolutionRefused(
+                    f"cannot convert {name}.{column}: physical numeric UNION does "
+                    "not match the old source descriptor",
+                    target=name,
+                )
+            old_member_name = union_member_name(old_source)
+            union_sql = (
+                f"UNION({old_member_name} {old_native.sql},{wanted_name} {new_native.sql})"
+            )
+            expression = (
+                f"union_value({old_member_name} := "
+                f"CAST({quote(column)} AS {old_native.sql}))"
+            )
+        elif _is_top_level_union(physical):
+            # The physical declaration is the durable member history.  Reuse its SQL
+            # and append the new member; the old descriptor is only needed to resolve
+            # the new member's native SQL when a process restarted.
+            member_sql = _union_members(physical)
+            members = [(member_name, member_type) for member_name, member_type in member_sql]
+            members.append((wanted_name, new_native.sql))
+            union_sql = "UNION(" + ",".join(f"{member} {sql}" for member, sql in members) + ")"
+            expression = f"CAST({quote(column)} AS {union_sql})"
+        else:
+            member_name = union_member_name(old_source)
+            union_sql = f"UNION({member_name} {old_native.sql},{wanted_name} {new_native.sql})"
+            expression = (
+                f"union_value({member_name} := "
+                f"CAST({quote(column)} AS {old_native.sql}))"
+            )
+
+        shadow = f"{name}__cdcf_typed_shadow"
+        self.con.execute(f"DROP TABLE IF EXISTS {quote(self.dataset)}.{quote(shadow)}")
+        definitions: list[str] = []
+        for current_column, current_type in table.raw_types.items():
+            if current_column == column:
+                definitions.append(f"{quote(current_column)} {union_sql}")
+            else:
+                definitions.append(f"{quote(current_column)} {current_type}")
+        primary = table.primary_key_columns or table.key_columns
+        # Every source-type change produces a UNION, and DuckDB forbids any UNION
+        # column from being an index/primary-key expression even when both members
+        # individually are scalar/indexable.
+        if column in primary:
+            primary = ("cdcf_internal_id",)
+            if "cdcf_internal_id" not in table.raw_types:
+                definitions.append('"cdcf_internal_id" VARCHAR DEFAULT uuid()')
+        if not primary:
+            raise SchemaEvolutionRefused(
+                f"cannot convert {name}.{column}: no destination identity is available", target=name
+            )
+        ddl = (
+            f"CREATE TABLE {quote(self.dataset)}.{quote(shadow)} "
+            f"({', '.join(definitions)}, PRIMARY KEY ({', '.join(quote(item) for item in primary)}))"
+        )
+        try:
+            self.con.execute(ddl)
+            target_columns = list(table.raw_types)
+            if "cdcf_internal_id" in primary and "cdcf_internal_id" not in target_columns:
+                target_columns.append("cdcf_internal_id")
+            select_expressions: list[str] = []
+            for current_column in target_columns:
+                if current_column == column:
+                    select_expressions.append(expression)
+                elif current_column == "cdcf_internal_id" and current_column not in table.raw_types:
+                    select_expressions.append(
+                        _identity_expression(
+                            table,
+                            table.key_columns or (column,),
+                        )
+                    )
+                else:
+                    select_expressions.append(quote(current_column))
+            self.con.execute(
+                f"INSERT INTO {quote(self.dataset)}.{quote(shadow)} "
+                f"({', '.join(quote(item) for item in target_columns)}) "
+                f"SELECT {', '.join(select_expressions)} FROM {table.qualified}"
+            )
+            self.con.execute(f"DROP TABLE {table.qualified}")
+            self.con.execute(
+                f"ALTER TABLE {quote(self.dataset)}.{quote(shadow)} RENAME TO {quote(name)}"
+            )
+        except Exception as exc:
+            raise SchemaEvolutionRefused(
+                f"typed UNION shadow conversion failed for {name}.{column}: {exc}", target=name
+            ) from exc
+        self.forget(name)
+        table = self.get(name)
+        table.key_columns = source_key_columns
+        table.source_key_columns = source_key_columns
+        table.primary_key_columns = primary
+        table.internal_identity = primary == ("cdcf_internal_id",)
+        table.source_descriptors = {**cached_descriptors, column: new_source}
+        table.native_types = {
+            **cached_native_types,
+            column: _physical_union_native(union_sql, source=new_source),
+        }
+        return table
+
     def _create(
         self, table: TableSchema, columns: dict[str, str], key_columns: tuple[str, ...]
     ) -> None:
@@ -326,6 +659,7 @@ class SchemaRegistry:
         table.columns = dict(columns)
         table.raw_types = dict(columns)
         table.exists = True
+        table.source_key_columns = tuple(key_columns)
 
     def drop(self, name: str) -> None:
         table = self.get(name)
@@ -357,6 +691,7 @@ class SchemaRegistry:
         table.columns.pop(column, None)
         table.raw_types.pop(column, None)
         table.key_columns = tuple(c for c in table.key_columns if c != column)
+        table.source_key_columns = tuple(c for c in table.source_key_columns if c != column)
 
     def rename_column(self, name: str, old: str | None, new: str | None) -> None:
         """Apply a true rename, including a late-arriving new-name row.
@@ -391,6 +726,10 @@ class SchemaRegistry:
                 ) from exc
             table.columns[new] = table.columns.pop(old)
             table.raw_types[new] = table.raw_types.pop(old)
+            if old in table.source_descriptors:
+                table.source_descriptors[new] = table.source_descriptors.pop(old)
+            if old in table.native_types:
+                table.native_types[new] = table.native_types.pop(old)
         elif old_exists and new_exists:
             # Prefer the already-arriving new image; fall back to the old value for rows
             # that predate the catalog poll. This is the only safe merge for a rename
@@ -452,6 +791,9 @@ class SchemaRegistry:
         # idempotent late-rename merge. If neither remains, the source relation may have
         # produced no row carrying either shape; the catalog action remains harmless.
         table.key_columns = tuple(new if c == old else c for c in table.key_columns)
+        table.source_key_columns = tuple(
+            new if c == old else c for c in table.source_key_columns
+        )
 
     def _rebuild_with_primary_key(
         self,
@@ -519,6 +861,7 @@ class SchemaRegistry:
         table.columns = columns
         table.raw_types = raw_types
         table.key_columns = key_columns
+        table.source_key_columns = key_columns
         table.constrained = True
 
     def backfill_columns(
@@ -548,24 +891,27 @@ class SchemaRegistry:
         value_columns = tuple(column for column in value_columns if column in table.columns)
         if not key_columns or not value_columns:
             return
-        set_clause = ", ".join(f"{quote(column)} = ?" for column in value_columns)
-        where_clause = " AND ".join(
-            f"{quote(column)} IS NOT DISTINCT FROM ?" for column in key_columns
-        )
         value_count = len(value_columns)
         key_count = len(key_columns)
         for row in rows:
             keys = row[:key_count]
             values = row[key_count : key_count + value_count]
-            params = [
-                bind(value, table.columns[column])
-                for column, value in zip(value_columns, values, strict=True)
-            ] + [
-                bind(value, table.columns[column])
-                for column, value in zip(key_columns, keys, strict=True)
-            ]
+            set_parts: list[str] = []
+            params: list[Any] = []
+            for column, value in zip(value_columns, values, strict=True):
+                expression, bound = _typed_assignment(table, column, value)
+                set_parts.append(f"{quote(column)} = {expression}")
+                params.extend(bound)
+            where_parts: list[str] = []
+            for column, value in zip(key_columns, keys, strict=True):
+                expression, bound = _typed_assignment(table, column, value)
+                where_parts.append(
+                    f"{quote(column)} IS NOT DISTINCT FROM {expression}"
+                )
+                params.extend(bound)
             self.con.execute(
-                f"UPDATE {table.qualified} SET {set_clause} WHERE {where_clause}",
+                f"UPDATE {table.qualified} SET {', '.join(set_parts)} "
+                f"WHERE {' AND '.join(where_parts)}",
                 params,
             )
 
@@ -611,12 +957,15 @@ class SchemaRegistry:
                 f"cannot backfill keyless table {name}: added-column values are not "
                 "uniform and the source has no stable row identity"
             )
-        set_clause = ", ".join(f"{quote(column)} = ?" for column in value_columns)
-        params = [
-            bind(value, table.columns[column])
-            for column, value in zip(value_columns, values, strict=True)
-        ]
-        self.con.execute(f"UPDATE {table.qualified} SET {set_clause}", params)
+        set_parts: list[str] = []
+        params: list[Any] = []
+        for column, value in zip(value_columns, values, strict=True):
+            expression, bound = _typed_assignment(table, column, value)
+            set_parts.append(f"{quote(column)} = {expression}")
+            params.extend(bound)
+        self.con.execute(
+            f"UPDATE {table.qualified} SET {', '.join(set_parts)}", params
+        )
 
 
 #: Destination types the widening lattice actually understands. Anything else is
@@ -654,18 +1003,149 @@ def assert_identity_is_unique(con, table: TableSchema) -> None:
 
 
 def _normalise_type(duckdb_type: str) -> str:
-    upper = duckdb_type.upper()
+    upper = str(duckdb_type).upper()
     if upper.startswith("VARCHAR") or upper in ("TEXT", "STRING"):
         return VARCHAR
-    if upper in ("BIGINT", "INT64", "HUGEINT", "INTEGER", "INT", "INT32", "SMALLINT"):
+    if upper in ("SMALLINT", "INT16"):
+        return "SMALLINT"
+    if upper in ("INTEGER", "INT", "INT32"):
+        return "INTEGER"
+    if upper in ("BIGINT", "INT64", "HUGEINT"):
         return BIGINT
     if upper in ("DOUBLE", "FLOAT", "REAL", "FLOAT8"):
-        return DOUBLE
+        return upper if upper != "REAL" else "FLOAT"
     if upper == "BOOLEAN":
         return BOOLEAN
+    if upper in {"BLOB", "BYTEA"}:
+        return "BLOB"
     if upper == "JSON":
         return JSON_T
+    if upper in {"DATE", "TIME", "TIMESTAMP", "TIMESTAMP WITH TIME ZONE", "TIMESTAMPTZ", "TIME WITH TIME ZONE", "TIMETZ", "INTERVAL", "UUID"}:
+        return upper
+    if upper.startswith(("STRUCT(", "MAP(", "UNION(", "ENUM(", "LIST(", "DECIMAL(", "BIGNUM")) or upper.endswith("[]"):
+        return upper
     return VARCHAR
+
+
+def _union_members(physical: str) -> list[tuple[str, str]]:
+    """Parse the top-level member declaration exposed by DuckDB metadata."""
+    text = physical.strip()
+    if text.upper().startswith("UNION(") and text.endswith(")"):
+        text = text[text.find("(") + 1 : -1]
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    for index, char in enumerate(text):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append(text[start:index])
+            start = index + 1
+    if text[start:].strip():
+        parts.append(text[start:])
+    result = []
+    for part in parts:
+        name, separator, type_name = part.strip().partition(" ")
+        if separator and name:
+            result.append((name.strip('"'), type_name.strip()))
+    return result
+
+
+def _is_top_level_union(physical: str) -> bool:
+    text = str(physical).strip()
+    if not text.upper().startswith("UNION("):
+        return False
+    depth = 0
+    opening = text.find("(")
+    for index in range(opening, len(text)):
+        char = text[index]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index == len(text) - 1
+    return False
+
+
+def _is_numeric_inner_union(physical: str) -> bool:
+    """Whether a physical UNION is the numeric finite/special value encoding."""
+    if not _is_top_level_union(physical):
+        return False
+    members = _union_members(physical)
+    return len(members) == 2 and {name.lower() for name, _ in members} == {
+        "finite",
+        "special",
+    }
+
+
+def _union_member_names(physical: str) -> set[str]:
+    return {name.lower() for name, _ in _union_members(physical)}
+
+
+def _type_sql_equal(left: str, right: str) -> bool:
+    """Compare physical/member SQL without treating harmless whitespace as drift."""
+    import re
+
+    def compact(value: str) -> str:
+        normalized = re.sub(r"\s+", " ", str(value).strip()).upper()
+        for spelling, canonical in (
+            ("TIMESTAMP WITH TIME ZONE", "TIMESTAMPTZ"),
+            ("TIME WITH TIME ZONE", "TIMETZ"),
+            ("CHARACTER VARYING", "VARCHAR"),
+            ("DOUBLE PRECISION", "DOUBLE"),
+        ):
+            normalized = normalized.replace(spelling, canonical)
+        return normalized.replace(" ", "")
+
+    return compact(left) == compact(right)
+
+
+def _identity_expression(table: TableSchema, columns: tuple[str, ...]) -> str:
+    """Build a deterministic, length-prefixed typed identity serialization.
+
+    The internal identity is a uniqueness key, not a digest.  Each component carries
+    its source fingerprint, NULL marker, UNION tag where applicable, and the byte
+    length of its rendered native value.  Length prefixes make concatenation
+    unambiguous and avoid the old delimiter/hash shortcut while retaining a SQL-only
+    shadow copy.
+    """
+    expressions: list[str] = []
+    for column in columns:
+        descriptor = table.source_descriptors.get(column)
+        fingerprint = descriptor.fingerprint if descriptor is not None else "legacy"
+        fingerprint_sql = "'" + fingerprint.replace("'", "''") + "'"
+        value_sql = f"CAST({quote(column)} AS VARCHAR)"
+        native = table.native_types.get(column)
+        if native is not None and native.kind in {"UNION", "NUMERIC_UNION"}:
+            tag_sql = f"CAST(union_tag({quote(column)}) AS VARCHAR)"
+        else:
+            tag_sql = "'value'"
+        payload = (
+            f"CASE WHEN {quote(column)} IS NULL THEN {fingerprint_sql} || ':NULL' "
+            f"ELSE {fingerprint_sql} || ':' || {tag_sql} || ':' || "
+            f"CAST(length({value_sql}) AS VARCHAR) || ':' || {value_sql} END"
+        )
+        expressions.append(
+            f"CAST(length({payload}) AS VARCHAR) || ':' || {payload}"
+        )
+    return " || ".join(expressions)
+
+
+def _physical_union_native(physical: str, *, source=None):
+    """Rehydrate a cached native UNION from the destination declaration."""
+    from .typed_types import NativeMember, NativeType
+
+    members = tuple(
+        NativeMember(
+            name,
+            NativeType(_normalise_type(type_name), type_name),
+        )
+        for name, type_name in _union_members(physical)
+    )
+    return NativeType("UNION", physical, source=source, members=members, indexable=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -683,10 +1163,20 @@ def delete_keys(con, table: TableSchema, key_columns: tuple[str, ...], keys: lis
         # temporary and therefore invisible to any other connection, so it cannot
         # weaken the atomicity guarantee the commit group exists to provide.
         staging = "_cdcf_delete_keys"
-        types = [table.columns.get(c, VARCHAR) for c in key_columns]
+        types = [table.raw_types.get(c, table.columns.get(c, VARCHAR)) for c in key_columns]
         defs = ", ".join(f"{quote(c)} {t}" for c, t in zip(key_columns, types, strict=True))
         con.execute(f"CREATE OR REPLACE TEMP TABLE {staging} ({defs})")
-        bulk_insert(con, staging, list(key_columns), [list(k) for k in keys], types)
+        if table.native_types and any(column in table.native_types for column in key_columns):
+            insert_typed_rows(
+                con,
+                table,
+                list(key_columns),
+                [list(k) for k in keys],
+                [table.native_types.get(column) for column in key_columns],
+                target=staging,
+            )
+        else:
+            bulk_insert(con, staging, list(key_columns), [list(k) for k in keys], types)
         con.execute(
             f"DELETE FROM {table.qualified} AS t WHERE EXISTS "
             f"(SELECT 1 FROM {staging} AS v WHERE {predicate})"
@@ -695,17 +1185,28 @@ def delete_keys(con, table: TableSchema, key_columns: tuple[str, ...], keys: lis
         return
     for start in range(0, len(keys), DELETE_CHUNK):
         chunk = keys[start : start + DELETE_CHUNK]
-        placeholders = ", ".join(
-            "(" + ", ".join("?" for _ in key_columns) + ")" for _ in chunk
-        )
+        value_sql: list[str] = []
         params: list[Any] = []
         for key in chunk:
-            params.extend(key)
+            expressions: list[str] = []
+            for column, value in zip(key_columns, key, strict=True):
+                expression, bound = _key_parameter(value, table, column)
+                expressions.append(expression)
+                params.extend(bound)
+            value_sql.append("(" + ", ".join(expressions) + ")")
+        placeholders = ", ".join(value_sql)
         con.execute(
             f"DELETE FROM {table.qualified} AS t WHERE EXISTS "
             f"(SELECT 1 FROM (VALUES {placeholders}) AS v({cols}) WHERE {predicate})",
             params,
         )
+
+
+def _key_parameter(value: Any, table: TableSchema, column: str) -> tuple[str, list[Any]]:
+    native = table.native_types.get(column)
+    if native is not None:
+        return _typed_parameter(value, native)
+    return "?", [value]
 
 
 def rows_per_statement(n_columns: int) -> int:
@@ -779,13 +1280,15 @@ def bulk_insert(
             values = [row[index] for row in batch]
             try:
                 arrays[column] = pa.array(values, type=_arrow_type(column_types[index]))
-            except (pa.ArrowInvalid, pa.ArrowTypeError, OverflowError):
-                # A value the declared type cannot hold (a huge integer, a mixed
-                # column mid-evolution). Keeping the value as text is always
-                # possible and DuckDB casts it on the way in; losing it is not.
-                arrays[column] = pa.array(
-                    [None if v is None else str(v) for v in values], type=pa.string()
-                )
+            except (pa.ArrowInvalid, pa.ArrowTypeError, OverflowError) as exc:
+                # A typed column must never silently become text.  The caller can
+                # still explicitly request VARCHAR for an obscure source type, but a
+                # native matrix row failing Arrow is a hard error with its column
+                # context.  The old string retry was the 2.4 data-loss path.
+                raise ValueError(
+                    f"cannot build Arrow values for destination column {column} "
+                    f"declared {column_types[index]!r}: {exc}"
+                ) from exc
         table = pa.table(arrays)
         con.register(view, table)
         try:
@@ -797,6 +1300,15 @@ def bulk_insert(
 def insert_rows(
     con, table: TableSchema, columns: list[str], rows: list[list]
 ) -> None:
+    if table.native_types:
+        insert_typed_rows(
+            con,
+            table,
+            columns,
+            rows,
+            [table.native_types.get(column) for column in columns],
+        )
+        return
     bulk_insert(
         con,
         table.qualified,
@@ -804,6 +1316,214 @@ def insert_rows(
         rows,
         [table.columns.get(c, VARCHAR) for c in columns],
     )
+
+
+def insert_typed_rows(
+    con,
+    table: TableSchema,
+    columns: list[str],
+    rows: list[list],
+    native_types: list[Any],
+    *,
+    target: str | None = None,
+) -> None:
+    """Insert rows whose values carry explicit native/UNION semantics.
+
+    Arrow has no portable representation for DuckDB's tagged UNION.  Such rows use
+    generated parameterized SQL with ``union_value`` expressions; scalar and nested
+    non-UNION rows use the same statement shape, and bounded multi-row statements
+    keep the encoder and physical declaration in lockstep without a network round
+    trip per row.  This path is used for typed source rows only.  The legacy untyped
+    path above remains for compatibility with old callers and does not participate in
+    2.4/2.5 schema creation.
+    """
+    if not rows:
+        return
+    from .typed_types import NativeType, UnionValue
+
+    target = table.qualified if target is None else target
+    collist = ", ".join(quote(column) for column in columns)
+    value_rows: list[str] = []
+    batch_params: list[Any] = []
+
+    def flush() -> None:
+        if not value_rows:
+            return
+        con.execute(
+            f"INSERT INTO {target} ({collist}) VALUES {', '.join(value_rows)}",
+            batch_params,
+        )
+        value_rows.clear()
+        batch_params.clear()
+
+    for row in rows:
+        expressions: list[str] = []
+        row_params: list[Any] = []
+        for value, native in zip(row, native_types, strict=True):
+            native = native if isinstance(native, NativeType) else None
+            value = _prepare_typed_value(value, native)
+            expression, bound = _typed_parameter(value, native)
+            expressions.append(expression)
+            row_params.extend(bound)
+        if any(_contains_union(parameter, UnionValue) for parameter in row_params):
+            raise ValueError(
+                f"typed parameter escaped UNION lowering for columns {columns!r}: "
+                f"{row_params!r}"
+            )
+        if value_rows and (
+            len(value_rows) >= MAX_ROWS_PER_STATEMENT
+            or len(batch_params) + len(row_params) > MAX_PARAMS_PER_STATEMENT
+        ):
+            flush()
+        value_rows.append("(" + ", ".join(expressions) + ")")
+        batch_params.extend(row_params)
+    flush()
+
+
+def _typed_parameter(value: Any, native: Any) -> tuple[str, list[Any]]:
+    from .typed_types import NativeType, UnionValue
+
+    if value is None:
+        return "NULL", []
+    if native is None:
+        return "?", [value]
+    if isinstance(value, UnionValue):
+        member_native = _union_member_native(native, value.member)
+        if value.native is not None and (
+            member_native is None
+            or _type_sql_equal(member_native.sql, value.native.sql)
+        ):
+            member_native = value.native
+        if value.value is None and member_native is not None:
+            return (
+                f"union_value({quote(value.member)} := "
+                f"CAST(NULL AS {member_native.sql}))",
+                [],
+            )
+        if isinstance(value.value, UnionValue) or member_native is not None:
+            inner_expression, inner_params = _typed_parameter(
+                value.value, NativeType("UNION", "UNION")
+                if member_native is None
+                else member_native,
+            )
+            return (
+                f"union_value({quote(value.member)} := {inner_expression})",
+                inner_params,
+            )
+        return f"union_value({quote(value.member)} := ?)", [value.value]
+    if native.kind in {"UNION", "NUMERIC_UNION"}:
+        raise ValueError(
+            f"value for {native.sql} lacks an explicit UNION member; refusing an implicit cast"
+        )
+    if native.kind == "LIST" and native.children:
+        values = value if isinstance(value, (list, tuple)) else []
+        expressions: list[str] = []
+        params: list[Any] = []
+        for item in values:
+            expression, bound = _typed_parameter(item, native.children[0])
+            expressions.append(expression)
+            params.extend(bound)
+        return f"[{', '.join(expressions)}]::{native.sql}", params
+    if native.kind in {"STRUCT", "NUMERIC_VARIABLE"} and native.fields:
+        if not isinstance(value, dict):
+            raise ValueError(f"value for {native.sql} is not a mapping")
+        expressions: list[str] = []
+        params: list[Any] = []
+        for field_name, field_native in native.fields:
+            expression, bound = _typed_parameter(value.get(field_name), field_native)
+            expressions.append(f"{quote(field_name)} := {expression}")
+            params.extend(bound)
+        return (
+            f"CAST(struct_pack({', '.join(expressions)}) AS {native.sql})",
+            params,
+        )
+    if native.kind == "MAP" and native.key is not None and native.value is not None:
+        if not isinstance(value, dict):
+            raise ValueError(f"value for {native.sql} is not a mapping")
+        key_expressions: list[str] = []
+        value_expressions: list[str] = []
+        key_params: list[Any] = []
+        value_params: list[Any] = []
+        for key, item in value.items():
+            key_expression, item_key_params = _typed_parameter(key, native.key)
+            item_expression, item_value_params = _typed_parameter(item, native.value)
+            key_expressions.append(key_expression)
+            value_expressions.append(item_expression)
+            key_params.extend(item_key_params)
+            value_params.extend(item_value_params)
+        return (
+            f"CAST(MAP([{', '.join(key_expressions)}], "
+            f"[{', '.join(value_expressions)}]) AS {native.sql})",
+            [*key_params, *value_params],
+        )
+    if native.kind in {"LIST", "STRUCT", "MAP", "NUMERIC_VARIABLE"}:
+        return f"CAST(? AS {native.sql})", [value]
+    return "?", [value]
+
+
+def _union_member_native(native: Any, member_name: str) -> Any:
+    if getattr(native, "kind", None) not in {"UNION", "NUMERIC_UNION"}:
+        return None
+    lowered = str(member_name).lower()
+    for member in getattr(native, "members", ()):
+        if str(member.name).lower() == lowered:
+            return member.type
+    return None
+
+
+def _contains_union(value: Any, union_class: type) -> bool:
+    if isinstance(value, union_class):
+        return True
+    if isinstance(value, dict):
+        return any(_contains_union(item, union_class) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_union(item, union_class) for item in value)
+    return False
+
+
+def _prepare_typed_value(value: Any, native: Any) -> Any:
+    """Materialize an implicit source value into its declared UNION member."""
+    from .typed_types import UnionValue, encode_value, native_type, union_member_name
+
+    if native is None or isinstance(value, UnionValue):
+        return value
+    if native.source is not None:
+        encoded = encode_value(value, native.source)
+        if native.kind == "UNION":
+            return UnionValue(
+                union_member_name(native.source),
+                encoded,
+                native=native_type(native.source),
+            )
+        if native.kind == "NUMERIC_UNION":
+            # ``encode_value`` already returns the inner finite/special
+            # UnionValue.  Wrapping it again would ask DuckDB to cast a tagged
+            # UNION into DECIMAL and lose the numeric member boundary.
+            if encoded is None:
+                return UnionValue("finite", None, native=native_type(native.source))
+            return encoded
+        return encoded
+    if value is None and native.kind in {"UNION", "NUMERIC_UNION"}:
+        member = "finite" if native.kind == "NUMERIC_UNION" else (
+            native.members[0].name if native.members else "m_null"
+        )
+        return UnionValue(member, None)
+    return value
+
+
+def _typed_assignment(table: TableSchema, column: str, value: Any) -> tuple[str, list[Any]]:
+    """Encode a backfill assignment against the table's exact native type."""
+    from .typed_types import UnionValue, encode_value, native_type, union_member_name
+
+    native = table.native_types.get(column)
+    source = table.source_descriptors.get(column)
+    if source is not None:
+        value = encode_value(value, source)
+        if native is not None and native.kind in {"UNION", "NUMERIC_UNION"}:
+            member = union_member_name(source) if native.kind == "UNION" else "finite"
+            if not isinstance(value, UnionValue) or value.member != member:
+                value = UnionValue(member, value, native=native_type(source))
+    return _typed_parameter(value, native)
 
 
 __all__ = [
@@ -815,6 +1535,7 @@ __all__ = [
     "bind",
     "delete_keys",
     "insert_rows",
+    "insert_typed_rows",
     "sql_type",
     "widen",
 ]

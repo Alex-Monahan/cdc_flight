@@ -65,6 +65,16 @@ def decode_notification(raw, *, topic_prefix: str) -> SnapshotNotification | Non
         raise SnapshotObservationError(
             f"snapshot notification on {topic} is not an object"
         )
+    # JsonConverter with schemas.enable=true wraps the sink notification in the
+    # same ``{"schema": ..., "payload": ...}`` envelope as row records.  The
+    # notification schema is transport metadata; the payload remains the closed
+    # callback protocol validated below.
+    if (
+        isinstance(payload.get("schema"), dict)
+        and "payload" in payload
+        and isinstance(payload.get("payload"), dict)
+    ):
+        payload = payload["payload"]
     aggregate = payload.get("aggregate_type")
     if aggregate != INITIAL_SNAPSHOT:
         raise SnapshotObservationError(

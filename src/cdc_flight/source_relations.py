@@ -83,6 +83,10 @@ def upsert_source_relation(
                         "name": column.name,
                         "type_oid": column.type_oid,
                         "type_name": column.type_name,
+                        "typmod": column.typmod,
+                        "descriptor": (
+                            column.descriptor.to_dict() if column.descriptor is not None else None
+                        ),
                         "nullable": column.nullable,
                         "has_missing_default": column.has_missing_default,
                         "missing_value_text": (

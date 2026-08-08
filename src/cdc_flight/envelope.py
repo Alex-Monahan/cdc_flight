@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .errors import EnvelopeDecodeError
+from .typed_types import SourceTypeDescriptor, TypedImage
 
 #: `source.snapshot` values that mean "this record came out of a snapshot".
 #: Debezium serialises `SnapshotRecord` lowercased.
@@ -123,6 +124,19 @@ class PendingRecord:
     #: assigned where the records arrive, so the ordinal is arrival order whether
     #: the record is later spilled or kept in memory (Codex 1).
     snapshot_ordinal: int | None = None
+    #: Schema-enabled Connect JSON facts.  The legacy `key/before/after` mappings are
+    #: retained for the transaction assembler and for the unchanged-TOAST path; these
+    #: descriptors are the authoritative type input for 2.4/2.5 encoding.
+    value_schema: dict[str, Any] | None = None
+    key_schema: dict[str, Any] | None = None
+    before_schema: dict[str, Any] | None = None
+    after_schema: dict[str, Any] | None = None
+    key_descriptors: dict[str, SourceTypeDescriptor] = field(default_factory=dict)
+    before_descriptors: dict[str, SourceTypeDescriptor] = field(default_factory=dict)
+    after_descriptors: dict[str, SourceTypeDescriptor] = field(default_factory=dict)
+    typed_key: TypedImage | None = None
+    typed_before: TypedImage | None = None
+    typed_after: TypedImage | None = None
 
     @property
     def is_data(self) -> bool:
@@ -276,6 +290,7 @@ def decode(raw: Any, *, topic_prefix: str, want_offsets: bool = False) -> Pendin
             f"payload on {topic} decoded to {type(payload).__name__}, not an object"
         )
 
+    value_schema, payload = _unwrap_schema_payload(payload)
     if topic == f"{topic_prefix}.transaction":
         # The only records whose LSN is NOT in the payload: the transaction value
         # schema is {status, id, ts_ms, event_count, data_collections}, so the
@@ -315,8 +330,15 @@ def decode(raw: Any, *, topic_prefix: str, want_offsets: bool = False) -> Pendin
     rec.lsn = source.get("lsn") or _offset_lsn(rec.source_offset)
     rec.source_ts_ms = source.get("ts_ms")
     rec.snapshot = _as_str(source.get("snapshot"))
+    rec.value_schema = value_schema
+    rec.before_schema = _schema_for_field(value_schema, "before")
+    rec.after_schema = _schema_for_field(value_schema, "after")
     rec.before = payload.get("before")
     rec.after = payload.get("after")
+    rec.before_descriptors = _field_descriptors(rec.before_schema)
+    rec.after_descriptors = _field_descriptors(rec.after_schema)
+    rec.typed_before = TypedImage.from_mapping(rec.before, rec.before_descriptors)
+    rec.typed_after = TypedImage.from_mapping(rec.after, rec.after_descriptors)
 
     txn = payload.get("transaction")
     if isinstance(txn, dict):
@@ -346,7 +368,10 @@ def decode(raw: Any, *, topic_prefix: str, want_offsets: bool = False) -> Pendin
         if key_str:
             try:
                 parsed = json.loads(key_str)
+                rec.key_schema, parsed = _unwrap_schema_payload(parsed)
                 rec.key = parsed if isinstance(parsed, dict) else None
+                rec.key_descriptors = _field_descriptors(rec.key_schema)
+                rec.typed_key = TypedImage.from_mapping(rec.key, rec.key_descriptors)
             except json.JSONDecodeError:  # pragma: no cover
                 rec.key = None
 
@@ -393,3 +418,52 @@ def _offset_lsn(offset: dict[str, Any] | None) -> int | None:
         if isinstance(value, int):
             return value
     return None
+
+
+def _unwrap_schema_payload(payload: Any) -> tuple[dict[str, Any] | None, Any]:
+    """Accept both schema-disabled envelopes and Connect schema/payload wrappers."""
+    if (
+        isinstance(payload, dict)
+        and isinstance(payload.get("schema"), dict)
+        and "payload" in payload
+    ):
+        return payload["schema"], payload.get("payload")
+    return None, payload
+
+
+def _schema_for_field(schema: dict[str, Any] | None, name: str) -> dict[str, Any] | None:
+    if not schema:
+        return None
+    for field_schema in schema.get("fields", ()) or ():
+        if not isinstance(field_schema, dict):
+            continue
+        field_name = field_schema.get("field", field_schema.get("name"))
+        if field_name == name:
+            nested = field_schema.get("schema")
+            return nested if isinstance(nested, dict) else field_schema
+    return None
+
+
+def _field_descriptors(schema: dict[str, Any] | None) -> dict[str, SourceTypeDescriptor]:
+    if not schema:
+        return {}
+    result: dict[str, SourceTypeDescriptor] = {}
+    for field_schema in schema.get("fields", ()) or ():
+        if not isinstance(field_schema, dict):
+            continue
+        name = field_schema.get("field", field_schema.get("name"))
+        nested = field_schema.get("schema")
+        if nested is None and isinstance(field_schema.get("type"), dict):
+            nested = field_schema["type"]
+        if name is None or not isinstance(nested if nested is not None else field_schema, dict):
+            continue
+        try:
+            result[str(name)] = SourceTypeDescriptor.from_connect_schema(
+                nested if isinstance(nested, dict) else field_schema
+            )
+        except (TypeError, ValueError):
+            # A malformed optional field is not allowed to erase the whole envelope;
+            # the strict resolver will refuse the field if the caller attempts to
+            # materialize it.  Existing transaction metadata still remains usable.
+            continue
+    return result

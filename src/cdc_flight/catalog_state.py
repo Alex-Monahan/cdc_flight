@@ -21,7 +21,8 @@ from .machines import (
     CHANGE_PENDING,
     require_admission_state,
 )
-from .schema_evolution import ColumnChange, SourceColumn
+from .schema_evolution import ColumnChange, SourceColumn, descriptor_from_type_name
+from .typed_types import SourceTypeDescriptor
 
 CHANGE_DROPPED = "dropped"
 CHANGE_RECREATED = "recreated"
@@ -199,10 +200,21 @@ def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
                 name=str(raw["name"]),
                 type_oid=int(raw["type_oid"]),
                 type_name=str(raw["type_name"]),
+                typmod=(int(raw["typmod"]) if raw.get("typmod") is not None else None),
                 nullable=bool(raw.get("nullable", True)),
                 has_missing_default=bool(raw.get("has_missing_default", False)),
                 missing_value=_missing_value(
                     raw.get("missing_value_text"), str(raw["type_name"])
+                ),
+                descriptor=(
+                    SourceTypeDescriptor.from_dict(raw["descriptor"])
+                    if raw.get("descriptor")
+                    else descriptor_from_type_name(
+                        str(raw["type_name"]),
+                        oid=int(raw["type_oid"]),
+                        typmod=(int(raw["typmod"]) if raw.get("typmod") is not None else None),
+                        nullable=bool(raw.get("nullable", True)),
+                    )
                 ),
             )
             for raw in raw_columns

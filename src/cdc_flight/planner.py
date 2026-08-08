@@ -52,6 +52,7 @@ class GroupPlan:
         truncate_mode: str,
         created_in_txn: set[str],
         watermarks: dict[str, int] | None = None,
+        descriptor_provider=None,
     ):
         self.con = con
         self.commit_id = commit_id
@@ -64,6 +65,7 @@ class GroupPlan:
         self.created_in_txn = created_in_txn
         #: rubric 1.6, per-table snapshot watermarks. See `add_unit`.
         self.watermarks = watermarks or {}
+        self.descriptor_provider = descriptor_provider
         self.watermark_fenced_events = 0
 
         self.work: dict[str, TableWork] = {}
@@ -207,6 +209,7 @@ class GroupPlan:
                 if snapshot is not None
                 else stream_event_id(event)
             )
+        self._enrich_descriptors(event)
         item = table_work.work_for(self.work, target, event, snapshot is not None)
         row = table_work.row_for(event, self.commit_id, event_id, snapshot=item.snapshot)
         table_work.collect(item, event, row, event_id, probe=self)
@@ -219,6 +222,28 @@ class GroupPlan:
             )
         )
         self.source_tables.add(f"{event.schema}.{event.table}")
+
+    def _enrich_descriptors(self, event: PendingRecord) -> None:
+        """Merge one memoized catalog descriptor map into a row envelope."""
+        if self.descriptor_provider is None or not event.qualified_table:
+            return
+        try:
+            catalog_descriptors = self.descriptor_provider(event.qualified_table)
+        except Exception:
+            # The catalog watcher is an observation aid, not a second transaction
+            # boundary.  A missing map leaves the schema-enabled envelope path in
+            # charge; the strict resolver still refuses an actually unsupported type.
+            log.debug("could not obtain catalog descriptors for %s", event.qualified_table, exc_info=True)
+            return
+        if not catalog_descriptors:
+            return
+        for attribute in ("key_descriptors", "before_descriptors", "after_descriptors"):
+            descriptors = getattr(event, attribute)
+            for name, descriptor in catalog_descriptors.items():
+                # The source catalog is authoritative for physical PostgreSQL
+                # identity and typmod.  Connect may intentionally flatten a value
+                # to STRING (decimal/interval) while retaining no logical name.
+                descriptors[name] = descriptor
 
     def _count_event(self, event: PendingRecord) -> None:
         """Group-level bookkeeping every event contributes to, whatever it is.
@@ -314,8 +339,11 @@ class GroupPlan:
             if column_type is None:
                 continue
             comparable += 1
-            predicate += f" AND {naming.quote(column)} IS NOT DISTINCT FROM ?"
-            params.append(apply_sql.bind(value, column_type))
+            expression, bound = apply_sql._typed_assignment(table, column, value)
+            predicate += (
+                f" AND {naming.quote(column)} IS NOT DISTINCT FROM {expression}"
+            )
+            params.extend(bound)
         if not comparable:
             return None
         found = self.con.execute(
@@ -335,13 +363,16 @@ class GroupPlan:
         return table if table.exists else None
 
     def _key_predicate(self, table, item: TableWork, key: tuple) -> tuple[str, list]:
+        expressions: list[str] = []
+        params: list = []
+        for column, value in zip(item.key_columns, key, strict=False):
+            expression, bound = apply_sql._typed_assignment(table, column, value)
+            expressions.append(expression)
+            params.extend(bound)
         predicate = " AND ".join(
-            f"{naming.quote(column)} IS NOT DISTINCT FROM ?" for column in item.key_columns
+            f"{naming.quote(column)} IS NOT DISTINCT FROM {expression}"
+            for column, expression in zip(item.key_columns, expressions, strict=True)
         )
-        params = [
-            apply_sql.bind(value, table.columns.get(column, apply_sql.VARCHAR))
-            for column, value in zip(item.key_columns, key, strict=False)
-        ]
         return predicate, params
 
     # ------------------------------------------------------------------ #

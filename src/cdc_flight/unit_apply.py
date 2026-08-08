@@ -36,6 +36,14 @@ def apply_units(
         truncate_mode=applier.cfg.truncate_mode,
         created_in_txn=created_in_txn,
         watermarks=applier.watermarks,
+        descriptor_provider=(
+            applier.descriptor_provider
+            or (
+                getattr(applier.catalog, "descriptors_for", None)
+                if applier.catalog is not None
+                else None
+            )
+        ),
     )
     for unit in group:
         if unit.fenced:

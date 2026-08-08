@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 
 from . import catalog_support as observation_mod
 from . import faults as faults_mod
+from .catalog_descriptors import CatalogDescriptorReader
 from .catalog_state import FENCED, SourceRelation, _missing_value
 from .machines import (
     CATALOG_SCHEMA_LIVENESS,
@@ -15,10 +17,47 @@ from .machines import (
     SCHEMA_UNAVAILABLE,
     SCHEMA_VISIBLE,
 )
-from .schema_evolution import SourceColumn
+from .schema_evolution import SourceColumn, descriptor_from_type_name
 from .states import IllegalTransition, UnknownState
+from .typed_types import SourceTypeDescriptor
 
 log = logging.getLogger("cdc_flight.catalog_poll")
+
+
+def _column_descriptor(raw: dict, descriptors: dict[int, SourceTypeDescriptor]) -> SourceTypeDescriptor:
+    oid = int(raw["type_oid"])
+    descriptor = descriptors.get(oid) or descriptor_from_type_name(
+        str(raw["type_name"]), oid=oid, nullable=bool(raw.get("nullable", True))
+    )
+    typmod = raw.get("typmod")
+    if typmod is not None:
+        descriptor = replace(descriptor, typmod=int(typmod))
+    descriptor = _apply_formatted_precision(descriptor, str(raw["type_name"]))
+    return descriptor
+
+
+def _apply_formatted_precision(
+    descriptor: SourceTypeDescriptor, formatted_name: str
+) -> SourceTypeDescriptor:
+    """Recover column/array numeric precision from PostgreSQL's formatted type."""
+    text = formatted_name.strip()
+    if descriptor.kind in {"numeric", "decimal"} and text.lower().startswith(
+        ("numeric(", "decimal(")
+    ):
+        parsed = descriptor_from_type_name(
+            text,
+            oid=descriptor.oid,
+            typmod=descriptor.typmod,
+            nullable=descriptor.nullable,
+        )
+        return replace(descriptor, precision=parsed.precision, scale=parsed.scale)
+    if descriptor.kind == "array" and descriptor.array_element is not None and text.endswith(
+        "[]"
+    ):
+        element_text = text[:-2].strip()
+        element = _apply_formatted_precision(descriptor.array_element, element_text)
+        return replace(descriptor, array_element=element)
+    return descriptor
 
 
 def connect(watcher, *, autocommit: bool = True, dsn: str | None = None):
@@ -100,23 +139,46 @@ def poll(watcher):
         ).fetchall()
         lsn = int(conn.execute(observation_mod.LSN_SQL).fetchone()[0])
         observed: dict[str, SourceRelation] = {}
-        for row in rows:
+        descriptor_reader = CatalogDescriptorReader(
+            conn, cache=getattr(watcher, "_descriptor_cache", {})
+        )
+        watcher._descriptor_cache = descriptor_reader.cache
+        parsed_columns: dict[int, list[dict]] = {}
+        all_type_oids: set[int] = set()
+        for index, row in enumerate(rows):
             raw_columns = row[9] if len(row) > 9 else []
             if isinstance(raw_columns, str):
                 try:
                     raw_columns = json.loads(raw_columns)
-                except ValueError:
+                except (TypeError, ValueError):
                     raw_columns = []
+            if not isinstance(raw_columns, list):
+                raw_columns = []
+            parsed_columns[index] = [raw for raw in raw_columns if isinstance(raw, dict)]
+            all_type_oids.update(
+                int(raw["type_oid"])
+                for raw in parsed_columns[index]
+                if raw.get("type_oid")
+            )
+        descriptors = descriptor_reader.resolve(all_type_oids)
+        for index, row in enumerate(rows):
+            raw_columns = parsed_columns[index]
             columns = tuple(
                 SourceColumn(
                     attnum=int(raw["attnum"]),
                     name=str(raw["name"]),
                     type_oid=int(raw["type_oid"]),
                     type_name=str(raw["type_name"]),
+                    typmod=(int(raw["typmod"]) if raw.get("typmod") is not None else None),
                     nullable=bool(raw.get("nullable", True)),
                     has_missing_default=bool(raw.get("has_missing_default", False)),
                     missing_value=_missing_value(
                         raw.get("missing_value_text"), str(raw["type_name"])
+                    ),
+                    descriptor=(
+                        SourceTypeDescriptor.from_dict(raw["descriptor"])
+                        if raw.get("descriptor")
+                        else _column_descriptor(raw, descriptors)
                     ),
                 )
                 for raw in (raw_columns or [])

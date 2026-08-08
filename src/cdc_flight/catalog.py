@@ -366,6 +366,24 @@ class CatalogWatcher:
                 )
             )
 
+    def descriptors_for(self, qualified: str) -> dict[str, object]:
+        """Return the latest catalog descriptor tree for one source relation.
+
+        Row envelopes are allowed to omit Connect logical names (notably when
+        Debezium is configured to emit decimal/interval strings).  The catalog
+        observation already carries the source type identity, so DML can use it as
+        the authoritative descriptor without issuing a catalog query per event.
+        """
+        with self._lock:
+            relation = self.known.get(str(qualified))
+            if relation is None:
+                return {}
+            return {
+                column.destination_name: column.descriptor
+                for column in relation.columns
+                if column.descriptor is not None
+            }
+
     def snapshot_names(self) -> tuple[str, ...]:
         """Logical relations whose snapshot callbacks are expected at startup.
 

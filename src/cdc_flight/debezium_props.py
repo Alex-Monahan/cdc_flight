@@ -203,12 +203,17 @@ def build_properties(
         # `before` image (1.2, 1.4, 2.6), the truncate/message operations (1.5,
         # 7.4) and, decisively, the `transaction` block that ADR 0001 §3.2 and §6
         # both depend on. Nothing downstream of here can recover those.
-        "key.converter.schemas.enable": "false",
-        # DEVIATION from ADR 0001 §5, recorded in the ADR amendment: the Connect
-        # *schema* stays off for now. The applier needs the *envelope*; the schema
-        # is what rubric 2.4/2.6 need, and turning it on inflates every payload
-        # 3-5x, which §5.1 flags as an unmeasured throughput risk owned by 5.3.
-        "value.converter.schemas.enable": "false",
+        # 2.4/2.5 consume the schema-bearing wrapper.  The envelope decoder accepts
+        # the old schema-disabled shape for replay fixtures, but production records
+        # must retain Connect logical names/parameters so a NULL-only or empty nested
+        # value cannot be inferred as VARCHAR/JSON.
+        "key.converter.schemas.enable": "true",
+        "value.converter.schemas.enable": "true",
+        "decimal.handling.mode": "string",
+        "time.precision.mode": "microseconds",
+        "interval.handling.mode": "string",
+        "binary.handling.mode": "base64",
+        "hstore.handling.mode": "map",
         "topic.naming.strategy": "io.debezium.schema.DefaultTopicNamingStrategy",
         # ADR 0001 §3.2: MANDATORY, not optional. Without it there is no `END`
         # marker and therefore no way to prove a Postgres transaction whole, so

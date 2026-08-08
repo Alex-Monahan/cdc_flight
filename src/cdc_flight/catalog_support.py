@@ -32,6 +32,12 @@ SELECT n.nspname                                  AS source_schema,
                    'name', a.attname,
                    'type_oid', a.atttypid::bigint,
                    'type_name', format_type(a.atttypid, a.atttypmod),
+                   'typmod', a.atttypmod,
+                   'type_schema', typ_ns.nspname,
+                   'type_kind', typ.typtype,
+                   'typelem', typ.typelem::bigint,
+                   'typbasetype', typ.typbasetype::bigint,
+                   'typrelid', typ.typrelid::bigint,
                    'nullable', NOT a.attnotnull,
                    'has_missing_default', COALESCE(a.atthasmissing, false),
                    'missing_value_text', CASE WHEN a.atthasmissing
@@ -48,6 +54,8 @@ LEFT JOIN pg_inherits inh ON inh.inhrelid = c.oid
 LEFT JOIN pg_publication_rel parent_pr
     ON parent_pr.prrelid = inh.inhparent AND parent_pr.prpubid = p.oid
 LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+LEFT JOIN pg_type typ ON typ.oid = a.atttypid
+LEFT JOIN pg_namespace typ_ns ON typ_ns.oid = typ.typnamespace
 WHERE c.relkind IN ('r', 'p')
   AND (
       (%s::text[] IS NULL AND n.nspname NOT IN ('pg_catalog', 'information_schema', '_cdc_flight'))
