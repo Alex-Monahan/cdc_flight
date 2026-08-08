@@ -252,7 +252,11 @@ class Lab:
         **cfg: Any,
     ) -> None:
         self.path = Path(path)
-        self.con = duckdb.connect(str(self.path))
+        # Native VARIANT tables require the same storage compatibility and
+        # shredding settings as the production destination connection.  The lab
+        # drives the real applier, so opening a different DuckDB runtime contract
+        # would make native merge coverage fail before RowPatch reaches SQL.
+        self.con = duckdb.connect(str(self.path), config=dest_mod.DUCKDB_CONNECT_CONFIG)
         dest_mod.ensure_control_schema(self.con)
         dest_mod.ensure_dataset(self.con, DATASET)
         self.committer = FakeCommitter()

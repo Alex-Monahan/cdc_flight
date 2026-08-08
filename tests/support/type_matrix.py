@@ -36,6 +36,7 @@ def scalar_matrix() -> tuple[SourceTypeDescriptor, ...]:
         descriptor("timetz", oid=1266),
         descriptor("interval", oid=1186),
         descriptor("uuid", oid=2950),
+        descriptor("json", oid=114),
         descriptor("jsonb", oid=3802),
         descriptor("numeric", oid=1700, precision=12, scale=4),
         descriptor("numeric", oid=1700, precision=50, scale=8),

@@ -972,7 +972,7 @@ class SchemaRegistry:
 #: reported as VARCHAR by `_normalise_type` and must never be ALTERed on that basis.
 _RECOGNISED_TYPES = frozenset(
     {
-        BOOLEAN, BIGINT, DOUBLE, JSON_T, VARCHAR,
+        BOOLEAN, BIGINT, DOUBLE, JSON_T, "VARIANT", VARCHAR,
         "TEXT", "STRING", "INT64", "HUGEINT", "INTEGER", "INT", "INT32", "SMALLINT",
         "FLOAT", "REAL", "FLOAT8",
     }
@@ -1020,6 +1020,8 @@ def _normalise_type(duckdb_type: str) -> str:
         return "BLOB"
     if upper == "JSON":
         return JSON_T
+    if upper == "VARIANT":
+        return "VARIANT"
     if upper in {"DATE", "TIME", "TIMESTAMP", "TIMESTAMP WITH TIME ZONE", "TIMESTAMPTZ", "TIME WITH TIME ZONE", "TIMETZ", "INTERVAL", "UUID"}:
         return upper
     if upper.startswith(("STRUCT(", "MAP(", "UNION(", "ENUM(", "LIST(", "DECIMAL(", "BIGNUM")) or upper.endswith("[]"):
@@ -1648,7 +1650,7 @@ def insert_typed_rows(
 
 
 def _typed_parameter(value: Any, native: Any) -> tuple[str, list[Any]]:
-    from .typed_types import NativeType, UnionValue
+    from .typed_types import JsonbNull, NativeType, UnionValue
 
     if value is None:
         return "NULL", []
@@ -1683,6 +1685,16 @@ def _typed_parameter(value: Any, native: Any) -> tuple[str, list[Any]]:
                 inner_params,
             )
         return f"union_value({quote(value.member)} := ?)", [value.value]
+    if native.kind == "VARIANT":
+        if isinstance(value, JsonbNull):
+            return "CAST(JSON 'null' AS VARIANT)", []
+        if isinstance(value, str):
+            # A direct Python string bind becomes a VARIANT string.  JSONB's
+            # wire value is JSON text, so parse it first and then construct the
+            # native VARIANT value.  This is also the recursive form used inside
+            # LIST/STRUCT/MAP and UNION members.
+            return "CAST(CAST(? AS JSON) AS VARIANT)", [value]
+        raise ValueError(f"value for VARIANT is not validated JSON text: {value!r}")
     if native.kind in {"UNION", "NUMERIC_UNION"}:
         raise ValueError(
             f"value for {native.sql} lacks an explicit UNION member; refusing an implicit cast"

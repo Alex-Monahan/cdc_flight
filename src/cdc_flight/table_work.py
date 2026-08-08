@@ -308,7 +308,14 @@ def collect(
 
     key = tuple(event.key[k] for k in event.key)
     if event.op == "d":
-        _remove(item, key, event.before, probe, descriptors=event.before_descriptors)
+        _remove(
+            item,
+            key,
+            event.before,
+            probe,
+            descriptors=event.before_descriptors,
+            typed=event.typed_before,
+        )
         return
 
     if event.op == "u":
@@ -327,6 +334,7 @@ def collect(
                     event.before,
                     probe,
                     descriptors=event.before_descriptors,
+                    typed=event.typed_before,
                 )
                 if isinstance(removed, RowMove):
                     _place(
@@ -351,7 +359,7 @@ def collect(
         # how three updates of one key inside one transaction became three live rows.
         _update(
             item, key, patch.encoded_values(), event.before, probe,
-            patch=patch, descriptors=event.before_descriptors,
+            patch=patch, descriptors=event.before_descriptors, typed=event.typed_before,
         )
         return
     _place(item, key, patch.encoded_values(), patch=patch)
@@ -443,6 +451,7 @@ def _update(
     *,
     patch: RowPatch | None = None,
     descriptors=None,
+    typed=None,
 ) -> None:
     """An UPDATE with an unchanged key: the same physical row, with new values."""
     if key in item.deleted_keys:
@@ -453,7 +462,7 @@ def _update(
     if not entries:
         _missing_toast_base(item, None, reason="UPDATE has no destination base row")
     index = _target_entry(
-        item, key, entries, before, probe, "update", descriptors=descriptors
+        item, key, entries, before, probe, "update", descriptors=descriptors, typed=typed
     )
     patch = patch or RowPatch({name: FieldValue.of(value) for name, value in row.items()})
     if index is None:
@@ -471,7 +480,7 @@ def _update(
     _track(item, key, entries)
 
 
-def _remove(item: TableWork, key: tuple, before, probe, *, descriptors=None):
+def _remove(item: TableWork, key: tuple, before, probe, *, descriptors=None, typed=None):
     """Rubric 1.4's hard case: which of the rows wearing `key` did this delete take?
 
     The two orderings below are byte-identical event streams with opposite answers,
@@ -491,7 +500,7 @@ def _remove(item: TableWork, key: tuple, before, probe, *, descriptors=None):
     if entries == [START]:
         _resolve_start(item, key, entries, probe)
     index = _target_entry(
-        item, key, entries, before, probe, "delete", descriptors=descriptors
+        item, key, entries, before, probe, "delete", descriptors=descriptors, typed=typed
     )
     removed = None
     if index is None:
@@ -507,7 +516,7 @@ def _remove(item: TableWork, key: tuple, before, probe, *, descriptors=None):
 
 
 def _target_entry(
-    item, key: tuple, entries: list, before, probe, what: str, *, descriptors=None
+    item, key: tuple, entries: list, before, probe, what: str, *, descriptors=None, typed=None
 ) -> int | None:
     """Index of the entry `before` describes, or None for "collapse the key".
 
@@ -519,7 +528,7 @@ def _target_entry(
         return None
     if len(entries) == 1:
         return 0
-    image = _distinguishing(item, before, descriptors=descriptors)
+    image = _distinguishing(item, before, descriptors=descriptors, typed=typed)
     concrete = _concrete(entries)
     if not image:
         # Nothing in the before-image separates the candidates. That is only ever the
@@ -592,15 +601,25 @@ def _matches(item, key, entry, image: dict, probe) -> bool:
     return all(entry.get(column) == value for column, value in image.items())
 
 
-def _distinguishing(item: TableWork, before, *, descriptors=None) -> dict:
+def _distinguishing(item: TableWork, before, *, descriptors=None, typed=None) -> dict:
     """The before-image columns that can tell two rows under one key apart."""
     if not before:
         return {}
     out = {}
     descriptors = descriptors or {}
+    typed_fields = dict(typed.fields) if typed is not None else {}
     for column, value in before.items():
         name = naming.normalize(column)
         descriptor = descriptors.get(column) or descriptors.get(name) or item.descriptors.get(name)
+        disposition = typed_fields.get(column) or typed_fields.get(name)
+        if disposition is not None and disposition.state in {
+            FieldState.UNCHANGED_TOAST,
+            FieldState.ABSENT,
+        }:
+            # A typed sidecar is authoritative even when the legacy raw image still
+            # contains a connector marker.  The marker is a no-op, not a value that
+            # may be bound into the destination probe for attribution.
+            continue
         if name in item.key_columns or is_structural_marker(value, descriptor):
             continue
         out[name] = value
