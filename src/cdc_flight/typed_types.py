@@ -43,6 +43,22 @@ class FieldState(StrEnum):
     ABSENT = "absent"
 
 
+@dataclass(frozen=True)
+class JsonbNull:
+    """A JSONB document whose root value is JSON ``null``.
+
+    PostgreSQL JSONB's JSON-null document is distinct from a SQL NULL before it
+    reaches DuckDB.  Keeping that distinction in the typed value boundary lets
+    nested encoders and UNION member binders choose the native VARIANT form
+    explicitly.  DuckDB 1.5.4 currently exposes both forms as VARIANT_NULL when
+    read back; the distinction is therefore intentionally not collapsed in spill
+    serialization before the destination bind.
+    """
+
+
+JSONB_NULL = JsonbNull()
+
+
 def _freeze_pairs(value: Mapping[str, Any] | None) -> tuple[tuple[str, str], ...]:
     if not value:
         return ()
@@ -450,8 +466,10 @@ def native_type(source: SourceTypeDescriptor | NativeType) -> NativeType:
         return NativeType("INTERVAL", "INTERVAL", descriptor)
     if kind in {"uuid"}:
         return NativeType("UUID", "UUID", descriptor)
-    if kind in {"json", "jsonb"}:
+    if kind == "json":
         return NativeType("JSON", "JSON", descriptor)
+    if kind == "jsonb":
+        return NativeType("VARIANT", "VARIANT", descriptor)
     if kind == "array":
         if descriptor.array_element is None:
             raise UnsupportedType(f"array {descriptor.qualified_name} has no element descriptor")
@@ -636,10 +654,10 @@ def encode_value(value: Any, descriptor: SourceTypeDescriptor | NativeType) -> A
             return str(value if isinstance(value, UUID) else UUID(str(value)))
         except (ValueError, AttributeError) as exc:
             raise InvalidTypedValue(f"{value!r} is not a UUID") from exc
-    if kind in {"json", "jsonb"}:
-        if isinstance(value, str):
-            return value
-        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    if kind == "json":
+        return _encode_json(value, jsonb=False)
+    if kind == "jsonb":
+        return _encode_json(value, jsonb=True)
     if kind in {"bit", "varbit"}:
         return _encode_bits(value, source)
     if kind in {"range", "daterange", "int4range", "int8range", "numrange", "tsrange", "tstzrange"}:
@@ -746,6 +764,36 @@ def _encode_struct(value: Any, source: SourceTypeDescriptor) -> dict[str, Any]:
         result.setdefault("srid", 0)
         result["wkb"] = _decode_bytes(value.get("wkb", b""))
     return result
+
+
+def _encode_json(value: Any, *, jsonb: bool) -> str | JsonbNull:
+    """Validate JSON and canonicalize JSONB without changing JSON object order."""
+
+    try:
+        if jsonb and isinstance(value, JsonbNull):
+            return value
+        if isinstance(value, str):
+            parsed = json.loads(value, parse_constant=_reject_json_constant)
+            if not jsonb:
+                return value
+        else:
+            parsed = value
+        if jsonb and parsed is None:
+            return JSONB_NULL
+        return json.dumps(
+            parsed,
+            sort_keys=jsonb,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        name = "jsonb" if jsonb else "json"
+        raise InvalidTypedValue(f"{value!r} is not valid PostgreSQL {name} JSON") from exc
+
+
+def _reject_json_constant(value: str) -> Any:
+    raise ValueError(f"non-finite JSON constant {value!r} is not valid JSON")
 
 
 def _encode_bits(value: Any, source: SourceTypeDescriptor) -> dict[str, Any]:
@@ -1061,6 +1109,8 @@ def _quote_identifier(value: str) -> str:
 
 
 def _jsonable(value: Any) -> Any:
+    if isinstance(value, JsonbNull):
+        return {"__cdc_jsonb_null__": True}
     if isinstance(value, UnionValue):
         return {"__union_member__": value.member, "value": _jsonable(value.value)}
     if isinstance(value, Decimal):
@@ -1080,6 +1130,8 @@ def _jsonable(value: Any) -> Any:
 
 def _from_jsonable(value: Any) -> Any:
     if isinstance(value, Mapping):
+        if value.get("__cdc_jsonb_null__") is True and len(value) == 1:
+            return JSONB_NULL
         if "__union_member__" in value:
             return UnionValue(str(value["__union_member__"]), _from_jsonable(value.get("value")))
         if "__decimal__" in value:
@@ -1106,7 +1158,20 @@ _OBSCURE_EXTENSIONS = frozenset()
 
 
 __all__ = [
-    "FieldState", "FieldValue", "InvalidTypedValue", "NativeMember", "NativeType",
-    "SourceTypeDescriptor", "TypedImage", "UnionValue", "UnsupportedType", "encode_value",
-    "native_type", "numeric_value", "union_member_name", "union_type",
+    "JSONB_NULL",
+    "FieldState",
+    "FieldValue",
+    "InvalidTypedValue",
+    "JsonbNull",
+    "NativeMember",
+    "NativeType",
+    "SourceTypeDescriptor",
+    "TypedImage",
+    "UnionValue",
+    "UnsupportedType",
+    "encode_value",
+    "native_type",
+    "numeric_value",
+    "union_member_name",
+    "union_type",
 ]

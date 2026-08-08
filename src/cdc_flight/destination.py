@@ -46,6 +46,12 @@ __all__ = ["CONTROL_DDL", "ensure_control_schema"]
 
 log = logging.getLogger("cdc_flight.destination")
 
+# DuckDB 1.5.4 supports VARIANT in persistent databases only when the file is
+# created with the v1.5 storage compatibility level.  The same connection option
+# is accepted by MotherDuck, keeping the resolver/encoder and destination setup
+# on one runtime-neutral contract.
+DUCKDB_CONNECT_CONFIG = {"storage_compatibility_version": "v1.5.0"}
+
 CONTROL_SCHEMA = "_cdc_flight"
 
 #: `table_state.snapshot_state` for a table whose destination data cannot be trusted
@@ -141,7 +147,7 @@ def connect(dest) -> Any:
 
     if dest.kind == "duckdb":
         dest.duckdb_path.parent.mkdir(parents=True, exist_ok=True)
-        return duckdb.connect(str(dest.duckdb_path))
+        return duckdb.connect(str(dest.duckdb_path), config=DUCKDB_CONNECT_CONFIG)
 
     if dest.kind == "motherduck":
         from .config import motherduck_token
@@ -152,13 +158,16 @@ def connect(dest) -> Any:
                 "CDC_DESTINATION=motherduck but neither `motherduck_token` nor "
                 "`MOTHERDUCK_TOKEN` is set in the environment."
             )
-        bootstrap = duckdb.connect(f"md:?motherduck_token={token}")
+        bootstrap = duckdb.connect(
+            f"md:?motherduck_token={token}", config=DUCKDB_CONNECT_CONFIG
+        )
         try:
             bootstrap.execute(f'CREATE DATABASE IF NOT EXISTS "{dest.motherduck_database}"')
         finally:
             bootstrap.close()
         return duckdb.connect(
-            f"md:{dest.motherduck_database}?motherduck_token={token}"
+            f"md:{dest.motherduck_database}?motherduck_token={token}",
+            config=DUCKDB_CONNECT_CONFIG,
         )
 
     raise ValueError(f"unknown destination {dest.kind!r} (expected duckdb|motherduck)")

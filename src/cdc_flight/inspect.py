@@ -10,15 +10,21 @@ import argparse
 import duckdb
 
 from .config import DestinationConfig, motherduck_token
+from .destination import DUCKDB_CONNECT_CONFIG
 
 
 def connect(dest: DestinationConfig) -> duckdb.DuckDBPyConnection:
     if dest.kind == "duckdb":
-        return duckdb.connect(str(dest.duckdb_path), read_only=True)
+        return duckdb.connect(
+            str(dest.duckdb_path), read_only=True, config=DUCKDB_CONNECT_CONFIG
+        )
     token = motherduck_token()
     if not token:
         raise RuntimeError("`motherduck_token` is not set")
-    return duckdb.connect(f"md:{dest.motherduck_database}?motherduck_token={token}")
+    return duckdb.connect(
+        f"md:{dest.motherduck_database}?motherduck_token={token}",
+        config=DUCKDB_CONNECT_CONFIG,
+    )
 
 
 def _report_incomplete_tables(con, dest: DestinationConfig) -> None:
