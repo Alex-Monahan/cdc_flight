@@ -222,7 +222,7 @@ Debezium policy.
 | r2 finding | round-3 evidence now required for closure |
 |---|---|
 | JSONB `1`/`1.0` identity false negative | Six PostgreSQL equality classes, recursively nested, delete one row on local DuckDB and MotherDuck; the source-key binder also canonicalizes JSONB text before SQL. |
-| identity recomputed from shadow-swap readback | 37 full-type property cases compare source-derived identity with the stored post-swap identity, including real/double, both numeric scales, two DST-zone timestamptz values, NULL/empty/nested arrays, composites, maps, ranges, multiranges, a JSONB domain, and unicode. |
+| identity recomputed from shadow-swap readback | 33 full-type property cases plus four exact r2 readback probes (37 tests in the regression file) compare source-derived identity with the stored post-swap identity, including real/double, both numeric scales, two DST-zone timestamptz values, NULL/empty/nested arrays, composites, maps, ranges, multiranges, a JSONB domain, and unicode. |
 | activation boundary crossed relation generations | Same complete `(oid, relfilenode, relation_type_oid)` carries the boundary; a changed token and FULL loss invalidate it and force a fresh same-connection verification path. |
 | descriptor fallback guessed types | Live and persisted misses fail closed; the production catalog wrapper records a durable refusal and `awaiting_snapshot`, so recovery is automatic rather than a startup deadlock. |
 | interval key rejection | PostgreSQL creation audit says interval is a valid source key; the destination marks it non-indexable, uses the internal canonical identity, and creation/migration/replay pass. |
@@ -1898,7 +1898,8 @@ lanes were green after these changes.
 `cdcf_internal_id` verbatim whenever a current-version type change already has
 one; for indexable keys that become internal during the swap, the codec
 canonicalizes source semantics (including PostgreSQL binary32 `real`) before the
-new ID is created. The 37-case property test
+new ID is created. The 33-case full-type property test (plus four exact r2 probes,
+37 tests total in the regression file)
 `test_2_5_fix3_regressions.py::test_full_24_type_list_source_identity_survives_typed_shadow_swap`
 compares the source-derived ID with the post-swap stored ID for every declared
 scalar/recursive type and the additional range, multirange, JSONB-domain, nested,
