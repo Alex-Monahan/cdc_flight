@@ -84,6 +84,7 @@ def apply_units(
             source_schema=schema,
             source_table=table,
             target_table=target,
+            control_schema=applier.control_schema,
         )
     with applier._lock:
         for target, count in plan.table_counts.items():

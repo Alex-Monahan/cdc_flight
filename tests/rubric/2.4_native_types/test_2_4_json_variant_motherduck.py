@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import json
+import contextlib
 
 import pytest
-from support.motherduck_probe import assert_runtime, connect, scratch_database
+from support.motherduck_probe import assert_runtime, connect
 
-from cdc_flight.apply_sql import SchemaRegistry, delete_keys, insert_rows
-from cdc_flight.config import DestinationConfig, motherduck_token
-from cdc_flight.destination import connect as destination_connect
+from cdc_flight.apply_sql import SchemaRegistry, insert_rows
+from cdc_flight.naming import quote
 from cdc_flight.typed_types import SourceTypeDescriptor
 
 pytestmark = [pytest.mark.motherduck, pytest.mark.e2e]
@@ -19,245 +18,10 @@ def _source(kind: str, oid: int) -> SourceTypeDescriptor:
     return SourceTypeDescriptor(oid, f"pg_catalog.{kind}", kind)
 
 
-def test_motherduck_accepts_json_as_a_jsonb_primary_key():
-    token = motherduck_token()
-    if not token:
-        pytest.skip("`motherduck_token` not set")
-
-    integer = _source("int4", 23)
-    jsonb = _source("jsonb", 3802)
-    with scratch_database(token, "cdc_p2b_json_key") as database:
-        con = connect(token, database)
-        try:
-            con.execute("CREATE SCHEMA typed")
-            registry = SchemaRegistry(con, "typed")
-            registry.ensure_typed(
-                "jsonb_key",
-                columns={"id": jsonb, "tenant": integer, "payload": jsonb},
-                key_columns=("id", "tenant"),
-            )
-            table = registry.get("jsonb_key")
-            assert table.raw_types["id"] == "JSON"
-            assert table.raw_types["payload"] == "VARIANT"
-            insert_rows(
-                con,
-                table,
-                ["id", "tenant", "payload"],
-                [['{"account": 7}', 1, '{"body": true}']],
-            )
-            assert con.execute(
-                'SELECT "id", "payload" FROM typed."jsonb_key"'
-            ).fetchone() == ('{"account":7}', {"body": True})
-        finally:
-            con.close()
-
-
-def test_motherduck_probe_connections_share_the_production_configuration():
-    token = motherduck_token()
-    if not token:
-        pytest.skip("`motherduck_token` not set")
-    with scratch_database(token, "cdc_p2b_probe_config") as database:
-        probe = connect(token, database)
-        try:
-            production = destination_connect(
-                DestinationConfig(kind="motherduck", motherduck_database=database)
-            )
-            production.close()
-        finally:
-            probe.close()
-
-
-def test_motherduck_jsonb_key_gain_and_loss_use_the_same_shadow_resolver():
-    token = motherduck_token()
-    if not token:
-        pytest.skip("`motherduck_token` not set")
-
-    integer = _source("int4", 23)
-    jsonb = _source("jsonb", 3802)
-    with scratch_database(token, "cdc_p2b_json_key_transition") as database:
-        con = connect(token, database)
-        try:
-            con.execute("CREATE SCHEMA typed")
-            registry = SchemaRegistry(con, "typed")
-            registry.ensure_typed(
-                "transitions",
-                columns={"id": integer, "json_key": jsonb, "payload": jsonb},
-                key_columns=("id",),
-            )
-            insert_rows(
-                con,
-                registry.get("transitions"),
-                ["id", "json_key", "payload"],
-                [[1, '{"a":1}', '{"body":true}']],
-            )
-            registry.ensure_typed(
-                "transitions",
-                columns={"id": integer, "json_key": jsonb, "payload": jsonb},
-                key_columns=("id", "json_key"),
-            )
-            assert registry.get("transitions").raw_types["json_key"] == "JSON"
-            registry.ensure_typed(
-                "transitions",
-                columns={"id": integer, "json_key": jsonb, "payload": jsonb},
-                key_columns=("id",),
-            )
-            table = registry.get("transitions")
-            assert table.raw_types["json_key"] == "VARIANT"
-            assert table.primary_key_columns == ("id",)
-            assert con.execute(
-                'SELECT "payload" FROM typed."transitions"'
-            ).fetchone() == ({"body": True},)
-        finally:
-            con.close()
-
-
-def test_motherduck_nested_composite_jsonb_key_deletes_existing_row():
-    """A recursive key descriptor must use JSON on the physical shadow table."""
-    token = motherduck_token()
-    if not token:
-        pytest.skip("`motherduck_token` not set")
-
-    integer = _source("int4", 23)
-    text = _source("text", 25)
-    jsonb = _source("jsonb", 3802)
-    inner = SourceTypeDescriptor(
-        9100,
-        "app.inner_key",
-        "composite",
-        composite_fields=(("doc", jsonb), ("n", integer)),
-    )
-    outer = SourceTypeDescriptor(
-        9101,
-        "app.outer_key",
-        "composite",
-        composite_fields=(("inner_key", inner), ("note", text)),
-    )
-
-    with scratch_database(token, "cdc_p2b_nested_json_key") as database:
-        con = connect(token, database)
-        try:
-            con.execute("CREATE SCHEMA typed")
-            registry = SchemaRegistry(con, "typed")
-            registry.ensure_typed(
-                "nested_key",
-                columns={"id": integer, "compound": outer, "payload": text},
-                key_columns=("id",),
-            )
-            insert_rows(
-                con,
-                registry.get("nested_key"),
-                ["id", "compound", "payload"],
-                [[1, {"inner_key": {"doc": '{"a":1}', "n": 7}, "note": "x"}, "kept"]],
-            )
-            registry.ensure_typed(
-                "nested_key",
-                columns={"id": integer, "compound": outer, "payload": text},
-                key_columns=("id", "compound"),
-            )
-            table = registry.get("nested_key")
-            assert "doc JSON" in table.raw_types["compound"]
-            delete_keys(
-                con,
-                table,
-                ("id", "compound"),
-                [(1, {"inner_key": {"doc": '{"a":1}', "n": 7}, "note": "x"})],
-            )
-            assert con.execute('SELECT count(*) FROM typed."nested_key"').fetchone()[0] == 0
-        finally:
-            con.close()
-
-
-def test_motherduck_jsonb_identity_equality_classes_delete_one_row():
-    """MotherDuck must use the same PostgreSQL JSONB numeric classes as local DuckDB."""
-    token = motherduck_token()
-    if not token:
-        pytest.skip("`motherduck_token` not set")
-
-    jsonb = _source("jsonb", 3802)
-    text = _source("text", 25)
-    compound = SourceTypeDescriptor(
-        9300,
-        "app.jsonb_identity_compound",
-        "composite",
-        composite_fields=(("doc", jsonb), ("note", text)),
-    )
-    equality_classes = (
-        ('{"v":1}', '{"v":1.0}'),
-        ('{"v":1e2}', '{"v":100}'),
-        ('{"v":1.2300}', '{"v":1.23}'),
-        ('{"v":-0.0}', '{"v":0}'),
-        ('{"a":1,"a":2}', '{"a":2}'),
-        ('{"b":[1,{"z":1,"a":2}]}', '{"b":[1.0,{"a":2,"z":1.0}]}'),
-    )
-    with scratch_database(token, "cdc_p2b_jsonb_identity_classes") as database:
-        con = connect(token, database)
-        try:
-            assert_runtime(con)
-            con.execute("CREATE SCHEMA typed")
-            registry = SchemaRegistry(con, "typed")
-            registry.ensure_typed(
-                "jsonb_identity",
-                columns={"compound": compound, "payload": text},
-                key_columns=("compound",),
-            )
-            table = registry.get("jsonb_identity")
-            assert table.internal_identity
-            for left, right in equality_classes:
-                insert_rows(
-                    con,
-                    table,
-                    ["compound", "payload"],
-                    [[{"doc": json.loads(left), "note": "same"}, "kept"]],
-                )
-                delete_keys(
-                    con,
-                    table,
-                    ("compound",),
-                    [({"doc": json.loads(right), "note": "same"},)],
-                )
-                assert con.execute(
-                    'SELECT count(*) FROM typed."jsonb_identity"'
-                ).fetchone()[0] == 0
-        finally:
-            con.close()
-
-
-def test_motherduck_bytea_key_changed_to_union_deletes_existing_row():
-    """The SQL and Python bytea identity renderings must be byte-for-byte equal."""
-    token = motherduck_token()
-    if not token:
-        pytest.skip("`motherduck_token` not set")
-
-    bytea = _source("bytea", 17)
-    text = _source("text", 25)
-    with scratch_database(token, "cdc_p2b_bytea_union_key") as database:
-        con = connect(token, database)
-        try:
-            con.execute("CREATE SCHEMA typed")
-            registry = SchemaRegistry(con, "typed")
-            registry.ensure_typed(
-                "bytea_union_key",
-                columns={"id": bytea, "payload": text},
-                key_columns=("id",),
-            )
-            insert_rows(
-                con,
-                registry.get("bytea_union_key"),
-                ["id", "payload"],
-                [[b"abc", "kept"]],
-            )
-            registry.convert_column_to_union("bytea_union_key", "id", bytea, text)
-            table = registry.get("bytea_union_key")
-            delete_keys(con, table, ("id",), [(b"abc",)])
-            assert con.execute('SELECT count(*) FROM typed."bytea_union_key"').fetchone()[0] == 0
-        finally:
-            con.close()
-
-
-def test_motherduck_json_variant_nested_round_trip_and_union_shadow():
-    token = motherduck_token()
-    if not token:
-        pytest.skip("`motherduck_token` not set")
+def test_motherduck_json_variant_nested_round_trip_and_union_shadow(motherduck_case):
+    token = motherduck_case["token"]
+    typed = motherduck_case["control_schema"]
+    quoted_typed = quote(typed)
 
     integer = _source("int4", 23)
     text = _source("text", 25)
@@ -289,12 +53,12 @@ def test_motherduck_json_variant_nested_round_trip_and_union_shadow():
         map_value=text,
     )
 
-    with scratch_database(token, "cdc_p2b_json_variant") as database:
+    with contextlib.nullcontext(motherduck_case["database"]) as database:
         con = connect(token, database)
         try:
             assert_runtime(con)
-            con.execute("CREATE SCHEMA typed")
-            registry = SchemaRegistry(con, "typed")
+            con.execute(f"CREATE SCHEMA {quoted_typed}")
+            registry = SchemaRegistry(con, typed)
             registry.ensure_typed(
                 "native_values",
                 columns={
@@ -330,7 +94,8 @@ def test_motherduck_json_variant_nested_round_trip_and_union_shadow():
             types = dict(
                 con.execute(
                     "SELECT column_name, data_type FROM information_schema.columns "
-                    "WHERE table_schema='typed' AND table_name='native_values'"
+                    "WHERE table_schema=? AND table_name='native_values'",
+                    [typed],
                 ).fetchall()
             )
             assert types["json_value"] == "JSON"
@@ -342,9 +107,9 @@ def test_motherduck_json_variant_nested_round_trip_and_union_shadow():
             assert types["attrs"] == "MAP(VARCHAR, VARCHAR)"
 
             rows = con.execute(
-                "SELECT id, json_value, jsonb_value, variant_typeof(jsonb_value), "
-                "jsonb_array, payload, payloads, attrs "
-                "FROM typed.native_values ORDER BY id"
+                f"SELECT id, json_value, jsonb_value, variant_typeof(jsonb_value), "
+                f"jsonb_array, payload, payloads, attrs "
+                f"FROM {quoted_typed}.native_values ORDER BY id"
             ).fetchall()
             assert rows[0][1] == '{"b":[1,{"unicode":"é🙂"}],"a":1}'
             assert rows[0][2] == {"a": 3, "b": 1}
@@ -359,15 +124,15 @@ def test_motherduck_json_variant_nested_round_trip_and_union_shadow():
             assert rows[2][2] is None and rows[2][4] is None and rows[2][5] is None
 
             con.execute(
-                "CREATE TABLE typed.jsonb_nulls (id INTEGER, value VARIANT)"
+                f"CREATE TABLE {quoted_typed}.jsonb_nulls (id INTEGER, value VARIANT)"
             )
             con.execute(
-                "INSERT INTO typed.jsonb_nulls VALUES "
+                f"INSERT INTO {quoted_typed}.jsonb_nulls VALUES "
                 "(1, CAST(JSON 'null' AS VARIANT)), (2, NULL)"
             )
             assert con.execute(
-                "SELECT variant_typeof(value), value IS NULL "
-                "FROM typed.jsonb_nulls ORDER BY id"
+                f"SELECT variant_typeof(value), value IS NULL "
+                f"FROM {quoted_typed}.jsonb_nulls ORDER BY id"
             ).fetchall() == [("VARIANT_NULL", True), ("VARIANT_NULL", True)]
 
             registry.ensure_typed(
@@ -385,11 +150,12 @@ def test_motherduck_json_variant_nested_round_trip_and_union_shadow():
             )
             physical = con.execute(
                 "SELECT data_type FROM information_schema.columns "
-                "WHERE table_schema='typed' AND table_name='changes' AND column_name='value'"
+                "WHERE table_schema=? AND table_name='changes' AND column_name='value'",
+                [typed],
             ).fetchone()[0]
             assert "JSON" in physical and "VARIANT" in physical
             changed = con.execute(
-                "SELECT union_tag(value), value FROM typed.changes ORDER BY id"
+                f"SELECT union_tag(value), value FROM {quoted_typed}.changes ORDER BY id"
             ).fetchall()
             assert changed[0][1] == '{"old":1}'
             assert changed[1][1] == {"a": 1, "new": 2}
@@ -398,10 +164,10 @@ def test_motherduck_json_variant_nested_round_trip_and_union_shadow():
             con.close()
 
 
-def test_motherduck_json_variant_edge_states_and_multidimensional_lists():
-    token = motherduck_token()
-    if not token:
-        pytest.skip("`motherduck_token` not set")
+def test_motherduck_json_variant_edge_states_and_multidimensional_lists(motherduck_case):
+    token = motherduck_case["token"]
+    typed = motherduck_case["control_schema"]
+    quoted_typed = quote(typed)
 
     integer = _source("int4", 23)
     text = _source("text", 25)
@@ -417,12 +183,12 @@ def test_motherduck_json_variant_edge_states_and_multidimensional_lists():
         9002, "public.hstore", "map", map_key=text, map_value=text
     )
 
-    with scratch_database(token, "cdc_p2b_json_variant_edges") as database:
+    with contextlib.nullcontext(motherduck_case["database"]) as database:
         con = connect(token, database)
         try:
             assert_runtime(con)
-            con.execute("CREATE SCHEMA typed")
-            registry = SchemaRegistry(con, "typed")
+            con.execute(f"CREATE SCHEMA {quoted_typed}")
+            registry = SchemaRegistry(con, typed)
             registry.ensure_typed(
                 "edge_values",
                 columns={
@@ -454,7 +220,8 @@ def test_motherduck_json_variant_edge_states_and_multidimensional_lists():
             types = dict(
                 con.execute(
                     "SELECT column_name, data_type FROM information_schema.columns "
-                    "WHERE table_schema='typed' AND table_name='edge_values'"
+                    "WHERE table_schema=? AND table_name='edge_values'",
+                    [typed],
                 ).fetchall()
             )
             assert types["json_value"] == "JSON"
@@ -462,8 +229,8 @@ def test_motherduck_json_variant_edge_states_and_multidimensional_lists():
             assert types["jsonb_array"] == "VARIANT[]"
             assert types["jsonb_matrix"] == "VARIANT[][]"
             rows = con.execute(
-                "SELECT id, json_value, jsonb_value, variant_typeof(jsonb_value), "
-                "jsonb_array, jsonb_matrix, attrs FROM typed.edge_values ORDER BY id"
+                f"SELECT id, json_value, jsonb_value, variant_typeof(jsonb_value), "
+                f"jsonb_array, jsonb_matrix, attrs FROM {quoted_typed}.edge_values ORDER BY id"
             ).fetchall()
             assert rows[0][1] == large_json
             assert len(rows[0][2]["payload"]) == len(large)

@@ -113,6 +113,7 @@ def finish_source_missing_tables(
     drop_mode: str = DROP_LOG,
     namespace: str | None = None,
     snapshot_epoch: int | None = None,
+    control_schema: str | None = None,
 ) -> tuple[list[str], list[str]]:
     """Apply the configured drop policy only after final source absence evidence."""
     if drop_mode == DROP_IGNORE:
@@ -177,6 +178,7 @@ def finish_source_missing_tables(
                     pipeline=pipeline,
                     source_schema=schema,
                     source_table=table,
+                    control_schema=control_schema,
                 )
                 if state != table_lifecycle.AWAITING:
                     table_lifecycle.transition(
@@ -186,6 +188,7 @@ def finish_source_missing_tables(
                         source_table=table,
                         to=table_lifecycle.AWAITING,
                         reason="normalizing a source-missing re-snapshot obligation",
+                        control_schema=control_schema,
                     )
                 table_lifecycle.transition(
                     con,
@@ -198,6 +201,7 @@ def finish_source_missing_tables(
                         "the retained image is a logged drop"
                     ),
                     snapshot_lsn=evidence.wal_lsn,
+                    control_schema=control_schema,
                 )
             projection.project_snapshot_completion(
                 con,
@@ -219,6 +223,7 @@ def finish_source_missing_tables(
                     ),
                 ),
                 snapshot_epoch=snapshot_epoch,
+                control_schema=control_schema,
             )
             if applied:
                 con.execute(f"DROP TABLE IF EXISTS {quote(dataset)}.{quote(target)}")
@@ -227,12 +232,14 @@ def finish_source_missing_tables(
                     pipeline=pipeline,
                     source_schema=schema,
                     source_table=table,
+                    control_schema=control_schema,
                 )
                 dest_mod.forget_source_relation(
                     con,
                     pipeline=pipeline,
                     source_schema=schema,
                     source_table=table,
+                    control_schema=control_schema,
                 )
                 dropped.append(qualified)
             else:

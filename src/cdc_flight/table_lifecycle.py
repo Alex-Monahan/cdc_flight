@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import logging
 
-from .control_schema import CONTROL_SCHEMA
+from .config import resolve_control_schema
 from .machines import (
     LIFECYCLE_ABSENT,
     LIFECYCLE_AWAITING,
@@ -39,6 +39,7 @@ from .machines import (
     LIFECYCLE_OWING_WORK,
     TABLE_LIFECYCLE,
 )
+from .naming import control_table
 from .states import IllegalTransition, UnknownState
 
 log = logging.getLogger("cdc_flight.table_lifecycle")
@@ -69,10 +70,17 @@ OWING_WORK = LIFECYCLE_OWING_WORK
 _KEEP = object()
 
 
+def _control_table(control_schema: str | None, table: str) -> str:
+    return control_table(resolve_control_schema(control_schema), table)
+
+
 # --------------------------------------------------------------------------- #
 # reading
 # --------------------------------------------------------------------------- #
-def read(con, *, pipeline: str, source_schema: str, source_table: str) -> str:
+def read(
+    con, *, pipeline: str, source_schema: str, source_table: str,
+    control_schema: str | None = None,
+) -> str:
     """This table's lifecycle state, or `absent` when it has no row.
 
     Validated: a value outside the declared domain raises `UnknownState` rather than
@@ -80,7 +88,7 @@ def read(con, *, pipeline: str, source_schema: str, source_table: str) -> str:
     exactly the shape that makes a rebuild silently never happen.
     """
     rows = con.execute(
-        f"SELECT snapshot_state FROM {CONTROL_SCHEMA}.table_state "
+        f"SELECT snapshot_state FROM {_control_table(control_schema, 'table_state')} "
         "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
         [pipeline, source_schema, source_table],
     ).fetchall()
@@ -89,19 +97,23 @@ def read(con, *, pipeline: str, source_schema: str, source_table: str) -> str:
     return _parse(rows[0][0], f"{source_schema}.{source_table}")
 
 
-def read_all(con, pipeline: str) -> dict[str, str]:
+def read_all(
+    con, pipeline: str, *, control_schema: str | None = None
+) -> dict[str, str]:
     """`"<schema>.<table>" -> state`, every row, validated."""
     return {
         f"{schema}.{table}": _parse(state, f"{schema}.{table}")
         for schema, table, state in con.execute(
             f"SELECT source_schema, source_table, snapshot_state FROM "
-            f"{CONTROL_SCHEMA}.table_state WHERE pipeline = ?",
+            f"{_control_table(control_schema, 'table_state')} WHERE pipeline = ?",
             [pipeline],
         ).fetchall()
     }
 
 
-def owing_work(con, pipeline: str) -> list[str]:
+def owing_work(
+    con, pipeline: str, *, control_schema: str | None = None
+) -> list[str]:
     """Every table in a state that means "this image cannot be trusted".
 
     Derived from the machine's `terminal` set, not from a second literal list — with
@@ -110,7 +122,9 @@ def owing_work(con, pipeline: str) -> list[str]:
     been snapshotted.
     """
     return sorted(
-        name for name, state in read_all(con, pipeline).items() if state in OWING_WORK
+        name
+        for name, state in read_all(con, pipeline, control_schema=control_schema).items()
+        if state in OWING_WORK
     )
 
 
@@ -118,7 +132,7 @@ def _parse(value, qualified: str) -> str:
     text = str(value)
     if text not in LIFECYCLE_DURABLE_VALUES:
         raise UnknownState(
-            f"{CONTROL_SCHEMA}.table_state for {qualified} carries "
+            f"{qualified} carries "
             f"snapshot_state={text!r}, which is not one of "
             f"{sorted(LIFECYCLE_DURABLE_VALUES)}. A state outside the frozen domain "
             "belongs to no queue and no recovery path, so it is refused rather than "
@@ -136,6 +150,7 @@ def check_transition(
     to: str,
     reason: str,
     alerts=None,
+    control_schema: str | None = None,
 ) -> str:
     """Assert `current -> to` is declared WITHOUT writing anything. Returns `current`.
 
@@ -147,7 +162,8 @@ def check_transition(
     MINOR-3). Check first, then mutate.
     """
     frm = read(
-        con, pipeline=pipeline, source_schema=source_schema, source_table=source_table
+        con, pipeline=pipeline, source_schema=source_schema, source_table=source_table,
+        control_schema=control_schema,
     )
     _check(
         frm, to,
@@ -174,6 +190,7 @@ def transition(
     last_commit_id=_KEEP,
     replace: bool = False,
     alerts=None,
+    control_schema: str | None = None,
 ) -> str:
     """Move one table to `to`, asserting the edge first. Returns the previous state.
 
@@ -183,7 +200,8 @@ def transition(
     configuration columns alone.
     """
     frm = read(
-        con, pipeline=pipeline, source_schema=source_schema, source_table=source_table
+        con, pipeline=pipeline, source_schema=source_schema, source_table=source_table,
+        control_schema=control_schema,
     )
     _check(
         frm, to,
@@ -193,12 +211,12 @@ def transition(
     if frm == ABSENT or replace:
         if frm != ABSENT:
             con.execute(
-                f"DELETE FROM {CONTROL_SCHEMA}.table_state "
+                f"DELETE FROM {_control_table(control_schema, 'table_state')} "
                 "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
                 [pipeline, source_schema, source_table],
             )
         con.execute(
-            f"INSERT INTO {CONTROL_SCHEMA}.table_state "
+            f"INSERT INTO {_control_table(control_schema, 'table_state')} "
             "(pipeline, source_schema, source_table, target_table, snapshot_state, "
             " snapshot_epoch, snapshot_lsn, last_commit_id) VALUES (?,?,?,?,?,?,?,?)",
             [
@@ -225,7 +243,7 @@ def transition(
         sets.append("target_table = ?")
         params.append(target_table)
     con.execute(
-        f"UPDATE {CONTROL_SCHEMA}.table_state SET {', '.join(sets)} "
+        f"UPDATE {_control_table(control_schema, 'table_state')} SET {', '.join(sets)} "
         "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
         [*params, pipeline, source_schema, source_table],
     )
@@ -241,6 +259,7 @@ def transition_all(
     to: str,
     reason: str,
     reset_snapshot_columns: bool = False,
+    control_schema: str | None = None,
 ) -> list[str]:
     """Move every table currently in `frm` to `to`. Returns the qualified names.
 
@@ -252,7 +271,8 @@ def transition_all(
     if frm != to:
         _check(frm, to, pipeline=pipeline, qualified="*", reason=reason, alerts=None)
     rows = con.execute(
-        f"SELECT source_schema, source_table FROM {CONTROL_SCHEMA}.table_state "
+        f"SELECT source_schema, source_table FROM "
+        f"{_control_table(control_schema, 'table_state')} "
         "WHERE pipeline = ? AND snapshot_state = ? ORDER BY source_schema, source_table",
         [pipeline, frm],
     ).fetchall()
@@ -263,7 +283,8 @@ def transition_all(
         if reset_snapshot_columns else ""
     )
     con.execute(
-        f"UPDATE {CONTROL_SCHEMA}.table_state SET snapshot_state = ?{extra} "
+        f"UPDATE {_control_table(control_schema, 'table_state')} "
+        f"SET snapshot_state = ?{extra} "
         "WHERE pipeline = ? AND snapshot_state = ?",
         [to, pipeline, frm],
     )
@@ -275,7 +296,9 @@ def transition_all(
     return names
 
 
-def reset_all(con, *, pipeline: str, reason: str) -> list[str]:
+def reset_all(
+    con, *, pipeline: str, reason: str, control_schema: str | None = None
+) -> list[str]:
     """`--reset-state`: every table's snapshot bookkeeping goes back to `none`.
 
     Deliberately NOT a DELETE. `table_state` is the canonical source-to-destination
@@ -287,22 +310,26 @@ def reset_all(con, *, pipeline: str, reason: str) -> list[str]:
         moved += transition_all(
             con, pipeline=pipeline, frm=frm, to=NONE, reason=reason,
             reset_snapshot_columns=True,
+            control_schema=control_schema,
         )
     # Rows already at `none` still need their epoch/lsn cleared, and `none -> none` is
     # a declared no-op edge rather than a special case.
     transition_all(
         con, pipeline=pipeline, frm=NONE, to=NONE, reason=reason,
         reset_snapshot_columns=True,
+        control_schema=control_schema,
     )
     return sorted(moved)
 
 
 def forget(
-    con, *, pipeline: str, source_schema: str, source_table: str, reason: str, alerts=None
+    con, *, pipeline: str, source_schema: str, source_table: str, reason: str, alerts=None,
+    control_schema: str | None = None,
 ) -> str:
     """The source relation is gone: the registry row goes with it (`-> absent`)."""
     frm = read(
-        con, pipeline=pipeline, source_schema=source_schema, source_table=source_table
+        con, pipeline=pipeline, source_schema=source_schema, source_table=source_table,
+        control_schema=control_schema,
     )
     if frm == ABSENT:
         return frm
@@ -312,7 +339,7 @@ def forget(
         reason=reason, alerts=alerts,
     )
     con.execute(
-        f"DELETE FROM {CONTROL_SCHEMA}.table_state "
+        f"DELETE FROM {_control_table(control_schema, 'table_state')} "
         "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
         [pipeline, source_schema, source_table],
     )

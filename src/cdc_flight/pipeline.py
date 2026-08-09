@@ -56,7 +56,7 @@ from .config import (
     lease_ttl_seconds,
 )
 from .debezium_props import assert_no_internal_topic_collision, build_properties
-from .destination import CONTROL_SCHEMA, Lease
+from .destination import Lease
 from .errors import EngineFailure
 from .faults import validate_env as validate_fault_env
 from .machines import (
@@ -65,6 +65,7 @@ from .machines import (
     PHASE_SNAPSHOTTING,
     PHASE_STOPPING,
 )
+from .naming import control_table
 from .ownership import DestinationOwnership
 from .run_state import RunOutcome, RunPhaseWriter
 from .snapshot_completion import SnapshotCompletion
@@ -102,6 +103,7 @@ def run(
     source = SourceConfig()
     replication = ReplicationConfig()
     dest = DestinationConfig(**({"kind": destination} if destination else {}))
+    control_schema = dest.control_schema
     run_cfg = RunConfig(
         **{
             k: v
@@ -144,7 +146,9 @@ def run(
     # the applier writes through, rather than by scattering anchors through the SQL
     # builders. `AlertSink`'s independent `cursor()` is delegated untouched on
     # purpose - see `faults.FaultyConnection`.
-    con = faults_mod.wrap_destination(dest_mod.connect(dest))
+    con = faults_mod.wrap_destination(
+        dest_mod.connect(dest), control_schema=control_schema
+    )
     summary_extra: dict = {}
     lease: Lease | None = None
     lease_held = False
@@ -160,14 +164,18 @@ def run(
     #: while the run was still `draining`.
     reported: dict | None = None
     try:
-        dest_mod.ensure_control_schema(con)
+        dest_mod.ensure_control_schema(con, control_schema)
         dest_mod.ensure_dataset(con, dest.dataset_name)
         # rubric 1.9 / ADR §4.8: one `_cdc_flight.heartbeat` row per run, moved through
         # the `RUN_PHASE` machine on its OWN connection. "Where is this run" stops being
         # a source-line position in a 470-line function and becomes a query. The
         # periodic liveness/lag writer is still 4.4/6.1's.
         phases = RunPhaseWriter(
-            con, pipeline=dest.pipeline_name, runner_id=runner_id, outcome=outcome
+            con,
+            pipeline=dest.pipeline_name,
+            runner_id=runner_id,
+            outcome=outcome,
+            control_schema=control_schema,
         )
 
         if reset_state:
@@ -178,7 +186,8 @@ def run(
             # pipeline"; `Lease.acquire` reclaims a dead owner on its own, so this only
             # covers an owner whose host we cannot check.
             con.execute(
-                f"DELETE FROM {CONTROL_SCHEMA}.lease WHERE pipeline = ?",
+                f"DELETE FROM {control_table(control_schema, 'lease')} "
+                "WHERE pipeline = ?",
                 [dest.pipeline_name],
             )
 
@@ -196,7 +205,12 @@ def run(
         # The lease is taken first: this path mutates destination state (marks tables,
         # deletes the resume point, drops the slot), and a second runner doing that
         # concurrently is exactly what rubric 4.2 exists to prevent.
-        lease = Lease(dest.pipeline_name, owner_id=runner_id, ttl_seconds=lease_ttl_seconds())
+        lease = Lease(
+            dest.pipeline_name,
+            owner_id=runner_id,
+            ttl_seconds=lease_ttl_seconds(),
+            control_schema=control_schema,
+        )
         lease.acquire(con)
         lease_held = True
 
@@ -208,7 +222,13 @@ def run(
             source.dsn, replication.slot_name
         )
 
-        captured_tables = acquisition.captured_tables(con, dest.pipeline_name, source, replication)
+        captured_tables = acquisition.captured_tables(
+            con,
+            dest.pipeline_name,
+            source,
+            replication,
+            control_schema=control_schema,
+        )
 
         if reset_state:
             # Journalled BEFORE the first destructive step, and before the generic
@@ -250,7 +270,10 @@ def run(
             phases.to(PHASE_RECOVERING, detail=verdict.decision)
             summary_extra["slot_recovery"] = recovery
             journal = recovery_mod.read(
-                con, pipeline=dest.pipeline_name, namespace=namespace
+                con,
+                pipeline=dest.pipeline_name,
+                namespace=namespace,
+                control_schema=control_schema,
             )
         if journal is not None:
             # A recovery has deleted the resume point, so the run has to snapshot data
@@ -317,6 +340,7 @@ def run(
                 captured_tables=captured_tables,
                 forget_catalog=False,
                 context={"file_lsn": reconciliation.file_lsn},
+                control_schema=control_schema,
             )
             summary_extra["recovery_journal"] = journal.as_dict()
             summary_extra["orphan_recovery"] = recovery_mod.resume(
@@ -325,6 +349,7 @@ def run(
                 namespace=namespace,
                 record=journal,
                 dsn=source.dsn,
+                control_schema=control_schema,
             )
         if (
             journal is not None
@@ -345,6 +370,7 @@ def run(
             con, pipeline=dest.pipeline_name, namespace=namespace,
             dsn=source.dsn, slot_name=replication.slot_name,
             snapshot_mode=props["snapshot.mode"],
+            control_schema=control_schema,
         )
 
         # ADR §14.1's open question, answered by measurement rather than by guess.
@@ -353,7 +379,9 @@ def run(
         # rejected by the lease could otherwise drop the incumbent's probe tables
         # mid-probe and make the incumbent conclude `transactional_ddl=False`
         # (Opus MINOR-7).
-        transactional_ddl = dest_mod.probe_transactional_ddl(con)
+        transactional_ddl = dest_mod.probe_transactional_ddl(
+            con, control_schema=control_schema
+        )
         summary_extra["transactional_ddl"] = transactional_ddl
 
         # rubric 1.6 — the blocking re-snapshot phase, BEFORE the main stream starts.
@@ -403,6 +431,7 @@ def run(
         baseline = baseline_mod.mark_unconfirmed(
             con, pipeline=dest.pipeline_name, dataset=dest.dataset_name,
             runner_id=runner_id, reconcile=catalog_enabled,
+            control_schema=control_schema,
         )
         summary_extra.update(baseline.as_dict())
 
@@ -425,8 +454,12 @@ def run(
                 auto_discover=source.auto_discovery,
                 publication_ownership=source.publication_ownership,
                 include={t if "." in t else f"{source.schema}.{t}" for t in source.tables},
-                known=catalog_mod.read_known_relations(con, dest.pipeline_name),
-                replicated=catalog_mod.seed_from_table_state(con, dest.pipeline_name),
+                known=catalog_mod.read_known_relations(
+                    con, dest.pipeline_name, control_schema=control_schema
+                ),
+                replicated=catalog_mod.seed_from_table_state(
+                    con, dest.pipeline_name, control_schema=control_schema
+                ),
                 # `unmarked`, NOT a recomputation. By here the marking above has put
                 # every unrelatable relation in the owed queue and the blocking
                 # re-snapshot has already rebuilt it from the current source relation.
@@ -456,6 +489,7 @@ def run(
                         for relation in discovered
                     ],
                     detail="a new source relation was discovered by the catalog watcher",
+                    control_schema=control_schema,
                 )
                 summary_extra["discovered_relations"] = [
                     relation.qualified for relation in discovered
@@ -524,13 +558,18 @@ def run(
             con,
             pipeline=dest.pipeline_name,
             state_dir=replication.state_dir / "resnapshot",
+            control_schema=control_schema,
         )
         if interrupted_resnapshot:
             summary_extra["interrupted_resnapshot_requeued"] = interrupted_resnapshot
-        interrupted = dest_mod.promote_interrupted_snapshots(con, dest.pipeline_name)
+        interrupted = dest_mod.promote_interrupted_snapshots(
+            con, dest.pipeline_name, control_schema=control_schema
+        )
         if interrupted:
             summary_extra["interrupted_snapshots_requeued"] = interrupted
-        owed = dest_mod.tables_awaiting_snapshot(con, dest.pipeline_name)
+        owed = dest_mod.tables_awaiting_snapshot(
+            con, dest.pipeline_name, control_schema=control_schema
+        )
         will_snapshot_everything = (
             props["snapshot.mode"] == "always"
             or (
@@ -588,6 +627,7 @@ def run(
                 ownership=ownership,
                 new_relations={relation.qualified for relation in discovered},
                 drop_mode=applier_cfg.drop_mode,
+                control_schema=control_schema,
             )
             summary_extra.update(resnap.as_dict())
             if watcher is not None and discovered:
@@ -653,7 +693,9 @@ def run(
 
         # rubric 1.6: the per-table snapshot watermark, read AFTER any re-snapshot so it
         # carries the image the main stream now has to hand over from.
-        watermarks = resnapshot_mod.read_watermarks(con, dest.pipeline_name)
+        watermarks = resnapshot_mod.read_watermarks(
+            con, dest.pipeline_name, control_schema=control_schema
+        )
         summary_extra["snapshot_watermarks"] = len(watermarks)
 
         # A journalled recovery forces the MAIN engine into a data-reading snapshot even
@@ -722,7 +764,10 @@ def run(
             descriptor_provider=descriptor_provider,
             catalog_flush_exclude=set(
                 baseline_mod.unrebuilt_relations(
-                    con, pipeline=dest.pipeline_name, dataset=dest.dataset_name
+                    con,
+                    pipeline=dest.pipeline_name,
+                    dataset=dest.dataset_name,
+                    control_schema=control_schema,
                 )
             ),
         )

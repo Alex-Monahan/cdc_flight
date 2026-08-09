@@ -58,6 +58,7 @@ class SnapshotCoordinator:
         get_registry,
         epoch: int,
         transactional_ddl: bool,
+        control_schema: str | None = None,
         alerts=None,
         on_swap=None,
     ):
@@ -81,6 +82,7 @@ class SnapshotCoordinator:
         self._get_registry = get_registry
         self.epoch = epoch
         self.transactional_ddl = transactional_ddl
+        self.control_schema = control_schema
         #: Optional callback owned by a bounded re-snapshot.  It runs after the
         #: shadow rename and lifecycle transition but before the surrounding COMMIT,
         #: so discovery audit/refusal discharge cannot get ahead of the image.
@@ -155,6 +157,7 @@ class SnapshotCoordinator:
             source_table=table,
             to=table_lifecycle.IN_PROGRESS,
             reason=f"a snapshot shadow is about to be opened for {key}",
+            control_schema=self.control_schema,
             alerts=self.alerts,
         )
         # A crash mid-snapshot means Debezium re-snapshots from the beginning
@@ -181,6 +184,7 @@ class SnapshotCoordinator:
             target_table=target,
             epoch=self.epoch,
             replace=True,
+            control_schema=self.control_schema,
             alerts=self.alerts,
         )
         self._tables[key] = state
@@ -274,6 +278,7 @@ class SnapshotCoordinator:
             reason=f"the shadow for {key} was swapped in at commit {commit_id}",
             snapshot_lsn=snapshot_lsn,
             last_commit_id=commit_id,
+            control_schema=self.control_schema,
             alerts=self.alerts,
         )
         if swapped and self._on_swap is not None:

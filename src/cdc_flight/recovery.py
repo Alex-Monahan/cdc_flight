@@ -73,7 +73,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import catalog_baseline, table_lifecycle
-from .destination import CONTROL_SCHEMA, now, raise_alert, request_snapshot
+from .config import resolve_control_schema
+from .destination import now, raise_alert, request_snapshot
 from .errors import RecoveryFailed
 from .faults import arrival, maybe_crash
 from .machines import (
@@ -84,6 +85,7 @@ from .machines import (
     RECOVERY_REQUESTED,
     RECOVERY_ROW_DELETED,
 )
+from .naming import control_table
 
 log = logging.getLogger("cdc_flight.recovery")
 
@@ -189,12 +191,19 @@ class Completion:
     reason: str = ""
 
 
-def read(con, *, pipeline: str, namespace: str) -> RecoveryRecord | None:
+def read(
+    con,
+    *,
+    pipeline: str,
+    namespace: str,
+    control_schema: str | None = None,
+) -> RecoveryRecord | None:
     """The recovery this pipeline is in the middle of, or None."""
     rows = con.execute(
         f"SELECT recovery_id, decision, phase, slot_name, offset_path, snapshot_mode, "
         f"       forget_catalog, tables_marked, message, captured_json, state_dir "
-        f"FROM {CONTROL_SCHEMA}.recovery_state WHERE pipeline = ? AND namespace = ?",
+        f"FROM {control_table(resolve_control_schema(control_schema), 'recovery_state')} "
+        "WHERE pipeline = ? AND namespace = ?",
         [pipeline, namespace],
     ).fetchall()
     if not rows:
@@ -232,7 +241,15 @@ def read(con, *, pipeline: str, namespace: str) -> RecoveryRecord | None:
     )
 
 
-def _write_phase(con, *, pipeline: str, namespace: str, phase: str, frm: str) -> None:
+def _write_phase(
+    con,
+    *,
+    pipeline: str,
+    namespace: str,
+    phase: str,
+    frm: str,
+    control_schema: str | None = None,
+) -> None:
     """The ONE writer of `recovery_state.phase`, and it asserts the edge first.
 
     `PHASES` used to be declared and never consumed: `read()` accepted any string and
@@ -243,25 +260,38 @@ def _write_phase(con, *, pipeline: str, namespace: str, phase: str, frm: str) ->
     """
     ACQUISITION_RECOVERY.check(frm, phase)
     con.execute(
-        f"UPDATE {CONTROL_SCHEMA}.recovery_state SET phase = ?, updated_at = ? "
+        f"UPDATE {control_table(resolve_control_schema(control_schema), 'recovery_state')} "
+        "SET phase = ?, updated_at = ? "
         "WHERE pipeline = ? AND namespace = ?",
         [phase, now(), pipeline, namespace],
     )
 
 
-def clear(con, *, pipeline: str, namespace: str) -> None:
+def clear(
+    con,
+    *,
+    pipeline: str,
+    namespace: str,
+    control_schema: str | None = None,
+) -> None:
     """The recovery is done: the tables it owed have been snapshotted.
 
     `armed -> absent` is the ONLY declared edge into `absent`. Clearing from an earlier
     phase would discard the record of a destructive sequence that is still half-done -
     exactly the state the journal exists to name - so a caller that tries is refused.
     """
-    record = read(con, pipeline=pipeline, namespace=namespace)
+    record = read(
+        con,
+        pipeline=pipeline,
+        namespace=namespace,
+        control_schema=control_schema,
+    )
     if record is None:
         return
     ACQUISITION_RECOVERY.check(record.phase, RECOVERY_ABSENT)
     con.execute(
-        f"DELETE FROM {CONTROL_SCHEMA}.recovery_state WHERE pipeline = ? AND namespace = ?",
+        f"DELETE FROM {control_table(resolve_control_schema(control_schema), 'recovery_state')} "
+        "WHERE pipeline = ? AND namespace = ?",
         [pipeline, namespace],
     )
 
@@ -280,6 +310,7 @@ def begin(
     context: dict | None = None,
     state_dir: Path | None = None,
     severity: str = "critical",
+    control_schema: str | None = None,
 ) -> RecoveryRecord:
     """Write the intent, atomically with the to-do list. NOTHING is destroyed here.
 
@@ -291,7 +322,12 @@ def begin(
     Idempotent: an existing journal row for this pipeline is replaced, because a second
     detection of the same unsafe state is the same recovery, not a new one.
     """
-    existing = read(con, pipeline=pipeline, namespace=namespace)
+    existing = read(
+        con,
+        pipeline=pipeline,
+        namespace=namespace,
+        control_schema=control_schema,
+    )
     ACQUISITION_RECOVERY.check(
         existing.phase if existing is not None else RECOVERY_ABSENT, RECOVERY_REQUESTED
     )
@@ -316,6 +352,7 @@ def begin(
             "each table's snapshot is complete and swapped in one transaction."
         ),
         context=(context or {}) | {"recovery_id": record.recovery_id},
+        control_schema=control_schema,
     )
     con.execute("BEGIN TRANSACTION")
     try:
@@ -323,7 +360,12 @@ def begin(
             # `--reset-state` first puts the per-table snapshot bookkeeping (epoch,
             # `snapshot_lsn`, `last_commit_id`) back to nothing, which is what "start
             # over" means for those columns.
-            table_lifecycle.reset_all(con, pipeline=pipeline, reason=f"{decision}: {message}")
+            table_lifecycle.reset_all(
+                con,
+                pipeline=pipeline,
+                reason=f"{decision}: {message}",
+                control_schema=control_schema,
+            )
         # ...and then EVERY captured table is owed a fresh image, reset included.
         #
         # The first cut of the journalled reset stopped at `reset_all()` and recorded
@@ -339,6 +381,7 @@ def begin(
             pipeline=pipeline,
             tables=captured_tables,
             detail=f"{decision}: {message}",
+            control_schema=control_schema,
         )
         record.tables_marked = marked
         if forget_catalog:
@@ -351,7 +394,8 @@ def begin(
             # keep the same `system_identifier`, rewind WAL, change the timeline and
             # still hand back different relation oids (Codex M1).
             con.execute(
-                f"DELETE FROM {CONTROL_SCHEMA}.source_relations WHERE pipeline = ?",
+                f"DELETE FROM {control_table(resolve_control_schema(control_schema), 'source_relations')} "
+                "WHERE pipeline = ?",
                 [pipeline],
             )
             # The CLAIM about that registry goes with it, in the same transaction
@@ -359,14 +403,17 @@ def begin(
             # that no longer exists would be worse than no mark: it would make the next
             # run reconcile the *replacement* registry against relations this recovery
             # has already marked for rebuild.
-            catalog_baseline.forget(con, pipeline)
+            catalog_baseline.forget(
+                con, pipeline, control_schema=control_schema
+            )
         con.execute(
-            f"DELETE FROM {CONTROL_SCHEMA}.recovery_state WHERE pipeline = ? "
+            f"DELETE FROM {control_table(resolve_control_schema(control_schema), 'recovery_state')} "
+            "WHERE pipeline = ? "
             "AND namespace = ?",
             [pipeline, namespace],
         )
         con.execute(
-            f"INSERT INTO {CONTROL_SCHEMA}.recovery_state "
+            f"INSERT INTO {control_table(resolve_control_schema(control_schema), 'recovery_state')} "
             "(pipeline, namespace, recovery_id, decision, phase, slot_name, "
             " offset_path, snapshot_mode, forget_catalog, tables_marked, message, "
             " captured_json, state_dir, requested_at, updated_at) "
@@ -403,6 +450,7 @@ def resume(
     dsn: str,
     drop_slot=None,
     on_phase=None,
+    control_schema: str | None = None,
 ) -> dict:
     """Run the recovery forward from whatever phase the journal records. Idempotent.
 
@@ -456,12 +504,14 @@ def resume(
         _write_phase(
             con, pipeline=pipeline, namespace=namespace,
             phase=PHASE_FILE_DELETED, frm=PHASE_REQUESTED,
+            control_schema=control_schema,
         )
         record.phase = PHASE_FILE_DELETED
 
     if record.phase == PHASE_FILE_DELETED:
         con.execute(
-            f"DELETE FROM {CONTROL_SCHEMA}.debezium_offsets WHERE pipeline = ? "
+            f"DELETE FROM {control_table(resolve_control_schema(control_schema), 'debezium_offsets')} "
+            "WHERE pipeline = ? "
             "AND namespace = ?",
             [pipeline, namespace],
         )
@@ -473,6 +523,7 @@ def resume(
         _write_phase(
             con, pipeline=pipeline, namespace=namespace,
             phase=PHASE_ROW_DELETED, frm=PHASE_FILE_DELETED,
+            control_schema=control_schema,
         )
         record.phase = PHASE_ROW_DELETED
 
@@ -490,6 +541,7 @@ def resume(
         _write_phase(
             con, pipeline=pipeline, namespace=namespace,
             phase=PHASE_ARMED, frm=PHASE_ROW_DELETED,
+            control_schema=control_schema,
         )
         record.phase = PHASE_ARMED
 
@@ -517,6 +569,7 @@ def complete_if_ready(
     namespace: str,
     record: RecoveryRecord,
     verified_empty: list[str] | tuple[str, ...] = (),
+    control_schema: str | None = None,
 ) -> Completion:
     """Has the rebuild this journal demanded actually happened? Clear it if so.
 
@@ -536,7 +589,9 @@ def complete_if_ready(
     The caller gets a typed result; `pipeline.run()` turns "not cleared" into a
     non-successful run.
     """
-    states = table_lifecycle.read_all(con, pipeline)
+    states = table_lifecycle.read_all(
+        con, pipeline, control_schema=control_schema
+    )
     #: The captured set the JOURNAL recorded, falling back to everything the pipeline
     #: currently knows about for journals written before the column existed.
     obligation = list(record.captured) or sorted(states)
@@ -552,7 +607,7 @@ def complete_if_ready(
     )
     has_resume = bool(
         con.execute(
-            f"SELECT 1 FROM {CONTROL_SCHEMA}.debezium_offsets "
+            f"SELECT 1 FROM {control_table(resolve_control_schema(control_schema), 'debezium_offsets')} "
             "WHERE pipeline = ? AND namespace = ?",
             [pipeline, namespace],
         ).fetchall()
@@ -596,7 +651,12 @@ def complete_if_ready(
             has_resume_point=has_resume,
             reason=reason,
         )
-    clear(con, pipeline=pipeline, namespace=namespace)
+    clear(
+        con,
+        pipeline=pipeline,
+        namespace=namespace,
+        control_schema=control_schema,
+    )
     handoff = (
         "the destination has a resume point again" if has_resume
         else "every captured relation was PROVEN empty at the source, so there is no "

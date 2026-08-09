@@ -17,8 +17,9 @@ import os
 from . import destination as dest_mod
 from . import reconcile as reconcile_mod
 from . import recovery as recovery_mod
-from .destination import CONTROL_SCHEMA
+from .config import resolve_control_schema
 from .machines import PHASE_RECOVERING
+from .naming import control_table
 
 log = logging.getLogger("cdc_flight.acquisition")
 
@@ -37,7 +38,9 @@ def resnapshot_enabled() -> bool:
     )
 
 
-def captured_tables(con, pipeline: str, source, replication) -> list[tuple[str, str, str]]:
+def captured_tables(
+    con, pipeline: str, source, replication, *, control_schema: str | None = None
+) -> list[tuple[str, str, str]]:
     """`(schema, table, target)` for every table this pipeline captures.
 
     Built from the *configuration*, not from `table_state`: a recovery has to be able to
@@ -51,7 +54,8 @@ def captured_tables(con, pipeline: str, source, replication) -> list[tuple[str, 
         f"{schema}.{table}": target
         for schema, table, target in con.execute(
             f"SELECT source_schema, source_table, target_table FROM "
-            f"{CONTROL_SCHEMA}.table_state WHERE pipeline = ?",
+            f"{control_table(resolve_control_schema(control_schema), 'table_state')} "
+            "WHERE pipeline = ?",
             [pipeline],
         ).fetchall()
     }
@@ -80,7 +84,10 @@ def resume_any_journalled_recovery(
     exact durable shape - no resume row, maybe no slot - that the slot check reads as a
     brand-new problem.
     """
-    record = recovery_mod.read(con, pipeline=dest.pipeline_name, namespace=namespace)
+    record = recovery_mod.read(
+        con, pipeline=dest.pipeline_name, namespace=namespace,
+        control_schema=dest.control_schema,
+    )
     if record is None:
         return None, None
     if phases is not None:
@@ -109,6 +116,7 @@ def resume_any_journalled_recovery(
         namespace=namespace,
         record=record,
         dsn=source.dsn,
+        control_schema=dest.control_schema,
     )
     return record, result
 
@@ -123,20 +131,27 @@ def check_the_slot(
     detectable at all on the *next* run (`_cdc_flight.slot_state`).
     """
     durable = con.execute(
-        f"SELECT last_lsn FROM {CONTROL_SCHEMA}.debezium_offsets "
+        f"SELECT last_lsn FROM "
+        f"{control_table(dest.control_schema, 'debezium_offsets')} "
         "WHERE pipeline = ? AND namespace = ?",
         [dest.pipeline_name, namespace],
     ).fetchall()
     durable_lsn = int(durable[0][0]) if durable else None
     observation = reconcile_mod.observe_slot(source.dsn, replication.slot_name)
-    previous = dest_mod.read_slot_state(con, dest.pipeline_name, replication.slot_name)
+    previous = dest_mod.read_slot_state(
+        con, dest.pipeline_name, replication.slot_name,
+        control_schema=dest.control_schema,
+    )
     # What the destination actually holds, not what a control row says about it. The
     # `no_durable_destination_row` cell is defined as "destination EMPTY, slot
     # positioned" and used to be decided without ever looking (Opus BLOCKER-2). Only
     # read when there is no resume point, because that is the only cell it decides and
     # counting every captured table on every start-up is not free.
     destination_rows = (
-        dest_mod.destination_holds_rows(con, dataset=dest.dataset_name, tables=captured)
+        dest_mod.destination_holds_rows(
+            con, dataset=dest.dataset_name, tables=captured,
+            control_schema=dest.control_schema,
+        )
         if durable_lsn is None
         else None
     )
@@ -156,6 +171,7 @@ def check_the_slot(
         dest_mod.raise_alert(
             con, pipeline=dest.pipeline_name, severity="critical",
             code=verdict.decision, message=verdict.message, context=verdict.as_dict(),
+            control_schema=dest.control_schema,
         )
     if verdict.resnapshot and orphan_file and verdict.decision == "no_durable_destination_row":
         # The one place a re-snapshot is NOT the right automatic answer, and the reason
@@ -186,6 +202,7 @@ def check_the_slot(
                 con, pipeline=dest.pipeline_name, severity="critical",
                 code=verdict.decision, message=verdict.message,
                 context=verdict.as_dict(),
+                control_schema=dest.control_schema,
             )
             raise reconcile_mod.SlotAheadOfDestination(
                 f"{verdict.decision}: {verdict.message}. CDC_RESNAPSHOT=0, so the "
@@ -201,6 +218,7 @@ def check_the_slot(
             verdict=verdict,
             captured_tables=captured,
             forget_catalog=verdict.decision in reconcile_mod.FORGET_CATALOG_DECISIONS,
+            control_schema=dest.control_schema,
         )
     if observation.observable:
         recorded = observation.as_dict() | {"durable_lsn": durable_lsn}
@@ -222,6 +240,7 @@ def check_the_slot(
             # `last_run.json` on whichever host ran.
             verdict=verdict.decision,
             verdict_message=verdict.message or None,
+            control_schema=dest.control_schema,
         )
     return verdict, recovery
 
@@ -271,6 +290,7 @@ def journal_the_reset(
         forget_catalog=True,
         state_dir=replication.state_dir,
         severity="warning",
+        control_schema=dest.control_schema,
     )
     result = recovery_mod.resume(
         con,
@@ -278,6 +298,7 @@ def journal_the_reset(
         namespace=namespace,
         record=record,
         dsn=source.dsn,
+        control_schema=dest.control_schema,
     )
     log.info("--reset-state is journalled and armed: %s", result)
     return result

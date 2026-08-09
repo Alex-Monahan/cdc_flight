@@ -11,6 +11,7 @@ import duckdb
 
 from .config import DestinationConfig, motherduck_token
 from .destination import DUCKDB_CONNECT_CONFIG
+from .naming import control_table
 
 
 def connect(dest: DestinationConfig) -> duckdb.DuckDBPyConnection:
@@ -38,7 +39,8 @@ def _report_incomplete_tables(con, dest: DestinationConfig) -> None:
     try:
         rows = con.execute(
             "SELECT pipeline, source_schema, source_table, target_table "
-            "FROM _cdc_flight.table_state WHERE snapshot_state = 'awaiting_snapshot' "
+            f"FROM {control_table(dest.control_schema, 'table_state')} "
+            "WHERE snapshot_state = 'awaiting_snapshot' "
             "ORDER BY 1, 2, 3"
         ).fetchall()
     except Exception:  # pragma: no cover - a destination with no control schema yet

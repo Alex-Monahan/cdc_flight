@@ -24,7 +24,7 @@ def discovery_scenario(sandbox):
         # watcher must hand the running engine through the existing re-snapshot path;
         # a second `box.run()` would only prove restart-time discovery.
         proc = box.spawn(max_seconds=300, idle_seconds=60)
-        time.sleep(3)
+        box.wait_for_slot_active(process=proc)
         box.sql(
             [
                 "CREATE TABLE app.discovered_rows (id bigint PRIMARY KEY, value text)",

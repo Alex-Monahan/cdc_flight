@@ -15,6 +15,7 @@ def flush_table_events(applier, commit_id: int) -> None:
             pipeline=applier.pipeline,
             commit_id=commit_id,
             seq=applier.group.next_table_event_seq(),
+            control_schema=applier.control_schema,
             **marker,
         )
     applier.group.table_events = []

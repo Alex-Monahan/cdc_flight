@@ -16,7 +16,10 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+import uuid
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -48,8 +51,14 @@ sys.path.insert(0, str(PROJECT_DIR / "src"))
 # drivers; the repository's top-level conftest adds `tests/` to `sys.path`.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cdc_flight.config import DestinationConfig, ReplicationConfig, SourceConfig
+from cdc_flight.config import (
+    DestinationConfig,
+    ReplicationConfig,
+    SourceConfig,
+    motherduck_token,
+)
 from support import postgres_test_instance
+from support.motherduck_probe import _drop_database, _drop_schema, create_database
 
 POSTGRES_TEST_INSTANCE = postgres_test_instance.INSTANCE
 PG_SH = POSTGRES_TEST_INSTANCE.pg_sh
@@ -312,6 +321,64 @@ def duck(cdc_env: dict[str, str]):
 
 
 # --------------------------------------------------------------------------- #
+# MotherDuck state
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class MotherDuckWorker:
+    """One cloud database owned by one pytest worker for the whole session."""
+
+    token: str
+    database: str
+    worker_id: str
+
+
+def _motherduck_worker_id() -> str:
+    raw = os.environ.get("PYTEST_XDIST_WORKER", "serial")
+    return re.sub(r"[^a-z0-9_]", "_", raw.lower()).strip("_") or "serial"
+
+
+@pytest.fixture(scope="session")
+def motherduck_worker() -> Iterator[MotherDuckWorker]:
+    """Create exactly one clearly named MotherDuck database per xdist worker."""
+
+    token = motherduck_token()
+    if not token:
+        pytest.skip("`motherduck_token` not set")
+    worker_id = _motherduck_worker_id()
+    database = (
+        f"cdc_flight_md_{TEST_INSTANCE_ID}_{worker_id}_{uuid.uuid4().hex[:10]}"
+    )
+    create_database(token, database)
+    try:
+        yield MotherDuckWorker(token, database, worker_id)
+    finally:
+        _drop_database(token, database)
+
+
+@pytest.fixture
+def motherduck_case(motherduck_worker: MotherDuckWorker) -> Iterator[dict[str, str]]:
+    """Give one test a unique schema inside its worker-owned database."""
+
+    suffix = uuid.uuid4().hex[:10]
+    control_schema = f"_cdc_flight_{motherduck_worker.worker_id}_{suffix}"
+    dataset = f"cdc_md_{motherduck_worker.worker_id}_{suffix}"
+    try:
+        yield {
+            "token": motherduck_worker.token,
+            "database": motherduck_worker.database,
+            "worker_id": motherduck_worker.worker_id,
+            "control_schema": control_schema,
+            "dataset": dataset,
+        }
+    finally:
+        _drop_schema(
+            motherduck_worker.token,
+            motherduck_worker.database,
+            control_schema,
+        )
+
+
+# --------------------------------------------------------------------------- #
 # module-scoped sandbox (used by the rubric gap suites under tests/<item>_*/)
 # --------------------------------------------------------------------------- #
 class Sandbox:
@@ -391,6 +458,43 @@ class Sandbox:
     def pg_query(self, stmt: str, params: tuple | None = None) -> list[tuple]:
         with psycopg.connect(self.source.dsn, autocommit=True) as conn:
             return conn.execute(stmt, params).fetchall()
+
+    def wait_for_slot_active(
+        self,
+        *,
+        process: subprocess.Popen | None = None,
+        timeout: float = 30.0,
+        poll_seconds: float = 0.1,
+    ) -> None:
+        """Wait until this sandbox's live pipeline owns its replication slot.
+
+        A live-discovery scenario must issue its DDL after the main engine has
+        connected; otherwise the same assertions could accidentally exercise
+        restart-time discovery.  Polling ``pg_replication_slots.active`` is the
+        predicate that proves that condition.  The catalog watcher is started
+        before the engine in the pipeline, and the scenario separately waits for
+        its throwaway snapshot slot to start and retire, so this replaces only
+        the old arbitrary startup sleep.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            if process is not None and process.poll() is not None:
+                raise AssertionError(
+                    "live-discovery pipeline exited before its main replication slot "
+                    f"became active (returncode={process.returncode})"
+                )
+            if self.pg_query(
+                "SELECT 1 FROM pg_replication_slots "
+                "WHERE slot_name = %s AND active",
+                (self.slot,),
+            ):
+                return
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"replication slot {self.slot!r} did not become active within "
+                    f"{timeout:.1f}s"
+                )
+            time.sleep(poll_seconds)
 
     # -- pipeline ----------------------------------------------------------- #
     def run(self, *, extra_env: dict[str, str] | None = None, **kwargs) -> dict:

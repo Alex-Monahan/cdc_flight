@@ -47,6 +47,13 @@ export PGDATABASE = $(CDC_TEST_PGDATABASE)
 export ARROW_DEFAULT_MEMORY_POOL ?= system
 PYTEST_WORKERS ?= 12
 PYTEST_XDIST_ARGS ?= -n $(PYTEST_WORKERS) --dist=loadscope --max-worker-restart=0
+# The slow lane contains real crash/snapshot timing proofs and heavy DuckDB/JPype
+# subprocesses. Six workers keeps those timing proofs isolated.
+PYTEST_SLOW_WORKERS ?= 6
+PYTEST_SLOW_XDIST_ARGS ?= -n $(PYTEST_SLOW_WORKERS) --dist=loadscope --max-worker-restart=0
+# MotherDuck uses one database per worker and a unique control schema per test.
+PYTEST_MD_WORKERS ?= 8
+PYTEST_MD_XDIST_ARGS ?= -n $(PYTEST_MD_WORKERS) --dist=load --max-worker-restart=0
 
 .DEFAULT_GOAL := help
 
@@ -144,11 +151,11 @@ test-md: ## run only the MotherDuck tests
 		echo "ERROR: make test-md requires motherduck_token or MOTHERDUCK_TOKEN" >&2; \
 		exit 2; \
 	}
-	$(UV) run pytest -m motherduck --durations=20
+	$(UV) run pytest $(PYTEST_MD_XDIST_ARGS) -m motherduck --durations=20
 
 .PHONY: test-slow
 test-slow: ## run only the slow fault-injection tests (real SIGKILL, big loads)
-	$(UV) run pytest -m "slow and not motherduck" --durations=20
+	$(UV) run pytest $(PYTEST_SLOW_XDIST_ARGS) -m "slow and not motherduck" --durations=20
 
 .PHONY: lint
 lint: ## ruff

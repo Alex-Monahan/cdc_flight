@@ -30,11 +30,9 @@ import duckdb
 import pytest
 
 from cdc_flight.config import motherduck_token
-from cdc_flight.destination import DUCKDB_CONNECT_CONFIG
 
 pytestmark = [pytest.mark.motherduck, pytest.mark.e2e]
 
-MD_DATABASE = "cdc_flight_dev"
 REFRESH = "FORCE CHECKPOINT"
 N = 20
 #: (anchor, tag). Two anchors, not seven: each is a crash plus a recovery run
@@ -50,22 +48,19 @@ def md_token() -> str:
     return token
 
 
-@pytest.fixture(scope="module")
-def md_crashed(sandbox, md_token) -> dict:
+@pytest.fixture
+def md_crashed(sandbox, md_token, motherduck_case) -> dict:
+    database = motherduck_case["database"]
     dataset = f"cdc_fault_{uuid.uuid4().hex[:8]}"
-    dsn = f"md:{MD_DATABASE}?motherduck_token={md_token}"
+    control_schema = motherduck_case["control_schema"]
+    dsn = f"md:{database}?motherduck_token={md_token}"
     env = {
         "CDC_DATASET": dataset,
-        "CDC_MD_DATABASE": MD_DATABASE,
+        "CDC_MD_DATABASE": database,
+        "CDC_CONTROL_SCHEMA": control_schema,
         "MOTHERDUCK_TOKEN": md_token,
         "motherduck_token": md_token,
     }
-
-    bootstrap = duckdb.connect(
-        f"md:?motherduck_token={md_token}", config=DUCKDB_CONNECT_CONFIG
-    )
-    bootstrap.execute(f'CREATE DATABASE IF NOT EXISTS "{MD_DATABASE}"')
-    bootstrap.close()
 
     sandbox.reseed()
     sandbox.run(
@@ -95,12 +90,18 @@ def md_crashed(sandbox, md_token) -> dict:
         )
         results[anchor] = {"crashed": crashed, "recovered": recovered, "tag": tag}
 
-    con = duckdb.connect(dsn, config=DUCKDB_CONNECT_CONFIG)
+    con = duckdb.connect(dsn)
     con.execute(REFRESH)
     try:
-        yield {"con": con, "dataset": dataset, "results": results, "n": N}
+        yield {
+            "con": con,
+            "database": database,
+            "control_schema": control_schema,
+            "dataset": dataset,
+            "results": results,
+            "n": N,
+        }
     finally:
-        con.execute(f'DROP SCHEMA IF EXISTS "{MD_DATABASE}"."{dataset}" CASCADE')
         con.close()
 
 

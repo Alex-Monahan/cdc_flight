@@ -60,7 +60,7 @@ import threading
 import time
 from contextlib import contextmanager
 
-from .control_schema import CONTROL_SCHEMA
+from .config import resolve_control_schema
 from .machines import (
     CONNECTION_RETIREMENT,
     OUTCOME_FAILURES,
@@ -70,6 +70,7 @@ from .machines import (
     RUN_OUTCOME,
     RUN_PHASE,
 )
+from .naming import control_table
 from .retirement import retire_handle
 from .states import IllegalTransition
 
@@ -306,10 +307,12 @@ class RunPhaseWriter:
     RETIRE_TIMEOUT = 2.0
 
     def __init__(
-        self, con, *, pipeline: str, runner_id: str, outcome: RunOutcome | None = None
+        self, con, *, pipeline: str, runner_id: str, outcome: RunOutcome | None = None,
+        control_schema: str | None = None,
     ) -> None:
         self.pipeline = pipeline
         self.runner_id = runner_id
+        self.control_schema = resolve_control_schema(control_schema)
         self.phase = PHASE_STARTING
         #: The run's ONE outcome. `pipeline.run()` hands the same object to
         #: `supervisor.run_engine_bounded`, so `last_run.json`'s `stop_reason` and the
@@ -542,12 +545,12 @@ class RunPhaseWriter:
             stamp = now()
             if insert:
                 self._sink.execute(
-                    f"DELETE FROM {CONTROL_SCHEMA}.heartbeat "
+                    f"DELETE FROM {control_table(self.control_schema, 'heartbeat')} "
                     "WHERE pipeline = ? AND runner_id = ?",
                     [self.pipeline, self.runner_id],
                 )
                 self._sink.execute(
-                    f"INSERT INTO {CONTROL_SCHEMA}.heartbeat "
+                    f"INSERT INTO {control_table(self.control_schema, 'heartbeat')} "
                     "(pipeline, runner_id, beat_at, phase, phase_since, "
                     " terminal_reason, phase_history) VALUES (?,?,?,?,?,?,?)",
                     [
@@ -560,7 +563,8 @@ class RunPhaseWriter:
             if not self._row:  # the INSERT failed; do not silently write nothing
                 return
             self._sink.execute(
-                f"UPDATE {CONTROL_SCHEMA}.heartbeat SET phase = ?, phase_since = ?, "
+                f"UPDATE {control_table(self.control_schema, 'heartbeat')} "
+                "SET phase = ?, phase_since = ?, "
                 "beat_at = ?, terminal_reason = ?, phase_history = ? "
                 "WHERE pipeline = ? AND runner_id = ?",
                 [
