@@ -764,6 +764,40 @@ INTERACTING_MACHINE_PAIRS = (
 )
 
 
+# Physical-row attribution is a declared product of the RowPatch, spill, toast,
+# recovery, identity, and schema-fence owners.  These are decision domains rather
+# than additional durable machines: a physical row does not persist an independent
+# seven-axis state record.  ``physical_row_matrix`` derives its cells from these
+# declarations and calls the owning gates for every feasible combination.
+PHYSICAL_ROW_OPERATIONS = Domain(
+    "physical_row_operations", values=("insert", "update", "delete", "key_move")
+)
+PHYSICAL_ROW_FIELD_STATES = Domain(
+    # Keep the declaration available to the standalone runtime-state helper,
+    # which intentionally copies only ``states.py`` and ``machines.py``.  The
+    # physical-row executor converts these names to the canonical FieldState
+    # enum when it exercises a cell.
+    "physical_row_field_states",
+    values=("value", "explicit_null", "unchanged_toast", "absent"),
+)
+PHYSICAL_ROW_BASE_STATES = Domain(
+    "physical_row_base_states", values=("start", "in_group", "missing")
+)
+PHYSICAL_ROW_STORAGE = Domain(
+    "physical_row_storage", values=("memory", "spill")
+)
+PHYSICAL_ROW_OUTCOMES = Domain(
+    "physical_row_outcomes",
+    values=("commit", "ambiguous_delete", "toast_base_missing", "schema_refusal", "swap_fault"),
+)
+PHYSICAL_ROW_IDENTITIES = Domain(
+    "physical_row_identities", values=("keyed", "keyless")
+)
+PHYSICAL_ROW_SCHEMA_EPOCHS = Domain(
+    "physical_row_schema_epochs", values=("pre", "post", "mixed")
+)
+
+
 def declared_machines() -> dict[str, Machine]:
     """Return only this module's system declarations.
 

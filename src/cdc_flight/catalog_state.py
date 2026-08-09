@@ -58,6 +58,9 @@ class SourceRelation:
     publication_all_tables: bool = False
     is_partition: bool = False
     admission_state: str | _AdmissionStateUnset | None = _ADMISSION_STATE_UNSET
+    #: Source LSN boundary after which residual TOAST events were generated under
+    #: verified REPLICA IDENTITY FULL.
+    full_activation_lsn: int | None = None
 
     def __post_init__(self) -> None:
         state = self.admission_state
@@ -79,6 +82,7 @@ class SourceRelation:
             self.qualified,
             self.columns,
             replica_identity=self.replica_identity,
+            full_activation_lsn=self.full_activation_lsn,
         )
 
 
@@ -185,7 +189,7 @@ def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
     rows = con.execute(
         f"SELECT source_schema, source_table, relation_oid, relation_filenode, "
         "relation_type_oid, "
-        "published, replica_identity, columns_json, admission_state "
+        "published, replica_identity, full_activation_lsn, columns_json, admission_state "
         f"FROM {CONTROL_SCHEMA}.source_relations WHERE pipeline = ?",
         [pipeline],
     ).fetchall()
@@ -198,6 +202,7 @@ def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
         relation_type_oid,
         published,
         identity,
+        full_activation_lsn,
         columns_json,
         admission_state,
     ) in rows:
@@ -245,6 +250,9 @@ def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
             # This is a durable read, so NULL must reach the machine boundary and be
             # refused; it is not an observation that may derive a default from `published`.
             admission_state=admission_state,
+            full_activation_lsn=(
+                int(full_activation_lsn) if full_activation_lsn is not None else None
+            ),
         )
     return known
 

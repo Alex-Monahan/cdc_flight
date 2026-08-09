@@ -53,6 +53,7 @@ after the change.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -142,6 +143,11 @@ class TableWork:
     #: identity key -> the rows that currently wear it, in source order. See the
     #: module docstring: this is the whole fold.
     live: dict[tuple, list] = field(default_factory=dict)
+    #: Fold token -> raw source key and the descriptor epoch that emitted it.
+    #: Fingerprinting the token keeps an int4 key and an int8 key with the same
+    #: rendered value from sharing one physical-row slot during a migration.
+    key_values: dict[tuple, tuple] = field(default_factory=dict)
+    key_descriptors: dict[tuple, dict[str, Any]] = field(default_factory=dict)
     #: keys currently holding two or more CONCRETE rows. Never legal at a source
     #: transaction boundary, so `end_transaction` refuses on it.
     multi: set[tuple] = field(default_factory=set)
@@ -174,6 +180,9 @@ class TableWork:
     #: (Codex 5).
     source_schema: str | None = None
     source_table: str | None = None
+    #: Production path is native-only. The compatibility dispatcher is retained
+    #: solely for explicit migration/unit callers.
+    allow_legacy_inference: bool = False
     #: A DELETE makes a key unavailable for a later sparse UPDATE in the same source
     #: transaction.  A following INSERT clears the tombstone and is a legal physical
     #: key reuse; an UPDATE must never silently reuse the destination's START row.
@@ -181,7 +190,8 @@ class TableWork:
 
 
 def work_for(
-    work: dict[str, TableWork], target: str, event: PendingRecord, snapshot: bool
+    work: dict[str, TableWork], target: str, event: PendingRecord, snapshot: bool,
+    *, allow_legacy_inference: bool = False,
 ) -> TableWork:
     """The `TableWork` for `target`, created on first sight.
 
@@ -195,7 +205,11 @@ def work_for(
     """
     item = work.get(target)
     if item is None:
-        item = TableWork(target=target, snapshot=snapshot)
+        item = TableWork(
+            target=target,
+            snapshot=snapshot,
+            allow_legacy_inference=allow_legacy_inference,
+        )
         work[target] = item
     if item.source_schema is None and event.schema:
         item.source_schema = event.schema
@@ -209,6 +223,49 @@ def work_for(
             else (CDCF_EVENT_ID,)
         )
     return item
+
+
+def _key_token(
+    item: TableWork,
+    values: tuple,
+    descriptors: dict[str, Any] | None,
+    *,
+    update_native: bool = True,
+) -> tuple:
+    descriptors = descriptors or {}
+    token: list[str] = []
+    resolved_descriptors: dict[str, Any] = {}
+    for column, value in zip(item.key_columns, values, strict=True):
+        descriptor = descriptors.get(column) or item.descriptors.get(column)
+        if descriptor is not None:
+            resolved_descriptors[column] = descriptor
+            fingerprint = descriptor.fingerprint
+        else:
+            fingerprint = "legacy"
+        try:
+            rendered = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+        except (TypeError, ValueError):
+            rendered = repr(value)
+        token.append(f"{fingerprint}:{rendered}")
+        if update_native and descriptor is not None and (
+            column not in item.native_columns or column in item.key_columns
+        ):
+            from .typed_types import native_type
+
+            item.descriptors[column] = descriptor
+            item.native_columns[column] = native_type(
+                descriptor, for_key=column in item.key_columns
+            )
+            item.native_fingerprints[column] = descriptor.fingerprint
+            item.columns[column] = item.native_columns[column].sql
+    result = tuple(token)
+    item.key_values[result] = tuple(values)
+    item.key_descriptors[result] = resolved_descriptors
+    return result
+
+
+def _raw_key(item: TableWork, key: tuple) -> tuple:
+    return getattr(item, "key_values", {}).get(key, key)
 
 
 def row_for(
@@ -306,8 +363,22 @@ def collect(
         item.live[(event_id,)] = [patch.encoded_values()]
         return
 
-    key = tuple(event.key[k] for k in event.key)
+    current_values = tuple(
+        (event.key or {}).get(column) for column in item.key_columns
+    )
+    current_descriptors = dict(event.after_descriptors or {})
+    current_descriptors.update(event.key_descriptors or {})
+    key = _key_token(item, current_values, current_descriptors)
     if event.op == "d":
+        before_values = tuple(
+            (event.before or {}).get(column) for column in item.key_columns
+        )
+        key = _key_token(
+            item,
+            before_values,
+            event.before_descriptors,
+            update_native=False,
+        )
         _remove(
             item,
             key,
@@ -326,7 +397,13 @@ def collect(
         # under it would otherwise be re-inserted and the destination would hold the
         # row twice.
         if event.before and all(k in event.before for k in event.key):
-            old = tuple(event.before[k] for k in event.key)
+            old_values = tuple(event.before.get(column) for column in item.key_columns)
+            old = _key_token(
+                item,
+                old_values,
+                event.before_descriptors,
+                update_native=False,
+            )
             if old != key:
                 removed = _remove(
                     item,
@@ -530,6 +607,21 @@ def _target_entry(
         return 0
     image = _distinguishing(item, before, descriptors=descriptors, typed=typed)
     concrete = _concrete(entries)
+    descriptor_map = descriptors or {}
+    collapsed_variant_null = any(
+        _variant_null_value(value, descriptor_map.get(column) or item.descriptors.get(column))
+        for column, value in (before or {}).items()
+        if naming.normalize(column) not in item.key_columns
+    )
+    if collapsed_variant_null and concrete >= 1:
+        raise _unattributable(
+            item,
+            key,
+            entries,
+            before,
+            what,
+            "the runtime collapses SQL NULL and JSONB root null into one null value",
+        )
     if not image:
         # Nothing in the before-image separates the candidates. That is only ever the
         # case under `REPLICA IDENTITY DEFAULT` (or a fully TOASTed row), and a
@@ -553,6 +645,16 @@ def _target_entry(
                 return index
         return matched[0]
     raise _unattributable(item, key, entries, before, what, "no candidate matches")
+
+
+def _variant_null_value(value, descriptor) -> bool:
+    if descriptor is None or str(descriptor.kind).lower() != "jsonb":
+        return False
+    from .typed_types import JsonbNull
+
+    return value is None or isinstance(value, JsonbNull) or (
+        isinstance(value, str) and value.strip().lower() == "null"
+    )
 
 
 def _resolve_start(item, key, entries: list, probe) -> None:
@@ -700,6 +802,14 @@ def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
             refused.target = refused.target or item.target
             raise
     else:
+        if not item.allow_legacy_inference:
+            raise SchemaEvolutionRefused(
+                f"{item.target}: catalog-authoritative descriptors are incomplete; "
+                "the production typed path cannot enter legacy value inference",
+                source_schema=item.source_schema,
+                source_table=item.source_table,
+                target=item.target,
+            )
         table, created = registry.ensure(
             item.target, columns=columns, key_columns=item.key_columns
         )
@@ -728,7 +838,7 @@ def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
         keys = [
             tuple(
                 _key_value(table, col, value)
-                for col, value in zip(item.key_columns, key, strict=False)
+                for col, value in zip(item.key_columns, _raw_key(item, key), strict=False)
             )
             for key in delete_keys
         ]
@@ -739,16 +849,18 @@ def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
     for key, patch in partial_updates:
         source_key = tuple(
             _key_value(table, column, value)
-            for column, value in zip(item.key_columns, key, strict=False)
+            for column, value in zip(item.key_columns, _raw_key(item, key), strict=False)
         )
         updates.append((source_key, patch.bindable_values()))
     for move in moves:
         assignments = move.patch.bindable_values()
-        for column, value in zip(item.key_columns, move.target_key, strict=False):
+        target_key = _raw_key(item, move.target_key)
+        source_key_values = _raw_key(item, move.source_key)
+        for column, value in zip(item.key_columns, target_key, strict=False):
             assignments[column] = value
         source_key = tuple(
             _key_value(table, column, value)
-            for column, value in zip(item.key_columns, move.source_key, strict=False)
+            for column, value in zip(item.key_columns, source_key_values, strict=False)
         )
         updates.append((source_key, assignments))
     if updates:
@@ -806,7 +918,14 @@ def _typed_value(table, column: str, value):
     source = table.source_descriptors.get(column)
     if native is None or source is None:
         return value
-    if native.kind in {"UNION", "NUMERIC_UNION"}:
+    if native.kind == "NUMERIC_UNION":
+        from .typed_types import encode_value
+
+        encoded = encode_value(value, source)
+        if encoded is None:
+            return None
+        return encoded
+    if native.kind == "UNION":
         member = union_member_name(source) if native.kind == "UNION" else "finite"
         if isinstance(value, UnionValue) and value.member == member:
             return value
@@ -821,6 +940,12 @@ def _typed_value(table, column: str, value):
 def _key_value(table, column: str, value):
     """Encode a key using the same source descriptor as the row path."""
     from .typed_types import UnionValue, encode_value, union_member_name
+
+    if table.internal_identity:
+        # Source keys are resolved to the deterministic cdcf_internal_id by
+        # apply_sql. Keeping the source value raw here lets that resolver try the
+        # descriptor that emitted the old UNION member as well as the current one.
+        return value
 
     native = table.native_types.get(column)
     source = table.source_descriptors.get(column)

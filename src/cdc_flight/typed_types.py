@@ -408,8 +408,17 @@ class TypedImage:
         return cls(tuple((str(name), FieldValue.from_dict(item)) for name, item in raw.items()))
 
 
-def native_type(source: SourceTypeDescriptor | NativeType) -> NativeType:
-    """Resolve one source descriptor recursively, or return an existing native type."""
+def native_type(
+    source: SourceTypeDescriptor | NativeType, *, for_key: bool = False
+) -> NativeType:
+    """Resolve one source descriptor recursively.
+
+    ``for_key`` is the one destination-independent identity decision.  PostgreSQL
+    JSONB values use VARIANT for ordinary columns, while a JSONB source key uses
+    JSON because DuckDB does not permit VARIANT in an index key.  The source
+    descriptor remains JSONB in both cases, so this is a representation choice,
+    not a type inference or a lossy fallback.
+    """
 
     if isinstance(source, NativeType):
         return source
@@ -418,7 +427,7 @@ def native_type(source: SourceTypeDescriptor | NativeType) -> NativeType:
     if kind == "domain":
         if descriptor.domain_base is None:
             raise UnsupportedType(f"domain {descriptor.qualified_name} has no base descriptor")
-        base = native_type(descriptor.domain_base)
+        base = native_type(descriptor.domain_base, for_key=for_key)
         return NativeType(base.kind, base.sql, descriptor, base.children, base.fields, base.members, base.key, base.value, base.indexable)
     if kind in {"smallint", "int2", "smallserial"}:
         return NativeType("SMALLINT", "SMALLINT", descriptor)
@@ -472,6 +481,8 @@ def native_type(source: SourceTypeDescriptor | NativeType) -> NativeType:
     if kind == "json":
         return NativeType("JSON", "JSON", descriptor)
     if kind == "jsonb":
+        if for_key:
+            return NativeType("JSON", "JSON", descriptor)
         return NativeType("VARIANT", "VARIANT", descriptor)
     if kind == "array":
         if descriptor.array_element is None:

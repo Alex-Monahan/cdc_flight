@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 from .envelope import PendingRecord
+from .errors import SchemaEvolutionRefused
 from .faults import maybe_crash
 from .planner import stream_event_id
 from .spill import StagedEvent
@@ -75,14 +76,41 @@ def _enrich_descriptors(applier, event: PendingRecord) -> None:
         if applier.catalog is not None
         else None
     )
-    if provider is None or not event.qualified_table:
+    strict = not applier.allow_legacy_inference
+    if not event.qualified_table:
+        return
+    if provider is None:
+        if strict:
+            raise SchemaEvolutionRefused(
+                f"catalog descriptor authority is unavailable for {event.qualified_table}; "
+                "the spilled source unit is held for automatic retry",
+                source_schema=event.schema,
+                source_table=event.table,
+                target=event.qualified_table,
+            )
         return
     try:
         descriptors = provider(event.qualified_table)
-    except Exception:
+    except Exception as exc:
+        if strict:
+            raise SchemaEvolutionRefused(
+                f"catalog descriptor authority failed for {event.qualified_table}; "
+                "the spilled source unit is held for automatic retry",
+                source_schema=event.schema,
+                source_table=event.table,
+                target=event.qualified_table,
+            ) from exc
         log.debug("could not enrich spilled event descriptors", exc_info=True)
         return
     if not descriptors:
+        if strict:
+            raise SchemaEvolutionRefused(
+                f"catalog descriptor authority is incomplete for {event.qualified_table}; "
+                "the spilled source unit is held for automatic retry",
+                source_schema=event.schema,
+                source_table=event.table,
+                target=event.qualified_table,
+            )
         return
     for attribute in ("key_descriptors", "before_descriptors", "after_descriptors"):
         getattr(event, attribute).update(descriptors)

@@ -23,9 +23,9 @@ class CatalogDescriptorReader:
 
     def resolve(self, oids: Iterable[int]) -> dict[int, SourceTypeDescriptor]:
         wanted = {int(oid) for oid in oids if oid}
-        missing = wanted - set(self.cache)
         facts: dict[int, dict] = {}
-        while missing:
+        pending = set(wanted)
+        while pending:
             rows = self.con.execute(
                 "SELECT t.oid::bigint, n.nspname, t.typname, t.typtype, "
                 "t.typcategory, t.typbasetype::bigint, t.typelem::bigint, "
@@ -34,7 +34,7 @@ class CatalogDescriptorReader:
                 "FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace "
                 "LEFT JOIN pg_range r ON r.rngtypid=t.oid "
                 "WHERE t.oid = ANY(%s::oid[])",
-                [sorted(missing)],
+                [sorted(pending)],
             ).fetchall()
             for row in rows:
                 (
@@ -58,7 +58,10 @@ class CatalogDescriptorReader:
                 children.update(item for item in (fact["base"], fact["element"], fact["subtype"]) if item)
                 if fact["typtype"] == "m" and fact["multirange_oid"]:
                     children.add(fact["multirange_oid"])
-            missing = children - set(self.cache) - set(facts)
+            # OID identity does not make enum labels or composite attributes
+            # immutable.  Revisit every descendant in every catalog epoch so an
+            # ADD VALUE/ADD ATTRIBUTE cannot hide behind a process-local cache.
+            pending = children - set(facts)
         enum_labels = self._enum_labels([fact["oid"] for fact in facts.values() if fact["typtype"] == "e"])
         composite_fields = self._composite_fields(
             [fact["relid"] for fact in facts.values() if fact["typtype"] == "c" and fact["relid"]]
@@ -68,18 +71,21 @@ class CatalogDescriptorReader:
             for fields in composite_fields.values()
             for _, child in fields
         }
-        child_oids -= set(self.cache) | set(facts)
+        # A child can itself be mutable (for example a composite field whose type
+        # gained an attribute).  Do not let its process-local OID cache suppress a
+        # fresh recursive catalog read for this epoch.
+        child_oids -= set(facts)
         if child_oids:
             self.resolve(child_oids)
         building: set[int] = set()
 
         def build(oid: int) -> SourceTypeDescriptor:
-            if oid in self.cache:
-                return self.cache[oid]
             if oid in building:
                 raise ValueError(f"recursive PostgreSQL type descriptor at OID {oid}")
             fact = facts.get(oid)
             if fact is None:
+                if oid in self.cache:
+                    return self.cache[oid]
                 raise KeyError(f"PostgreSQL type OID {oid} was not returned by the catalog")
             building.add(oid)
             kind = _kind_for_fact(fact)
@@ -118,8 +124,7 @@ class CatalogDescriptorReader:
             return descriptor
 
         for oid in sorted(wanted):
-            if oid not in self.cache:
-                build(oid)
+            build(oid)
         return {oid: self.cache[oid] for oid in wanted if oid in self.cache}
 
     def _enum_labels(self, oids: list[int]) -> dict[int, list[str]]:

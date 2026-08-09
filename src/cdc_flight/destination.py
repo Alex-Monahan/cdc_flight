@@ -57,6 +57,21 @@ DUCKDB_CONNECT_CONFIG = {
     "variant_minimum_shredding_size": "-1",
 }
 
+
+def assert_runtime_capabilities(con) -> None:
+    """Verify the effective settings, not only the requested connect options."""
+    names = tuple(DUCKDB_CONNECT_CONFIG)
+    rows = con.execute(
+        "SELECT name, value FROM duckdb_settings() WHERE name IN (?, ?)", names
+    ).fetchall()
+    effective = {str(name): str(value) for name, value in rows}
+    expected = {name: str(value) for name, value in DUCKDB_CONNECT_CONFIG.items()}
+    if effective != expected:
+        raise RuntimeError(
+            f"destination runtime did not apply the required VARIANT settings: "
+            f"expected {expected!r}, got {effective!r}"
+        )
+
 CONTROL_SCHEMA = "_cdc_flight"
 
 #: `table_state.snapshot_state` for a table whose destination data cannot be trusted
@@ -152,7 +167,9 @@ def connect(dest) -> Any:
 
     if dest.kind == "duckdb":
         dest.duckdb_path.parent.mkdir(parents=True, exist_ok=True)
-        return duckdb.connect(str(dest.duckdb_path), config=DUCKDB_CONNECT_CONFIG)
+        con = duckdb.connect(str(dest.duckdb_path), config=DUCKDB_CONNECT_CONFIG)
+        assert_runtime_capabilities(con)
+        return con
 
     if dest.kind == "motherduck":
         from .config import motherduck_token
@@ -167,13 +184,16 @@ def connect(dest) -> Any:
             f"md:?motherduck_token={token}", config=DUCKDB_CONNECT_CONFIG
         )
         try:
+            assert_runtime_capabilities(bootstrap)
             bootstrap.execute(f'CREATE DATABASE IF NOT EXISTS "{dest.motherduck_database}"')
         finally:
             bootstrap.close()
-        return duckdb.connect(
+        con = duckdb.connect(
             f"md:{dest.motherduck_database}?motherduck_token={token}",
             config=DUCKDB_CONNECT_CONFIG,
         )
+        assert_runtime_capabilities(con)
+        return con
 
     raise ValueError(f"unknown destination {dest.kind!r} (expected duckdb|motherduck)")
 

@@ -49,6 +49,7 @@ def apply_units(
             if applier.catalog is not None
             else None
         ),
+        allow_legacy_inference=applier.allow_legacy_inference,
         binary_handling_mode=(
             getattr(applier.catalog, "binary_handling_mode", applier.binary_handling_mode)
             if applier.catalog is not None

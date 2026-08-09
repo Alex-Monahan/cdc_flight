@@ -413,6 +413,7 @@ def run(
         # rows are never mistaken for a stream tail.
         watcher = None
         discovered = ()
+        descriptor_provider = None
         if catalog_enabled:
             watcher = catalog_mod.CatalogWatcher(
                 dsn=source.dsn,
@@ -464,12 +465,6 @@ def run(
                 # Debezium is publication-driven in discovery mode. Snapshot completion
                 # therefore expects the relations observed at the run's start, including
                 # a relation that was not in CDC_TABLES.
-                # Keep an explicit current relation list on the initial engine as well:
-                # it preserves publication-root partition semantics (the publication
-                # contains the parent, while a broad no-filter snapshot can enumerate
-                # each child separately). Subsequent no-data engines use the
-                # publication directly, so a relation added during this run is
-                # automatically eligible without rebuilding this list.
                 props["table.include.list"] = ",".join(
                     sorted(
                         relation.qualified
@@ -499,6 +494,31 @@ def run(
                     "correctness guarantee (ADR 0001 §18/A38).",
                     catalog_cfg.grace_seconds,
                 )
+        else:
+            # The live watcher is intentionally disabled for explicit no-catalog
+            # modes, but the typed path must never infer source types from the
+            # Connect envelope.  Resolve the configured relation/type trees once
+            # from PostgreSQL and retain only the immutable descriptor map for this
+            # run.  A missing or failed read propagates as a startup refusal; there
+            # is no legacy fallback here.
+            import psycopg
+
+            from .catalog_descriptors import RelationDescriptorProvider
+
+            requested_tables = []
+            for qualified in source.tables:
+                schema, separator, table = qualified.partition(".")
+                if not separator or not schema or not table:
+                    raise EngineFailure(
+                        f"configured source table {qualified!r} is not qualified; "
+                        "catalog descriptor authority cannot be established",
+                        dict(summary_extra),
+                    )
+                requested_tables.append((schema, table, ""))
+            with psycopg.connect(source.dsn, autocommit=True) as descriptor_con:
+                descriptor_provider = RelationDescriptorProvider.from_tables(
+                    descriptor_con, requested_tables
+                ).descriptors_for
 
         interrupted_resnapshot = resnapshot_recovery_mod.requeue_interrupted(
             con,
@@ -699,6 +719,7 @@ def run(
             outcome=outcome,
             summary_extra=summary_extra,
             resnapshot_enabled=acquisition.resnapshot_enabled(),
+            descriptor_provider=descriptor_provider,
             catalog_flush_exclude=set(
                 baseline_mod.unrebuilt_relations(
                     con, pipeline=dest.pipeline_name, dataset=dest.dataset_name

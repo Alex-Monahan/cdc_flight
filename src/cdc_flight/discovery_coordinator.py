@@ -59,6 +59,7 @@ class LiveDiscoveryCoordinator:
         outcome: RunOutcome,
         summary_extra: dict[str, Any],
         resnapshot_enabled: bool,
+        descriptor_provider=None,
         catalog_flush_exclude: set[str] | None = None,
     ) -> None:
         self.con = con
@@ -85,6 +86,11 @@ class LiveDiscoveryCoordinator:
         self.outcome = outcome
         self.summary_extra = summary_extra
         self._resnapshot_enabled = resnapshot_enabled
+        # In the normal path the live CatalogWatcher is the provider.  Explicit
+        # no-watcher modes (for example CDC_DROP_MODE=ignore) still need the
+        # source catalog's type authority for typed rows, supplied as a one-shot
+        # immutable provider by pipeline.py.
+        self.descriptor_provider = descriptor_provider
         self.catalog_flush_exclude = set(catalog_flush_exclude or ())
 
         self.applier = None
@@ -343,6 +349,8 @@ class LiveDiscoveryCoordinator:
             runner_id=self.runner_id,
             transactional_ddl=self.transactional_ddl,
             catalog=self.watcher,
+            descriptor_provider=self.descriptor_provider,
+            allow_legacy_inference=False,
             watermarks=self.watermarks,
             completion=completion,
             binary_handling_mode=self.props.get("binary.handling.mode", "base64"),

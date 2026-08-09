@@ -27,10 +27,9 @@ from . import apply_sql, destination, naming, table_work
 from .assembler import UNIT_CONTROL, UNIT_SNAPSHOT_CHUNK, CompleteUnit
 from .config import TRUNCATE_IGNORE, TRUNCATE_REPLICATE
 from .envelope import KIND_TRUNCATE, PendingRecord
-from .errors import ToastBaseMissing
+from .errors import SchemaEvolutionRefused, ToastBaseMissing
 from .snapshot import SnapshotTable
 from .table_work import TableWork
-from .toast import ToastRoute
 
 log = logging.getLogger("cdc_flight.planner")
 
@@ -56,6 +55,7 @@ class GroupPlan:
         watermarks: dict[str, int] | None = None,
         descriptor_provider=None,
         toast_policy_provider=None,
+        allow_legacy_inference: bool = False,
         binary_handling_mode: str = "base64",
         hstore_handling_mode: str = "map",
     ):
@@ -72,6 +72,7 @@ class GroupPlan:
         self.watermarks = watermarks or {}
         self.descriptor_provider = descriptor_provider
         self.toast_policy_provider = toast_policy_provider
+        self.allow_legacy_inference = allow_legacy_inference
         self.binary_handling_mode = binary_handling_mode
         self.hstore_handling_mode = hstore_handling_mode
         self.watermark_fenced_events = 0
@@ -229,7 +230,7 @@ class GroupPlan:
             if policy is None:
                 policy = self.toast_policy_provider(event.qualified_table)
                 self._toast_policy_cache[event.qualified_table] = policy
-            if policy is not None and policy.route is ToastRoute.FALLBACK:
+            if policy is not None and not policy.accepts_event(event.lsn):
                 raise ToastBaseMissing(
                     f"{event.qualified_table}: residual TOAST column(s) have no "
                     "verified REPLICA IDENTITY FULL; automatic refetch/resnapshot "
@@ -238,7 +239,13 @@ class GroupPlan:
                     source_table=event.table,
                     target=target,
                 )
-        item = table_work.work_for(self.work, target, event, snapshot is not None)
+        item = table_work.work_for(
+            self.work,
+            target,
+            event,
+            snapshot is not None,
+            allow_legacy_inference=self.allow_legacy_inference,
+        )
         patch = table_work.patch_for(
             event,
             self.commit_id,
@@ -267,13 +274,31 @@ class GroupPlan:
 
     def _enrich_descriptors(self, event: PendingRecord) -> None:
         """Merge one memoized catalog descriptor map into a row envelope."""
-        if self.descriptor_provider is None or not event.qualified_table:
+        if not event.qualified_table:
+            return
+        if self.descriptor_provider is None:
+            if not self.allow_legacy_inference:
+                raise SchemaEvolutionRefused(
+                    f"catalog descriptor authority is unavailable for {event.qualified_table}; "
+                    "holding the source unit until a verified descriptor is available",
+                    source_schema=event.schema,
+                    source_table=event.table,
+                    target=event.qualified_table,
+                )
             return
         qualified = event.qualified_table
         if qualified not in self._catalog_descriptor_cache:
             try:
                 catalog_descriptors = self.descriptor_provider(qualified)
-            except Exception:
+            except Exception as exc:
+                if not self.allow_legacy_inference:
+                    raise SchemaEvolutionRefused(
+                        f"catalog descriptor authority failed for {qualified}: {exc}; "
+                        "the source unit is held for automatic catalog retry",
+                        source_schema=event.schema,
+                        source_table=event.table,
+                        target=qualified,
+                    ) from exc
                 # The catalog watcher is an observation aid, not a second transaction
                 # boundary.  A missing map leaves the schema-enabled envelope path in
                 # charge; the strict resolver still refuses an actually unsupported type.
@@ -282,7 +307,28 @@ class GroupPlan:
             self._catalog_descriptor_cache[qualified] = dict(catalog_descriptors or {})
         catalog_descriptors = self._catalog_descriptor_cache[qualified]
         if not catalog_descriptors:
+            if not self.allow_legacy_inference:
+                raise SchemaEvolutionRefused(
+                    f"catalog descriptor authority is incomplete for {qualified}; "
+                    "the source unit is held for automatic catalog retry",
+                    source_schema=event.schema,
+                    source_table=event.table,
+                    target=qualified,
+                )
             return
+        if not self.allow_legacy_inference:
+            required = set()
+            for image in (event.key, event.before, event.after):
+                required.update(image or {})
+            missing = sorted(name for name in required if name not in catalog_descriptors)
+            if missing:
+                raise SchemaEvolutionRefused(
+                    f"catalog descriptor authority is incomplete for {qualified}; "
+                    f"missing {missing!r}; the source unit is held for automatic retry",
+                    source_schema=event.schema,
+                    source_table=event.table,
+                    target=qualified,
+                )
         for attribute in ("key_descriptors", "before_descriptors", "after_descriptors"):
             descriptors = getattr(event, attribute)
             if len(descriptors) >= len(catalog_descriptors) and all(
@@ -353,7 +399,13 @@ class GroupPlan:
         if not replicate:
             self.truncates_logged += 1
             return
-        item = table_work.work_for(self.work, target, event, snapshot is not None)
+        item = table_work.work_for(
+            self.work,
+            target,
+            event,
+            snapshot is not None,
+            allow_legacy_inference=self.allow_legacy_inference,
+        )
         table_work.truncate(item)
         self.stats["tables"].add(target)
         self.truncates_applied += 1
@@ -419,9 +471,20 @@ class GroupPlan:
         return table if table.exists else None
 
     def _key_predicate(self, table, item: TableWork, key: tuple) -> tuple[str, list]:
+        raw_key = table_work._raw_key(item, tuple(key))
+        key_descriptors = getattr(item, "key_descriptors", {}).get(tuple(key))
+        if table.internal_identity:
+            identities = apply_sql._identity_candidates(
+                table,
+                raw_key,
+                descriptors=key_descriptors,
+                key_columns=item.key_columns,
+            )
+            placeholders = ", ".join("?" for _ in identities)
+            return f'{naming.quote("cdcf_internal_id")} IN ({placeholders})', list(identities)
         expressions: list[str] = []
         params: list = []
-        for column, value in zip(item.key_columns, key, strict=False):
+        for column, value in zip(item.key_columns, raw_key, strict=False):
             expression, bound = apply_sql._typed_assignment(table, column, value)
             expressions.append(expression)
             params.extend(bound)

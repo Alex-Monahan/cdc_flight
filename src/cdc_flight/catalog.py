@@ -402,6 +402,7 @@ class CatalogWatcher:
                 replica_identity=relation.replica_identity,
                 binary_mode=self.binary_handling_mode,
                 hstore_mode=self.hstore_handling_mode,
+                full_activation_lsn=relation.full_activation_lsn,
             )
 
     def snapshot_names(self) -> tuple[str, ...]:

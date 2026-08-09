@@ -77,18 +77,43 @@ def connect(watcher, *, autocommit: bool = True, dsn: str | None = None):
     )
 
 
-def _ensure_toast_policies(watcher, conn, observed: dict[str, SourceRelation]):
+def _ensure_toast_policies(
+    watcher,
+    conn,
+    observed: dict[str, SourceRelation],
+    *,
+    activation_lsn: int | None = None,
+):
     """Make residual TOAST tables FULL before this catalog epoch is admitted."""
     updated = dict(observed)
     for qualified, relation in observed.items():
+        previous = getattr(watcher, "known", {}).get(qualified)
+        if (
+            relation.full_activation_lsn is None
+            and previous is not None
+            and previous.full_activation_lsn is not None
+        ):
+            relation = replace(
+                relation, full_activation_lsn=previous.full_activation_lsn
+            )
+            updated[qualified] = relation
         policy = classify_relation(
             qualified,
             relation.columns,
             replica_identity=relation.replica_identity,
             binary_mode=watcher.binary_handling_mode,
             hstore_mode=watcher.hstore_handling_mode,
+            full_activation_lsn=relation.full_activation_lsn,
         )
         if not policy.residual_columns or str(relation.replica_identity).lower() == "f":
+            if (
+                policy.residual_columns
+                and relation.full_activation_lsn is None
+                and activation_lsn is not None
+            ):
+                updated[qualified] = replace(
+                    relation, full_activation_lsn=int(activation_lsn)
+                )
             continue
         try:
             schema, _, table = qualified.partition(".")
@@ -107,7 +132,12 @@ def _ensure_toast_policies(watcher, conn, observed: dict[str, SourceRelation]):
                 raise RuntimeError(
                     f"source reported replica identity {verified[0] if verified else None!r}"
                 )
-            updated[qualified] = replace(relation, replica_identity="f")
+            boundary = int(activation_lsn) if activation_lsn is not None else 0
+            updated[qualified] = replace(
+                relation,
+                replica_identity="f",
+                full_activation_lsn=boundary,
+            )
             log.info(
                 "TOAST residual table %s admitted with verified REPLICA IDENTITY FULL: %s",
                 qualified,
@@ -266,7 +296,9 @@ def poll(watcher):
         # A residual table is either verified FULL or remains explicitly on the
         # automatic refetch/resnapshot route; an unverified ALTER is never treated as
         # success.
-        observed = _ensure_toast_policies(watcher, write_conn, observed)
+        observed = _ensure_toast_policies(
+            watcher, write_conn, observed, activation_lsn=lsn + 1
+        )
         added = watcher._compare(observed, lsn)
         watcher._ensure_published(write_conn, observed, added)
         with watcher._lock:

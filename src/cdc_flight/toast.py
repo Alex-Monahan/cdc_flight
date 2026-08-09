@@ -63,6 +63,10 @@ class ToastTablePolicy:
     residual_columns: tuple[str, ...] = ()
     fixed_columns: tuple[str, ...] = ()
     reasons: tuple[str, ...] = ()
+    #: First source LSN known to have been generated after REPLICA IDENTITY FULL
+    #: became effective. Events before this boundary cannot be judged by the
+    #: current catalog value.
+    full_activation_lsn: int | None = None
 
     @property
     def efficient(self) -> bool:
@@ -71,6 +75,17 @@ class ToastTablePolicy:
     @property
     def fallback_required(self) -> bool:
         return bool(self.residual_columns)
+
+    def accepts_event(self, lsn: int | None) -> bool:
+        """Whether this policy is evidence for one event's source generation."""
+        if self.route is ToastRoute.FALLBACK:
+            return False
+        if self.route is ToastRoute.REPLICA_IDENTITY_FULL:
+            if self.full_activation_lsn is None:
+                return False
+            if lsn is None or int(lsn) < self.full_activation_lsn:
+                return False
+        return True
 
 
 def _kind(descriptor: SourceTypeDescriptor | None) -> str:
@@ -244,6 +259,7 @@ def classify_relation(
     replica_identity: str = "d",
     binary_mode: str = "base64",
     hstore_mode: str = "map",
+    full_activation_lsn: int | None = None,
 ) -> ToastTablePolicy:
     """Classify all fields and select one table-scoped route."""
 
@@ -283,6 +299,7 @@ def classify_relation(
         table=str(table), route=route,
         structural_columns=tuple(structural), residual_columns=tuple(residual),
         fixed_columns=tuple(fixed), reasons=tuple(reasons),
+        full_activation_lsn=full_activation_lsn,
     )
 
 

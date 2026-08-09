@@ -205,10 +205,9 @@ DuckDB file, so they never disturb `make pipeline` or the pytest suite.
 
 ## Changes since the baseline scoring
 
-The scores below are the **Phase-0 baseline** and are deliberately left
-unchanged until each item is re-measured. **1.1, 1.2 and 1.3 have now been
-re-measured and are listed at the top of the summary table**; everything else
-below is still the baseline.
+The historical blocks below preserve the **Phase-0 baseline**. The summary
+table is the current score, and the 2026-08-08 FIX ROUND blocks under 2.4,
+2.5, and 2.6 record the new executed evidence for those items.
 
 ### TODO 1.1 / 1.2 / 1.3 — the transactional applier (implemented 2026-07-30)
 
@@ -371,9 +370,9 @@ correct assumptions in the notes below:
 | 2.1 | Added / dropped columns handled | **5** | Catalog-fenced attnum diffs add and backfill existing rows, physically drop destination columns, and continue through live CDC; the add/drop E2E compares source and destination before and after both DDLs. |
 | 2.2 | Renamed columns handled well | **5** | Same-attnum/type changes use a true destination rename, including a late-row merge/fence path; the E2E has one logical column, one rename audit event, and no data loss. |
 | 2.3 | New tables and schemas auto-discovered | **5** | A 10-second (configurable) all-schema watcher admits table-scoped publication members and performs an in-process targeted re-snapshot on the same main slot; new-table and new-schema existing rows arrive without config edit or restart. |
-| 2.4 | Postgres types → native MotherDuck types | 1 | numeric→base64 VARCHAR, date/time/timestamp/interval→BIGINT, NaN/Inf degrade the column to VARCHAR, `col_numeric_nan` dropped entirely. |
-| 2.5 | Data type changes supported | 3 | dlt adds a `__v_text` variant column beside the old one; no widening logic, no UNION type. |
-| 2.6 | TOAST columns handled well | 4 | The configured `hex:00` marker is recognized only for the structural type allowlist; residual TOAST shapes automatically use verified table-scoped `REPLICA IDENTITY FULL` or refetch/resnapshot recovery. |
+| 2.4 | Postgres types → native MotherDuck types | ~~1~~ → **5** | Catalog-authoritative recursive descriptors map the full supported matrix to native JSON/VARIANT/LIST/STRUCT/MAP and bounded numeric UNIONs; NaN/Infinity/NULL/spill/replay are covered. JSONB keys use JSON on both runtimes, including composite keys and automatic key gain/loss repair. |
+| 2.5 | Data type changes supported | ~~3~~ → **5** | One typed shadow-swap path creates fingerprinted UNION members, preserves old members and source-key identity across type changes/key moves/restarts, fences mixed epochs, and is fault-instrumented. |
+| 2.6 | TOAST columns handled well | **4** | Sparse physical-row folding, durable NULL-vs-JSONB-root-null ambiguity refusal, and a per-table FULL activation boundary close soundness defects. Stock Debezium still lacks a marker-preserving efficient channel, so the policy ceiling remains 4. |
 | 3.1 | Backfill scalable / parallelized | 3 | 120 k rows in ~28 s single-threaded (`snapshot.max.threads=1`); works but does not scale, untested past 120 k. |
 | 3.2 | Backfills atomic | 1 | Snapshot rows are appended straight into the live table; no shadow table, no swap. |
 | 3.3 | Existing tables keep receiving CDC during snapshot | 1 | Debezium's initial snapshot blocks streaming entirely; everything goes stale for the snapshot's duration. |
@@ -405,9 +404,9 @@ correct assumptions in the notes below:
 **Baseline average: 66 / 40 = 1.65 out of 5.** Items at 5 in the baseline:
 **1 of 40** (7.1).
 
-**Current average (this branch): 108 / 42 = 2.57 out of 5.** Items at 5: **12 of 42**.
-Rubric 1.7 remains 3 while 1.9 is 5. Distribution: 20 at 1, 2 at 2, 8 at 3,
-0 at 4, 12 at 5. Distance to target: **102 rubric points**.
+**Current average (this branch): 114 / 42 = 2.71 out of 5.** Items at 5: **14 of 42**.
+Rubric 1.7 remains 3 while 1.9 is 5. Distribution: 19 at 1, 2 at 2, 7 at 3,
+0 at 4, 14 at 5. Distance to target: **96 rubric points**.
 
 **Correction (2026-07-31).** This paragraph previously read `100 / 41 = 2.44` with a
 distribution of `21/3/8/0/9`, and neither matched the summary table above it — the block
@@ -425,7 +424,8 @@ The delta over the prior published branch total is +2 points: rubric 1.9 moved f
 round-5 3-band to the round-7 reviewer verdict of 5. The broader historical delta includes
 1.1 (3 -> 5), 1.2 (3 -> 5), 1.3 (1 -> 5), 1.4 (2 -> 5), 1.5 (1 -> 5), 1.6 (3 -> 5), 1.7 (1 -> 3), 1.8 (1 -> 5),
 4.6 (1 -> 3), plus 4.7 as a new item scored **1** and 1.9 as a new item scored **5**.
-Every other row is still the baseline score, and the detail sections say so.
+Every other row is still the baseline score, and the detail sections say so; 2.4/2.5/2.6
+are the 2026-08-08 FIX ROUND exceptions.
 
 **Rescored 2026-07-31 after the 1.6-1.8 review round**, in both directions and
 conservatively. 1.5 rose from 4 to 5 (its stated condition is met and the machinery it
@@ -1771,7 +1771,22 @@ membership, both tables' pre-existing rows, post-snapshot CDC rows, and one appl
 `new` audit event per relation. No config edit or second process run is used for the
 discovery itself.
 
-### 2.4 Postgres types accurately converted to native MotherDuck types — **1 / 5**
+### 2.4 Postgres types accurately converted to native MotherDuck types — **5 / 5**
+
+**FIX ROUND (2026-08-08).** The production typed path now takes a
+catalog-authoritative recursive `SourceTypeDescriptor` and has no implicit
+value/text fallback. `native_type(source, for_key=True)` is the single resolver:
+ordinary JSONB is `VARIANT`, while JSONB in a source key is `JSON`; this is the
+same rule for local DuckDB and MotherDuck. A durable key-metadata sidecar and a
+typed shadow rebind handle composite keys, key gain/loss, and restart recovery.
+The local and MotherDuck probes both executed real `PRIMARY KEY` creation with
+JSON and passed.
+
+The native matrix now covers JSON, JSONB/VARIANT, recursive LIST/STRUCT/MAP,
+bounded NUMERIC finite/NaN/Infinity/-Infinity/NULL, temporal types, replay,
+spill, and mutable enum/composite descriptor epochs. Evidence includes
+`tests/rubric/2.4_native_types/` and the final default, slow, and MotherDuck
+lanes (`1395`, `128`, and `34` selected tests respectively).
 
 `most types text/json=1, core scalars well (nested as text)=3, (nested as json)=4, full=5`
 
@@ -1808,7 +1823,20 @@ partial wins to sequence first: `decimal.handling.mode=string`,
 need a JSON encoding decision (DuckDB `DOUBLE` supports both natively).
 Arrays must become DuckDB `LIST`, `json`/`jsonb` must become `JSON`.
 
-### 2.5 Data type changes supported — **3 / 5**
+### 2.5 Data type changes supported — **5 / 5**
+
+**FIX ROUND (2026-08-08).** Type changes use one instrumented typed shadow
+swap. UNION members carry recursive descriptor fingerprints; existing values
+and tags survive repeated changes, and a durable length-prefixed internal
+identity resolves old and current source-key descriptors for delete, update,
+key-move, replay, start-probe, idempotency, and restart paths. Same-name type
+changes participate in the schema epoch fence; a DDL+DML unit containing both
+descriptor epochs is refused before apply. The swap anchor is exercised on
+local DuckDB and MotherDuck across repeated fault/restart/convergence cycles.
+
+Evidence: `tests/rubric/2.5_union_type_changes/`, including the real PostgreSQL
+DDL+DML fence and the type-change-plus-key-move regression. The exact required
+lanes were green after these changes.
 
 `error=1, drop and add=3, widening automatic=4, MotherDuck UNION types=5`
 
@@ -1827,6 +1855,20 @@ dlt destination-level type hint or a post-load `ALTER TABLE`, and a decision on
 what happens to downstream views.
 
 ### 2.6 TOAST columns handled well — **4 / 5**
+
+**FIX ROUND (2026-08-08).** The physical-row fold now treats a runtime-collapsed
+SQL NULL/JSONB-root-null before-image as ambiguous and routes it to refusal and
+reconstruction; it never prefers `START`. The source catalog persists the first
+LSN known to be generated after `REPLICA IDENTITY FULL` activation, and events
+before that boundary are not admitted as complete under the current policy. The
+declared operation × field-state × base-state × storage × outcome/fault ×
+identity × schema-epoch product is realized by the generated 2,880-cell matrix,
+with explicit refusal cells where the stock runtime cannot prove attribution.
+
+Evidence: `tests/rubric/2.6_toast_sparse_updates/`, including a real PostgreSQL
+pre-FULL event-boundary race. The honest score remains 4: stock published
+Debezium still does not expose a marker-preserving, efficient unchanged-TOAST
+channel, and no fork, custom converter, or Java artifact was added.
 
 `errors on TOAST=1, handled but inefficiently=4, handled efficiently=5`
 

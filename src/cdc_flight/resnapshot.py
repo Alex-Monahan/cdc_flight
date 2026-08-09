@@ -460,6 +460,7 @@ def run(
             completion=completion,
             snapshot_audit=snapshot_audit,
             descriptor_provider=descriptor_provider,
+            allow_legacy_inference=False,
             binary_handling_mode=props.get("binary.handling.mode", "base64"),
             hstore_handling_mode=props.get("hstore.handling.mode", "map"),
         )
