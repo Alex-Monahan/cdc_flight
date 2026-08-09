@@ -28,12 +28,12 @@ import uuid
 
 import duckdb
 import pytest
+from support.motherduck_probe import scratch_database
 
 from cdc_flight.config import motherduck_token
 
 pytestmark = [pytest.mark.motherduck, pytest.mark.e2e]
 
-MD_DATABASE = "cdc_flight_dev"
 REFRESH = "FORCE CHECKPOINT"
 N = 20
 #: (anchor, tag). Two anchors, not seven: each is a crash plus a recovery run
@@ -49,30 +49,29 @@ def md_token() -> str:
     return token
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def md_crashed(sandbox, md_token) -> dict:
-    dataset = f"cdc_fault_{uuid.uuid4().hex[:8]}"
-    dsn = f"md:{MD_DATABASE}?motherduck_token={md_token}"
-    env = {
-        "CDC_DATASET": dataset,
-        "CDC_MD_DATABASE": MD_DATABASE,
-        "MOTHERDUCK_TOKEN": md_token,
-        "motherduck_token": md_token,
-    }
+    with scratch_database(md_token, "cdc_fault") as database:
+        dataset = f"cdc_fault_{uuid.uuid4().hex[:8]}"
+        control_schema = f"_cdc_flight_{uuid.uuid4().hex[:8]}"
+        dsn = f"md:{database}?motherduck_token={md_token}"
+        env = {
+            "CDC_DATASET": dataset,
+            "CDC_MD_DATABASE": database,
+            "CDC_CONTROL_SCHEMA": control_schema,
+            "MOTHERDUCK_TOKEN": md_token,
+            "motherduck_token": md_token,
+        }
 
-    bootstrap = duckdb.connect(f"md:?motherduck_token={md_token}")
-    bootstrap.execute(f'CREATE DATABASE IF NOT EXISTS "{MD_DATABASE}"')
-    bootstrap.close()
+        sandbox.reseed()
+        sandbox.run(
+            reset_state=True, destination="motherduck", max_seconds=300,
+            timeout=600, extra_env=env,
+        )
 
-    sandbox.reseed()
-    sandbox.run(
-        reset_state=True, destination="motherduck", max_seconds=300,
-        timeout=600, extra_env=env,
-    )
-
-    results: dict[str, dict] = {}
-    for anchor, tag in ANCHORS:
-        sandbox.sql(
+        results: dict[str, dict] = {}
+        for anchor, tag in ANCHORS:
+            sandbox.sql(
             [
                 "INSERT INTO app.customers (name, email) SELECT "
                 f"'{tag}-c-' || i, '{tag}-c-' || i || '@example.com' "
@@ -82,23 +81,29 @@ def md_crashed(sandbox, md_token) -> dict:
             ],
             one_transaction=True,
         )
-        crashed = sandbox.run(
-            destination="motherduck", max_seconds=300, timeout=600,
-            expect_success=False,
-            extra_env={**env, "CDC_FAULT_INJECT": f"{anchor}:1"},
-        )
-        recovered = sandbox.run(
-            destination="motherduck", max_seconds=300, timeout=600, extra_env=env
-        )
-        results[anchor] = {"crashed": crashed, "recovered": recovered, "tag": tag}
+            crashed = sandbox.run(
+                destination="motherduck", max_seconds=300, timeout=600,
+                expect_success=False,
+                extra_env={**env, "CDC_FAULT_INJECT": f"{anchor}:1"},
+            )
+            recovered = sandbox.run(
+                destination="motherduck", max_seconds=300, timeout=600, extra_env=env
+            )
+            results[anchor] = {"crashed": crashed, "recovered": recovered, "tag": tag}
 
-    con = duckdb.connect(dsn)
-    con.execute(REFRESH)
-    try:
-        yield {"con": con, "dataset": dataset, "results": results, "n": N}
-    finally:
-        con.execute(f'DROP SCHEMA IF EXISTS "{MD_DATABASE}"."{dataset}" CASCADE')
-        con.close()
+        con = duckdb.connect(dsn)
+        con.execute(REFRESH)
+        try:
+            yield {
+                "con": con,
+                "database": database,
+                "control_schema": control_schema,
+                "dataset": dataset,
+                "results": results,
+                "n": N,
+            }
+        finally:
+            con.close()
 
 
 def _q(md, sql: str):

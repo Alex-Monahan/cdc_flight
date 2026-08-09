@@ -11,7 +11,7 @@ import json
 import time
 from dataclasses import dataclass, field
 
-from .destination import CONTROL_SCHEMA
+from .config import resolve_control_schema
 from .machines import (
     ADMISSION_EXTERNAL,
     ADMISSION_PENDING,
@@ -21,6 +21,7 @@ from .machines import (
     CHANGE_PENDING,
     require_admission_state,
 )
+from .naming import control_table
 from .schema_evolution import ColumnChange, SourceColumn, descriptor_from_type_name
 from .typed_types import SourceTypeDescriptor
 
@@ -181,12 +182,15 @@ def _missing_value(raw: str | None, type_name: str) -> object | None:
     return text.replace('\\"', '"').replace('\\\\', '\\')
 
 
-def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
+def read_known_relations(
+    con, pipeline: str, *, control_schema: str | None = None
+) -> dict[str, SourceRelation]:
     rows = con.execute(
         f"SELECT source_schema, source_table, relation_oid, relation_filenode, "
         "relation_type_oid, "
         "published, replica_identity, columns_json, admission_state "
-        f"FROM {CONTROL_SCHEMA}.source_relations WHERE pipeline = ?",
+        f"FROM {control_table(resolve_control_schema(control_schema), 'source_relations')} "
+        "WHERE pipeline = ?",
         [pipeline],
     ).fetchall()
     known: dict[str, SourceRelation] = {}
@@ -249,9 +253,12 @@ def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
     return known
 
 
-def seed_from_table_state(con, pipeline: str) -> set[str]:
+def seed_from_table_state(
+    con, pipeline: str, *, control_schema: str | None = None
+) -> set[str]:
     rows = con.execute(
-        f"SELECT source_schema, source_table FROM {CONTROL_SCHEMA}.table_state "
+        f"SELECT source_schema, source_table FROM "
+        f"{control_table(resolve_control_schema(control_schema), 'table_state')} "
         "WHERE pipeline = ?",
         [pipeline],
     ).fetchall()

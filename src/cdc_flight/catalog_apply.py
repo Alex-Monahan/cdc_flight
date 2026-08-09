@@ -78,6 +78,7 @@ class CatalogCoordinator:
         drop_mode: str,
         registry_of,
         lifecycle_con=None,
+        control_schema: str | None = None,
         max_destructive_per_group: int = 1,
         allow_mass_drop: bool = False,
     ):
@@ -87,6 +88,7 @@ class CatalogCoordinator:
         self.drop_mode = drop_mode
         self._registry_of = registry_of
         self._lifecycle_con = lifecycle_con
+        self.control_schema = control_schema
         self.max_destructive_per_group = max_destructive_per_group
         self.allow_mass_drop = allow_mass_drop
         self.tables_dropped = 0
@@ -119,7 +121,13 @@ class CatalogCoordinator:
 
         due = self.catalog.due(durable_lsn)
         if self._lifecycle_con is not None:
-            owing = set(table_lifecycle.owing_work(self._lifecycle_con, self.pipeline))
+            owing = set(
+                table_lifecycle.owing_work(
+                    self._lifecycle_con,
+                    self.pipeline,
+                    control_schema=self.control_schema,
+                )
+            )
             eligible: list[CatalogChange] = []
             for change in due:
                 if change.kind == CHANGE_DROPPED and change.qualified in owing:
@@ -345,6 +353,7 @@ class CatalogCoordinator:
                     pipeline=self.pipeline,
                     source_schema=change.schema,
                     source_table=change.table,
+                    control_schema=self.control_schema,
                 )
                 stats["tables"].add(action.target)
                 self.tables_dropped += 1
@@ -362,6 +371,7 @@ class CatalogCoordinator:
                     source_table=change.table,
                     target_table=action.target,
                     state=AWAITING_SNAPSHOT,
+                    control_schema=self.control_schema,
                 )
                 self.awaiting_snapshot.add(change.qualified)
             if change.kind == CHANGE_DROPPED and action.destructive:
@@ -370,6 +380,7 @@ class CatalogCoordinator:
                     pipeline=self.pipeline,
                     source_schema=change.schema,
                     source_table=change.table,
+                    control_schema=self.control_schema,
                 )
             if change.kind == CHANGE_SCHEMA and change.column_changes:
                 event_details = [
@@ -418,6 +429,7 @@ class CatalogCoordinator:
                 admission_state=require_admission_state(relation.admission_state),
                 replica_identity=relation.replica_identity,
                 columns=relation.columns,
+                control_schema=self.control_schema,
             )
         self.destructive_refused += len(plan.refused)
         return markers

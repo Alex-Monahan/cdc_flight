@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from .config import DEFAULT_CONTROL_SCHEMA
+
 #: Reserved for the applier's own bookkeeping; never taken from a source column.
 CDCF_COMMIT_ID = "cdcf_commit_id"
 CDCF_EVENT_ID = "cdcf_event_id"
@@ -70,3 +72,13 @@ def shadow_table(name: str) -> str:
 
 def quote(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
+
+
+def control_table(schema: str, table: str) -> str:
+    """Return an injection-safe qualified control-table identifier."""
+    if schema == DEFAULT_CONTROL_SCHEMA:
+        # Preserve the published default SQL spelling. The default is a fixed,
+        # trusted identifier; every configured non-default schema takes the quoted
+        # path below.
+        return f"{schema}.{table}"
+    return f"{quote(schema)}.{quote(table)}"

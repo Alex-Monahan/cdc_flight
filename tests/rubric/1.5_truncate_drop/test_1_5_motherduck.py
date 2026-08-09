@@ -21,6 +21,7 @@ import uuid
 
 import duckdb
 import pytest
+from support.motherduck_probe import scratch_database
 
 from cdc_flight.config import motherduck_token
 
@@ -30,7 +31,6 @@ pytestmark = [pytest.mark.motherduck, pytest.mark.e2e]
 #: can go stale against writes made by the pipeline subprocess (ADR §15/A15).
 REFRESH = "FORCE CHECKPOINT"
 
-MD_DATABASE = "cdc_flight_dev"
 TR = "cdcflight_app_md_trunc"
 DR = "cdcflight_app_md_drop"
 TABLES = "customers,orders,sensor_readings,documents,wide_types,audit_log,md_trunc,md_drop"
@@ -44,29 +44,33 @@ def md_token() -> str:
     return token
 
 
-@pytest.fixture(scope="module")
-def md_truncate_drop(sandbox, md_token) -> dict:
+@pytest.fixture
+def md_database(md_token):
+    with scratch_database(md_token, "cdc_15") as database:
+        yield {
+            "database": database,
+            "control_schema": f"_cdc_flight_{uuid.uuid4().hex[:8]}",
+        }
+
+
+@pytest.fixture
+def md_truncate_drop(sandbox, md_token, md_database) -> dict:
     suffix = uuid.uuid4().hex[:8]
     dataset = f"cdc_15_{suffix}"
-    # A unique pipeline name, because `_cdc_flight` is SHARED by every run against this
-    # MotherDuck database: a marker row from an earlier run of this module would
-    # otherwise be indistinguishable from this run's (measured - the row-count assertion
-    # saw two).
     pipeline = f"cdc_15_{suffix}"
-    dsn = f"md:{MD_DATABASE}?motherduck_token={md_token}"
+    database = md_database["database"]
+    control_schema = md_database["control_schema"]
+    dsn = f"md:{database}?motherduck_token={md_token}"
     env = {
         "CDC_PIPELINE_NAME": pipeline,
         "CDC_DATASET": dataset,
-        "CDC_MD_DATABASE": MD_DATABASE,
+        "CDC_MD_DATABASE": database,
+        "CDC_CONTROL_SCHEMA": control_schema,
         "MOTHERDUCK_TOKEN": md_token,
         "motherduck_token": md_token,
         "CDC_TABLES": TABLES,
         "CDC_CATALOG_POLL_SECONDS": "1",
     }
-
-    bootstrap = duckdb.connect(f"md:?motherduck_token={md_token}")
-    bootstrap.execute(f'CREATE DATABASE IF NOT EXISTS "{MD_DATABASE}"')
-    bootstrap.close()
 
     box = sandbox
     box.reseed()
@@ -103,21 +107,20 @@ def md_truncate_drop(sandbox, md_token) -> dict:
     con = duckdb.connect(dsn)
     con.execute(REFRESH)
     try:
-        yield {"box": box, "con": con, "dataset": dataset, "pipeline": pipeline,
+        yield {"box": box, "con": con, "database": database,
+               "control_schema": control_schema, "dataset": dataset, "pipeline": pipeline,
                "streamed": streamed, "settled": settled}
     finally:
-        con.execute(f'DROP SCHEMA IF EXISTS "{MD_DATABASE}"."{dataset}" CASCADE')
-        for table in (
-            "table_events", "commit_log", "debezium_offsets", "table_state",
-            "source_relations", "lease", "alerts",
-        ):
-            con.execute(f"DELETE FROM _cdc_flight.{table} WHERE pipeline = ?", [pipeline])
         con.close()
         box.reseed()
 
 
 def _rows(state, sql: str, params: list | None = None) -> list[tuple]:
     return state["con"].execute(sql, params or []).fetchall()
+
+
+def _state(state, table: str) -> str:
+    return f'"{state["control_schema"]}"."{table}"'
 
 
 def test_the_runs_reached_motherduck_cleanly(md_truncate_drop):
@@ -136,7 +139,7 @@ def test_the_truncate_marker_counted_the_rows_motherduck_removed(md_truncate_dro
     "unknown" where the whole point is to say what was lost."""
     rows = _rows(
         md_truncate_drop,
-        "SELECT rows_removed FROM _cdc_flight.table_events WHERE pipeline = ? "
+        f"SELECT rows_removed FROM {_state(md_truncate_drop, 'table_events')} WHERE pipeline = ? "
         "AND event = 'truncate' AND source_table = 'md_trunc'",
         [md_truncate_drop["pipeline"]],
     )
@@ -175,7 +178,7 @@ def test_the_alert_sink_is_an_independent_connection_at_motherduck(md_truncate_d
     assert md_truncate_drop["settled"]["alerts_out_of_transaction"] is True
     codes = _rows(
         md_truncate_drop,
-        "SELECT DISTINCT code FROM _cdc_flight.alerts WHERE pipeline = ?",
+        f"SELECT DISTINCT code FROM {_state(md_truncate_drop, 'alerts')} WHERE pipeline = ?",
         [md_truncate_drop["pipeline"]],
     )
     assert ("table_dropped",) in codes
@@ -186,7 +189,7 @@ def test_the_source_relation_ownership_survived(md_truncate_drop):
     is written by whoever first materialises the table."""
     owned = _rows(
         md_truncate_drop,
-        "SELECT source_table FROM _cdc_flight.table_state WHERE pipeline = ? "
+        f"SELECT source_table FROM {_state(md_truncate_drop, 'table_state')} WHERE pipeline = ? "
         "ORDER BY source_table",
         [md_truncate_drop["pipeline"]],
     )
@@ -197,8 +200,8 @@ def test_the_source_relation_ownership_survived(md_truncate_drop):
 # --------------------------------------------------------------------------- #
 # a fault around a truncate, at MotherDuck (Codex 9-point item 9)
 # --------------------------------------------------------------------------- #
-@pytest.fixture(scope="module")
-def md_truncate_rollback(sandbox, md_token) -> dict:
+@pytest.fixture
+def md_truncate_rollback(sandbox, md_token, md_database) -> dict:
     """A truncate whose commit group fails at `pre_commit`, then the replay.
 
     The `DELETE FROM` and the `table_events` marker are inside one server-side
@@ -209,11 +212,14 @@ def md_truncate_rollback(sandbox, md_token) -> dict:
     suffix = uuid.uuid4().hex[:8]
     dataset = f"cdc_15rb_{suffix}"
     pipeline = f"cdc_15rb_{suffix}"
-    dsn = f"md:{MD_DATABASE}?motherduck_token={md_token}"
+    database = md_database["database"]
+    control_schema = md_database["control_schema"]
+    dsn = f"md:{database}?motherduck_token={md_token}"
     env = {
         "CDC_PIPELINE_NAME": pipeline,
         "CDC_DATASET": dataset,
-        "CDC_MD_DATABASE": MD_DATABASE,
+        "CDC_MD_DATABASE": database,
+        "CDC_CONTROL_SCHEMA": control_schema,
         "MOTHERDUCK_TOKEN": md_token,
         "motherduck_token": md_token,
         "CDC_TABLES": TABLES,
@@ -250,7 +256,8 @@ def md_truncate_rollback(sandbox, md_token) -> dict:
     # Scoped to truncate markers: the first run records one `new` row per discovered
     # table (rubric 2.3's hook), which is not what this asserts.
     markers_after_failure = con.execute(
-        "SELECT count(*) FROM _cdc_flight.table_events WHERE pipeline = ? "
+        f"SELECT count(*) FROM {_state({'control_schema': control_schema}, 'table_events')} "
+        "WHERE pipeline = ? "
         "AND event = 'truncate'",
         [pipeline],
     ).fetchall()
@@ -264,18 +271,13 @@ def md_truncate_rollback(sandbox, md_token) -> dict:
     con.execute(REFRESH)
     try:
         yield {
-            "con": con, "dataset": dataset, "pipeline": pipeline,
+            "con": con, "database": database, "control_schema": control_schema,
+            "dataset": dataset, "pipeline": pipeline,
             "failed": failed, "replayed": replayed,
             "after_failure": after_failure,
             "markers_after_failure": markers_after_failure,
         }
     finally:
-        con.execute(f'DROP SCHEMA IF EXISTS "{MD_DATABASE}"."{dataset}" CASCADE')
-        for table in (
-            "table_events", "commit_log", "debezium_offsets", "table_state",
-            "source_relations", "lease", "alerts",
-        ):
-            con.execute(f"DELETE FROM _cdc_flight.{table} WHERE pipeline = ?", [pipeline])
         con.close()
         box.reseed()
 
@@ -300,7 +302,8 @@ def test_the_replay_lands_the_truncate_exactly_once(md_truncate_rollback):
     ]
     assert _rows(
         md_truncate_rollback,
-        "SELECT count(*), max(rows_removed) FROM _cdc_flight.table_events "
+        f"SELECT count(*), max(rows_removed) FROM "
+        f"{_state(md_truncate_rollback, 'table_events')} "
         "WHERE pipeline = ? AND event = 'truncate'",
         [md_truncate_rollback["pipeline"]],
     ) == [(1, 3)]

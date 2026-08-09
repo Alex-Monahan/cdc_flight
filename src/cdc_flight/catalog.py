@@ -116,12 +116,12 @@ def _missing_value(raw: str | None, type_name: str) -> object | None:
     return catalog_state._missing_value(raw, type_name)
 
 
-def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
-    return catalog_state.read_known_relations(con, pipeline)
+def read_known_relations(con, pipeline: str, *, control_schema: str | None = None) -> dict[str, SourceRelation]:
+    return catalog_state.read_known_relations(con, pipeline, control_schema=control_schema)
 
 
-def seed_from_table_state(con, pipeline: str) -> set[str]:
-    return catalog_state.seed_from_table_state(con, pipeline)
+def seed_from_table_state(con, pipeline: str, *, control_schema: str | None = None) -> set[str]:
+    return catalog_state.seed_from_table_state(con, pipeline, control_schema=control_schema)
 
 
 class CatalogWatcher:

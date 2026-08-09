@@ -15,13 +15,18 @@ from __future__ import annotations
 import contextlib
 import logging
 
+from .config import DEFAULT_CONTROL_SCHEMA, resolve_control_schema
+from .naming import control_table, quote
+
 log = logging.getLogger("cdc_flight.control_schema")
 
-CONTROL_SCHEMA = "_cdc_flight"
+# Keep the published default DDL byte-for-byte compatible with the original
+# deployment.  A non-default schema is rendered with ``quote`` by ``control_ddl``.
+_DEFAULT_CONTROL_IDENTIFIER = DEFAULT_CONTROL_SCHEMA
 
 CONTROL_DDL = [
-    f"CREATE SCHEMA IF NOT EXISTS {CONTROL_SCHEMA}",
-    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.debezium_offsets (
+    f"CREATE SCHEMA IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}",
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.debezium_offsets (
             pipeline          VARCHAR     NOT NULL,
             namespace         VARCHAR     NOT NULL,
             resume_json       VARCHAR     NOT NULL,
@@ -43,7 +48,7 @@ CONTROL_DDL = [
     # commit_id" was acting as a coordination mechanism with no global lease
     # (Codex 9). Scoped per pipeline it matches the lease's scope, and the
     # allocation below is monotone within a pipeline.
-    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.commit_log (
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.commit_log (
             commit_id       BIGINT      NOT NULL,
             pipeline        VARCHAR     NOT NULL,
             runner_id       VARCHAR     NOT NULL,
@@ -62,7 +67,7 @@ CONTROL_DDL = [
             tables_touched  VARCHAR[],
             PRIMARY KEY (pipeline, commit_id)
         )""",
-    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.lease (
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.lease (
             pipeline        VARCHAR     PRIMARY KEY,
             owner_id        VARCHAR     NOT NULL,
             host            VARCHAR,
@@ -71,7 +76,7 @@ CONTROL_DDL = [
             renewed_at      TIMESTAMPTZ NOT NULL,
             expires_at      TIMESTAMPTZ NOT NULL
         )""",
-    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.table_state (
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.table_state (
             pipeline        VARCHAR     NOT NULL,
             source_schema   VARCHAR     NOT NULL,
             source_table    VARCHAR     NOT NULL,
@@ -87,7 +92,7 @@ CONTROL_DDL = [
             last_commit_id  BIGINT,
             PRIMARY KEY (pipeline, source_schema, source_table)
         )""",
-    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.spill_events (
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.spill_events (
             commit_id      BIGINT   NOT NULL,
             unit_seq       BIGINT   NOT NULL,
             event_seq      BIGINT   NOT NULL,
@@ -111,7 +116,7 @@ CONTROL_DDL = [
     # atomic fact. It is also the answer to what a truncate means for history: the
     # current-state table is emptied because Postgres emptied it, and the marker is
     # what a changelog table (8.2) will carry as its truncate row.
-    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.table_events (
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.table_events (
             pipeline        VARCHAR     NOT NULL,
             commit_id       BIGINT      NOT NULL,
             seq             BIGINT      NOT NULL DEFAULT 0,
@@ -131,7 +136,7 @@ CONTROL_DDL = [
     # load-bearing generation token. OIDs can be reused, while a recreate gets a new
     # relfilenode; partitioned parents keep relfilenode=0, so their row type completes
     # the proof.
-    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.source_relations (
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.source_relations (
             pipeline          VARCHAR     NOT NULL,
             source_schema     VARCHAR     NOT NULL,
             source_table      VARCHAR     NOT NULL,
@@ -155,7 +160,7 @@ CONTROL_DDL = [
     # source NULL or an absent field in a partial Debezium image.  The row path records
     # field presence here inside the same destination transaction; the fenced rename
     # consumes it before dropping the old physical name.
-    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.column_presence (
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.column_presence (
             target_dataset  VARCHAR NOT NULL,
             target_table    VARCHAR NOT NULL,
             event_id        VARCHAR NOT NULL,
@@ -167,7 +172,7 @@ CONTROL_DDL = [
     # A schema fold can be safely refused but must not become an infinite invisible
     # retry.  This row is written after the failed data transaction rolls back and
     # remains the operator/resnapshot obligation until explicitly discharged.
-    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.schema_refusals (
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.schema_refusals (
             pipeline        VARCHAR NOT NULL,
             source_schema   VARCHAR NOT NULL,
             source_table    VARCHAR NOT NULL,
@@ -182,7 +187,7 @@ CONTROL_DDL = [
     # these rows in the shadow-swap transaction; the key also makes recovery and the
     # compatibility projection replayable without duplicate "new" or "resnapshot"
     # facts.
-    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.snapshot_audits (
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.snapshot_audits (
             pipeline        VARCHAR NOT NULL,
             source_schema   VARCHAR NOT NULL,
             source_table    VARCHAR NOT NULL,
@@ -207,7 +212,7 @@ CONTROL_DDL = [
     # Written OUTSIDE the commit group, before the engine starts and again after the
     # watcher is proved quiesced: it is a claim about an observation, not a fact about
     # the data, and it must be durable before anything can fail to establish it.
-    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.catalog_baseline (
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.catalog_baseline (
             pipeline          VARCHAR     PRIMARY KEY,
             state             VARCHAR     NOT NULL,
             reason            VARCHAR,
@@ -231,7 +236,7 @@ CONTROL_DDL = [
     # fail a commit. Correctness never depends on it - every check degrades to
     # "cannot compare, so assume nothing changed" when the row is missing - it only
     # makes the *detectable* set larger.
-    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.slot_state (
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.slot_state (
             pipeline           VARCHAR     NOT NULL,
             slot_name          VARCHAR     NOT NULL,
             system_identifier  VARCHAR,
@@ -267,7 +272,7 @@ CONTROL_DDL = [
     # It also carries the forced snapshot mode. That used to live only in a local
     # variable, so a crash after the slot was dropped lost the fact that a data-reading
     # snapshot was owed and the next run saw an ordinary fresh start (Codex B3).
-    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.recovery_state (
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.recovery_state (
             pipeline          VARCHAR     NOT NULL,
             namespace         VARCHAR     NOT NULL,
             recovery_id       VARCHAR     NOT NULL,
@@ -302,7 +307,7 @@ CONTROL_DDL = [
     # `phase` is validated against `machines.RUN_PHASE`; `terminal_reason` against
     # `machines.RUN_OUTCOME`, whose precedence is why a symptom cannot overwrite a
     # diagnosis (A49).
-    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.heartbeat (
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.heartbeat (
             pipeline                 VARCHAR     NOT NULL,
             runner_id                VARCHAR     NOT NULL,
             beat_at                  TIMESTAMPTZ NOT NULL,
@@ -325,7 +330,7 @@ CONTROL_DDL = [
             lag_seconds              DOUBLE,
             PRIMARY KEY (pipeline, runner_id, beat_at)
         )""",
-    f"""CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.alerts (
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.alerts (
             pipeline        VARCHAR     NOT NULL,
             raised_at       TIMESTAMPTZ NOT NULL,
             severity        VARCHAR     NOT NULL,
@@ -334,6 +339,15 @@ CONTROL_DDL = [
             context         VARCHAR
         )""",
 ]
+
+
+def control_ddl(control_schema: str | None = None) -> list[str]:
+    """Render the control DDL for one configured, quoted schema identifier."""
+    identifier = quote(resolve_control_schema(control_schema))
+    return [
+        statement.replace(_DEFAULT_CONTROL_IDENTIFIER, identifier)
+        for statement in CONTROL_DDL
+    ]
 
 
 #: Columns of `commit_log`, in DDL order, used by the key migration below.
@@ -396,7 +410,7 @@ _ADDED_COLUMN_DEFAULTS = {
 }
 
 
-def ensure_control_schema(con) -> None:
+def ensure_control_schema(con, control_schema: str | None = None) -> None:
     """Create and migrate the control schema as one idempotent transaction.
 
     MotherDuck supports the DDL used here transactionally, but does not support an
@@ -404,13 +418,14 @@ def ensure_control_schema(con) -> None:
     columns, and their backfills in one transaction means a failed migration cannot
     leave a half-created control schema that later writers mistake for a valid one.
     """
+    configured = resolve_control_schema(control_schema)
     con.execute("BEGIN TRANSACTION")
     try:
-        _migrate_commit_log_key(con)
-        for statement in CONTROL_DDL:
+        _migrate_commit_log_key(con, configured)
+        for statement in control_ddl(configured):
             con.execute(statement)
         for table, columns in _ADDED_COLUMNS.items():
-            _migrate_added_columns(con, table, columns)
+            _migrate_added_columns(con, configured, table, columns)
         con.execute("COMMIT")
     except BaseException:
         with contextlib.suppress(Exception):
@@ -418,7 +433,7 @@ def ensure_control_schema(con) -> None:
         raise
 
 
-def _table_columns(con, table: str) -> set[str]:
+def _table_columns(con, control_schema: str, table: str) -> set[str]:
     """The columns `table` currently has. Raises if the question cannot be answered.
 
     "I could not read the metadata" is NOT "the table is fine" (Codex r2 MINOR-1). The
@@ -429,35 +444,35 @@ def _table_columns(con, table: str) -> set[str]:
     table genuinely has no columns we can see, and that is worth failing on too.
     """
     try:
-        # MotherDuck's information_schema can expose the columns from a
-        # `CREATE TABLE IF NOT EXISTS` definition even when that definition did not
-        # alter an already-existing table. It is useful as a connectivity check (and
-        # remains part of the loud introspection contract), but PRAGMA table_info is
-        # the actual physical shape used to decide whether an ALTER is needed.
-        con.execute(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_schema = ? AND table_name = ?",
-            [CONTROL_SCHEMA, table],
-        ).fetchall()
+        # ``PRAGMA table_info('schema.table')`` parses the qualified name as a
+        # mini-language and cannot represent a schema containing a double quote.
+        # Information-schema parameters keep the configurable identifier as data,
+        # and the catalog predicate prevents MotherDuck's cross-database catalog
+        # view from merging same-named tables from another attached database.
         rows = con.execute(
-            f"PRAGMA table_info('{CONTROL_SCHEMA}.{table}')"
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_catalog = current_database() "
+            "AND table_schema = ? AND table_name = ?",
+            [control_schema, table],
         ).fetchall()
-        actual = {str(row[1]) for row in rows}
+        actual = {str(row[0]) for row in rows}
         if not actual:
             raise RuntimeError(
-                f"{CONTROL_SCHEMA}.{table} has no introspectable physical columns"
+                f"{control_table(control_schema, table)} has no introspectable physical columns"
             )
         return actual
     except Exception as exc:
         raise ControlSchemaFailed(
-            f"could not read the columns of {CONTROL_SCHEMA}.{table} ({exc}), so the "
+            f"could not read the columns of {control_table(control_schema, table)} ({exc}), so the "
             "late-added columns cannot be shown to exist. Refusing to continue: every "
             "write naming one of them would fail silently for the life of this "
             "destination."
         ) from exc
 
 
-def _migrate_added_columns(con, table: str, columns: tuple[tuple[str, str], ...]) -> None:
+def _migrate_added_columns(
+    con, control_schema: str, table: str, columns: tuple[tuple[str, str], ...]
+) -> None:
     """Add late-arriving columns to an already-created control table. Idempotent.
 
     A failed `ALTER` is **re-checked, not assumed benign**: the only reading of the
@@ -465,71 +480,74 @@ def _migrate_added_columns(con, table: str, columns: tuple[tuple[str, str], ...]
     know that is to look. Anything else raises, because the alternative is a writer that
     silently fails on every statement for the life of the destination (Codex r1 MINOR-1).
     """
-    existing = _table_columns(con, table)
+    qualified = control_table(control_schema, table)
+    existing = _table_columns(con, control_schema, table)
     for column, sql_type in columns:
         if column in existing:
-            _backfill_added_column(con, table, column)
+            _backfill_added_column(con, control_schema, table, column)
             continue
-        log.warning("adding %s.%s.%s", CONTROL_SCHEMA, table, column)
+        log.warning("adding %s.%s.%s", control_schema, table, column)
         try:
-            con.execute(
-                f"ALTER TABLE {CONTROL_SCHEMA}.{table} ADD COLUMN {column} {sql_type}"
-            )
+            con.execute(f"ALTER TABLE {qualified} ADD COLUMN {quote(column)} {sql_type}")
         except Exception as exc:
-            after = _table_columns(con, table)
+            after = _table_columns(con, control_schema, table)
             if column in after:
                 # The only benign reading: a concurrent runner added it between our
                 # read and our ALTER. Verified rather than assumed.
                 log.info(
                     "%s.%s.%s already existed by the time the ALTER ran (a concurrent "
-                    "runner won the race)", CONTROL_SCHEMA, table, column,
+                    "runner won the race)", control_schema, table, column,
                 )
-                _backfill_added_column(con, table, column)
+                _backfill_added_column(con, control_schema, table, column)
                 continue
             raise ControlSchemaFailed(
-                f"could not add {CONTROL_SCHEMA}.{table}.{column} ({exc}), and it is "
+                f"could not add {qualified}.{quote(column)} ({exc}), and it is "
                 "still absent. Refusing to continue: every write naming that column "
                 "would fail silently for the life of this destination. Grant the DDL "
-                f"privilege, or drop {CONTROL_SCHEMA}.{table} if it is empty."
+                f"privilege, or drop {qualified} if it is empty."
             ) from exc
-        _backfill_added_column(con, table, column)
+        _backfill_added_column(con, control_schema, table, column)
 
 
-def _backfill_added_column(con, table: str, column: str) -> None:
+def _backfill_added_column(con, control_schema: str, table: str, column: str) -> None:
     """Fill an additive column's logical default without relying on DDL constraints."""
     default = _ADDED_COLUMN_DEFAULTS.get((table, column))
     if default is None:
         return
+    qualified = control_table(control_schema, table)
+    column_identifier = (
+        column if control_schema == DEFAULT_CONTROL_SCHEMA else quote(column)
+    )
     try:
         con.execute(
-            f"UPDATE {CONTROL_SCHEMA}.{table} SET {column} = ? "
-            f"WHERE {column} IS NULL",
+            f"UPDATE {qualified} SET {column_identifier} = ? "
+            f"WHERE {column_identifier} IS NULL",
             [default],
         )
         remaining = con.execute(
-            f"SELECT count(*) FROM {CONTROL_SCHEMA}.{table} WHERE {column} IS NULL"
+            f"SELECT count(*) FROM {qualified} WHERE {column_identifier} IS NULL"
         ).fetchone()[0]
     except Exception as exc:
         raise ControlSchemaFailed(
-            f"could not backfill {CONTROL_SCHEMA}.{table}.{column} ({exc}); the "
+            f"could not backfill {qualified}.{quote(column)} ({exc}); the "
             "control-schema transaction is being rolled back"
         ) from exc
     if remaining:
         raise ControlSchemaFailed(
             f"backfill left {remaining} NULL value(s) in "
-            f"{CONTROL_SCHEMA}.{table}.{column}; refusing to publish a partially "
+            f"{qualified}.{quote(column)}; refusing to publish a partially "
             "initialized state column"
         )
 
 
-def _commit_log_primary_key(con) -> tuple[str, ...] | None:
+def _commit_log_primary_key(con, control_schema: str) -> tuple[str, ...] | None:
     """The column list of `commit_log`'s PRIMARY KEY, or None if unknowable."""
     try:
         rows = con.execute(
             "SELECT constraint_column_names FROM duckdb_constraints() "
             "WHERE schema_name = ? AND table_name = 'commit_log' "
             "AND constraint_type = 'PRIMARY KEY'",
-            [CONTROL_SCHEMA],
+            [control_schema],
         ).fetchall()
     except Exception:  # pragma: no cover - a destination without duckdb_constraints()
         log.debug("could not read commit_log constraints", exc_info=True)
@@ -539,7 +557,7 @@ def _commit_log_primary_key(con) -> tuple[str, ...] | None:
     return tuple(str(c) for c in rows[0][0])
 
 
-def _migrate_commit_log_key(con) -> None:
+def _migrate_commit_log_key(con, control_schema: str) -> None:
     """Move `commit_log` from `PRIMARY KEY (commit_id)` to `(pipeline, commit_id)`.
 
     Needed because `CREATE TABLE IF NOT EXISTS` cannot change a key, and a
@@ -550,21 +568,22 @@ def _migrate_commit_log_key(con) -> None:
 
     Runs before any commit group opens a transaction, and is a no-op once done.
     """
-    existing = _commit_log_primary_key(con)
+    existing = _commit_log_primary_key(con, control_schema)
     if existing is None or existing == () or set(existing) == {"pipeline", "commit_id"}:
         return
     log.warning(
         "migrating %s.commit_log from PRIMARY KEY %s to (pipeline, commit_id)",
-        CONTROL_SCHEMA, existing,
+        control_schema, existing,
     )
     columns = ", ".join(_COMMIT_LOG_COLUMNS)
-    old = f"{CONTROL_SCHEMA}.commit_log__cdcf_oldkey"
+    qualified = control_table(control_schema, "commit_log")
+    old = control_table(control_schema, "commit_log__cdcf_oldkey")
     con.execute(f"DROP TABLE IF EXISTS {old}")
-    con.execute(f"ALTER TABLE {CONTROL_SCHEMA}.commit_log RENAME TO commit_log__cdcf_oldkey")
-    for statement in CONTROL_DDL:
+    con.execute(f"ALTER TABLE {qualified} RENAME TO {quote('commit_log__cdcf_oldkey')}")
+    for statement in control_ddl(control_schema):
         if ".commit_log (" in statement:
             con.execute(statement)
     con.execute(
-        f"INSERT INTO {CONTROL_SCHEMA}.commit_log ({columns}) SELECT {columns} FROM {old}"
+        f"INSERT INTO {qualified} ({columns}) SELECT {columns} FROM {old}"
     )
     con.execute(f"DROP TABLE {old}")

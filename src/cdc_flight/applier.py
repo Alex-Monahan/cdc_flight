@@ -61,7 +61,7 @@ from . import (
 from .assembler import CompleteUnit, TransactionAssembler
 from .catalog_apply import CatalogCoordinator, CatalogPlan
 from .commit_group import CommitResult, OpenGroup
-from .config import ApplierConfig
+from .config import ApplierConfig, resolve_control_schema
 from .destination import AlertSink, Lease, ResumePoint
 from .envelope import KIND_SNAPSHOT_BOUNDARY, PendingRecord, decode
 from .errors import (
@@ -105,6 +105,7 @@ class Applier:
         completion: SnapshotCompletion | None = None,
         snapshot_audit=None, descriptor_provider=None,
         binary_handling_mode: str = "base64", hstore_handling_mode: str = "map",
+        control_schema: str | None = None,
     ):
         self.con = con
         self.pipeline = pipeline
@@ -114,6 +115,7 @@ class Applier:
         self.offset_path = offset_path
         self.resume_point = resume_point
         self.cfg = config
+        self.control_schema = resolve_control_schema(control_schema)
         self.lease = lease
         self.runner_id = runner_id
         self.verifier = verifier
@@ -134,10 +136,7 @@ class Applier:
         self.snapshot_completion = completion or SnapshotCompletion.full_snapshot()
         #: the consistent point of the snapshot this run applied, if any
         self.last_snapshot_lsn: int | None = None
-
-        self.registry = apply_sql.SchemaRegistry(
-            con, dataset, constraints=config.destination_constraints
-        )
+        self.registry = apply_sql.SchemaRegistry(con, dataset, constraints=config.destination_constraints, control_schema=self.control_schema)
         self.assembler = TransactionAssembler(
             snapshot_chunk_events=config.snapshot_chunk_events,
             snapshot_chunk_bytes=config.snapshot_chunk_bytes,
@@ -166,10 +165,11 @@ class Applier:
             get_registry=lambda: self.registry,
             epoch=resume_point.snapshot_epoch,
             transactional_ddl=transactional_ddl,
+            control_schema=self.control_schema,
             on_swap=snapshot_audit,
         )
-        self.spill = SpillBuffer(con, binary_mode=self.binary_handling_mode, hstore_mode=self.hstore_handling_mode)
-        self.alerts = AlertSink(con, pipeline=pipeline)
+        self.spill = SpillBuffer(con, binary_mode=self.binary_handling_mode, hstore_mode=self.hstore_handling_mode, control_schema=self.control_schema)
+        self.alerts = AlertSink(con, pipeline=pipeline, control_schema=self.control_schema)
         # rubric 1.9: an illegal table-lifecycle transition must reach an operator, and
         # the only connection that survives this group's rollback is the sink's.
         self.snapshots.alerts = self.alerts
@@ -180,6 +180,7 @@ class Applier:
             drop_mode=config.drop_mode,
             registry_of=lambda: self.registry,
             lifecycle_con=self.con,
+            control_schema=self.control_schema,
             max_destructive_per_group=config.drop_max_per_group,
             allow_mass_drop=config.drop_allow_mass,
         )
@@ -233,7 +234,7 @@ class Applier:
         self.table_counts: dict[str, int] = {}
         self.last_commit_id = resume_point.commit_id
         self.error: BaseException | None = None
-        self._next_commit_id = destination.next_commit_id(con, pipeline)
+        self._next_commit_id = destination.next_commit_id(con, pipeline, control_schema=self.control_schema)
         self._pending_offset_blob: bytes | None = None
         self._pending_offset_key_blob: bytes | None = None
 
@@ -629,6 +630,7 @@ class Applier:
                 last_lsn=stats["last_lsn"],
                 max_source_ts=commit_metadata.epoch_ms(stats["max_source_ts"]),
                 tables_touched=sorted(table_work.live_names(stats["tables"])),
+                control_schema=self.control_schema,
             )
             destination.write_resume_point(
                 self.con,
@@ -638,6 +640,7 @@ class Applier:
                 commit_id=commit_id,
                 offset_blob=self._pending_offset_blob,
                 offset_key_blob=self._pending_offset_key_blob,
+                control_schema=self.control_schema,
             )
             if fault_enabled:
                 maybe_crash("pre_commit", fault_group)
@@ -795,6 +798,7 @@ class Applier:
             target_table=refused.target,
             detected_lsn=refused.detected_lsn,
             reason=str(refused),
+            control_schema=self.control_schema,
         )
 
     def _rollback_quietly(self) -> None:
@@ -827,9 +831,7 @@ class Applier:
         # Every CREATE / ALTER we issued is gone with the transaction, so the
         # cached destination shape is now a lie. Rebuilding it is cheap and
         # not doing it is how a rolled-back run corrupts the next one.
-        self.registry = apply_sql.SchemaRegistry(
-            self.con, self.dataset, constraints=self.cfg.destination_constraints
-        )
+        self.registry = apply_sql.SchemaRegistry(self.con, self.dataset, constraints=self.cfg.destination_constraints, control_schema=self.control_schema)
         failed = list(self.group.units)
         self._reset_group()
         if failed:

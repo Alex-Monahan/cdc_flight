@@ -20,8 +20,9 @@ import contextlib
 import json
 import logging
 
-from .control_schema import CONTROL_SCHEMA
+from .config import resolve_control_schema
 from .machines import require_admission_state
+from .naming import control_table
 
 log = logging.getLogger("cdc_flight.source_relations")
 
@@ -47,6 +48,7 @@ def upsert_source_relation(
     replica_identity: str | None,
     admission_state: str = "external",
     columns=(),
+    control_schema: str | None = None,
 ) -> None:
     """Record what the source catalog says, inside the commit group's transaction.
 
@@ -56,18 +58,21 @@ def upsert_source_relation(
     """
     admission_state = require_admission_state(admission_state)
     first_seen = con.execute(
-        f"SELECT first_seen_at FROM {CONTROL_SCHEMA}.source_relations "
+        f"SELECT first_seen_at FROM "
+        f"{control_table(resolve_control_schema(control_schema), 'source_relations')} "
         "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
         [pipeline, source_schema, source_table],
     ).fetchall()
     current = _now()
     con.execute(
-        f"DELETE FROM {CONTROL_SCHEMA}.source_relations "
+        f"DELETE FROM "
+        f"{control_table(resolve_control_schema(control_schema), 'source_relations')} "
         "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
         [pipeline, source_schema, source_table],
     )
     con.execute(
-        f"INSERT INTO {CONTROL_SCHEMA}.source_relations "
+        f"INSERT INTO "
+        f"{control_table(resolve_control_schema(control_schema), 'source_relations')} "
         "(pipeline, source_schema, source_table, relation_oid, relation_filenode, "
         " relation_type_oid, published, admission_state, replica_identity, "
         " columns_json, first_seen_at, last_seen_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -105,16 +110,21 @@ def upsert_source_relation(
     )
 
 
-def forget_source_relation(con, *, pipeline: str, source_schema: str, source_table: str) -> None:
+def forget_source_relation(
+    con, *, pipeline: str, source_schema: str, source_table: str,
+    control_schema: str | None = None,
+) -> None:
     con.execute(
-        f"DELETE FROM {CONTROL_SCHEMA}.source_relations "
+        f"DELETE FROM "
+        f"{control_table(resolve_control_schema(control_schema), 'source_relations')} "
         "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
         [pipeline, source_schema, source_table],
     )
 
 
 def flush_learned_relations(
-    con, *, pipeline: str, catalog, exclude: set[str] | None = None
+    con, *, pipeline: str, catalog, exclude: set[str] | None = None,
+    control_schema: str | None = None,
 ) -> list[str]:
     """Persist what the catalog watcher learned, in its own transaction. Returns names.
 
@@ -170,6 +180,7 @@ def flush_learned_relations(
                 replica_identity=relation.replica_identity,
                 admission_state=require_admission_state(relation.admission_state),
                 columns=relation.columns,
+                control_schema=control_schema,
             )
         con.execute("COMMIT")
     except BaseException:

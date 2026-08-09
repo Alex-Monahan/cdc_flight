@@ -31,6 +31,7 @@ import uuid
 import duckdb
 import pytest
 from support.applier_lab import FakeCommitter, begin, end, keyed, snap
+from support.motherduck_probe import scratch_database
 
 from cdc_flight import destination as dest_mod
 from cdc_flight.applier import Applier
@@ -50,7 +51,6 @@ pytestmark = [pytest.mark.motherduck, pytest.mark.e2e]
 #: have seen the transition.
 REFRESH = "FORCE CHECKPOINT"
 
-MD_DATABASE = "cdc_flight_dev"
 N = 1500  # per table; 2 * N = 3000 events > max.batch.size (2048)
 
 
@@ -63,7 +63,7 @@ def md_token() -> str:
     return token
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def md_observed_txn(sandbox, md_token) -> dict:
     """Stream one multi-table PG transaction into MotherDuck, watching from outside.
 
@@ -71,26 +71,25 @@ def md_observed_txn(sandbox, md_token) -> dict:
     the pipeline writes, and records every `(customers, orders)` pair it sees.
     An atomic implementation can only ever be observed at `(0, 0)` or `(N, N)`.
     """
-    dataset = f"cdc_atomic_{uuid.uuid4().hex[:8]}"
-    dsn = f"md:{MD_DATABASE}?motherduck_token={md_token}"
-    env = {
-        "CDC_DATASET": dataset,
-        "CDC_MD_DATABASE": MD_DATABASE,
-        "MOTHERDUCK_TOKEN": md_token,
-        "motherduck_token": md_token,
-    }
+    with scratch_database(md_token, "cdc_atomic") as database:
+        dataset = f"cdc_atomic_{uuid.uuid4().hex[:8]}"
+        control_schema = f"_cdc_flight_{uuid.uuid4().hex[:8]}"
+        dsn = f"md:{database}?motherduck_token={md_token}"
+        env = {
+            "CDC_DATASET": dataset,
+            "CDC_MD_DATABASE": database,
+            "CDC_CONTROL_SCHEMA": control_schema,
+            "MOTHERDUCK_TOKEN": md_token,
+            "motherduck_token": md_token,
+        }
 
-    bootstrap = duckdb.connect(f"md:?motherduck_token={md_token}")
-    bootstrap.execute(f'CREATE DATABASE IF NOT EXISTS "{MD_DATABASE}"')
-    bootstrap.close()
+        sandbox.reseed()
+        sandbox.run(
+            reset_state=True, destination="motherduck", max_seconds=300,
+            timeout=600, extra_env=env,
+        )
 
-    sandbox.reseed()
-    sandbox.run(
-        reset_state=True, destination="motherduck", max_seconds=300,
-        timeout=600, extra_env=env,
-    )
-
-    sandbox.sql(
+        sandbox.sql(
         [
             "INSERT INTO app.customers (name, email) SELECT "
             "'mdatomic-c-' || i, 'mdatomic-c-' || i || '@example.com' "
@@ -101,56 +100,66 @@ def md_observed_txn(sandbox, md_token) -> dict:
         one_transaction=True,
     )
 
-    observations: list[tuple[int, int]] = []
-    stop = threading.Event()
+        observations: list[tuple[int, int]] = []
+        stop = threading.Event()
 
-    def _observe():
-        con = duckdb.connect(dsn)
+        def _observe():
+            con = duckdb.connect(dsn)
+            try:
+                while not stop.is_set():
+                    try:
+                        con.execute(REFRESH)
+                        row = con.execute(
+                            f'SELECT (SELECT count(*) FROM "{dataset}"."cdcflight_app_customers" '
+                            "        WHERE name LIKE 'mdatomic-c-%'), "
+                            f'       (SELECT count(*) FROM "{dataset}"."cdcflight_app_orders" o '
+                            f'        WHERE EXISTS (SELECT 1 FROM "{dataset}"."cdcflight_app_customers" c '
+                            "                      WHERE c.id = o.customer_id "
+                            "                        AND c.name LIKE 'mdatomic-c-%'))"
+                        ).fetchone()
+                        observations.append((int(row[0]), int(row[1])))
+                    except duckdb.Error:
+                        observations.append((0, 0))  # tables not created yet
+                    stop.wait(0.25)
+            finally:
+                con.close()
+
+        watcher = threading.Thread(target=_observe, name="md-observer", daemon=True)
+        watcher.start()
         try:
-            while not stop.is_set():
-                try:
-                    con.execute(REFRESH)
-                    row = con.execute(
-                        f'SELECT (SELECT count(*) FROM "{dataset}"."cdcflight_app_customers" '
-                        "        WHERE name LIKE 'mdatomic-c-%'), "
-                        f'       (SELECT count(*) FROM "{dataset}"."cdcflight_app_orders" o '
-                        f'        WHERE EXISTS (SELECT 1 FROM "{dataset}"."cdcflight_app_customers" c '
-                        "                      WHERE c.id = o.customer_id "
-                        "                        AND c.name LIKE 'mdatomic-c-%'))"
-                    ).fetchone()
-                    observations.append((int(row[0]), int(row[1])))
-                except duckdb.Error:
-                    observations.append((0, 0))  # tables not created yet
-                stop.wait(0.25)
+            streamed = sandbox.run(
+                destination="motherduck", max_seconds=400, idle_seconds=10,
+                timeout=700, extra_env=env,
+            )
+        finally:
+            time.sleep(1.0)
+            stop.set()
+            watcher.join(timeout=15)
+
+        con = duckdb.connect(dsn)
+        con.execute(REFRESH)
+        try:
+            yield {
+                "box": sandbox,
+                "con": con,
+                "database": database,
+                "control_schema": control_schema,
+                "dataset": dataset,
+                "streamed": streamed,
+                "observations": observations,
+                "n": N,
+            }
         finally:
             con.close()
 
-    watcher = threading.Thread(target=_observe, name="md-observer", daemon=True)
-    watcher.start()
-    try:
-        streamed = sandbox.run(
-            destination="motherduck", max_seconds=400, idle_seconds=10,
-            timeout=700, extra_env=env,
-        )
-    finally:
-        time.sleep(1.0)
-        stop.set()
-        watcher.join(timeout=15)
 
-    con = duckdb.connect(dsn)
-    con.execute(REFRESH)
-    try:
+@pytest.fixture
+def md_case(md_token):
+    with scratch_database(md_token, "cdc_overlap") as database:
         yield {
-            "box": sandbox,
-            "con": con,
-            "dataset": dataset,
-            "streamed": streamed,
-            "observations": observations,
-            "n": N,
+            "database": database,
+            "control_schema": f"_cdc_flight_{uuid.uuid4().hex[:8]}",
         }
-    finally:
-        con.execute(f'DROP SCHEMA IF EXISTS "{MD_DATABASE}"."{dataset}" CASCADE')
-        con.close()
 
 
 def test_scenario_reached_motherduck(md_observed_txn):
@@ -209,19 +218,18 @@ def test_target_one_commit_group_per_pg_transaction_in_motherduck(md_observed_tx
     assert len(commits) == 1, f"PG transaction split across {len(commits)} commit groups"
 
 
-def test_motherduck_fenced_spilled_overlap_is_dropped_without_owner(md_token, tmp_path):
+def test_motherduck_fenced_spilled_overlap_is_dropped_without_owner(md_case, md_token, tmp_path):
     """MotherDuck sees no destination owner for a discarded overlap."""
+    database = md_case["database"]
+    control_schema = md_case["control_schema"]
     dataset = f"cdc_overlap_{uuid.uuid4().hex[:8]}"
     pipeline = f"md_overlap_{uuid.uuid4().hex[:8]}"
-    dsn = f"md:{MD_DATABASE}?motherduck_token={md_token}"
-    bootstrap = duckdb.connect(f"md:?motherduck_token={md_token}")
-    bootstrap.execute(f'CREATE DATABASE IF NOT EXISTS "{MD_DATABASE}"')
-    bootstrap.close()
+    dsn = f"md:{database}?motherduck_token={md_token}"
 
     con = duckdb.connect(dsn)
-    dest_mod.ensure_control_schema(con)
+    dest_mod.ensure_control_schema(con, control_schema)
     dest_mod.ensure_dataset(con, dataset)
-    lease = Lease(pipeline, ttl_seconds=600)
+    lease = Lease(pipeline, ttl_seconds=600, control_schema=control_schema)
     lease.acquire(con)
     completion = SnapshotCompletion.full_snapshot({"app.customers"})
     completion.observe_notification("STARTED", {})
@@ -251,6 +259,7 @@ def test_motherduck_fenced_spilled_overlap_is_dropped_without_owner(md_token, tm
         lease=lease,
         runner_id="md-overlap-runner",
         completion=completion,
+        control_schema=control_schema,
     )
     committer = FakeCommitter()
     applier._committer = committer
@@ -297,10 +306,10 @@ def test_motherduck_fenced_spilled_overlap_is_dropped_without_owner(md_token, tm
                 (2, "s"),
             ]
             assert verify.execute(
-                "SELECT count(*) FROM _cdc_flight.spill_events"
+                f'SELECT count(*) FROM "{control_schema}"."spill_events"'
             ).fetchone()[0] == 0
             assert verify.execute(
-                "SELECT count(*), sum(fenced_units) FROM _cdc_flight.commit_log "
+                f'SELECT count(*), sum(fenced_units) FROM "{control_schema}"."commit_log" '
                 "WHERE pipeline = ?",
                 [pipeline],
             ).fetchone() == (1, 0)
@@ -311,8 +320,3 @@ def test_motherduck_fenced_spilled_overlap_is_dropped_without_owner(md_token, tm
         lease.release(con)
         applier.alerts.close()
         con.close()
-        cleanup = duckdb.connect(dsn)
-        try:
-            cleanup.execute(f'DROP SCHEMA IF EXISTS "{dataset}" CASCADE')
-        finally:
-            cleanup.close()

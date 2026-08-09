@@ -12,11 +12,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
+DEFAULT_CONTROL_SCHEMA = "_cdc_flight"
 
 
 def _env(name: str, default: str) -> str:
     value = os.environ.get(name)
     return default if value is None or value == "" else value
+
+
+def resolve_control_schema(value: str | None = None) -> str:
+    """Resolve the destination control schema from the one destination config surface."""
+    if value is not None and value != "":
+        return value
+    return _env("CDC_CONTROL_SCHEMA", DEFAULT_CONTROL_SCHEMA)
 
 
 def _instance_id() -> str:
@@ -150,6 +158,7 @@ class DestinationConfig:
     motherduck_database: str = field(
         default_factory=lambda: _env("CDC_MD_DATABASE", "cdc_flight_dev")
     )
+    control_schema: str = field(default_factory=resolve_control_schema)
     pipelines_dir: Path = field(
         default_factory=lambda: Path(
             _env(

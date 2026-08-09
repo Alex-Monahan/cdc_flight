@@ -65,6 +65,7 @@ class PostEngineCompletion:
             dsn=self.source_dsn,
             slot_name=self.slot_name,
             snapshot_mode=self.snapshot_mode,
+            control_schema=self.destination.control_schema,
         )
 
         learned = dest_mod.flush_learned_relations(
@@ -76,8 +77,10 @@ class PostEngineCompletion:
                     self.con,
                     pipeline=self.pipeline,
                     dataset=self.dataset,
+                    control_schema=self.destination.control_schema,
                 )
             ),
+            control_schema=self.destination.control_schema,
         )
         if learned:
             extra["source_relations_persisted"] = learned
@@ -85,7 +88,9 @@ class PostEngineCompletion:
         if self.journal is not None:
             self._discharge_recovery(result, extra)
 
-        owing = table_lifecycle.owing_work(self.con, self.pipeline)
+        owing = table_lifecycle.owing_work(
+            self.con, self.pipeline, control_schema=self.destination.control_schema
+        )
         if owing:
             extra["tables_awaiting_snapshot_unhandled"] = owing
             self.outcome.record("catalog_unresolved")
@@ -102,7 +107,9 @@ class PostEngineCompletion:
             self._confirm_baseline(result, extra)
 
         pending_refusals = dest_mod.pending_schema_refusals(
-            self.con, self.pipeline
+            self.con,
+            self.pipeline,
+            control_schema=self.destination.control_schema,
         )
         if pending_refusals:
             names = [f"{schema}.{table}" for schema, table, _reason in pending_refusals]
@@ -126,9 +133,14 @@ class PostEngineCompletion:
             pipeline=self.pipeline,
             dataset=self.dataset,
             dsn=self.source_dsn,
-            owed=dest_mod.tables_awaiting_snapshot(self.con, self.pipeline),
+            owed=dest_mod.tables_awaiting_snapshot(
+                self.con,
+                self.pipeline,
+                control_schema=self.destination.control_schema,
+            ),
             completion=self.snapshot_completion,
             drop_mode=self.drop_mode,
+            control_schema=self.destination.control_schema,
         )
         if emptied:
             extra["verified_empty_after_snapshot"] = emptied
@@ -140,6 +152,7 @@ class PostEngineCompletion:
             namespace=self.namespace,
             record=self.journal,
             verified_empty=emptied,
+            control_schema=self.destination.control_schema,
         )
         if completion.cleared:
             extra["recovery_cleared"] = completion.recovery_id
@@ -168,6 +181,7 @@ class PostEngineCompletion:
             check=self.baseline,
             successful_polls=self.watcher.successful_polls,
             runner_id=self.runner_id,
+            control_schema=self.destination.control_schema,
         )
         extra.update(baseline.as_dict())
         if baseline.valid:

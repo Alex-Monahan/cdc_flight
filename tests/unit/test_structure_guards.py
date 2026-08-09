@@ -15,7 +15,7 @@ import pytest
 _BASELINE_SELECTED = {
     "not motherduck and not slow": 1371,
     "slow and not motherduck": 124,
-    "motherduck": 29,
+    "motherduck": 30,
 }
 
 

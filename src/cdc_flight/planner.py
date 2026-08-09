@@ -466,7 +466,11 @@ class GroupPlan:
             for target, event_id, columns, digest in self.column_presence
             for column in columns
         ]
-        destination.write_column_presence_batch(self.con, presence_rows)
+        destination.write_column_presence_batch(
+            self.con,
+            presence_rows,
+            control_schema=getattr(self.snapshots, "control_schema", None),
+        )
 
         if self.staged_units and clear_spill:
             self.spill.clear(self.commit_id)

@@ -24,8 +24,9 @@ import logging
 from dataclasses import dataclass
 
 from . import apply_sql, naming
-from .destination import CONTROL_SCHEMA
+from .config import resolve_control_schema
 from .envelope import KIND_DATA, KIND_TRUNCATE, OP_TRUNCATE, PendingRecord
+from .naming import control_table
 from .row_patch import RowPatch
 from .typed_types import SourceTypeDescriptor, TypedImage
 
@@ -64,8 +65,12 @@ class StagedEvent:
 class SpillBuffer:
     """Reads and writes `_cdc_flight.spill_events`. Owns no policy."""
 
-    def __init__(self, con, *, binary_mode: str = "base64", hstore_mode: str = "map"):
+    def __init__(
+        self, con, *, binary_mode: str = "base64", hstore_mode: str = "map",
+        control_schema: str | None = None,
+    ):
         self.con = con
+        self.control_schema = resolve_control_schema(control_schema)
         self.binary_mode = binary_mode
         self.hstore_mode = hstore_mode
         #: rows currently staged for the open commit group
@@ -106,7 +111,8 @@ class SpillBuffer:
             for staged in prepared
         ]
         apply_sql.bulk_insert(
-            self.con, f"{CONTROL_SCHEMA}.spill_events", _COLUMNS, rows, _TYPES
+            self.con, control_table(self.control_schema, "spill_events"),
+            _COLUMNS, rows, _TYPES
         )
         self.rows += len(rows)
         return len(rows)
@@ -122,7 +128,8 @@ class SpillBuffer:
             f"SELECT target_table, source_schema, source_table, lsn, txn_id, total_order, "
             "       cdcf_event_id, op, source_ts_ms, before_json, after_json, key_json, "
             "       event_seq "
-            f"FROM {CONTROL_SCHEMA}.spill_events WHERE commit_id = ? AND unit_seq = ? "
+            f"FROM {control_table(self.control_schema, 'spill_events')} "
+            "WHERE commit_id = ? AND unit_seq = ? "
             "ORDER BY event_seq",
             [commit_id, unit_seq],
         ).fetchall()
@@ -172,7 +179,8 @@ class SpillBuffer:
         either way.
         """
         self.con.execute(
-            f"DELETE FROM {CONTROL_SCHEMA}.spill_events WHERE commit_id = ?", [commit_id]
+            f"DELETE FROM {control_table(self.control_schema, 'spill_events')} "
+            "WHERE commit_id = ?", [commit_id]
         )
         self.rows = 0
 

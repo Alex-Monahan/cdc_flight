@@ -35,6 +35,7 @@ import logging
 import math
 from typing import Any
 
+from .config import resolve_control_schema
 from .errors import (
     DestinationIdentityCollision,
     SchemaBackfillRefused,
@@ -192,10 +193,18 @@ class SchemaRegistry:
     accepted, so the merge path is unaffected.
     """
 
-    def __init__(self, con, dataset: str, *, constraints: bool = True):
+    def __init__(
+        self,
+        con,
+        dataset: str,
+        *,
+        constraints: bool = True,
+        control_schema: str | None = None,
+    ):
         self.con = con
         self.dataset = dataset
         self.constraints = constraints
+        self.control_schema = resolve_control_schema(control_schema)
         self._tables: dict[str, TableSchema] = {}
 
     def get(self, name: str) -> TableSchema:
@@ -742,7 +751,7 @@ class SchemaRegistry:
             if CDCF_EVENT_ID in table.columns:
                 self.con.execute(
                     f"UPDATE {table.qualified} AS t SET {quote(new)} = {quote(old)} "
-                    f"WHERE NOT EXISTS (SELECT 1 FROM {quote('_cdc_flight')}."
+                    f"WHERE NOT EXISTS (SELECT 1 FROM {quote(self.control_schema)}."
                     f"{quote('column_presence')} AS p "
                     f"WHERE p.target_dataset = ? AND p.target_table = ? "
                     f"AND p.event_id = t.{quote(CDCF_EVENT_ID)} "
@@ -782,7 +791,7 @@ class SchemaRegistry:
                 table.raw_types.pop(old, None)
             if CDCF_EVENT_ID in table.columns:
                 self.con.execute(
-                    f"DELETE FROM {quote('_cdc_flight')}."
+                    f"DELETE FROM {quote(self.control_schema)}."
                     f"{quote('column_presence')} "
                     "WHERE target_dataset = ? AND target_table = ? AND column_name = ?",
                     [self.dataset, table.name, new],

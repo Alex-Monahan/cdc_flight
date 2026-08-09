@@ -70,7 +70,13 @@ def reject_log_owed_tail(applier, unit) -> None:
     """
     if applier.catalog is None or unit.kind != UNIT_TXN:
         return
-    owing = set(table_lifecycle.owing_work(applier.con, applier.pipeline))
+    owing = set(
+        table_lifecycle.owing_work(
+            applier.con,
+            applier.pipeline,
+            control_schema=applier.control_schema,
+        )
+    )
     blocked = sorted(unit.tables_touched() & owing)
     if blocked and applier.cfg.drop_mode == DROP_LOG:
         raise SnapshotObservationError(

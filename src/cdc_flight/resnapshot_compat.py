@@ -22,6 +22,7 @@ def completed_tables(
     reason: str = "",
     new_relations: set[str] | None = None,
     write_audit: bool = True,
+    control_schema: str | None = None,
 ) -> list[str]:
     """Project requested tables whose shadow has already reached ``complete``.
 
@@ -34,7 +35,11 @@ def completed_tables(
     discovered = new_relations or set()
     for schema, table, target in tables:
         state = table_lifecycle.read(
-            con, pipeline=pipeline, source_schema=schema, source_table=table
+            con,
+            pipeline=pipeline,
+            source_schema=schema,
+            source_table=table,
+            control_schema=control_schema,
         )
         if state != table_lifecycle.COMPLETE:
             continue
@@ -79,6 +84,7 @@ def completed_tables(
                 events=tuple(events),
                 namespace=None,
                 snapshot_epoch=None,
+                control_schema=control_schema,
             )
             con.execute("COMMIT")
         except BaseException:

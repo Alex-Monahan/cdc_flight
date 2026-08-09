@@ -506,7 +506,11 @@ def run_engine_bounded(
         con = getattr(handler, "con", None)
         pipeline = getattr(handler, "pipeline", None)
         owing = (
-            table_lifecycle.owing_work(con, pipeline)
+            table_lifecycle.owing_work(
+                con,
+                pipeline,
+                control_schema=getattr(handler, "control_schema", None),
+            )
             if con is not None and pipeline is not None
             else []
         )

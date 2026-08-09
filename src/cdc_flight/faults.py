@@ -95,6 +95,9 @@ import os
 import sys
 import time
 
+from .config import resolve_control_schema
+from .naming import quote
+
 log = logging.getLogger("cdc_flight.faults")
 
 ENV_VAR = "CDC_FAULT_INJECT"
@@ -351,10 +354,15 @@ def current_group() -> int:
 _DATA_STATEMENTS = ("insert into", "update ", "delete from", "create table", "create or replace")
 
 
-def _is_data_statement(sql: str) -> bool:
+def _is_data_statement(sql: str, control_schema: str | None = None) -> bool:
     lowered = sql.lstrip().lower()
-    if lowered.startswith(("insert into _cdc_flight", "delete from _cdc_flight",
-                           "update _cdc_flight", "insert or replace into _cdc_flight")):
+    configured = resolve_control_schema(control_schema)
+    control_prefixes = (configured.lower(), quote(configured).lower())
+    if any(
+        lowered.startswith(f"{verb} {prefix}.")
+        for verb in ("insert into", "delete from", "update", "insert or replace into")
+        for prefix in control_prefixes
+    ):
         return False
     return lowered.startswith(_DATA_STATEMENTS)
 
@@ -370,11 +378,20 @@ class FaultyConnection:
     conflating them would hide which one the test proved).
     """
 
-    def __init__(self, con, point: str, nth: int, *, hang_seconds: float = 3600.0):
+    def __init__(
+        self,
+        con,
+        point: str,
+        nth: int,
+        *,
+        hang_seconds: float = 3600.0,
+        control_schema: str | None = None,
+    ):
         self._con = con
         self._point = point
         self._nth = nth
         self._hang_seconds = hang_seconds
+        self._control_schema = resolve_control_schema(control_schema)
         self.fired = False
 
     # -- the injected surface ---------------------------------------------- #
@@ -400,7 +417,9 @@ class FaultyConnection:
 
     def _maybe_fire(self, statement: str) -> None:
         lowered = statement.lstrip().lower()
-        if self._point == "destination_write" and _is_data_statement(statement):
+        if self._point == "destination_write" and _is_data_statement(
+            statement, self._control_schema
+        ):
             self.fired = True
             record_fired(self._point, self._nth, "raise")
             log.error("FAULT INJECTION: destination rejects %r (group %s)",
@@ -429,7 +448,9 @@ class FaultyConnection:
                 )
                 sys.stdout.flush()
                 time.sleep(self._hang_seconds)
-        if self._point == "destination_close" and _is_data_statement(statement):
+        if self._point == "destination_close" and _is_data_statement(
+            statement, self._control_schema
+        ):
             self.fired = True
             record_fired(self._point, self._nth, "close")
             log.error("FAULT INJECTION: severing the destination connection (group %s)",
@@ -466,7 +487,12 @@ def hang_seconds() -> float:
         ) from exc
 
 
-def wrap_destination(con, *, hang_seconds: float | None = None):
+def wrap_destination(
+    con,
+    *,
+    hang_seconds: float | None = None,
+    control_schema: str | None = None,
+):
     """Return `con`, or a `FaultyConnection` when a `destination_*` fault is armed."""
     spec = _spec()
     if spec is None:
@@ -479,7 +505,13 @@ def wrap_destination(con, *, hang_seconds: float | None = None):
         "destination fault armed: %s at data group %s%s",
         point, nth, f" (hang {hang}s)" if point == "destination_hang" else "",
     )
-    return FaultyConnection(con, point, nth, hang_seconds=hang)
+    return FaultyConnection(
+        con,
+        point,
+        nth,
+        hang_seconds=hang,
+        control_schema=control_schema,
+    )
 
 
 #: Where a fired anchor records itself. Inside `CDC_STATE_DIR` so a test that owns a

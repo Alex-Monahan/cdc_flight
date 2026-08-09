@@ -207,7 +207,10 @@ class LiveDiscoveryCoordinator:
                         dict(self.result),
                     )
                 self.main_resume = dest_mod.read_resume_point(
-                    self.con, self.destination.pipeline_name, self.namespace
+                    self.con,
+                    self.destination.pipeline_name,
+                    self.namespace,
+                    control_schema=self.destination.control_schema,
                 ) or self.applier.resume_point
                 tables = [
                     (
@@ -227,6 +230,7 @@ class LiveDiscoveryCoordinator:
                         "a new source relation was discovered while the pipeline was "
                         "running; the main slot remains active during its re-snapshot"
                     ),
+                    control_schema=self.destination.control_schema,
                 )
                 self.phases.to(
                     PHASE_SNAPSHOTTING, detail="live catalog discovery hand-off"
@@ -249,6 +253,7 @@ class LiveDiscoveryCoordinator:
                     ownership=self.ownership,
                     new_relations={relation.qualified for relation in newly_discovered},
                     drop_mode=self.applier_cfg.drop_mode,
+                    control_schema=self.destination.control_schema,
                 )
                 self.watcher.complete_discoveries(
                     {relation.qualified for relation in newly_discovered}
@@ -270,7 +275,9 @@ class LiveDiscoveryCoordinator:
                     resnap.snapshot_epoch,
                 )
                 self.watermarks = resnapshot_mod.read_watermarks(
-                    self.con, self.destination.pipeline_name
+                    self.con,
+                    self.destination.pipeline_name,
+                    control_schema=self.destination.control_schema,
                 )
                 handled_discoveries.update(
                     relation.qualified for relation in newly_discovered
@@ -311,6 +318,7 @@ class LiveDiscoveryCoordinator:
                         pipeline=self.destination.pipeline_name,
                         catalog=self.watcher,
                         exclude=self.catalog_flush_exclude,
+                        control_schema=self.destination.control_schema,
                     )
                     if learned:
                         self.summary_extra["source_relations_persisted"] = learned
@@ -347,6 +355,7 @@ class LiveDiscoveryCoordinator:
             completion=completion,
             binary_handling_mode=self.props.get("binary.handling.mode", "base64"),
             hstore_handling_mode=self.props.get("hstore.handling.mode", "map"),
+            control_schema=self.destination.control_schema,
         )
         self.ownership.attach(applier)
         return applier
