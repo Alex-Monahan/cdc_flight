@@ -87,14 +87,24 @@ def _ensure_toast_policies(
     """Make residual TOAST tables FULL before this catalog epoch is admitted."""
     updated = dict(observed)
     for qualified, relation in observed.items():
+        def positive_lsn(value):
+            try:
+                candidate = int(value)
+            except (TypeError, ValueError):
+                return None
+            return candidate if candidate > 0 else None
+
         previous = getattr(watcher, "known", {}).get(qualified)
+        current_boundary = positive_lsn(relation.full_activation_lsn)
+        previous_boundary = positive_lsn(
+            getattr(previous, "full_activation_lsn", None)
+        )
         if (
-            relation.full_activation_lsn is None
-            and previous is not None
-            and previous.full_activation_lsn is not None
+            current_boundary is None
+            and previous_boundary is not None
         ):
             relation = replace(
-                relation, full_activation_lsn=previous.full_activation_lsn
+                relation, full_activation_lsn=previous_boundary
             )
             updated[qualified] = relation
         policy = classify_relation(
@@ -105,15 +115,12 @@ def _ensure_toast_policies(
             hstore_mode=watcher.hstore_handling_mode,
             full_activation_lsn=relation.full_activation_lsn,
         )
-        if not policy.residual_columns or str(relation.replica_identity).lower() == "f":
-            if (
-                policy.residual_columns
-                and relation.full_activation_lsn is None
-                and activation_lsn is not None
-            ):
-                updated[qualified] = replace(
-                    relation, full_activation_lsn=int(activation_lsn)
-                )
+        if not policy.residual_columns:
+            continue
+        if (
+            str(relation.replica_identity).lower() == "f"
+            and positive_lsn(relation.full_activation_lsn) is not None
+        ):
             continue
         try:
             schema, _, table = qualified.partition(".")
@@ -132,7 +139,18 @@ def _ensure_toast_policies(
                 raise RuntimeError(
                     f"source reported replica identity {verified[0] if verified else None!r}"
                 )
-            boundary = int(activation_lsn) if activation_lsn is not None else 0
+            # The read-side sample is intentionally not an activation proof: it is
+            # taken before this ALTER in the normal poll path, so an event committed
+            # between that sample and the ALTER would otherwise be admitted.  Sample
+            # WAL only after the source confirms FULL, and reject zero/absent values.
+            post_alter = conn.execute(observation_mod.ACTIVATION_LSN_SQL).fetchone()
+            boundary = positive_lsn(post_alter[0] if post_alter else None)
+            pre_alter = positive_lsn(activation_lsn)
+            if boundary is None or (pre_alter is not None and boundary <= pre_alter):
+                raise RuntimeError(
+                    f"post-ALTER WAL boundary {boundary!r} did not prove it follows "
+                    f"the pre-ALTER sample {pre_alter!r}"
+                )
             updated[qualified] = replace(
                 relation,
                 replica_identity="f",
@@ -297,7 +315,7 @@ def poll(watcher):
         # automatic refetch/resnapshot route; an unverified ALTER is never treated as
         # success.
         observed = _ensure_toast_policies(
-            watcher, write_conn, observed, activation_lsn=lsn + 1
+            watcher, write_conn, observed, activation_lsn=lsn
         )
         added = watcher._compare(observed, lsn)
         watcher._ensure_published(write_conn, observed, added)

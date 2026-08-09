@@ -81,7 +81,7 @@ class ToastTablePolicy:
         if self.route is ToastRoute.FALLBACK:
             return False
         if self.route is ToastRoute.REPLICA_IDENTITY_FULL:
-            if self.full_activation_lsn is None:
+            if self.full_activation_lsn is None or int(self.full_activation_lsn) <= 0:
                 return False
             if lsn is None or int(lsn) < self.full_activation_lsn:
                 return False

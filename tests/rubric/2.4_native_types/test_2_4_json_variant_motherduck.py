@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from support.motherduck_probe import assert_runtime, connect, scratch_database
 
-from cdc_flight.apply_sql import SchemaRegistry, insert_rows
+from cdc_flight.apply_sql import SchemaRegistry, delete_keys, insert_rows
 from cdc_flight.config import DestinationConfig, motherduck_token
 from cdc_flight.destination import connect as destination_connect
 from cdc_flight.typed_types import SourceTypeDescriptor
@@ -105,6 +105,94 @@ def test_motherduck_jsonb_key_gain_and_loss_use_the_same_shadow_resolver():
             assert con.execute(
                 'SELECT "payload" FROM typed."transitions"'
             ).fetchone() == ({"body": True},)
+        finally:
+            con.close()
+
+
+def test_motherduck_nested_composite_jsonb_key_deletes_existing_row():
+    """A recursive key descriptor must use JSON on the physical shadow table."""
+    token = motherduck_token()
+    if not token:
+        pytest.skip("`motherduck_token` not set")
+
+    integer = _source("int4", 23)
+    text = _source("text", 25)
+    jsonb = _source("jsonb", 3802)
+    inner = SourceTypeDescriptor(
+        9100,
+        "app.inner_key",
+        "composite",
+        composite_fields=(("doc", jsonb), ("n", integer)),
+    )
+    outer = SourceTypeDescriptor(
+        9101,
+        "app.outer_key",
+        "composite",
+        composite_fields=(("inner_key", inner), ("note", text)),
+    )
+
+    with scratch_database(token, "cdc_p2b_nested_json_key") as database:
+        con = connect(token, database)
+        try:
+            con.execute("CREATE SCHEMA typed")
+            registry = SchemaRegistry(con, "typed")
+            registry.ensure_typed(
+                "nested_key",
+                columns={"id": integer, "compound": outer, "payload": text},
+                key_columns=("id",),
+            )
+            insert_rows(
+                con,
+                registry.get("nested_key"),
+                ["id", "compound", "payload"],
+                [[1, {"inner_key": {"doc": '{"a":1}', "n": 7}, "note": "x"}, "kept"]],
+            )
+            registry.ensure_typed(
+                "nested_key",
+                columns={"id": integer, "compound": outer, "payload": text},
+                key_columns=("id", "compound"),
+            )
+            table = registry.get("nested_key")
+            assert "doc JSON" in table.raw_types["compound"]
+            delete_keys(
+                con,
+                table,
+                ("id", "compound"),
+                [(1, {"inner_key": {"doc": '{"a":1}', "n": 7}, "note": "x"})],
+            )
+            assert con.execute('SELECT count(*) FROM typed."nested_key"').fetchone()[0] == 0
+        finally:
+            con.close()
+
+
+def test_motherduck_bytea_key_changed_to_union_deletes_existing_row():
+    """The SQL and Python bytea identity renderings must be byte-for-byte equal."""
+    token = motherduck_token()
+    if not token:
+        pytest.skip("`motherduck_token` not set")
+
+    bytea = _source("bytea", 17)
+    text = _source("text", 25)
+    with scratch_database(token, "cdc_p2b_bytea_union_key") as database:
+        con = connect(token, database)
+        try:
+            con.execute("CREATE SCHEMA typed")
+            registry = SchemaRegistry(con, "typed")
+            registry.ensure_typed(
+                "bytea_union_key",
+                columns={"id": bytea, "payload": text},
+                key_columns=("id",),
+            )
+            insert_rows(
+                con,
+                registry.get("bytea_union_key"),
+                ["id", "payload"],
+                [[b"abc", "kept"]],
+            )
+            registry.convert_column_to_union("bytea_union_key", "id", bytea, text)
+            table = registry.get("bytea_union_key")
+            delete_keys(con, table, ("id",), [(b"abc",)])
+            assert con.execute('SELECT count(*) FROM typed."bytea_union_key"').fetchone()[0] == 0
         finally:
             con.close()
 

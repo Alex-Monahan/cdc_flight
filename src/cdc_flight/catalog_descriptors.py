@@ -11,9 +11,10 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 
+from .errors import SchemaEvolutionRefused
 from .naming import normalize
 from .schema_evolution import descriptor_from_type_name
-from .typed_types import SourceTypeDescriptor
+from .typed_types import SourceTypeDescriptor, UnsupportedType, native_type
 
 
 @dataclass
@@ -186,13 +187,26 @@ class RelationDescriptorProvider:
         oids = {int(row[3]) for row in rows}
         reader = CatalogDescriptorReader(con)
         descriptors = reader.resolve(oids)
+        missing = sorted(oids - set(descriptors))
+        if missing:
+            raise SchemaEvolutionRefused(
+                "catalog descriptor authority is incomplete for OID(s) "
+                + ", ".join(str(oid) for oid in missing)
+            )
         result: dict[str, dict[str, SourceTypeDescriptor]] = {}
         for schema, table, name, oid, typmod, formatted in rows:
             oid = int(oid)
-            descriptor = descriptors.get(oid) or descriptor_from_type_name(
-                str(formatted), oid=oid, typmod=int(typmod)
-            )
+            descriptor = descriptors[oid]
             descriptor = _column_facts(descriptor, str(formatted), typmod)
+            try:
+                # Resolving the complete tree is the authority check.  An empty
+                # composite, missing array child, incomplete map, or unsupported
+                # descendant must not be converted into a guessed VARCHAR.
+                native_type(descriptor)
+            except (UnsupportedType, ValueError) as exc:
+                raise SchemaEvolutionRefused(
+                    f"catalog descriptor authority is incomplete for {schema}.{table}.{name}"
+                ) from exc
             result.setdefault(f"{schema}.{table}", {})[normalize(str(name))] = descriptor
         return cls(result)
 

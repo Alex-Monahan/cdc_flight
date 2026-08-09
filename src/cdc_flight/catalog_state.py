@@ -68,6 +68,15 @@ class SourceRelation:
             state = ADMISSION_EXTERNAL if self.published else ADMISSION_PENDING
         state = require_admission_state(state)
         object.__setattr__(self, "admission_state", state)
+        try:
+            boundary = int(self.full_activation_lsn) if self.full_activation_lsn is not None else None
+        except (TypeError, ValueError):
+            boundary = None
+        object.__setattr__(
+            self,
+            "full_activation_lsn",
+            boundary if boundary is not None and boundary > 0 else None,
+        )
 
     @property
     def qualified(self) -> str:
@@ -251,7 +260,9 @@ def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
             # refused; it is not an observation that may derive a default from `published`.
             admission_state=admission_state,
             full_activation_lsn=(
-                int(full_activation_lsn) if full_activation_lsn is not None else None
+                int(full_activation_lsn)
+                if full_activation_lsn is not None and int(full_activation_lsn) > 0
+                else None
             ),
         )
     return known

@@ -337,7 +337,9 @@ def collect(
             fingerprint = descriptor.fingerprint
             if item.native_fingerprints.get(column) != fingerprint:
                 item.descriptors[column] = descriptor
-                item.native_columns[column] = native_type(descriptor)
+                item.native_columns[column] = native_type(
+                    descriptor, for_key=column in item.key_columns
+                )
                 item.native_fingerprints[column] = fingerprint
             item.columns[column] = item.native_columns[column].sql
         elif source_name in APPLIER_COLUMN_TYPES:
@@ -912,34 +914,18 @@ def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
 
 def _typed_value(table, column: str, value):
     """Bind a source value to the current physical native declaration."""
-    from .typed_types import UnionValue, union_member_name
+    from .typed_types import adapt_value
 
     native = table.native_types.get(column)
     source = table.source_descriptors.get(column)
     if native is None or source is None:
         return value
-    if native.kind == "NUMERIC_UNION":
-        from .typed_types import encode_value
-
-        encoded = encode_value(value, source)
-        if encoded is None:
-            return None
-        return encoded
-    if native.kind == "UNION":
-        member = union_member_name(source) if native.kind == "UNION" else "finite"
-        if isinstance(value, UnionValue) and value.member == member:
-            return value
-        from .typed_types import native_type
-
-        return UnionValue(member, value, native=native_type(source))
-    if isinstance(value, UnionValue):
-        return value
-    return value
+    return adapt_value(value, native)
 
 
 def _key_value(table, column: str, value):
     """Encode a key using the same source descriptor as the row path."""
-    from .typed_types import UnionValue, encode_value, union_member_name
+    from .typed_types import adapt_value
 
     if table.internal_identity:
         # Source keys are resolved to the deterministic cdcf_internal_id by
@@ -951,13 +937,7 @@ def _key_value(table, column: str, value):
     source = table.source_descriptors.get(column)
     if native is None or source is None:
         return apply_sql.bind(value, table.columns.get(column, apply_sql.VARCHAR))
-    encoded = encode_value(value, source)
-    if native.kind in {"UNION", "NUMERIC_UNION"}:
-        member = union_member_name(source) if native.kind == "UNION" else "finite"
-        if isinstance(encoded, UnionValue) and encoded.member == member:
-            return encoded
-        return UnionValue(member, encoded, native=native)
-    return encoded
+    return adapt_value(value, native)
 
 
 def _plan(item: TableWork) -> tuple[

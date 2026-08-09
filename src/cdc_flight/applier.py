@@ -54,6 +54,7 @@ from . import (
     schema_epoch,
     self_heal,
     spill_protocol,
+    spill_refusal,
     table_work,
     unit_admission,
     unit_apply,
@@ -787,17 +788,12 @@ class Applier:
         self.ambiguous_resnapshots_queued += int(recorded)
 
     def _record_schema_refusal(self, refused: SchemaEvolutionRefused) -> None:
-        if not refused.source_schema or not refused.source_table:
-            return
-        destination.record_schema_refusal(
-            self.con,
-            pipeline=self.pipeline,
-            source_schema=refused.source_schema,
-            source_table=refused.source_table,
-            target_table=refused.target,
-            detected_lsn=refused.detected_lsn,
-            reason=str(refused),
-        )
+        spill_refusal.record_schema_refusal(self, refused)
+
+    def _handle_spill_refusal(
+        self, refused: SchemaEvolutionRefused, events: list[PendingRecord]
+    ) -> None:
+        spill_refusal.handle(self, refused, events)
 
     def _rollback_quietly(self) -> None:
         if not self.group.txn_open:
@@ -954,9 +950,13 @@ class Applier:
         unit_seq: int,
         snapshot: tuple[str | None, str | None] | None = None,
     ) -> int:
-        return spill_protocol.stage_events(
-            self, events, unit_seq=unit_seq, snapshot=snapshot
-        )
+        try:
+            return spill_protocol.stage_events(
+                self, events, unit_seq=unit_seq, snapshot=snapshot
+            )
+        except SchemaEvolutionRefused as refused:
+            self._handle_spill_refusal(refused, events)
+            raise
 
     # ------------------------------------------------------------------ #
     # shutdown

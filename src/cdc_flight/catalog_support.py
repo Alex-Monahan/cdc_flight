@@ -76,6 +76,15 @@ SELECT ((CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn()
               ELSE pg_current_wal_lsn() END) - '0/0'::pg_lsn)::bigint
 """
 
+# A primary's flushed LSN can lag a catalog DDL even after the statement returned.
+# The activation fence is sampled on the same write connection after FULL was
+# verified, so use the insert position there; on a standby the receive position is
+# the available upper bound.
+ACTIVATION_LSN_SQL = """
+SELECT ((CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn()
+              ELSE pg_current_wal_insert_lsn() END) - '0/0'::pg_lsn)::bigint
+"""
+
 SCHEMA_LIVENESS_SQL = """
 SELECT n.nspname,
        count(c.oid)::bigint AS relation_count

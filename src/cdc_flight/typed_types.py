@@ -487,10 +487,13 @@ def native_type(
     if kind == "array":
         if descriptor.array_element is None:
             raise UnsupportedType(f"array {descriptor.qualified_name} has no element descriptor")
-        child = native_type(descriptor.array_element)
+        child = native_type(descriptor.array_element, for_key=for_key)
         return NativeType("LIST", f"{child.sql}[]", descriptor, children=(child,), indexable=False)
     if kind in {"struct", "composite"}:
-        fields = tuple((name, native_type(child)) for name, child in descriptor.composite_fields)
+        fields = tuple(
+            (name, native_type(child, for_key=for_key))
+            for name, child in descriptor.composite_fields
+        )
         if not fields:
             raise UnsupportedType(f"composite {descriptor.qualified_name} has no fields")
         sql = "STRUCT(" + ",".join(f"{_quote_identifier(name)} {child.sql}" for name, child in fields) + ")"
@@ -498,8 +501,8 @@ def native_type(
     if kind == "map":
         if descriptor.map_key is None or descriptor.map_value is None:
             raise UnsupportedType(f"map {descriptor.qualified_name} has incomplete key/value descriptors")
-        key = native_type(descriptor.map_key)
-        value = native_type(descriptor.map_value)
+        key = native_type(descriptor.map_key, for_key=for_key)
+        value = native_type(descriptor.map_value, for_key=for_key)
         return NativeType("MAP", f"MAP({key.sql},{value.sql})", descriptor, key=key, value=value, indexable=False)
     if kind == "enum":
         if not descriptor.enum_labels:
@@ -515,7 +518,7 @@ def native_type(
     if kind in {"range", "daterange", "int4range", "int8range", "numrange", "tsrange", "tstzrange"}:
         if descriptor.range_subtype is None:
             raise UnsupportedType(f"range {descriptor.qualified_name} has no subtype descriptor")
-        subtype = native_type(descriptor.range_subtype)
+        subtype = native_type(descriptor.range_subtype, for_key=for_key)
         fields = (
             ("is_empty", NativeType("BOOLEAN", "BOOLEAN", descriptor)),
             ("lower", subtype),
@@ -528,7 +531,7 @@ def native_type(
     if kind == "multirange":
         if descriptor.range_subtype is None:
             raise UnsupportedType(f"multirange {descriptor.qualified_name} has no range subtype")
-        range_native = native_type(descriptor.range_subtype)
+        range_native = native_type(descriptor.range_subtype, for_key=for_key)
         return NativeType("LIST", f"{range_native.sql}[]", descriptor, children=(range_native,), indexable=False)
     if kind in {"bit", "varbit"}:
         fields = (("bits", NativeType("BLOB", "BLOB", descriptor)), ("bit_length", NativeType("INTEGER", "INTEGER", descriptor)))
@@ -685,6 +688,30 @@ def encode_value(value: Any, descriptor: SourceTypeDescriptor | NativeType) -> A
     if kind in _OBSCURE_TEXT_KINDS or target.kind == "VARCHAR":
         return str(value)
     return value
+
+
+def adapt_value(value: Any, target: NativeType) -> Any:
+    """Adapt a value to a native target exactly once.
+
+    UNION values are already wire/tagged values. Keeping them unchanged here
+    is important because this adapter is shared by inserts, updates, replay,
+    spill and the assignment seam; re-wrapping one changes a numeric special
+    into ``finite(special)`` and makes DuckDB reject the assignment.
+    """
+
+    if value is None or isinstance(value, UnionValue):
+        return value
+    source = target.source
+    if source is None:
+        return value
+    encoded = encode_value(value, source)
+    if target.kind == "NUMERIC_UNION":
+        if isinstance(encoded, UnionValue):
+            return encoded
+        return UnionValue("finite", encoded, native=native_type(source))
+    if target.kind == "UNION":
+        return UnionValue(union_member_name(source), encoded, native=native_type(source))
+    return encoded
 
 
 def _variable_numeric(value: SourceTypeDescriptor) -> NativeType:
@@ -1183,6 +1210,7 @@ __all__ = [
     "TypedImage",
     "UnionValue",
     "UnsupportedType",
+    "adapt_value",
     "encode_value",
     "native_type",
     "numeric_value",

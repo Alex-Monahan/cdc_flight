@@ -1773,24 +1773,37 @@ discovery itself.
 
 ### 2.4 Postgres types accurately converted to native MotherDuck types — **5 / 5**
 
-**FIX ROUND (2026-08-08).** The production typed path now takes a
+**FIX ROUND 2 (2026-08-08).** The production typed path now takes a
 catalog-authoritative recursive `SourceTypeDescriptor` and has no implicit
 value/text fallback. `native_type(source, for_key=True)` is the single resolver:
 ordinary JSONB is `VARIANT`, while JSONB in a source key is `JSON`; this is the
-same rule for local DuckDB and MotherDuck. A durable key-metadata sidecar and a
-typed shadow rebind handle composite keys, key gain/loss, and restart recovery.
+same rule for local DuckDB and MotherDuck, including LIST/STRUCT/MAP/range
+recursion. A durable key-metadata sidecar and a typed shadow rebind handle
+composite keys, key gain/loss, and restart recovery. Existing-row materialization
+and lookup share one recursive identity encoder: descriptor fingerprints,
+explicit NULL/JSONB-null states, structural JSON, recursive composites, and
+hex-encoded bytes are serialized in one canonical JSON identity. There is no
+DuckDB `CAST(... AS VARCHAR)` identity path left to disagree with Python.
 The local and MotherDuck probes both executed real `PRIMARY KEY` creation with
 JSON and passed.
 
 The native matrix now covers JSON, JSONB/VARIANT, recursive LIST/STRUCT/MAP,
 bounded NUMERIC finite/NaN/Infinity/-Infinity/NULL, temporal types, replay,
 spill, and mutable enum/composite descriptor epochs. Evidence includes
-`tests/rubric/2.4_native_types/` and the final default, slow, and MotherDuck
-lanes (`1395`, `128`, and `34` selected tests respectively).
+`tests/rubric/2.4_native_types/`, the local nested-composite and bytea UNION
+regressions, and the MotherDuck nested-composite and bytea UNION proofs. The
+final repository lanes selected 1,405 default, 128 slow, and 36 MotherDuck
+tests; all passed. Strict catalog descriptor authority now refuses missing or
+recursively incomplete trees. Numeric inserts, replay, spill, and the assignment
+seam use the same idempotent adapter; UPDATEs of NaN, Infinity, and -Infinity
+retain their `special` UNION tag.
 
 `most types text/json=1, core scalars well (nested as text)=3, (nested as json)=4, full=5`
 
-**Evidence** (`p02` `colsD_wide_types`, `tests/e2e/test_e2e_duckdb.py::test_documented_baseline_gaps`).
+**Historical pre-fix evidence** (`p02` `colsD_wide_types`,
+`tests/e2e/test_e2e_duckdb.py::test_documented_baseline_gaps`). This measurement
+predates FIX ROUND 2 and is retained for audit history, not as the current score
+evidence.
 Observed destination types for `app.wide_types`:
 
 | Postgres | destination | verdict |
@@ -1813,7 +1826,8 @@ so this cannot reach the rubric's "3". The dropped `col_numeric_nan` column is
 the most serious individual finding in this section: an entire column of source
 data vanishes without an error.
 
-**Gap to 5.** Almost certainly means abandoning `ExtractNewRecordState` +
+**Historical pre-fix gap to 5 (closed by FIX ROUND 2).** The old recommendation
+was to abandon `ExtractNewRecordState` +
 `JsonConverter` and consuming the full Debezium envelope with its Connect schema,
 so the semantic type (`io.debezium.time.MicroTimestamp`,
 `org.apache.kafka.connect.data.Decimal`, …) is available at mapping time. Cheaper
@@ -1825,14 +1839,16 @@ Arrays must become DuckDB `LIST`, `json`/`jsonb` must become `JSON`.
 
 ### 2.5 Data type changes supported — **5 / 5**
 
-**FIX ROUND (2026-08-08).** Type changes use one instrumented typed shadow
+**FIX ROUND 2 (2026-08-08).** Type changes use one instrumented typed shadow
 swap. UNION members carry recursive descriptor fingerprints; existing values
-and tags survive repeated changes, and a durable length-prefixed internal
+and tags survive repeated changes, and the same canonical recursive internal
 identity resolves old and current source-key descriptors for delete, update,
 key-move, replay, start-probe, idempotency, and restart paths. Same-name type
 changes participate in the schema epoch fence; a DDL+DML unit containing both
 descriptor epochs is refused before apply. The swap anchor is exercised on
-local DuckDB and MotherDuck across repeated fault/restart/convergence cycles.
+local DuckDB and MotherDuck across repeated fault/restart/convergence cycles. The
+bytea-key-to-UNION regression now deletes the existing row on both runtimes using
+the same hex-byte identity for shadow materialization and lookup.
 
 Evidence: `tests/rubric/2.5_union_type_changes/`, including the real PostgreSQL
 DDL+DML fence and the type-change-plus-key-move regression. The exact required
@@ -1840,7 +1856,7 @@ lanes were green after these changes.
 
 `error=1, drop and add=3, widening automatic=4, MotherDuck UNION types=5`
 
-**Evidence** (`p02` step D). `ALTER COLUMN col_smallint TYPE text` then inserting
+**Historical pre-fix evidence** (`p02` step D). `ALTER COLUMN col_smallint TYPE text` then inserting
 `'now-a-string'` → dlt created a **variant column**: `col_smallint BIGINT` (old
 values) alongside `col_smallint__v_text VARCHAR` (new values). No error, no data
 loss, but the consumer must know to coalesce two columns.
@@ -1848,7 +1864,7 @@ loss, but the consumer must know to coalesce two columns.
 every Postgres integer width to `BIGINT` — that is a coincidence, not widening
 logic, so it does not earn the rubric's 4.
 
-**Gap to 5.** Represent the column as a MotherDuck/DuckDB `UNION(bigint BIGINT,
+**Historical pre-fix gap to 5 (closed by FIX ROUND 2).** Represent the column as a MotherDuck/DuckDB `UNION(bigint BIGINT,
 str VARCHAR)` so both representations live in one column with their types
 intact, and migrate the existing values into the union on the DDL event. Needs a
 dlt destination-level type hint or a post-load `ALTER TABLE`, and a decision on
@@ -1856,7 +1872,7 @@ what happens to downstream views.
 
 ### 2.6 TOAST columns handled well — **4 / 5**
 
-**FIX ROUND (2026-08-08).** The physical-row fold now treats a runtime-collapsed
+**FIX ROUND 2 (2026-08-08).** The physical-row fold now treats a runtime-collapsed
 SQL NULL/JSONB-root-null before-image as ambiguous and routes it to refusal and
 reconstruction; it never prefers `START`. The source catalog persists the first
 LSN known to be generated after `REPLICA IDENTITY FULL` activation, and events
@@ -1864,9 +1880,16 @@ before that boundary are not admitted as complete under the current policy. The
 declared operation × field-state × base-state × storage × outcome/fault ×
 identity × schema-epoch product is realized by the generated 2,880-cell matrix,
 with explicit refusal cells where the stock runtime cannot prove attribution.
+The real executor drives the production GroupPlan, TableWork fold, SchemaRegistry,
+SpillBuffer, typed swap, and destination transaction. It reports 272 committed
+cells and 2,608 refused cells; 1,519 results are covered by a declared owner and
+1,361 combinations are explicitly `covered=false` because their axes are
+mutually unreachable (for example keyless ambiguous-delete or a delete that
+cannot require a missing TOAST base). No unreachable cell is counted as exercised.
 
 Evidence: `tests/rubric/2.6_toast_sparse_updates/`, including a real PostgreSQL
-pre-FULL event-boundary race. The honest score remains 4: stock published
+pre-FULL event-boundary race using the reviewer’s pre-sample plus insert-LSN
+probe. The honest score remains 4: stock published
 Debezium still does not expose a marker-preserving, efficient unchanged-TOAST
 channel, and no fork, custom converter, or Java artifact was added.
 

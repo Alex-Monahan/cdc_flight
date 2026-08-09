@@ -44,12 +44,17 @@ def test_postgres_event_before_full_activation_is_fenced_from_current_policy(san
         con.execute(
             "INSERT INTO app.p2b_toast_race VALUES (1, decode('00ff','hex'))"
         )
+        sample_lsn = int(
+            con.execute(
+                "SELECT (pg_current_wal_lsn() - '0/0'::pg_lsn)::bigint"
+            ).fetchone()[0]
+        )
         con.execute(
             "UPDATE app.p2b_toast_race SET payload = decode('010203','hex') WHERE id = 1"
         )
         event_lsn = int(
             con.execute(
-                "SELECT (pg_current_wal_lsn() - '0/0'::pg_lsn)::bigint"
+                "SELECT (pg_current_wal_insert_lsn() - '0/0'::pg_lsn)::bigint"
             ).fetchone()[0]
         )
         relation_oid = int(
@@ -98,12 +103,12 @@ def test_postgres_event_before_full_activation_is_fenced_from_current_policy(san
             watcher,
             con,
             {qualified: relation},
-            activation_lsn=event_lsn + 1,
+            activation_lsn=sample_lsn,
         )
         policy = observed[qualified].toast_policy
-        assert policy.full_activation_lsn == event_lsn + 1
+        assert policy.full_activation_lsn > event_lsn
         assert policy.accepts_event(event_lsn) is False
-        assert policy.accepts_event(event_lsn + 1) is True
+        assert policy.accepts_event(policy.full_activation_lsn) is True
         assert con.execute(
             "SELECT payload FROM app.p2b_toast_race WHERE id = 1"
         ).fetchone()[0] == b"\x01\x02\x03"

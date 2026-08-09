@@ -232,9 +232,9 @@ def test_event_before_full_activation_is_not_admitted_by_the_current_policy():
     watcher = SimpleNamespace(binary_handling_mode="base64", hstore_handling_mode="map")
     observed = _ensure_toast_policies(
         watcher,
-        _PolicyConnection(),
+        _PolicyConnection(post_lsn=100),
         {relation.qualified: relation},
-        activation_lsn=100,
+        activation_lsn=99,
     )
     policy = observed[relation.qualified].toast_policy
     assert policy.route is ToastRoute.REPLICA_IDENTITY_FULL
@@ -243,9 +243,29 @@ def test_event_before_full_activation_is_not_admitted_by_the_current_policy():
     assert policy.accepts_event(100) is True
 
 
+def test_missing_full_activation_evidence_never_accepts_an_event():
+    """Zero/absent activation boundaries must stay on the refusal route."""
+    relation = _residual_relation()
+    watcher = SimpleNamespace(
+        binary_handling_mode="base64",
+        hstore_handling_mode="map",
+        known={},
+    )
+    observed = _ensure_toast_policies(
+        watcher,
+        _PolicyConnection(post_lsn=0),
+        {relation.qualified: relation},
+        activation_lsn=None,
+    )
+    policy = observed[relation.qualified].toast_policy
+    assert policy.full_activation_lsn is None
+    assert policy.accepts_event(1) is False
+
+
 class _PolicyConnection:
-    def __init__(self, *, fail=False):
+    def __init__(self, *, fail=False, post_lsn=101):
         self.fail = fail
+        self.post_lsn = post_lsn
         self.sql = []
 
     def execute(self, sql, params=None):
@@ -255,6 +275,11 @@ class _PolicyConnection:
         return self
 
     def fetchone(self):
+        if self.sql and (
+            "pg_current_wal_lsn" in self.sql[-1][0]
+            or "pg_current_wal_insert_lsn" in self.sql[-1][0]
+        ):
+            return (self.post_lsn,)
         return ("f",)
 
 

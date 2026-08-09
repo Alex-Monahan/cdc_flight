@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+from collections.abc import Mapping
 from typing import Any
 
 from .errors import (
@@ -686,24 +687,18 @@ class SchemaRegistry:
                 f"({definitions}{constraint_sql})"
             )
             target_columns = list(target_types)
-            select_expressions: list[str] = []
+            changed_python: set[str] = set()
             for column in target_columns:
                 if column == "cdcf_internal_id":
-                    # This expression uses the requested key tuple and the new
-                    # source descriptors.  It is the same identity algorithm used by
-                    # post-migration deletes, updates, replay and idempotency.
-                    select_expressions.append(
-                        _identity_expression(table, key_columns)
-                    )
                     continue
                 current_type = old_raw_types.get(column, target_types[column])
                 desired_type = target_types[column]
                 if _type_sql_equal(current_type, desired_type):
-                    select_expressions.append(quote(column))
-                elif _json_key_transition(current_type, desired_type):
-                    select_expressions.append(
-                        f"CAST({quote(column)} AS {desired_type})"
-                    )
+                    continue
+                elif _json_key_transition(current_type, desired_type) or _lossless_numeric_supertype(
+                    current_type, desired_type
+                ):
+                    changed_python.add(column)
                 else:
                     # UNION history has already been deliberately retained above;
                     # any other mismatch belongs to the normal 2.5 typed shadow
@@ -714,12 +709,16 @@ class SchemaRegistry:
                         "shadow conversion is required",
                         target=table.name,
                     )
-            if target_columns:
-                self.con.execute(
-                    f"INSERT INTO {quote(self.dataset)}.{quote(shadow)} "
-                    f"({', '.join(quote(column) for column in target_columns)}) "
-                    f"SELECT {', '.join(select_expressions)} FROM {table.qualified}"
-                )
+            _copy_rows_with_identity(
+                self.con,
+                table,
+                shadow,
+                target_types,
+                target_native,
+                key_columns=key_columns,
+                identity_descriptors={**old_descriptors, **descriptors},
+                changed_python=frozenset(changed_python),
+            )
             self.con.execute(f"DROP TABLE {table.qualified}")
             from . import faults
 
@@ -899,6 +898,8 @@ class SchemaRegistry:
         shadow = f"{name}__cdcf_typed_shadow"
         self.con.execute(f"DROP TABLE IF EXISTS {quote(self.dataset)}.{quote(shadow)}")
         definitions: list[str] = []
+        target_types = dict(table.raw_types)
+        target_types[column] = union_sql
         for current_column, current_type in table.raw_types.items():
             if current_column == column:
                 definitions.append(f"{quote(current_column)} {union_sql}")
@@ -912,6 +913,7 @@ class SchemaRegistry:
             primary = ("cdcf_internal_id",)
             if "cdcf_internal_id" not in table.raw_types:
                 definitions.append('"cdcf_internal_id" VARCHAR DEFAULT uuid()')
+                target_types["cdcf_internal_id"] = "VARCHAR"
         if not primary:
             raise SchemaEvolutionRefused(
                 f"cannot convert {name}.{column}: no destination identity is available", target=name
@@ -925,25 +927,33 @@ class SchemaRegistry:
             target_columns = list(table.raw_types)
             if "cdcf_internal_id" in primary and "cdcf_internal_id" not in target_columns:
                 target_columns.append("cdcf_internal_id")
-            select_expressions: list[str] = []
-            for current_column in target_columns:
-                if current_column == column:
-                    select_expressions.append(expression)
-                elif current_column == "cdcf_internal_id" and current_column not in table.raw_types:
-                    select_expressions.append(
-                        _identity_expression(
-                            table,
-                            table.key_columns or (column,),
-                            union_columns=frozenset({column}),
-                        )
-                    )
-                else:
-                    select_expressions.append(quote(current_column))
-            self.con.execute(
-                f"INSERT INTO {quote(self.dataset)}.{quote(shadow)} "
-                f"({', '.join(quote(item) for item in target_columns)}) "
-                f"SELECT {', '.join(select_expressions)} FROM {table.qualified}"
-            )
+            if "cdcf_internal_id" in primary:
+                target_native = dict(cached_native_types)
+                target_native[column] = _physical_union_native(
+                    union_sql, source=new_source
+                )
+                identity_descriptors = {**cached_descriptors, column: old_source}
+                _copy_rows_with_identity(
+                    self.con,
+                    table,
+                    shadow,
+                    target_types,
+                    target_native,
+                    key_columns=source_key_columns or (column,),
+                    identity_descriptors=identity_descriptors,
+                    changed_sql={column: expression},
+                    union_columns=frozenset({column}),
+                )
+            else:
+                select_expressions = [
+                    expression if current_column == column else quote(current_column)
+                    for current_column in target_columns
+                ]
+                self.con.execute(
+                    f"INSERT INTO {quote(self.dataset)}.{quote(shadow)} "
+                    f"({', '.join(quote(item) for item in target_columns)}) "
+                    f"SELECT {', '.join(select_expressions)} FROM {table.qualified}"
+                )
             self.con.execute(f"DROP TABLE {table.qualified}")
             from . import faults
 
@@ -1451,9 +1461,23 @@ def _type_sql_equal(left: str, right: str) -> bool:
 
 
 def _json_key_transition(current: str, desired: str) -> bool:
-    """Whether a key-status change is the lossless JSONB representation swap."""
-    pair = {str(current).strip().upper(), str(desired).strip().upper()}
-    return pair == {"JSON", "VARIANT"}
+    """Whether a key-status change is a lossless JSONB representation swap.
+
+    A composite/array/map key can carry the JSONB field several levels down.  In
+    that case the physical declarations are STRUCT/LIST/MAP expressions rather
+    than the scalar ``JSON``/``VARIANT`` pair, but the only representation change
+    permitted here is still the recursive JSONB key representation change.
+    """
+    current_name = str(current).strip().upper()
+    desired_name = str(desired).strip().upper()
+    if current_name == desired_name:
+        return False
+    if {current_name, desired_name} == {"JSON", "VARIANT"}:
+        return True
+    return (
+        ("VARIANT" in current_name and "JSON" in desired_name)
+        or ("JSON" in current_name and "VARIANT" in desired_name)
+    )
 
 
 def _lossless_numeric_supertype(current: str, desired: str) -> bool:
@@ -1468,62 +1492,117 @@ def _lossless_numeric_supertype(current: str, desired: str) -> bool:
     )
 
 
-def _identity_expression(
-    table: TableSchema,
-    columns: tuple[str, ...],
-    *,
-    union_columns: frozenset[str] = frozenset(),
-) -> str:
-    """Build a deterministic, length-prefixed typed identity serialization.
+def _identity_runtime(value: Any) -> Any:
+    """Return the JSON-safe leaf representation owned by the identity encoder.
 
-    The internal identity is a uniqueness key, not a digest.  Each component carries
-    its source fingerprint, NULL marker, UNION tag where applicable, and the byte
-    length of its rendered native value.  Length prefixes make concatenation
-    unambiguous and avoid the old delimiter/hash shortcut while retaining a SQL-only
-    shadow copy.
+    Identity is a typed serialization, not a display string.  In particular, bytes are
+    represented as hexadecimal data and non-finite floats have explicit tokens.  This
+    prevents a destination's pretty-printer (``CAST(BLOB AS VARCHAR)`` was the old
+    example) from becoming part of the source identity contract.
     """
-    expressions: list[str] = []
-    for column in columns:
-        descriptor = table.source_descriptors.get(column)
-        fingerprint = descriptor.fingerprint if descriptor is not None else "legacy"
-        fingerprint_sql = "'" + fingerprint.replace("'", "''") + "'"
-        value_sql = f"CAST({quote(column)} AS VARCHAR)"
-        native = table.native_types.get(column)
-        if column in union_columns:
-            from .typed_types import union_member_name
-
-            tag_sql = "'" + union_member_name(descriptor).replace("'", "''") + "'"
-        elif native is not None and native.kind in {"UNION", "NUMERIC_UNION"}:
-            tag_sql = f"CAST(union_tag({quote(column)}) AS VARCHAR)"
-        else:
-            tag_sql = "'value'"
-        payload = (
-            f"CASE WHEN {quote(column)} IS NULL THEN {fingerprint_sql} || ':NULL' "
-            f"ELSE {fingerprint_sql} || ':' || {tag_sql} || ':' || "
-            f"CAST(length({value_sql}) AS VARCHAR) || ':' || {value_sql} END"
-        )
-        expressions.append(
-            f"CAST(length({payload}) AS VARCHAR) || ':' || {payload}"
-        )
-    return " || ".join(expressions)
-
-
-def _identity_render(value: Any) -> str:
-    """Render one encoded source key as the SQL shadow expression does."""
-    import json
+    from datetime import date, datetime, time, timedelta
     from decimal import Decimal
 
-    from .typed_types import JsonbNull
+    from .typed_types import JsonbNull, UnionValue
 
     if isinstance(value, JsonbNull):
-        return "null"
-    if isinstance(value, dict):
-        return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    if isinstance(value, (list, tuple)):
-        return json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=str)
+        return {"jsonb_null": True}
+    if isinstance(value, UnionValue):
+        return {
+            "union_member": value.member,
+            "value": _identity_runtime(value.value),
+        }
+    if isinstance(value, (bytes, bytearray)):
+        return {"bytes_hex": bytes(value).hex()}
     if isinstance(value, Decimal):
-        return str(value)
-    return str(value)
+        return {"decimal": str(value)}
+    if isinstance(value, datetime):
+        return {"datetime": value.isoformat()}
+    if isinstance(value, date):
+        return {"date": value.isoformat()}
+    if isinstance(value, time):
+        return {"time": value.isoformat()}
+    if isinstance(value, timedelta):
+        return {"timedelta_microseconds": value.total_seconds() * 1_000_000}
+    if isinstance(value, float):
+        if math.isnan(value):
+            return {"float": "NaN"}
+        if math.isinf(value):
+            return {"float": "Infinity" if value > 0 else "-Infinity"}
+        return {"float": repr(value)}
+    if isinstance(value, Mapping):
+        items = [
+            [_identity_runtime(key), _identity_runtime(item)]
+            for key, item in value.items()
+        ]
+        items.sort(key=lambda item: json.dumps(item[0], sort_keys=True, separators=(",", ":")))
+        return {"map": items}
+    if isinstance(value, (list, tuple)):
+        return {"list": [_identity_runtime(item) for item in value]}
+    return value
+
+
+def _identity_tree(value: Any, descriptor: Any) -> Any:
+    """Encode one source value recursively according to its catalog descriptor."""
+    from .typed_types import JsonbNull, UnionValue, encode_value
+
+    if descriptor is None:
+        return _identity_runtime(value)
+    source = descriptor
+    seen: set[int] = set()
+    while getattr(source, "domain_base", None) is not None and id(source) not in seen:
+        seen.add(id(source))
+        source = source.domain_base
+    kind = str(source.kind or source.qualified_name).lower()
+    if isinstance(value, UnionValue):
+        return _identity_runtime(value)
+    if kind == "jsonb" and value is None:
+        # SQL NULL and a JSONB root-null document can look identical after a
+        # destination round trip.  The source identity must retain the distinction
+        # before DuckDB's VARIANT display layer collapses it.
+        return {"sql_null": True}
+    encoded = encode_value(value, descriptor)
+    if encoded is None and kind != "jsonb":
+        return None
+    if kind == "jsonb":
+        if isinstance(encoded, JsonbNull):
+            return {"jsonb": None}
+        try:
+            parsed = json.loads(str(encoded))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = str(encoded)
+        return {"jsonb": _identity_runtime(parsed)}
+    if kind == "json":
+        # PostgreSQL JSON is textual and its destination JSON representation preserves
+        # that text.  JSONB, above, deliberately takes the structural path instead.
+        return {"json_text": str(encoded)}
+    if kind in {"bytea", "bytes", "blob"}:
+        return _identity_runtime(encoded)
+    if kind in {"struct", "composite", "point", "geometry", "geography", "postgis"}:
+        mapping = encoded if isinstance(encoded, Mapping) else {}
+        return {
+            "struct": [
+                [name, _identity_tree(mapping.get(name), child)]
+                for name, child in source.composite_fields
+            ]
+        }
+    if kind == "array" and source.array_element is not None:
+        values = encoded if isinstance(encoded, (list, tuple)) else []
+        return {
+            "list": [_identity_tree(item, source.array_element) for item in values]
+        }
+    if kind == "map" and source.map_key is not None and source.map_value is not None:
+        mapping = encoded if isinstance(encoded, Mapping) else {}
+        items = [
+            [
+                _identity_tree(key, source.map_key),
+                _identity_tree(item, source.map_value),
+            ]
+            for key, item in mapping.items()
+        ]
+        items.sort(key=lambda item: json.dumps(item[0], sort_keys=True, separators=(",", ":")))
+        return {"map": items}
+    return _identity_runtime(encoded)
 
 
 def _identity_value(
@@ -1532,38 +1611,42 @@ def _identity_value(
     *,
     descriptors: dict[str, Any] | None = None,
     key_columns: tuple[str, ...] | None = None,
+    union_columns: frozenset[str] = frozenset(),
 ) -> str:
-    """Build the stable, length-prefixed identity used by internal keys."""
-    from .typed_types import UnionValue, encode_value, union_member_name
+    """Build one canonical recursive identity for writes, lookups and rebuilds."""
+    from .typed_types import UnionValue, union_member_name
 
     descriptors = descriptors or {}
     key_columns = tuple(key_columns or table.source_key_columns or table.key_columns)
-    parts: list[str] = []
+    components: list[dict[str, Any]] = []
     for column, value in zip(key_columns, values, strict=True):
         descriptor = descriptors.get(column) or table.source_descriptors.get(column)
+        native = table.native_types.get(column)
         if isinstance(value, UnionValue):
-            encoded = value
+            tag = value.member
+            tree = _identity_runtime(value.value)
         else:
-            encoded = encode_value(value, descriptor) if descriptor is not None else value
-        if isinstance(encoded, UnionValue):
-            tag = encoded.member
-            rendered = encoded.value
-        else:
-            native = table.native_types.get(column)
-            tag = (
-                union_member_name(descriptor)
-                if native is not None and native.kind == "UNION" and descriptor is not None
-                else "value"
-            )
-            rendered = encoded
+            encoded = _identity_tree(value, descriptor)
+            if column in union_columns or (
+                native is not None and native.kind == "UNION" and descriptor is not None
+            ):
+                tag = union_member_name(descriptor)
+            elif native is not None and native.kind == "NUMERIC_UNION":
+                tag = encoded.get("union_member") if isinstance(encoded, dict) else "value"
+            else:
+                tag = "value"
+            tree = encoded
         fingerprint = descriptor.fingerprint if descriptor is not None else "legacy"
-        if rendered is None:
-            payload = f"{fingerprint}:NULL"
+        source_kind = str(getattr(descriptor, "kind", "")).lower() if descriptor else ""
+        if value is None and source_kind != "jsonb":
+            components.append({"descriptor": fingerprint, "state": "sql_null"})
         else:
-            text = _identity_render(rendered)
-            payload = f"{fingerprint}:{tag}:{len(text)}:{text}"
-        parts.append(f"{len(payload)}:{payload}")
-    return "".join(parts)
+            components.append({
+                "descriptor": fingerprint,
+                "member": tag,
+                "value": tree,
+            })
+    return json.dumps(components, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def _identity_candidates(
@@ -1609,6 +1692,82 @@ def _identity_candidates(
             )
         )
     return tuple(dict.fromkeys(result))
+
+
+def _copy_rows_with_identity(
+    con,
+    table: TableSchema,
+    shadow: str,
+    target_types: dict[str, str],
+    target_native: dict[str, Any],
+    *,
+    key_columns: tuple[str, ...],
+    identity_descriptors: dict[str, Any],
+    changed_sql: dict[str, str] | None = None,
+    changed_python: frozenset[str] = frozenset(),
+    union_columns: frozenset[str] = frozenset(),
+) -> None:
+    """Copy existing rows while using the canonical Python identity encoder.
+
+    DuckDB's SQL display casts are deliberately not used for identity materialization.
+    The old implementation generated an ID with ``CAST(value AS VARCHAR)`` and later
+    looked it up with Python ``str(value)``; BLOB and nested STRUCT values proved that
+    those are different languages.  This routine reads each old source key, calls the
+    same recursive encoder used by inserts/lookups, and binds that ID into the shadow
+    row.  Ordinary columns continue to be copied by SQL so UNION values retain their
+    physical tags without a Python round trip.
+    """
+    old_columns = list(table.raw_types)
+    if not old_columns:
+        return
+    rows = con.execute(
+        f"SELECT rowid, {', '.join(quote(column) for column in old_columns)} "
+        f"FROM {table.qualified}"
+    ).fetchall()
+    changed_sql = changed_sql or {}
+    column_indexes = {column: index + 1 for index, column in enumerate(old_columns)}
+    target_columns = list(target_types)
+    from .typed_types import encode_value
+
+    for row in rows:
+        rowid = row[0]
+        raw = {column: row[index] for column, index in column_indexes.items()}
+        key_values = tuple(raw[column] for column in key_columns)
+        identity = _identity_value(
+            table,
+            key_values,
+            descriptors=identity_descriptors,
+            key_columns=key_columns,
+            union_columns=union_columns,
+        )
+        expressions: list[str] = []
+        params: list[Any] = []
+        for column in target_columns:
+            if column == CDCF_EVENT_ID and column not in raw:
+                # This branch is defensive; the applier event identity is never a
+                # source-key shadow column, but it keeps a malformed legacy table from
+                # silently receiving a NULL in a rebuild.
+                expressions.append("NULL")
+            elif column == "cdcf_internal_id":
+                expressions.append("?")
+                params.append(identity)
+            elif column in changed_sql:
+                expressions.append(changed_sql[column])
+            elif column in changed_python:
+                descriptor = identity_descriptors.get(column) or table.source_descriptors.get(column)
+                encoded = encode_value(raw.get(column), descriptor) if descriptor is not None else raw.get(column)
+                expression, bound = _typed_parameter(encoded, target_native.get(column))
+                expressions.append(expression)
+                params.extend(bound)
+            else:
+                expressions.append(quote(column))
+        params.append(rowid)
+        con.execute(
+            f"INSERT INTO {quote(table.dataset)}.{quote(shadow)} "
+            f"({', '.join(quote(column) for column in target_columns)}) "
+            f"SELECT {', '.join(expressions)} FROM {table.qualified} WHERE rowid = ?",
+            params,
+        )
 
 
 def _physical_union_native(physical: str, *, source=None):
@@ -2322,46 +2481,54 @@ def _contains_union(value: Any, union_class: type) -> bool:
 
 def _prepare_typed_value(value: Any, native: Any) -> Any:
     """Materialize an implicit source value into its declared UNION member."""
-    from .typed_types import UnionValue, encode_value, native_type, union_member_name
+    from .typed_types import UnionValue, adapt_value
 
     if native is None or isinstance(value, UnionValue):
         return value
     if native.source is not None:
-        encoded = encode_value(value, native.source)
-        if native.kind == "UNION":
-            return UnionValue(
-                union_member_name(native.source),
-                encoded,
-                native=native_type(native.source),
-            )
-        if native.kind == "NUMERIC_UNION":
-            # ``encode_value`` already returns the inner finite/special
-            # UnionValue.  Wrapping it again would ask DuckDB to cast a tagged
-            # UNION into DECIMAL and lose the numeric member boundary.
-            if encoded is None:
-                return UnionValue("finite", None, native=native_type(native.source))
-            return encoded
-        return encoded
+        adapted = adapt_value(value, native)
+        return _tagged_union_null(native) if adapted is None else adapted
     if value is None and native.kind in {"UNION", "NUMERIC_UNION"}:
-        member = "finite" if native.kind == "NUMERIC_UNION" else (
+        return _tagged_union_null(native)
+    return value
+
+
+def _tagged_union_null(native: Any) -> Any:
+    """Keep the established typed-NULL member when a UNION receives SQL NULL."""
+    from .typed_types import UnionValue, native_type, union_member_name
+
+    if native.kind == "NUMERIC_UNION":
+        return UnionValue(
+            "finite",
+            None,
+            native=native_type(native.source) if native.source is not None else None,
+        )
+    if native.kind == "UNION":
+        source = native.source
+        member = union_member_name(source) if source is not None else (
             native.members[0].name if native.members else "m_null"
         )
-        return UnionValue(member, None)
-    return value
+        return UnionValue(
+            member,
+            None,
+            native=native_type(source) if source is not None else None,
+        )
+    return None
 
 
 def _typed_assignment(table: TableSchema, column: str, value: Any) -> tuple[str, list[Any]]:
     """Encode a backfill assignment against the table's exact native type."""
-    from .typed_types import UnionValue, encode_value, native_type, union_member_name
+    from .typed_types import adapt_value, encode_value
 
     native = table.native_types.get(column)
     source = table.source_descriptors.get(column)
     if source is not None:
-        value = encode_value(value, source)
-        if native is not None and native.kind in {"UNION", "NUMERIC_UNION"}:
-            member = union_member_name(source) if native.kind == "UNION" else "finite"
-            if not isinstance(value, UnionValue) or value.member != member:
-                value = UnionValue(member, value, native=native_type(source))
+        if native is not None:
+            value = adapt_value(value, native)
+            if value is None and native.kind in {"UNION", "NUMERIC_UNION"}:
+                value = _tagged_union_null(native)
+        else:
+            value = encode_value(value, source)
     return _typed_parameter(value, native)
 
 

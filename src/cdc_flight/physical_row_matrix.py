@@ -1,29 +1,44 @@
-"""Declared physical-row attribution product for rubric 2.6.
+"""Real physical-row coverage for rubric 2.6.
 
-The row path has seven interacting dimensions.  Keeping only a four-state field
-table in the tests misses failures that happen only when, for example, a spilled
-key-move has a missing base during a mixed schema epoch.  The declarations live in
-``machines.py``; this module is the production-owned executor for the Cartesian
-product.  A cell is either driven through the RowPatch/toast/fault boundary or is
-returned as a machine refusal with the reason that makes it impossible.
-
-This is coverage accounting for existing owners, not a second implementation of
-their decisions.  The actual RowPatch codec, attribution gate, TOAST refusal and
-fault parser are called below; cells that cannot reach one of those gates are
-refused before any destination write could be invented.
+The seven declared dimensions are a coverage product, not a second row engine.  Each
+reachable cell below enters the production ``GroupPlan`` and ``TableWork`` fold and
+the production ``SchemaRegistry`` writer inside a real DuckDB transaction.  Spill
+cells use the production ``SpillBuffer`` table and codec.  Error cells invoke the
+owner that actually raises the error, then verify that the transaction is rolled
+back.  A combination whose axes cannot simultaneously be realized is explicitly
+marked uncovered; it is never reported as a successful physical-row cell.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
 from dataclasses import dataclass
 from itertools import product
 
-from . import faults, machines
-from .errors import AmbiguousDelete, ToastBaseMissing
-from .row_patch import RowPatch
-from .table_work import TableWork, _missing_toast_base, _target_entry
-from .typed_types import FieldState, FieldValue, SourceTypeDescriptor
+import duckdb
+
+from . import destination as destination_mod
+from . import faults, machines, schema_epoch
+from .assembler import UNIT_TXN, CompleteUnit
+from .catalog import CHANGE_SCHEMA, CatalogChange
+from .catalog_apply import CatalogAction
+from .config import TRUNCATE_REPLICATE
+from .destination import DUCKDB_CONNECT_CONFIG, ensure_dataset
+from .envelope import KIND_DATA, PendingRecord
+from .errors import AmbiguousDelete, SchemaEvolutionRefused, ToastBaseMissing
+from .schema_evolution import COLUMN_TYPE_CHANGED, ColumnChange
+from .spill import SpillBuffer, StagedEvent
+from .typed_types import (
+    FieldState,
+    FieldValue,
+    SourceTypeDescriptor,
+    TypedImage,
+)
+
+INTEGER = SourceTypeDescriptor(23, "pg_catalog.int4", "int4")
+TEXT = SourceTypeDescriptor(25, "pg_catalog.text", "text")
+STRUCTURAL_MARKER = "hex:00"
 
 
 @dataclass(frozen=True)
@@ -42,6 +57,10 @@ class PhysicalRowResult:
     cell: PhysicalRowCell
     kind: str
     reason: str
+    proof: str = ""
+    #: False means a declared axis combination was not physically reachable.  Such a
+    #: result is retained for accounting but is never included in covered counts.
+    covered: bool = True
 
 
 def declared_cells() -> tuple[PhysicalRowCell, ...]:
@@ -58,95 +77,518 @@ def declared_cells() -> tuple[PhysicalRowCell, ...]:
     return tuple(PhysicalRowCell(*values) for values in product(*dimensions))
 
 
-def exercise_cell(cell: PhysicalRowCell) -> PhysicalRowResult:
-    """Drive one declared cell through the owning production boundaries."""
-    refusal = _machine_refusal(cell)
-    if refusal is not None:
-        return PhysicalRowResult(cell, "refused", refusal)
+class _MatrixSnapshots:
+    """The smallest real SnapshotCoordinator interface GroupPlan consumes here."""
 
-    descriptor = SourceTypeDescriptor(25, "pg_catalog.text", "text")
-    field_state = FieldState(cell.field_state)
-    field = {
-        FieldState.VALUE: FieldValue.of("value", descriptor),
-        FieldState.EXPLICIT_NULL: FieldValue.explicit_null(descriptor),
-        FieldState.UNCHANGED_TOAST: FieldValue.unchanged_toast(descriptor),
-        FieldState.ABSENT: FieldValue.absent(descriptor),
-    }[field_state]
-    patch = RowPatch({"payload": field})
-    if cell.storage == "spill":
-        # The staged representation is the real spill codec, not a test-side copy.
-        patch = RowPatch.from_dict(patch.to_dict())
-    patch.bindable_values()
+    def __init__(self, target: str):
+        self.target = target
 
-    if cell.outcome == "toast_base_missing":
-        try:
-            _missing_toast_base(
-                TableWork(
-                    target="matrix",
-                    key_columns=("id",),
-                    source_schema="app",
-                    source_table="matrix",
-                ),
-                None,
-                reason="declared physical-row base state is missing",
-            )
-        except ToastBaseMissing as exc:
-            return PhysicalRowResult(cell, "refused", str(exc))
+    def target_table(self, _schema: str, _table: str) -> str:
+        return self.target
 
-    if cell.outcome == "ambiguous_delete":
-        item = TableWork(target="matrix", key_columns=("id",))
-        entries = [RowPatch({"payload": FieldValue.of("a", descriptor)}),
-                   RowPatch({"payload": FieldValue.of("b", descriptor)})]
-        try:
-            _target_entry(item, (1,), entries, {}, None, cell.operation)
-        except AmbiguousDelete as exc:
-            return PhysicalRowResult(cell, "refused", str(exc))
+    def state_for(self, _schema: str | None, _table: str | None):
+        return None
 
-    if cell.outcome == "schema_refusal":
-        return PhysicalRowResult(
-            cell,
-            "refused",
-            "the declared schema-refusal outcome is terminal before a row write",
+
+def _descriptor_map(identity: str) -> dict[str, SourceTypeDescriptor]:
+    return {"payload": TEXT} if identity == "keyless" else {"id": INTEGER, "payload": TEXT}
+
+
+def _field_value(state: str, value, descriptor: SourceTypeDescriptor) -> FieldValue:
+    field_state = FieldState(state)
+    if field_state is FieldState.VALUE:
+        return FieldValue.of(value, descriptor)
+    if field_state is FieldState.EXPLICIT_NULL:
+        return FieldValue.explicit_null(descriptor)
+    if field_state is FieldState.UNCHANGED_TOAST:
+        return FieldValue.unchanged_toast(descriptor)
+    return FieldValue.absent(descriptor)
+
+
+def _image(
+    identity: str,
+    state: str,
+    *,
+    key_value: int,
+    payload,
+    include_payload: bool = True,
+) -> tuple[dict, dict[str, SourceTypeDescriptor], TypedImage]:
+    descriptors = _descriptor_map(identity)
+    fields = [("payload", _field_value(state, payload, TEXT))]
+    image = {}
+    if identity != "keyless":
+        image["id"] = key_value
+        fields.insert(0, ("id", FieldValue.of(key_value, INTEGER)))
+    if include_payload:
+        image["payload"] = payload
+    else:
+        image.pop("payload", None)
+    return image, descriptors, TypedImage(tuple(fields))
+
+
+def _event(
+    cell: PhysicalRowCell,
+    *,
+    index: int,
+    order: int,
+    operation: str | None = None,
+    old_key: int = 1,
+    new_key: int = 1,
+    payload_state: str | None = None,
+    payload: object = "value",
+    before_payload: object = "base",
+    force_mixed: bool = False,
+    ambiguous: bool = False,
+) -> PendingRecord:
+    identity = cell.identity
+    op = operation or {"insert": "c", "update": "u", "delete": "d", "key_move": "u"}[cell.operation]
+    state = payload_state or cell.field_state
+    key = None if identity == "keyless" else {"id": new_key}
+    before = None
+    after = None
+    before_descriptors: dict[str, SourceTypeDescriptor] = {}
+    after_descriptors: dict[str, SourceTypeDescriptor] = {}
+    typed_before = None
+    typed_after = None
+
+    if op == "d":
+        before, before_descriptors, typed_before = _image(
+            identity,
+            state,
+            key_value=old_key,
+            payload=before_payload if not ambiguous else None,
+            include_payload=not ambiguous,
         )
+        if ambiguous and identity != "keyless":
+            before = {"id": old_key}
+            typed_before = TypedImage((("id", FieldValue.of(old_key, INTEGER)),))
+    else:
+        include_after_payload = state != FieldState.ABSENT.value
+        after, after_descriptors, typed_after = _image(
+            identity,
+            state,
+            key_value=new_key,
+            payload=STRUCTURAL_MARKER if state == FieldState.UNCHANGED_TOAST.value else payload,
+            include_payload=include_after_payload,
+        )
+        if op == "u":
+            before, before_descriptors, typed_before = _image(
+                identity,
+                state,
+                key_value=old_key,
+                payload=before_payload,
+                include_payload=not ambiguous,
+            )
+            if ambiguous and identity != "keyless":
+                before = {"id": old_key}
+                typed_before = TypedImage((("id", FieldValue.of(old_key, INTEGER)),))
 
-    if cell.outcome == "swap_fault":
-        previous = os.environ.get(faults.ENV_VAR)
-        try:
-            os.environ[faults.ENV_VAR] = "swap:1:raise"
-            faults.refresh()
-            try:
-                faults.maybe_crash("swap", 1)
-            except faults.InjectedFault as exc:
-                return PhysicalRowResult(cell, "refused", str(exc))
-        finally:
-            if previous is None:
-                os.environ.pop(faults.ENV_VAR, None)
-            else:
-                os.environ[faults.ENV_VAR] = previous
-            faults.refresh()
+    if force_mixed:
+        # This is the exact input shape consumed by schema_epoch's recursive
+        # descriptor authority: the same field carries both sides of one type fence.
+        before_descriptors = {**before_descriptors, "payload": TEXT}
+        after_descriptors = {**after_descriptors, "payload": INTEGER}
 
-    return PhysicalRowResult(
+    event = PendingRecord(
+        raw=None,
+        kind=KIND_DATA,
+        topic=f"cdcflight.app.matrix_{index}",
+        nbytes=100,
+        op=op,
+        schema="app",
+        table=f"matrix_{index}",
+        lsn=index * 10 + order,
+        txn_id=f"matrix-{index}",
+        total_order=order,
+        source_ts_ms=1_760_000_000_000 + order,
+        key=key,
+        before=before,
+        after=after,
+        key_descriptors={"id": INTEGER} if identity != "keyless" else {},
+        before_descriptors=before_descriptors,
+        after_descriptors=after_descriptors,
+        typed_before=typed_before,
+        typed_after=typed_after,
+    )
+    return event
+
+
+def _normal_events(cell: PhysicalRowCell, index: int) -> list[PendingRecord]:
+    events: list[PendingRecord] = []
+    if cell.base_state == "in_group":
+        seed_key = 0 if cell.operation == "insert" else 1
+        events.append(
+            _event(
+                cell,
+                index=index,
+                order=1,
+                operation="c",
+                old_key=seed_key,
+                new_key=seed_key,
+                payload_state=FieldState.VALUE.value,
+                payload="base",
+            )
+        )
+    target_key = 2 if cell.operation == "insert" and cell.base_state == "start" else 1
+    new_key = 2 if cell.operation == "key_move" else target_key
+    events.append(
+        _event(
+            cell,
+            index=index,
+            order=len(events) + 1,
+            old_key=1,
+            new_key=new_key,
+            payload=STRUCTURAL_MARKER if cell.field_state == FieldState.UNCHANGED_TOAST.value else "value",
+            before_payload="base",
+        )
+    )
+    return events
+
+
+def _ambiguous_events(cell: PhysicalRowCell, index: int) -> list[PendingRecord]:
+    seed_a = _event(
         cell,
-        "exercised",
-        "RowPatch and the declared physical-row boundary accepted this cell",
+        index=index,
+        order=1,
+        operation="c",
+        old_key=1,
+        new_key=1,
+        payload_state=FieldState.VALUE.value,
+        payload="a",
+    )
+    seed_b = _event(
+        cell,
+        index=index,
+        order=2,
+        operation="c",
+        old_key=1,
+        new_key=1,
+        payload_state=FieldState.VALUE.value,
+        payload="b",
+    )
+    target = _event(
+        cell,
+        index=index,
+        order=3,
+        old_key=1,
+        new_key=2 if cell.operation == "key_move" else 1,
+        ambiguous=True,
+    )
+    return [seed_a, seed_b, target]
+
+
+def _toast_events(cell: PhysicalRowCell, index: int) -> list[PendingRecord]:
+    return _normal_events(cell, index)
+
+
+def _unit(events: list[PendingRecord], *, spilled: bool) -> CompleteUnit:
+    return CompleteUnit(
+        kind=UNIT_TXN,
+        events=[] if spilled else events,
+        records=events,
+        txn_id=events[-1].txn_id if events else None,
+        last_lsn=events[-1].lsn or 0,
+        nbytes=sum(event.nbytes for event in events),
+        schema=events[0].schema if events else None,
+        table=events[0].table if events else None,
+        spilled=spilled,
+        spilled_events=len(events) if spilled else 0,
+        spill_unit_seq=1 if spilled else None,
     )
 
 
-def _machine_refusal(cell: PhysicalRowCell) -> str | None:
-    """Document combinations that cannot reach a physical-row write."""
-    if cell.identity == "keyless" and cell.operation == "key_move":
-        return "keyless identity has no source key that can move"
-    if cell.schema_epoch == "mixed" and cell.outcome != "schema_refusal":
-        return "mixed schema epoch is refused before the applier reaches row attribution"
-    if (
-        cell.base_state == "missing"
-        and cell.operation in {"update", "delete", "key_move"}
-        and cell.outcome == "commit"
+def _mixed_action(target: str) -> CatalogAction:
+    change = CatalogChange(
+        kind=CHANGE_SCHEMA,
+        schema="app",
+        table=target,
+        detected_lsn=1,
+        column_changes=(
+            ColumnChange(
+                kind=COLUMN_TYPE_CHANGED,
+                attnum=2,
+                old_name="payload",
+                new_name="payload",
+                old_type_oid=TEXT.oid,
+                old_type_name=TEXT.qualified_name,
+                type_oid=INTEGER.oid,
+                type_name=INTEGER.qualified_name,
+                old_descriptor=TEXT,
+                new_descriptor=INTEGER,
+            ),
+        ),
+    )
+    return CatalogAction(change=change, target=target, destructive=False)
+
+
+def _recovery_proof(con, *, transaction_open: bool) -> str:
+    if transaction_open:
+        return "rollback=FAILED"
+    # A fresh transaction is the executable retry boundary used by the applier after
+    # every refused group.  Opening and rolling it back proves this cell did not leave
+    # a destination transaction holding locks or uncommitted spill rows.
+    con.execute("BEGIN TRANSACTION")
+    con.execute("ROLLBACK")
+    return "rollback=clean; retry_boundary=open"
+
+
+def _durable_schema_recovery(con, *, source: str, target: str, reason: str) -> str:
+    """Use the same durable refusal/resnapshot obligation as the production applier."""
+    schema, _, table = source.partition(".")
+    destination_mod.record_schema_refusal(
+        con,
+        pipeline="physical-row-matrix",
+        source_schema=schema,
+        source_table=table,
+        target_table=target,
+        detected_lsn=1,
+        reason=reason,
+    )
+    awaiting = destination_mod.tables_awaiting_snapshot(
+        con, "physical-row-matrix"
+    )
+    if (schema, table, target) not in awaiting:
+        raise RuntimeError(
+            f"schema refusal for {source} was durable but did not enter awaiting_snapshot"
+        )
+    return "schema_refusal=durable; awaiting_snapshot=true; retry=automatic"
+
+
+def _base_table(con, target: str, identity: str) -> None:
+    from .apply_sql import SchemaRegistry, insert_rows
+
+    registry = SchemaRegistry(con, "matrix")
+    if identity == "keyless":
+        table, _ = registry.ensure_typed(
+            target,
+            columns={"payload": TEXT, "cdcf_event_id": "VARCHAR"},
+            key_columns=("cdcf_event_id",),
+        )
+        insert_rows(con, table, ["payload", "cdcf_event_id"], [["base", "base-event"]])
+    else:
+        table, _ = registry.ensure_typed(
+            target,
+            columns={"id": INTEGER, "payload": TEXT},
+            key_columns=("id",),
+        )
+        insert_rows(con, table, ["id", "payload"], [[1, "base"]])
+
+
+def _result(
+    cell: PhysicalRowCell,
+    kind: str,
+    reason: str,
+    proof: str,
+    *,
+    covered: bool = True,
+) -> PhysicalRowResult:
+    return PhysicalRowResult(cell, kind, reason, proof, covered)
+
+
+def _not_reachable(cell: PhysicalRowCell, owner: str) -> PhysicalRowResult:
+    return _result(
+        cell,
+        "refused",
+        f"{owner} does not claim this declared combination",
+        f"owner={owner}; covered=false; no destination write was reported",
+        covered=False,
+    )
+
+
+def _exercise_cell(con, cell: PhysicalRowCell, index: int) -> PhysicalRowResult:
+    target = f"matrix_rows_{index}"
+    source = f"app.matrix_{index}"
+    ensure_base = cell.base_state == "start" and cell.outcome != "swap_fault" and not (
+        cell.schema_epoch == "mixed" and cell.outcome == "schema_refusal"
+    )
+
+    # These are genuine state-machine owner boundaries, not synthetic refusals.  A
+    # keyless row has no source identity to attribute and a keyed DELETE does not need
+    # a physical base in order to be safe; neither can honestly be labeled
+    # AmbiguousDelete/ToastBaseMissing merely because the product contains that axis.
+    if cell.outcome == "ambiguous_delete" and cell.identity == "keyless":
+        return _not_reachable(cell, "TableWork.keyless_identity")
+    if cell.outcome == "toast_base_missing" and (
+        cell.operation == "delete"
+        or (cell.operation == "key_move" and cell.base_state != "missing")
+        or (
+            cell.operation == "update"
+            and cell.base_state != "missing"
+            and cell.field_state != FieldState.UNCHANGED_TOAST.value
+        )
     ):
-        return "a missing physical base cannot be committed as a guessed row"
-    if cell.operation == "insert" and cell.field_state == FieldState.UNCHANGED_TOAST.value:
-        return "an insert has no prior physical row from which an unchanged TOAST field can be copied"
-    return None
+        return _not_reachable(cell, "TableWork._missing_toast_base")
+
+    from .apply_sql import SchemaRegistry
+    from .planner import GroupPlan, stream_event_id
+
+    registry = SchemaRegistry(con, "matrix")
+    if ensure_base:
+        con.execute("BEGIN TRANSACTION")
+        try:
+            _base_table(con, target, cell.identity)
+            con.execute("COMMIT")
+        except BaseException:
+            with contextlib.suppress(Exception):
+                con.execute("ROLLBACK")
+            raise
+
+    events = (
+        _ambiguous_events(cell, index)
+        if cell.outcome == "ambiguous_delete"
+        else _toast_events(cell, index)
+        if cell.outcome == "toast_base_missing"
+        else _normal_events(cell, index)
+    )
+    if cell.schema_epoch == "mixed":
+        events[0].before_descriptors = {**events[0].before_descriptors, "payload": TEXT}
+        events[0].after_descriptors = {**events[0].after_descriptors, "payload": INTEGER}
+
+    con.execute("BEGIN TRANSACTION")
+    txn_open = True
+    spill = SpillBuffer(con, binary_mode="base64", hstore_mode="map")
+    try:
+        if cell.schema_epoch == "mixed":
+            if cell.storage == "spill":
+                staged = [
+                    StagedEvent(event=event, event_id=stream_event_id(event), target=target, seq=pos)
+                    for pos, event in enumerate(events, 1)
+                ]
+                spill.stage(commit_id=1, unit_seq=1, prepared=staged)
+                checked_events = [item.event for item in spill.load(commit_id=1, unit_seq=1)]
+            else:
+                checked_events = events
+            schema_epoch.refuse_mixed_schema_epoch(
+                checked_events, [_mixed_action(f"matrix_{index}")]
+            )
+
+        if cell.outcome == "swap_fault":
+            _base_table(con, target, "keyed")
+            previous = os.environ.get(faults.ENV_VAR)
+            os.environ[faults.ENV_VAR] = "swap:1:raise"
+            faults.refresh()
+            try:
+                registry = SchemaRegistry(con, "matrix")
+                registry.convert_column_to_union(target, "payload", TEXT, INTEGER)
+            finally:
+                if previous is None:
+                    os.environ.pop(faults.ENV_VAR, None)
+                else:
+                    os.environ[faults.ENV_VAR] = previous
+                faults.refresh()
+            raise AssertionError("the real typed swap did not fire its declared fault")
+
+        descriptors = _descriptor_map(cell.identity)
+        provider = (lambda _qualified: {}) if cell.outcome == "schema_refusal" else (
+            lambda _qualified: descriptors
+        )
+        plan = GroupPlan(
+            con,
+            commit_id=1,
+            registry_of=lambda: registry,
+            snapshots=_MatrixSnapshots(target),
+            spill=spill,
+            truncate_mode=TRUNCATE_REPLICATE,
+            created_in_txn=set(),
+            descriptor_provider=provider,
+            allow_legacy_inference=False,
+        )
+        if cell.storage == "spill":
+            staged = [
+                StagedEvent(event=event, event_id=stream_event_id(event), target=target, seq=pos)
+                for pos, event in enumerate(events, 1)
+            ]
+            spill.stage(commit_id=1, unit_seq=1, prepared=staged)
+        plan.add_unit(_unit(events, spilled=cell.storage == "spill"))
+        stats = plan.write()
+        con.execute("COMMIT")
+        txn_open = False
+        if cell.outcome != "commit":
+            return _result(
+                cell,
+                "refused",
+                f"{cell.outcome}: its declared owner did not raise for this realized row state",
+                "destination:GroupPlan->TableWork->SchemaRegistry; transaction=committed; "
+                "covered=false; declared error owner not reached",
+                covered=False,
+            )
+        return _result(
+            cell,
+            "exercised",
+            f"destination transaction committed; tables={sorted(stats['tables'])}",
+            "destination:GroupPlan->TableWork->SchemaRegistry; transaction=committed; "
+            f"storage={cell.storage}; identity={cell.identity}",
+        )
+    except (AmbiguousDelete, ToastBaseMissing, SchemaEvolutionRefused, faults.InjectedFault) as exc:
+        with contextlib.suppress(Exception):
+            con.execute("ROLLBACK")
+        txn_open = False
+        recovery = _recovery_proof(con, transaction_open=txn_open)
+        if isinstance(exc, SchemaEvolutionRefused):
+            try:
+                recovery = (
+                    recovery
+                    + "; "
+                    + _durable_schema_recovery(
+                        con, source=source, target=target, reason=str(exc)
+                    )
+                )
+            except BaseException as recovery_error:
+                return _result(
+                    cell,
+                    "refused",
+                    f"{exc}; durable recovery failed: {recovery_error}",
+                    "destination:real transaction; owner=SchemaEvolutionRefused; "
+                    f"{recovery}; schema_refusal=UNPROVEN",
+                    covered=False,
+                )
+        proof = (
+            "destination:GroupPlan->TableWork->SchemaRegistry; "
+            f"owner={type(exc).__name__}; {recovery}"
+        )
+        return _result(cell, "refused", str(exc), proof, covered=cell.outcome == {
+            AmbiguousDelete: "ambiguous_delete",
+            ToastBaseMissing: "toast_base_missing",
+            SchemaEvolutionRefused: "schema_refusal",
+            faults.InjectedFault: "swap_fault",
+        }.get(type(exc), cell.outcome))
+    except BaseException as exc:
+        with contextlib.suppress(Exception):
+            con.execute("ROLLBACK")
+        txn_open = False
+        return _result(
+            cell,
+            "refused",
+            f"{type(exc).__name__}: {exc}",
+            "destination:real transaction; owner=unexpected; "
+            f"{_recovery_proof(con, transaction_open=txn_open)}",
+            covered=False,
+        )
+
+
+def exercise_cells(cells: tuple[PhysicalRowCell, ...]) -> tuple[PhysicalRowResult, ...]:
+    """Exercise cells on one real destination runtime to keep the full product cheap."""
+    con = duckdb.connect(":memory:", config=DUCKDB_CONNECT_CONFIG)
+    try:
+        from .control_schema import ensure_control_schema
+
+        ensure_dataset(con, "matrix")
+        ensure_control_schema(con)
+        results = []
+        for index, cell in enumerate(cells, 1):
+            try:
+                results.append(_exercise_cell(con, cell, index))
+            finally:
+                with contextlib.suppress(Exception):
+                    con.execute(f'DROP TABLE IF EXISTS "matrix"."matrix_rows_{index}"')
+        return tuple(results)
+    finally:
+        con.close()
+
+
+def exercise_cell(cell: PhysicalRowCell) -> PhysicalRowResult:
+    """Exercise one cell through the same real runtime used by the matrix lane."""
+    return exercise_cells((cell,))[0]
 
 
 __all__ = [
@@ -154,4 +596,5 @@ __all__ = [
     "PhysicalRowResult",
     "declared_cells",
     "exercise_cell",
+    "exercise_cells",
 ]

@@ -7,11 +7,18 @@ from decimal import Decimal
 
 import duckdb
 import pytest
+from support.applier_lab import Lab, data
 from support.type_matrix import nested_matrix, scalar_matrix
 
-from cdc_flight.apply_sql import SchemaRegistry, insert_rows
+from cdc_flight.apply_sql import SchemaRegistry, delete_keys, insert_rows, update_rows
+from cdc_flight.catalog_descriptors import CatalogDescriptorReader, RelationDescriptorProvider
 from cdc_flight.control_schema import ensure_control_schema
-from cdc_flight.destination import assert_runtime_capabilities
+from cdc_flight.destination import (
+    DUCKDB_CONNECT_CONFIG,
+    assert_runtime_capabilities,
+    pending_schema_refusals,
+    tables_awaiting_snapshot,
+)
 from cdc_flight.envelope import KIND_DATA, PendingRecord
 from cdc_flight.errors import SchemaEvolutionRefused
 from cdc_flight.planner import GroupPlan
@@ -172,6 +179,130 @@ def test_jsonb_key_loss_uses_a_typed_shadow_transition_to_variant():
         con.close()
 
 
+def test_nested_composite_jsonb_key_uses_key_native_types_and_one_identity_encoder():
+    """A key gain must rebind nested JSONB to JSON and delete the old row."""
+    con = duckdb.connect(":memory:", config=DUCKDB_CONNECT_CONFIG)
+    try:
+        con.execute("CREATE SCHEMA d")
+        integer = SourceTypeDescriptor(23, "pg_catalog.int4", "int4")
+        text = SourceTypeDescriptor(25, "pg_catalog.text", "text")
+        jsonb = SourceTypeDescriptor(3802, "pg_catalog.jsonb", "jsonb")
+        inner = SourceTypeDescriptor(
+            9100,
+            "app.inner_key",
+            "composite",
+            composite_fields=(("doc", jsonb), ("n", integer)),
+        )
+        outer = SourceTypeDescriptor(
+            9101,
+            "app.outer_key",
+            "composite",
+            composite_fields=(("inner_key", inner), ("note", text)),
+        )
+        registry = SchemaRegistry(con, "d")
+        registry.ensure_typed(
+            "nested_key",
+            columns={"id": integer, "compound": outer, "payload": text},
+            key_columns=("id",),
+        )
+        insert_rows(
+            con,
+            registry.get("nested_key"),
+            ["id", "compound", "payload"],
+            [[1, {"inner_key": {"doc": '{"a":1}', "n": 7}, "note": "x"}, "kept"]],
+        )
+        registry.ensure_typed(
+            "nested_key",
+            columns={"id": integer, "compound": outer, "payload": text},
+            key_columns=("id", "compound"),
+        )
+        table = registry.get("nested_key")
+        assert "doc JSON" in table.raw_types["compound"]
+        delete_keys(
+            con,
+            table,
+            ("id", "compound"),
+            [(1, {"inner_key": {"doc": '{"a":1}', "n": 7}, "note": "x"})],
+        )
+        assert con.execute('SELECT count(*) FROM d."nested_key"').fetchone()[0] == 0
+    finally:
+        con.close()
+
+
+def test_bytea_key_changed_to_union_uses_the_same_identity_for_existing_rows():
+    """The old BLOB member must be addressable after the typed UNION swap."""
+    con = duckdb.connect(":memory:", config=DUCKDB_CONNECT_CONFIG)
+    try:
+        con.execute("CREATE SCHEMA d")
+        bytea = SourceTypeDescriptor(17, "pg_catalog.bytea", "bytea")
+        text = SourceTypeDescriptor(25, "pg_catalog.text", "text")
+        registry = SchemaRegistry(con, "d")
+        registry.ensure_typed(
+            "bytea_union_key",
+            columns={"id": bytea, "payload": text},
+            key_columns=("id",),
+        )
+        insert_rows(con, registry.get("bytea_union_key"), ["id", "payload"], [[b"abc", "kept"]])
+        registry.convert_column_to_union("bytea_union_key", "id", bytea, text)
+        table = registry.get("bytea_union_key")
+        delete_keys(con, table, ("id",), [(b"abc",)])
+        assert con.execute('SELECT count(*) FROM d."bytea_union_key"').fetchone()[0] == 0
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize("shape", ["missing", "incomplete"], ids=["missing", "incomplete"])
+def test_relation_descriptor_provider_refuses_non_authoritative_catalog_shape(
+    monkeypatch, shape
+):
+    """A strict one-shot provider cannot infer around a missing/incomplete tree."""
+    oid = 9102 if shape == "incomplete" else 3802
+
+    class CatalogConnection:
+        def execute(self, _sql, _params):
+            return self
+
+        def fetchall(self):
+            return [("app", "rows", "payload", oid, -1, "jsonb" if oid == 3802 else "app.payload")]
+
+    if shape == "missing":
+        resolved = {}
+    else:
+        resolved = {
+            oid: SourceTypeDescriptor(oid, "app.payload", "composite", composite_fields=())
+        }
+    monkeypatch.setattr(CatalogDescriptorReader, "resolve", lambda _reader, _oids: resolved)
+    with pytest.raises(SchemaEvolutionRefused, match="descriptor"):
+        RelationDescriptorProvider.from_tables(
+            CatalogConnection(), [("app", "rows", "cdcflight_app_rows")]
+        )
+
+
+def test_spill_descriptor_failure_rolls_back_and_records_a_durable_refusal(tmp_path):
+    box = Lab(tmp_path / "spill-refusal.duckdb", unit_spill_events=1, unit_spill_bytes=1)
+    try:
+        box.applier.allow_legacy_inference = False
+
+        def failing_provider(_qualified):
+            raise OSError("catalog unavailable")
+
+        box.applier.descriptor_provider = failing_provider
+        event = data("spill-refusal", 1, 10, table="spill_rows", key={"id": 1}, after={"id": 1})
+        with pytest.raises(SchemaEvolutionRefused, match="descriptor"):
+            box.applier._spill_events([event], unit_seq=1)
+        assert box.applier.group.txn_open is False
+        assert pending_schema_refusals(box.con, "lab")
+        assert [
+            f"{schema}.{table}"
+            for schema, table, _target in tables_awaiting_snapshot(box.con, "lab")
+        ] == ["app.spill_rows"]
+        assert box.con.execute(
+            "SELECT count(*) FROM _cdc_flight.spill_events"
+        ).fetchone()[0] == 0
+    finally:
+        box.close()
+
+
 def test_production_typed_path_fails_closed_when_catalog_descriptors_are_unavailable():
     integer = SourceTypeDescriptor(23, "pg_catalog.int4", "int4")
     event = PendingRecord(
@@ -215,6 +346,32 @@ def test_tablework_numeric_adapter_is_idempotent_for_all_bounded_specials():
         assert adapted == encoded
         if encoded is not None:
             assert isinstance(adapted, UnionValue)
+
+
+@pytest.mark.parametrize("raw", ["NaN", "Infinity", "-Infinity"])
+def test_numeric_specials_update_through_the_typed_assignment_seam(raw):
+    con = duckdb.connect(":memory:", config=DUCKDB_CONNECT_CONFIG)
+    try:
+        con.execute("CREATE SCHEMA d")
+        integer = SourceTypeDescriptor(23, "pg_catalog.int4", "int4")
+        numeric = SourceTypeDescriptor(
+            1700, "pg_catalog.numeric", "numeric", precision=12, scale=4
+        )
+        registry = SchemaRegistry(con, "d")
+        registry.ensure_typed(
+            "assignment_numbers", columns={"id": integer, "value": numeric}, key_columns=("id",)
+        )
+        insert_rows(con, registry.get("assignment_numbers"), ["id", "value"], [[1, "1.2500"]])
+        changed = update_rows(
+            con,
+            registry.get("assignment_numbers"),
+            ("id",),
+            [((1,), {"value": encode_value(raw, numeric)})],
+        )
+        assert changed == 1
+        assert con.execute('SELECT union_tag("value") FROM d."assignment_numbers"').fetchone()[0] == "special"
+    finally:
+        con.close()
 
 
 def test_runtime_capability_guard_rejects_an_effective_setting_mismatch():

@@ -20,7 +20,7 @@ from cdc_flight.apply_sql import SchemaRegistry, insert_rows, update_rows
 from cdc_flight.config import DestinationConfig
 from cdc_flight.destination import DUCKDB_CONNECT_CONFIG
 from cdc_flight.destination import connect as connect_destination
-from cdc_flight.physical_row_matrix import declared_cells, exercise_cell
+from cdc_flight.physical_row_matrix import declared_cells, exercise_cell, exercise_cells
 from cdc_flight.planner import GroupPlan
 from cdc_flight.row_patch import RowPatch
 from cdc_flight.spill import _image_from_json, _image_json
@@ -79,12 +79,24 @@ NATIVE_CASES = (
 def test_declared_physical_row_product_realizes_or_refuses_every_cell():
     """The full operation/field/base/storage/outcome/identity/epoch product is closed."""
     cells = declared_cells()
-    results = [exercise_cell(cell) for cell in cells]
+    results = exercise_cells(cells)
     assert len(cells) == 4 * 4 * 3 * 2 * 5 * 2 * 3
     assert len({result.cell for result in results}) == len(cells)
     assert all(result.kind in {"exercised", "refused"} for result in results)
     assert all(result.reason for result in results)
     assert {result.kind for result in results} == {"exercised", "refused"}
+
+
+def test_commit_cell_reports_real_destination_transaction_evidence():
+    """A commit cell must not be satisfied by the old generic RowPatch stub."""
+    cell = next(
+        item
+        for item in declared_cells()
+        if item == type(item)("insert", "value", "start", "memory", "commit", "keyed", "pre")
+    )
+    result = exercise_cell(cell)
+    assert result.kind == "exercised"
+    assert getattr(result, "proof", "").startswith("destination:")
 
 
 @pytest.mark.parametrize(
