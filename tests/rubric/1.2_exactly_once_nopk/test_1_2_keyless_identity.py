@@ -25,6 +25,7 @@ import pytest
 from support.applier_lab import DATASET, Lab, data, end
 
 from cdc_flight.assembler import TransactionAssembler
+from cdc_flight.destination import ResumePoint
 from cdc_flight.envelope import PendingRecord
 from cdc_flight.errors import TransactionAssemblyError
 
@@ -101,8 +102,9 @@ def test_a_replay_recomputes_the_same_identity_and_cannot_duplicate(lab):
     A resume point can only ever sit on a transaction boundary (the assembler
     never emits a partial unit and a control record inside a transaction is
     carried by it), so a replayed transaction renumbers from 1 and recomputes
-    *identical* identities. The fence is turned off here — `resume_lsn` stays 0 —
-    so the merge on `cdcf_event_id` is what has to hold.
+    *identical* identities. The second delivery is deliberately admitted with a
+    fresh test applier whose explicit resume point is zero, so the merge on
+    `cdcf_event_id` is what this test proves.
     """
     box = lab()
     records = [
@@ -114,7 +116,11 @@ def test_a_replay_recomputes_the_same_identity_and_cannot_duplicate(lab):
     first = box.q(f'SELECT cdcf_event_id FROM "{DATASET}"."{READINGS}" ORDER BY 1')
 
     # The same WAL, delivered again, with a *fresh* record stream (the identity
-    # must be derived, not remembered).
+    # must be derived, not remembered). Reset only this test's in-memory admission
+    # point so the replay is above the fence rather than silently discarded by it.
+    # This is an explicit test seam: production startup obtains this point from the
+    # durable destination and never carries state between tests.
+    box.applier.resume_point = ResumePoint(last_lsn=0)
     box.run(
         [
             _reading("7", 1, 100, 1.0),
@@ -122,7 +128,15 @@ def test_a_replay_recomputes_the_same_identity_and_cannot_duplicate(lab):
             end("7", 2, 102, {"app.sensor_readings": 2}),
         ]
     )
-    second = box.q(f'SELECT cdcf_event_id FROM "{DATASET}"."{READINGS}" ORDER BY 1')
+    assert box.applier.fenced_units == 0
+    assert box.applier.applied_events == 4
+    assert box.q(
+        "SELECT event_count, fenced_units FROM _cdc_flight.commit_log "
+        "WHERE pipeline = 'lab' ORDER BY commit_id DESC LIMIT 1"
+    ) == [(2, 0)]
+    second = box.q(
+        f'SELECT cdcf_event_id FROM "{DATASET}"."{READINGS}" ORDER BY 1'
+    )
 
     assert first == second == [("100:7:1",), ("101:7:2",)]
     assert box.scalar(f'SELECT count(*) FROM "{DATASET}"."{READINGS}"') == 2, (

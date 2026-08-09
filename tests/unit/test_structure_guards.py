@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 _BASELINE_SELECTED = {
-    "not motherduck and not slow": 1451,
+    "not motherduck and not slow": 1452,
     "slow and not motherduck": 127,
     "motherduck": 36,
 }
