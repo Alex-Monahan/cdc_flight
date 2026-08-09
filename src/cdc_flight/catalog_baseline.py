@@ -236,15 +236,12 @@ def unrebuilt_relations(con, *, pipeline: str, dataset: str) -> list[str]:
     ]
 
 
-def owing_relations_with_rows(con, *, pipeline: str, dataset: str) -> list[str]:
+def owing_relations_with_rows(con, *, pipeline: str) -> list[str]:
     """Return every owing lifecycle name, including an empty or absent target.
 
     Trust belongs to ``TABLE_LIFECYCLE``.  Row presence is only an observation about
     the retained image; it cannot discharge ``awaiting_snapshot`` or ``in_progress``.
-    The optional ``dataset`` parameter remains for compatibility with callers that used
-    the old row-count helper.
     """
-    del dataset
     return table_lifecycle.owing_work(con, pipeline)
 
 
@@ -524,7 +521,7 @@ def confirm(
     # evidence.  The durable lifecycle alone is authoritative: an owing table is
     # untrusted until the replacement image reaches `complete`.
     remaining = sorted(set(remaining) | set(
-        owing_relations_with_rows(con, pipeline=pipeline, dataset=dataset)
+        owing_relations_with_rows(con, pipeline=pipeline)
     ))
     if remaining:
         check.unreconciled = remaining

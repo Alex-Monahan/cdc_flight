@@ -22,7 +22,7 @@ from cdc_flight.errors import AmbiguousDelete
 from cdc_flight.row_patch import RowPatch
 from cdc_flight.schema_evolution import SourceColumn
 from cdc_flight.spill import _image_from_json, _image_json
-from cdc_flight.table_work import START, TOAST_PLACEHOLDER, TableWork, _target_entry
+from cdc_flight.table_work import START, TableWork, _target_entry
 from cdc_flight.toast import (
     STRUCTURAL_MARKER,
     ToastRoute,
@@ -31,6 +31,7 @@ from cdc_flight.toast import (
     field_value,
     is_structural_marker,
 )
+from cdc_flight.toast import UNAVAILABLE_VALUE_PLACEHOLDER as TOAST_PLACEHOLDER
 from cdc_flight.typed_types import FieldState, FieldValue, SourceTypeDescriptor, TypedImage
 
 

@@ -131,7 +131,6 @@ def test_real_catalog_watcher_refreshes_mutable_enum_and_composite_facts(sandbox
         plan = object.__new__(GroupPlan)
         plan.descriptor_provider = provider
         plan._catalog_descriptor_cache = {}
-        plan.allow_legacy_inference = False
         plan._enrich_descriptors(event)
         assert event.after_descriptors["mood"].enum_labels[-1] == "sleepy"
         assert tuple(

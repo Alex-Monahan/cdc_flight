@@ -439,7 +439,7 @@ or transaction-metadata markers are not counted, because otherwise enabling
 the whole 1.1/1.2 suite. The action defaults to `os._exit(137)`; `:raise` instead raises,
 which exercises Debezium's error-teardown path. The spec is parsed and validated once at
 start-up, so a typo fails the run rather than leaving a fault test vacuously green.
-Legacy names `before_load` / `after_load` still work.
+Fault specifications use the canonical protocol anchor names listed above.
 
 The tests start the Postgres cluster themselves if it is not already up (session fixture
 `postgres_cluster`), reseed the schema, and give every test its own replication slot,

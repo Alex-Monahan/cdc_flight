@@ -30,7 +30,7 @@ import uuid
 
 import duckdb
 import pytest
-from support.applier_lab import FakeCommitter, begin, end, keyed, snap
+from support.applier_lab import FakeCommitter, begin, end, fixture_descriptors, keyed, snap
 
 from cdc_flight import destination as dest_mod
 from cdc_flight.applier import Applier
@@ -255,7 +255,7 @@ def test_motherduck_fenced_spilled_overlap_is_dropped_without_owner(md_token, tm
         lease=lease,
         runner_id="md-overlap-runner",
         completion=completion,
-        allow_legacy_inference=True,
+        descriptor_provider=fixture_descriptors,
     )
     committer = FakeCommitter()
     applier._committer = committer

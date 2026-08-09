@@ -54,7 +54,6 @@ import threading
 from pathlib import Path
 
 from .errors import OffsetFlushFailed
-from .faults import maybe_crash
 
 log = logging.getLogger("cdc_flight.consumer")
 
@@ -138,7 +137,7 @@ def verifying_consumer_class():
             self.batches_acked = 0
             self.records_acked = 0
 
-        # -- pydbzengine compatibility surface ------------------------------ #
+        # -- pydbzengine callback surface ----------------------------------- #
         def set_change_handler(self, handler) -> None:
             self.handler = handler
 
@@ -163,34 +162,14 @@ def verifying_consumer_class():
             from pydbzengine._jvm import JavaLangThread
 
             try:
-                if hasattr(self.handler, "handle_batch"):
-                    # ADR 0001 D3 / Invariant O: the handler owns the
-                    # acknowledgement, because `markProcessed()` may only run
-                    # AFTER the destination COMMIT, and a commit group can span
-                    # several Debezium batches. `SourceRecordCommitter` is created
-                    # once per poll loop (`AsyncEmbeddedEngine.java:1300`), so the
-                    # committer handed to us is the same object every batch and is
-                    # safe to hold across batches on this (single) poll thread.
-                    self.handler.handle_batch(records, self._wrap(committer))
-                    return
-
-                # Legacy shape: consume, then acknowledge the whole batch. Kept so
-                # a handler that does not need the committer still works.
-                self.handler.handleJsonBatch(records=records)
-                marked = 0
-                for record in records:
-                    committer.markProcessed(record)
-                    marked += 1
-                before = self.verifier.before() if self.verifier else None
-                committer.markBatchFinished()
-                if self.verifier is not None:
-                    self.verifier.after(before, marked=marked)
-                with self._lock:
-                    self.batches_acked += 1
-                    self.records_acked += marked
-                data_batches = getattr(self.handler, "data_batch_count", 0)
-                if marked:
-                    maybe_crash("post_ack", data_batches)
+                # ADR 0001 D3 / Invariant O: the handler owns the
+                # acknowledgement, because `markProcessed()` may only run
+                # AFTER the destination COMMIT, and a commit group can span
+                # several Debezium batches. `SourceRecordCommitter` is created
+                # once per poll loop (`AsyncEmbeddedEngine.java:1300`), so the
+                # committer handed to us is the same object every batch and is
+                # safe to hold across batches on this (single) poll thread.
+                self.handler.handle_batch(records, self._wrap(committer))
             except BaseException as exc:
                 log.error("failed to consume events in python", exc_info=True)
                 self._exception = exc

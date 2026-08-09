@@ -29,9 +29,6 @@ today keeps working after D5/D9/D1 land:
   but the replication slot has not been confirmed yet (that happens on the next
   `poll()`). Under Invariant O a crash here loses nothing and duplicates nothing.
 
-Legacy aliases `before_load` / `after_load` map onto `pre_commit` /
-`post_commit_pre_ack` so existing scenarios keep working.
-
 `<nth>` is 1-based over the **data-carrying commit groups** this process
 performs (for `decode`, over data-carrying Debezium batches). Batches that
 contain only internal/skipped records (Debezium heartbeats, transaction-metadata
@@ -213,9 +210,6 @@ SOURCE_POINTS = ("catalog_poll",)
 
 ALL_POINTS = POINTS + DESTINATION_POINTS + RECOVERY_POINTS + SOURCE_POINTS
 
-#: Names kept working from the first fault-injection cut.
-ALIASES = {"before_load": "pre_commit", "after_load": "post_commit_pre_ack"}
-
 DEFAULT_EXIT_CODE = 137
 RAISE = "raise"
 
@@ -247,11 +241,11 @@ def parse_spec(raw: str | None) -> tuple[str, int, int | str] | None:
     if not raw:
         return None
     parts = raw.split(":")
-    point = ALIASES.get(parts[0].strip(), parts[0].strip())
+    point = parts[0].strip()
     if point not in ALL_POINTS:
         raise FaultSpecError(
             f"{ENV_VAR}: unknown point {parts[0]!r}; expected one of "
-            f"{ALL_POINTS} (or aliases {tuple(ALIASES)})"
+            f"{ALL_POINTS}"
         )
     try:
         nth = int(parts[1]) if len(parts) > 1 and parts[1] else 1
@@ -568,7 +562,7 @@ def maybe_crash(point: str, nth: int) -> None:
     if spec is None:
         return
     want_point, want_nth, action = spec
-    if ALIASES.get(point, point) != want_point or nth != want_nth:
+    if point != want_point or nth != want_nth:
         return
     log.error("FAULT INJECTION: firing at %s (data batch %s) action=%s", point, nth, action)
     # BEFORE the exit, and fsynced: `os._exit` runs no atexit hook, so this is the only

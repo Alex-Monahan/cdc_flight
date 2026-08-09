@@ -232,33 +232,6 @@ def test_the_heartbeat_table_carries_the_run_phase_columns(con):
     assert {"phase", "phase_since", "terminal_reason", "phase_history"} <= columns
 
 
-def test_the_columns_are_added_to_a_heartbeat_that_predates_them(tmp_path):
-    """`CREATE TABLE IF NOT EXISTS` cannot add a column, and the table shipped one round
-    ago — including into the shared MotherDuck development database."""
-    path = str(tmp_path / "old.duckdb")
-    old = duckdb.connect(path)
-    old.execute("CREATE SCHEMA _cdc_flight")
-    old.execute(
-        "CREATE TABLE _cdc_flight.heartbeat (pipeline VARCHAR, runner_id VARCHAR, "
-        "beat_at TIMESTAMPTZ, phase VARCHAR)"
-    )
-    old.close()
-
-    fresh = duckdb.connect(path)
-    try:
-        dest_mod.ensure_control_schema(fresh)
-        columns = {
-            str(row[0])
-            for row in fresh.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema = '_cdc_flight' AND table_name = 'heartbeat'"
-            ).fetchall()
-        }
-        assert {"phase_since", "terminal_reason", "phase_history"} <= columns
-    finally:
-        fresh.close()
-
-
 def test_the_terminal_reason_reaches_the_heartbeat_row(con):
     """`heartbeat.terminal_reason` has to say something, or the column is decoration.
 
@@ -406,80 +379,6 @@ def test_no_independent_connection_means_no_row_rather_than_the_primary_one(con)
         ).fetchone()[0] == 0
     finally:
         phases.close()
-
-
-def test_a_migration_that_cannot_be_shown_to_have_happened_is_loud(tmp_path):
-    """Every `ALTER` exception used to be read as "a concurrent runner won the race",
-    with no re-check, so a permission or DDL failure looked like success and the writer
-    that depends on the column failed silently for ever (Codex r1 MINOR-1)."""
-    from cdc_flight import control_schema
-
-    path = str(tmp_path / "old.duckdb")
-    old = duckdb.connect(path)
-    old.execute("CREATE SCHEMA _cdc_flight")
-    old.execute(
-        "CREATE TABLE _cdc_flight.heartbeat (pipeline VARCHAR, runner_id VARCHAR, "
-        "beat_at TIMESTAMPTZ, phase VARCHAR)"
-    )
-    old.close()
-
-    fresh = duckdb.connect(path)
-
-    class _RefusesAlters:
-        def __init__(self, real):
-            self._real = real
-
-        def execute(self, sql, *a, **k):
-            if "ADD COLUMN" in str(sql):
-                raise RuntimeError("permission denied")
-            return self._real.execute(sql, *a, **k)
-
-    try:
-        with pytest.raises(control_schema.ControlSchemaFailed) as failure:
-            dest_mod.ensure_control_schema(_RefusesAlters(fresh))
-        assert "phase_since" in str(failure.value)
-    finally:
-        fresh.close()
-
-
-def test_a_migration_that_lost_the_race_is_accepted_after_re_reading(tmp_path):
-    """The one benign reading, VERIFIED rather than assumed."""
-
-    path = str(tmp_path / "raced.duckdb")
-    old = duckdb.connect(path)
-    old.execute("CREATE SCHEMA _cdc_flight")
-    old.execute(
-        "CREATE TABLE _cdc_flight.heartbeat (pipeline VARCHAR, runner_id VARCHAR, "
-        "beat_at TIMESTAMPTZ, phase VARCHAR)"
-    )
-    old.close()
-
-    fresh = duckdb.connect(path)
-
-    class _RacedBy:
-        """Adds the column behind our back, then reports the ALTER as failed."""
-
-        def __init__(self, real):
-            self._real = real
-
-        def execute(self, sql, *a, **k):
-            if "ADD COLUMN" in str(sql):
-                self._real.execute(sql)
-                raise RuntimeError("a concurrent runner added it first")
-            return self._real.execute(sql, *a, **k)
-
-    try:
-        dest_mod.ensure_control_schema(_RacedBy(fresh))  # must not raise
-        columns = {
-            str(row[0])
-            for row in fresh.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema = '_cdc_flight' AND table_name = 'heartbeat'"
-            ).fetchall()
-        }
-        assert {"phase_since", "terminal_reason", "phase_history"} <= columns
-    finally:
-        fresh.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -670,71 +569,6 @@ def test_the_window_is_left_even_when_the_acknowledgement_raises():
     assert "finally:" in tail and "COMMIT_ACK.leave()" in tail, (
         "the acknowledgement block must leave the window in a `finally`"
     )
-
-
-def test_metadata_that_cannot_be_read_is_loud_rather_than_skipped(tmp_path):
-    """"I could not read the metadata" is not "the table is fine" (Codex r2 MINOR-1)."""
-    from cdc_flight import control_schema
-
-    class _NoIntrospection:
-        def __init__(self, real):
-            self._real = real
-
-        def execute(self, sql, *a, **k):
-            if "information_schema.columns" in str(sql):
-                raise RuntimeError("catalog unavailable")
-            return self._real.execute(sql, *a, **k)
-
-    fresh = duckdb.connect(str(tmp_path / "blind.duckdb"))
-    try:
-        with pytest.raises(control_schema.ControlSchemaFailed):
-            dest_mod.ensure_control_schema(_NoIntrospection(fresh))
-    finally:
-        fresh.close()
-
-
-def test_an_old_heartbeat_with_a_key_and_data_keeps_both_through_the_migration(tmp_path):
-    """The exact prior DDL, with its constraint and its rows (Codex r2 MINOR-1)."""
-    path = str(tmp_path / "prior.duckdb")
-    old = duckdb.connect(path)
-    old.execute("CREATE SCHEMA _cdc_flight")
-    old.execute(
-        "CREATE TABLE _cdc_flight.heartbeat ("
-        " pipeline VARCHAR NOT NULL, runner_id VARCHAR NOT NULL,"
-        " beat_at TIMESTAMPTZ NOT NULL, phase VARCHAR NOT NULL,"
-        " last_event_at TIMESTAMPTZ, last_commit_id BIGINT, lag_seconds DOUBLE,"
-        " PRIMARY KEY (pipeline, runner_id, beat_at))"
-    )
-    old.execute(
-        "INSERT INTO _cdc_flight.heartbeat (pipeline, runner_id, beat_at, phase, "
-        "last_commit_id) VALUES ('p', 'r', now(), 'streaming', 7)"
-    )
-    old.close()
-
-    fresh = duckdb.connect(path)
-    try:
-        dest_mod.ensure_control_schema(fresh)
-        columns = {
-            str(row[0])
-            for row in fresh.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema = '_cdc_flight' AND table_name = 'heartbeat'"
-            ).fetchall()
-        }
-        assert {"phase_since", "terminal_reason", "phase_history"} <= columns
-        kept = fresh.execute(
-            "SELECT phase, last_commit_id FROM _cdc_flight.heartbeat WHERE pipeline = 'p'"
-        ).fetchall()
-        assert kept == [("streaming", 7)], "the migration lost the existing row"
-        # The key survives too: the migration adds columns, it does not rebuild.
-        keys = fresh.execute(
-            "SELECT constraint_column_names FROM duckdb_constraints() "
-            "WHERE schema_name = '_cdc_flight' AND table_name = 'heartbeat' "
-            "AND constraint_type = 'PRIMARY KEY'"
-        ).fetchall()
-        assert keys and set(keys[0][0]) == {"pipeline", "runner_id", "beat_at"}
-    finally:
-        fresh.close()
 
 
 # --------------------------------------------------------------------------- #

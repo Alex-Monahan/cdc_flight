@@ -542,7 +542,6 @@ def _exercise_cell(
             truncate_mode=TRUNCATE_REPLICATE,
             created_in_txn=set(),
             descriptor_provider=provider,
-            allow_legacy_inference=False,
         )
         if cell.storage == "spill":
             staged = [

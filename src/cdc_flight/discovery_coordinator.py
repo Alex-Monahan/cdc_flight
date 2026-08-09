@@ -350,7 +350,6 @@ class LiveDiscoveryCoordinator:
             transactional_ddl=self.transactional_ddl,
             catalog=self.watcher,
             descriptor_provider=self.descriptor_provider,
-            allow_legacy_inference=False,
             watermarks=self.watermarks,
             completion=completion,
             binary_handling_mode=self.props.get("binary.handling.mode", "base64"),

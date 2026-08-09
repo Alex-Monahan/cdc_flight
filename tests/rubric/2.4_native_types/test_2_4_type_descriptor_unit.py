@@ -281,8 +281,6 @@ def test_relation_descriptor_provider_refuses_non_authoritative_catalog_shape(
 def test_spill_descriptor_failure_rolls_back_and_records_a_durable_refusal(tmp_path):
     box = Lab(tmp_path / "spill-refusal.duckdb", unit_spill_events=1, unit_spill_bytes=1)
     try:
-        box.applier.allow_legacy_inference = False
-
         def failing_provider(_qualified):
             raise OSError("catalog unavailable")
 
@@ -321,8 +319,6 @@ def test_production_typed_path_fails_closed_when_catalog_descriptors_are_unavail
         OSError("catalog unavailable")
     )
     plan._catalog_descriptor_cache = {}
-    plan.allow_legacy_inference = False
-
     with pytest.raises(SchemaEvolutionRefused, match="catalog descriptor"):
         plan._enrich_descriptors(event)
 
