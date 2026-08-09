@@ -395,65 +395,6 @@ def _not_reachable(cell: PhysicalRowCell, reason: str) -> PhysicalRowResult:
     )
 
 
-def _unreachable_reason(cell: PhysicalRowCell) -> str | None:
-    """Derive only state-machine-impossible cells, not runtime failures."""
-    if cell.schema_epoch == "mixed" and cell.outcome != "schema_refusal":
-        return "schema_epoch_mixed->SchemaEvolutionRefused"
-    if (
-        cell.outcome == "commit"
-        and cell.operation == "insert"
-        and cell.field_state == FieldState.UNCHANGED_TOAST.value
-    ):
-        return "insert_unchanged_toast->no_prior_row_to_merge"
-    if cell.outcome == "ambiguous_delete":
-        if cell.identity == "keyless":
-            return "keyless_identity->no_source_key_attribution"
-        if cell.operation != "delete":
-            return "ambiguous_delete->DELETE_only"
-    if cell.outcome == "toast_base_missing":
-        if cell.operation in {"insert", "delete"}:
-            return "toast_base_missing->insert_delete_have_no_toast_base_read"
-        if cell.field_state != FieldState.UNCHANGED_TOAST.value:
-            return "toast_base_missing->unchanged_toast_only"
-        if cell.base_state != "missing":
-            return "toast_base_missing->requires_missing_base"
-    if cell.outcome == "commit" and cell.identity == "keyless" and cell.operation == "key_move":
-        return "keyless_key_move->no_source_key_tuple"
-    if cell.outcome == "commit" and cell.identity == "keyless" and cell.operation == "delete":
-        return "keyless_delete->no_event_identity_base"
-    if (
-        cell.outcome == "commit"
-        and cell.identity == "keyless"
-        and cell.operation == "insert"
-        and cell.field_state == FieldState.ABSENT.value
-    ):
-        return "keyless_insert_absent->no_complete_source_image"
-    if (
-        cell.outcome == "commit"
-        and cell.identity == "keyless"
-        and cell.operation == "update"
-        and cell.field_state == FieldState.ABSENT.value
-    ):
-        return "keyless_update_absent->no_complete_source_image"
-    if (
-        cell.outcome == "commit"
-        and cell.identity == "keyless"
-        and cell.operation == "update"
-        and cell.field_state == FieldState.UNCHANGED_TOAST.value
-        and cell.base_state != "missing"
-    ):
-        return "keyless_update_unchanged_toast->no_source_row_identity"
-    if (
-        cell.outcome == "commit"
-        and cell.operation in {"update", "key_move"}
-        and cell.base_state == "missing"
-    ):
-        return "sparse_update->requires_verified_destination_base"
-    if cell.outcome == "swap_fault" and cell.schema_epoch != "pre":
-        return "swap_fault->mixed_schema_refusal_precedes_swap"
-    return None
-
-
 def _exercise_cell(
     con, cell: PhysicalRowCell, index: int, *, matrix_applier=None
 ) -> PhysicalRowResult:
@@ -466,7 +407,7 @@ def _exercise_cell(
     # keyless row has no source identity to attribute and a keyed DELETE does not need
     # a physical base in order to be safe; neither can honestly be labeled
     # AmbiguousDelete/ToastBaseMissing merely because the product contains that axis.
-    unreachable = _unreachable_reason(cell)
+    unreachable = machines.physical_row_unreachable_reason(cell)
     if unreachable is not None:
         return _not_reachable(cell, unreachable)
 

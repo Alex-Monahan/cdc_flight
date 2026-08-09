@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import timedelta
 from decimal import Decimal
 
 import duckdb
@@ -152,6 +153,15 @@ def _full_type_cases():
 
 _FULL_TYPE_CASES = _full_type_cases()
 
+_SPECIAL_ROUND_TRIPS = (
+    ("float4-nan", _source("real", 700), "NaN"),
+    ("float4-positive-infinity", _source("real", 700), "Infinity"),
+    ("float8-negative-infinity", _source("double", 701), "-Infinity"),
+    ("float8-signed-zero", _source("double", 701), -0.0),
+    ("numeric-special", _source("numeric", 1700, precision=12, scale=4), "NaN"),
+    ("numeric-variable-special", _source("numeric", 1700, precision=50, scale=8), "Infinity"),
+)
+
 
 @pytest.mark.parametrize(
     ("name", "source", "source_value"),
@@ -161,7 +171,7 @@ _FULL_TYPE_CASES = _full_type_cases()
 def test_full_24_type_list_source_identity_survives_typed_shadow_swap(
     name, source, source_value
 ):
-    """The ID after a typed swap is the source identity, never a readback identity."""
+    """A typed swap rewrites the row to the one current source identity."""
     new_source = replace(
         source,
         oid=(source.oid or 1) + 50000,
@@ -185,18 +195,15 @@ def test_full_24_type_list_source_identity_survives_typed_shadow_swap(
             ["key", "payload"],
             [[source_value, "kept"]],
         )
-        source_identity = identity_value(
-            registry.get("full_type_identity"),
-            (source_value,),
-            key_columns=("key",),
-        )
         registry.convert_column_to_union(
             "full_type_identity", "key", source, new_source
         )
-        stored_identity = con.execute(
-            'SELECT "cdcf_internal_id" FROM typed."full_type_identity"'
-        ).fetchone()[0]
-        assert stored_identity == source_identity, name
+        current = registry.get("full_type_identity")
+        row = con.execute(
+            'SELECT "key", "cdcf_internal_id" FROM typed."full_type_identity"'
+        ).fetchone()
+        assert row[1] == identity_value(current, (source_value,), key_columns=("key",)), name
+        assert row[1] == identity_value(current, (row[0],), key_columns=("key",)), name
     finally:
         con.close()
 
@@ -228,7 +235,7 @@ def test_full_24_type_list_source_identity_survives_typed_shadow_swap(
         ),
     ],
 )
-def test_shadow_swap_carries_source_identity_verbatim(
+def test_shadow_swap_rewrites_to_current_source_identity(
     old_child, new_child, source_value
 ):
     old_key = _wrapped(old_child, 9400 + old_child.oid % 100)
@@ -249,15 +256,248 @@ def test_shadow_swap_carries_source_identity_verbatim(
             con, registry.get("stable_identity"), ["key", "payload"],
             [[source_value, "kept"]],
         )
-        before = con.execute(
-            'SELECT "cdcf_internal_id" FROM typed."stable_identity"'
-        ).fetchone()[0]
         registry.convert_column_to_union("stable_identity", "key", old_key, new_key)
-        after = con.execute(
-            'SELECT "cdcf_internal_id" FROM typed."stable_identity"'
-        ).fetchone()[0]
-        assert after == before
-        delete_keys(con, registry.get("stable_identity"), ("key",), [(source_value,)])
+        row = con.execute(
+            'SELECT "key", "cdcf_internal_id" FROM typed."stable_identity"'
+        ).fetchone()
+        after = row[1]
+        current = registry.get("stable_identity")
+        assert after == identity_value(current, (row[0],), key_columns=("key",))
+        # For an incompatible source-type change, an existing old UNION member
+        # is addressed by its destination readback value.  The int4 -> int8
+        # source-value path above proves the lossless widening case directly.
+        delete_keys(con, registry.get("stable_identity"), ("key",), [(row[0],)])
         assert con.execute('SELECT count(*) FROM typed."stable_identity"').fetchone()[0] == 0
+    finally:
+        con.close()
+
+
+def test_float4_key_delete_binds_the_target_native_type():
+    """The exact r3 FLOAT/DOUBLE predicate miss must be a red regression."""
+    real = _source("real", 700)
+    con = duckdb.connect(":memory:", config={
+        "storage_compatibility_version": "v1.5.0",
+        "variant_minimum_shredding_size": "-1",
+    })
+    try:
+        con.execute("CREATE SCHEMA typed")
+        registry = SchemaRegistry(con, "typed")
+        registry.ensure_typed(
+            "float4_key", columns={"key": real, "payload": _source("text", 25)},
+            key_columns=("key",),
+        )
+        insert_rows(con, registry.get("float4_key"), ["key", "payload"], [[1.23, "kept"]])
+        delete_keys(con, registry.get("float4_key"), ("key",), [(1.23,)])
+        assert con.execute('SELECT count(*) FROM typed."float4_key"').fetchone() == (0,)
+    finally:
+        con.close()
+
+
+def test_interval_identity_is_stable_from_source_text_to_duckdb_readback():
+    """P1Y2M3DT4H5M6S must address the timedelta DuckDB returns."""
+    interval = _source("interval", 1186)
+    con = duckdb.connect(":memory:", config={
+        "storage_compatibility_version": "v1.5.0",
+        "variant_minimum_shredding_size": "-1",
+    })
+    try:
+        con.execute("CREATE SCHEMA typed")
+        registry = SchemaRegistry(con, "typed")
+        registry.ensure_typed(
+            "interval_readback", columns={"key": interval, "payload": _source("text", 25)},
+            key_columns=("key",),
+        )
+        table = registry.get("interval_readback")
+        source_value = "P1Y2M3DT4H5M6S"
+        insert_rows(con, table, ["key", "payload"], [[source_value, "kept"]])
+        readback = con.execute('SELECT "key" FROM typed."interval_readback"').fetchone()[0]
+        assert identity_value(table, (source_value,), key_columns=("key",)) == identity_value(
+            table, (readback,), key_columns=("key",)
+        )
+        delete_keys(con, table, ("key",), [(source_value,)])
+        assert con.execute('SELECT count(*) FROM typed."interval_readback"').fetchone() == (0,)
+    finally:
+        con.close()
+
+
+def test_numeric_union_readback_normalizes_to_the_source_numeric_tree():
+    numeric12 = _source("numeric", 1700, precision=12, scale=4)
+    numeric18 = _source("numeric", 1701, precision=18, scale=4)
+    con = duckdb.connect(":memory:", config={
+        "storage_compatibility_version": "v1.5.0",
+        "variant_minimum_shredding_size": "-1",
+    })
+    try:
+        con.execute("CREATE SCHEMA typed")
+        registry = SchemaRegistry(con, "typed")
+        registry.ensure_typed(
+            "numeric_key", columns={"key": numeric12, "payload": _source("text", 25)},
+            key_columns=("key",),
+        )
+        insert_rows(
+            con, registry.get("numeric_key"), ["key", "payload"], [[Decimal("1.0000"), "kept"]]
+        )
+        registry.convert_column_to_union("numeric_key", "key", numeric12, numeric18)
+        table = registry.get("numeric_key")
+        readback = con.execute('SELECT "key" FROM typed."numeric_key"').fetchone()[0]
+        assert identity_value(table, (Decimal("1.0000"),), key_columns=("key",)) == identity_value(
+            table, (readback,), key_columns=("key",)
+        )
+        delete_keys(con, table, ("key",), [(Decimal("1.0000"),)])
+        assert con.execute('SELECT count(*) FROM typed."numeric_key"').fetchone() == (0,)
+    finally:
+        con.close()
+
+
+def test_signed_zero_has_one_internal_identity():
+    float8 = _source("double", 701)
+    composite = SourceTypeDescriptor(
+        9701,
+        "app.zero_key",
+        "composite",
+        composite_fields=(("value", float8),),
+    )
+    con = duckdb.connect(":memory:", config={
+        "storage_compatibility_version": "v1.5.0",
+        "variant_minimum_shredding_size": "-1",
+    })
+    try:
+        con.execute("CREATE SCHEMA typed")
+        registry = SchemaRegistry(con, "typed")
+        registry.ensure_typed(
+            "signed_zero", columns={"key": composite, "payload": _source("text", 25)},
+            key_columns=("key",),
+        )
+        table = registry.get("signed_zero")
+        insert_rows(con, table, ["key", "payload"], [[{"value": 0.0}, "kept"]])
+        delete_keys(con, table, ("key",), [({"value": -0.0},)])
+        assert con.execute('SELECT count(*) FROM typed."signed_zero"').fetchone() == (0,)
+    finally:
+        con.close()
+
+
+def test_interval_identity_uses_exact_integer_units_not_float_microseconds():
+    interval = _source("interval", 1186)
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("CREATE SCHEMA typed")
+        registry = SchemaRegistry(con, "typed")
+        registry.ensure_typed(
+            "interval_collision", columns={"key": interval}, key_columns=("key",)
+        )
+        table = registry.get("interval_collision")
+        left = timedelta(days=200_000_000)
+        right = timedelta(days=200_000_000, microseconds=1)
+        assert identity_value(table, (left,), key_columns=("key",)) != identity_value(
+            table, (right,), key_columns=("key",)
+        )
+    finally:
+        con.close()
+
+
+def test_current_identity_has_no_historical_descriptor_sidecar_or_candidates():
+    """Identity history is forbidden once the canonical swap rewrite is in place."""
+    from cdc_flight import identity_codec
+
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("CREATE SCHEMA typed")
+        registry = SchemaRegistry(con, "typed")
+        table, _ = registry.ensure_typed(
+            "current_identity", columns={"key": _source("int4", 23)}, key_columns=("key",)
+        )
+        assert not hasattr(table, "identity_descriptors")
+        assert not hasattr(identity_codec, "_identity_candidates")
+        columns = con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema='typed' AND table_name='__cdcf_key_metadata'"
+        ).fetchall()
+        assert "identity_descriptors" not in {row[0] for row in columns}
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize(
+    ("name", "source", "source_value"),
+    _FULL_TYPE_CASES,
+    ids=[case[0] for case in _FULL_TYPE_CASES],
+)
+def test_full_declared_type_identity_matches_readback_and_current_swap(
+    name, source, source_value
+):
+    """Every declared source value has one identity before/after a typed swap."""
+    new_source = replace(
+        source,
+        oid=(source.oid or 1) + 70000,
+        qualified_name=f"{source.qualified_name}.current",
+    )
+    con = duckdb.connect(":memory:", config={
+        "storage_compatibility_version": "v1.5.0",
+        "variant_minimum_shredding_size": "-1",
+    })
+    try:
+        con.execute("CREATE SCHEMA typed")
+        registry = SchemaRegistry(con, "typed")
+        registry.ensure_typed(
+            "identity_property", columns={"key": source, "payload": _source("text", 25)},
+            key_columns=("key",),
+        )
+        table = registry.get("identity_property")
+        insert_rows(con, table, ["key", "payload"], [[source_value, "kept"]])
+        source_id = identity_value(table, (source_value,), key_columns=("key",))
+        readback = con.execute('SELECT "key" FROM typed."identity_property"').fetchone()[0]
+        assert source_id == identity_value(table, (readback,), key_columns=("key",)), name
+
+        registry.convert_column_to_union("identity_property", "key", source, new_source)
+        current = registry.get("identity_property")
+        swapped = con.execute('SELECT "key", "cdcf_internal_id" FROM typed."identity_property"').fetchone()
+        current_id = identity_value(current, (source_value,), key_columns=("key",))
+        assert swapped[1] == current_id, name
+        assert current_id == identity_value(current, (swapped[0],), key_columns=("key",)), name
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize(
+    ("name", "source", "source_value"),
+    _SPECIAL_ROUND_TRIPS,
+    ids=[case[0] for case in _SPECIAL_ROUND_TRIPS],
+)
+def test_special_values_are_stable_through_readback_and_shadow_swap(
+    name, source, source_value
+):
+    """NaN, infinities, and signed zero share one current canonical tree."""
+    new_source = replace(
+        source,
+        oid=(source.oid or 1) + 80000,
+        qualified_name=f"{source.qualified_name}.special",
+    )
+    con = duckdb.connect(":memory:", config={
+        "storage_compatibility_version": "v1.5.0",
+        "variant_minimum_shredding_size": "-1",
+    })
+    try:
+        con.execute("CREATE SCHEMA typed")
+        registry = SchemaRegistry(con, "typed")
+        registry.ensure_typed(
+            "special_identity",
+            columns={"key": source, "payload": _source("text", 25)},
+            key_columns=("key",),
+        )
+        table = registry.get("special_identity")
+        insert_rows(con, table, ["key", "payload"], [[source_value, "kept"]])
+        readback = con.execute(
+            'SELECT "key" FROM typed."special_identity"'
+        ).fetchone()[0]
+        assert identity_value(table, (source_value,), key_columns=("key",)) == identity_value(
+            table, (readback,), key_columns=("key",)
+        ), name
+        registry.convert_column_to_union("special_identity", "key", source, new_source)
+        current = registry.get("special_identity")
+        row = con.execute(
+            'SELECT "key", "cdcf_internal_id" FROM typed."special_identity"'
+        ).fetchone()
+        assert row[1] == identity_value(current, (source_value,), key_columns=("key",)), name
+        assert row[1] == identity_value(current, (row[0],), key_columns=("key",)), name
     finally:
         con.close()

@@ -12,7 +12,6 @@ import math
 from typing import Any
 
 from .identity_codec import (  # noqa: F401
-    _identity_candidates,
     _identity_runtime,
     _identity_tree,
     _identity_value,

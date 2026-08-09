@@ -15,7 +15,7 @@ import duckdb
 import pytest
 from support.applier_lab import Lab, data, end
 
-from cdc_flight import apply_sql
+from cdc_flight import apply_sql, machines
 from cdc_flight.apply_sql import SchemaRegistry, insert_rows, update_rows
 from cdc_flight.config import DestinationConfig
 from cdc_flight.destination import DUCKDB_CONNECT_CONFIG
@@ -126,6 +126,18 @@ def test_schema_refusal_uses_the_real_applier_spill_refusal_seam():
     assert "seam=Applier._handle_spill_refusal->spill_refusal.handle" in result.proof
     assert "awaiting_snapshot=true" in result.proof
     assert "retry=automatic" in result.proof
+
+
+def test_uncovered_cells_match_declared_machine_preconditions():
+    """Unreachability must be derived by production declarations, not test prose."""
+    results = exercise_cells(declared_cells())
+    for result in results:
+        reason = machines.physical_row_unreachable_reason(result.cell)
+        if result.covered:
+            assert reason is None, result.cell
+        else:
+            assert reason is not None, result.cell
+            assert result.reason == f"unreachable:{reason}", result.cell
 
 
 @pytest.mark.parametrize(

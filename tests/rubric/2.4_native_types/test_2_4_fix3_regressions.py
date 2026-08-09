@@ -13,6 +13,7 @@ from cdc_flight import destination
 from cdc_flight.apply_sql import SchemaRegistry, delete_keys, insert_rows
 from cdc_flight.catalog_poll import _column_descriptor
 from cdc_flight.catalog_state import read_known_relations
+from cdc_flight.identity_codec import identity_value
 from cdc_flight.typed_types import SourceTypeDescriptor, native_type
 
 
@@ -121,14 +122,17 @@ def test_interval_key_creation_migration_and_replay_keep_one_identity_path():
             'SELECT "cdcf_internal_id" FROM typed."interval_lifecycle"'
         ).fetchone()[0]
 
-        # A current-version type change must carry the existing ID across the
-        # shadow copy instead of deriving it from a readback INTERVAL/UNION value.
+        # A current-version type change rewrites the row into the one current
+        # source-semantic identity.  The destination TEXT representation is the
+        # value that subsequent TEXT events/lookups address.
         registry.convert_column_to_union("interval_lifecycle", "key", interval, text)
+        current = registry.get("interval_lifecycle")
         after = con.execute(
-            'SELECT "cdcf_internal_id" FROM typed."interval_lifecycle"'
-        ).fetchone()[0]
-        assert after == before
-        delete_keys(con, registry.get("interval_lifecycle"), ("key",), [(value,)])
+            'SELECT "key", "cdcf_internal_id" FROM typed."interval_lifecycle"'
+        ).fetchone()
+        assert after[1] != before
+        assert after[1] == identity_value(current, (after[0],), key_columns=("key",))
+        delete_keys(con, current, ("key",), [(after[0],)])
         assert con.execute('SELECT count(*) FROM typed."interval_lifecycle"').fetchone()[0] == 0
     finally:
         con.close()

@@ -369,7 +369,7 @@ def test_a_phase_write_inside_the_commit_ack_window_is_dropped_not_performed(con
 def test_the_applier_really_holds_that_window_around_commit_to_ack():
     """The flag is only worth anything if the applier is the thing that sets it."""
     source = (
-        Path(__file__).resolve().parents[3] / "src" / "cdc_flight" / "applier.py"
+        Path(__file__).resolve().parents[3] / "src" / "cdc_flight" / "commit_protocol.py"
     ).read_text()
     commit = source.index('self.con.execute("COMMIT")')
     ack = source.index("self._committer.markBatchFinished()")
@@ -663,7 +663,7 @@ def test_the_window_is_left_even_when_the_acknowledgement_raises():
     """`markProcessed`/`markBatchFinished` can raise; a window left open would drop
     every later phase write silently (Codex r2 MAJOR-1)."""
     source = (
-        Path(__file__).resolve().parents[3] / "src" / "cdc_flight" / "applier.py"
+        Path(__file__).resolve().parents[3] / "src" / "cdc_flight" / "commit_protocol.py"
     ).read_text()
     ack = source.index("self._committer.markBatchFinished()")
     tail = source[ack : ack + 600]

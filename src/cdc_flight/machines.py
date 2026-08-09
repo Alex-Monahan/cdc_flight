@@ -47,6 +47,10 @@ over external state) — appear below only as frozen **domains** where they have
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
+
 from .states import Domain, Machine, UnknownState, ranked
 
 # --------------------------------------------------------------------------- #
@@ -796,6 +800,150 @@ PHYSICAL_ROW_IDENTITIES = Domain(
 PHYSICAL_ROW_SCHEMA_EPOCHS = Domain(
     "physical_row_schema_epochs", values=("pre", "post", "mixed")
 )
+
+
+@dataclass(frozen=True)
+class PhysicalRowPrecondition:
+    """One declared machine precondition for the physical-row product.
+
+    The matrix executor is allowed to refuse a cell only when one of these
+    production-owned predicates says that the requested owner cannot receive that
+    combination.  Keeping the predicate and its stable diagnostic together makes
+    an ``unreachable`` result a declaration lookup, not a second test harness
+    policy.
+    """
+
+    name: str
+    reason: str
+    predicate: Callable[[Any], bool]
+
+
+PHYSICAL_ROW_PRECONDITIONS = (
+    PhysicalRowPrecondition(
+        "mixed_schema_epoch_requires_schema_refusal",
+        "schema_epoch_mixed->SchemaEvolutionRefused",
+        lambda cell: cell.schema_epoch == "mixed" and cell.outcome != "schema_refusal",
+    ),
+    PhysicalRowPrecondition(
+        "insert_unchanged_toast_requires_prior_row",
+        "insert_unchanged_toast->no_prior_row_to_merge",
+        lambda cell: (
+            cell.outcome == "commit"
+            and cell.operation == "insert"
+            and cell.field_state == "unchanged_toast"
+        ),
+    ),
+    PhysicalRowPrecondition(
+        "ambiguous_delete_requires_keyed_delete",
+        "ambiguous_delete->DELETE_only",
+        lambda cell: (
+            cell.outcome == "ambiguous_delete"
+            and cell.identity != "keyless"
+            and cell.operation != "delete"
+        ),
+    ),
+    PhysicalRowPrecondition(
+        "ambiguous_delete_requires_source_key",
+        "keyless_identity->no_source_key_attribution",
+        lambda cell: cell.outcome == "ambiguous_delete" and cell.identity == "keyless",
+    ),
+    PhysicalRowPrecondition(
+        "toast_missing_requires_update",
+        "toast_base_missing->insert_delete_have_no_toast_base_read",
+        lambda cell: cell.outcome == "toast_base_missing"
+        and cell.operation in {"insert", "delete"},
+    ),
+    PhysicalRowPrecondition(
+        "toast_missing_requires_unchanged_marker",
+        "toast_base_missing->unchanged_toast_only",
+        lambda cell: (
+            cell.outcome == "toast_base_missing"
+            and cell.operation not in {"insert", "delete"}
+            and cell.field_state != "unchanged_toast"
+        ),
+    ),
+    PhysicalRowPrecondition(
+        "toast_missing_requires_missing_base",
+        "toast_base_missing->requires_missing_base",
+        lambda cell: (
+            cell.outcome == "toast_base_missing"
+            and cell.operation not in {"insert", "delete"}
+            and cell.field_state == "unchanged_toast"
+            and cell.base_state != "missing"
+        ),
+    ),
+    PhysicalRowPrecondition(
+        "keyless_move_requires_source_key",
+        "keyless_key_move->no_source_key_tuple",
+        lambda cell: (
+            cell.outcome == "commit"
+            and cell.identity == "keyless"
+            and cell.operation == "key_move"
+        ),
+    ),
+    PhysicalRowPrecondition(
+        "keyless_delete_requires_event_identity",
+        "keyless_delete->no_event_identity_base",
+        lambda cell: (
+            cell.outcome == "commit"
+            and cell.identity == "keyless"
+            and cell.operation == "delete"
+        ),
+    ),
+    PhysicalRowPrecondition(
+        "keyless_insert_requires_complete_image",
+        "keyless_insert_absent->no_complete_source_image",
+        lambda cell: (
+            cell.outcome == "commit"
+            and cell.identity == "keyless"
+            and cell.operation == "insert"
+            and cell.field_state == "absent"
+        ),
+    ),
+    PhysicalRowPrecondition(
+        "keyless_update_requires_complete_image",
+        "keyless_update_absent->no_complete_source_image",
+        lambda cell: (
+            cell.outcome == "commit"
+            and cell.identity == "keyless"
+            and cell.operation == "update"
+            and cell.field_state == "absent"
+        ),
+    ),
+    PhysicalRowPrecondition(
+        "keyless_update_requires_source_row_identity",
+        "keyless_update_unchanged_toast->no_source_row_identity",
+        lambda cell: (
+            cell.outcome == "commit"
+            and cell.identity == "keyless"
+            and cell.operation == "update"
+            and cell.field_state == "unchanged_toast"
+            and cell.base_state != "missing"
+        ),
+    ),
+    PhysicalRowPrecondition(
+        "sparse_update_requires_verified_base",
+        "sparse_update->requires_verified_destination_base",
+        lambda cell: (
+            cell.outcome == "commit"
+            and cell.operation in {"update", "key_move"}
+            and cell.base_state == "missing"
+        ),
+    ),
+    PhysicalRowPrecondition(
+        "swap_fault_must_precede_schema_fence",
+        "swap_fault->mixed_schema_refusal_precedes_swap",
+        lambda cell: cell.outcome == "swap_fault" and cell.schema_epoch != "pre",
+    ),
+)
+
+
+def physical_row_unreachable_reason(cell: Any) -> str | None:
+    """Return the first declared machine precondition that forbids ``cell``."""
+    for precondition in PHYSICAL_ROW_PRECONDITIONS:
+        if precondition.predicate(cell):
+            return precondition.reason
+    return None
 
 
 def declared_machines() -> dict[str, Machine]:

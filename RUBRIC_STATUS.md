@@ -206,7 +206,7 @@ DuckDB file, so they never disturb `make pipeline` or the pytest suite.
 ## Changes since the baseline scoring
 
 The historical blocks below preserve the **Phase-0 baseline**. The summary
-table is the current score, and the 2026-08-08 FIX ROUND blocks under 2.4,
+table is the current score, and the 2026-08-09 FIX ROUND blocks under 2.4,
 2.5, and 2.6 record the new executed evidence for those items.
 
 ### FIX ROUND 3 correction (2026-08-08)
@@ -228,14 +228,54 @@ Debezium policy.
 | interval key rejection | PostgreSQL creation audit says interval is a valid source key; the destination marks it non-indexable, uses the internal canonical identity, and creation/migration/replay pass. |
 | physical-row matrix gaps | The matrix uses the real Applier refusal seam, asserts a covered floor and machine-derived uncovered reasons, and re-raises unexpected exceptions. |
 
-N1 is explicitly dismissed by the user's 2026-08-08 directive: this code is still in
-testing, so state written by a previous build does not require migration. No identity
-format versioning, legacy-build candidate lookup, or conversion backfill was added.
-The current-version descriptor history used by a typed shadow swap is a separate,
-active-build schema-evolution mechanism and is covered by the 2.5 property tests.
+### FIX ROUND 4 closure (2026-08-09)
 
-Final required-lane evidence for this round is 1,459 default tests, 128 slow tests,
-37 MotherDuck tests, and a clean `make lint` run.
+The two identity findings are one fix, as required: `identity_codec.py` now
+normalizes every value by source semantics before creation, lookup, and typed
+shadow copy, and the encoder is stable under destination readback for the
+declared types. FLOAT/real predicates bind to the target native type and real
+values are canonicalized as binary32; signed zero has one class; numeric raw and
+physical-UNION values share one finite/special tree; and intervals use exact
+integer `{months, days, microseconds}` units with no float conversion. The
+interval source/readback normalization also distinguishes the two PostgreSQL-
+unequal 200,000,000-day values.
+
+The full declared 33-case key-gain audit reran with **`cases 33 failed 0`**.
+The source/readback/current-shadow property passed for all 33 cases, including
+float4/float8, numeric scales and trailing zeros, signed zero, NaN/±Inf,
+intervals, timestamptz across spring/fall DST, date/time, UUID case, arrays with
+NULL and empty members, nested composites, maps, ranges/multiranges, JSONB, and
+unicode. Six additional special-value round trips also passed.
+
+Identity history is gone: there is no `TableSchema.identity_descriptors`, no
+`__cdcf_key_metadata.identity_descriptors` column, and no `_identity_candidates`
+lookup or multi-candidate delete/update path. The shadow copy recomputes every
+row's identity in the current canonical form. The old-member addressing
+regression still passes for an int4→int8 change, and incompatible swaps delete
+through the actual destination readback, so removing history did not restore the
+orphan-row defect.
+
+For 2.6, catalog activation now verifies FULL again after sampling the activation
+LSN on the same connection; the exact two-connection downgrade race observed in
+r3 now leaves no boundary and is rejected by policy. The 2,880-cell matrix's
+1,860 uncovered cells obtain reasons from the production
+`machines.PHYSICAL_ROW_PRECONDITIONS` declarations, and unexpected exceptions
+still fail the executor. The honest score remains **4/5** because stock,
+published Debezium still does not provide the marker-preserving efficient TOAST
+channel; the deferred 5/5 upgrade remains out of scope.
+
+The ownership split is substantive: DDL, typed shadow swaps, and backfills are
+separate owner modules with import-direction guards, and the commit durability
+protocol is in `commit_protocol.py`; `applier.py` is 774 lines and
+`schema_registry.py` is 642 lines. The guard checks owner method modules and
+dependency boundaries, not just file lengths.
+
+Final required-lane evidence: default **1,507 passed**, slow **129 passed**,
+MotherDuck **37 passed**, and clean `make lint` (all on `CDC_TEST_PGPORT=15434`).
+
+No identity versioning, legacy-build candidate lookup, or conversion backfill was
+added. This code is still in testing and intentionally supports one current
+canonical identity format only.
 
 ### TODO 1.1 / 1.2 / 1.3 — the transactional applier (implemented 2026-07-30)
 
@@ -399,8 +439,8 @@ correct assumptions in the notes below:
 | 2.2 | Renamed columns handled well | **5** | Same-attnum/type changes use a true destination rename, including a late-row merge/fence path; the E2E has one logical column, one rename audit event, and no data loss. |
 | 2.3 | New tables and schemas auto-discovered | **5** | A 10-second (configurable) all-schema watcher admits table-scoped publication members and performs an in-process targeted re-snapshot on the same main slot; new-table and new-schema existing rows arrive without config edit or restart. |
 | 2.4 | Postgres types → native MotherDuck types | ~~1~~ → **5** | Catalog-authoritative recursive descriptors map the full supported matrix to native JSON/VARIANT/LIST/STRUCT/MAP and bounded numeric UNIONs; NaN/Infinity/NULL/spill/replay are covered. JSONB keys use JSON on both runtimes, including composite keys and automatic key gain/loss repair. |
-| 2.5 | Data type changes supported | ~~3~~ → **5** | One typed shadow-swap path creates fingerprinted UNION members, preserves old members and source-key identity across type changes/key moves/restarts, fences mixed epochs, and is fault-instrumented. |
-| 2.6 | TOAST columns handled well | **4** | Sparse physical-row folding, durable NULL-vs-JSONB-root-null ambiguity refusal, and a per-table FULL activation boundary close soundness defects. Stock Debezium still lacks a marker-preserving efficient channel, so the policy ceiling remains 4. |
+| 2.5 | Data type changes supported | ~~3~~ → **5** | One typed shadow-swap path creates fingerprinted UNION members, rewrites every row to the one current source-semantic identity, fences mixed epochs, and is fault-instrumented; no identity history or candidate lookup remains. |
+| 2.6 | TOAST columns handled well | **4** | Sparse physical-row folding, durable NULL-vs-JSONB-root-null ambiguity refusal, post-sample FULL re-verification, and a per-table activation boundary close soundness defects. Stock Debezium still lacks a marker-preserving efficient channel, so the policy ceiling remains 4. |
 | 3.1 | Backfill scalable / parallelized | 3 | 120 k rows in ~28 s single-threaded (`snapshot.max.threads=1`); works but does not scale, untested past 120 k. |
 | 3.2 | Backfills atomic | 1 | Snapshot rows are appended straight into the live table; no shadow table, no swap. |
 | 3.3 | Existing tables keep receiving CDC during snapshot | 1 | Debezium's initial snapshot blocks streaming entirely; everything goes stale for the snapshot's duration. |
@@ -1820,13 +1860,13 @@ bounded NUMERIC finite/NaN/Infinity/-Infinity/NULL, temporal types, replay,
 spill, and mutable enum/composite descriptor epochs. Evidence includes
 `tests/rubric/2.4_native_types/`, the local nested-composite and bytea UNION
 regressions, and the MotherDuck nested-composite and bytea UNION proofs. The
-final repository lanes selected 1,405 default, 128 slow, and 36 MotherDuck
+final repository lanes selected 1,507 default, 129 slow, and 37 MotherDuck
 tests; all passed. Strict catalog descriptor authority now refuses missing or
 recursively incomplete trees. Numeric inserts, replay, spill, and the assignment
 seam use the same idempotent adapter; UPDATEs of NaN, Infinity, and -Infinity
 retain their `special` UNION tag.
 
-**FIX ROUND 3 current evidence.** `identity_codec.py` is now the sole canonical
+**FIX ROUND 3 evidence (superseded by FIX ROUND 4).** `identity_codec.py` is now the sole canonical
 typed identity owner. Its recursive JSONB canonicalizer uses exact decimal tokens,
 last-object-key-wins, sorted object keys, and one numeric class for `1`, `1.0`,
 `1e2`, trailing-zero variants, and negative zero. `test_2_4_fix3_regressions.py`
@@ -1839,6 +1879,15 @@ explicitly internal-identity-only at the destination. The strict descriptor miss
 test proves the automatic refusal → durable `awaiting_snapshot` route. The explicit
 interval lifecycle regression covers creation, replay delete/reinsert, typed
 migration, and final delete through the internal identity path.
+
+**FIX ROUND 4 current evidence (2026-08-09).** The canonical encoder is
+source-semantic and destination-round-trip-stable before identity history is
+removed. The 33-case audit reports **0 failures**; the full property and six
+special-value cases pass. It covers binary32 float4, float8, signed zero,
+numeric scale/trailing-zero and special values, exact interval units including
+the two large-day collision candidates, timestamptz/DST, date/time, UUID case,
+NULL/empty arrays, nested composites, maps, JSONB and unicode. The physical
+scalar predicate is explicitly cast to its target native type.
 
 `most types text/json=1, core scalars well (nested as text)=3, (nested as json)=4, full=5`
 
@@ -1896,11 +1945,9 @@ Evidence: `tests/rubric/2.5_union_type_changes/`, including the real PostgreSQL
 DDL+DML fence and the type-change-plus-key-move regression. The exact required
 lanes were green after these changes.
 
-**FIX ROUND 3 current evidence.** The shadow copier carries an existing
-`cdcf_internal_id` verbatim whenever a current-version type change already has
-one; for indexable keys that become internal during the swap, the codec
-canonicalizes source semantics (including PostgreSQL binary32 `real`) before the
-new ID is created. The 33-case full-type property test (plus four exact r2 probes,
+**Historical FIX ROUND 3 evidence (superseded by FIX ROUND 4).** The shadow
+copier carried an existing `cdcf_internal_id` for a current-version type change;
+that was the identity-history defect closed below. The 33-case full-type property test (plus four exact r2 probes,
 37 tests total in the regression file)
 `test_2_5_fix3_regressions.py::test_full_24_type_list_source_identity_survives_typed_shadow_swap`
 compares the source-derived ID with the post-swap stored ID for every declared
@@ -1910,6 +1957,15 @@ readback values (real `1.23` → `1.2300000190734863`, numeric `1.0` → `Decima
 timestamptz `+02:00` → local-zone readback, and an array with a NULL element) also
 delete to zero rows after the swap. This proves the current-version migration
 contract; it is not an old-build compatibility claim.
+
+**FIX ROUND 4 current evidence (2026-08-09).** The copier now recomputes every
+row's identity with the current descriptor as it copies the row. It does not
+carry a prior ID, persist descriptor history, expand lookup to historical
+candidates, or issue multi-candidate deletes/updates. The no-history structural
+test passes, and the int4→int8 old-member delete regression still passes. The
+33-case key-gain audit and source/readback/current-shadow property both report
+zero failures, so deleting the history did not reintroduce the old UNION-member
+orphan-row bug.
 
 `error=1, drop and add=3, widening automatic=4, MotherDuck UNION types=5`
 
@@ -1943,12 +1999,23 @@ retained: after the round-3 machine-derived unreachability rules, the matrix rep
 **2,880 cells, 188 exercised, 2,692 refused, 1,020 covered, and 1,860 explicitly
 unreachable**. No unreachable cell is counted as exercised.
 
-**FIX ROUND 3 current evidence.** The test requires at least 1,000 covered cells,
+**Historical FIX ROUND 3 evidence (superseded by FIX ROUND 4).** The test requires at least 1,000 covered cells,
 requires every uncovered reason to begin with `unreachable:` and include its machine
 owner, and re-raises every unexpected `BaseException`. Schema-refusal cells
 instantiate the real `Applier._handle_spill_refusal -> spill_refusal.handle` seam
 and prove durable `awaiting_snapshot` plus automatic retry. The dedicated seam
 regression and unexpected-exception regression pass.
+
+**FIX ROUND 4 current evidence (2026-08-09).** `catalog_poll.py` verifies
+`relreplident='f'`, samples the activation LSN, and verifies FULL again after the
+sample on the same connection. The exact two-connection r3 probe now observes
+the downgrade, stores no activation boundary, and rejects the residual event;
+the stale hard-coded boundary is not accepted. Uncovered matrix cells are
+classified only by the production `PHYSICAL_ROW_PRECONDITIONS` predicates in
+`machines.py`; the derivation assertion covers all 1,860 uncovered cells. The
+run remains **2,880 declared / 1,020 covered / 1,860 derived-unreachable / 188
+exercised / 2,692 refused**, with unexpected exceptions failing rather than
+being absorbed.
 
 Evidence: `tests/rubric/2.6_toast_sparse_updates/`, including a real PostgreSQL
 pre-FULL event-boundary race using the reviewer’s pre-sample plus insert-LSN

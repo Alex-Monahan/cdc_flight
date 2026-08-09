@@ -166,6 +166,24 @@ def _ensure_toast_policies(
                     f"post-ALTER WAL boundary {boundary!r} did not prove it follows "
                     f"the pre-ALTER sample {pre_alter!r}"
                 )
+            # A concurrent ALTER can run after the first verification and before
+            # the WAL sample.  The boundary is not admissible until the same
+            # connection proves FULL again after sampling; otherwise a residual
+            # event can pass a boundary belonging to a state that has already
+            # returned to DEFAULT.  Failure deliberately leaves ``relation``
+            # unchanged (DEFAULT with no boundary), so the next poll/refetch path
+            # remains fail-closed.
+            verified_after_sample = conn.execute(
+                "SELECT relreplident FROM pg_class WHERE oid = %s", [relation.oid]
+            ).fetchone()
+            if (
+                not verified_after_sample
+                or str(verified_after_sample[0]).lower() != "f"
+            ):
+                raise RuntimeError(
+                    "source replica identity changed while sampling activation WAL; "
+                    "discarding the boundary and requiring refetch"
+                )
             updated[qualified] = replace(
                 relation,
                 replica_identity="f",

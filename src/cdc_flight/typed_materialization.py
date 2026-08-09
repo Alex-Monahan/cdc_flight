@@ -6,7 +6,6 @@ import logging
 from typing import Any
 
 from .identity_codec import (
-    _identity_candidates,
     _identity_value,
     canonical_jsonb_text,
 )
@@ -29,11 +28,9 @@ def _copy_rows_with_identity(
     target_native: dict[str, Any],
     *,
     key_columns: tuple[str, ...],
-    identity_descriptors: dict[str, Any],
+    descriptors: dict[str, Any],
     changed_sql: dict[str, str] | None = None,
     changed_python: frozenset[str] = frozenset(),
-    union_columns: frozenset[str] = frozenset(),
-    carry_existing_identity: bool = False,
 ) -> None:
     """Copy existing rows while using the canonical Python identity encoder.
 
@@ -61,20 +58,12 @@ def _copy_rows_with_identity(
         rowid = row[0]
         raw = {column: row[index] for column, index in column_indexes.items()}
         key_values = tuple(raw[column] for column in key_columns)
-        if carry_existing_identity and "cdcf_internal_id" in raw:
-            # This value was produced from the source image before the typed swap.
-            # Re-encoding a value read through DuckDB would make destination display
-            # precision, timezone, UNION member names, or numeric scale part of the
-            # source identity contract.
-            identity = raw["cdcf_internal_id"]
-        else:
-            identity = _identity_value(
-                table,
-                key_values,
-                descriptors=identity_descriptors,
-                key_columns=key_columns,
-                union_columns=union_columns,
-            )
+        identity = _identity_value(
+            table,
+            key_values,
+            descriptors=descriptors,
+            key_columns=key_columns,
+        )
         expressions: list[str] = []
         params: list[Any] = []
         for column in target_columns:
@@ -89,7 +78,7 @@ def _copy_rows_with_identity(
             elif column in changed_sql:
                 expressions.append(changed_sql[column])
             elif column in changed_python:
-                descriptor = identity_descriptors.get(column) or table.source_descriptors.get(column)
+                descriptor = descriptors.get(column) or table.source_descriptors.get(column)
                 encoded = encode_value(raw.get(column), descriptor) if descriptor is not None else raw.get(column)
                 expression, bound = _typed_parameter(encoded, target_native.get(column))
                 expressions.append(expression)
@@ -108,11 +97,10 @@ def delete_keys(con, table: TableSchema, key_columns: tuple[str, ...], keys: lis
     if not keys:
         return
     if table.internal_identity:
-        identities: list[str] = []
-        for key in keys:
-            identities.extend(
-                _identity_candidates(table, tuple(key), key_columns=key_columns)
-            )
+        identities = [
+            _identity_value(table, tuple(key), key_columns=key_columns)
+            for key in keys
+        ]
         identities = list(dict.fromkeys(identities))
         placeholders = ", ".join("?" for _ in identities)
         con.execute(
@@ -303,14 +291,11 @@ def _update_rows_by_internal_identity(
             )
         if not set_parts:
             continue
-        identities = _identity_candidates(
-            table, source_key, key_columns=key_columns
-        )
-        placeholders = ", ".join("?" for _ in identities)
+        identity = _identity_value(table, source_key, key_columns=key_columns)
         result = con.execute(
             f"UPDATE {table.qualified} SET {', '.join(set_parts)} WHERE "
-            f"{quote('cdcf_internal_id')} IN ({placeholders}) RETURNING 1",
-            [*params, *identities],
+            f"{quote('cdcf_internal_id')} = ? RETURNING 1",
+            [*params, identity],
         )
         affected += len(result.fetchall())
     return affected
@@ -788,6 +773,16 @@ def _typed_parameter(value: Any, native: Any) -> tuple[str, list[Any]]:
             [*key_params, *value_params],
         )
     if native.kind in {"LIST", "STRUCT", "MAP", "NUMERIC_VARIABLE"}:
+        return f"CAST(? AS {native.sql})", [value]
+    if native.kind in {
+        "SMALLINT", "INTEGER", "BIGINT", "FLOAT", "DOUBLE", "BOOLEAN",
+        "VARCHAR", "BLOB", "DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ",
+        "TIMETZ", "INTERVAL", "UUID", "ENUM",
+    }:
+        # A Python float is bound as DOUBLE by DuckDB unless the target type is
+        # explicit.  Predicates must compare against the stored native value (in
+        # particular PostgreSQL binary32), and assignments benefit from the same
+        # one-type boundary.
         return f"CAST(? AS {native.sql})", [value]
     return "?", [value]
 

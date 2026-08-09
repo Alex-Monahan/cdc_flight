@@ -474,14 +474,13 @@ class GroupPlan:
         raw_key = table_work._raw_key(item, tuple(key))
         key_descriptors = getattr(item, "key_descriptors", {}).get(tuple(key))
         if table.internal_identity:
-            identities = apply_sql._identity_candidates(
+            identity = apply_sql._identity_value(
                 table,
                 raw_key,
                 descriptors=key_descriptors,
                 key_columns=item.key_columns,
             )
-            placeholders = ", ".join("?" for _ in identities)
-            return f'{naming.quote("cdcf_internal_id")} IN ({placeholders})', list(identities)
+            return f'{naming.quote("cdcf_internal_id")} = ?', [identity]
         expressions: list[str] = []
         params: list = []
         for column, value in zip(item.key_columns, raw_key, strict=False):

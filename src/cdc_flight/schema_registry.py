@@ -1,8 +1,8 @@
-"""Destination schema registry and DDL ownership.
+"""Source-descriptor registry and destination-shape coordinator.
 
-This module owns source-descriptor authority, physical table shape, and typed
-shadow swaps. Identity serialization and row materialization live in sibling
-modules; the compatibility facade keeps historical imports stable.
+The registry owns catalog metadata and orchestration. Destination DDL, typed
+shadow swaps, and source backfills live in their dedicated owner mixins; the
+public registry class remains the stable compatibility surface.
 """
 
 from __future__ import annotations
@@ -11,27 +11,33 @@ import json
 import logging
 from typing import Any
 
-from .errors import (
-    DestinationIdentityCollision,
-    SchemaBackfillRefused,
-    SchemaEvolutionRefused,
-)
+from . import schema_backfill, schema_ddl, schema_shadow
+from .errors import SchemaEvolutionRefused
 from .naming import CDCF_EVENT_ID, quote
+from .schema_ddl import (
+    _RECOGNISED_TYPES,
+    _is_numeric_inner_union,
+    _is_top_level_union,
+    _json_key_transition,
+    _lossless_numeric_supertype,
+    _normalise_type,
+    _physical_union_native,
+    _type_sql_equal,
+    _union_member_names,
+    _union_members,
+    assert_identity_is_unique,
+    widen,
+)
 
-BOOLEAN, BIGINT, DOUBLE, JSON_T, VARCHAR = "BOOLEAN", "BIGINT", "DOUBLE", "JSON", "VARCHAR"
+BOOLEAN, BIGINT, DOUBLE, JSON_T, VARCHAR = (
+    schema_ddl.BOOLEAN,
+    schema_ddl.BIGINT,
+    schema_ddl.DOUBLE,
+    schema_ddl.JSON_T,
+    schema_ddl.VARCHAR,
+)
 
 log = logging.getLogger("cdc_flight.schema_registry")
-
-
-def widen(current: str | None, incoming: str | None) -> str | None:
-    """Least type that holds both; ambiguous changes remain conservative text."""
-    if current is None:
-        return incoming
-    if incoming is None or current == incoming:
-        return current
-    if {current, incoming} == {BIGINT, DOUBLE}:
-        return DOUBLE
-    return VARCHAR
 
 
 class TableSchema:
@@ -65,17 +71,17 @@ class TableSchema:
         #: legacy table with only ``cdcf_internal_id`` has no source-key metadata;
         #: the next catalog-authoritative ensure is allowed to repair that shape.
         self.key_metadata_loaded = False
-        #: Every source descriptor that has occupied an internal-identity key
-        #: column.  Retaining the history lets a post-DDL delete resolve the old
-        #: UNION member instead of binding only the current descriptor.
-        self.identity_descriptors: dict[str, tuple[Any, ...]] = {}
 
     @property
     def qualified(self) -> str:
         return f"{quote(self.dataset)}.{quote(self.name)}"
 
 
-class SchemaRegistry:
+class SchemaRegistry(
+    schema_ddl.DDLOwner,
+    schema_shadow.ShadowOwner,
+    schema_backfill.BackfillOwner,
+):
     """Creates and evolves destination tables. All DDL runs in the caller's txn.
 
     Every table it creates carries a `PRIMARY KEY` on its identity columns - the
@@ -94,22 +100,18 @@ class SchemaRegistry:
         self.dataset = dataset
         self.constraints = constraints
         self._tables: dict[str, TableSchema] = {}
-        self._identity_history: dict[str, dict[str, tuple[Any, ...]]] = {}
         self._typed_swap_count = 0
 
     def get(self, name: str) -> TableSchema:
         table = self._tables.get(name)
         if table is None:
             table = TableSchema(name, self.dataset)
-            table.identity_descriptors = dict(self._identity_history.get(name, {}))
             self._load(table)
             self._tables[name] = table
         return table
 
     def forget(self, name: str) -> None:
-        table = self._tables.pop(name, None)
-        if table is not None and table.identity_descriptors:
-            self._identity_history[name] = dict(table.identity_descriptors)
+        self._tables.pop(name, None)
 
     def _load(self, table: TableSchema) -> None:
         self._refresh(table)
@@ -126,8 +128,8 @@ class SchemaRegistry:
 
         try:
             rows = self.con.execute(
-                f"SELECT source_key_columns, source_descriptors, "
-                f"identity_descriptors FROM {self._key_metadata_qualified} "
+                f"SELECT source_key_columns, source_descriptors "
+                f"FROM {self._key_metadata_qualified} "
                 "WHERE target_table = ?",
                 [table.name],
             ).fetchall()
@@ -138,7 +140,7 @@ class SchemaRegistry:
             return
         if not rows:
             return
-        key_json, descriptor_json, history_json = rows[0]
+        key_json, descriptor_json = rows[0]
         try:
             table.source_key_columns = tuple(json.loads(key_json or "[]"))
             table.key_columns = table.source_key_columns or table.key_columns
@@ -146,20 +148,6 @@ class SchemaRegistry:
             table.source_descriptors = {
                 str(column): SourceTypeDescriptor.from_dict(value)
                 for column, value in descriptors.items()
-            }
-            history = json.loads(history_json or "{}")
-            loaded_history = {
-                str(column): tuple(SourceTypeDescriptor.from_dict(item) for item in values)
-                for column, values in history.items()
-            }
-            table.identity_descriptors = {
-                column: tuple(
-                    dict.fromkeys(
-                        (*table.identity_descriptors.get(column, ()),
-                         *loaded_history.get(column, ()))
-                    )
-                )
-                for column in set(table.identity_descriptors) | set(loaded_history)
             }
             table.key_metadata_loaded = True
         except (TypeError, ValueError, KeyError) as exc:
@@ -170,32 +158,27 @@ class SchemaRegistry:
             ) from exc
 
     def _persist_key_metadata(self, table: TableSchema) -> None:
-        """Persist source-key and old-descriptor identity facts atomically."""
+        """Persist only the current source-key and descriptor facts atomically."""
         self.con.execute(
             f"CREATE TABLE IF NOT EXISTS {self._key_metadata_qualified} ("
             "target_table VARCHAR PRIMARY KEY, source_key_columns VARCHAR, "
-            "source_descriptors VARCHAR, identity_descriptors VARCHAR)"
+            "source_descriptors VARCHAR)"
         )
         descriptors = {
             column: descriptor.to_dict()
             for column, descriptor in table.source_descriptors.items()
             if hasattr(descriptor, "to_dict")
         }
-        history = {
-            column: [descriptor.to_dict() for descriptor in descriptors_for_column]
-            for column, descriptors_for_column in table.identity_descriptors.items()
-        }
         self.con.execute(
             f"DELETE FROM {self._key_metadata_qualified} WHERE target_table = ?",
             [table.name],
         )
         self.con.execute(
-            f"INSERT INTO {self._key_metadata_qualified} VALUES (?, ?, ?, ?)",
+            f"INSERT INTO {self._key_metadata_qualified} VALUES (?, ?, ?)",
             [
                 table.name,
                 json.dumps(list(table.source_key_columns)),
                 json.dumps(descriptors, sort_keys=True),
-                json.dumps(history, sort_keys=True),
             ],
         )
         table.key_metadata_loaded = True
@@ -495,422 +478,12 @@ class SchemaRegistry:
         table.internal_identity = not indexable
         table.source_descriptors = descriptors
         table.native_types = resolved
-        if table.internal_identity:
-            table.identity_descriptors = {
-                column: (descriptors[column],)
-                for column in key_columns
-                if column in descriptors
-            }
         self._persist_key_metadata(table)
         return table, True
 
-    def _rebind_key_identity(
-        self,
-        table: TableSchema,
-        *,
-        key_columns: tuple[str, ...],
-        resolved: dict[str, Any],
-        descriptors: dict[str, Any],
-    ) -> tuple[TableSchema, bool]:
-        """Rebuild a destination whose source key tuple changed.
-
-        DuckDB/MotherDuck do not support changing a primary-key column list in place.
-        More importantly, JSONB has two deliberate physical representations: JSON for
-        an indexed source key and VARIANT for an ordinary value.  Rebinding the key
-        therefore has to be one shadow copy, with the exact current catalog mapping
-        on the shadow, rather than an ALTER followed by a best-effort insert.
-        """
-        from .typed_types import NativeType
-
-        old_descriptors = dict(table.source_descriptors)
-        old_native_types = dict(table.native_types)
-        old_raw_types = dict(table.raw_types)
-        target_types: dict[str, str] = {}
-        target_native: dict[str, NativeType] = {}
-        for column, current_type in old_raw_types.items():
-            if column == "cdcf_internal_id":
-                continue
-            target = resolved.get(column)
-            if target is None:
-                target_types[column] = current_type
-                if column in old_native_types:
-                    target_native[column] = old_native_types[column]
-                continue
-            # A source-type UNION is durable history.  A key rebind changes its
-            # identity enforcement, not the historical value representation.
-            if _is_top_level_union(current_type):
-                target_types[column] = current_type
-                target_native[column] = _physical_union_native(
-                    current_type, source=descriptors.get(column)
-                )
-            else:
-                target_types[column] = target.sql
-                target_native[column] = target
-
-        indexable = all(
-            column in resolved
-            and resolved[column].indexable
-            and not _is_top_level_union(target_types.get(column, ""))
-            for column in key_columns
-        )
-        primary = tuple(key_columns) if indexable else ("cdcf_internal_id",)
-        if not self.constraints:
-            constraint_sql = ""
-        else:
-            constraint_sql = ", PRIMARY KEY (" + ", ".join(
-                quote(column) for column in primary
-            ) + ")"
-        if not indexable:
-            target_types["cdcf_internal_id"] = 'VARCHAR'
-
-        shadow = f"{table.name}__cdcf_key_shadow"
-        definitions = ", ".join(
-            f"{quote(column)} {type_name}"
-            for column, type_name in target_types.items()
-        )
-        try:
-            self.con.execute(f"DROP TABLE IF EXISTS {quote(self.dataset)}.{quote(shadow)}")
-            self.con.execute(
-                f"CREATE TABLE {quote(self.dataset)}.{quote(shadow)} "
-                f"({definitions}{constraint_sql})"
-            )
-            target_columns = list(target_types)
-            changed_python: set[str] = set()
-            for column in target_columns:
-                if column == "cdcf_internal_id":
-                    continue
-                current_type = old_raw_types.get(column, target_types[column])
-                desired_type = target_types[column]
-                if _type_sql_equal(current_type, desired_type):
-                    continue
-                elif _json_key_transition(current_type, desired_type) or _lossless_numeric_supertype(
-                    current_type, desired_type
-                ):
-                    changed_python.add(column)
-                else:
-                    # UNION history has already been deliberately retained above;
-                    # any other mismatch belongs to the normal 2.5 typed shadow
-                    # conversion and must not be silently narrowed here.
-                    raise SchemaEvolutionRefused(
-                        f"cannot rebind {table.name}.{column}: destination type "
-                        f"{current_type} does not match {desired_type}; a typed "
-                        "shadow conversion is required",
-                        target=table.name,
-                    )
-            _copy_rows_with_identity(
-                self.con,
-                table,
-                shadow,
-                target_types,
-                target_native,
-                key_columns=key_columns,
-                identity_descriptors={**old_descriptors, **descriptors},
-                changed_python=frozenset(changed_python),
-                carry_existing_identity=(
-                    table.internal_identity
-                    and "cdcf_internal_id" in old_raw_types
-                    and tuple(table.source_key_columns or table.key_columns) == tuple(key_columns)
-                ),
-            )
-            self.con.execute(f"DROP TABLE {table.qualified}")
-            from . import faults
-
-            self._typed_swap_count += 1
-            faults.maybe_crash("swap", self._typed_swap_count)
-            self.con.execute(
-                f"ALTER TABLE {quote(self.dataset)}.{quote(shadow)} "
-                f"RENAME TO {quote(table.name)}"
-            )
-        except Exception as exc:
-            from . import faults
-
-            if isinstance(exc, faults.InjectedFault):
-                raise
-            raise SchemaEvolutionRefused(
-                f"typed key shadow conversion failed for {table.name}: {exc}",
-                target=table.name,
-            ) from exc
-
-        # `forget()` retains the old identity descriptors before the fresh physical
-        # metadata load.  Reattach the requested source key and its complete history
-        # so a later process-local post-migration event can resolve the old member.
-        old_identity = dict(table.identity_descriptors)
-        self.forget(table.name)
-        refreshed = self.get(table.name)
-        refreshed.key_columns = key_columns
-        refreshed.source_key_columns = key_columns
-        refreshed.primary_key_columns = primary
-        refreshed.internal_identity = not indexable
-        refreshed.constrained = bool(self.constraints and primary)
-        refreshed.source_descriptors = {**old_descriptors, **descriptors}
-        refreshed.native_types = {**old_native_types, **target_native}
-        if refreshed.internal_identity:
-            for column in key_columns:
-                history = list(old_identity.get(column, ()))
-                history.extend(
-                    descriptor
-                    for descriptor in (old_descriptors.get(column), descriptors.get(column))
-                    if descriptor is not None
-                )
-                refreshed.identity_descriptors[column] = tuple(dict.fromkeys(history))
-        self._persist_key_metadata(refreshed)
-        return refreshed, False
-
-    def _create_strict(
-        self, table: TableSchema, columns: dict[str, str], primary_key_columns: tuple[str, ...]
-    ) -> None:
-        definitions = ", ".join(f"{quote(column)} {ctype}" for column, ctype in columns.items())
-        constraint = (
-            ", PRIMARY KEY (" + ", ".join(quote(column) for column in primary_key_columns) + ")"
-            if self.constraints and primary_key_columns
-            else ""
-        )
-        try:
-            self.con.execute(
-                f"CREATE TABLE {table.qualified} ({definitions}{constraint})"
-            )
-        except Exception as exc:
-            raise SchemaEvolutionRefused(
-                f"cannot create typed destination {table.name}: {exc}", target=table.name
-            ) from exc
-        table.columns = {column: _normalise_type(ctype) for column, ctype in columns.items()}
-        table.raw_types = dict(columns)
-        table.exists = True
-        table.constrained = bool(constraint)
-        table.primary_key_columns = primary_key_columns
-
-    def convert_column_to_union(
-        self,
-        name: str,
-        column: str,
-        old_descriptor: Any,
-        new_descriptor: Any,
-    ) -> TableSchema:
-        """Convert one source column through the sole typed shadow-swap path.
-
-        The copy is performed before the live table is dropped.  DuckDB's cast from a
-        UNION to an expanded UNION preserves existing member tags, while a scalar is
-        wrapped explicitly with its stable fingerprinted member.  No direct ALTER and
-        no text/JSON fallback is permitted here.
-        """
-        from .typed_types import (
-            SourceTypeDescriptor,
-            native_type,
-            union_member_name,
-        )
-
-        table = self.get(name)
-        if not table.exists:
-            raise SchemaEvolutionRefused(
-                f"cannot convert {name}.{column}: destination table does not exist", target=name
-            )
-        if table.internal_identity and not table.key_metadata_loaded:
-            raise SchemaEvolutionRefused(
-                f"cannot convert {name}.{column}: the destination has an internal "
-                "identity but no durable source-key metadata; automatic resnapshot "
-                "must establish the catalog-authoritative key before typed evolution",
-                target=name,
-            )
-        old_source = old_descriptor if isinstance(old_descriptor, SourceTypeDescriptor) else SourceTypeDescriptor.from_dict(old_descriptor)
-        new_source = new_descriptor if isinstance(new_descriptor, SourceTypeDescriptor) else SourceTypeDescriptor.from_dict(new_descriptor)
-        source_key = column in table.source_key_columns or column in table.key_columns
-        old_native = native_type(old_source, for_key=source_key)
-        new_native = native_type(new_source, for_key=source_key)
-        source_key_columns = tuple(table.source_key_columns or table.key_columns)
-        cached_descriptors = dict(table.source_descriptors)
-        cached_native_types = dict(table.native_types)
-        if column in table.key_columns:
-            for key_column in table.key_columns:
-                history = list(table.identity_descriptors.get(key_column, ()))
-                previous = cached_descriptors.get(key_column)
-                if previous is not None and previous not in history:
-                    history.append(previous)
-                if key_column == column and old_source not in history:
-                    history.append(old_source)
-                if history:
-                    table.identity_descriptors[key_column] = tuple(history)
-        physical = str(table.raw_types.get(column, table.columns.get(column, old_native.sql)))
-
-        # If a previous change already introduced the member, the catalog observation
-        # is a repeated same-type observation; reusing the existing declaration is
-        # idempotent and does not create a duplicate member.
-        current_members = _union_member_names(physical)
-        wanted_name = union_member_name(new_source)
-        if wanted_name in current_members:
-            declared = dict(_union_members(physical)).get(wanted_name)
-            if declared is None or _type_sql_equal(declared, new_native.sql) is False:
-                raise SchemaEvolutionRefused(
-                    f"cannot reuse UNION member {wanted_name} on {name}.{column}: "
-                    f"physical type {declared!r} disagrees with descriptor type "
-                    f"{new_native.sql!r}",
-                    target=name,
-                )
-            table.source_descriptors[column] = new_source
-            table.native_types[column] = _physical_union_native(
-                physical, source=new_source
-            )
-            self._persist_key_metadata(table)
-            return table
-
-        if _is_numeric_inner_union(physical):
-            # The existing bounded NUMERIC declaration is the old source type's
-            # inner value UNION.  Source-type evolution adds one stable outer
-            # member for that complete representation; it must not append a
-            # fingerprint member beside ``finite`` and ``special``.
-            if old_native.kind != "NUMERIC_UNION":
-                raise SchemaEvolutionRefused(
-                    f"cannot convert {name}.{column}: physical numeric UNION does "
-                    "not match the old source descriptor",
-                    target=name,
-                )
-            old_member_name = union_member_name(old_source)
-            union_sql = (
-                f"UNION({old_member_name} {old_native.sql},{wanted_name} {new_native.sql})"
-            )
-            expression = (
-                f"union_value({old_member_name} := "
-                f"CAST({quote(column)} AS {old_native.sql}))"
-            )
-        elif _is_top_level_union(physical):
-            # The physical declaration is the durable member history.  Reuse its SQL
-            # and append the new member; the old descriptor is only needed to resolve
-            # the new member's native SQL when a process restarted.
-            member_sql = _union_members(physical)
-            members = [(member_name, member_type) for member_name, member_type in member_sql]
-            members.append((wanted_name, new_native.sql))
-            union_sql = "UNION(" + ",".join(f"{member} {sql}" for member, sql in members) + ")"
-            expression = f"CAST({quote(column)} AS {union_sql})"
-        else:
-            member_name = union_member_name(old_source)
-            union_sql = f"UNION({member_name} {old_native.sql},{wanted_name} {new_native.sql})"
-            expression = (
-                f"union_value({member_name} := "
-                f"CAST({quote(column)} AS {old_native.sql}))"
-            )
-
-        shadow = f"{name}__cdcf_typed_shadow"
-        self.con.execute(f"DROP TABLE IF EXISTS {quote(self.dataset)}.{quote(shadow)}")
-        definitions: list[str] = []
-        target_types = dict(table.raw_types)
-        target_types[column] = union_sql
-        for current_column, current_type in table.raw_types.items():
-            if current_column == column:
-                definitions.append(f"{quote(current_column)} {union_sql}")
-            else:
-                definitions.append(f"{quote(current_column)} {current_type}")
-        primary = table.primary_key_columns or table.key_columns
-        # Every source-type change produces a UNION, and DuckDB forbids any UNION
-        # column from being an index/primary-key expression even when both members
-        # individually are scalar/indexable.
-        if column in primary:
-            primary = ("cdcf_internal_id",)
-            if "cdcf_internal_id" not in table.raw_types:
-                definitions.append('"cdcf_internal_id" VARCHAR DEFAULT uuid()')
-                target_types["cdcf_internal_id"] = "VARCHAR"
-        if not primary:
-            raise SchemaEvolutionRefused(
-                f"cannot convert {name}.{column}: no destination identity is available", target=name
-            )
-        ddl = (
-            f"CREATE TABLE {quote(self.dataset)}.{quote(shadow)} "
-            f"({', '.join(definitions)}, PRIMARY KEY ({', '.join(quote(item) for item in primary)}))"
-        )
-        try:
-            self.con.execute(ddl)
-            target_columns = list(table.raw_types)
-            if "cdcf_internal_id" in primary and "cdcf_internal_id" not in target_columns:
-                target_columns.append("cdcf_internal_id")
-            if "cdcf_internal_id" in primary:
-                target_native = dict(cached_native_types)
-                target_native[column] = _physical_union_native(
-                    union_sql, source=new_source
-                )
-                identity_descriptors = {**cached_descriptors, column: old_source}
-                _copy_rows_with_identity(
-                    self.con,
-                    table,
-                    shadow,
-                    target_types,
-                    target_native,
-                    key_columns=source_key_columns or (column,),
-                    identity_descriptors=identity_descriptors,
-                    changed_sql={column: expression},
-                    union_columns=frozenset({column}),
-                    carry_existing_identity=(
-                        table.internal_identity
-                        and "cdcf_internal_id" in table.raw_types
-                        and tuple(table.source_key_columns or table.key_columns)
-                        == tuple(source_key_columns or (column,))
-                    ),
-                )
-            else:
-                select_expressions = [
-                    expression if current_column == column else quote(current_column)
-                    for current_column in target_columns
-                ]
-                self.con.execute(
-                    f"INSERT INTO {quote(self.dataset)}.{quote(shadow)} "
-                    f"({', '.join(quote(item) for item in target_columns)}) "
-                    f"SELECT {', '.join(select_expressions)} FROM {table.qualified}"
-                )
-            self.con.execute(f"DROP TABLE {table.qualified}")
-            from . import faults
-
-            self._typed_swap_count += 1
-            faults.maybe_crash("swap", self._typed_swap_count)
-            self.con.execute(
-                f"ALTER TABLE {quote(self.dataset)}.{quote(shadow)} RENAME TO {quote(name)}"
-            )
-        except Exception as exc:
-            from . import faults
-
-            if isinstance(exc, faults.InjectedFault):
-                raise
-            raise SchemaEvolutionRefused(
-                f"typed UNION shadow conversion failed for {name}.{column}: {exc}", target=name
-            ) from exc
-        self.forget(name)
-        table = self.get(name)
-        table.key_columns = source_key_columns
-        table.source_key_columns = source_key_columns
-        table.primary_key_columns = primary
-        table.internal_identity = primary == ("cdcf_internal_id",)
-        table.source_descriptors = {**cached_descriptors, column: new_source}
-        table.native_types = {
-            **cached_native_types,
-            column: _physical_union_native(union_sql, source=new_source),
-        }
-        self._persist_key_metadata(table)
-        return table
-
-    def _create(
-        self, table: TableSchema, columns: dict[str, str], key_columns: tuple[str, ...]
-    ) -> None:
-        defs = ", ".join(f"{quote(col)} {ctype}" for col, ctype in columns.items())
-        constraint = ""
-        if self.constraints and key_columns and all(c in columns for c in key_columns):
-            constraint = ", PRIMARY KEY (" + ", ".join(quote(c) for c in key_columns) + ")"
-        try:
-            self.con.execute(
-                f"CREATE TABLE IF NOT EXISTS {table.qualified} ({defs}{constraint})"
-            )
-            table.constrained = bool(constraint)
-        except Exception as exc:
-            if not constraint:
-                raise
-            # A destination that cannot express the constraint must not block the
-            # load; `_assert_identity_is_unique` becomes the enforcement instead.
-            log.warning(
-                "could not create %s with a PRIMARY KEY on %s (%s); falling back to a "
-                "post-apply uniqueness assertion inside the commit group",
-                table.name, key_columns, exc,
-            )
-            self.con.execute(f"CREATE TABLE IF NOT EXISTS {table.qualified} ({defs})")
-            table.constrained = False
-        table.columns = dict(columns)
-        table.raw_types = dict(columns)
-        table.exists = True
-        table.source_key_columns = tuple(key_columns)
+    # Physical DDL, typed shadow swaps, and source backfills are inherited
+    # from their ownership modules; this class remains the registry coordinator
+    # and source-key metadata authority.
 
     def drop(self, name: str) -> None:
         table = self.get(name)
@@ -1049,375 +622,9 @@ class SchemaRegistry:
         )
         self._persist_key_metadata(table)
 
-    def _rebuild_with_primary_key(
-        self,
-        table: TableSchema,
-        *,
-        drop_column: str,
-        key_columns: tuple[str, ...],
-    ) -> None:
-        """Recreate a constrained table when its identity column is renamed.
 
-        DuckDB has no ``DROP CONSTRAINT`` implementation.  The temporary table is
-        created with the replacement key before the source table is dropped, so a
-        uniqueness failure cannot leave a destination with neither identity nor data.
-        The caller owns the transaction; the table-cache update happens only after all
-        physical statements succeed.
-        """
-        columns = {
-            column: type_name
-            for column, type_name in table.columns.items()
-            if column != drop_column
-        }
-        raw_types = {
-            column: table.raw_types.get(column, type_name)
-            for column, type_name in columns.items()
-        }
-        if not key_columns or any(column not in columns for column in key_columns):
-            raise SchemaEvolutionRefused(
-                f"cannot rebind primary-key identity {drop_column!r} on {table.name}: "
-                "the replacement key is not present in the destination schema",
-                target=table.name,
-            )
-        temp_name = f"{table.name}__cdcf_pk_rebind"
-        definitions = ", ".join(
-            f"{quote(column)} {raw_types[column]}" for column in columns
-        )
-        key_sql = ", ".join(quote(column) for column in key_columns)
-        try:
-            self.con.execute(
-                f"CREATE TABLE {quote(self.dataset)}.{quote(temp_name)} "
-                f"({definitions}, PRIMARY KEY ({key_sql}))"
-            )
-            column_sql = ", ".join(quote(column) for column in columns)
-            self.con.execute(
-                f"INSERT INTO {quote(self.dataset)}.{quote(temp_name)} ({column_sql}) "
-                f"SELECT {column_sql} FROM {table.qualified}"
-            )
-            self.con.execute(f"DROP TABLE {table.qualified}")
-            self.con.execute(
-                f"ALTER TABLE {quote(self.dataset)}.{quote(temp_name)} "
-                f"RENAME TO {quote(table.name)}"
-            )
-        except Exception as exc:
-            try:
-                self.con.execute(
-                    f"DROP TABLE IF EXISTS {quote(self.dataset)}.{quote(temp_name)}"
-                )
-            except Exception:  # pragma: no cover - the caller rolls back the transaction
-                log.debug("could not clean up failed PK-rebind table", exc_info=True)
-            raise SchemaEvolutionRefused(
-                f"cannot rebind primary-key identity {drop_column!r} -> "
-                f"{key_columns!r} on {table.name}: the destination identity is not "
-                "unique or the table could not be rebuilt",
-                target=table.name,
-            ) from exc
-        table.columns = columns
-        table.raw_types = raw_types
-        table.key_columns = key_columns
-        table.source_key_columns = key_columns
-        table.constrained = True
+    # Source-read backfills are inherited from schema_backfill.BackfillOwner.
 
-    def backfill_columns(
-        self,
-        name: str,
-        *,
-        key_columns: tuple[str, ...],
-        value_columns: tuple[str, ...],
-        rows: list[tuple],
-    ) -> None:
-        """Copy current source values into newly added columns in this transaction.
-
-        PostgreSQL evaluates an ADD COLUMN default for rows already in the source.
-        The CDC stream only carries future row changes, so a destination-side ADD alone
-        would leave those rows NULL forever.  The catalog fence supplies a stable key
-        and source read; this method makes the existing destination rows agree before
-        the commit becomes durable.  It deliberately uses UPDATE, not a delete/insert
-        merge, so the operation remains safe after the schema DDL has run in the same
-        transaction on DuckDB/MotherDuck.
-        """
-        if not key_columns or not value_columns or not rows:
-            return
-        table = self.get(name)
-        if not table.exists:
-            return
-        key_columns = tuple(column for column in key_columns if column in table.columns)
-        value_columns = tuple(column for column in value_columns if column in table.columns)
-        if not key_columns or not value_columns:
-            return
-        value_count = len(value_columns)
-        key_count = len(key_columns)
-        for row in rows:
-            keys = row[:key_count]
-            values = row[key_count : key_count + value_count]
-            set_parts: list[str] = []
-            params: list[Any] = []
-            for column, value in zip(value_columns, values, strict=True):
-                expression, bound = _typed_assignment(table, column, value)
-                set_parts.append(f"{quote(column)} = {expression}")
-                params.extend(bound)
-            where_parts: list[str] = []
-            for column, value in zip(key_columns, keys, strict=True):
-                expression, bound = _typed_assignment(table, column, value)
-                where_parts.append(
-                    f"{quote(column)} IS NOT DISTINCT FROM {expression}"
-                )
-                params.extend(bound)
-            self.con.execute(
-                f"UPDATE {table.qualified} SET {', '.join(set_parts)} "
-                f"WHERE {' AND '.join(where_parts)}",
-                params,
-            )
-
-    def backfill_constant_columns(
-        self,
-        name: str,
-        *,
-        value_columns: tuple[str, ...],
-        rows: list[tuple],
-    ) -> None:
-        """Backfill a keyless destination when the source values are uniform.
-
-        A source table without a primary key has no durable identity that can match a
-        current source row to a historical ``cdcf_event_id`` row.  Applying a value
-        that differs by source row would therefore be an invented mapping.  PostgreSQL
-        ADD COLUMN normally gives every existing row one default (or NULL), so that
-        common case has a safe all-rows operation; a non-uniform source is rejected by
-        the caller before this update runs.
-        """
-        if not value_columns:
-            return
-        table = self.get(name)
-        if not table.exists:
-            return
-        value_columns = tuple(column for column in value_columns if column in table.columns)
-        if not value_columns:
-            return
-        if not rows:
-            destination_rows = self.con.execute(
-                f"SELECT count(*) FROM {table.qualified}"
-            ).fetchone()[0]
-            if destination_rows:
-                raise SchemaBackfillRefused(
-                    f"cannot backfill keyless table {name}: the source returned no "
-                    f"rows for an added column while {destination_rows} destination "
-                    "changelog rows already exist; no stable identity or source value "
-                    "proves what those rows should contain"
-                )
-            return
-        values = tuple(rows[0][: len(value_columns)])
-        if any(tuple(row[: len(value_columns)]) != values for row in rows[1:]):
-            raise SchemaBackfillRefused(
-                f"cannot backfill keyless table {name}: added-column values are not "
-                "uniform and the source has no stable row identity"
-            )
-        set_parts: list[str] = []
-        params: list[Any] = []
-        for column, value in zip(value_columns, values, strict=True):
-            expression, bound = _typed_assignment(table, column, value)
-            set_parts.append(f"{quote(column)} = {expression}")
-            params.extend(bound)
-        self.con.execute(
-            f"UPDATE {table.qualified} SET {', '.join(set_parts)}", params
-        )
-
-
-#: Destination types the widening lattice actually understands. Anything else is
-#: reported as VARCHAR by `_normalise_type` and must never be ALTERed on that basis.
-
-_RECOGNISED_TYPES = frozenset(
-    {
-        BOOLEAN, BIGINT, DOUBLE, JSON_T, "VARIANT", VARCHAR,
-        "TEXT", "STRING", "INT64", "HUGEINT", "INTEGER", "INT", "INT32", "SMALLINT",
-        "FLOAT", "REAL", "FLOAT8",
-    }
-)
-
-
-def assert_identity_is_unique(con, table: TableSchema) -> None:
-    """Fallback for a destination that cannot express the PRIMARY KEY (Opus M-2).
-
-    Runs **inside** the commit group's transaction, so a violation rolls the whole
-    group back and the events replay. Only used when `_create` could not attach the
-    constraint; with the constraint in place the destination raises on the INSERT
-    itself and this is never called.
-    """
-    if table.constrained or not table.key_columns:
-        return
-    cols = ", ".join(quote(c) for c in table.key_columns)
-    duplicates = con.execute(
-        f"SELECT count(*) FROM (SELECT {cols} FROM {table.qualified} "
-        f"GROUP BY {cols} HAVING count(*) > 1)"
-    ).fetchone()[0]
-    if duplicates:
-        raise DestinationIdentityCollision(
-            f"{table.qualified} holds {duplicates} identity value(s) more than once on "
-            f"({cols}). Exactly-once delivery means one row per identity, so this commit "
-            "group is rolled back (ADR 0001 §15/A21)."
-        )
-
-
-def _normalise_type(duckdb_type: str) -> str:
-    upper = str(duckdb_type).upper()
-    if upper.startswith("VARCHAR") or upper in ("TEXT", "STRING"):
-        return VARCHAR
-    if upper in ("SMALLINT", "INT16"):
-        return "SMALLINT"
-    if upper in ("INTEGER", "INT", "INT32"):
-        return "INTEGER"
-    if upper in ("BIGINT", "INT64", "HUGEINT"):
-        return BIGINT
-    if upper in ("DOUBLE", "FLOAT", "REAL", "FLOAT8"):
-        return upper if upper != "REAL" else "FLOAT"
-    if upper == "BOOLEAN":
-        return BOOLEAN
-    if upper in {"BLOB", "BYTEA"}:
-        return "BLOB"
-    if upper == "JSON":
-        return JSON_T
-    if upper == "VARIANT":
-        return "VARIANT"
-    if upper in {"DATE", "TIME", "TIMESTAMP", "TIMESTAMP WITH TIME ZONE", "TIMESTAMPTZ", "TIME WITH TIME ZONE", "TIMETZ", "INTERVAL", "UUID"}:
-        return upper
-    if upper.startswith(("STRUCT(", "MAP(", "UNION(", "ENUM(", "LIST(", "DECIMAL(", "BIGNUM")) or upper.endswith("[]"):
-        return upper
-    return VARCHAR
-
-
-def _union_members(physical: str) -> list[tuple[str, str]]:
-    """Parse the top-level member declaration exposed by DuckDB metadata."""
-    text = physical.strip()
-    if text.upper().startswith("UNION(") and text.endswith(")"):
-        text = text[text.find("(") + 1 : -1]
-    parts: list[str] = []
-    depth = 0
-    start = 0
-    for index, char in enumerate(text):
-        if char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-        elif char == "," and depth == 0:
-            parts.append(text[start:index])
-            start = index + 1
-    if text[start:].strip():
-        parts.append(text[start:])
-    result = []
-    for part in parts:
-        name, separator, type_name = part.strip().partition(" ")
-        if separator and name:
-            result.append((name.strip('"'), type_name.strip()))
-    return result
-
-
-def _is_top_level_union(physical: str) -> bool:
-    text = str(physical).strip()
-    if not text.upper().startswith("UNION("):
-        return False
-    depth = 0
-    opening = text.find("(")
-    for index in range(opening, len(text)):
-        char = text[index]
-        if char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-            if depth == 0:
-                return index == len(text) - 1
-    return False
-
-
-def _is_numeric_inner_union(physical: str) -> bool:
-    """Whether a physical UNION is the numeric finite/special value encoding."""
-    if not _is_top_level_union(physical):
-        return False
-    members = _union_members(physical)
-    return len(members) == 2 and {name.lower() for name, _ in members} == {
-        "finite",
-        "special",
-    }
-
-
-def _union_member_names(physical: str) -> set[str]:
-    return {name.lower() for name, _ in _union_members(physical)}
-
-
-def _type_sql_equal(left: str, right: str) -> bool:
-    """Compare physical/member SQL without treating harmless whitespace as drift."""
-    import re
-
-    def compact(value: str) -> str:
-        normalized = re.sub(r"\s+", " ", str(value).strip()).upper()
-        for spelling, canonical in (
-            ("TIMESTAMP WITH TIME ZONE", "TIMESTAMPTZ"),
-            ("TIME WITH TIME ZONE", "TIMETZ"),
-            ("CHARACTER VARYING", "VARCHAR"),
-            ("DOUBLE PRECISION", "DOUBLE"),
-        ):
-            normalized = normalized.replace(spelling, canonical)
-        return normalized.replace(" ", "")
-
-    return compact(left) == compact(right)
-
-
-def _json_key_transition(current: str, desired: str) -> bool:
-    """Whether a key-status change is a lossless JSONB representation swap.
-
-    A composite/array/map key can carry the JSONB field several levels down.  In
-    that case the physical declarations are STRUCT/LIST/MAP expressions rather
-    than the scalar ``JSON``/``VARIANT`` pair, but the only representation change
-    permitted here is still the recursive JSONB key representation change.
-    """
-    current_name = str(current).strip().upper()
-    desired_name = str(desired).strip().upper()
-    if current_name == desired_name:
-        return False
-    if {current_name, desired_name} == {"JSON", "VARIANT"}:
-        return True
-    return (
-        ("VARIANT" in current_name and "JSON" in desired_name)
-        or ("JSON" in current_name and "VARIANT" in desired_name)
-    )
-
-
-def _lossless_numeric_supertype(current: str, desired: str) -> bool:
-    """Allow a legacy inferred integer column to adopt its narrower catalog fact."""
-    ranks = {"SMALLINT": 1, "INTEGER": 2, "BIGINT": 3, "HUGEINT": 4}
-    current_name = _normalise_type(current)
-    desired_name = _normalise_type(desired)
-    return (
-        current_name in ranks
-        and desired_name in ranks
-        and ranks[current_name] >= ranks[desired_name]
-    )
-
-def _physical_union_native(physical: str, *, source=None):
-    """Rehydrate a cached native UNION from the destination declaration."""
-    from .typed_types import NativeMember, NativeType
-
-    members = tuple(
-        NativeMember(
-            name,
-            NativeType(_normalise_type(type_name), type_name),
-        )
-        for name, type_name in _union_members(physical)
-    )
-    return NativeType("UNION", physical, source=source, members=members, indexable=False)
-
-
-# --------------------------------------------------------------------------- #
-# the two statements an apply is made of
-# --------------------------------------------------------------------------- #
-
-
-def _copy_rows_with_identity(*args, **kwargs):
-    from .typed_materialization import _copy_rows_with_identity as copy_rows
-    return copy_rows(*args, **kwargs)
-
-
-def _typed_assignment(*args, **kwargs):
-    from .typed_materialization import _typed_assignment as assignment
-    return assignment(*args, **kwargs)
 
 
 __all__ = [
