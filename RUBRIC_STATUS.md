@@ -257,10 +257,11 @@ orphan-row defect.
 
 For 2.6, catalog activation now verifies FULL again after sampling the activation
 LSN on the same connection; the exact two-connection downgrade race observed in
-r3 now leaves no boundary and is rejected by policy. The 2,880-cell matrix's
-1,860 uncovered cells obtain reasons from the production
+r3 now leaves no boundary and is rejected by policy. The then-current 2,880-cell
+matrix's 1,860 uncovered cells obtained reasons from the production
 `machines.PHYSICAL_ROW_PRECONDITIONS` declarations, and unexpected exceptions
-still fail the executor. The honest score remains **4/5** because stock,
+still failed the executor. That matrix proof was superseded by FIX ROUND 5's
+real-owner execution below. The honest score remains **4/5** because stock,
 published Debezium still does not provide the marker-preserving efficient TOAST
 channel; the deferred 5/5 upgrade remains out of scope.
 
@@ -270,12 +271,62 @@ protocol is in `commit_protocol.py`; `applier.py` is 774 lines and
 `schema_registry.py` is 642 lines. The guard checks owner method modules and
 dependency boundaries, not just file lengths.
 
-Final required-lane evidence: default **1,507 passed**, slow **129 passed**,
-MotherDuck **37 passed**, and clean `make lint` (all on `CDC_TEST_PGPORT=15434`).
+Final required-lane evidence for FIX ROUND 4 was: default **1,507 passed**, slow
+**129 passed**, MotherDuck **37 passed**, and clean `make lint`; FIX ROUND 5's
+replacement lane results are recorded above.
 
 No identity versioning, legacy-build candidate lookup, or conversion backfill was
 added. This code is still in testing and intentionally supports one current
 canonical identity format only.
+
+### FIX ROUND 5 closure (2026-08-09)
+
+The round-5 reproductions were added as failing tests before the fixes. The required
+lanes then passed on the clone's PostgreSQL 18 at `CDC_TEST_PGPORT=15434`:
+`make test` **1,509 passed**, `make test-slow` **131 passed**, `make test-md`
+**38 passed**, and `make lint` passed.
+
+For 2.4/2.5, `identity_codec.py` now has explicit source-semantic range and
+multirange branches after encoding, rather than falling through the runtime leaf
+path. Bounds retain inclusive/exclusive meaning, unbounded bounds are distinct from
+`EMPTY` and SQL NULL, discrete `int4range`/`int8range`/`daterange` endpoints are
+normalized to PostgreSQL's `[)` equality class, and multiranges are ordered and
+overlap/adjacency-merged before identity serialization. The exact float4 widened
+readback pair and timestamptz offset-equivalence class pass. Local DuckDB and real
+MotherDuck each insert a range and multirange key, compare source identity with the
+STRUCT/LIST readback identity, and delete the row using an equivalent PostgreSQL key.
+The native-type sweep found no `_OBSCURE_TEXT_KINDS` member missing from the explicit
+codec text branch; all other `native_type` groups (domains, scalars, temporal,
+numeric, JSON, recursive containers, enums, spatial/vector, bit, range and
+multirange) have explicit source branches. No `total_seconds()` path was added.
+
+For 2.6 #3, the poll takes `ACCESS EXCLUSIVE` for activation, or `ACCESS SHARE` for
+an already-valid FULL boundary, with `LOCK TABLE ... NOWAIT` in the same transaction
+as the verification, WAL sample, post-sample verification, and boundary record.
+`ALTER TABLE ... REPLICA IDENTITY` cannot interleave with those locks, so the race is
+closed by PostgreSQL's lock conflict rather than by another check. `NOWAIT` makes a
+pipeline DML/streaming lock or operator DDL a bounded automatic refusal; failed
+admission clears any copied boundary and leaves the next poll/refetch route to heal.
+The exact r4 pause-after-verification-2 probe, including event LSN `11777429008`,
+gets `LockNotAvailable`, observes `d` with no boundary, and rejects the event. A
+separate held-`ROW EXCLUSIVE` transaction returns in under one second with the same
+fail-closed state. There is no third relreplident verification.
+
+For 2.6 #7, the matrix no longer calls `machines.physical_row_unreachable_reason`
+and no test validates exclusions with that function. Every one of the 2,880 cells
+enters the real GroupPlan/TableWork/SchemaRegistry/SpillBuffer path using the real
+Applier SnapshotCoordinator; cells are uncovered only when the real owner raises,
+and results record durable row count, rollback state, owner outcome, and transition.
+The three prior false exclusions—keyless update/absent, keyless delete, and keyless
+key_move—now commit through the `cdcf_event_id` identity and are individually tested.
+The Applier spill-refusal seam still records durable `awaiting_snapshot` recovery.
+
+Unproven or intentionally deferred: stock Debezium's marker-preserving unchanged-
+TOAST channel remains unavailable, so 2.6 is honestly 4/5; this work does not claim
+the deferred 5/5 upgrade. The range evidence covers the declared native range
+representation and built-in PostgreSQL discrete classes, not arbitrary extension
+range canonical functions. No Debezium fork, converter/SMT, Java, Maven, or Gradle
+artifact was introduced.
 
 ### TODO 1.1 / 1.2 / 1.3 — the transactional applier (implemented 2026-07-30)
 
@@ -438,9 +489,9 @@ correct assumptions in the notes below:
 | 2.1 | Added / dropped columns handled | **5** | Catalog-fenced attnum diffs add and backfill existing rows, physically drop destination columns, and continue through live CDC; the add/drop E2E compares source and destination before and after both DDLs. |
 | 2.2 | Renamed columns handled well | **5** | Same-attnum/type changes use a true destination rename, including a late-row merge/fence path; the E2E has one logical column, one rename audit event, and no data loss. |
 | 2.3 | New tables and schemas auto-discovered | **5** | A 10-second (configurable) all-schema watcher admits table-scoped publication members and performs an in-process targeted re-snapshot on the same main slot; new-table and new-schema existing rows arrive without config edit or restart. |
-| 2.4 | Postgres types → native MotherDuck types | ~~1~~ → **5** | Catalog-authoritative recursive descriptors map the full supported matrix to native JSON/VARIANT/LIST/STRUCT/MAP and bounded numeric UNIONs; NaN/Infinity/NULL/spill/replay are covered. JSONB keys use JSON on both runtimes, including composite keys and automatic key gain/loss repair. |
-| 2.5 | Data type changes supported | ~~3~~ → **5** | One typed shadow-swap path creates fingerprinted UNION members, rewrites every row to the one current source-semantic identity, fences mixed epochs, and is fault-instrumented; no identity history or candidate lookup remains. |
-| 2.6 | TOAST columns handled well | **4** | Sparse physical-row folding, durable NULL-vs-JSONB-root-null ambiguity refusal, post-sample FULL re-verification, and a per-table activation boundary close soundness defects. Stock Debezium still lacks a marker-preserving efficient channel, so the policy ceiling remains 4. |
+| 2.4 | Postgres types → native MotherDuck types | ~~1~~ → **5** | Catalog-authoritative recursive descriptors map the full supported matrix to native JSON/VARIANT/LIST/STRUCT/MAP/range/multirange and bounded numeric UNIONs; NaN/Infinity/NULL/spill/replay are covered. JSONB and range keys use source-semantic identity on both runtimes, including composite keys and automatic key gain/loss repair. |
+| 2.5 | Data type changes supported | ~~3~~ → **5** | One typed shadow-swap path creates fingerprinted UNION members, rewrites every row to the one current source-semantic identity, including range/multirange equality classes, fences mixed epochs, and is fault-instrumented; no identity history or candidate lookup remains. |
+| 2.6 | TOAST columns handled well | **4** | Sparse physical-row folding, durable NULL-vs-JSONB-root-null ambiguity refusal, and a bounded relation-lock activation fence close the soundness defects. The real-owner matrix is non-circular. Stock Debezium still lacks a marker-preserving efficient channel, so the policy ceiling remains 4. |
 | 3.1 | Backfill scalable / parallelized | 3 | 120 k rows in ~28 s single-threaded (`snapshot.max.threads=1`); works but does not scale, untested past 120 k. |
 | 3.2 | Backfills atomic | 1 | Snapshot rows are appended straight into the live table; no shadow table, no swap. |
 | 3.3 | Existing tables keep receiving CDC during snapshot | 1 | Debezium's initial snapshot blocks streaming entirely; everything goes stale for the snapshot's duration. |
@@ -1860,7 +1911,7 @@ bounded NUMERIC finite/NaN/Infinity/-Infinity/NULL, temporal types, replay,
 spill, and mutable enum/composite descriptor epochs. Evidence includes
 `tests/rubric/2.4_native_types/`, the local nested-composite and bytea UNION
 regressions, and the MotherDuck nested-composite and bytea UNION proofs. The
-final repository lanes selected 1,507 default, 129 slow, and 37 MotherDuck
+final repository lanes selected 1,509 default, 131 slow, and 38 MotherDuck
 tests; all passed. Strict catalog descriptor authority now refuses missing or
 recursively incomplete trees. Numeric inserts, replay, spill, and the assignment
 seam use the same idempotent adapter; UPDATEs of NaN, Infinity, and -Infinity
@@ -1890,6 +1941,15 @@ NULL/empty arrays, nested composites, maps, JSONB and unicode. The physical
 scalar predicate is explicitly cast to its target native type.
 
 `most types text/json=1, core scalars well (nested as text)=3, (nested as json)=4, full=5`
+
+**FIX ROUND 5 range/multirange closure (2026-08-09).** The explicit codec branches
+now preserve inclusive/exclusive and unbounded-vs-empty-vs-NULL semantics, apply
+PostgreSQL's discrete `[)` normalization for `int4range`/`int8range`/`daterange`,
+and sort/merge multirange equality classes. The local and MotherDuck key-gain tests
+insert range and multirange keys, compare source identity with destination
+STRUCT/LIST readback, and delete through equivalent keys. The native resolver's
+remaining declared groups were swept against explicit codec branches; no declared
+native kind falls through solely to `_identity_runtime`.
 
 **Historical pre-fix evidence** (`p02` `colsD_wide_types`,
 `tests/e2e/test_e2e_duckdb.py::test_documented_baseline_gaps`). This measurement
@@ -1969,6 +2029,13 @@ orphan-row bug.
 
 `error=1, drop and add=3, widening automatic=4, MotherDuck UNION types=5`
 
+**FIX ROUND 5 current evidence (2026-08-09).** The range/multirange equality-class
+and key-gain regressions pass in the local 2.5 suite and in real MotherDuck. The
+full local 2.5 lane passed **102 tests**, including the 33-case current-identity
+audit and the exact widened-float4, discrete-range, timestamptz-zone, and
+multirange-order cases. No identity history, legacy candidates, or conversion
+backfill was reintroduced.
+
 **Historical pre-fix evidence** (`p02` step D). `ALTER COLUMN col_smallint TYPE text` then inserting
 `'now-a-string'` → dlt created a **variant column**: `col_smallint BIGINT` (old
 values) alongside `col_smallint__v_text VARCHAR` (new values). No error, no data
@@ -2006,15 +2073,15 @@ instantiate the real `Applier._handle_spill_refusal -> spill_refusal.handle` sea
 and prove durable `awaiting_snapshot` plus automatic retry. The dedicated seam
 regression and unexpected-exception regression pass.
 
-**FIX ROUND 4 current evidence (2026-08-09).** `catalog_poll.py` verifies
+**Historical FIX ROUND 4 evidence (2026-08-09; superseded by FIX ROUND 5).** `catalog_poll.py` verifies
 `relreplident='f'`, samples the activation LSN, and verifies FULL again after the
 sample on the same connection. The exact two-connection r3 probe now observes
 the downgrade, stores no activation boundary, and rejects the residual event;
 the stale hard-coded boundary is not accepted. Uncovered matrix cells are
 classified only by the production `PHYSICAL_ROW_PRECONDITIONS` predicates in
-`machines.py`; the derivation assertion covers all 1,860 uncovered cells. The
-run remains **2,880 declared / 1,020 covered / 1,860 derived-unreachable / 188
-exercised / 2,692 refused**, with unexpected exceptions failing rather than
+`machines.py`; the derivation assertion covered all 1,860 uncovered cells in that
+round. The old run was **2,880 declared / 1,020 covered / 1,860 derived-unreachable
+/ 188 exercised / 2,692 refused**, with unexpected exceptions failing rather than
 being absorbed.
 
 Evidence: `tests/rubric/2.6_toast_sparse_updates/`, including a real PostgreSQL
@@ -2024,6 +2091,15 @@ Debezium still does not expose a marker-preserving, efficient unchanged-TOAST
 channel, and no fork, custom converter, or Java artifact was added.
 
 `errors on TOAST=1, handled but inefficiently=4, handled efficiently=5`
+
+**FIX ROUND 5 current evidence (2026-08-09).** Activation now takes a conflicting
+PostgreSQL relation lock with `NOWAIT` and keeps it through verify → sample → record;
+the exact r4 pause after verification #2 receives `LockNotAvailable` on the second
+connection's downgrade and returns no boundary, while the contention probe proves
+the pipeline remains bounded and fail-closed. The matrix executes all 2,880 cells
+through the real owner and records durable rows, rollback state, and transitions;
+the three keyless event-identity cells commit. This is still **4/5**, because the
+stock Debezium marker-preserving 5/5 channel is intentionally deferred.
 
 **Evidence.** The current-runtime implementation configures Debezium's
 `unavailable.value.placeholder` as `hex:00`, treats the decoded NUL as an

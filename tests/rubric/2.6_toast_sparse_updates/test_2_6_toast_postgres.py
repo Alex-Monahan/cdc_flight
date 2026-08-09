@@ -8,6 +8,7 @@ the slow lane, using only the project-local port selected by CDC_TEST_PGPORT.
 from __future__ import annotations
 
 import os
+import time
 
 import psycopg
 import pytest
@@ -180,6 +181,7 @@ def test_two_connection_identity_downgrade_after_verification_is_not_admitted(sa
                 self.paused = True
                 # The verification has returned FULL.  A second connection now
                 # downgrades the relation before the first connection samples WAL.
+                self.racer.execute("SET lock_timeout = '100ms'")
                 self.racer.execute(
                     "ALTER TABLE app.p2b_toast_identity_toc "
                     "REPLICA IDENTITY DEFAULT"
@@ -214,6 +216,197 @@ def test_two_connection_identity_downgrade_after_verification_is_not_admitted(sa
             assert observed[qualified].replica_identity == "d"
             assert observed[qualified].full_activation_lsn is None
             assert policy.accepts_event(11777429008) is False
+    finally:
+        with psycopg.connect(sandbox.source.dsn, autocommit=True) as cleanup:
+            cleanup.execute(f"ALTER PUBLICATION {publication} DROP TABLE {qualified}")
+            cleanup.execute(f"DROP TABLE IF EXISTS {qualified}")
+
+
+def test_two_connection_downgrade_after_post_sample_verification_is_not_admitted(sandbox):
+    """The r4 pause after verification #2 must fail closed under a held relation lock."""
+    publication = "cdc_flight_pub"
+    qualified = "app.p2b_toast_identity_toc_r4"
+    with psycopg.connect(sandbox.source.dsn, autocommit=True) as setup:
+        setup.execute(f"DROP TABLE IF EXISTS {qualified}")
+        setup.execute(
+            "CREATE TABLE app.p2b_toast_identity_toc_r4 "
+            "(id integer PRIMARY KEY, payload bytea)"
+        )
+        setup.execute(f"ALTER PUBLICATION {publication} ADD TABLE {qualified}")
+        relation_oid, relfilenode, relation_type_oid = map(
+            int,
+            setup.execute(
+                "SELECT c.oid, c.relfilenode, c.reltype FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid=c.relnamespace "
+                "WHERE n.nspname='app' AND c.relname='p2b_toast_identity_toc_r4'"
+            ).fetchone(),
+        )
+
+    relation = SourceRelation(
+        schema="app",
+        table="p2b_toast_identity_toc_r4",
+        oid=relation_oid,
+        relfilenode=relfilenode,
+        relation_type_oid=relation_type_oid,
+        published=True,
+        replica_identity="d",
+        columns=(
+            SourceColumn(
+                attnum=1,
+                name="id",
+                type_oid=23,
+                type_name="integer",
+                descriptor=SourceTypeDescriptor(23, "pg_catalog.int4", "int4"),
+                attstorage="p",
+            ),
+            SourceColumn(
+                attnum=2,
+                name="payload",
+                type_oid=17,
+                type_name="bytea",
+                descriptor=SourceTypeDescriptor(17, "pg_catalog.bytea", "bytea"),
+                attstorage="x",
+            ),
+        ),
+    )
+
+    class PausingAfterSecondVerification:
+        def __init__(self, inner, racer):
+            self.inner = inner
+            self.racer = racer
+            self.verify_count = 0
+            self.racer_error = None
+
+        def execute(self, statement, params=None):
+            result = self.inner.execute(statement, params)
+            if "SELECT relreplident" in statement:
+                self.verify_count += 1
+                if self.verify_count == 2:
+                    self.racer.execute("SET lock_timeout = '100ms'")
+                    try:
+                        self.racer.execute(
+                            "ALTER TABLE app.p2b_toast_identity_toc_r4 "
+                            "REPLICA IDENTITY DEFAULT"
+                        )
+                    except psycopg.errors.LockNotAvailable as exc:
+                        self.racer_error = exc
+                        raise
+            return result
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+    watcher = CatalogWatcher(
+        dsn=sandbox.source.dsn,
+        primary_dsn=sandbox.source.dsn,
+        publication=publication,
+        schema="app",
+        schemas={"app"},
+        include={qualified},
+        emit_marker=False,
+        confirm_polls=1,
+    )
+    try:
+        with (
+            psycopg.connect(sandbox.source.dsn, autocommit=True) as write,
+            psycopg.connect(sandbox.source.dsn, autocommit=True) as racer,
+        ):
+            conn = PausingAfterSecondVerification(write, racer)
+            observed = _ensure_toast_policies(
+                watcher,
+                conn,
+                {qualified: relation},
+                activation_lsn=1,
+            )
+            assert conn.verify_count == 2
+            assert conn.racer_error is not None
+            assert observed[qualified].replica_identity == "d"
+            assert observed[qualified].full_activation_lsn is None
+            assert observed[qualified].toast_policy.accepts_event(11777429008) is False
+            assert write.execute(
+                "SELECT relreplident FROM pg_class WHERE oid = %s", [relation_oid]
+            ).fetchone()[0] == "d"
+    finally:
+        with psycopg.connect(sandbox.source.dsn, autocommit=True) as cleanup:
+            cleanup.execute(f"ALTER PUBLICATION {publication} DROP TABLE {qualified}")
+            cleanup.execute(f"DROP TABLE IF EXISTS {qualified}")
+
+
+def test_activation_lock_timeout_refuses_behind_a_streaming_transaction(sandbox):
+    """A DML-style relation lock cannot deadlock or stall the catalog poll."""
+    publication = "cdc_flight_pub"
+    qualified = "app.p2b_toast_identity_lock_timeout"
+    with psycopg.connect(sandbox.source.dsn, autocommit=True) as setup:
+        setup.execute(f"DROP TABLE IF EXISTS {qualified}")
+        setup.execute(
+            "CREATE TABLE app.p2b_toast_identity_lock_timeout "
+            "(id integer PRIMARY KEY, payload bytea)"
+        )
+        setup.execute(f"ALTER PUBLICATION {publication} ADD TABLE {qualified}")
+        relation_oid, relfilenode, relation_type_oid = map(
+            int,
+            setup.execute(
+                "SELECT c.oid, c.relfilenode, c.reltype FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid=c.relnamespace "
+                "WHERE n.nspname='app' AND c.relname='p2b_toast_identity_lock_timeout'"
+            ).fetchone(),
+        )
+
+    residual = SourceTypeDescriptor(17, "pg_catalog.bytea", "bytea")
+    relation = SourceRelation(
+        schema="app",
+        table="p2b_toast_identity_lock_timeout",
+        oid=relation_oid,
+        relfilenode=relfilenode,
+        relation_type_oid=relation_type_oid,
+        published=True,
+        replica_identity="d",
+        columns=(
+            SourceColumn(
+                1, "id", 23, "integer",
+                descriptor=SourceTypeDescriptor(23, "pg_catalog.int4", "int4"),
+                attstorage="p",
+            ),
+            SourceColumn(
+                2, "payload", 17, "bytea", descriptor=residual, attstorage="x"
+            ),
+        ),
+    )
+    watcher = CatalogWatcher(
+        dsn=sandbox.source.dsn,
+        primary_dsn=sandbox.source.dsn,
+        publication=publication,
+        schema="app",
+        schemas={"app"},
+        include={qualified},
+        emit_marker=False,
+        confirm_polls=1,
+    )
+    try:
+        # A streaming/DML transaction normally holds ROW EXCLUSIVE.  The poll's
+        # ACCESS EXCLUSIVE NOWAIT must refuse immediately and leave the relation on
+        # automatic refetch, rather than waiting for that transaction or deadlocking.
+        with (
+            psycopg.connect(sandbox.source.dsn, autocommit=False) as blocker,
+            psycopg.connect(sandbox.source.dsn, autocommit=True) as poll_conn,
+        ):
+            blocker.execute(
+                "LOCK TABLE app.p2b_toast_identity_lock_timeout "
+                "IN ROW EXCLUSIVE MODE"
+            )
+            started = time.monotonic()
+            observed = _ensure_toast_policies(
+                watcher,
+                poll_conn,
+                {qualified: relation},
+                activation_lsn=1,
+            )
+            elapsed = time.monotonic() - started
+            assert elapsed < 1.0
+            assert observed[qualified].replica_identity == "d"
+            assert observed[qualified].full_activation_lsn is None
+            assert observed[qualified].toast_policy.accepts_event(11777429008) is False
+            blocker.rollback()
     finally:
         with psycopg.connect(sandbox.source.dsn, autocommit=True) as cleanup:
             cleanup.execute(f"ALTER PUBLICATION {publication} DROP TABLE {qualified}")

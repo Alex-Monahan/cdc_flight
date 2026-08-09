@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 
 import duckdb
@@ -11,7 +11,7 @@ import pytest
 from support.type_matrix import nested_matrix, scalar_matrix
 
 from cdc_flight.apply_sql import SchemaRegistry, delete_keys, insert_rows
-from cdc_flight.identity_codec import identity_value
+from cdc_flight.identity_codec import _identity_tree, identity_value
 from cdc_flight.typed_types import SourceTypeDescriptor
 
 
@@ -26,6 +26,132 @@ def _wrapped(child: SourceTypeDescriptor, oid: int) -> SourceTypeDescriptor:
         "composite",
         composite_fields=(("value", child),),
     )
+
+
+def test_range_and_multirange_identity_preserves_postgres_equality_classes():
+    """Supported range values must keep source semantics across destination readback."""
+    int4 = _source("int4", 23)
+    int4range = SourceTypeDescriptor(
+        3904, "pg_catalog.int4range", "range", range_subtype=int4
+    )
+    int4multirange = SourceTypeDescriptor(
+        4451, "pg_catalog.int4multirange", "multirange", range_subtype=int4range
+    )
+    float4 = _source("float4", 700)
+    float4range = SourceTypeDescriptor(
+        3906, "pg_catalog.float4range", "range", range_subtype=float4
+    )
+    tstz = _source("timestamptz", 1184)
+    tstzrange = SourceTypeDescriptor(
+        3910, "pg_catalog.tstzrange", "range", range_subtype=tstz
+    )
+
+    # This is the exact r4 float4 readback pair: DuckDB exposes the FLOAT value
+    # through Python as a widened double.
+    source_float4 = {
+        "is_empty": False,
+        "lower": 1.23,
+        "upper": 2.34,
+        "lower_inclusive": True,
+        "upper_inclusive": False,
+    }
+    readback_float4 = {
+        "is_empty": False,
+        "lower": 1.2300000190734863,
+        "upper": 2.3399999141693115,
+        "lower_inclusive": True,
+        "upper_inclusive": False,
+    }
+    assert _identity_tree(source_float4, float4range) == _identity_tree(
+        readback_float4, float4range
+    )
+
+    # PostgreSQL canonicalizes discrete ranges to [): these are equal ranges.
+    assert _identity_tree("[1,3]", int4range) == _identity_tree(
+        "[1,4)", int4range
+    )
+    assert _identity_tree("(1,2)", int4range) == _identity_tree(
+        "empty", int4range
+    )
+    assert _identity_tree(None, int4range) != _identity_tree("empty", int4range)
+
+    # PostgreSQL compares timestamptz endpoints by instant, not by offset spelling.
+    minus_seven = timezone(timedelta(hours=-7))
+    first_zone = {
+        "is_empty": False,
+        "lower": datetime(2024, 1, 1, 0, 0, tzinfo=minus_seven),
+        "upper": datetime(2024, 1, 1, 8, 0, tzinfo=minus_seven),
+        "lower_inclusive": True,
+        "upper_inclusive": False,
+    }
+    utc = {
+        "is_empty": False,
+        "lower": datetime(2024, 1, 1, 7, 0, tzinfo=UTC),
+        "upper": datetime(2024, 1, 1, 15, 0, tzinfo=UTC),
+        "lower_inclusive": True,
+        "upper_inclusive": False,
+    }
+    assert _identity_tree(first_zone, tstzrange) == _identity_tree(utc, tstzrange)
+
+    # Unbounded flags are syntax, not values: PostgreSQL treats every spelling
+    # without a lower/upper bound as the same infinite endpoint.
+    assert _identity_tree("[,3)", int4range) == _identity_tree("(,3)", int4range)
+    assert _identity_tree("[1,)", int4range) == _identity_tree("[1,]", int4range)
+    assert _identity_tree("empty", int4range) != _identity_tree("[,)", int4range)
+
+    # Multirange equality is order-independent and merges overlapping/adjacent
+    # ranges before identity is formed.
+    assert _identity_tree(
+        ["[10,12)", "[1,3]"], int4multirange
+    ) == _identity_tree(["[1,4)", "[10,12)"], int4multirange)
+
+
+def test_range_and_multirange_key_gain_deletes_equivalent_keys_after_readback():
+    """The production key path uses the range identity, not STRUCT display text."""
+    integer = _source("int4", 23)
+    text = _source("text", 25)
+    range_type = SourceTypeDescriptor(
+        3904, "pg_catalog.int4range", "range", range_subtype=integer
+    )
+    multirange_type = SourceTypeDescriptor(
+        4451,
+        "pg_catalog.int4multirange",
+        "multirange",
+        range_subtype=range_type,
+    )
+    con = duckdb.connect(":memory:", config={
+        "storage_compatibility_version": "v1.5.0",
+        "variant_minimum_shredding_size": "-1",
+    })
+    try:
+        con.execute("CREATE SCHEMA typed")
+        registry = SchemaRegistry(con, "typed")
+        cases = (
+            ("range_key", range_type, "[1,3]", "[1,4)"),
+            (
+                "multirange_key",
+                multirange_type,
+                ["[10,12)", "[1,3]", "[3,5)"],
+                ["[1,5)", "[10,12)"],
+            ),
+        )
+        for name, descriptor, source_value, equivalent_value in cases:
+            table, _ = registry.ensure_typed(
+                name,
+                columns={"key": descriptor, "payload": text},
+                key_columns=("key",),
+            )
+            insert_rows(con, table, ["key", "payload"], [[source_value, "kept"]])
+            readback = con.execute(
+                f'SELECT "key" FROM typed."{name}"'
+            ).fetchone()[0]
+            assert identity_value(table, (source_value,), key_columns=("key",)) == identity_value(
+                table, (readback,), key_columns=("key",)
+            )
+            delete_keys(con, table, ("key",), [(equivalent_value,)])
+            assert con.execute(f'SELECT count(*) FROM typed."{name}"').fetchone() == (0,)
+    finally:
+        con.close()
 
 
 def _full_type_cases():

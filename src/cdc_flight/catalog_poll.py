@@ -132,16 +132,42 @@ def _ensure_toast_policies(
         )
         if not policy.residual_columns:
             continue
-        if (
-            str(relation.replica_identity).lower() == "f"
-            and positive_lsn(relation.full_activation_lsn) is not None
-        ):
-            continue
         try:
             schema, _, table = qualified.partition(".")
             if not schema or not table:
                 raise ValueError(f"unqualified source relation {qualified!r}")
             from .naming import quote
+
+            # ALTER TABLE ... REPLICA IDENTITY takes ACCESS EXCLUSIVE. Acquire the
+            # same relation lock before any state check and keep it through the WAL
+            # sample and the in-memory boundary record. NOWAIT is deliberate: a
+            # source transaction or an operator DDL cannot deadlock this poll or make
+            # streaming wait behind it; the exception below leaves the relation on
+            # automatic refetch/resnapshot recovery for the next poll.
+            needs_activation = not (
+                str(relation.replica_identity).lower() == "f"
+                and positive_lsn(relation.full_activation_lsn) is not None
+            )
+            lock_mode = "ACCESS EXCLUSIVE" if needs_activation else "ACCESS SHARE"
+            conn.execute("BEGIN TRANSACTION")
+            conn.execute(
+                f"LOCK TABLE {quote(schema)}.{quote(table)} "
+                f"IN {lock_mode} MODE NOWAIT"
+            )
+            if not needs_activation:
+                # The catalog observation happened before this transaction. Recheck
+                # exactly once while the conflicting lock is held; no later
+                # check-then-use window exists inside this admission transaction.
+                locked_identity = conn.execute(
+                    "SELECT relreplident FROM pg_class WHERE oid = %s", [relation.oid]
+                ).fetchone()
+                if not locked_identity or str(locked_identity[0]).lower() != "f":
+                    raise RuntimeError(
+                        "source replica identity changed before the held-lock admission"
+                    )
+                updated[qualified] = relation
+                conn.execute("COMMIT")
+                continue
 
             conn.execute(
                 f"ALTER TABLE {quote(schema)}.{quote(table)} "
@@ -166,13 +192,11 @@ def _ensure_toast_policies(
                     f"post-ALTER WAL boundary {boundary!r} did not prove it follows "
                     f"the pre-ALTER sample {pre_alter!r}"
                 )
-            # A concurrent ALTER can run after the first verification and before
-            # the WAL sample.  The boundary is not admissible until the same
-            # connection proves FULL again after sampling; otherwise a residual
-            # event can pass a boundary belonging to a state that has already
-            # returned to DEFAULT.  Failure deliberately leaves ``relation``
-            # unchanged (DEFAULT with no boundary), so the next poll/refetch path
-            # remains fail-closed.
+            # Keep the post-sample verification from r3 as a defense-in-depth
+            # assertion.  The held ACCESS EXCLUSIVE lock is the actual race closure:
+            # PostgreSQL cannot execute a concurrent REPLICA IDENTITY ALTER until
+            # this transaction commits, so the verification, WAL sample, and boundary
+            # record all describe one locked source state.
             verified_after_sample = conn.execute(
                 "SELECT relreplident FROM pg_class WHERE oid = %s", [relation.oid]
             ).fetchone()
@@ -189,18 +213,28 @@ def _ensure_toast_policies(
                 replica_identity="f",
                 full_activation_lsn=boundary,
             )
+            conn.execute("COMMIT")
             log.info(
                 "TOAST residual table %s admitted with verified REPLICA IDENTITY FULL: %s",
                 qualified,
                 ", ".join(policy.residual_columns),
             )
         except Exception as exc:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                log.debug("could not roll back source activation transaction", exc_info=True)
             log.warning(
                 "could not establish REPLICA IDENTITY FULL for residual TOAST table %s; "
                 "events will take automatic refetch/resnapshot recovery: %s",
                 qualified,
                 exc,
             )
+            # A lock timeout or any other failed admission must not return a boundary
+            # copied from the pre-lock observation.  Clear it even when the observed
+            # relation was already FULL; the next poll must reacquire the fence before
+            # it can admit another event.
+            updated[qualified] = replace(relation, full_activation_lsn=None)
     return updated
 
 

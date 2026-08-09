@@ -16,6 +16,7 @@ import struct
 from collections.abc import Mapping
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
+from functools import cmp_to_key
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -124,8 +125,9 @@ def _canonical_float(value: Any, *, bits: int | None = None) -> str:
         return "Infinity" if number > 0 else "-Infinity"
     if number == 0:
         return "0"
-    if bits == 32:
-        number = struct.unpack("!f", struct.pack("!f", number))[0]
+    if bits in {16, 32}:
+        format_code = "e" if bits == 16 else "f"
+        number = struct.unpack(f"!{format_code}", struct.pack(f"!{format_code}", number))[0]
     return repr(number)
 
 
@@ -318,6 +320,246 @@ def _identity_runtime(value: Any) -> Any:
     return value
 
 
+class _RangeInfinity:
+    """An internal bound used when discrete canonicalization crosses a type edge."""
+
+    __slots__ = ("positive",)
+
+    def __init__(self, positive: bool):
+        self.positive = bool(positive)
+
+
+def _range_name(source: Any) -> str:
+    return str(getattr(source, "qualified_name", "")).rsplit(".", 1)[-1].lower()
+
+
+def _range_subtype(source: Any) -> Any:
+    value = source
+    seen: set[int] = set()
+    while getattr(value, "domain_base", None) is not None and id(value) not in seen:
+        seen.add(id(value))
+        value = value.domain_base
+    return value
+
+
+def _range_step(value: Any, subtype: Any) -> Any:
+    """Return the next discrete subtype value without float arithmetic."""
+    subtype = _range_subtype(subtype)
+    kind = str(getattr(subtype, "kind", "")).lower()
+    if kind in {"int2", "smallint", "int4", "integer", "int8", "bigint"}:
+        return int(value) + 1
+    if kind == "date" and isinstance(value, date):
+        try:
+            return value + timedelta(days=1)
+        except OverflowError:
+            return _RangeInfinity(True)
+    return value
+
+
+def _range_discrete(source: Any) -> bool:
+    """Whether PostgreSQL has a built-in canonical [) form for this range."""
+    return _range_name(source) in {"int4range", "int8range", "daterange"}
+
+
+def _range_order_value(value: Any) -> Any:
+    """Unwrap destination wrappers before comparing two same-subtype bounds."""
+    from .typed_types import UnionValue
+
+    while isinstance(value, UnionValue):
+        value = value.value
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        return value.astimezone(UTC).replace(tzinfo=None)
+    if isinstance(value, _RangeInfinity):
+        return value
+    return value
+
+
+def _range_compare(left: Any, right: Any) -> int:
+    """Compare bounds after their source subtype has been encoded."""
+    if isinstance(left, _RangeInfinity):
+        if isinstance(right, _RangeInfinity):
+            return (left.positive > right.positive) - (left.positive < right.positive)
+        return 1 if left.positive else -1
+    if isinstance(right, _RangeInfinity):
+        return -1 if right.positive else 1
+    left = _range_order_value(left)
+    right = _range_order_value(right)
+    try:
+        return (left > right) - (left < right)
+    except TypeError:
+        left_text = repr(left)
+        right_text = repr(right)
+        return (left_text > right_text) - (left_text < right_text)
+
+
+def _normalise_range(value: Any, source: Any) -> dict[str, Any]:
+    """Normalize one PostgreSQL range before its bounds enter the identity tree."""
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{value!r} is not an encoded range")
+    subtype = source.range_subtype
+    empty = bool(value.get("is_empty", False))
+    lower = value.get("lower")
+    upper = value.get("upper")
+    lower_inclusive = bool(value.get("lower_inclusive", False)) and lower is not None
+    upper_inclusive = bool(value.get("upper_inclusive", False)) and upper is not None
+    if empty:
+        return {
+            "empty": True,
+            "lower": None,
+            "upper": None,
+            "lower_inclusive": False,
+            "upper_inclusive": False,
+        }
+    if _range_discrete(source):
+        if lower is not None and not lower_inclusive:
+            lower = _range_step(lower, subtype)
+        if lower is not None:
+            lower_inclusive = True
+        if upper is not None and upper_inclusive:
+            upper = _range_step(upper, subtype)
+        if upper is not None:
+            upper_inclusive = False
+    if lower is not None and upper is not None:
+        order = _range_compare(lower, upper)
+        if order > 0 or (order == 0 and not (lower_inclusive and upper_inclusive)):
+            return {
+                "empty": True,
+                "lower": None,
+                "upper": None,
+                "lower_inclusive": False,
+                "upper_inclusive": False,
+            }
+    return {
+        "empty": False,
+        "lower": lower,
+        "upper": upper,
+        "lower_inclusive": lower_inclusive,
+        "upper_inclusive": upper_inclusive,
+    }
+
+
+def _range_bound_identity(value: Any, subtype: Any) -> Any:
+    if value is None:
+        return {"unbounded": True}
+    if isinstance(value, _RangeInfinity):
+        return {"infinity": "positive" if value.positive else "negative"}
+    return _identity_tree(value, subtype)
+
+
+def _range_identity(value: Any, source: Any) -> dict[str, Any]:
+    normalized = _normalise_range(value, source)
+    if normalized["empty"]:
+        return {"range": {"empty": True}}
+    subtype = source.range_subtype
+    return {
+        "range": {
+            "empty": False,
+            "lower": _range_bound_identity(normalized["lower"], subtype),
+            "lower_inclusive": normalized["lower_inclusive"],
+            "upper": _range_bound_identity(normalized["upper"], subtype),
+            "upper_inclusive": normalized["upper_inclusive"],
+        }
+    }
+
+
+def _ranges_mergeable(left: dict[str, Any], right: dict[str, Any], source: Any) -> bool:
+    if left["upper"] is None or right["lower"] is None:
+        return True
+    order = _range_compare(left["upper"], right["lower"])
+    if order > 0:
+        return True
+    if order < 0:
+        return False
+    # Discrete canonical ranges are half-open, so equality is adjacency. For a
+    # continuous subtype, the shared point must belong to at least one range.
+    return _range_discrete(source) or left["upper_inclusive"] or right["lower_inclusive"]
+
+
+def _merge_ranges(ranges: list[dict[str, Any]], source: Any) -> list[dict[str, Any]]:
+    def compare(left: dict[str, Any], right: dict[str, Any]) -> int:
+        left_lower = left["lower"]
+        right_lower = right["lower"]
+        if left_lower is None or right_lower is None:
+            if left_lower is None and right_lower is None:
+                order = 0
+            else:
+                order = -1 if left_lower is None else 1
+        else:
+            order = _range_compare(left_lower, right_lower)
+        if order:
+            return order
+        # PostgreSQL's canonical multirange has one range per equality class;
+        # this tie-break only makes malformed/overlapping input deterministic.
+        if left["lower_inclusive"] != right["lower_inclusive"]:
+            return -1 if left["lower_inclusive"] else 1
+        return 0
+
+    ranges.sort(key=cmp_to_key(compare))
+    merged: list[dict[str, Any]] = []
+    for current in ranges:
+        if not merged or not _ranges_mergeable(merged[-1], current, source):
+            merged.append(dict(current))
+            continue
+        previous = merged[-1]
+        if previous["upper"] is None or current["upper"] is None:
+            previous["upper"] = None
+            previous["upper_inclusive"] = False
+            continue
+        order = _range_compare(previous["upper"], current["upper"])
+        if order < 0:
+            previous["upper"] = current["upper"]
+            previous["upper_inclusive"] = current["upper_inclusive"]
+        elif order == 0:
+            previous["upper_inclusive"] = (
+                previous["upper_inclusive"] or current["upper_inclusive"]
+            )
+    return merged
+
+
+def _multirange_identity(value: Any, source: Any) -> dict[str, Any]:
+    range_source = source.range_subtype
+    normalized = [
+        _normalise_range(item, range_source)
+        for item in (value if isinstance(value, (list, tuple)) else ())
+    ]
+    normalized = [item for item in normalized if not item["empty"]]
+    return {
+        "multirange": [
+            _range_identity(item, range_source)["range"]
+            for item in _merge_ranges(normalized, range_source)
+        ]
+    }
+
+
+def _time_identity(value: Any, *, zoned: bool) -> dict[str, Any]:
+    if not isinstance(value, time):
+        return {"time": str(value)}
+    if not zoned or value.tzinfo is None:
+        return {"time": value.isoformat()}
+    offset = value.utcoffset() or timedelta()
+    day_microseconds = 86_400_000_000
+    local_microseconds = (
+        (value.hour * 3_600 + value.minute * 60 + value.second) * 1_000_000
+        + value.microsecond
+    )
+    offset_microseconds = (
+        (offset.days * 86_400 + offset.seconds) * 1_000_000 + offset.microseconds
+    )
+    return {"timetz": (local_microseconds - offset_microseconds) % day_microseconds}
+
+
+_IDENTITY_TEXT_KINDS = frozenset(
+    {
+        "char", "bpchar", "varchar", "text", "citext", "name", "string",
+        "inet", "cidr", "macaddr", "macaddr8", "ltree", "tsvector", "tsquery",
+        "pg_lsn", "jsonpath", "xml", "money", "regproc", "regprocedure", "regoper",
+        "regoperator", "regclass", "regcollation", "regconfig", "regdictionary",
+        "regnamespace", "regrole", "regtype", "aclitem", "pg_node_tree", "tinterval",
+        "snapshot", "opaque",
+    }
+)
+
+
 def _identity_tree(value: Any, descriptor: Any) -> Any:
     """Encode one value recursively according to source semantics."""
     from .typed_types import encode_value
@@ -371,7 +613,70 @@ def _identity_tree(value: Any, descriptor: Any) -> Any:
         return {"timestamptz": encoded.astimezone(UTC).isoformat()}
     if kind == "interval":
         return {"interval": _interval_units(encoded)}
-    if kind in {"struct", "composite", "point", "geometry", "geography", "postgis"}:
+    if kind in {"smallint", "int2", "smallserial", "integer", "int", "int4", "serial", "bigint", "int8", "bigserial", "oid", "xid", "xid8"}:
+        return {"integer": str(int(encoded))}
+    if kind in {"boolean", "bool", "bit1"}:
+        return {"boolean": bool(encoded)}
+    if kind in {"char", "bpchar"}:
+        return {"text": str(encoded).rstrip(" ")}
+    if kind in _IDENTITY_TEXT_KINDS:
+        return {"text": str(encoded)}
+    if kind == "enum":
+        return {"enum": str(encoded)}
+    if kind == "uuid":
+        return {"uuid": str(encoded).lower()}
+    if kind == "date" and isinstance(encoded, date):
+        return {"date": encoded.isoformat()}
+    if kind in {"time", "time_microseconds", "microtime"}:
+        return _time_identity(encoded, zoned=False)
+    if kind in {"timetz", "zonedtime"}:
+        return _time_identity(encoded, zoned=True)
+    if kind in {"timestamp", "timestamp_microseconds", "microtimestamp"}:
+        return {"timestamp": encoded.isoformat() if isinstance(encoded, datetime) else str(encoded)}
+    if kind in {"range", "daterange", "int4range", "int8range", "numrange", "tsrange", "tstzrange"}:
+        return _range_identity(encoded, source)
+    if kind == "multirange":
+        return _multirange_identity(encoded, source)
+    if kind == "bit" or kind == "varbit":
+        mapping = encoded if isinstance(encoded, Mapping) else {}
+        bits = mapping.get("bits")
+        return {
+            "bits": bytes(bits or b"").hex() if isinstance(bits, (bytes, bytearray)) else str(bits),
+            "bit_length": int(mapping.get("bit_length", 0)),
+        }
+    if kind in {"vector", "halfvec"}:
+        bits = 16 if kind == "halfvec" else 32
+        values = encoded if isinstance(encoded, (list, tuple)) else []
+        return {"vector": [_canonical_float(item, bits=bits) for item in values]}
+    if kind == "sparsevec":
+        mapping = encoded if isinstance(encoded, Mapping) else {}
+        vector = mapping.get("vector", {})
+        items = [
+            [str(key), _canonical_float(item, bits=32)]
+            for key, item in (vector.items() if isinstance(vector, Mapping) else ())
+        ]
+        items.sort(key=lambda item: int(item[0]) if item[0].lstrip("-").isdigit() else item[0])
+        return {"sparsevec": [int(mapping.get("dimensions", 0)), items]}
+    if kind == "point":
+        mapping = encoded if isinstance(encoded, Mapping) else {}
+        return {
+            "point": [
+                _canonical_float(mapping.get("x")),
+                _canonical_float(mapping.get("y")),
+            ]
+        }
+    if kind in {"geometry", "geography", "postgis"}:
+        mapping = encoded if isinstance(encoded, Mapping) else {}
+        wkb = mapping.get("wkb")
+        return {
+            "geometry": {
+                "srid": int(mapping.get("srid", 0)),
+                "wkb": bytes(wkb or b"").hex()
+                if isinstance(wkb, (bytes, bytearray))
+                else str(wkb),
+            }
+        }
+    if kind in {"struct", "composite"}:
         mapping = encoded if isinstance(encoded, Mapping) else {}
         return {
             "struct": [

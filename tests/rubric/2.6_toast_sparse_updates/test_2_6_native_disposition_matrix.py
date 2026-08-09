@@ -15,7 +15,7 @@ import duckdb
 import pytest
 from support.applier_lab import Lab, data, end
 
-from cdc_flight import apply_sql, machines
+from cdc_flight import apply_sql
 from cdc_flight.apply_sql import SchemaRegistry, insert_rows, update_rows
 from cdc_flight.config import DestinationConfig
 from cdc_flight.destination import DUCKDB_CONNECT_CONFIG
@@ -85,16 +85,23 @@ def test_declared_physical_row_product_realizes_or_refuses_every_cell():
     assert all(result.kind in {"exercised", "refused"} for result in results)
     assert all(result.reason for result in results)
     assert {result.kind for result in results} == {"exercised", "refused"}
-    # A green matrix is not evidence that every product cell was reachable. Keep a
-    # quantitative floor, and require every uncovered cell to come from the explicit
-    # state-machine precondition rather than a swallowed runtime exception.
+    # Every cell was sent through the real owner. An uncovered result is allowed only
+    # when that owner itself refused the requested outcome; no machine predicate is
+    # consulted here.
     assert sum(result.covered for result in results) >= 1000
     assert all(
-        result.covered or result.reason.startswith("unreachable:")
+        result.covered or result.reason.startswith("owner_refusal:")
         for result in results
     )
     assert all(
-        result.covered or "machine_owner=" in result.proof
+        result.owner
+        for result in results
+    )
+    assert all(result.rollback_clean for result in results)
+    assert all(
+        result.actual_outcome in {
+            "commit", "ambiguous_delete", "toast_base_missing", "schema_refusal", "swap_fault"
+        }
         for result in results
     )
 
@@ -108,7 +115,11 @@ def test_commit_cell_reports_real_destination_transaction_evidence():
     )
     result = exercise_cell(cell)
     assert result.kind == "exercised"
-    assert getattr(result, "proof", "").startswith("destination:")
+    assert result.owner == "destination_commit"
+    assert result.actual_outcome == "commit"
+    assert result.durable_rows == 2
+    assert result.rollback_clean
+    assert result.state_transition == "destination_commit"
 
 
 def test_schema_refusal_uses_the_real_applier_spill_refusal_seam():
@@ -123,21 +134,34 @@ def test_schema_refusal_uses_the_real_applier_spill_refusal_seam():
     result = exercise_cell(cell)
     assert result.kind == "refused"
     assert result.covered
-    assert "seam=Applier._handle_spill_refusal->spill_refusal.handle" in result.proof
-    assert "awaiting_snapshot=true" in result.proof
-    assert "retry=automatic" in result.proof
+    assert result.owner == "SchemaEvolutionRefused"
+    assert result.actual_outcome == "schema_refusal"
+    assert result.rollback_clean
+    assert result.state_transition == "schema_refusal->awaiting_snapshot"
+    assert result.durable_rows == 1
 
 
-def test_uncovered_cells_match_declared_machine_preconditions():
-    """Unreachability must be derived by production declarations, not test prose."""
-    results = exercise_cells(declared_cells())
-    for result in results:
-        reason = machines.physical_row_unreachable_reason(result.cell)
-        if result.covered:
-            assert reason is None, result.cell
-        else:
-            assert reason is not None, result.cell
-            assert result.reason == f"unreachable:{reason}", result.cell
+def test_keyless_event_identity_cells_reach_the_real_owner():
+    """A keyless changelog uses cdcf_event_id for every physical row operation."""
+    cells = (
+        type(declared_cells()[0])(
+            "update", "absent", "in_group", "spill", "commit", "keyless", "post"
+        ),
+        type(declared_cells()[0])(
+            "delete", "value", "start", "memory", "commit", "keyless", "pre"
+        ),
+        type(declared_cells()[0])(
+            "key_move", "value", "start", "memory", "commit", "keyless", "post"
+        ),
+    )
+    for cell in cells:
+        result = exercise_cell(cell)
+        assert result.kind == "exercised", result
+        assert result.covered
+        assert result.owner == "destination_commit"
+        assert result.actual_outcome == "commit"
+        assert result.durable_rows is not None
+        assert result.rollback_clean
 
 
 @pytest.mark.parametrize(

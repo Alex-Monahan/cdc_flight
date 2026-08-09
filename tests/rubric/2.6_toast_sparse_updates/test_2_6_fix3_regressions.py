@@ -88,7 +88,7 @@ def test_activation_boundary_is_copied_only_for_the_same_complete_generation():
         watcher, con, {current.qualified: current}, activation_lsn=101
     )
     assert observed[current.qualified].full_activation_lsn == 100
-    assert con.calls == []
+    assert any(call.startswith("LOCK TABLE") for call in con.calls)
 
 
 def test_activation_boundary_is_invalidated_when_full_is_lost():

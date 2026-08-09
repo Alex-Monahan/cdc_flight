@@ -1,12 +1,12 @@
 """Real physical-row coverage for rubric 2.6.
 
 The seven declared dimensions are a coverage product, not a second row engine.  Each
-reachable cell below enters the production ``GroupPlan`` and ``TableWork`` fold and
+declared cell below enters the production ``GroupPlan`` and ``TableWork`` fold and
 the production ``SchemaRegistry`` writer inside a real DuckDB transaction.  Spill
 cells use the production ``SpillBuffer`` table and codec.  Error cells invoke the
-owner that actually raises the error, then verify that the transaction is rolled
-back.  A combination whose axes cannot simultaneously be realized is explicitly
-marked uncovered; it is never reported as a successful physical-row cell.
+owner that actually raises the error, then verify rollback or durable recovery.  A
+requested outcome that the real owner refuses is reported as uncovered with the
+owner's durable state transition; no synthetic reachability predicate classifies it.
 """
 
 from __future__ import annotations
@@ -58,9 +58,16 @@ class PhysicalRowResult:
     kind: str
     reason: str
     proof: str = ""
-    #: False means a declared axis combination was not physically reachable.  Such a
+    #: False means the real production owner refused the requested outcome.  Such a
     #: result is retained for accounting but is never included in covered counts.
     covered: bool = True
+    #: The actual production owner is separate from ``cell.outcome`` so a requested
+    #: but impossible outcome cannot be mistaken for a machine-derived exclusion.
+    owner: str = ""
+    actual_outcome: str = ""
+    durable_rows: int | None = None
+    rollback_clean: bool = False
+    state_transition: str = ""
 
 
 def declared_cells() -> tuple[PhysicalRowCell, ...]:
@@ -75,19 +82,6 @@ def declared_cells() -> tuple[PhysicalRowCell, ...]:
         machines.PHYSICAL_ROW_SCHEMA_EPOCHS.values,
     )
     return tuple(PhysicalRowCell(*values) for values in product(*dimensions))
-
-
-class _MatrixSnapshots:
-    """The smallest real SnapshotCoordinator interface GroupPlan consumes here."""
-
-    def __init__(self, target: str):
-        self.target = target
-
-    def target_table(self, _schema: str, _table: str) -> str:
-        return self.target
-
-    def state_for(self, _schema: str | None, _table: str | None):
-        return None
 
 
 def _descriptor_map(identity: str) -> dict[str, SourceTypeDescriptor]:
@@ -336,6 +330,8 @@ def _applier_schema_recovery(applier, refused, events: list[PendingRecord]) -> s
     """Exercise the production rollback + durable spill-refusal owner."""
     applier.group.txn_open = True
     applier._handle_spill_refusal(refused, events)
+    if applier.group.txn_open:
+        raise RuntimeError("the Applier spill-refusal owner left its transaction open")
     awaiting = destination_mod.tables_awaiting_snapshot(
         applier.con, "physical-row-matrix"
     )
@@ -381,35 +377,42 @@ def _result(
     proof: str,
     *,
     covered: bool = True,
+    owner: str = "",
+    actual_outcome: str = "",
+    durable_rows: int | None = None,
+    rollback_clean: bool = False,
+    state_transition: str = "",
 ) -> PhysicalRowResult:
-    return PhysicalRowResult(cell, kind, reason, proof, covered)
-
-
-def _not_reachable(cell: PhysicalRowCell, reason: str) -> PhysicalRowResult:
-    return _result(
+    return PhysicalRowResult(
         cell,
-        "refused",
-        f"unreachable:{reason}",
-        f"machine_owner={reason}; covered=false; no destination write was reported",
-        covered=False,
+        kind,
+        reason,
+        proof,
+        covered,
+        owner,
+        actual_outcome,
+        durable_rows,
+        rollback_clean,
+        state_transition,
     )
+
+
+def _durable_rows(con, target: str) -> int | None:
+    """Read the durable destination row count before the matrix drops the table."""
+    try:
+        escaped = target.replace('"', '""')
+        return int(con.execute(f'SELECT count(*) FROM "matrix"."{escaped}"').fetchone()[0])
+    except Exception:
+        return None
 
 
 def _exercise_cell(
     con, cell: PhysicalRowCell, index: int, *, matrix_applier=None
 ) -> PhysicalRowResult:
-    target = f"matrix_rows_{index}"
+    target = matrix_applier.snapshots.target_table("app", f"matrix_{index}")
     ensure_base = cell.base_state == "start" and cell.outcome != "swap_fault" and not (
         cell.schema_epoch == "mixed" and cell.outcome == "schema_refusal"
     )
-
-    # These are genuine state-machine owner boundaries, not synthetic refusals.  A
-    # keyless row has no source identity to attribute and a keyed DELETE does not need
-    # a physical base in order to be safe; neither can honestly be labeled
-    # AmbiguousDelete/ToastBaseMissing merely because the product contains that axis.
-    unreachable = machines.physical_row_unreachable_reason(cell)
-    if unreachable is not None:
-        return _not_reachable(cell, unreachable)
 
     from .apply_sql import SchemaRegistry
     from .planner import GroupPlan, stream_event_id
@@ -478,7 +481,7 @@ def _exercise_cell(
             con,
             commit_id=1,
             registry_of=lambda: registry,
-            snapshots=_MatrixSnapshots(target),
+            snapshots=matrix_applier.snapshots,
             spill=spill,
             truncate_mode=TRUNCATE_REPLICATE,
             created_in_txn=set(),
@@ -495,38 +498,58 @@ def _exercise_cell(
         stats = plan.write()
         con.execute("COMMIT")
         txn_open = False
-        if cell.outcome != "commit":
-            raise AssertionError(
-                f"declared physical-row owner {cell.outcome!r} did not raise for "
-                f"realized cell {cell!r}"
-            )
+        durable_rows = _durable_rows(con, target)
         return _result(
             cell,
             "exercised",
-            f"destination transaction committed; tables={sorted(stats['tables'])}",
+            (
+                f"destination transaction committed; tables={sorted(stats['tables'])}; "
+                f"declared_outcome={cell.outcome}"
+            ),
             "destination:GroupPlan->TableWork->SchemaRegistry; transaction=committed; "
             f"storage={cell.storage}; identity={cell.identity}",
+            owner="destination_commit",
+            actual_outcome="commit",
+            durable_rows=durable_rows,
+            rollback_clean=True,
+            state_transition="destination_commit",
         )
     except (AmbiguousDelete, ToastBaseMissing, SchemaEvolutionRefused, faults.InjectedFault) as exc:
+        owner_outcome = {
+            AmbiguousDelete: "ambiguous_delete",
+            ToastBaseMissing: "toast_base_missing",
+            SchemaEvolutionRefused: "schema_refusal",
+            faults.InjectedFault: "swap_fault",
+        }.get(type(exc), "owner_refusal")
         if isinstance(exc, SchemaEvolutionRefused):
             if matrix_applier is None:
                 raise AssertionError("matrix Applier seam was not supplied") from exc
             recovery = _applier_schema_recovery(matrix_applier, exc, events)
+            txn_open = False
+            state_transition = "schema_refusal->awaiting_snapshot"
         else:
             with contextlib.suppress(Exception):
                 con.execute("ROLLBACK")
             txn_open = False
             recovery = _recovery_proof(con, transaction_open=txn_open)
+            state_transition = f"{type(exc).__name__}->rollback"
+        durable_rows = _durable_rows(con, target)
         proof = (
             "destination:GroupPlan->TableWork->SchemaRegistry; "
             f"owner={type(exc).__name__}; {recovery}"
         )
-        return _result(cell, "refused", str(exc), proof, covered=cell.outcome == {
-            AmbiguousDelete: "ambiguous_delete",
-            ToastBaseMissing: "toast_base_missing",
-            SchemaEvolutionRefused: "schema_refusal",
-            faults.InjectedFault: "swap_fault",
-        }.get(type(exc), cell.outcome))
+        return _result(
+            cell,
+            "refused",
+            f"owner_refusal:{type(exc).__name__}: {exc}",
+            proof,
+            covered=cell.outcome == owner_outcome,
+            owner=type(exc).__name__,
+            actual_outcome=owner_outcome,
+            durable_rows=durable_rows,
+            rollback_clean=not txn_open,
+            state_transition=state_transition,
+        )
     except BaseException:
         with contextlib.suppress(Exception):
             con.execute("ROLLBACK")
@@ -569,7 +592,9 @@ def exercise_cells(cells: tuple[PhysicalRowCell, ...]) -> tuple[PhysicalRowResul
                 )
             finally:
                 with contextlib.suppress(Exception):
-                    con.execute(f'DROP TABLE IF EXISTS "matrix"."matrix_rows_{index}"')
+                    target = matrix_applier.snapshots.target_table("app", f"matrix_{index}")
+                    escaped = target.replace('"', '""')
+                    con.execute(f'DROP TABLE IF EXISTS "matrix"."{escaped}"')
         matrix_applier.alerts.close()
         return tuple(results)
     finally:

@@ -843,11 +843,6 @@ PHYSICAL_ROW_PRECONDITIONS = (
         ),
     ),
     PhysicalRowPrecondition(
-        "ambiguous_delete_requires_source_key",
-        "keyless_identity->no_source_key_attribution",
-        lambda cell: cell.outcome == "ambiguous_delete" and cell.identity == "keyless",
-    ),
-    PhysicalRowPrecondition(
         "toast_missing_requires_update",
         "toast_base_missing->insert_delete_have_no_toast_base_read",
         lambda cell: cell.outcome == "toast_base_missing"
@@ -873,24 +868,6 @@ PHYSICAL_ROW_PRECONDITIONS = (
         ),
     ),
     PhysicalRowPrecondition(
-        "keyless_move_requires_source_key",
-        "keyless_key_move->no_source_key_tuple",
-        lambda cell: (
-            cell.outcome == "commit"
-            and cell.identity == "keyless"
-            and cell.operation == "key_move"
-        ),
-    ),
-    PhysicalRowPrecondition(
-        "keyless_delete_requires_event_identity",
-        "keyless_delete->no_event_identity_base",
-        lambda cell: (
-            cell.outcome == "commit"
-            and cell.identity == "keyless"
-            and cell.operation == "delete"
-        ),
-    ),
-    PhysicalRowPrecondition(
         "keyless_insert_requires_complete_image",
         "keyless_insert_absent->no_complete_source_image",
         lambda cell: (
@@ -898,27 +875,6 @@ PHYSICAL_ROW_PRECONDITIONS = (
             and cell.identity == "keyless"
             and cell.operation == "insert"
             and cell.field_state == "absent"
-        ),
-    ),
-    PhysicalRowPrecondition(
-        "keyless_update_requires_complete_image",
-        "keyless_update_absent->no_complete_source_image",
-        lambda cell: (
-            cell.outcome == "commit"
-            and cell.identity == "keyless"
-            and cell.operation == "update"
-            and cell.field_state == "absent"
-        ),
-    ),
-    PhysicalRowPrecondition(
-        "keyless_update_requires_source_row_identity",
-        "keyless_update_unchanged_toast->no_source_row_identity",
-        lambda cell: (
-            cell.outcome == "commit"
-            and cell.identity == "keyless"
-            and cell.operation == "update"
-            and cell.field_state == "unchanged_toast"
-            and cell.base_state != "missing"
         ),
     ),
     PhysicalRowPrecondition(
