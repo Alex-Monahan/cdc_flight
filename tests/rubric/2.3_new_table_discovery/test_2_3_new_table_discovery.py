@@ -92,7 +92,7 @@ def test_catalog_poll_default_is_short_and_configurable():
 
 
 def test_discovery_ownership_modules_stay_below_the_maintainability_boundary():
-    """Keep legacy ownership guards; catalog cohesion is asserted separately.
+    """Keep ownership guards; catalog cohesion is asserted separately.
 
     ``catalog.py`` was already at 996 lines before this round and now owns the
     durable descriptor-refusal recovery boundary.  Keeping it in a numeric guard
@@ -104,7 +104,6 @@ def test_discovery_ownership_modules_stay_below_the_maintainability_boundary():
         "src/cdc_flight/pipeline.py",
         "src/cdc_flight/applier.py",
         "src/cdc_flight/resnapshot.py",
-        "src/cdc_flight/resnapshot_compat.py",
         "src/cdc_flight/resnapshot_projection.py",
         "src/cdc_flight/state_interactions.py",
     ):

@@ -1,11 +1,11 @@
 """The one durable completion projection shared by every re-snapshot path.
 
-The image-producing path, the replayable compatibility path, and the verified-empty
-path have different transaction owners and different table-event shapes.  They do not
-have different meanings: each must publish the table watermark, snapshot audit,
-table-event history, refusal discharge, and main snapshot epoch as one destination
-projection.  This module owns that projection and deliberately assumes its caller has
-already opened the transaction that also owns the image or emptying operation.
+The image-producing path and the verified-empty path have different transaction owners
+and different table-event shapes. They do not have different meanings: each must
+publish the table watermark, snapshot audit, table-event history, refusal discharge,
+and main snapshot epoch as one destination projection. This module owns that projection
+and deliberately assumes its caller has already opened the transaction that also owns
+the image or emptying operation.
 """
 
 from __future__ import annotations

@@ -1,11 +1,11 @@
 """The source-descriptor and native-value contract for rubric 2.4/2.5.
 
-The old apply path inferred a DuckDB type from whatever Python value happened to
-be observed first.  That cannot represent an empty array, an all-NULL column, a
-logical Connect value, or a source type boundary.  This module is intentionally a
-small value boundary: catalog facts and Connect schemas become immutable source
-descriptors, one recursive resolver returns the destination type, and one encoder
-turns values into values that the destination can bind without a lossy fallback.
+Destination types are never inferred from whichever Python value happens to be
+observed first.  That cannot represent an empty array, an all-NULL column, a logical
+Connect value, or a source type boundary.  This module is intentionally a small value
+boundary: catalog facts and Connect schemas become immutable source descriptors, one
+recursive resolver returns the destination type, and one encoder turns values into
+values that the destination can bind without a lossy fallback.
 
 There is no per-type builder registry here.  The recursive dispatch is the same
 contract used by DML, snapshot/backfill, UNION conversion, and spill codecs.
@@ -184,12 +184,12 @@ class SourceTypeDescriptor:
 
     @classmethod
     def from_connect_schema(
-        cls, schema: Mapping[str, Any] | None, *, value: Any = None
+        cls, schema: Mapping[str, Any]
     ) -> SourceTypeDescriptor:
         """Translate a schema-enabled JSON converter schema into source facts."""
 
         if not schema:
-            return _descriptor_from_runtime(value)
+            raise ValueError("a Connect schema is required for a source descriptor")
         if "schema" in schema and isinstance(schema.get("schema"), Mapping):
             schema = schema["schema"]
         raw_type = str(schema.get("type", "unknown")).lower()
@@ -1150,24 +1150,6 @@ def _interval_value(value: Any) -> Any:
         if raw is not None:
             parts.append(f"{sign}{raw} {unit}")
     return " ".join(parts) or "0 seconds"
-
-
-def _descriptor_from_runtime(value: Any) -> SourceTypeDescriptor:
-    if isinstance(value, bool):
-        kind = "bool"
-    elif isinstance(value, int):
-        kind = "int64"
-    elif isinstance(value, float):
-        kind = "float64"
-    elif isinstance(value, str):
-        kind = "text"
-    elif isinstance(value, (list, tuple)):
-        kind = "array"
-    elif isinstance(value, Mapping):
-        kind = "struct"
-    else:
-        kind = "unknown"
-    return SourceTypeDescriptor(None, f"runtime.{kind}", kind)
 
 
 def _descriptor_from_any(value: Any) -> SourceTypeDescriptor:

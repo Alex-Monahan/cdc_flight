@@ -76,41 +76,33 @@ def _enrich_descriptors(applier, event: PendingRecord) -> None:
         if applier.catalog is not None
         else None
     )
-    strict = not applier.allow_legacy_inference
     if not event.qualified_table:
         return
     if provider is None:
-        if strict:
-            raise SchemaEvolutionRefused(
-                f"catalog descriptor authority is unavailable for {event.qualified_table}; "
-                "the spilled source unit is held for automatic retry",
-                source_schema=event.schema,
-                source_table=event.table,
-                target=event.qualified_table,
-            )
-        return
+        raise SchemaEvolutionRefused(
+            f"catalog descriptor authority is unavailable for {event.qualified_table}; "
+            "the spilled source unit is held for automatic retry",
+            source_schema=event.schema,
+            source_table=event.table,
+            target=event.qualified_table,
+        )
     try:
         descriptors = provider(event.qualified_table)
     except Exception as exc:
-        if strict:
-            raise SchemaEvolutionRefused(
-                f"catalog descriptor authority failed for {event.qualified_table}; "
-                "the spilled source unit is held for automatic retry",
-                source_schema=event.schema,
-                source_table=event.table,
-                target=event.qualified_table,
-            ) from exc
-        log.debug("could not enrich spilled event descriptors", exc_info=True)
-        return
+        raise SchemaEvolutionRefused(
+            f"catalog descriptor authority failed for {event.qualified_table}; "
+            "the spilled source unit is held for automatic retry",
+            source_schema=event.schema,
+            source_table=event.table,
+            target=event.qualified_table,
+        ) from exc
     if not descriptors:
-        if strict:
-            raise SchemaEvolutionRefused(
-                f"catalog descriptor authority is incomplete for {event.qualified_table}; "
-                "the spilled source unit is held for automatic retry",
-                source_schema=event.schema,
-                source_table=event.table,
-                target=event.qualified_table,
-            )
-        return
+        raise SchemaEvolutionRefused(
+            f"catalog descriptor authority is incomplete for {event.qualified_table}; "
+            "the spilled source unit is held for automatic retry",
+            source_schema=event.schema,
+            source_table=event.table,
+            target=event.qualified_table,
+        )
     for attribute in ("key_descriptors", "before_descriptors", "after_descriptors"):
         getattr(event, attribute).update(descriptors)

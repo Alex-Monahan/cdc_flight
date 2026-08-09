@@ -102,7 +102,6 @@ class Applier:
         watermarks: dict[str, int] | None = None,
         completion: SnapshotCompletion | None = None,
         snapshot_audit=None, descriptor_provider=None,
-        allow_legacy_inference: bool = False,
         binary_handling_mode: str = "base64", hstore_handling_mode: str = "map",
     ):
         self.con = con
@@ -121,7 +120,6 @@ class Applier:
         #: (rubric 1.5): logical decoding does not carry DDL at all.
         self.catalog = catalog
         self.descriptor_provider = descriptor_provider
-        self.allow_legacy_inference = allow_legacy_inference
         self.binary_handling_mode, self.hstore_handling_mode = str(binary_handling_mode), str(hstore_handling_mode)
         #: rubric 1.6: `"<schema>.<table>" -> snapshot_lsn`. A source transaction whose
         #: **commit** LSN is below a table's watermark is already inside that table's
@@ -401,10 +399,6 @@ class Applier:
                 self.last_batch_at = time.monotonic()
                 if self._in_flight == 0:
                     self._quiescence.notify_all()
-
-    # pydbzengine compatibility, used only if something calls the old shape.
-    def handleJsonBatch(self, records):  # pragma: no cover - not the live path
-        raise RuntimeError("the applier needs the RecordCommitter; use handle_batch()")
 
     def _handle(self, records, committer) -> None:
         self._committer = committer

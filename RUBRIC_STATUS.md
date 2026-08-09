@@ -745,7 +745,7 @@ dlt load path was removed by ADR 0001 D1/D10. Kept because it is the measurement
 that motivated the design.*
 
 **Evidence.** `repos/pydbzengine/pydbzengine/_jvm.py:121-124` calls
-`committer.markProcessed()` / `markBatchFinished()` *after* `handleJsonBatch()`
+`committer.markProcessed()` / `markBatchFinished()` *after* the old handler callback
 returns, and `offset.flush.interval.ms=1000`
 (`src/cdc_flight/debezium_props.py:77`). So the offset is never ahead of the
 destination write — losses are impossible on this path, replays are not. Write
@@ -1809,8 +1809,8 @@ Each of these is a test in `tests/rubric/1.9_state_machines/`, named after the f
   ever wrote it, so "where is this run" was a source-line position in a 470-line function.
   One row per run, updated on each transition, on the **independent** connection, never
   inside a commit group and never inside the commit→ack window. `phase_since`,
-  `terminal_reason` and `phase_history` are added by a migration, because
-  `CREATE TABLE IF NOT EXISTS` cannot add a column and the table shipped one round ago.
+  `terminal_reason` and `phase_history` are declared in the current `CONTROL_DDL`; a
+  fresh current control schema creates them together with the phase writer.
 * **The commit group is one object.** Sixteen fields reset by name in *two* functions that
   had to stay in sync become `applier.OpenGroup`, created at BEGIN and **replaced** at
   COMMIT and ROLLBACK, so neither reset path can forget a field — which is the defect
@@ -1849,7 +1849,7 @@ a count. Full table in ADR §20/A55.
 | the mechanism, and the five bugs as illegal edges | `tests/rubric/1.9_state_machines/test_1_9_machines.py` | ms |
 | interruption preparation at `armed`, terminal replacement, and cleanup-to-arm cuts | `tests/rubric/1.9_state_machines/test_1_9_destination_ownership.py` | ms |
 | one writer, the `in_progress` residue, the owed queue, `--reset-state`, alerts | `tests/rubric/1.9_state_machines/test_1_9_table_lifecycle.py` | ms |
-| the durable phase row, the precedence, the migration, the independent connection | `tests/rubric/1.9_state_machines/test_1_9_run_state.py` | ms |
+| the durable phase row, the precedence, and the independent connection | `tests/rubric/1.9_state_machines/test_1_9_run_state.py` | ms |
 | the per-relation state and the fence | `tests/rubric/1.9_state_machines/test_1_9_catalog_change.py` | ms |
 | the durable identity-adoption baseline and rebuild discharge | `tests/rubric/1.9_state_machines/test_1_9_catalog_baseline.py` | ms |
 | `OpenGroup` — the object is replaced, not edited | `tests/rubric/1.3_atomic_batches/test_1_3_rollback_resets_the_group.py` | ms |
@@ -1898,7 +1898,7 @@ than a documentation change.
 | **MAJOR-3** — the heartbeat could overlap commit→ack and could borrow the primary connection | true in program order, false in wall clock: the supervisor writes `draining` on its own thread the moment `max_seconds`/engine error/source-dark breaks the loop, and `con.cursor()` failing set `_sink = con` | `run_state.COMMIT_ACK` is entered by the applier immediately before `COMMIT` and left immediately after `markBatchFinished()`; a phase write inside it is **dropped** (never deferred behind a lock, never blocking), counted, and reported. No independent connection now means **no row**, not the applier's connection |
 | **MAJOR-4** — `--reset-state` neither atomic nor convergent | five independent durable mutations plus a process-local `snapshot.mode='initial'`. The convergence argument was false: a positioned slot over a populated destination makes the next run refuse with `no_durable_destination_row` before `will_snapshot_everything` is computed, and repeating the flag does not drop that slot | a journalled recovery (`decision='operator_reset'`) like any other: intent and table reset in one transaction, then state directory, resume row and **slot**, each idempotent. Proved by an `os._exit` mid-sequence and a restart **without the flag** under `no_data` |
 | **MAJOR-5** — ownership gaps | `SLOT_VERDICTS` / `RECONCILE_DECISIONS` were referenced only by tests; the recovery-clear predicate lived in `pipeline.py` and a false predicate still reported `ok: true`; the captured obligation was not persisted | both domains are parsed in `__post_init__` on the production types; `recovery.complete_if_ready()` owns the predicate, validates the **journalled** captured set, performs `armed -> absent` itself and returns a typed `Completion`; an uncleared recovery raises `EngineFailure` and the run exits non-zero. `slot_state` persists `verdict`, `verdict_message`, `verdict_at` in the observation's own transaction |
-| **MINOR-1/2/3** | migration failures silently accepted; the `OpenGroup` claim overstated; `in_progress -> in_progress` checked after a side effect | a failed `ALTER` is **re-read** and raises `ControlSchemaFailed` unless the column is now present; the `OpenGroup` claim is narrowed to what is true and the one legitimate partial mutation is `discard_units()`; `SnapshotCoordinator.state_for` calls `table_lifecycle.check_transition()` **before** it drops the shadow |
+| **MINOR-1/2/3** | historical migration failures were silently accepted; the `OpenGroup` claim was overstated; `in_progress -> in_progress` was checked after a side effect | current control state is created only from the complete `CONTROL_DDL` (there is no older-build upgrade path); the `OpenGroup` claim is narrowed to what is true and the one legitimate partial mutation is `discard_units()`; `SnapshotCoordinator.state_for` calls `table_lifecycle.check_transition()` **before** it drops the shadow |
 
 #### What the SECOND Codex review found in those fixes, and what round 3 changed
 
@@ -1914,7 +1914,7 @@ four incomplete fixes. All reproduced, all now fixed (ADR §A59):
 | **MAJOR** — pre-engine failures had two reporting surfaces | `reported` was populated only on the inner engine paths, so a lease refusal wrote heartbeat `failed/error` and shipped a `last_run.json` with no `run_phase` and no `run_outcome` | the escaping exception carries the one projection; a slow E2E asserts the heartbeat row and `last_run.json` agree on a route that never reaches the engine |
 | **MAJOR** — the catalog verdict was sampled before the watcher stopped | a poll finishing between the supervisor's one check and `pipeline.run()`'s `finally` could take an undeclared edge that nobody re-read | the supervisor calls `catalog.stop()` — set the event, join the thread — before any verdict is taken |
 | **MAJOR** — the blackhole proof was timing-dependent | `connect_timeout` bounds only the handshake, so a relay that blackholes an **established** socket left the sampler blocked for ever: `unknown` was never recorded, `unknown_for` never reached the threshold, and the run died of `hung` with `source_dark` never formed | the sampler sets `statement_timeout`, keepalives and `tcp_user_timeout`, all well under `CDC_SOURCE_DARK_SECONDS`. Two consecutive isolated runs green |
-| **MINORs** | metadata-read failures were swallowed one step before the loud `ALTER` branch; the `in_progress` regression test drove the writer rather than the coordinator; `--help` named two of five destructive surfaces | introspection raises `ControlSchemaFailed`; the migration test uses the exact prior DDL with its key and a row; the coordinator test drives `state_for()` and asserts the shadow, registry and `created_in_txn` are untouched by a refused edge; both destructive flags name every surface including the slot drop |
+| **MINORs** | historical metadata-read failures were swallowed before the old `ALTER` branch; the `in_progress` regression test drove the writer rather than the coordinator; `--help` named two of five destructive surfaces | old-control-schema introspection/backfill coverage was removed with the unsupported upgrade path; the coordinator test drives `state_for()` and asserts the shadow, registry and `created_in_txn` are untouched by a refused edge; both destructive flags name every surface including the slot drop |
 
 Fixing the reset obligation also surfaced a **latent 1.5 bug** that had been hidden by an
 accident: `source_relations` was persisted only as a side effect of a `CatalogPlan` that

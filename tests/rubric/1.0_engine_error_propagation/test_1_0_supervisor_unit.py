@@ -339,9 +339,6 @@ def test_close_on_an_engine_that_was_never_built_does_not_build_one():
         ("pre_commit:1", ("pre_commit", 1, 137)),
         ("post_commit_pre_ack:3:9", ("post_commit_pre_ack", 3, 9)),
         ("post_ack:2:raise", ("post_ack", 2, "raise")),
-        # legacy names keep working
-        ("before_load:1", ("pre_commit", 1, 137)),
-        ("after_load:1", ("post_commit_pre_ack", 1, 137)),
     ],
 )
 def test_fault_spec_parses(raw, expected):

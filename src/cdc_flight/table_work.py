@@ -68,7 +68,7 @@ from .errors import (
 )
 from .naming import CDCF_COMMIT_ID, CDCF_EVENT_ID, CDCF_TOTAL_ORDER
 from .row_patch import RowPatch
-from .toast import UNAVAILABLE_VALUE_PLACEHOLDER, is_structural_marker
+from .toast import is_structural_marker
 from .typed_types import FieldState, FieldValue
 
 log = logging.getLogger("cdc_flight.table_work")
@@ -90,12 +90,6 @@ APPLIER_COLUMN_TYPES = {
     CDCF_TOTAL_ORDER: apply_sql.BIGINT,
     **DBZ_COLUMN_TYPES,
 }
-
-# Re-exported for existing callers.  The configured marker is single-sourced in
-# ``toast.py``; this name is retained as a compatibility alias, not a value-equality
-# classifier.
-TOAST_PLACEHOLDER = UNAVAILABLE_VALUE_PLACEHOLDER
-
 
 class _Start:
     """The row the destination already held under a key, before this group.
@@ -132,9 +126,9 @@ class TableWork:
     key_columns: tuple[str, ...] = ()
     keyless: bool = False
     columns: dict[str, str] = field(default_factory=dict)
-    #: Source descriptors observed on the schema-bearing envelope.  Values in
-    #: `columns` are still kept for the legacy metadata fields and compatibility
-    #: callers; a non-empty map selects the strict native creation/bind path.
+    #: Source descriptors observed on the schema-bearing envelope. Values in
+    #: `columns` are retained for the applier's fixed metadata fields; source
+    #: creation and binding use the native descriptor map.
     descriptors: dict[str, Any] = field(default_factory=dict)
     native_columns: dict[str, Any] = field(default_factory=dict)
     #: Native descriptors are recursive and immutable; resolve each catalog
@@ -180,9 +174,6 @@ class TableWork:
     #: (Codex 5).
     source_schema: str | None = None
     source_table: str | None = None
-    #: Production path is native-only. The compatibility dispatcher is retained
-    #: solely for explicit migration/unit callers.
-    allow_legacy_inference: bool = False
     #: A DELETE makes a key unavailable for a later sparse UPDATE in the same source
     #: transaction.  A following INSERT clears the tombstone and is a legal physical
     #: key reuse; an UPDATE must never silently reuse the destination's START row.
@@ -191,7 +182,6 @@ class TableWork:
 
 def work_for(
     work: dict[str, TableWork], target: str, event: PendingRecord, snapshot: bool,
-    *, allow_legacy_inference: bool = False,
 ) -> TableWork:
     """The `TableWork` for `target`, created on first sight.
 
@@ -208,7 +198,6 @@ def work_for(
         item = TableWork(
             target=target,
             snapshot=snapshot,
-            allow_legacy_inference=allow_legacy_inference,
         )
         work[target] = item
     if item.source_schema is None and event.schema:
@@ -246,7 +235,13 @@ def _key_token(
             resolved_descriptors[column] = descriptor
             fingerprint = descriptor.fingerprint
         else:
-            fingerprint = "legacy"
+            raise SchemaEvolutionRefused(
+                f"{item.target}: catalog descriptor is missing for key column "
+                f"{column!r}; the source unit is held for automatic retry",
+                source_schema=item.source_schema,
+                source_table=item.source_table,
+                target=item.target,
+            )
         try:
             rendered = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
         except (TypeError, ValueError):
@@ -350,12 +345,13 @@ def collect(
         elif source_name in APPLIER_COLUMN_TYPES:
             item.columns[column] = APPLIER_COLUMN_TYPES[source_name]
         elif field_value_item.state in {FieldState.VALUE, FieldState.EXPLICIT_NULL}:
-            item.columns[column] = apply_sql.widen(
-                item.columns.get(column), apply_sql.sql_type(field_value_item.value)
+            raise SchemaEvolutionRefused(
+                f"{item.target}: catalog descriptor is missing for source column "
+                f"{source_name!r}; the source unit is held for automatic retry",
+                source_schema=item.source_schema,
+                source_table=item.source_table,
+                target=item.target,
             )
-    for column, value in patch.encoded_values().items():
-        if column not in item.columns:
-            item.columns[column] = apply_sql.sql_type(value)
     item.events += 1
     if patch.has_marker() and event.op in {"c", "r"}:
         _missing_toast_base(item, event)
@@ -789,9 +785,9 @@ def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
         item.rows_removed = 0
         _finish_truncate_audit(item)
         return
-    # A column every event left NULL tells us nothing about its type; VARCHAR is the
-    # honest placeholder and `widen()` upgrades it the moment a real value shows up
-    # (rubric 2.1/2.5 own the better answer).
+    # Every source column must have a catalog descriptor. Only the applier's own
+    # control columns have fixed types here; source shape is never inferred from a
+    # Python value.
     columns = {col: ctype or apply_sql.VARCHAR for col, ctype in item.columns.items()}
     columns.update(APPLIER_COLUMN_TYPES)
     for column in item.key_columns:
@@ -808,17 +804,18 @@ def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
             refused.source_table = refused.source_table or item.source_table
             refused.target = refused.target or item.target
             raise
+    elif item.truncated and registry.get(item.target).exists:
+        # A pure TRUNCATE carries no row image from which a source descriptor could be
+        # obtained. Reuse the already-known destination shape for the table-level
+        # operation; this is not a schema-creation or value-inference path.
+        table, created = registry.get(item.target), False
     else:
-        if not item.allow_legacy_inference:
-            raise SchemaEvolutionRefused(
-                f"{item.target}: catalog-authoritative descriptors are incomplete; "
-                "the production typed path cannot enter legacy value inference",
-                source_schema=item.source_schema,
-                source_table=item.source_table,
-                target=item.target,
-            )
-        table, created = registry.ensure(
-            item.target, columns=columns, key_columns=item.key_columns
+        raise SchemaEvolutionRefused(
+            f"{item.target}: catalog-authoritative descriptors are incomplete; "
+            "the production typed path cannot create or write an untyped table",
+            source_schema=item.source_schema,
+            source_table=item.source_table,
+            target=item.target,
         )
     if created:
         created_in_txn.add(item.target)

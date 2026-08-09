@@ -374,7 +374,7 @@ def test_debeziums_ordered_callback_ends_the_snapshot_phase():
         },
     )
     applier.completion.observe_notification("COMPLETED", {})
-    assert resnapshot_mod.snapshot_phase_ended(applier.completion) is True
+    assert applier.completion.phase_ended is True
 
 
 def test_an_empty_table_ends_from_its_terminal_callback_not_streaming():
@@ -389,17 +389,15 @@ def test_an_empty_table_ends_from_its_terminal_callback_not_streaming():
         },
     )
     completion.observe_notification("COMPLETED", {})
-    assert resnapshot_mod.snapshot_phase_ended(completion) is True
+    assert completion.phase_ended is True
 
 
 def test_an_interrupted_engine_never_counts_as_an_ended_snapshot_phase():
     for _stop_reason in ("max_seconds", "work_done", "hung", "engine_error", "source_dark"):
         completion = _FakeApplier(False, set()).completion
-        assert resnapshot_mod.snapshot_phase_ended(completion) is False
+        assert completion.phase_ended is False
     # ... and neither does a run that scanned SOMETHING but never saw the marker.
-    assert resnapshot_mod.snapshot_phase_ended(
-        _FakeApplier(False, {"app.customers"}).completion
-    ) is False
+    assert _FakeApplier(False, {"app.customers"}).completion.phase_ended is False
 
 
 # --------------------------------------------------------------------------- #

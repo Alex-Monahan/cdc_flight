@@ -126,7 +126,6 @@ from .destination import CONTROL_SCHEMA, ResumePoint
 from .errors import EngineFailure
 from .naming import quote
 from .ownership import DestinationOwnership
-from .resnapshot_compat import completed_tables as _completed_tables
 from .resnapshot_projection import ProjectionEvent
 from .resnapshot_recovery import InterruptionRecovery
 from .resnapshot_source_policy import (
@@ -210,8 +209,7 @@ def _record_snapshot_swap_audit(
     """Project a swapped image's audit and refusal discharge inside its COMMIT.
 
     ``SnapshotCoordinator.swap`` invokes this callback while the image transaction is
-    still open.  The post-swap completion projection remains as a read-only compatibility
-    check; it is no longer the transaction that makes a discovery look complete.
+    still open, so the image and its lifecycle/audit projection commit together.
     """
     qualified = f"{state.schema}.{state.table}"
     detail = (
@@ -246,16 +244,24 @@ def _record_snapshot_swap_audit(
     )
 
 
-def _advance_snapshot_epoch(
-    con, *, pipeline: str, namespace: str | None, snapshot_epoch: int | None
-) -> None:
-    """Compatibility wrapper for callers that only need the epoch projection."""
-    projection.advance_snapshot_epoch(
-        con,
-        pipeline=pipeline,
-        namespace=namespace,
-        snapshot_epoch=snapshot_epoch,
-    )
+def _completed_tables(
+    con, pipeline: str, tables: list[tuple[str, str, str]]
+) -> list[str]:
+    """Return requested tables whose current lifecycle is complete.
+
+    The bounded snapshot engine uses this read-only view after its coordinator has
+    committed the canonical swap projection.  It deliberately performs no second
+    projection or control-plane write: current-run recovery reads the durable lifecycle
+    and audit state directly.
+    """
+    return [
+        f"{schema}.{table}"
+        for schema, table, _target in tables
+        if table_lifecycle.read(
+            con, pipeline=pipeline, source_schema=schema, source_table=table
+        )
+        == table_lifecycle.COMPLETE
+    ]
 
 
 class _SlotWatcher:
@@ -460,7 +466,6 @@ def run(
             completion=completion,
             snapshot_audit=snapshot_audit,
             descriptor_provider=descriptor_provider,
-            allow_legacy_inference=False,
             binary_handling_mode=props.get("binary.handling.mode", "base64"),
             hstore_handling_mode=props.get("hstore.handling.mode", "map"),
         )
@@ -523,10 +528,6 @@ def run(
                 con,
                 pipeline,
                 tables,
-                outcome.consistent_lsn,
-                reason=reason,
-                new_relations=new_relations or set(),
-                write_audit=False,
             )
         pending = [t for t in tables if f"{t[0]}.{t[1]}" not in set(outcome.swapped)]
         evidence = _gather_emptiness_evidence(
@@ -634,11 +635,6 @@ def run(
             # ownership token proves every destination user has left AND a safe owner
             # has discharged the durable recovery obligation.
             recovery.retire_terminal_resources(dsn=source.dsn, slot=slot)
-
-
-def snapshot_phase_ended(completion: SnapshotCompletion) -> bool:
-    """Compatibility projection of the canonical completion policy."""
-    return completion.phase_ended
 
 
 def reassert_owed(

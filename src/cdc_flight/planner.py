@@ -21,8 +21,6 @@ for the table, so what they read is genuinely the pre-group state.
 
 from __future__ import annotations
 
-import logging
-
 from . import apply_sql, destination, naming, table_work
 from .assembler import UNIT_CONTROL, UNIT_SNAPSHOT_CHUNK, CompleteUnit
 from .config import TRUNCATE_IGNORE, TRUNCATE_REPLICATE
@@ -30,8 +28,6 @@ from .envelope import KIND_TRUNCATE, PendingRecord
 from .errors import SchemaEvolutionRefused, ToastBaseMissing
 from .snapshot import SnapshotTable
 from .table_work import TableWork
-
-log = logging.getLogger("cdc_flight.planner")
 
 
 class GroupPlan:
@@ -55,7 +51,6 @@ class GroupPlan:
         watermarks: dict[str, int] | None = None,
         descriptor_provider=None,
         toast_policy_provider=None,
-        allow_legacy_inference: bool = False,
         binary_handling_mode: str = "base64",
         hstore_handling_mode: str = "map",
     ):
@@ -72,7 +67,6 @@ class GroupPlan:
         self.watermarks = watermarks or {}
         self.descriptor_provider = descriptor_provider
         self.toast_policy_provider = toast_policy_provider
-        self.allow_legacy_inference = allow_legacy_inference
         self.binary_handling_mode = binary_handling_mode
         self.hstore_handling_mode = hstore_handling_mode
         self.watermark_fenced_events = 0
@@ -246,7 +240,6 @@ class GroupPlan:
             target,
             event,
             snapshot is not None,
-            allow_legacy_inference=self.allow_legacy_inference,
         )
         patch = table_work.patch_for(
             event,
@@ -279,58 +272,47 @@ class GroupPlan:
         if not event.qualified_table:
             return
         if self.descriptor_provider is None:
-            if not self.allow_legacy_inference:
-                raise SchemaEvolutionRefused(
-                    f"catalog descriptor authority is unavailable for {event.qualified_table}; "
-                    "holding the source unit until a verified descriptor is available",
-                    source_schema=event.schema,
-                    source_table=event.table,
-                    target=event.qualified_table,
-                )
-            return
+            raise SchemaEvolutionRefused(
+                f"catalog descriptor authority is unavailable for {event.qualified_table}; "
+                "holding the source unit until a verified descriptor is available",
+                source_schema=event.schema,
+                source_table=event.table,
+                target=event.qualified_table,
+            )
         qualified = event.qualified_table
         if qualified not in self._catalog_descriptor_cache:
             try:
                 catalog_descriptors = self.descriptor_provider(qualified)
             except Exception as exc:
-                if not self.allow_legacy_inference:
-                    raise SchemaEvolutionRefused(
-                        f"catalog descriptor authority failed for {qualified}: {exc}; "
-                        "the source unit is held for automatic catalog retry",
-                        source_schema=event.schema,
-                        source_table=event.table,
-                        target=qualified,
-                    ) from exc
-                # The catalog watcher is an observation aid, not a second transaction
-                # boundary.  A missing map leaves the schema-enabled envelope path in
-                # charge; the strict resolver still refuses an actually unsupported type.
-                log.debug("could not obtain catalog descriptors for %s", qualified, exc_info=True)
-                catalog_descriptors = {}
-            self._catalog_descriptor_cache[qualified] = dict(catalog_descriptors or {})
-        catalog_descriptors = self._catalog_descriptor_cache[qualified]
-        if not catalog_descriptors:
-            if not self.allow_legacy_inference:
                 raise SchemaEvolutionRefused(
-                    f"catalog descriptor authority is incomplete for {qualified}; "
+                    f"catalog descriptor authority failed for {qualified}: {exc}; "
                     "the source unit is held for automatic catalog retry",
                     source_schema=event.schema,
                     source_table=event.table,
                     target=qualified,
-                )
-            return
-        if not self.allow_legacy_inference:
-            required = set()
-            for image in (event.key, event.before, event.after):
-                required.update(image or {})
-            missing = sorted(name for name in required if name not in catalog_descriptors)
-            if missing:
-                raise SchemaEvolutionRefused(
-                    f"catalog descriptor authority is incomplete for {qualified}; "
-                    f"missing {missing!r}; the source unit is held for automatic retry",
-                    source_schema=event.schema,
-                    source_table=event.table,
-                    target=qualified,
-                )
+                ) from exc
+            self._catalog_descriptor_cache[qualified] = dict(catalog_descriptors or {})
+        catalog_descriptors = self._catalog_descriptor_cache[qualified]
+        if not catalog_descriptors:
+            raise SchemaEvolutionRefused(
+                f"catalog descriptor authority is incomplete for {qualified}; "
+                "the source unit is held for automatic catalog retry",
+                source_schema=event.schema,
+                source_table=event.table,
+                target=qualified,
+            )
+        required = set()
+        for image in (event.key, event.before, event.after):
+            required.update(image or {})
+        missing = sorted(name for name in required if name not in catalog_descriptors)
+        if missing:
+            raise SchemaEvolutionRefused(
+                f"catalog descriptor authority is incomplete for {qualified}; "
+                f"missing {missing!r}; the source unit is held for automatic retry",
+                source_schema=event.schema,
+                source_table=event.table,
+                target=qualified,
+            )
         for attribute in ("key_descriptors", "before_descriptors", "after_descriptors"):
             descriptors = getattr(event, attribute)
             if len(descriptors) >= len(catalog_descriptors) and all(
@@ -426,7 +408,6 @@ class GroupPlan:
             target,
             event,
             snapshot is not None,
-            allow_legacy_inference=self.allow_legacy_inference,
         )
         table_work.truncate(item)
         self.stats["tables"].add(target)

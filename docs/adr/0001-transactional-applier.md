@@ -929,7 +929,7 @@ Rev 1 claimed the larger payload "is paid for by the byte-bounded commit trigger
 and by not building a Python dict per row twice". That does not address
 **per-event parse cost**, which is the dominant term above 2000 events/s.
 Re-serialising the Connect schema into every record inflates the JSON by roughly
-3–5×, and every one of those bytes is parsed by Python in `handleJsonBatch`. The
+3–5×, and every one of those bytes was parsed by Python in the old handler callback. The
 measured baseline is ~1 000 rows/s end to end (`RUBRIC_STATUS.md`, p12/p13).
 
 **This is now an explicit measurement task owned by TODO 5.3**, listed in §14.7,
@@ -2033,8 +2033,8 @@ rolled back safely, so it was never a loss hole, but a destination hosting more
 than one pipeline could not operate, and a global id was acting as a coordination
 mechanism with no global lease (Codex 9). The key is `(pipeline, commit_id)` now,
 allocated monotonically per pipeline — the same scope the lease already
-guarantees — with a migration for destinations that already carry the global key,
-which the shared MotherDuck development database did.
+guarantees. Destinations with the former global key are intentionally outside this
+testing system's supported state set; there is no control-plane upgrade path.
 
 ### A27 — a hard crash leaves the lease row locked at MotherDuck (new, measured)
 
@@ -3431,9 +3431,9 @@ gain), `machine.check(from, to)` raising `IllegalTransition`, `machine.parse()` 
   function and a `last_run.json` on the machine that ran. One row per run, updated on
   each transition, on the independent connection, never inside a commit group and never
   inside the commit→ack window. `phase_since`, `terminal_reason` and `phase_history` are
-  added by a migration, because `CREATE TABLE IF NOT EXISTS` cannot add a column and the
-  table shipped one round ago — including into the shared MotherDuck database. **This is
-  the phase writer only**: the periodic liveness/lag heartbeat and the source-side
+  part of the current `CONTROL_DDL`; fresh control state creates them with the phase
+  writer, and older control-table shapes are intentionally unsupported. **This is the
+  phase writer only**: the periodic liveness/lag heartbeat and the source-side
   WAL-advancing heartbeat remain 4.4/6.1's, with their own cadence and their own design.
 * **`run_outcome`.** A49's defect was a `finally` overwriting `stop_reason='source_dark'`
   with `'hung'` — a dark source makes `engine.close()` hang almost by definition, so the
@@ -3827,10 +3827,10 @@ both well under the dark threshold.
 
 #### A59.6 — the minors
 
-* `_table_columns()` caught an introspection failure and returned `None`, and the caller
-  silently returned — which recreates the silent-writer-failure the new
-  `ControlSchemaFailed` exists to prevent, one step earlier. It raises. The migration test
-  now uses the exact prior DDL, with its primary key and a row in it.
+* The former control-schema introspection/backfill path caught metadata failures and
+  silently returned. That upgrade path and its tests are removed: the current schema is
+  created only from the complete `CONTROL_DDL`, and an older control-table shape is not a
+  supported destination in this testing system.
 * The `in_progress -> in_progress` regression test drove the lifecycle writer directly, so
   it would have stayed green if `SnapshotCoordinator.state_for()` regressed to
   side-effect-first ordering. It drives the real coordinator now and asserts the shadow,
@@ -3840,8 +3840,8 @@ both well under the dark threshold.
 
 ### A60 — rev 12: what round 3's review found in round 2's fixes
 
-Round 3 confirmed the empty-table reset fix, pre-engine reporting, the migration
-introspection, the coordinator side-effect test, the destructive `--help`, and the
+Round 3 confirmed the empty-table reset fix, pre-engine reporting, the historical
+control-schema review, the coordinator side-effect test, the destructive `--help`, and the
 blackhole determinism (two consecutive green runs). It found one reproduced blocker and
 three majors, all of them the same shape: **a guarantee that held on the path the test
 took and not on the path production takes.**
