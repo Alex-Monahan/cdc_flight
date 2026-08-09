@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
+import duckdb
 import pytest
 
+from cdc_flight import destination
 from cdc_flight.catalog_poll import _ensure_toast_policies
-from cdc_flight.catalog_state import SourceRelation
+from cdc_flight.catalog_state import SourceRelation, read_known_relations
 from cdc_flight.schema_evolution import SourceColumn
+from cdc_flight.source_relations import upsert_source_relation
 from cdc_flight.typed_types import SourceTypeDescriptor
 
 
@@ -106,8 +110,48 @@ def test_activation_boundary_is_invalidated_when_full_is_lost():
     observed = _ensure_toast_policies(
         watcher, con, {current.qualified: current}, activation_lsn=101
     )
-    assert observed[current.qualified].full_activation_lsn is None
-    assert any("ALTER TABLE" in call for call in con.calls)
+    closed = observed[current.qualified]
+    assert closed.full_activation_lsn == 100
+    assert closed.full_invalidation_lsn == 101
+    assert closed.toast_policy.accepts_event(100) is True
+    assert closed.toast_policy.accepts_event(101) is False
+
+
+def test_full_validity_interval_is_durable_across_catalog_restart():
+    """The exclusive invalidation LSN survives the one-row relation restart path."""
+    con = duckdb.connect(":memory:")
+    try:
+        destination.ensure_control_schema(con)
+        relation = _relation(
+            oid=42,
+            relfilenode=1000,
+            relation_type_oid=100,
+            replica_identity="d",
+            boundary=100,
+        )
+        relation = replace(relation, full_invalidation_lsn=200)
+        upsert_source_relation(
+            con,
+            pipeline="fence",
+            source_schema=relation.schema,
+            source_table=relation.table,
+            relation_oid=relation.oid,
+            relation_filenode=relation.relfilenode,
+            relation_type_oid=relation.relation_type_oid,
+            published=relation.published,
+            replica_identity=relation.replica_identity,
+            full_activation_lsn=relation.full_activation_lsn,
+            full_invalidation_lsn=relation.full_invalidation_lsn,
+            admission_state=relation.admission_state,
+            columns=relation.columns,
+        )
+        restored = read_known_relations(con, "fence")[relation.qualified]
+        assert restored.full_activation_lsn == 100
+        assert restored.full_invalidation_lsn == 200
+        assert restored.toast_policy.accepts_event(199) is True
+        assert restored.toast_policy.accepts_event(200) is False
+    finally:
+        con.close()
 
 
 def test_unexpected_physical_matrix_exceptions_are_not_classified_as_unreachable(monkeypatch):

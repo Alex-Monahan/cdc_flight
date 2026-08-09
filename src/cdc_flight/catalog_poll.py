@@ -82,6 +82,56 @@ def connect(watcher, *, autocommit: bool = True, dsn: str | None = None):
     )
 
 
+def _positive_lsn(value):
+    try:
+        candidate = int(value)
+    except (TypeError, ValueError):
+        return None
+    return candidate if candidate > 0 else None
+
+
+def _closed_full_relation(relation, activation_lsn, invalidation_lsn):
+    """Close one FULL evidence interval without manufacturing an open one."""
+    activation = _positive_lsn(activation_lsn)
+    if activation is None:
+        return replace(
+            relation,
+            full_activation_lsn=None,
+            full_invalidation_lsn=None,
+        )
+    invalidation = _positive_lsn(invalidation_lsn)
+    # If an external downgrade is observed without an event LSN, the only safe
+    # point we can name from this observation is the first LSN after activation.
+    # That is deliberately conservative: it routes the rest through refetch rather
+    # than admitting an event whose generation cannot be proven.
+    if invalidation is None or invalidation <= activation:
+        invalidation = activation + 1
+    return replace(
+        relation,
+        full_activation_lsn=activation,
+        full_invalidation_lsn=invalidation,
+    )
+
+
+def _post_commit_full_state(conn, relation, boundary):
+    """Re-check after COMMIT and close the interval if a racer downgraded it."""
+    verified = conn.execute(
+        "SELECT relreplident FROM pg_class WHERE oid = %s", [relation.oid]
+    ).fetchone()
+    if verified and str(verified[0]).lower() == "f":
+        return replace(
+            relation,
+            replica_identity="f",
+            full_activation_lsn=boundary,
+            full_invalidation_lsn=None,
+        )
+    sampled = conn.execute(observation_mod.ACTIVATION_LSN_SQL).fetchone()
+    invalidation = _positive_lsn(sampled[0] if sampled else None)
+    return _closed_full_relation(
+        replace(relation, replica_identity="d"), boundary, invalidation
+    )
+
+
 def _ensure_toast_policies(
     watcher,
     conn,
@@ -89,20 +139,25 @@ def _ensure_toast_policies(
     *,
     activation_lsn: int | None = None,
 ):
-    """Make residual TOAST tables FULL before this catalog epoch is admitted."""
+    """Make residual TOAST tables FULL and bound each proven FULL interval.
+
+    The relation lock proves the lower bound only while the activation transaction
+    is open.  The explicit post-COMMIT recheck is a *closing* observation: if another
+    connection downgrades the relation in the interval after COMMIT, the fresh WAL
+    sample becomes the exclusive upper bound and the policy routes later events to
+    fallback.  A downgrade seen by the next poll is closed conservatively at the
+    first LSN after the old activation until an event-level LSN can provide a tighter
+    boundary; it is never treated as an open FULL interval.
+    """
     updated = dict(observed)
     for qualified, relation in observed.items():
-        def positive_lsn(value):
-            try:
-                candidate = int(value)
-            except (TypeError, ValueError):
-                return None
-            return candidate if candidate > 0 else None
-
         previous = getattr(watcher, "known", {}).get(qualified)
-        current_boundary = positive_lsn(relation.full_activation_lsn)
-        previous_boundary = positive_lsn(
+        current_boundary = _positive_lsn(relation.full_activation_lsn)
+        previous_boundary = _positive_lsn(
             getattr(previous, "full_activation_lsn", None)
+        )
+        previous_invalidation = _positive_lsn(
+            getattr(previous, "full_invalidation_lsn", None)
         )
         previous_identity = identity_for(previous) if previous is not None else None
         current_identity = identity_for(relation)
@@ -112,16 +167,54 @@ def _ensure_toast_policies(
             and previous_identity.complete
             and identities_equal(current_identity, previous_identity)
         )
-        # An activation LSN belongs to one physical relation generation and one
-        # verified FULL state. Never carry it by qualified name across DROP/CREATE,
-        # OID reuse, relfilenode rewrite, or a missing generation token.
-        if not same_complete_generation or str(relation.replica_identity).lower() != "f":
-            relation = replace(relation, full_activation_lsn=None)
+        current_full = str(relation.replica_identity).lower() == "f"
+
+        # A source generation owns one evidence interval.  Never carry either end
+        # across a DROP/CREATE or an incomplete identity token.
+        if not same_complete_generation:
+            relation = replace(
+                relation,
+                full_activation_lsn=None,
+                full_invalidation_lsn=None,
+            )
             current_boundary = None
+            previous_boundary = None
+            previous_invalidation = None
+        elif current_full:
+            # A previously closed interval followed by an external re-enable needs a
+            # fresh lower bound; the next activation transaction establishes it.
+            if previous_invalidation is not None:
+                relation = replace(
+                    relation,
+                    full_activation_lsn=None,
+                    full_invalidation_lsn=None,
+                )
+                current_boundary = None
+            elif current_boundary is None and previous_boundary is not None:
+                relation = replace(
+                    relation,
+                    full_activation_lsn=previous_boundary,
+                    full_invalidation_lsn=None,
+                )
+                current_boundary = previous_boundary
+        elif previous_boundary is not None and previous_invalidation is None:
+            # The next poll has observed the downgrade.  Close the old interval and
+            # stop here; a later poll may establish a new FULL interval, but no event
+            # in this gap is admitted on the strength of the old lower bound.
+            relation = _closed_full_relation(
+                relation, previous_boundary, previous_boundary + 1
+            )
             updated[qualified] = relation
-        elif current_boundary is None and previous_boundary is not None:
-            relation = replace(relation, full_activation_lsn=previous_boundary)
-            updated[qualified] = relation
+            continue
+        else:
+            relation = replace(
+                relation,
+                full_activation_lsn=None,
+                full_invalidation_lsn=None,
+            )
+            current_boundary = None
+
+        updated[qualified] = relation
         policy = classify_relation(
             qualified,
             relation.columns,
@@ -129,6 +222,7 @@ def _ensure_toast_policies(
             binary_mode=watcher.binary_handling_mode,
             hstore_mode=watcher.hstore_handling_mode,
             full_activation_lsn=relation.full_activation_lsn,
+            full_invalidation_lsn=relation.full_invalidation_lsn,
         )
         if not policy.residual_columns:
             continue
@@ -138,15 +232,9 @@ def _ensure_toast_policies(
                 raise ValueError(f"unqualified source relation {qualified!r}")
             from .naming import quote
 
-            # ALTER TABLE ... REPLICA IDENTITY takes ACCESS EXCLUSIVE. Acquire the
-            # same relation lock before any state check and keep it through the WAL
-            # sample and the in-memory boundary record. NOWAIT is deliberate: a
-            # source transaction or an operator DDL cannot deadlock this poll or make
-            # streaming wait behind it; the exception below leaves the relation on
-            # automatic refetch/resnapshot recovery for the next poll.
             needs_activation = not (
                 str(relation.replica_identity).lower() == "f"
-                and positive_lsn(relation.full_activation_lsn) is not None
+                and _positive_lsn(relation.full_activation_lsn) is not None
             )
             lock_mode = "ACCESS EXCLUSIVE" if needs_activation else "ACCESS SHARE"
             conn.execute("BEGIN TRANSACTION")
@@ -155,9 +243,6 @@ def _ensure_toast_policies(
                 f"IN {lock_mode} MODE NOWAIT"
             )
             if not needs_activation:
-                # The catalog observation happened before this transaction. Recheck
-                # exactly once while the conflicting lock is held; no later
-                # check-then-use window exists inside this admission transaction.
                 locked_identity = conn.execute(
                     "SELECT relreplident FROM pg_class WHERE oid = %s", [relation.oid]
                 ).fetchone()
@@ -165,8 +250,10 @@ def _ensure_toast_policies(
                     raise RuntimeError(
                         "source replica identity changed before the held-lock admission"
                     )
-                updated[qualified] = relation
                 conn.execute("COMMIT")
+                updated[qualified] = _post_commit_full_state(
+                    conn, relation, _positive_lsn(relation.full_activation_lsn)
+                )
                 continue
 
             conn.execute(
@@ -180,23 +267,14 @@ def _ensure_toast_policies(
                 raise RuntimeError(
                     f"source reported replica identity {verified[0] if verified else None!r}"
                 )
-            # The read-side sample is intentionally not an activation proof: it is
-            # taken before this ALTER in the normal poll path, so an event committed
-            # between that sample and the ALTER would otherwise be admitted.  Sample
-            # WAL only after the source confirms FULL, and reject zero/absent values.
             post_alter = conn.execute(observation_mod.ACTIVATION_LSN_SQL).fetchone()
-            boundary = positive_lsn(post_alter[0] if post_alter else None)
-            pre_alter = positive_lsn(activation_lsn)
+            boundary = _positive_lsn(post_alter[0] if post_alter else None)
+            pre_alter = _positive_lsn(activation_lsn)
             if boundary is None or (pre_alter is not None and boundary <= pre_alter):
                 raise RuntimeError(
                     f"post-ALTER WAL boundary {boundary!r} did not prove it follows "
                     f"the pre-ALTER sample {pre_alter!r}"
                 )
-            # Keep the post-sample verification from r3 as a defense-in-depth
-            # assertion.  The held ACCESS EXCLUSIVE lock is the actual race closure:
-            # PostgreSQL cannot execute a concurrent REPLICA IDENTITY ALTER until
-            # this transaction commits, so the verification, WAL sample, and boundary
-            # record all describe one locked source state.
             verified_after_sample = conn.execute(
                 "SELECT relreplident FROM pg_class WHERE oid = %s", [relation.oid]
             ).fetchone()
@@ -208,17 +286,31 @@ def _ensure_toast_policies(
                     "source replica identity changed while sampling activation WAL; "
                     "discarding the boundary and requiring refetch"
                 )
-            updated[qualified] = replace(
-                relation,
-                replica_identity="f",
-                full_activation_lsn=boundary,
-            )
             conn.execute("COMMIT")
-            log.info(
-                "TOAST residual table %s admitted with verified REPLICA IDENTITY FULL: %s",
-                qualified,
-                ", ".join(policy.residual_columns),
+            updated[qualified] = _post_commit_full_state(
+                conn,
+                replace(
+                    relation,
+                    replica_identity="f",
+                    full_activation_lsn=boundary,
+                    full_invalidation_lsn=None,
+                ),
+                boundary,
             )
+            if updated[qualified].full_invalidation_lsn is None:
+                log.info(
+                    "TOAST residual table %s admitted with verified REPLICA IDENTITY "
+                    "FULL: %s",
+                    qualified,
+                    ", ".join(policy.residual_columns),
+                )
+            else:
+                log.warning(
+                    "TOAST residual table %s lost FULL immediately after COMMIT; "
+                    "closed validity interval at LSN %s",
+                    qualified,
+                    updated[qualified].full_invalidation_lsn,
+                )
         except Exception as exc:
             try:
                 conn.execute("ROLLBACK")
@@ -230,11 +322,11 @@ def _ensure_toast_policies(
                 qualified,
                 exc,
             )
-            # A lock timeout or any other failed admission must not return a boundary
-            # copied from the pre-lock observation.  Clear it even when the observed
-            # relation was already FULL; the next poll must reacquire the fence before
-            # it can admit another event.
-            updated[qualified] = replace(relation, full_activation_lsn=None)
+            updated[qualified] = replace(
+                relation,
+                full_activation_lsn=None,
+                full_invalidation_lsn=None,
+            )
     return updated
 
 

@@ -5,8 +5,8 @@ declared cell below enters the production ``GroupPlan`` and ``TableWork`` fold a
 the production ``SchemaRegistry`` writer inside a real DuckDB transaction.  Spill
 cells use the production ``SpillBuffer`` table and codec.  Error cells invoke the
 owner that actually raises the error, then verify rollback or durable recovery.  A
-requested outcome that the real owner refuses is reported as uncovered with the
-owner's durable state transition; no synthetic reachability predicate classifies it.
+requested outcome that the real owner refuses is recorded as an owner refusal with
+the owner's durable state transition; no synthetic reachability predicate classifies it.
 """
 
 from __future__ import annotations
@@ -59,7 +59,8 @@ class PhysicalRowResult:
     reason: str
     proof: str = ""
     #: False means the real production owner refused the requested outcome.  Such a
-    #: result is retained for accounting but is never included in covered counts.
+    #: result is retained for accounting but is not included in the requested-outcome
+    #: floor; it is still a classified production result.
     covered: bool = True
     #: The actual production owner is separate from ``cell.outcome`` so a requested
     #: but impossible outcome cannot be mistaken for a machine-derived exclusion.

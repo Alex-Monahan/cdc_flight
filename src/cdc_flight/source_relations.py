@@ -46,6 +46,7 @@ def upsert_source_relation(
     published: bool,
     replica_identity: str | None,
     full_activation_lsn: int | None = None,
+    full_invalidation_lsn: int | None = None,
     admission_state: str = "external",
     columns=(),
 ) -> None:
@@ -71,14 +72,16 @@ def upsert_source_relation(
         f"INSERT INTO {CONTROL_SCHEMA}.source_relations "
         "(pipeline, source_schema, source_table, relation_oid, relation_filenode, "
         " relation_type_oid, published, admission_state, replica_identity, "
-        " full_activation_lsn, columns_json, first_seen_at, last_seen_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " full_activation_lsn, full_invalidation_lsn, columns_json, "
+        " first_seen_at, last_seen_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         [
             pipeline, source_schema, source_table, relation_oid, relation_filenode,
             relation_type_oid, published,
             admission_state,
             replica_identity,
             full_activation_lsn,
+            full_invalidation_lsn,
             json.dumps(
                 [
                     {
@@ -172,6 +175,7 @@ def flush_learned_relations(
                 published=relation.published,
                 replica_identity=relation.replica_identity,
                 full_activation_lsn=relation.full_activation_lsn,
+                full_invalidation_lsn=relation.full_invalidation_lsn,
                 admission_state=require_admission_state(relation.admission_state),
                 columns=relation.columns,
             )

@@ -7,6 +7,7 @@ from typing import Any
 
 from .identity_codec import (
     _identity_value,
+    _stored_identity_source_value,
     canonical_jsonb_text,
 )
 from .naming import CDCF_EVENT_ID, quote
@@ -57,7 +58,11 @@ def _copy_rows_with_identity(
     for row in rows:
         rowid = row[0]
         raw = {column: row[index] for column, index in column_indexes.items()}
-        key_values = tuple(raw[column] for column in key_columns)
+        key_values = tuple(
+            _stored_identity_source_value(raw.get("cdcf_internal_id"), index)
+            or raw[column]
+            for index, column in enumerate(key_columns)
+        )
         identity = _identity_value(
             table,
             key_values,
@@ -669,12 +674,18 @@ def insert_typed_rows(
 
 
 def _typed_parameter(value: Any, native: Any) -> tuple[str, list[Any]]:
-    from .typed_types import JsonbNull, NativeType, UnionValue
+    from .typed_types import JsonbNull, NativeType, PostgresInfinity, UnionValue
 
     if value is None:
         return "NULL", []
     if native is None:
         return "?", [value]
+    if isinstance(value, PostgresInfinity):
+        if native.kind in {"DATE", "TIMESTAMP", "TIMESTAMPTZ"}:
+            return f"CAST(? AS {native.sql})", [str(value)]
+        raise ValueError(
+            f"PostgreSQL infinity cannot bind to destination type {native.sql}"
+        )
     if isinstance(value, UnionValue):
         member_native = _union_member_native(native, value.member)
         if value.native is not None and (

@@ -76,11 +76,6 @@ class GroupPlan:
         self.binary_handling_mode = binary_handling_mode
         self.hstore_handling_mode = hstore_handling_mode
         self.watermark_fenced_events = 0
-        #: A GroupPlan is built within one catalog/schema epoch.  Policy admission is
-        #: catalog work, so classify each source relation once rather than taking the
-        #: watcher lock and rebuilding the column matrix for every row in a large
-        #: transaction.
-        self._toast_policy_cache: dict[str, object] = {}
         self._catalog_descriptor_cache: dict[str, dict] = {}
 
         self.work: dict[str, TableWork] = {}
@@ -226,10 +221,17 @@ class GroupPlan:
             )
         self._enrich_descriptors(event)
         if self.toast_policy_provider is not None and snapshot is None:
-            policy = self._toast_policy_cache.get(event.qualified_table)
-            if policy is None:
+            try:
+                policy = self.toast_policy_provider(
+                    event.qualified_table, event_lsn=event.lsn
+                )
+            except TypeError as exc:
+                # Keep the narrow compatibility seam for embedders that supplied a
+                # legacy one-argument provider; the production CatalogWatcher uses
+                # the event-LSN close operation above.
+                if "event_lsn" not in str(exc):
+                    raise
                 policy = self.toast_policy_provider(event.qualified_table)
-                self._toast_policy_cache[event.qualified_table] = policy
             if policy is not None and not policy.accepts_event(event.lsn):
                 raise ToastBaseMissing(
                     f"{event.qualified_table}: residual TOAST column(s) have no "
@@ -346,6 +348,26 @@ class GroupPlan:
                     or descriptors[name].fingerprint != descriptor.fingerprint
                 ):
                     descriptors[name] = descriptor
+        # Stock Debezium flattens supported PostgreSQL range fields to STRING,
+        # while the source catalog tells us that the string is already the server's
+        # canonical range_out text.  Retain that provenance before the key/fold path
+        # stores raw values; destination STRUCT readback deliberately remains a
+        # separate fallback representation.
+        from .typed_types import mark_canonical_range_text
+
+        for image_name, descriptor_name in (
+            ("key", "key_descriptors"),
+            ("before", "before_descriptors"),
+            ("after", "after_descriptors"),
+        ):
+            image = getattr(event, image_name)
+            if not image:
+                continue
+            descriptors = getattr(event, descriptor_name)
+            for name, value in tuple(image.items()):
+                descriptor = descriptors.get(name) or descriptors.get(naming.normalize(name))
+                if descriptor is not None:
+                    image[name] = mark_canonical_range_text(value, descriptor)
 
     def _count_event(self, event: PendingRecord) -> None:
         """Group-level bookkeeping every event contributes to, whatever it is.

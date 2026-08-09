@@ -43,6 +43,27 @@ class FieldState(StrEnum):
     ABSENT = "absent"
 
 
+class CanonicalRangeText(str):
+    """PostgreSQL ``range_out`` text retained from a source change event.
+
+    A plain string is still accepted by the compatibility/value boundary because
+    destination readback and older callers do not carry provenance.  This narrow
+    subtype is used only after catalog descriptors have identified a source range;
+    the identity codec can therefore use PostgreSQL's already-canonical text without
+    parsing and re-serializing it in Python.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class PostgresInfinity:
+    """A PostgreSQL timestamp/date infinity endpoint for native binding."""
+
+    positive: bool
+
+    def __str__(self) -> str:
+        return "infinity" if self.positive else "-infinity"
+
+
 @dataclass(frozen=True)
 class JsonbNull:
     """A JSONB document whose root value is JSON ``null``.
@@ -277,6 +298,55 @@ class SourceTypeDescriptor:
     @property
     def type_identity(self) -> str:
         return self.fingerprint
+
+
+def mark_canonical_range_text(
+    value: Any, descriptor: SourceTypeDescriptor | None
+) -> Any:
+    """Mark source range text after catalog descriptors are authoritative.
+
+    Debezium's supported PostgreSQL range fields are STRING values containing the
+    server's ``range_out`` result.  The catalog is the only place that tells us that
+    a flattened string is a range rather than ordinary text, so marking belongs at
+    that enrichment seam.  Composite/array/map recursion keeps nested keys on the
+    same source-text path.  Structured mappings and list-valued compatibility input
+    are intentionally left alone: those are destination/value-boundary forms.
+    """
+
+    if descriptor is None or value is None:
+        return value
+    source = descriptor
+    seen: set[int] = set()
+    while source.domain_base is not None and id(source) not in seen:
+        seen.add(id(source))
+        source = source.domain_base
+    kind = str(source.kind or source.qualified_name).lower()
+    range_kinds = {
+        "range", "daterange", "int4range", "int8range", "numrange",
+        "tsrange", "tstzrange",
+    }
+    if kind in range_kinds and isinstance(value, str):
+        return value if isinstance(value, CanonicalRangeText) else CanonicalRangeText(value)
+    if kind == "multirange" and isinstance(value, str):
+        return value if isinstance(value, CanonicalRangeText) else CanonicalRangeText(value)
+    if kind in {"struct", "composite"} and isinstance(value, Mapping):
+        return {
+            name: mark_canonical_range_text(
+                item,
+                dict(source.composite_fields).get(str(name)),
+            )
+            for name, item in value.items()
+        }
+    if kind == "array" and isinstance(value, (list, tuple)):
+        return [mark_canonical_range_text(item, source.array_element) for item in value]
+    if kind == "map" and isinstance(value, Mapping):
+        return {
+            mark_canonical_range_text(key, source.map_key): mark_canonical_range_text(
+                item, source.map_value
+            )
+            for key, item in value.items()
+        }
+    return value
 
 
 @dataclass(frozen=True)
@@ -683,6 +753,8 @@ def encode_value(value: Any, descriptor: SourceTypeDescriptor | NativeType) -> A
     if kind in {"range", "daterange", "int4range", "int8range", "numrange", "tsrange", "tstzrange"}:
         return _encode_range(value, source)
     if kind == "multirange":
+        if isinstance(value, str):
+            value = _multirange_parts(value)
         if not isinstance(value, (list, tuple)):
             raise InvalidTypedValue(f"{value!r} is not a multirange value")
         if source.range_subtype is None:
@@ -901,6 +973,41 @@ def _encode_range(value: Any, source: SourceTypeDescriptor) -> dict[str, Any]:
     }
 
 
+def _multirange_parts(value: str) -> list[str]:
+    """Split PostgreSQL multirange text without interpreting its bounds."""
+
+    text = value.strip()
+    if text.lower() in {"{}", "{empty}"}:
+        return []
+    if len(text) < 2 or text[0] != "{" or text[-1] != "}":
+        raise InvalidTypedValue(f"{value!r} is not a PostgreSQL multirange value")
+    parts: list[str] = []
+    start = 1
+    depth = 0
+    quoted = False
+    escaped = False
+    for index, char in enumerate(text[1:-1], 1):
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == '"':
+            quoted = not quoted
+        elif not quoted and char in "([":
+            depth += 1
+        elif not quoted and char in ")]":
+            depth -= 1
+        elif not quoted and char == "," and depth == 0:
+            part = text[start:index].strip()
+            if part:
+                parts.append(part)
+            start = index + 1
+    part = text[start:-1].strip()
+    if part:
+        parts.append(part)
+    return parts
+
+
 def _range_separator(value: str) -> int | None:
     quoted = False
     escaped = False
@@ -954,6 +1061,9 @@ def _float_text(value: str) -> float:
 def _date_value(value: Any) -> date:
     if isinstance(value, date) and not isinstance(value, datetime):
         return value
+    lowered = str(value).strip().lower()
+    if lowered in {"infinity", "+infinity", "-infinity"}:
+        return PostgresInfinity(not lowered.startswith("-"))  # type: ignore[return-value]
     if isinstance(value, int):
         return date(1970, 1, 1) + timedelta(days=value)
     try:
@@ -982,6 +1092,9 @@ def _time_value(value: Any, *, preserve_zone: bool = False) -> time:
 def _datetime_value(value: Any, *, zoned: bool) -> datetime:
     if isinstance(value, datetime):
         return value
+    lowered = str(value).strip().lower()
+    if lowered in {"infinity", "+infinity", "-infinity"}:
+        return PostgresInfinity(not lowered.startswith("-"))  # type: ignore[return-value]
     if isinstance(value, int):
         return datetime.fromtimestamp(value / 1_000_000, tz=UTC if zoned else None)
     try:
@@ -1203,18 +1316,21 @@ _OBSCURE_EXTENSIONS = frozenset()
 
 __all__ = [
     "JSONB_NULL",
+    "CanonicalRangeText",
     "FieldState",
     "FieldValue",
     "InvalidTypedValue",
     "JsonbNull",
     "NativeMember",
     "NativeType",
+    "PostgresInfinity",
     "SourceTypeDescriptor",
     "TypedImage",
     "UnionValue",
     "UnsupportedType",
     "adapt_value",
     "encode_value",
+    "mark_canonical_range_text",
     "native_type",
     "numeric_value",
     "union_member_name",

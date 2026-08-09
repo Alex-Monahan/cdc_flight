@@ -143,6 +143,7 @@ def summary(watcher) -> dict:
                 binary_mode=getattr(watcher, "binary_handling_mode", "base64"),
                 hstore_mode=getattr(watcher, "hstore_handling_mode", "map"),
                 full_activation_lsn=relation.full_activation_lsn,
+                full_invalidation_lsn=relation.full_invalidation_lsn,
             )
             for relation in watcher.known.values()
         ]

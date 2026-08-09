@@ -9,7 +9,14 @@ from typing import Any
 
 from . import naming
 from .toast import STRUCTURAL_MARKER, field_value
-from .typed_types import FieldState, FieldValue, SourceTypeDescriptor, TypedImage, encode_value
+from .typed_types import (
+    FieldState,
+    FieldValue,
+    SourceTypeDescriptor,
+    TypedImage,
+    encode_value,
+    mark_canonical_range_text,
+)
 
 PATCH_VERSION = 1
 
@@ -89,6 +96,7 @@ class RowPatch:
         for raw_name, raw_value in image.items():
             name = naming.normalize(str(raw_name))
             descriptor = descriptors.get(str(raw_name)) or descriptors.get(name)
+            raw_value = mark_canonical_range_text(raw_value, descriptor)
             existing = typed_fields.get(str(raw_name)) or typed_fields.get(name)
             # The JSON schema image is built before the catalog descriptor is
             # enriched.  Re-run the narrow marker classifier for ordinary VALUE

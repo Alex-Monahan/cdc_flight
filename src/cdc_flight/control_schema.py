@@ -146,6 +146,7 @@ CONTROL_DDL = [
             admission_state  VARCHAR     NOT NULL DEFAULT 'external',
             replica_identity  VARCHAR,
             full_activation_lsn BIGINT,
+            full_invalidation_lsn BIGINT,
             columns_json      VARCHAR,
             first_seen_at     TIMESTAMPTZ NOT NULL,
             last_seen_at      TIMESTAMPTZ NOT NULL,
@@ -379,6 +380,7 @@ _ADDED_COLUMNS = {
         ("relation_filenode", "BIGINT"),
         ("relation_type_oid", "BIGINT"),
         ("full_activation_lsn", "BIGINT"),
+        ("full_invalidation_lsn", "BIGINT"),
         # MotherDuck/DuckDB reject constraints in ALTER TABLE ... ADD COLUMN.
         # The state is backfilled and checked below in this same transaction; the
         # application/state-machine boundary is the invariant for already-created

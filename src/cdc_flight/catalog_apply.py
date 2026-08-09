@@ -418,6 +418,7 @@ class CatalogCoordinator:
                 admission_state=require_admission_state(relation.admission_state),
                 replica_identity=relation.replica_identity,
                 full_activation_lsn=relation.full_activation_lsn,
+                full_invalidation_lsn=relation.full_invalidation_lsn,
                 columns=relation.columns,
             )
         self.destructive_refused += len(plan.refused)

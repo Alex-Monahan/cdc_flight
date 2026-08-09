@@ -62,6 +62,8 @@ class SourceRelation:
     #: Source LSN boundary after which residual TOAST events were generated under
     #: verified REPLICA IDENTITY FULL.
     full_activation_lsn: int | None = None
+    #: Exclusive upper bound of that same verified FULL interval.
+    full_invalidation_lsn: int | None = None
 
     def __post_init__(self) -> None:
         state = self.admission_state
@@ -78,6 +80,22 @@ class SourceRelation:
             "full_activation_lsn",
             boundary if boundary is not None and boundary > 0 else None,
         )
+        try:
+            invalidation = (
+                int(self.full_invalidation_lsn)
+                if self.full_invalidation_lsn is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            invalidation = None
+        if (
+            invalidation is None
+            or invalidation <= 0
+            or boundary is None
+            or invalidation <= boundary
+        ):
+            invalidation = None
+        object.__setattr__(self, "full_invalidation_lsn", invalidation)
 
     @property
     def qualified(self) -> str:
@@ -93,6 +111,7 @@ class SourceRelation:
             self.columns,
             replica_identity=self.replica_identity,
             full_activation_lsn=self.full_activation_lsn,
+            full_invalidation_lsn=self.full_invalidation_lsn,
         )
 
 
@@ -199,23 +218,44 @@ def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
     rows = con.execute(
         f"SELECT source_schema, source_table, relation_oid, relation_filenode, "
         "relation_type_oid, "
-        "published, replica_identity, full_activation_lsn, columns_json, admission_state "
+        "published, replica_identity, full_activation_lsn, full_invalidation_lsn, "
+        "columns_json, admission_state "
         f"FROM {CONTROL_SCHEMA}.source_relations WHERE pipeline = ?",
         [pipeline],
     ).fetchall()
     known: dict[str, SourceRelation] = {}
-    for (
-        schema,
-        table,
-        oid,
-        relfilenode,
-        relation_type_oid,
-        published,
-        identity,
-        full_activation_lsn,
-        columns_json,
-        admission_state,
-    ) in rows:
+    for row in rows:
+        if len(row) == 10:
+            # Read-only compatibility for a pre-invalidation test double or a
+            # destination that has not completed the additive migration yet.  The
+            # real control-schema SELECT above always returns eleven fields.
+            (
+                schema,
+                table,
+                oid,
+                relfilenode,
+                relation_type_oid,
+                published,
+                identity,
+                full_activation_lsn,
+                columns_json,
+                admission_state,
+            ) = row
+            full_invalidation_lsn = None
+        else:
+            (
+                schema,
+                table,
+                oid,
+                relfilenode,
+                relation_type_oid,
+                published,
+                identity,
+                full_activation_lsn,
+                full_invalidation_lsn,
+                columns_json,
+                admission_state,
+            ) = row
         try:
             raw_columns = json.loads(columns_json or "[]")
         except (TypeError, ValueError):
@@ -254,6 +294,14 @@ def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
             full_activation_lsn=(
                 int(full_activation_lsn)
                 if full_activation_lsn is not None and int(full_activation_lsn) > 0
+                else None
+            ),
+            full_invalidation_lsn=(
+                int(full_invalidation_lsn)
+                if (
+                    full_invalidation_lsn is not None
+                    and int(full_invalidation_lsn) > 0
+                )
                 else None
             ),
         )

@@ -288,12 +288,14 @@ def _union_contains_null(value: Any) -> bool:
 
 def _identity_runtime(value: Any) -> Any:
     """Return the JSON-safe representation for an already-normalized runtime leaf."""
-    from .typed_types import JsonbNull, UnionValue
+    from .typed_types import JsonbNull, PostgresInfinity, UnionValue
 
     if isinstance(value, JsonbNull):
         return {"jsonb_null": True}
     if isinstance(value, UnionValue):
         return {"union_member": value.member, "value": _identity_runtime(value.value)}
+    if isinstance(value, PostgresInfinity):
+        return {"infinity": "positive" if value.positive else "negative"}
     if isinstance(value, (bytes, bytearray)):
         return {"bytes_hex": bytes(value).hex()}
     if isinstance(value, Decimal):
@@ -344,6 +346,10 @@ def _range_subtype(source: Any) -> Any:
 
 def _range_step(value: Any, subtype: Any) -> Any:
     """Return the next discrete subtype value without float arithmetic."""
+    from .typed_types import PostgresInfinity
+
+    if isinstance(value, PostgresInfinity):
+        return value
     subtype = _range_subtype(subtype)
     kind = str(getattr(subtype, "kind", "")).lower()
     if kind in {"int2", "smallint", "int4", "integer", "int8", "bigint"}:
@@ -363,24 +369,37 @@ def _range_discrete(source: Any) -> bool:
 
 def _range_order_value(value: Any) -> Any:
     """Unwrap destination wrappers before comparing two same-subtype bounds."""
-    from .typed_types import UnionValue
+    from .typed_types import PostgresInfinity, UnionValue
 
     while isinstance(value, UnionValue):
         value = value.value
     if isinstance(value, datetime) and value.tzinfo is not None:
         return value.astimezone(UTC).replace(tzinfo=None)
-    if isinstance(value, _RangeInfinity):
+    if isinstance(value, (_RangeInfinity, PostgresInfinity)):
         return value
+    if isinstance(value, Mapping):
+        # DuckDB's variable-scale NUMERIC child is a STRUCT on destination
+        # readback.  This is a value-boundary fallback only; canonical source text
+        # never enters this comparison path.
+        if "coefficient" in value and "scale" in value:
+            try:
+                return Decimal(int(value["coefficient"])).scaleb(-int(value["scale"] or 0))
+            except (TypeError, ValueError, InvalidOperation):
+                return value
+        if value.get("special") is not None:
+            return value["special"]
     return value
 
 
 def _range_compare(left: Any, right: Any) -> int:
     """Compare bounds after their source subtype has been encoded."""
-    if isinstance(left, _RangeInfinity):
-        if isinstance(right, _RangeInfinity):
+    from .typed_types import PostgresInfinity
+
+    if isinstance(left, (_RangeInfinity, PostgresInfinity)):
+        if isinstance(right, (_RangeInfinity, PostgresInfinity)):
             return (left.positive > right.positive) - (left.positive < right.positive)
         return 1 if left.positive else -1
-    if isinstance(right, _RangeInfinity):
+    if isinstance(right, (_RangeInfinity, PostgresInfinity)):
         return -1 if right.positive else 1
     left = _range_order_value(left)
     right = _range_order_value(right)
@@ -439,9 +458,11 @@ def _normalise_range(value: Any, source: Any) -> dict[str, Any]:
 
 
 def _range_bound_identity(value: Any, subtype: Any) -> Any:
+    from .typed_types import PostgresInfinity
+
     if value is None:
         return {"unbounded": True}
-    if isinstance(value, _RangeInfinity):
+    if isinstance(value, (_RangeInfinity, PostgresInfinity)):
         return {"infinity": "positive" if value.positive else "negative"}
     return _identity_tree(value, subtype)
 
@@ -562,7 +583,7 @@ _IDENTITY_TEXT_KINDS = frozenset(
 
 def _identity_tree(value: Any, descriptor: Any) -> Any:
     """Encode one value recursively according to source semantics."""
-    from .typed_types import encode_value
+    from .typed_types import CanonicalRangeText, encode_value
 
     if descriptor is None:
         return _identity_runtime(value)
@@ -584,6 +605,25 @@ def _identity_tree(value: Any, descriptor: Any) -> Any:
         # SQL NULL and a JSONB root-null document collapse in some destination
         # readback APIs; retain SQL NULL before it reaches that display layer.
         return {"sql_null": True}
+    if (
+        isinstance(value, str)
+        and "infinity" in value.lower()
+        and kind in {
+            "range", "daterange", "int4range", "int8range", "numrange",
+            "tsrange", "tstzrange",
+        }
+    ):
+        # PostgreSQL's special infinity endpoints are values, not the empty text
+        # between unbounded delimiters.  Preserve this source spelling directly;
+        # asking the ISO parser to interpret it is precisely the r5 defect.
+        return {"range_text": str(value).strip()}
+    if isinstance(value, CanonicalRangeText) and kind in {
+        "range", "daterange", "int4range", "int8range", "numrange",
+        "tsrange", "tstzrange",
+    }:
+        return {"range_text": str(value)}
+    if isinstance(value, CanonicalRangeText) and kind == "multirange":
+        return {"multirange_text": str(value)}
     encoded = encode_value(value, descriptor)
     if encoded is None and kind != "jsonb":
         return None
@@ -728,6 +768,34 @@ def _identity_value(
     return json.dumps(components, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def _stored_identity_source_value(identity: Any, component: int) -> Any | None:
+    """Recover retained PostgreSQL source text for a typed shadow copy.
+
+    A source range event carries PostgreSQL's canonical text into the internal
+    identity.  If a later typed UNION swap changes that key's current descriptor,
+    the native destination STRUCT/LIST no longer contains that text; using its
+    Python display value would create a different current identity.  This helper
+    only reuses the value already in the current row identity.  It does not search
+    historical candidates or create a second identity format.
+    """
+    from .typed_types import CanonicalRangeText
+
+    if not isinstance(identity, str):
+        return None
+    try:
+        components = json.loads(identity)
+        value = components[component].get("value")
+    except (IndexError, AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, Mapping):
+        return None
+    for name in ("range_text", "multirange_text"):
+        text = value.get(name)
+        if isinstance(text, str):
+            return CanonicalRangeText(text)
+    return None
+
+
 def identity_value(table: Any, values: tuple[Any, ...], *, key_columns: tuple[str, ...]) -> str:
     """Public spelling for the canonical source identity encoder."""
     return _identity_value(table, values, key_columns=key_columns)
@@ -737,6 +805,7 @@ __all__ = [
     "_identity_runtime",
     "_identity_tree",
     "_identity_value",
+    "_stored_identity_source_value",
     "canonical_jsonb_identity",
     "canonical_jsonb_text",
     "identity_value",

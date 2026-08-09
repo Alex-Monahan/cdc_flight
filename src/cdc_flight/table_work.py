@@ -235,9 +235,14 @@ def _key_token(
     descriptors = descriptors or {}
     token: list[str] = []
     resolved_descriptors: dict[str, Any] = {}
-    for column, value in zip(item.key_columns, values, strict=True):
+    stored_values = list(values)
+    for index, (column, value) in enumerate(zip(item.key_columns, values, strict=True)):
         descriptor = descriptors.get(column) or item.descriptors.get(column)
         if descriptor is not None:
+            from .typed_types import mark_canonical_range_text
+
+            value = mark_canonical_range_text(value, descriptor)
+            stored_values[index] = value
             resolved_descriptors[column] = descriptor
             fingerprint = descriptor.fingerprint
         else:
@@ -259,7 +264,7 @@ def _key_token(
             item.native_fingerprints[column] = descriptor.fingerprint
             item.columns[column] = item.native_columns[column].sql
     result = tuple(token)
-    item.key_values[result] = tuple(values)
+    item.key_values[result] = tuple(stored_values)
     item.key_descriptors[result] = resolved_descriptors
     return result
 

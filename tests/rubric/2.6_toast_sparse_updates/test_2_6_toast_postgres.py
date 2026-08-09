@@ -413,6 +413,118 @@ def test_activation_lock_timeout_refuses_behind_a_streaming_transaction(sandbox)
             cleanup.execute(f"DROP TABLE IF EXISTS {qualified}")
 
 
+def test_post_commit_downgrade_closes_the_full_validity_interval(sandbox):
+    """The exact r5 pause must reject an event emitted after FULL was lost."""
+    publication = "cdc_flight_pub"
+    qualified = "app.p2b_toast_identity_toc_r5"
+    with psycopg.connect(sandbox.source.dsn, autocommit=True) as setup:
+        setup.execute(f"DROP TABLE IF EXISTS {qualified}")
+        setup.execute(
+            "CREATE TABLE app.p2b_toast_identity_toc_r5 "
+            "(id integer PRIMARY KEY, payload bytea)"
+        )
+        setup.execute(f"ALTER PUBLICATION {publication} ADD TABLE {qualified}")
+        relation_oid, relfilenode, relation_type_oid = map(
+            int,
+            setup.execute(
+                "SELECT c.oid, c.relfilenode, c.reltype FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid=c.relnamespace "
+                "WHERE n.nspname='app' AND c.relname='p2b_toast_identity_toc_r5'"
+            ).fetchone(),
+        )
+
+    residual = SourceTypeDescriptor(17, "pg_catalog.bytea", "bytea")
+    relation = SourceRelation(
+        schema="app",
+        table="p2b_toast_identity_toc_r5",
+        oid=relation_oid,
+        relfilenode=relfilenode,
+        relation_type_oid=relation_type_oid,
+        published=True,
+        replica_identity="d",
+        columns=(
+            SourceColumn(
+                1,
+                "id",
+                23,
+                "integer",
+                descriptor=SourceTypeDescriptor(23, "pg_catalog.int4", "int4"),
+                attstorage="p",
+            ),
+            SourceColumn(
+                2,
+                "payload",
+                17,
+                "bytea",
+                descriptor=residual,
+                attstorage="x",
+            ),
+        ),
+    )
+
+    class PauseAfterCommit:
+        def __init__(self, inner, racer):
+            self.inner = inner
+            self.racer = racer
+            self.paused = False
+            self.post_downgrade_lsn = None
+
+        def execute(self, statement, params=None):
+            result = self.inner.execute(statement, params)
+            if str(statement).strip().upper() == "COMMIT" and not self.paused:
+                self.paused = True
+                self.racer.execute(
+                    "ALTER TABLE app.p2b_toast_identity_toc_r5 "
+                    "REPLICA IDENTITY DEFAULT"
+                )
+                self.racer.execute(
+                    "UPDATE app.p2b_toast_identity_toc_r5 "
+                    "SET payload = decode('aabbcc','hex') WHERE id = 1"
+                )
+                self.post_downgrade_lsn = int(
+                    self.racer.execute(
+                        "SELECT (pg_current_wal_insert_lsn() - '0/0'::pg_lsn)::bigint"
+                    ).fetchone()[0]
+                )
+            return result
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+    watcher = CatalogWatcher(
+        dsn=sandbox.source.dsn,
+        primary_dsn=sandbox.source.dsn,
+        publication=publication,
+        schema="app",
+        schemas={"app"},
+        include={qualified},
+        emit_marker=False,
+        confirm_polls=1,
+    )
+    try:
+        with (
+            psycopg.connect(sandbox.source.dsn, autocommit=True) as write,
+            psycopg.connect(sandbox.source.dsn, autocommit=True) as racer,
+        ):
+            conn = PauseAfterCommit(write, racer)
+            observed = _ensure_toast_policies(
+                watcher,
+                conn,
+                {qualified: relation},
+                activation_lsn=1,
+            )
+            admitted = observed[qualified]
+            assert conn.paused
+            assert conn.post_downgrade_lsn is not None
+            assert admitted.full_invalidation_lsn is not None
+            assert admitted.full_activation_lsn < admitted.full_invalidation_lsn
+            assert admitted.toast_policy.accepts_event(conn.post_downgrade_lsn) is False
+    finally:
+        with psycopg.connect(sandbox.source.dsn, autocommit=True) as cleanup:
+            cleanup.execute(f"ALTER PUBLICATION {publication} DROP TABLE {qualified}")
+            cleanup.execute(f"DROP TABLE IF EXISTS {qualified}")
+
+
 def test_postgres_rejects_nul_for_structural_string_types_and_accepts_bytea():
     with psycopg.connect(_dsn(), autocommit=True) as con:
         cases = (

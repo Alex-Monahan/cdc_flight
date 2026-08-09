@@ -214,10 +214,12 @@ table is the current score, and the 2026-08-09 FIX ROUND blocks under 2.4,
 The FIX ROUND 2 claims below are historical, not closure evidence: the r2 re-review
 reproduced counterexamples behind a green suite. FIX ROUND 3 first ran those exact
 counterexamples as failing regressions, then changed the implementation and attacked
-each result from a second angle. The current scores remain **2.4 = 5/5, 2.5 = 5/5,
-2.6 = 4/5** only because the evidence below and the required final lanes pass; 2.6's
-5/5 marker-preserving upgrade is intentionally deferred under the binding stock
-Debezium policy.
+each result from a second angle. The post-FIX ROUND 6 scores are **2.4 = 4/5,
+2.5 = 4/5, 2.6 = 4/5**. The range implementation is closed for the text that
+stock Debezium actually delivers, but stock Debezium omits PostgreSQL multirange
+columns from change events; I therefore do not claim a 5/5 multirange production
+path. 2.6's 5/5 marker-preserving upgrade remains intentionally deferred under the
+binding stock Debezium policy.
 
 | r2 finding | round-3 evidence now required for closure |
 |---|---|
@@ -327,6 +329,112 @@ the deferred 5/5 upgrade. The range evidence covers the declared native range
 representation and built-in PostgreSQL discrete classes, not arbitrary extension
 range canonical functions. No Debezium fork, converter/SMT, Java, Maven, or Gradle
 artifact was introduced.
+
+### FIX ROUND 6 root-fix evidence (2026-08-09)
+
+The r5 residuals were reproduced first as failing tests, then fixed at their
+owners: `test_r5_range_residuals_use_special_infinity_and_continuous_multirange_equality`,
+`test_post_commit_downgrade_closes_the_full_validity_interval`, and
+`test_matrix_has_no_parallel_physical_row_reachability_predicates`. The focused
+regressions pass after the changes. The round-6 score is **2.4 = 4/5, 2.5 = 4/5,
+2.6 = 4/5**; the 2.4/2.5 point is withheld for the stock connector's multirange
+omission, and the 2.6 point is withheld by the binding marker-preservation policy.
+
+**What stock Debezium delivers.** A stock Debezium 3.6 `pgoutput` probe against
+the project-local PostgreSQL 18 instance showed PostgreSQL `tsrange` and `tstzrange`
+fields arriving at the SourceRecord boundary with Connect schema `type=string` and
+payloads such as `[-infinity,infinity]`: these are the server's canonical
+`range_out` strings, not a Python-normalized range object. The same probe logged
+`Unexpected JDBC type '1111'` and `No converter found ... int4multirange` /
+`nummultirange`; stock Debezium omitted those columns from the change event. Thus
+canonical source text is available for delivered range columns, but not end to end
+for multiranges because stock Debezium drops them before the application boundary.
+No fork, custom converter/SMT, Java, Maven, or Gradle workaround was added.
+
+The destination does not retain that text as its native value: local DuckDB and
+MotherDuck store a range as a `STRUCT` and a multirange compatibility value as a
+`LIST` of range `STRUCT`s, and read them back as mappings/lists. The planner and
+key path retain a narrow canonical-source-text marker before materialization; a
+destination readback that has lost the text uses the existing typed semantic
+fallback. During a typed key shadow swap, the copier reuses canonical range text
+already retained in the current row identity instead of stringifying a native
+STRUCT as Python `repr`; it does not search historical identity candidates. This
+is the precise point where source canonical text is unavailable, and it is why the
+score does not claim unsupported stock multirange delivery.
+
+**Equality classes against the real PostgreSQL `=` operator.** The new slow probe
+queries the source server's `=` operator and `::text` output, then checks the same
+classes through local DuckDB and MotherDuck key insertion/deletion:
+
+| source class | PostgreSQL canonical text | `=` |
+|---|---|---:|
+| special timestamp endpoint versus itself | `[-infinity,infinity]` / `[-infinity,infinity]` | true |
+| special timestamp endpoint versus unbounded | `[-infinity,infinity]` / `(,)` | false |
+| reordered continuous numeric multirange versus merged spelling | `{[2,20)}` / `{[2,20)}` | true |
+| overlapping continuous numeric multirange versus merged spelling | `{[1,4)}` / `{[1,4)}` | true |
+| adjacent continuous numeric multirange versus merged spelling | `{[1,3)}` / `{[1,3)}` | true |
+| discrete closed versus `[)` spelling | `[1,4)` / `[1,4)` | true |
+| discrete empty versus `empty` | `empty` / `empty` | true |
+
+`tests/rubric/2.5_union_type_changes/test_2_5_range_source_equality.py` passed
+locally and its MotherDuck counterpart passed against the same source classes.
+The existing 33-case identity audit and both runtime key-gain probes remain green.
+
+**Fence validity interval.** `SourceRelation` and `ToastTablePolicy` now carry an
+exclusive `full_invalidation_lsn`; a verified FULL interval is exactly
+`[full_activation_lsn, full_invalidation_lsn)`. The activation transaction still
+does `BEGIN → LOCK TABLE ... NOWAIT → verify → post-ALTER LSN sample → second
+verify → COMMIT`. Immediately after that COMMIT, the writer re-queries
+`relreplident`; if a second connection has downgraded the relation, it samples the
+source WAL position and closes the interval. A later poll that first observes a
+downgrade closes any still-open interval conservatively at `activation_lsn + 1`
+and routes the remainder through fallback; an event-LSN observation can tighten an
+unclosed downgrade boundary. Events are admitted only when their LSN is inside the
+interval. Both LSNs are written through `source_relations` in the same durable
+catalog path, and the restart test reads the pair back and checks the exclusive
+upper edge.
+
+The exact r5 probe was rerun with table `app.p2b_toast_identity_toc_r5`: after the
+lock transaction's COMMIT, the racer executed `REPLICA IDENTITY DEFAULT`, updated
+`payload` to `decode('aabbcc','hex')`, and captured its post-downgrade LSN. The
+observed relation had both bounds, and `accepts_event(post_downgrade_lsn)` was
+false. The straddling checks also pass for activation, `invalidation - 1`, and the
+exclusive invalidation edge.
+
+**Owner-derived physical-row matrix.** The parallel predicate table and both
+predicate APIs are gone. All **2,880** declared cells enter the production owner;
+commits become `exercised`, exactly these owner exceptions become `refused`, and
+anything else raises and fails the matrix:
+
+| owner outcome | cells |
+|---|---:|
+| `destination_commit` → exercised | 688 |
+| `SchemaEvolutionRefused` → refused | 1,334 |
+| `InjectedFault` → refused | 414 |
+| `ToastBaseMissing` → refused | 260 |
+| `AmbiguousDelete` → refused | 184 |
+
+The measured owner run reports **1,958** cells at the requested-outcome covered
+floor, **0** dirty rollback states, and **1,732** refusal observations without a
+durable target-row count; committed cells all report durable rows. The focused
+serial matrix test took **25.22 seconds** in pytest (**28.90 seconds** wall with
+startup/teardown); the full default lane's matrix call was **75.93 seconds** under
+the 12-worker suite. No cell is called unreachable, and unexpected exceptions are
+not classified as refusals.
+
+**Round-6 lanes.** After updating only the explicit composition guards for the new
+tests, `CDC_TEST_PGPORT=15434 make test` passed **1,513 selected tests** (**1,512
+substantive**), `make test-slow` passed **133 selected tests** (**132
+substantive**), `make test-md` passed **39 selected tests** (**38 substantive**),
+and `make lint` passed. All used the clone's PostgreSQL 18 instance on port
+15434; no Docker or alternate PostgreSQL port was used.
+
+**Still unproven.** There is no stock-Debezium multirange change-event path to
+prove end to end, because the connector omits those JDBC `1111` columns. The
+destination fallback is tested for direct canonical values and source equality,
+not presented as a connector capability. The marker-preserving TOAST 5/5 upgrade
+remains intentionally deferred. N1 remains dismissed: no identity versioning,
+legacy candidates, or conversion backfills were introduced.
 
 ### TODO 1.1 / 1.2 / 1.3 — the transactional applier (implemented 2026-07-30)
 
@@ -489,8 +597,8 @@ correct assumptions in the notes below:
 | 2.1 | Added / dropped columns handled | **5** | Catalog-fenced attnum diffs add and backfill existing rows, physically drop destination columns, and continue through live CDC; the add/drop E2E compares source and destination before and after both DDLs. |
 | 2.2 | Renamed columns handled well | **5** | Same-attnum/type changes use a true destination rename, including a late-row merge/fence path; the E2E has one logical column, one rename audit event, and no data loss. |
 | 2.3 | New tables and schemas auto-discovered | **5** | A 10-second (configurable) all-schema watcher admits table-scoped publication members and performs an in-process targeted re-snapshot on the same main slot; new-table and new-schema existing rows arrive without config edit or restart. |
-| 2.4 | Postgres types → native MotherDuck types | ~~1~~ → **5** | Catalog-authoritative recursive descriptors map the full supported matrix to native JSON/VARIANT/LIST/STRUCT/MAP/range/multirange and bounded numeric UNIONs; NaN/Infinity/NULL/spill/replay are covered. JSONB and range keys use source-semantic identity on both runtimes, including composite keys and automatic key gain/loss repair. |
-| 2.5 | Data type changes supported | ~~3~~ → **5** | One typed shadow-swap path creates fingerprinted UNION members, rewrites every row to the one current source-semantic identity, including range/multirange equality classes, fences mixed epochs, and is fault-instrumented; no identity history or candidate lookup remains. |
+| 2.4 | Postgres types → native MotherDuck types | ~~1~~ → **4** | Catalog-authoritative recursive descriptors map the delivered range text to native STRUCT/LIST forms and preserve source-key identity on both runtimes. Stock Debezium's PostgreSQL multirange JDBC `1111` values are omitted, so the missing stock wire capability prevents a 5/5 end-to-end claim. |
+| 2.5 | Data type changes supported | ~~3~~ → **4** | One typed shadow-swap path creates fingerprinted UNION members and uses the canonical source range text when it exists; real PostgreSQL equality classes pass on both runtimes. The stock multirange omission means those source type-change events cannot be proven end to end without a forbidden custom converter. |
 | 2.6 | TOAST columns handled well | **4** | Sparse physical-row folding, durable NULL-vs-JSONB-root-null ambiguity refusal, and a bounded relation-lock activation fence close the soundness defects. The real-owner matrix is non-circular. Stock Debezium still lacks a marker-preserving efficient channel, so the policy ceiling remains 4. |
 | 3.1 | Backfill scalable / parallelized | 3 | 120 k rows in ~28 s single-threaded (`snapshot.max.threads=1`); works but does not scale, untested past 120 k. |
 | 3.2 | Backfills atomic | 1 | Snapshot rows are appended straight into the live table; no shadow table, no swap. |
@@ -1890,7 +1998,7 @@ membership, both tables' pre-existing rows, post-snapshot CDC rows, and one appl
 `new` audit event per relation. No config edit or second process run is used for the
 discovery itself.
 
-### 2.4 Postgres types accurately converted to native MotherDuck types — **5 / 5**
+### 2.4 Postgres types accurately converted to native MotherDuck types — **4 / 5**
 
 **FIX ROUND 2 (2026-08-08).** The production typed path now takes a
 catalog-authoritative recursive `SourceTypeDescriptor` and has no implicit
@@ -1988,7 +2096,7 @@ partial wins to sequence first: `decimal.handling.mode=string`,
 need a JSON encoding decision (DuckDB `DOUBLE` supports both natively).
 Arrays must become DuckDB `LIST`, `json`/`jsonb` must become `JSON`.
 
-### 2.5 Data type changes supported — **5 / 5**
+### 2.5 Data type changes supported — **4 / 5**
 
 **FIX ROUND 2 (2026-08-08).** Type changes use one instrumented typed shadow
 swap. UNION members carry recursive descriptor fingerprints; existing values

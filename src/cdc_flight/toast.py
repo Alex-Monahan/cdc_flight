@@ -67,6 +67,11 @@ class ToastTablePolicy:
     #: became effective. Events before this boundary cannot be judged by the
     #: current catalog value.
     full_activation_lsn: int | None = None
+    #: First source LSN at which the FULL evidence is no longer valid.  The upper
+    #: bound is exclusive, so the validity interval is
+    #: ``[full_activation_lsn, full_invalidation_lsn)``.  ``None`` means the
+    #: currently observed FULL interval is still open.
+    full_invalidation_lsn: int | None = None
 
     @property
     def efficient(self) -> bool:
@@ -84,6 +89,11 @@ class ToastTablePolicy:
             if self.full_activation_lsn is None or int(self.full_activation_lsn) <= 0:
                 return False
             if lsn is None or int(lsn) < self.full_activation_lsn:
+                return False
+            if (
+                self.full_invalidation_lsn is not None
+                and int(lsn) >= int(self.full_invalidation_lsn)
+            ):
                 return False
         return True
 
@@ -260,6 +270,7 @@ def classify_relation(
     binary_mode: str = "base64",
     hstore_mode: str = "map",
     full_activation_lsn: int | None = None,
+    full_invalidation_lsn: int | None = None,
 ) -> ToastTablePolicy:
     """Classify all fields and select one table-scoped route."""
 
@@ -289,6 +300,10 @@ def classify_relation(
         route = (
             ToastRoute.REPLICA_IDENTITY_FULL
             if str(replica_identity).lower() == "f"
+            or (
+                full_activation_lsn is not None
+                and full_invalidation_lsn is not None
+            )
             else ToastRoute.FALLBACK
         )
     elif structural:
@@ -300,6 +315,7 @@ def classify_relation(
         structural_columns=tuple(structural), residual_columns=tuple(residual),
         fixed_columns=tuple(fixed), reasons=tuple(reasons),
         full_activation_lsn=full_activation_lsn,
+        full_invalidation_lsn=full_invalidation_lsn,
     )
 
 

@@ -419,14 +419,28 @@ class CatalogWatcher:
                 if column.descriptor is not None
             }
 
-    def toast_policy_for(self, qualified: str):
-        """Return the table-scoped marker/fallback route for the latest epoch."""
+    def toast_policy_for(self, qualified: str, *, event_lsn: int | None = None):
+        """Return the route, closing an observed FULL interval at an event LSN."""
         from .toast import classify_relation
 
         with self._lock:
             relation = self.known.get(str(qualified))
             if relation is None:
                 return None
+            if (
+                event_lsn is not None
+                and str(relation.replica_identity).lower() != "f"
+                and relation.full_activation_lsn is not None
+                and relation.full_invalidation_lsn is None
+            ):
+                try:
+                    candidate = int(event_lsn)
+                except (TypeError, ValueError):
+                    candidate = 0
+                if candidate > int(relation.full_activation_lsn):
+                    relation = replace(relation, full_invalidation_lsn=candidate)
+                    self.known[str(qualified)] = relation
+                    self._dirty[str(qualified)] = relation
             return classify_relation(
                 relation.qualified,
                 relation.columns,
@@ -434,6 +448,7 @@ class CatalogWatcher:
                 binary_mode=self.binary_handling_mode,
                 hstore_mode=self.hstore_handling_mode,
                 full_activation_lsn=relation.full_activation_lsn,
+                full_invalidation_lsn=relation.full_invalidation_lsn,
             )
 
     def snapshot_names(self) -> tuple[str, ...]:

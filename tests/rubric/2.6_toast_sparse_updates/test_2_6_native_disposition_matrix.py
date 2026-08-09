@@ -85,18 +85,27 @@ def test_declared_physical_row_product_realizes_or_refuses_every_cell():
     assert all(result.kind in {"exercised", "refused"} for result in results)
     assert all(result.reason for result in results)
     assert {result.kind for result in results} == {"exercised", "refused"}
-    # Every cell was sent through the real owner. An uncovered result is allowed only
-    # when that owner itself refused the requested outcome; no machine predicate is
-    # consulted here.
+    # Every cell was sent through the real owner. A requested outcome may differ from
+    # the outcome that owner can safely provide, but that is a classified refusal,
+    # never a reachability predicate or an unhandled exception.
     assert sum(result.covered for result in results) >= 1000
-    assert all(
-        result.covered or result.reason.startswith("owner_refusal:")
-        for result in results
-    )
-    assert all(
-        result.owner
-        for result in results
-    )
+    refusal_outcomes = {
+        "ambiguous_delete": "AmbiguousDelete",
+        "toast_base_missing": "ToastBaseMissing",
+        "schema_refusal": "SchemaEvolutionRefused",
+        "swap_fault": "InjectedFault",
+    }
+    for result in results:
+        assert result.owner
+        if result.actual_outcome == "commit":
+            assert result.kind == "exercised"
+            assert result.owner == "destination_commit"
+            assert result.durable_rows is not None
+            continue
+        assert result.kind == "refused"
+        assert result.actual_outcome in refusal_outcomes
+        assert result.owner == refusal_outcomes[result.actual_outcome]
+        assert result.reason.startswith("owner_refusal:")
     assert all(result.rollback_clean for result in results)
     assert all(
         result.actual_outcome in {

@@ -12,7 +12,7 @@ from support.type_matrix import nested_matrix, scalar_matrix
 
 from cdc_flight.apply_sql import SchemaRegistry, delete_keys, insert_rows
 from cdc_flight.identity_codec import _identity_tree, identity_value
-from cdc_flight.typed_types import SourceTypeDescriptor
+from cdc_flight.typed_types import CanonicalRangeText, SourceTypeDescriptor
 
 
 def _source(kind: str, oid: int, **kwargs) -> SourceTypeDescriptor:
@@ -104,6 +104,75 @@ def test_range_and_multirange_identity_preserves_postgres_equality_classes():
     assert _identity_tree(
         ["[10,12)", "[1,3]"], int4multirange
     ) == _identity_tree(["[1,4)", "[10,12)"], int4multirange)
+
+
+def test_r5_range_residuals_use_special_infinity_and_continuous_multirange_equality():
+    """The r5 residual pair must remain in PostgreSQL's equality classes."""
+    timestamp = _source("timestamp", 1114)
+    tsrange = SourceTypeDescriptor(
+        3908, "pg_catalog.tsrange", "range", range_subtype=timestamp
+    )
+    numeric = _source("numeric", 1700)
+    numrange = SourceTypeDescriptor(
+        3906, "pg_catalog.numrange", "range", range_subtype=numeric
+    )
+    nummultirange = SourceTypeDescriptor(
+        4532,
+        "pg_catalog.nummultirange",
+        "multirange",
+        range_subtype=numrange,
+    )
+
+    special = _identity_tree("[-infinity,infinity]", tsrange)
+    unbounded = _identity_tree("(,)", tsrange)
+    assert special == _identity_tree("[-infinity,infinity]", tsrange)
+    assert special != unbounded
+
+    assert _identity_tree(
+        ["[10,20)", "[2,10)"], nummultirange
+    ) == _identity_tree(["[2,20)"], nummultirange)
+
+
+def test_canonical_range_text_survives_a_typed_shadow_key_swap():
+    """A native STRUCT readback must not turn the source text into Python repr."""
+    timestamp = _source("timestamp", 1114)
+    tsrange = SourceTypeDescriptor(
+        3908, "pg_catalog.tsrange", "range", range_subtype=timestamp
+    )
+    text = _source("text", 25)
+    value = CanonicalRangeText("[-infinity,infinity]")
+    con = duckdb.connect(":memory:", config={
+        "storage_compatibility_version": "v1.5.0",
+        "variant_minimum_shredding_size": "-1",
+    })
+    try:
+        con.execute("CREATE SCHEMA typed")
+        registry = SchemaRegistry(con, "typed")
+        registry.ensure_typed(
+            "range_shadow_key",
+            columns={"key": tsrange, "payload": text},
+            key_columns=("key",),
+        )
+        insert_rows(con, registry.get("range_shadow_key"), ["key", "payload"], [[value, "kept"]])
+        registry.convert_column_to_union("range_shadow_key", "key", tsrange, text)
+        table = registry.get("range_shadow_key")
+        assert con.execute(
+            'SELECT "cdcf_internal_id" FROM typed."range_shadow_key"'
+        ).fetchone()[0] == identity_value(
+            table, (value,), key_columns=("key",)
+        )
+        delete_keys(con, table, ("key",), [(value,)])
+        assert con.execute('SELECT count(*) FROM typed."range_shadow_key"').fetchone() == (0,)
+    finally:
+        con.close()
+
+
+def test_matrix_has_no_parallel_physical_row_reachability_predicates():
+    """Reachability must come from the owner, not a second production table."""
+    from cdc_flight import machines
+
+    assert not hasattr(machines, "PHYSICAL_ROW_PRECONDITIONS")
+    assert not hasattr(machines, "physical_row_unreachable_reason")
 
 
 def test_range_and_multirange_key_gain_deletes_equivalent_keys_after_readback():
