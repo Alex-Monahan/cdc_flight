@@ -1001,6 +1001,7 @@ def test_two_pipelines_on_one_destination_do_not_contend_for_commit_ids(tmp_path
             lease=lease,
             runner_id=f"{name}-runner",
             completion=SnapshotCompletion.streaming_only(),
+            allow_legacy_inference=True,
         )
         applier._committer = type(
             "C", (), {"markProcessed": lambda s, r: None, "markBatchFinished": lambda s: None}

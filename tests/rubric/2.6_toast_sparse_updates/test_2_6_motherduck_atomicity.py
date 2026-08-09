@@ -17,4 +17,3 @@ def test_patch_digest_is_stable_for_memory_and_spill():
     spill = RowPatch.from_dict(memory.to_dict())
     assert spill.digest == memory.digest
     assert spill.field("body").state.value == "unchanged_toast"
-

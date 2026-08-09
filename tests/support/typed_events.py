@@ -47,4 +47,3 @@ def schema_enabled_key() -> str:
         },
         "payload": {"id": 1},
     })
-

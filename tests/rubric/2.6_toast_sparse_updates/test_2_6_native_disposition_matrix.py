@@ -20,6 +20,7 @@ from cdc_flight.apply_sql import SchemaRegistry, insert_rows, update_rows
 from cdc_flight.config import DestinationConfig
 from cdc_flight.destination import DUCKDB_CONNECT_CONFIG
 from cdc_flight.destination import connect as connect_destination
+from cdc_flight.physical_row_matrix import declared_cells, exercise_cell
 from cdc_flight.planner import GroupPlan
 from cdc_flight.row_patch import RowPatch
 from cdc_flight.spill import _image_from_json, _image_json
@@ -73,6 +74,17 @@ NATIVE_CASES = (
     ("list", LIST, ['{"old":1}', None], ['{"new":2}'], "LIST", [{"old": 1}, None], [{"new": 2}]),
     ("map", MAP, {"old": '{"n":1}'}, {"new": '{"n":2}'}, "MAP", {"old": {"n": 1}}, {"new": {"n": 2}}),
 )
+
+
+def test_declared_physical_row_product_realizes_or_refuses_every_cell():
+    """The full operation/field/base/storage/outcome/identity/epoch product is closed."""
+    cells = declared_cells()
+    results = [exercise_cell(cell) for cell in cells]
+    assert len(cells) == 4 * 4 * 3 * 2 * 5 * 2 * 3
+    assert len({result.cell for result in results}) == len(cells)
+    assert all(result.kind in {"exercised", "refused"} for result in results)
+    assert all(result.reason for result in results)
+    assert {result.kind for result in results} == {"exercised", "refused"}
 
 
 @pytest.mark.parametrize(

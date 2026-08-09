@@ -1,8 +1,8 @@
 # P2b capability-gate record
 
-Date: 2026-08-07  
-Base: `main @ 2d4276e`  
-Branch: `feature/2.4-2.6-type-handling`  
+Date: 2026-08-07
+Base: `main @ 2d4276e`
+Branch: `feature/2.4-2.6-type-handling`
 Environment: Homebrew PostgreSQL 18.1 on port `15432`; Debezium 3.6.0.Final;
 MotherDuck/DuckDB runtime `v1.5.4`.
 
@@ -65,4 +65,3 @@ shipping 2.4/2.5/2.6 without a lossless TOAST marker representation.
 plan's §10 stop condition applies. Work therefore stopped before production
 type machinery, RowPatch, UNION fencing, or rubric suites were added. Rubric
 2.4, 2.5, and 2.6 are not claimed as implemented.
-

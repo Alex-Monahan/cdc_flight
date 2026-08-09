@@ -285,6 +285,9 @@ class Lab:
             runner_id="lab-runner",
             catalog=catalog,
             completion=completion,
+            # The lab intentionally exercises legacy envelopes as well as typed
+            # ones; production discovery/resnapshot callers pass False.
+            allow_legacy_inference=True,
         )
         self.applier._committer = self.committer
 

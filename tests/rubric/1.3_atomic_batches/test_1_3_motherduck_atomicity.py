@@ -80,7 +80,9 @@ def md_observed_txn(sandbox, md_token) -> dict:
         "motherduck_token": md_token,
     }
 
-    bootstrap = duckdb.connect(f"md:?motherduck_token={md_token}")
+    bootstrap = duckdb.connect(
+        f"md:?motherduck_token={md_token}", config=dest_mod.DUCKDB_CONNECT_CONFIG
+    )
     bootstrap.execute(f'CREATE DATABASE IF NOT EXISTS "{MD_DATABASE}"')
     bootstrap.close()
 
@@ -105,7 +107,7 @@ def md_observed_txn(sandbox, md_token) -> dict:
     stop = threading.Event()
 
     def _observe():
-        con = duckdb.connect(dsn)
+        con = duckdb.connect(dsn, config=dest_mod.DUCKDB_CONNECT_CONFIG)
         try:
             while not stop.is_set():
                 try:
@@ -137,7 +139,7 @@ def md_observed_txn(sandbox, md_token) -> dict:
         stop.set()
         watcher.join(timeout=15)
 
-    con = duckdb.connect(dsn)
+    con = duckdb.connect(dsn, config=dest_mod.DUCKDB_CONNECT_CONFIG)
     con.execute(REFRESH)
     try:
         yield {
@@ -214,11 +216,13 @@ def test_motherduck_fenced_spilled_overlap_is_dropped_without_owner(md_token, tm
     dataset = f"cdc_overlap_{uuid.uuid4().hex[:8]}"
     pipeline = f"md_overlap_{uuid.uuid4().hex[:8]}"
     dsn = f"md:{MD_DATABASE}?motherduck_token={md_token}"
-    bootstrap = duckdb.connect(f"md:?motherduck_token={md_token}")
+    bootstrap = duckdb.connect(
+        f"md:?motherduck_token={md_token}", config=dest_mod.DUCKDB_CONNECT_CONFIG
+    )
     bootstrap.execute(f'CREATE DATABASE IF NOT EXISTS "{MD_DATABASE}"')
     bootstrap.close()
 
-    con = duckdb.connect(dsn)
+    con = duckdb.connect(dsn, config=dest_mod.DUCKDB_CONNECT_CONFIG)
     dest_mod.ensure_control_schema(con)
     dest_mod.ensure_dataset(con, dataset)
     lease = Lease(pipeline, ttl_seconds=600)
@@ -251,6 +255,7 @@ def test_motherduck_fenced_spilled_overlap_is_dropped_without_owner(md_token, tm
         lease=lease,
         runner_id="md-overlap-runner",
         completion=completion,
+        allow_legacy_inference=True,
     )
     committer = FakeCommitter()
     applier._committer = committer
@@ -288,7 +293,7 @@ def test_motherduck_fenced_spilled_overlap_is_dropped_without_owner(md_token, tm
         assert applier.fenced_spilled_events == 0
         assert applier.snapshot_completed is True
         assert committer.marked > 0
-        verify = duckdb.connect(dsn)
+        verify = duckdb.connect(dsn, config=dest_mod.DUCKDB_CONNECT_CONFIG)
         try:
             verify.execute("FORCE CHECKPOINT")
             table = f'"{dataset}"."cdcflight_app_customers"'
@@ -311,7 +316,7 @@ def test_motherduck_fenced_spilled_overlap_is_dropped_without_owner(md_token, tm
         lease.release(con)
         applier.alerts.close()
         con.close()
-        cleanup = duckdb.connect(dsn)
+        cleanup = duckdb.connect(dsn, config=dest_mod.DUCKDB_CONNECT_CONFIG)
         try:
             cleanup.execute(f'DROP SCHEMA IF EXISTS "{dataset}" CASCADE')
         finally:

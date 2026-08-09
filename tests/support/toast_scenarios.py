@@ -17,4 +17,3 @@ def incompressible_text(size: int = 16_384) -> str:
 def body_digest(value: str | bytes) -> str:
     raw = value.encode() if isinstance(value, str) else value
     return hashlib.sha256(raw).hexdigest()
-

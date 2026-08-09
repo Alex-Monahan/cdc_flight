@@ -17,6 +17,7 @@ import pytest
 from cdc_flight.catalog_state import read_known_relations
 from cdc_flight.config import motherduck_token
 from cdc_flight.control_schema import ensure_control_schema
+from cdc_flight.destination import DUCKDB_CONNECT_CONFIG
 from cdc_flight.states import UnknownState
 
 pytestmark = [pytest.mark.motherduck, pytest.mark.e2e]
@@ -39,7 +40,9 @@ def md_connect(token: str, database: str = MD_DATABASE):
     assertion pass vacuously, so it is fixed rather than worked around.
     `FORCE CHECKPOINT` is what re-syncs the cached instance.
     """
-    con = duckdb.connect(f"md:{database}?motherduck_token={token}")
+    con = duckdb.connect(
+        f"md:{database}?motherduck_token={token}", config=DUCKDB_CONNECT_CONFIG
+    )
     con.execute("FORCE CHECKPOINT")
     return con
 
@@ -82,11 +85,15 @@ def md_token() -> str:
 def md_dataset(md_token: str):
     """A throwaway dataset per run, dropped afterwards."""
     name = f"cdc_smoke_{uuid.uuid4().hex[:8]}"
-    con = duckdb.connect(f"md:?motherduck_token={md_token}")
+    con = duckdb.connect(
+        f"md:?motherduck_token={md_token}", config=DUCKDB_CONNECT_CONFIG
+    )
     con.execute(f'CREATE DATABASE IF NOT EXISTS "{MD_DATABASE}"')
     con.close()
     yield name
-    con = duckdb.connect(f"md:{MD_DATABASE}?motherduck_token={md_token}")
+    con = duckdb.connect(
+        f"md:{MD_DATABASE}?motherduck_token={md_token}", config=DUCKDB_CONNECT_CONFIG
+    )
     try:
         con.execute(f'DROP SCHEMA IF EXISTS "{MD_DATABASE}"."{name}" CASCADE')
     finally:
@@ -145,11 +152,15 @@ def test_motherduck_token_is_available_to_the_suite(md_token):
 def test_legacy_control_schema_migration_is_motherduck_compatible(md_token):
     """The real cloud destination accepts the additive migration and its backfill."""
     database = f"cdc_control_schema_{uuid.uuid4().hex[:8]}"
-    bootstrap = duckdb.connect(f"md:?motherduck_token={md_token}")
+    bootstrap = duckdb.connect(
+        f"md:?motherduck_token={md_token}", config=DUCKDB_CONNECT_CONFIG
+    )
     bootstrap.execute(f'CREATE DATABASE "{database}"')
     bootstrap.close()
 
-    con = duckdb.connect(f"md:{database}?motherduck_token={md_token}")
+    con = duckdb.connect(
+        f"md:{database}?motherduck_token={md_token}", config=DUCKDB_CONNECT_CONFIG
+    )
     try:
         con.execute("CREATE SCHEMA _cdc_flight")
         con.execute(
@@ -186,7 +197,9 @@ def test_legacy_control_schema_migration_is_motherduck_compatible(md_token):
             read_known_relations(con, "p")
     finally:
         con.close()
-        cleanup = duckdb.connect(f"md:?motherduck_token={md_token}")
+        cleanup = duckdb.connect(
+            f"md:?motherduck_token={md_token}", config=DUCKDB_CONNECT_CONFIG
+        )
         try:
             cleanup.execute(f'DROP DATABASE "{database}"')
         finally:

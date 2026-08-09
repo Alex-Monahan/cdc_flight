@@ -11,7 +11,10 @@ from support.type_matrix import nested_matrix, scalar_matrix
 
 from cdc_flight.apply_sql import SchemaRegistry, insert_rows
 from cdc_flight.control_schema import ensure_control_schema
+from cdc_flight.destination import assert_runtime_capabilities
 from cdc_flight.envelope import KIND_DATA, PendingRecord
+from cdc_flight.errors import SchemaEvolutionRefused
+from cdc_flight.planner import GroupPlan
 from cdc_flight.spill import SpillBuffer, StagedEvent
 from cdc_flight.typed_types import (
     FieldState,
@@ -33,6 +36,200 @@ def test_json_and_jsonb_have_distinct_native_targets():
     assert native_type(json_source).sql == "JSON"
     assert native_type(jsonb_source).kind == "VARIANT"
     assert native_type(jsonb_source).sql == "VARIANT"
+
+
+def test_jsonb_key_uses_json_while_non_key_jsonb_stays_variant():
+    """JSONB is a VARIANT value, but JSON is the lossless key representation."""
+
+    con = duckdb.connect(":memory:", config={
+        "storage_compatibility_version": "v1.5.0",
+        "variant_minimum_shredding_size": "-1",
+    })
+    try:
+        con.execute("CREATE SCHEMA d")
+        registry = SchemaRegistry(con, "d")
+        integer = SourceTypeDescriptor(23, "pg_catalog.int4", "int4")
+        jsonb = SourceTypeDescriptor(3802, "pg_catalog.jsonb", "jsonb")
+        registry.ensure_typed(
+            "jsonb_keys",
+            columns={"id": jsonb, "tenant": integer, "payload": jsonb},
+            key_columns=("id", "tenant"),
+        )
+        table = registry.get("jsonb_keys")
+        assert table.raw_types["id"] == "JSON"
+        assert table.raw_types["tenant"] == "INTEGER"
+        assert table.raw_types["payload"] == "VARIANT"
+        assert table.primary_key_columns == ("id", "tenant")
+        insert_rows(
+            con,
+            table,
+            ["id", "tenant", "payload"],
+            [['{"account": 7}', 1, '{"body": true}']],
+        )
+        assert con.execute(
+            'SELECT "id", "payload" FROM d."jsonb_keys"'
+        ).fetchone() == ('{"account":7}', {"body": True})
+    finally:
+        con.close()
+
+
+def test_jsonb_key_gain_rebinds_a_composite_identity_without_variant_pk():
+    con = duckdb.connect(":memory:", config={
+        "storage_compatibility_version": "v1.5.0",
+        "variant_minimum_shredding_size": "-1",
+    })
+    try:
+        con.execute("CREATE SCHEMA d")
+        registry = SchemaRegistry(con, "d")
+        integer = SourceTypeDescriptor(23, "pg_catalog.int4", "int4")
+        jsonb = SourceTypeDescriptor(3802, "pg_catalog.jsonb", "jsonb")
+        registry.ensure_typed(
+            "key_gain",
+            columns={"id": integer, "json_key": jsonb},
+            key_columns=("id",),
+        )
+        insert_rows(con, registry.get("key_gain"), ["id", "json_key"], [[1, '{"a": 1}']])
+        registry.ensure_typed(
+            "key_gain",
+            columns={"id": integer, "json_key": jsonb},
+            key_columns=("id", "json_key"),
+        )
+        table = registry.get("key_gain")
+        assert table.raw_types["json_key"] == "JSON"
+        assert table.primary_key_columns == ("id", "json_key")
+    finally:
+        con.close()
+
+
+def test_jsonb_primary_key_rebuild_self_heals_a_legacy_variant_identity():
+    """A queued rebuild cannot repeat the old VARIANT-primary-key failure."""
+    con = duckdb.connect(":memory:", config={
+        "storage_compatibility_version": "v1.5.0",
+        "variant_minimum_shredding_size": "-1",
+    })
+    try:
+        con.execute("CREATE SCHEMA d")
+        con.execute(
+            "CREATE TABLE d.legacy_variant_key ("
+            "id VARIANT, payload VARIANT, cdcf_internal_id VARCHAR PRIMARY KEY)"
+        )
+        con.execute(
+            "INSERT INTO d.legacy_variant_key VALUES "
+            "(CAST(CAST('{\"account\":7}' AS JSON) AS VARIANT), "
+            "CAST(CAST('{\"body\":true}' AS JSON) AS VARIANT), 'legacy-row')"
+        )
+        registry = SchemaRegistry(con, "d")
+        jsonb = SourceTypeDescriptor(3802, "pg_catalog.jsonb", "jsonb")
+        registry.ensure_typed(
+            "legacy_variant_key",
+            columns={"id": jsonb, "payload": jsonb},
+            key_columns=("id",),
+        )
+        table = registry.get("legacy_variant_key")
+        assert table.raw_types["id"] == "JSON"
+        assert table.primary_key_columns == ("id",)
+        assert "cdcf_internal_id" not in table.columns
+        assert con.execute(
+            'SELECT "id", "payload" FROM d."legacy_variant_key"'
+        ).fetchone() == ('{"account":7}', {"body": True})
+    finally:
+        con.close()
+
+
+def test_jsonb_key_loss_uses_a_typed_shadow_transition_to_variant():
+    con = duckdb.connect(":memory:", config={
+        "storage_compatibility_version": "v1.5.0",
+        "variant_minimum_shredding_size": "-1",
+    })
+    try:
+        con.execute("CREATE SCHEMA d")
+        registry = SchemaRegistry(con, "d")
+        integer = SourceTypeDescriptor(23, "pg_catalog.int4", "int4")
+        jsonb = SourceTypeDescriptor(3802, "pg_catalog.jsonb", "jsonb")
+        registry.ensure_typed(
+            "key_loss",
+            columns={"id": integer, "json_key": jsonb, "payload": jsonb},
+            key_columns=("id", "json_key"),
+        )
+        insert_rows(
+            con,
+            registry.get("key_loss"),
+            ["id", "json_key", "payload"],
+            [[1, '{"a": 1}', '{"body": true}']],
+        )
+        registry.ensure_typed(
+            "key_loss",
+            columns={"id": integer, "json_key": jsonb, "payload": jsonb},
+            key_columns=("id",),
+        )
+        table = registry.get("key_loss")
+        assert table.raw_types["json_key"] == "VARIANT"
+        assert table.primary_key_columns == ("id",)
+        assert con.execute('SELECT "payload" FROM d."key_loss"').fetchone() == (
+            {"body": True},
+        )
+    finally:
+        con.close()
+
+
+def test_production_typed_path_fails_closed_when_catalog_descriptors_are_unavailable():
+    integer = SourceTypeDescriptor(23, "pg_catalog.int4", "int4")
+    event = PendingRecord(
+        raw=None,
+        kind=KIND_DATA,
+        topic="app.rows",
+        nbytes=1,
+        schema="app",
+        table="rows",
+        key={"id": 1},
+        after={"id": 1, "payload": "{}"},
+        after_descriptors={"id": integer},
+    )
+    plan = object.__new__(GroupPlan)
+    plan.descriptor_provider = lambda _qualified: (_ for _ in ()).throw(
+        OSError("catalog unavailable")
+    )
+    plan._catalog_descriptor_cache = {}
+    plan.allow_legacy_inference = False
+
+    with pytest.raises(SchemaEvolutionRefused, match="catalog descriptor"):
+        plan._enrich_descriptors(event)
+
+
+def test_tablework_numeric_adapter_is_idempotent_for_all_bounded_specials():
+    from cdc_flight.table_work import _typed_value
+    from cdc_flight.typed_types import UnionValue
+
+    con = duckdb.connect()
+    con.execute("CREATE SCHEMA d")
+    registry = SchemaRegistry(con, "d")
+    integer = SourceTypeDescriptor(23, "pg_catalog.int4", "int4")
+    numeric = SourceTypeDescriptor(
+        1700, "pg_catalog.numeric", "numeric", precision=12, scale=4
+    )
+    registry.ensure_typed("adapter_numbers", columns={"id": integer, "value": numeric}, key_columns=("id",))
+    table = registry.get("adapter_numbers")
+    for raw in ("NaN", "Infinity", "-Infinity", "1.2500", None):
+        encoded = encode_value(raw, numeric)
+        adapted = _typed_value(table, "value", encoded)
+        assert adapted == encoded
+        if encoded is not None:
+            assert isinstance(adapted, UnionValue)
+
+
+def test_runtime_capability_guard_rejects_an_effective_setting_mismatch():
+    class WrongSettings:
+        def execute(self, _sql, _params):
+            return self
+
+        def fetchall(self):
+            return [
+                ("storage_compatibility_version", "v1.4.0"),
+                ("variant_minimum_shredding_size", "-1"),
+            ]
+
+    with pytest.raises(RuntimeError, match="required VARIANT settings"):
+        assert_runtime_capabilities(WrongSettings())
 
 
 def test_descriptor_is_recursive_and_has_stable_fingerprint():

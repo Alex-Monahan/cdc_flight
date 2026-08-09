@@ -5,9 +5,19 @@ from __future__ import annotations
 import duckdb
 import pytest
 
-from cdc_flight.apply_sql import SchemaRegistry, _union_members, delete_keys, insert_rows
-from cdc_flight.table_work import _key_value
+from cdc_flight import faults
+from cdc_flight.apply_sql import (
+    SchemaRegistry,
+    _union_members,
+    delete_keys,
+    insert_rows,
+    update_rows,
+)
+from cdc_flight.envelope import KIND_DATA, PendingRecord
+from cdc_flight.row_patch import RowPatch
+from cdc_flight.table_work import TableWork, _key_value, collect, end_transaction, write
 from cdc_flight.typed_types import (
+    FieldValue,
     SourceTypeDescriptor,
     union_member_name,
     union_type,
@@ -73,6 +83,143 @@ def test_union_key_uses_internal_identity_instead_of_a_failed_primary_key():
     table = registry.get("keyed")
     assert table.primary_key_columns == ("cdcf_internal_id",)
     assert "cdcf_internal_id" in table.columns
+
+
+def test_type_changed_source_key_delete_addresses_the_old_union_member():
+    """A post-DDL delete must remove a row carrying the pre-DDL key tag."""
+
+    con = duckdb.connect()
+    con.execute("CREATE SCHEMA d")
+    registry = SchemaRegistry(con, "d")
+    integer = _source("int4", 23)
+    widened = _source("int8", 20)
+    text = _source("text", 25)
+    registry.ensure_typed(
+        "changed_keys",
+        columns={"id": integer, "value": text},
+        key_columns=("id",),
+    )
+    insert_rows(con, registry.get("changed_keys"), ["id", "value"], [[1, "old"]])
+    registry.convert_column_to_union("changed_keys", "id", integer, widened)
+
+    table = registry.get("changed_keys")
+    delete_keys(con, table, ("id",), [(_key_value(table, "id", 1),)])
+    assert con.execute('SELECT count(*) FROM d."changed_keys"').fetchone() == (0,)
+
+
+def test_type_changed_key_move_uses_old_identity_then_writes_new_member():
+    con = duckdb.connect()
+    con.execute("CREATE SCHEMA d")
+    registry = SchemaRegistry(con, "d")
+    integer = _source("int4", 23)
+    widened = _source("int8", 20)
+    text = _source("text", 25)
+    registry.ensure_typed(
+        "moved_keys",
+        columns={"id": integer, "value": text},
+        key_columns=("id",),
+    )
+    insert_rows(con, registry.get("moved_keys"), ["id", "value"], [[1, "old"]])
+    registry.convert_column_to_union("moved_keys", "id", integer, widened)
+
+    item = TableWork(
+        target="moved_keys",
+        key_columns=("id",),
+        identified=True,
+        source_schema="app",
+        source_table="moved_keys",
+    )
+    event = PendingRecord(
+        raw=None,
+        kind=KIND_DATA,
+        topic="app.moved_keys",
+        nbytes=1,
+        op="u",
+        schema="app",
+        table="moved_keys",
+        key={"id": 2},
+        before={"id": 1, "value": "old"},
+        after={"id": 2, "value": "moved"},
+        before_descriptors={"id": integer, "value": text},
+        after_descriptors={"id": widened, "value": text},
+    )
+    patch = RowPatch(
+        {
+            "id": FieldValue.of(2, widened),
+            "value": FieldValue.of("moved", text),
+        },
+        complete=True,
+    )
+
+    class Probe:
+        def start_exists(self, _item, _key):
+            return True
+
+        def start_matches(self, _item, _key, _image):
+            return True
+
+    collect(item, event, patch.encoded_values(), "move", probe=Probe(), patch=patch)
+    end_transaction(item)
+    write(con, registry, item, set())
+    assert con.execute(
+        'SELECT id, value, union_tag(id) FROM d."moved_keys"'
+    ).fetchone() == (2, "moved", union_member_name(widened))
+
+
+def test_internal_identity_and_old_key_descriptor_survive_registry_restart():
+    con = duckdb.connect()
+    con.execute("CREATE SCHEMA d")
+    integer = _source("int4", 23)
+    widened = _source("int8", 20)
+    text = _source("text", 25)
+    first = SchemaRegistry(con, "d")
+    first.ensure_typed(
+        "restart_keys",
+        columns={"id": integer, "value": text},
+        key_columns=("id",),
+    )
+    insert_rows(con, first.get("restart_keys"), ["id", "value"], [[1, "old"]])
+    first.convert_column_to_union("restart_keys", "id", integer, widened)
+
+    restarted = SchemaRegistry(con, "d")
+    restarted.ensure_typed(
+        "restart_keys",
+        columns={"id": widened, "value": text},
+        key_columns=("id",),
+    )
+    table = restarted.get("restart_keys")
+    assert table.source_key_columns == ("id",)
+    assert table.identity_descriptors["id"] == (integer,)
+    assert update_rows(
+        con, table, ("id",), [((1,), {"id": 2, "value": "moved"})]
+    ) == 1
+    assert con.execute(
+        'SELECT id, value, union_tag(id) FROM d."restart_keys"'
+    ).fetchone() == (2, "moved", union_member_name(widened))
+
+
+def test_typed_union_shadow_swap_uses_the_declared_fault_anchor(monkeypatch):
+    con = duckdb.connect()
+    con.execute("CREATE SCHEMA d")
+    registry = SchemaRegistry(con, "d")
+    integer = _source("int4", 23)
+    text = _source("text", 25)
+    registry.ensure_typed("faulted", columns={"id": integer, "value": integer}, key_columns=("id",))
+    insert_rows(con, registry.get("faulted"), ["id", "value"], [[1, 7]])
+    monkeypatch.setenv("CDC_FAULT_INJECT", "swap:1:raise")
+    faults.refresh()
+    try:
+        con.execute("BEGIN")
+        with pytest.raises(faults.InjectedFault):
+            registry.convert_column_to_union("faulted", "value", integer, text)
+        con.rollback()
+    finally:
+        monkeypatch.delenv("CDC_FAULT_INJECT", raising=False)
+        faults.refresh()
+    assert con.execute(
+        "SELECT data_type FROM information_schema.columns "
+        "WHERE table_schema='d' AND table_name='faulted' AND column_name='value'"
+    ).fetchone() == ("INTEGER",)
 
 
 def test_repeated_changes_append_once_and_typed_rows_use_the_current_member():

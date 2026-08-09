@@ -6,7 +6,8 @@ import pytest
 from support.motherduck_probe import assert_runtime, connect, scratch_database
 
 from cdc_flight.apply_sql import SchemaRegistry, insert_rows
-from cdc_flight.config import motherduck_token
+from cdc_flight.config import DestinationConfig, motherduck_token
+from cdc_flight.destination import connect as destination_connect
 from cdc_flight.typed_types import SourceTypeDescriptor
 
 pytestmark = [pytest.mark.motherduck, pytest.mark.e2e]
@@ -14,6 +15,98 @@ pytestmark = [pytest.mark.motherduck, pytest.mark.e2e]
 
 def _source(kind: str, oid: int) -> SourceTypeDescriptor:
     return SourceTypeDescriptor(oid, f"pg_catalog.{kind}", kind)
+
+
+def test_motherduck_accepts_json_as_a_jsonb_primary_key():
+    token = motherduck_token()
+    if not token:
+        pytest.skip("`motherduck_token` not set")
+
+    integer = _source("int4", 23)
+    jsonb = _source("jsonb", 3802)
+    with scratch_database(token, "cdc_p2b_json_key") as database:
+        con = connect(token, database)
+        try:
+            con.execute("CREATE SCHEMA typed")
+            registry = SchemaRegistry(con, "typed")
+            registry.ensure_typed(
+                "jsonb_key",
+                columns={"id": jsonb, "tenant": integer, "payload": jsonb},
+                key_columns=("id", "tenant"),
+            )
+            table = registry.get("jsonb_key")
+            assert table.raw_types["id"] == "JSON"
+            assert table.raw_types["payload"] == "VARIANT"
+            insert_rows(
+                con,
+                table,
+                ["id", "tenant", "payload"],
+                [['{"account": 7}', 1, '{"body": true}']],
+            )
+            assert con.execute(
+                'SELECT "id", "payload" FROM typed."jsonb_key"'
+            ).fetchone() == ('{"account":7}', {"body": True})
+        finally:
+            con.close()
+
+
+def test_motherduck_probe_connections_share_the_production_configuration():
+    token = motherduck_token()
+    if not token:
+        pytest.skip("`motherduck_token` not set")
+    with scratch_database(token, "cdc_p2b_probe_config") as database:
+        probe = connect(token, database)
+        try:
+            production = destination_connect(
+                DestinationConfig(kind="motherduck", motherduck_database=database)
+            )
+            production.close()
+        finally:
+            probe.close()
+
+
+def test_motherduck_jsonb_key_gain_and_loss_use_the_same_shadow_resolver():
+    token = motherduck_token()
+    if not token:
+        pytest.skip("`motherduck_token` not set")
+
+    integer = _source("int4", 23)
+    jsonb = _source("jsonb", 3802)
+    with scratch_database(token, "cdc_p2b_json_key_transition") as database:
+        con = connect(token, database)
+        try:
+            con.execute("CREATE SCHEMA typed")
+            registry = SchemaRegistry(con, "typed")
+            registry.ensure_typed(
+                "transitions",
+                columns={"id": integer, "json_key": jsonb, "payload": jsonb},
+                key_columns=("id",),
+            )
+            insert_rows(
+                con,
+                registry.get("transitions"),
+                ["id", "json_key", "payload"],
+                [[1, '{"a":1}', '{"body":true}']],
+            )
+            registry.ensure_typed(
+                "transitions",
+                columns={"id": integer, "json_key": jsonb, "payload": jsonb},
+                key_columns=("id", "json_key"),
+            )
+            assert registry.get("transitions").raw_types["json_key"] == "JSON"
+            registry.ensure_typed(
+                "transitions",
+                columns={"id": integer, "json_key": jsonb, "payload": jsonb},
+                key_columns=("id",),
+            )
+            table = registry.get("transitions")
+            assert table.raw_types["json_key"] == "VARIANT"
+            assert table.primary_key_columns == ("id",)
+            assert con.execute(
+                'SELECT "payload" FROM typed."transitions"'
+            ).fetchone() == ({"body": True},)
+        finally:
+            con.close()
 
 
 def test_motherduck_json_variant_nested_round_trip_and_union_shadow():

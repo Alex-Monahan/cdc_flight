@@ -30,6 +30,7 @@ import duckdb
 import pytest
 
 from cdc_flight.config import motherduck_token
+from cdc_flight.destination import DUCKDB_CONNECT_CONFIG
 
 pytestmark = [pytest.mark.motherduck, pytest.mark.e2e]
 
@@ -60,7 +61,9 @@ def md_crashed(sandbox, md_token) -> dict:
         "motherduck_token": md_token,
     }
 
-    bootstrap = duckdb.connect(f"md:?motherduck_token={md_token}")
+    bootstrap = duckdb.connect(
+        f"md:?motherduck_token={md_token}", config=DUCKDB_CONNECT_CONFIG
+    )
     bootstrap.execute(f'CREATE DATABASE IF NOT EXISTS "{MD_DATABASE}"')
     bootstrap.close()
 
@@ -92,7 +95,7 @@ def md_crashed(sandbox, md_token) -> dict:
         )
         results[anchor] = {"crashed": crashed, "recovered": recovered, "tag": tag}
 
-    con = duckdb.connect(dsn)
+    con = duckdb.connect(dsn, config=DUCKDB_CONNECT_CONFIG)
     con.execute(REFRESH)
     try:
         yield {"con": con, "dataset": dataset, "results": results, "n": N}

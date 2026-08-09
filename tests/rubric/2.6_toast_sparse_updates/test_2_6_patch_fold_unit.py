@@ -22,7 +22,7 @@ from cdc_flight.errors import AmbiguousDelete
 from cdc_flight.row_patch import RowPatch
 from cdc_flight.schema_evolution import SourceColumn
 from cdc_flight.spill import _image_from_json, _image_json
-from cdc_flight.table_work import TOAST_PLACEHOLDER
+from cdc_flight.table_work import START, TOAST_PLACEHOLDER, TableWork, _target_entry
 from cdc_flight.toast import (
     STRUCTURAL_MARKER,
     ToastRoute,
@@ -31,7 +31,7 @@ from cdc_flight.toast import (
     field_value,
     is_structural_marker,
 )
-from cdc_flight.typed_types import FieldState, SourceTypeDescriptor, TypedImage
+from cdc_flight.typed_types import FieldState, FieldValue, SourceTypeDescriptor, TypedImage
 
 
 def source(name: str, kind: str, *, oid: int = 25, element=None):
@@ -69,6 +69,35 @@ HSTORE_ARRAY = source(
     "public.hstore[]", "array", oid=9998,
     element=HSTORE,
 )
+
+
+def test_variant_null_attribution_never_prefers_the_start_row():
+    """Collapsed SQL NULL/JSON-null equality is an ambiguity, not a match."""
+
+    item = TableWork(target="typed.rows", key_columns=("id",), descriptors={"payload": JSONB})
+
+    class Probe:
+        def start_exists(self, _item, _key):
+            return True
+
+        def start_matches(self, _item, _key, _image):
+            # DuckDB reports both SQL NULL and a JSONB root null as VARIANT_NULL.
+            return True
+
+    entries = [
+        START,
+        RowPatch({"payload": FieldValue.explicit_null(JSONB)}),
+    ]
+    with pytest.raises(AmbiguousDelete, match="null"):
+        _target_entry(
+            item,
+            (1,),
+            entries,
+            {"payload": None},
+            Probe(),
+            "delete",
+            descriptors={"payload": JSONB},
+        )
 
 
 @pytest.mark.parametrize("descriptor", [TEXT, VARCHAR, CHAR, JSON, JSONB, XML])
@@ -196,6 +225,22 @@ def test_replica_identity_full_is_the_verified_residual_route():
         "app.events", [("payload", BYTEA, "x")], replica_identity="f"
     )
     assert policy.route is ToastRoute.REPLICA_IDENTITY_FULL
+
+
+def test_event_before_full_activation_is_not_admitted_by_the_current_policy():
+    relation = _residual_relation()
+    watcher = SimpleNamespace(binary_handling_mode="base64", hstore_handling_mode="map")
+    observed = _ensure_toast_policies(
+        watcher,
+        _PolicyConnection(),
+        {relation.qualified: relation},
+        activation_lsn=100,
+    )
+    policy = observed[relation.qualified].toast_policy
+    assert policy.route is ToastRoute.REPLICA_IDENTITY_FULL
+    assert policy.full_activation_lsn == 100
+    assert policy.accepts_event(99) is False
+    assert policy.accepts_event(100) is True
 
 
 class _PolicyConnection:

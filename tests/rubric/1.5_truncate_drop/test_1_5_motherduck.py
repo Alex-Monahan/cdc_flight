@@ -23,6 +23,7 @@ import duckdb
 import pytest
 
 from cdc_flight.config import motherduck_token
+from cdc_flight.destination import DUCKDB_CONNECT_CONFIG
 
 pytestmark = [pytest.mark.motherduck, pytest.mark.e2e]
 
@@ -64,7 +65,9 @@ def md_truncate_drop(sandbox, md_token) -> dict:
         "CDC_CATALOG_POLL_SECONDS": "1",
     }
 
-    bootstrap = duckdb.connect(f"md:?motherduck_token={md_token}")
+    bootstrap = duckdb.connect(
+        f"md:?motherduck_token={md_token}", config=DUCKDB_CONNECT_CONFIG
+    )
     bootstrap.execute(f'CREATE DATABASE IF NOT EXISTS "{MD_DATABASE}"')
     bootstrap.close()
 
@@ -100,7 +103,7 @@ def md_truncate_drop(sandbox, md_token) -> dict:
         timeout=600, extra_env=env,
     )
 
-    con = duckdb.connect(dsn)
+    con = duckdb.connect(dsn, config=DUCKDB_CONNECT_CONFIG)
     con.execute(REFRESH)
     try:
         yield {"box": box, "con": con, "dataset": dataset, "pipeline": pipeline,
@@ -242,7 +245,7 @@ def md_truncate_rollback(sandbox, md_token) -> dict:
         expect_success=False,
         extra_env={**env, "CDC_FAULT_INJECT": "pre_commit:1:raise"},
     )
-    con = duckdb.connect(dsn)
+    con = duckdb.connect(dsn, config=DUCKDB_CONNECT_CONFIG)
     con.execute(REFRESH)
     after_failure = con.execute(
         f'SELECT id FROM "{dataset}"."{TR}" ORDER BY id'
@@ -260,7 +263,7 @@ def md_truncate_rollback(sandbox, md_token) -> dict:
         destination="motherduck", max_seconds=300, idle_seconds=8, timeout=600,
         extra_env=env,
     )
-    con = duckdb.connect(dsn)
+    con = duckdb.connect(dsn, config=DUCKDB_CONNECT_CONFIG)
     con.execute(REFRESH)
     try:
         yield {
