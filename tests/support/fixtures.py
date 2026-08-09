@@ -17,7 +17,9 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -49,8 +51,14 @@ sys.path.insert(0, str(PROJECT_DIR / "src"))
 # drivers; the repository's top-level conftest adds `tests/` to `sys.path`.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cdc_flight.config import DestinationConfig, ReplicationConfig, SourceConfig
+from cdc_flight.config import (
+    DestinationConfig,
+    ReplicationConfig,
+    SourceConfig,
+    motherduck_token,
+)
 from support import postgres_test_instance
+from support.motherduck_probe import _drop_database, _drop_schema, create_database
 
 POSTGRES_TEST_INSTANCE = postgres_test_instance.INSTANCE
 PG_SH = POSTGRES_TEST_INSTANCE.pg_sh
@@ -310,6 +318,64 @@ def duck(cdc_env: dict[str, str]):
         return duckdb.connect(path, read_only=True)
 
     return _connect
+
+
+# --------------------------------------------------------------------------- #
+# MotherDuck state
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class MotherDuckWorker:
+    """One cloud database owned by one pytest worker for the whole session."""
+
+    token: str
+    database: str
+    worker_id: str
+
+
+def _motherduck_worker_id() -> str:
+    raw = os.environ.get("PYTEST_XDIST_WORKER", "serial")
+    return re.sub(r"[^a-z0-9_]", "_", raw.lower()).strip("_") or "serial"
+
+
+@pytest.fixture(scope="session")
+def motherduck_worker() -> Iterator[MotherDuckWorker]:
+    """Create exactly one clearly named MotherDuck database per xdist worker."""
+
+    token = motherduck_token()
+    if not token:
+        pytest.skip("`motherduck_token` not set")
+    worker_id = _motherduck_worker_id()
+    database = (
+        f"cdc_flight_md_{TEST_INSTANCE_ID}_{worker_id}_{uuid.uuid4().hex[:10]}"
+    )
+    create_database(token, database)
+    try:
+        yield MotherDuckWorker(token, database, worker_id)
+    finally:
+        _drop_database(token, database)
+
+
+@pytest.fixture
+def motherduck_case(motherduck_worker: MotherDuckWorker) -> Iterator[dict[str, str]]:
+    """Give one test a unique schema inside its worker-owned database."""
+
+    suffix = uuid.uuid4().hex[:10]
+    control_schema = f"_cdc_flight_{motherduck_worker.worker_id}_{suffix}"
+    dataset = f"cdc_md_{motherduck_worker.worker_id}_{suffix}"
+    try:
+        yield {
+            "token": motherduck_worker.token,
+            "database": motherduck_worker.database,
+            "worker_id": motherduck_worker.worker_id,
+            "control_schema": control_schema,
+            "dataset": dataset,
+        }
+    finally:
+        _drop_schema(
+            motherduck_worker.token,
+            motherduck_worker.database,
+            control_schema,
+        )
 
 
 # --------------------------------------------------------------------------- #

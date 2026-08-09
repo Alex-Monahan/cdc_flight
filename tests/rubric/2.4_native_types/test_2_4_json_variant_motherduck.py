@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
-from support.motherduck_probe import assert_runtime, connect, scratch_database
+from support.motherduck_probe import assert_runtime, connect
 
 from cdc_flight.apply_sql import SchemaRegistry, insert_rows
-from cdc_flight.config import motherduck_token
+from cdc_flight.naming import quote
 from cdc_flight.typed_types import SourceTypeDescriptor
 
 pytestmark = [pytest.mark.motherduck, pytest.mark.e2e]
@@ -16,10 +18,10 @@ def _source(kind: str, oid: int) -> SourceTypeDescriptor:
     return SourceTypeDescriptor(oid, f"pg_catalog.{kind}", kind)
 
 
-def test_motherduck_json_variant_nested_round_trip_and_union_shadow():
-    token = motherduck_token()
-    if not token:
-        pytest.skip("`motherduck_token` not set")
+def test_motherduck_json_variant_nested_round_trip_and_union_shadow(motherduck_case):
+    token = motherduck_case["token"]
+    typed = motherduck_case["control_schema"]
+    quoted_typed = quote(typed)
 
     integer = _source("int4", 23)
     text = _source("text", 25)
@@ -51,12 +53,12 @@ def test_motherduck_json_variant_nested_round_trip_and_union_shadow():
         map_value=text,
     )
 
-    with scratch_database(token, "cdc_p2b_json_variant") as database:
+    with contextlib.nullcontext(motherduck_case["database"]) as database:
         con = connect(token, database)
         try:
             assert_runtime(con)
-            con.execute("CREATE SCHEMA typed")
-            registry = SchemaRegistry(con, "typed")
+            con.execute(f"CREATE SCHEMA {quoted_typed}")
+            registry = SchemaRegistry(con, typed)
             registry.ensure_typed(
                 "native_values",
                 columns={
@@ -92,7 +94,8 @@ def test_motherduck_json_variant_nested_round_trip_and_union_shadow():
             types = dict(
                 con.execute(
                     "SELECT column_name, data_type FROM information_schema.columns "
-                    "WHERE table_schema='typed' AND table_name='native_values'"
+                    "WHERE table_schema=? AND table_name='native_values'",
+                    [typed],
                 ).fetchall()
             )
             assert types["json_value"] == "JSON"
@@ -104,9 +107,9 @@ def test_motherduck_json_variant_nested_round_trip_and_union_shadow():
             assert types["attrs"] == "MAP(VARCHAR, VARCHAR)"
 
             rows = con.execute(
-                "SELECT id, json_value, jsonb_value, variant_typeof(jsonb_value), "
-                "jsonb_array, payload, payloads, attrs "
-                "FROM typed.native_values ORDER BY id"
+                f"SELECT id, json_value, jsonb_value, variant_typeof(jsonb_value), "
+                f"jsonb_array, payload, payloads, attrs "
+                f"FROM {quoted_typed}.native_values ORDER BY id"
             ).fetchall()
             assert rows[0][1] == '{"b":[1,{"unicode":"é🙂"}],"a":1}'
             assert rows[0][2] == {"a": 3, "b": 1}
@@ -121,15 +124,15 @@ def test_motherduck_json_variant_nested_round_trip_and_union_shadow():
             assert rows[2][2] is None and rows[2][4] is None and rows[2][5] is None
 
             con.execute(
-                "CREATE TABLE typed.jsonb_nulls (id INTEGER, value VARIANT)"
+                f"CREATE TABLE {quoted_typed}.jsonb_nulls (id INTEGER, value VARIANT)"
             )
             con.execute(
-                "INSERT INTO typed.jsonb_nulls VALUES "
+                f"INSERT INTO {quoted_typed}.jsonb_nulls VALUES "
                 "(1, CAST(JSON 'null' AS VARIANT)), (2, NULL)"
             )
             assert con.execute(
-                "SELECT variant_typeof(value), value IS NULL "
-                "FROM typed.jsonb_nulls ORDER BY id"
+                f"SELECT variant_typeof(value), value IS NULL "
+                f"FROM {quoted_typed}.jsonb_nulls ORDER BY id"
             ).fetchall() == [("VARIANT_NULL", True), ("VARIANT_NULL", True)]
 
             registry.ensure_typed(
@@ -147,11 +150,12 @@ def test_motherduck_json_variant_nested_round_trip_and_union_shadow():
             )
             physical = con.execute(
                 "SELECT data_type FROM information_schema.columns "
-                "WHERE table_schema='typed' AND table_name='changes' AND column_name='value'"
+                "WHERE table_schema=? AND table_name='changes' AND column_name='value'",
+                [typed],
             ).fetchone()[0]
             assert "JSON" in physical and "VARIANT" in physical
             changed = con.execute(
-                "SELECT union_tag(value), value FROM typed.changes ORDER BY id"
+                f"SELECT union_tag(value), value FROM {quoted_typed}.changes ORDER BY id"
             ).fetchall()
             assert changed[0][1] == '{"old":1}'
             assert changed[1][1] == {"a": 1, "new": 2}
@@ -160,10 +164,10 @@ def test_motherduck_json_variant_nested_round_trip_and_union_shadow():
             con.close()
 
 
-def test_motherduck_json_variant_edge_states_and_multidimensional_lists():
-    token = motherduck_token()
-    if not token:
-        pytest.skip("`motherduck_token` not set")
+def test_motherduck_json_variant_edge_states_and_multidimensional_lists(motherduck_case):
+    token = motherduck_case["token"]
+    typed = motherduck_case["control_schema"]
+    quoted_typed = quote(typed)
 
     integer = _source("int4", 23)
     text = _source("text", 25)
@@ -179,12 +183,12 @@ def test_motherduck_json_variant_edge_states_and_multidimensional_lists():
         9002, "public.hstore", "map", map_key=text, map_value=text
     )
 
-    with scratch_database(token, "cdc_p2b_json_variant_edges") as database:
+    with contextlib.nullcontext(motherduck_case["database"]) as database:
         con = connect(token, database)
         try:
             assert_runtime(con)
-            con.execute("CREATE SCHEMA typed")
-            registry = SchemaRegistry(con, "typed")
+            con.execute(f"CREATE SCHEMA {quoted_typed}")
+            registry = SchemaRegistry(con, typed)
             registry.ensure_typed(
                 "edge_values",
                 columns={
@@ -216,7 +220,8 @@ def test_motherduck_json_variant_edge_states_and_multidimensional_lists():
             types = dict(
                 con.execute(
                     "SELECT column_name, data_type FROM information_schema.columns "
-                    "WHERE table_schema='typed' AND table_name='edge_values'"
+                    "WHERE table_schema=? AND table_name='edge_values'",
+                    [typed],
                 ).fetchall()
             )
             assert types["json_value"] == "JSON"
@@ -224,8 +229,8 @@ def test_motherduck_json_variant_edge_states_and_multidimensional_lists():
             assert types["jsonb_array"] == "VARIANT[]"
             assert types["jsonb_matrix"] == "VARIANT[][]"
             rows = con.execute(
-                "SELECT id, json_value, jsonb_value, variant_typeof(jsonb_value), "
-                "jsonb_array, jsonb_matrix, attrs FROM typed.edge_values ORDER BY id"
+                f"SELECT id, json_value, jsonb_value, variant_typeof(jsonb_value), "
+                f"jsonb_array, jsonb_matrix, attrs FROM {quoted_typed}.edge_values ORDER BY id"
             ).fetchall()
             assert rows[0][1] == large_json
             assert len(rows[0][2]["payload"]) == len(large)

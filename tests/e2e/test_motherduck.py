@@ -1,7 +1,7 @@
 """MotherDuck smoke test.
 
 Deselected by `make test`; run with `make test-md` or `pytest -m motherduck`.
-Kept deliberately light - one snapshot load into `cdc_flight_dev`.
+The snapshot runs in the current xdist worker's database.
 """
 
 from __future__ import annotations
@@ -77,14 +77,12 @@ def md_token() -> str:
 
 
 @pytest.fixture
-def md_case(md_token: str):
-    """A complete per-test MotherDuck database and control schema."""
-    with scratch_database(md_token, "cdc_smoke") as database:
-        yield {
-            "database": database,
-            "dataset": f"cdc_smoke_{uuid.uuid4().hex[:8]}",
-            "control_schema": f"_cdc_flight_{uuid.uuid4().hex[:8]}",
-        }
+def md_case(motherduck_case):
+    """A complete per-test case in the current worker database."""
+    return {
+        **motherduck_case,
+        "dataset": f"cdc_smoke_{uuid.uuid4().hex[:8]}",
+    }
 
 
 def test_snapshot_loads_into_motherduck(fresh_seed, run_pipeline, md_token, md_case):

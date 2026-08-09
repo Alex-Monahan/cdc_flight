@@ -31,7 +31,6 @@ import uuid
 import duckdb
 import pytest
 from support.applier_lab import FakeCommitter, begin, end, keyed, snap
-from support.motherduck_probe import scratch_database
 
 from cdc_flight import destination as dest_mod
 from cdc_flight.applier import Applier
@@ -64,32 +63,32 @@ def md_token() -> str:
 
 
 @pytest.fixture
-def md_observed_txn(sandbox, md_token) -> dict:
+def md_observed_txn(sandbox, md_token, motherduck_case) -> dict:
     """Stream one multi-table PG transaction into MotherDuck, watching from outside.
 
     The observer polls both tables from a *separate* MotherDuck connection while
     the pipeline writes, and records every `(customers, orders)` pair it sees.
     An atomic implementation can only ever be observed at `(0, 0)` or `(N, N)`.
     """
-    with scratch_database(md_token, "cdc_atomic") as database:
-        dataset = f"cdc_atomic_{uuid.uuid4().hex[:8]}"
-        control_schema = f"_cdc_flight_{uuid.uuid4().hex[:8]}"
-        dsn = f"md:{database}?motherduck_token={md_token}"
-        env = {
-            "CDC_DATASET": dataset,
-            "CDC_MD_DATABASE": database,
-            "CDC_CONTROL_SCHEMA": control_schema,
-            "MOTHERDUCK_TOKEN": md_token,
-            "motherduck_token": md_token,
-        }
+    database = motherduck_case["database"]
+    dataset = f"cdc_atomic_{uuid.uuid4().hex[:8]}"
+    control_schema = motherduck_case["control_schema"]
+    dsn = f"md:{database}?motherduck_token={md_token}"
+    env = {
+        "CDC_DATASET": dataset,
+        "CDC_MD_DATABASE": database,
+        "CDC_CONTROL_SCHEMA": control_schema,
+        "MOTHERDUCK_TOKEN": md_token,
+        "motherduck_token": md_token,
+    }
 
-        sandbox.reseed()
-        sandbox.run(
-            reset_state=True, destination="motherduck", max_seconds=300,
-            timeout=600, extra_env=env,
-        )
+    sandbox.reseed()
+    sandbox.run(
+        reset_state=True, destination="motherduck", max_seconds=300,
+        timeout=600, extra_env=env,
+    )
 
-        sandbox.sql(
+    sandbox.sql(
         [
             "INSERT INTO app.customers (name, email) SELECT "
             "'mdatomic-c-' || i, 'mdatomic-c-' || i || '@example.com' "
@@ -100,66 +99,62 @@ def md_observed_txn(sandbox, md_token) -> dict:
         one_transaction=True,
     )
 
-        observations: list[tuple[int, int]] = []
-        stop = threading.Event()
+    observations: list[tuple[int, int]] = []
+    stop = threading.Event()
 
-        def _observe():
-            con = duckdb.connect(dsn)
-            try:
-                while not stop.is_set():
-                    try:
-                        con.execute(REFRESH)
-                        row = con.execute(
-                            f'SELECT (SELECT count(*) FROM "{dataset}"."cdcflight_app_customers" '
-                            "        WHERE name LIKE 'mdatomic-c-%'), "
-                            f'       (SELECT count(*) FROM "{dataset}"."cdcflight_app_orders" o '
-                            f'        WHERE EXISTS (SELECT 1 FROM "{dataset}"."cdcflight_app_customers" c '
-                            "                      WHERE c.id = o.customer_id "
-                            "                        AND c.name LIKE 'mdatomic-c-%'))"
-                        ).fetchone()
-                        observations.append((int(row[0]), int(row[1])))
-                    except duckdb.Error:
-                        observations.append((0, 0))  # tables not created yet
-                    stop.wait(0.25)
-            finally:
-                con.close()
-
-        watcher = threading.Thread(target=_observe, name="md-observer", daemon=True)
-        watcher.start()
-        try:
-            streamed = sandbox.run(
-                destination="motherduck", max_seconds=400, idle_seconds=10,
-                timeout=700, extra_env=env,
-            )
-        finally:
-            time.sleep(1.0)
-            stop.set()
-            watcher.join(timeout=15)
-
+    def _observe():
         con = duckdb.connect(dsn)
-        con.execute(REFRESH)
         try:
-            yield {
-                "box": sandbox,
-                "con": con,
-                "database": database,
-                "control_schema": control_schema,
-                "dataset": dataset,
-                "streamed": streamed,
-                "observations": observations,
-                "n": N,
-            }
+            while not stop.is_set():
+                try:
+                    con.execute(REFRESH)
+                    row = con.execute(
+                        f'SELECT (SELECT count(*) FROM "{dataset}"."cdcflight_app_customers" '
+                        "        WHERE name LIKE 'mdatomic-c-%'), "
+                        f'       (SELECT count(*) FROM "{dataset}"."cdcflight_app_orders" o '
+                        f'        WHERE EXISTS (SELECT 1 FROM "{dataset}"."cdcflight_app_customers" c '
+                        "                      WHERE c.id = o.customer_id "
+                        "                        AND c.name LIKE 'mdatomic-c-%'))"
+                    ).fetchone()
+                    observations.append((int(row[0]), int(row[1])))
+                except duckdb.Error:
+                    observations.append((0, 0))  # tables not created yet
+                stop.wait(0.25)
         finally:
             con.close()
 
+    watcher = threading.Thread(target=_observe, name="md-observer", daemon=True)
+    watcher.start()
+    try:
+        streamed = sandbox.run(
+            destination="motherduck", max_seconds=400, idle_seconds=10,
+            timeout=700, extra_env=env,
+        )
+    finally:
+        time.sleep(1.0)
+        stop.set()
+        watcher.join(timeout=15)
+
+    con = duckdb.connect(dsn)
+    con.execute(REFRESH)
+    try:
+        yield {
+            "box": sandbox,
+            "con": con,
+            "database": database,
+            "control_schema": control_schema,
+            "dataset": dataset,
+            "streamed": streamed,
+            "observations": observations,
+            "n": N,
+        }
+    finally:
+        con.close()
+
 
 @pytest.fixture
-def md_case(md_token):
-    with scratch_database(md_token, "cdc_overlap") as database:
-        yield {
-            "database": database,
-            "control_schema": f"_cdc_flight_{uuid.uuid4().hex[:8]}",
-        }
+def md_case(motherduck_case):
+    return motherduck_case
 
 
 def test_scenario_reached_motherduck(md_observed_txn):

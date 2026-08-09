@@ -43,11 +43,38 @@ def scratch_database(token: str, prefix: str) -> Iterator[str]:
         _drop_database(token, database)
 
 
+def create_database(token: str, database: str) -> None:
+    """Create one named MotherDuck database for a worker-owned test session."""
+
+    bootstrap = duckdb.connect(f"md:?motherduck_token={token}")
+    try:
+        bootstrap.execute(f"CREATE DATABASE {quote(database)}")
+    finally:
+        bootstrap.close()
+
+
 def _database_names(connect_factory=duckdb.connect, *, token: str) -> set[str]:
     """Read the account catalog through a newly opened connection."""
     con = connect_factory(f"md:?motherduck_token={token}")
     try:
         return {str(row[0]) for row in con.execute("SHOW DATABASES").fetchall()}
+    finally:
+        con.close()
+
+
+def _schema_names(
+    connect_factory=duckdb.connect, *, token: str, database: str
+) -> set[str]:
+    """Read one database's schemas through a newly opened connection."""
+
+    con = connect_factory(f"md:{database}?motherduck_token={token}")
+    try:
+        return {
+            str(row[0])
+            for row in con.execute(
+                "SELECT schema_name FROM information_schema.schemata"
+            ).fetchall()
+        }
     finally:
         con.close()
 
@@ -92,4 +119,46 @@ def _drop_database(
             time.sleep(delay)
     raise RuntimeError(
         f"could not prove MotherDuck scratch database {database!r} was dropped"
+    ) from last_error
+
+
+def _drop_schema(
+    token: str,
+    database: str,
+    schema: str,
+    *,
+    connect_factory=duckdb.connect,
+    attempts: int = 5,
+    delay: float = 1.0,
+) -> None:
+    """Drop a per-test schema, prove absence, and surface every failure."""
+
+    if attempts < 1:
+        raise ValueError("attempts must be positive")
+    last_error: BaseException | None = None
+    for attempt in range(attempts):
+        last_error = None
+        cleanup = connect_factory(f"md:{database}?motherduck_token={token}")
+        try:
+            cleanup.execute(f"DROP SCHEMA IF EXISTS {quote(schema)} CASCADE")
+        except BaseException as exc:
+            last_error = exc
+        finally:
+            cleanup.close()
+        if last_error is None:
+            try:
+                names = _schema_names(
+                    connect_factory, token=token, database=database
+                )
+                if schema not in names:
+                    return
+                last_error = RuntimeError(
+                    f"MotherDuck still lists test schema {schema!r} after DROP"
+                )
+            except BaseException as exc:
+                last_error = exc
+        if attempt + 1 < attempts:
+            time.sleep(delay)
+    raise RuntimeError(
+        f"could not prove MotherDuck test schema {schema!r} was dropped"
     ) from last_error

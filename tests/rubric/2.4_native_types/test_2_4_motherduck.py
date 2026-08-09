@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 from decimal import Decimal
 
 import pytest
-from support.motherduck_probe import assert_runtime, connect, scratch_database
+from support.motherduck_probe import assert_runtime, connect
 
 from cdc_flight.apply_sql import SchemaRegistry, insert_rows
-from cdc_flight.config import motherduck_token
+from cdc_flight.naming import quote
 from cdc_flight.typed_types import SourceTypeDescriptor
 
 pytestmark = [pytest.mark.motherduck, pytest.mark.e2e]
@@ -18,10 +19,10 @@ def _source(kind: str, oid: int) -> SourceTypeDescriptor:
     return SourceTypeDescriptor(oid, f"pg_catalog.{kind}", kind)
 
 
-def test_motherduck_accepts_native_nested_types_and_specials():
-    token = motherduck_token()
-    if not token:
-        pytest.skip("`motherduck_token` not set")
+def test_motherduck_accepts_native_nested_types_and_specials(motherduck_case):
+    token = motherduck_case["token"]
+    typed = motherduck_case["control_schema"]
+    quoted_typed = quote(typed)
 
     integer = _source("int4", 23)
     text = _source("text", 25)
@@ -45,12 +46,12 @@ def test_motherduck_accepts_native_nested_types_and_specials():
         9003, "app.mood", "enum", enum_labels=("calm", "alert")
     )
 
-    with scratch_database(token, "cdc_p2b_24") as database:
+    with contextlib.nullcontext(motherduck_case["database"]) as database:
         con = connect(token, database)
         try:
             assert_runtime(con)
-            con.execute("CREATE SCHEMA typed")
-            registry = SchemaRegistry(con, "typed")
+            con.execute(f"CREATE SCHEMA {quoted_typed}")
+            registry = SchemaRegistry(con, typed)
             registry.ensure_typed(
                 "native_values",
                 columns={
@@ -80,7 +81,8 @@ def test_motherduck_accepts_native_nested_types_and_specials():
             types = dict(
                 con.execute(
                     "SELECT column_name, data_type FROM information_schema.columns "
-                    "WHERE table_schema = 'typed' AND table_name = 'native_values'"
+                    "WHERE table_schema = ? AND table_name = 'native_values'",
+                    [typed],
                 ).fetchall()
             )
             assert types["payload"].startswith("STRUCT(")
@@ -90,8 +92,8 @@ def test_motherduck_accepts_native_nested_types_and_specials():
             assert types["mood"].startswith("ENUM(")
             assert types["double_value"] == "DOUBLE"
             row = con.execute(
-                "SELECT payload.amount, payload.values, attrs['site'], "
-                "nested, mood, isinf(double_value) FROM typed.native_values"
+                f"SELECT payload.amount, payload.values, attrs['site'], "
+                f"nested, mood, isinf(double_value) FROM {quoted_typed}.native_values"
             ).fetchone()
             assert row[0] == Decimal("12.3400")
             assert row[1] == [1, 2]
@@ -99,7 +101,7 @@ def test_motherduck_accepts_native_nested_types_and_specials():
             assert row[3] == [[1, 2], []]
             assert row[4:] == ("calm", True)
             assert con.execute(
-                "SELECT union_tag(payload.amount) FROM typed.native_values"
+                f"SELECT union_tag(payload.amount) FROM {quoted_typed}.native_values"
             ).fetchone() == ("finite",)
         finally:
             con.close()

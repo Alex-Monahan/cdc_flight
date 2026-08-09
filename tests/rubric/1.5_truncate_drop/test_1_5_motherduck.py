@@ -21,7 +21,6 @@ import uuid
 
 import duckdb
 import pytest
-from support.motherduck_probe import scratch_database
 
 from cdc_flight.config import motherduck_token
 
@@ -45,12 +44,8 @@ def md_token() -> str:
 
 
 @pytest.fixture
-def md_database(md_token):
-    with scratch_database(md_token, "cdc_15") as database:
-        yield {
-            "database": database,
-            "control_schema": f"_cdc_flight_{uuid.uuid4().hex[:8]}",
-        }
+def md_database(motherduck_case):
+    return motherduck_case
 
 
 @pytest.fixture

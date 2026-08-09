@@ -52,11 +52,11 @@ PYTEST_XDIST_ARGS ?= -n $(PYTEST_WORKERS) --dist=loadscope --max-worker-restart=
 # the post-change run; eight/ten workers exposed timing-proof and DuckDB failures.
 PYTEST_SLOW_WORKERS ?= 6
 PYTEST_SLOW_XDIST_ARGS ?= -n $(PYTEST_SLOW_WORKERS) --dist=loadscope --max-worker-restart=0
-# MotherDuck scenarios use per-test databases and control schemas. Four workers
-# stayed green in the post-isolation probe; the committed lane uses that measured
-# concurrency.
-PYTEST_MD_WORKERS ?= 4
-PYTEST_MD_XDIST_ARGS ?= -n $(PYTEST_MD_WORKERS) --dist=loadscope --max-worker-restart=0
+# MotherDuck scenarios use one database per worker and a unique control schema
+# per test. Eight workers with node-level distribution are the highest measured
+# green setting for this lane; default and slow worker counts stay independent.
+PYTEST_MD_WORKERS ?= 8
+PYTEST_MD_XDIST_ARGS ?= -n $(PYTEST_MD_WORKERS) --dist=load --max-worker-restart=0
 
 .DEFAULT_GOAL := help
 
