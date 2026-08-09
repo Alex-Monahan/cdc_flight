@@ -234,7 +234,7 @@ format versioning, legacy-build candidate lookup, or conversion backfill was add
 The current-version descriptor history used by a typed shadow swap is a separate,
 active-build schema-evolution mechanism and is covered by the 2.5 property tests.
 
-Final required-lane evidence for this round is 1,458 default tests, 128 slow tests,
+Final required-lane evidence for this round is 1,459 default tests, 128 slow tests,
 37 MotherDuck tests, and a clean `make lint` run.
 
 ### TODO 1.1 / 1.2 / 1.3 — the transactional applier (implemented 2026-07-30)
@@ -1836,7 +1836,9 @@ also found `json` has no PostgreSQL B-tree operator class (so it is not a valid
 source primary-key type), while `jsonb` is valid and uses the indexed JSON
 representation at both runtimes. Interval is valid in PostgreSQL but is now
 explicitly internal-identity-only at the destination. The strict descriptor miss
-test proves the automatic refusal → durable `awaiting_snapshot` route.
+test proves the automatic refusal → durable `awaiting_snapshot` route. The explicit
+interval lifecycle regression covers creation, replay delete/reinsert, typed
+migration, and final delete through the internal identity path.
 
 `most types text/json=1, core scalars well (nested as text)=3, (nested as json)=4, full=5`
 

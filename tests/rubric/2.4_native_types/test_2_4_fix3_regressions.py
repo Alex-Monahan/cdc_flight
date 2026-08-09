@@ -93,6 +93,47 @@ def test_interval_is_a_valid_source_key_but_uses_internal_identity():
         con.close()
 
 
+def test_interval_key_creation_migration_and_replay_keep_one_identity_path():
+    interval = _source("interval", 1186)
+    text = _source("text", 25)
+    con = duckdb.connect(":memory:", config={
+        "storage_compatibility_version": "v1.5.0",
+        "variant_minimum_shredding_size": "-1",
+    })
+    try:
+        con.execute("CREATE SCHEMA typed")
+        registry = SchemaRegistry(con, "typed")
+        registry.ensure_typed(
+            "interval_lifecycle",
+            columns={"key": interval, "payload": text},
+            key_columns=("key",),
+        )
+        table = registry.get("interval_lifecycle")
+        value = "P1Y2M3DT4H5M6S"
+
+        # Replay uses the same source-key identity for the delete and the next
+        # insert; it must never need a destination INTERVAL index.
+        insert_rows(con, table, ["key", "payload"], [[value, "first"]])
+        delete_keys(con, table, ("key",), [(value,)])
+        assert con.execute('SELECT count(*) FROM typed."interval_lifecycle"').fetchone()[0] == 0
+        insert_rows(con, table, ["key", "payload"], [[value, "replayed"]])
+        before = con.execute(
+            'SELECT "cdcf_internal_id" FROM typed."interval_lifecycle"'
+        ).fetchone()[0]
+
+        # A current-version type change must carry the existing ID across the
+        # shadow copy instead of deriving it from a readback INTERVAL/UNION value.
+        registry.convert_column_to_union("interval_lifecycle", "key", interval, text)
+        after = con.execute(
+            'SELECT "cdcf_internal_id" FROM typed."interval_lifecycle"'
+        ).fetchone()[0]
+        assert after == before
+        delete_keys(con, registry.get("interval_lifecycle"), ("key",), [(value,)])
+        assert con.execute('SELECT count(*) FROM typed."interval_lifecycle"').fetchone()[0] == 0
+    finally:
+        con.close()
+
+
 def test_live_catalog_descriptor_miss_fails_closed_instead_of_guessing():
     with pytest.raises(Exception, match="descriptor authority"):
         _column_descriptor(
