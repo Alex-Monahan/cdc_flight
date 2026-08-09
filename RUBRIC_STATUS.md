@@ -1828,7 +1828,7 @@ data vanishes without an error.
 
 **Historical pre-fix gap to 5 (closed by FIX ROUND 2).** The old recommendation
 was to abandon `ExtractNewRecordState` +
-`JsonConverter` and consuming the full Debezium envelope with its Connect schema,
+`JsonConverter` and consume the full Debezium envelope with its Connect schema,
 so the semantic type (`io.debezium.time.MicroTimestamp`,
 `org.apache.kafka.connect.data.Decimal`, …) is available at mapping time. Cheaper
 partial wins to sequence first: `decimal.handling.mode=string`,
