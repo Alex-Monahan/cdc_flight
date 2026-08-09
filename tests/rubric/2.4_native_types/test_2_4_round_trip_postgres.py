@@ -126,6 +126,7 @@ def test_real_catalog_watcher_refreshes_mutable_enum_and_composite_facts(sandbox
             nbytes=1,
             schema="app",
             table="p2b_mutable",
+            key={"id": 1},
             after={"mood": "sleepy", "address": {"street": "x", "postal_code": "y"}},
         )
         plan = object.__new__(GroupPlan)

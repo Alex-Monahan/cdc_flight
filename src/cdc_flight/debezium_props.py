@@ -8,6 +8,8 @@ in `research/NOTES.md`.
 
 from __future__ import annotations
 
+import os
+
 from .config import ReplicationConfig, SourceConfig
 from .errors import UnsafeDebeziumProperty
 from .snapshot_completion import notification_topic
@@ -214,6 +216,16 @@ def build_properties(
         "time.precision.mode": "microseconds",
         "interval.handling.mode": "string",
         "binary.handling.mode": "base64",
+        # Stock PostgreSQL 3.6 otherwise drops JDBC-1111 columns before the
+        # envelope reaches Python.  Unknown values are opaque bytes at the
+        # connector boundary; the strict catalog descriptor and the one native
+        # resolver decide whether/how they can be stored.
+        # The production default is TRUE.  A false value is retained as a safe
+        # diagnostic mode: the completeness gate must refuse an omitted source
+        # column rather than allowing Debezium's historical silent-drop behavior.
+        "include.unknown.datatypes": os.environ.get(
+            "CDC_INCLUDE_UNKNOWN_DATATYPES", "true"
+        ).lower(),
         "hstore.handling.mode": "map",
         # Gate2 Option N: Debezium accepts the documented hex form and emits a
         # U+0000 marker.  PostgreSQL text-like domains cannot contain that code

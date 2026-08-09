@@ -120,11 +120,18 @@ from . import reconcile as reconcile_mod
 from . import resnapshot_projection as projection
 from . import table_lifecycle
 from .applier import Applier
-from .config import DROP_LOG, ApplierConfig, ReplicationConfig, RunConfig, SourceConfig
+from .config import (
+    DROP_LOG,
+    ApplierConfig,
+    ReplicationConfig,
+    RunConfig,
+    SourceConfig,
+    resolve_control_schema,
+)
 from .debezium_props import build_properties
-from .destination import CONTROL_SCHEMA, ResumePoint
+from .destination import ResumePoint
 from .errors import EngineFailure
-from .naming import quote
+from .naming import control_table, quote
 from .ownership import DestinationOwnership
 from .resnapshot_projection import ProjectionEvent
 from .resnapshot_recovery import InterruptionRecovery
@@ -205,6 +212,7 @@ def _record_snapshot_swap_audit(
     new_relations: set[str],
     namespace: str | None = None,
     snapshot_epoch: int | None = None,
+    control_schema: str | None = None,
 ) -> None:
     """Project a swapped image's audit and refusal discharge inside its COMMIT.
 
@@ -241,6 +249,7 @@ def _record_snapshot_swap_audit(
         events=tuple(events),
         namespace=namespace,
         snapshot_epoch=snapshot_epoch,
+        control_schema=control_schema,
     )
 
 
@@ -367,6 +376,7 @@ def run(
     ownership: DestinationOwnership,
     new_relations: set[str] | None = None,
     drop_mode: str = DROP_LOG,
+    control_schema: str | None = None,
 ) -> ResnapshotOutcome:
     """Re-snapshot `tables` into shadow tables and swap them in, then return.
 
@@ -435,6 +445,7 @@ def run(
             new_relations=new_relations or set(),
             namespace=namespace,
             snapshot_epoch=epoch_base + len(tables) + 1,
+            control_schema=control_schema,
         )
     descriptor_connection = None
     try:
@@ -468,6 +479,7 @@ def run(
             descriptor_provider=descriptor_provider,
             binary_handling_mode=props.get("binary.handling.mode", "base64"),
             hstore_handling_mode=props.get("hstore.handling.mode", "map"),
+            control_schema=control_schema,
         )
         ownership.attach(applier)
         # Keep the historical pipeline seam: tests and embedding callers replace
@@ -615,7 +627,13 @@ def run(
                 recovery.marker,
             )
         else:
-            reassert_owed(con, pipeline=pipeline, tables=tables, terminal=outcome)
+            reassert_owed(
+                con,
+                pipeline=pipeline,
+                tables=tables,
+                terminal=outcome,
+                control_schema=control_schema,
+            )
             recovery.consume()
         raise
     finally:
@@ -643,6 +661,7 @@ def reassert_owed(
     pipeline: str,
     tables: list[tuple[str, str, str]],
     terminal: ResnapshotOutcome,
+    control_schema: str | None = None,
 ) -> list[str]:
     """Put every non-terminal requested table back on the durable to-do list.
 
@@ -665,6 +684,7 @@ def reassert_owed(
         pipeline=pipeline,
         tables=owed,
         detail="the re-snapshot did not complete for these tables (rubric 1.6)",
+        control_schema=control_schema,
     )
     return [f"{s}.{t}" for s, t, _ in owed]
 
@@ -730,6 +750,7 @@ def finish_verified_empty_tables(
     new_relations: set[str] | None = None,
     namespace: str | None = None,
     snapshot_epoch: int | None = None,
+    control_schema: str | None = None,
 ) -> list[str]:
     """Empty the destination for the tables PROVEN empty at the source. Nothing else.
 
@@ -793,6 +814,7 @@ def finish_verified_empty_tables(
                 to=table_lifecycle.COMPLETE,
                 reason="verified empty at the source; the destination table was emptied",
                 snapshot_lsn=consistent_lsn,
+                control_schema=control_schema,
             )
             audit_detail = (
                 f"re-snapshot verified the source relation empty at consistent point "
@@ -838,6 +860,7 @@ def finish_verified_empty_tables(
                 commit_id=0,
                 events=tuple(audit_events),
                 snapshot_epoch=snapshot_epoch,
+                control_schema=control_schema,
             )
             emptied.append(f"{schema}.{table}")
         con.execute("COMMIT")
@@ -847,7 +870,9 @@ def finish_verified_empty_tables(
     return emptied
 
 
-def read_watermarks(con, pipeline: str) -> dict[str, int]:
+def read_watermarks(
+    con, pipeline: str, *, control_schema: str | None = None
+) -> dict[str, int]:
     """`"<schema>.<table>" -> snapshot_lsn` for every table with a complete image.
 
     The main applier's per-table fence (see `planner.GroupPlan`). Reading it for *every*
@@ -856,7 +881,8 @@ def read_watermarks(con, pipeline: str) -> dict[str, int]:
     only armed on some paths is a fence nobody can reason about.
     """
     rows = con.execute(
-        f"SELECT source_schema, source_table, snapshot_lsn FROM {CONTROL_SCHEMA}.table_state "
+        f"SELECT source_schema, source_table, snapshot_lsn FROM "
+        f"{control_table(resolve_control_schema(control_schema), 'table_state')} "
         "WHERE pipeline = ? AND snapshot_state = 'complete' AND snapshot_lsn IS NOT NULL",
         [pipeline],
     ).fetchall()
@@ -872,6 +898,7 @@ def finish_empty_tables_after_main_snapshot(
     owed: list[tuple[str, str, str]],
     completion: SnapshotCompletion,
     drop_mode: str = DROP_LOG,
+    control_schema: str | None = None,
 ) -> tuple[list[str], int | None]:
     """Close out the tables a MAIN-engine snapshot left owed because they are empty.
 
@@ -916,6 +943,8 @@ def finish_empty_tables_after_main_snapshot(
         done=set(),
         evidence=evidence,
         drop_mode=drop_mode,
+        namespace=None,
+        control_schema=control_schema,
     )
     emptied = finish_verified_empty_tables(
         con,
@@ -924,5 +953,6 @@ def finish_empty_tables_after_main_snapshot(
         tables=owed,
         done=set(logged) | set(dropped),
         evidence=evidence,
+        control_schema=control_schema,
     )
     return emptied + logged + dropped, evidence.wal_lsn

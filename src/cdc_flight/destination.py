@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from . import faults, table_lifecycle
+from .config import resolve_control_schema
 from .control_schema import CONTROL_DDL, ensure_control_schema
 from .errors import LeaseLost
 from .machines import (
@@ -31,7 +32,7 @@ from .machines import (
     SCHEMA_REFUSAL,
     SLOT_VERDICTS,
 )
-from .naming import quote
+from .naming import control_table, quote
 from .retirement import RetirementResult, retire_handle
 
 # Re-exported: `source_relations.py` is a split of this module, not a new dependency
@@ -59,7 +60,7 @@ DUCKDB_CONNECT_CONFIG = {
 
 
 def assert_runtime_capabilities(con) -> None:
-    """Verify the effective settings, not only the requested connect options."""
+    """Verify the effective DuckDB/MotherDuck settings, not only the request."""
     names = tuple(DUCKDB_CONNECT_CONFIG)
     rows = con.execute(
         "SELECT name, value FROM duckdb_settings() WHERE name IN (?, ?)", names
@@ -68,11 +69,12 @@ def assert_runtime_capabilities(con) -> None:
     expected = {name: str(value) for name, value in DUCKDB_CONNECT_CONFIG.items()}
     if effective != expected:
         raise RuntimeError(
-            f"destination runtime did not apply the required VARIANT settings: "
+            "destination runtime did not apply the required VARIANT settings: "
             f"expected {expected!r}, got {effective!r}"
         )
 
-CONTROL_SCHEMA = "_cdc_flight"
+def _control_table(control_schema: str | None, table: str) -> str:
+    return control_table(resolve_control_schema(control_schema), table)
 
 #: `table_state.snapshot_state` for a table whose destination data cannot be trusted
 #: and which CDC alone cannot rebuild: a source relation that was dropped and
@@ -185,7 +187,9 @@ def connect(dest) -> Any:
         )
         try:
             assert_runtime_capabilities(bootstrap)
-            bootstrap.execute(f'CREATE DATABASE IF NOT EXISTS "{dest.motherduck_database}"')
+            bootstrap.execute(
+                f"CREATE DATABASE IF NOT EXISTS {quote(dest.motherduck_database)}"
+            )
         finally:
             bootstrap.close()
         con = duckdb.connect(
@@ -209,11 +213,14 @@ def now() -> datetime:
 # --------------------------------------------------------------------------- #
 # resume point I/O
 # --------------------------------------------------------------------------- #
-def read_resume_point(con, pipeline: str, namespace: str) -> ResumePoint | None:
+def read_resume_point(
+    con, pipeline: str, namespace: str, *, control_schema: str | None = None
+) -> ResumePoint | None:
     rows = con.execute(
         f"SELECT resume_json, commit_id, last_lsn, last_txn_id, last_total_order, "
         f"       snapshot_epoch, offset_blob, offset_key_blob "
-        f"FROM {CONTROL_SCHEMA}.debezium_offsets WHERE pipeline = ? AND namespace = ?",
+        f"FROM {_control_table(control_schema, 'debezium_offsets')} "
+        "WHERE pipeline = ? AND namespace = ?",
         [pipeline, namespace],
     ).fetchall()
     if not rows:
@@ -237,9 +244,12 @@ def read_resume_point(con, pipeline: str, namespace: str) -> ResumePoint | None:
     return point
 
 
-def read_offset_blobs(con, pipeline: str, namespace: str) -> tuple[bytes | None, bytes | None]:
+def read_offset_blobs(
+    con, pipeline: str, namespace: str, *, control_schema: str | None = None
+) -> tuple[bytes | None, bytes | None]:
     rows = con.execute(
-        f"SELECT offset_blob, offset_key_blob FROM {CONTROL_SCHEMA}.debezium_offsets "
+        f"SELECT offset_blob, offset_key_blob FROM "
+        f"{_control_table(control_schema, 'debezium_offsets')} "
         "WHERE pipeline = ? AND namespace = ?",
         [pipeline, namespace],
     ).fetchall()
@@ -259,15 +269,16 @@ def write_resume_point(
     commit_id: int,
     offset_blob: bytes | None,
     offset_key_blob: bytes | None,
+    control_schema: str | None = None,
 ) -> None:
     """The statement that makes principle (4) literal. Runs inside the group txn."""
     con.execute(
-        f"DELETE FROM {CONTROL_SCHEMA}.debezium_offsets "
+        f"DELETE FROM {_control_table(control_schema, 'debezium_offsets')} "
         "WHERE pipeline = ? AND namespace = ?",
         [pipeline, namespace],
     )
     con.execute(
-        f"INSERT INTO {CONTROL_SCHEMA}.debezium_offsets "
+        f"INSERT INTO {_control_table(control_schema, 'debezium_offsets')} "
         "(pipeline, namespace, resume_json, offset_blob, offset_key_blob, commit_id, "
         " last_lsn, last_txn_id, last_total_order, snapshot_epoch, updated_at) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -287,7 +298,7 @@ def write_resume_point(
     )
 
 
-def next_commit_id(con, pipeline: str) -> int:
+def next_commit_id(con, pipeline: str, *, control_schema: str | None = None) -> int:
     """The next commit id **for this pipeline** (Codex 9).
 
     Scoped, because `max(...) + 1` cannot be made atomic here and the lease is
@@ -296,7 +307,8 @@ def next_commit_id(con, pipeline: str) -> int:
     writer, so monotone-per-pipeline is exactly as strong as the lease is.
     """
     row = con.execute(
-        f"SELECT coalesce(max(commit_id), 0) FROM {CONTROL_SCHEMA}.commit_log "
+        f"SELECT coalesce(max(commit_id), 0) FROM "
+        f"{_control_table(control_schema, 'commit_log')} "
         "WHERE pipeline = ?",
         [pipeline],
     ).fetchone()
@@ -304,8 +316,9 @@ def next_commit_id(con, pipeline: str) -> int:
 
 
 def write_commit_log(con, **kwargs) -> None:
+    control_schema = kwargs.pop("control_schema", None)
     con.execute(
-        f"INSERT INTO {CONTROL_SCHEMA}.commit_log "
+        f"INSERT INTO {_control_table(control_schema, 'commit_log')} "
         "(commit_id, pipeline, runner_id, opened_at, committed_at, trigger, "
         " unit_count, event_count, fenced_units, spilled, first_txn_id, last_txn_id, "
         " first_lsn, last_lsn, max_source_ts, tables_touched) "
@@ -346,10 +359,11 @@ def write_table_event(
     txn_id: str | None = None,
     rows_removed: int | None = None,
     detail: str | None = None,
+    control_schema: str | None = None,
 ) -> None:
     """One `table_events` row, inside the commit group's transaction (rubric 1.5)."""
     con.execute(
-        f"INSERT INTO {CONTROL_SCHEMA}.table_events "
+        f"INSERT INTO {_control_table(control_schema, 'table_events')} "
         "(pipeline, commit_id, seq, occurred_at, event, source_schema, source_table, "
         " target_table, applied, lsn, txn_id, rows_removed, detail) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -369,6 +383,7 @@ def write_column_presence(
     column_name: str,
     present: bool = True,
     patch_digest: str | None = None,
+    control_schema: str | None = None,
 ) -> None:
     """Record row-image field presence atomically with the row write.
 
@@ -376,14 +391,16 @@ def write_column_presence(
     by a fenced late-rename merge and is deleted when that merge completes.
     """
     con.execute(
-        f"INSERT OR REPLACE INTO {CONTROL_SCHEMA}.column_presence "
+        f"INSERT OR REPLACE INTO {_control_table(control_schema, 'column_presence')} "
         "(target_dataset, target_table, event_id, column_name, present, patch_digest) "
         "VALUES (?,?,?,?,?,?)",
         [target_dataset, target_table, event_id, column_name, present, patch_digest],
     )
 
 
-def write_column_presence_batch(con, rows: list[tuple]) -> None:
+def write_column_presence_batch(
+    con, rows: list[tuple], *, control_schema: str | None = None
+) -> None:
     """Write immutable row-image presence facts in bounded SQL batches.
 
     The facts are part of the caller's open commit-group transaction and are immutable
@@ -402,7 +419,7 @@ def write_column_presence_batch(con, rows: list[tuple]) -> None:
 
     bulk_insert(
         con,
-        f"{CONTROL_SCHEMA}.column_presence",
+        _control_table(control_schema, "column_presence"),
         [
             "target_dataset", "target_table", "event_id", "column_name", "present",
             "patch_digest",
@@ -422,19 +439,20 @@ def record_schema_refusal(
     target_table: str | None,
     detected_lsn: int | None,
     reason: str,
+    control_schema: str | None = None,
 ) -> None:
     """Persist a refused schema fold after its data transaction has rolled back."""
     con.execute("BEGIN TRANSACTION")
     try:
         previous = con.execute(
-            f"SELECT state FROM {CONTROL_SCHEMA}.schema_refusals "
+            f"SELECT state FROM {_control_table(control_schema, 'schema_refusals')} "
             "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
             [pipeline, source_schema, source_table],
         ).fetchone()
         before = previous[0] if previous else REFUSAL_ABSENT
         SCHEMA_REFUSAL.check(before, REFUSAL_PENDING)
         con.execute(
-            f"INSERT OR REPLACE INTO {CONTROL_SCHEMA}.schema_refusals "
+            f"INSERT OR REPLACE INTO {_control_table(control_schema, 'schema_refusals')} "
             "(pipeline, source_schema, source_table, target_table, detected_lsn, "
             "reason, state, refused_at) VALUES (?,?,?,?,?,?,?,?)",
             [
@@ -449,16 +467,18 @@ def record_schema_refusal(
             source_table=source_table,
             target_table=target_table,
             state=AWAITING_SNAPSHOT,
+            control_schema=control_schema,
         )
         existing_event = con.execute(
-            f"SELECT 1 FROM {CONTROL_SCHEMA}.table_events "
+            f"SELECT 1 FROM {_control_table(control_schema, 'table_events')} "
             "WHERE pipeline = ? AND commit_id = 0 AND event = 'schema_refusal' "
             "AND source_schema = ? AND source_table = ?",
             [pipeline, source_schema, source_table],
         ).fetchone()
         if existing_event is None:
             next_seq = con.execute(
-                f"SELECT coalesce(max(seq), -1) + 1 FROM {CONTROL_SCHEMA}.table_events "
+                f"SELECT coalesce(max(seq), -1) + 1 FROM "
+                f"{_control_table(control_schema, 'table_events')} "
                 "WHERE pipeline = ? AND commit_id = 0",
                 [pipeline],
             ).fetchone()[0]
@@ -474,6 +494,7 @@ def record_schema_refusal(
                 applied=False,
                 lsn=detected_lsn,
                 detail=reason,
+                control_schema=control_schema,
             )
         con.execute("COMMIT")
     except BaseException:
@@ -481,16 +502,20 @@ def record_schema_refusal(
         raise
 
 
-def pending_schema_refusals(con, pipeline: str) -> list[tuple]:
+def pending_schema_refusals(
+    con, pipeline: str, *, control_schema: str | None = None
+) -> list[tuple]:
     return con.execute(
-        f"SELECT source_schema, source_table, reason FROM {CONTROL_SCHEMA}.schema_refusals "
+        f"SELECT source_schema, source_table, reason FROM "
+        f"{_control_table(control_schema, 'schema_refusals')} "
         "WHERE pipeline = ? AND state = ? ORDER BY source_schema, source_table",
         [pipeline, REFUSAL_PENDING],
     ).fetchall()
 
 
 def resolve_schema_refusal(
-    con, *, pipeline: str, source_schema: str, source_table: str
+    con, *, pipeline: str, source_schema: str, source_table: str,
+    control_schema: str | None = None,
 ) -> bool:
     """Discharge a refusal only after a complete replacement image is durable.
 
@@ -500,7 +525,7 @@ def resolve_schema_refusal(
     transaction, so a crash cannot publish one half of that pair.
     """
     row = con.execute(
-        f"SELECT state FROM {CONTROL_SCHEMA}.schema_refusals "
+        f"SELECT state FROM {_control_table(control_schema, 'schema_refusals')} "
         "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
         [pipeline, source_schema, source_table],
     ).fetchone()
@@ -511,7 +536,7 @@ def resolve_schema_refusal(
     if before == REFUSAL_RESOLVED:
         return False
     con.execute(
-        f"UPDATE {CONTROL_SCHEMA}.schema_refusals SET state = ? "
+        f"UPDATE {_control_table(control_schema, 'schema_refusals')} SET state = ? "
         "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
         [REFUSAL_RESOLVED, pipeline, source_schema, source_table],
     )
@@ -519,7 +544,8 @@ def resolve_schema_refusal(
 
 
 def forget_table_state(
-    con, *, pipeline: str, source_schema: str, source_table: str, alerts=None
+    con, *, pipeline: str, source_schema: str, source_table: str, alerts=None,
+    control_schema: str | None = None,
 ) -> None:
     """The source relation is gone: `TableLifecycle -> absent` (rubric 1.9)."""
     table_lifecycle.forget(
@@ -529,6 +555,7 @@ def forget_table_state(
         source_table=source_table,
         reason="the source relation was dropped (rubric 1.5)",
         alerts=alerts,
+        control_schema=control_schema,
     )
 
 
@@ -554,8 +581,9 @@ class AlertSink:
     rather than silently labelling a same-connection insert non-transactional.
     """
 
-    def __init__(self, con, *, pipeline: str):
+    def __init__(self, con, *, pipeline: str, control_schema: str | None = None):
         self.pipeline = pipeline
+        self.control_schema = control_schema
         self._main = con
         self._sink = None
         self.independent = False
@@ -580,7 +608,7 @@ class AlertSink:
         con = self._sink if self.independent else self._main
         try:
             con.execute(
-                f"INSERT INTO {CONTROL_SCHEMA}.alerts "
+                f"INSERT INTO {_control_table(self.control_schema, 'alerts')} "
                 "(pipeline, raised_at, severity, code, message, context) VALUES (?,?,?,?,?,?)",
                 [self.pipeline, now(), severity, code, message,
                  json.dumps(payload, default=str) if payload else None],
@@ -591,7 +619,9 @@ class AlertSink:
         log.warning("ALERT %s/%s: %s", severity, code, message)
         return self.independent
 
-    def request_snapshot(self, *, pipeline: str, schema: str, table: str, target: str) -> bool:
+    def request_snapshot(
+        self, *, pipeline: str, schema: str, table: str, target: str
+    ) -> bool:
         """Mark a table `awaiting_snapshot` so the request OUTLIVES a rolled-back group.
 
         Rubric 4.7. The one caller is `AmbiguousDelete`: the group that could not be
@@ -617,6 +647,7 @@ class AlertSink:
                 pipeline=pipeline,
                 tables=[(schema, table, target)],
                 detail=f"AmbiguousDelete on {schema}.{table} (rubric 4.7 self-heal)",
+                control_schema=self.control_schema,
             )
         except Exception:  # pragma: no cover - never mask the original failure
             log.warning("could not record the re-snapshot request", exc_info=True)
@@ -630,7 +661,10 @@ class AlertSink:
             self._sink = None
 
 
-def raise_alert(con, *, pipeline: str, severity: str, code: str, message: str, context=None):
+def raise_alert(
+    con, *, pipeline: str, severity: str, code: str, message: str, context=None,
+    control_schema: str | None = None,
+):
     """One-shot alert on a connection the caller owns.
 
     Kept for callers outside a commit group (start-up, shutdown), where the
@@ -639,7 +673,7 @@ def raise_alert(con, *, pipeline: str, severity: str, code: str, message: str, c
     """
     try:
         con.execute(
-            f"INSERT INTO {CONTROL_SCHEMA}.alerts "
+            f"INSERT INTO {_control_table(control_schema, 'alerts')} "
             "(pipeline, raised_at, severity, code, message, context) VALUES (?,?,?,?,?,?)",
             [pipeline, now(), severity, code, message,
              json.dumps(context, default=str) if context else None],
@@ -648,13 +682,16 @@ def raise_alert(con, *, pipeline: str, severity: str, code: str, message: str, c
         log.warning("could not write alert %s", code, exc_info=True)
 
 
-def read_slot_state(con, pipeline: str, slot_name: str) -> dict | None:
+def read_slot_state(
+    con, pipeline: str, slot_name: str, *, control_schema: str | None = None
+) -> dict | None:
     """The last recorded observation of this pipeline's slot, or None (rubric 1.8)."""
     rows = con.execute(
         f"SELECT system_identifier, timeline_id, restart_lsn, confirmed_flush_lsn, "
         f"       current_wal_lsn, durable_lsn, observed_at, verdict, verdict_message, "
         f"       verdict_at "
-        f"FROM {CONTROL_SCHEMA}.slot_state WHERE pipeline = ? AND slot_name = ?",
+        f"FROM {_control_table(control_schema, 'slot_state')} "
+        "WHERE pipeline = ? AND slot_name = ?",
         [pipeline, slot_name],
     ).fetchall()
     if not rows:
@@ -675,6 +712,7 @@ def write_slot_state(
     observation: dict,
     verdict: str | None = None,
     verdict_message: str | None = None,
+    control_schema: str | None = None,
 ) -> None:
     """Record what the slot and the source cluster look like now (rubric 1.8).
 
@@ -694,11 +732,12 @@ def write_slot_state(
     con.execute("BEGIN TRANSACTION")
     try:
         con.execute(
-            f"DELETE FROM {CONTROL_SCHEMA}.slot_state WHERE pipeline = ? AND slot_name = ?",
+            f"DELETE FROM {_control_table(control_schema, 'slot_state')} "
+            "WHERE pipeline = ? AND slot_name = ?",
             [pipeline, slot_name],
         )
         con.execute(
-            f"INSERT INTO {CONTROL_SCHEMA}.slot_state "
+            f"INSERT INTO {_control_table(control_schema, 'slot_state')} "
             "(pipeline, slot_name, system_identifier, timeline_id, restart_lsn, "
             " confirmed_flush_lsn, current_wal_lsn, durable_lsn, observed_at, "
             " verdict, verdict_message, verdict_at) "
@@ -725,7 +764,9 @@ def write_slot_state(
         raise
 
 
-def tables_awaiting_snapshot(con, pipeline: str) -> list[tuple[str, str, str]]:
+def tables_awaiting_snapshot(
+    con, pipeline: str, *, control_schema: str | None = None
+) -> list[tuple[str, str, str]]:
     """`(source_schema, source_table, target_table)` for every table owed a snapshot.
 
     The queue rubric 1.6's re-snapshot works from and rubric 1.5's `recreated` action
@@ -741,7 +782,8 @@ def tables_awaiting_snapshot(con, pipeline: str) -> list[tuple[str, str, str]]:
     """
     placeholders = ", ".join("?" for _ in SNAPSHOT_STATES_OWING_WORK)
     rows = con.execute(
-        f"SELECT source_schema, source_table, target_table FROM {CONTROL_SCHEMA}.table_state "
+        f"SELECT source_schema, source_table, target_table FROM "
+        f"{_control_table(control_schema, 'table_state')} "
         f"WHERE pipeline = ? AND snapshot_state IN ({placeholders}) "
         "ORDER BY source_schema, source_table",
         [pipeline, *sorted(SNAPSHOT_STATES_OWING_WORK)],
@@ -749,16 +791,20 @@ def tables_awaiting_snapshot(con, pipeline: str) -> list[tuple[str, str, str]]:
     return [(str(a), str(b), str(c)) for a, b, c in rows]
 
 
-def read_snapshot_states(con, pipeline: str) -> dict[str, str]:
+def read_snapshot_states(
+    con, pipeline: str, *, control_schema: str | None = None
+) -> dict[str, str]:
     """`"<schema>.<table>" -> snapshot_state`, VALIDATED against the frozen domain.
 
     A state outside the domain is a bug in whatever wrote it, and the honest response is
     a loud failure rather than a table that quietly belongs to no queue.
     """
-    return table_lifecycle.read_all(con, pipeline)
+    return table_lifecycle.read_all(con, pipeline, control_schema=control_schema)
 
 
-def promote_interrupted_snapshots(con, pipeline: str) -> list[str]:
+def promote_interrupted_snapshots(
+    con, pipeline: str, *, control_schema: str | None = None
+) -> list[str]:
     """Turn every durable `in_progress` row into owed work. Call once, at start-up.
 
     `in_progress` is written the instant a table's first snapshot record arrives and is
@@ -780,6 +826,7 @@ def promote_interrupted_snapshots(con, pipeline: str) -> list[str]:
         frm=SNAPSHOT_IN_PROGRESS,
         to=AWAITING_SNAPSHOT,
         reason="a previous process died inside this table's snapshot",
+        control_schema=control_schema,
     )
     if names:
         log.warning(
@@ -790,7 +837,8 @@ def promote_interrupted_snapshots(con, pipeline: str) -> list[str]:
 
 
 def request_snapshot(
-    con, *, pipeline: str, tables: list[tuple[str, str, str]], detail: str
+    con, *, pipeline: str, tables: list[tuple[str, str, str]], detail: str,
+    control_schema: str | None = None,
 ) -> int:
     """Mark tables as owing a snapshot. Returns how many `table_state` rows now say so.
 
@@ -814,6 +862,7 @@ def request_snapshot(
             to=AWAITING_SNAPSHOT,
             reason=detail,
             target_table=target,
+            control_schema=control_schema,
         )
         if index == 0:
             # rubric 1.7: the durable to-do list is **mid-write** — one table has taken
@@ -827,7 +876,7 @@ def request_snapshot(
     marked = 0
     for schema, table, _target in tables:
         rows = con.execute(
-            f"SELECT snapshot_state FROM {CONTROL_SCHEMA}.table_state "
+            f"SELECT snapshot_state FROM {_control_table(control_schema, 'table_state')} "
             "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
             [pipeline, schema, table],
         ).fetchall()
@@ -838,7 +887,8 @@ def request_snapshot(
 
 
 def destination_holds_rows(
-    con, *, dataset: str, tables: list[tuple[str, str, str]]
+    con, *, dataset: str, tables: list[tuple[str, str, str]],
+    control_schema: str | None = None,
 ) -> dict[str, int]:
     """`"<schema>.<table>" -> row count` for every captured table that EXISTS and is
     non-empty in the destination.
@@ -879,6 +929,7 @@ def mark_awaiting_snapshot(
     source_table: str,
     target_table: str,
     state: str,
+    control_schema: str | None = None,
 ) -> None:
     """Record that a table's destination image cannot be trusted by CDC alone.
 
@@ -903,6 +954,7 @@ def mark_awaiting_snapshot(
         # The row's identity is being re-established against a relation that is not the
         # one it described, so the snapshot bookkeeping goes with it.
         replace=True,
+        control_schema=control_schema,
     )
 
 
@@ -913,6 +965,7 @@ def register_table(
     source_schema: str,
     source_table: str,
     target_table: str,
+    control_schema: str | None = None,
 ) -> None:
     """Persist source-to-destination ownership, inside the transaction that creates it.
 
@@ -928,7 +981,8 @@ def register_table(
     genuinely in (a re-snapshot in flight, a rebuild owed) with "never snapshotted".
     """
     if table_lifecycle.read(
-        con, pipeline=pipeline, source_schema=source_schema, source_table=source_table
+        con, pipeline=pipeline, source_schema=source_schema, source_table=source_table,
+        control_schema=control_schema,
     ) != table_lifecycle.ABSENT:
         return
     table_lifecycle.transition(
@@ -939,6 +993,7 @@ def register_table(
         to=table_lifecycle.NONE,
         reason="a destination table was materialised for this relation",
         target_table=target_table,
+        control_schema=control_schema,
     )
 
 
@@ -971,10 +1026,12 @@ class Lease:
     pipeline: str
     owner_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     ttl_seconds: float = 60.0
+    control_schema: str | None = None
 
     def acquire(self, con) -> None:
         rows = con.execute(
-            f"SELECT owner_id, expires_at, host, pid FROM {CONTROL_SCHEMA}.lease "
+            f"SELECT owner_id, expires_at, host, pid FROM "
+            f"{_control_table(self.control_schema, 'lease')} "
             "WHERE pipeline = ?",
             [self.pipeline],
         ).fetchall()
@@ -1005,7 +1062,8 @@ class Lease:
         """Renewed *inside* every commit group, so the loser of a race fails
         before it writes rather than after."""
         rows = con.execute(
-            f"SELECT owner_id FROM {CONTROL_SCHEMA}.lease WHERE pipeline = ?",
+            f"SELECT owner_id FROM {_control_table(self.control_schema, 'lease')} "
+            "WHERE pipeline = ?",
             [self.pipeline],
         ).fetchall()
         if rows and rows[0][0] != self.owner_id:
@@ -1044,10 +1102,11 @@ class Lease:
             attempt += 1
             try:
                 con.execute(
-                    f"DELETE FROM {CONTROL_SCHEMA}.lease WHERE pipeline = ?", [self.pipeline]
+                    f"DELETE FROM {_control_table(self.control_schema, 'lease')} "
+                    "WHERE pipeline = ?", [self.pipeline]
                 )
                 con.execute(
-                    f"INSERT INTO {CONTROL_SCHEMA}.lease "
+                    f"INSERT INTO {_control_table(self.control_schema, 'lease')} "
                     "(pipeline, owner_id, host, pid, acquired_at, renewed_at, expires_at) "
                     "VALUES (?,?,?,?,?,?,?)",
                     [self.pipeline, self.owner_id, socket.gethostname(), os.getpid(),
@@ -1069,7 +1128,8 @@ class Lease:
     def release(self, con) -> None:
         try:
             con.execute(
-                f"DELETE FROM {CONTROL_SCHEMA}.lease WHERE pipeline = ? AND owner_id = ?",
+                f"DELETE FROM {_control_table(self.control_schema, 'lease')} "
+                "WHERE pipeline = ? AND owner_id = ?",
                 [self.pipeline, self.owner_id],
             )
         except Exception:  # pragma: no cover
@@ -1106,7 +1166,7 @@ def release_connection(con, *, timeout: float = 5.0) -> RetirementResult:
     )
 
 
-def probe_transactional_ddl(con) -> bool:
+def probe_transactional_ddl(con, *, control_schema: str | None = None) -> bool:
     """Answer ADR 0001's biggest open question empirically, once per run.
 
     The shadow-table swap (D7) is `DROP` + `ALTER … RENAME` inside the commit
@@ -1115,8 +1175,8 @@ def probe_transactional_ddl(con) -> bool:
     rubric explicitly allows ("BEGIN / COMMIT transactionality fine too"). The
     probe is a few milliseconds and removes a guess from the design.
     """
-    probe_a = f"{CONTROL_SCHEMA}.__ddl_probe_a"
-    probe_b = f"{CONTROL_SCHEMA}.__ddl_probe_b"
+    probe_a = _control_table(control_schema, "__ddl_probe_a")
+    probe_b = _control_table(control_schema, "__ddl_probe_b")
     try:
         con.execute(f"DROP TABLE IF EXISTS {probe_a}")
         con.execute(f"DROP TABLE IF EXISTS {probe_b}")
@@ -1124,12 +1184,13 @@ def probe_transactional_ddl(con) -> bool:
         con.execute(f"CREATE TABLE {probe_b} (x INTEGER)")
         con.execute("BEGIN TRANSACTION")
         con.execute(f"DROP TABLE {probe_a}")
-        con.execute(f"ALTER TABLE {probe_b} RENAME TO __ddl_probe_a")
+        con.execute(f"ALTER TABLE {probe_b} RENAME TO {quote('__ddl_probe_a')}")
         con.execute("ROLLBACK")
         # Transactional iff the rollback put both tables back.
         rows = con.execute(
             "SELECT table_name FROM information_schema.tables "
-            f"WHERE table_schema = '{CONTROL_SCHEMA}' AND table_name LIKE '__ddl_probe%'"
+            "WHERE table_schema = ? AND table_name LIKE '__ddl_probe%'",
+            [resolve_control_schema(control_schema)],
         ).fetchall()
         names = {r[0] for r in rows}
         return {"__ddl_probe_a", "__ddl_probe_b"} <= names

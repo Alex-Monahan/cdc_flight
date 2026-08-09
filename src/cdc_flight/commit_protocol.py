@@ -104,6 +104,7 @@ def commit_group(self, trigger: str) -> CommitResult:
             last_lsn=stats["last_lsn"],
             max_source_ts=commit_metadata.epoch_ms(stats["max_source_ts"]),
             tables_touched=sorted(table_work.live_names(stats["tables"])),
+            control_schema=self.control_schema,
         )
         destination.write_resume_point(
             self.con,
@@ -113,6 +114,7 @@ def commit_group(self, trigger: str) -> CommitResult:
             commit_id=commit_id,
             offset_blob=self._pending_offset_blob,
             offset_key_blob=self._pending_offset_key_blob,
+            control_schema=self.control_schema,
         )
         if fault_enabled:
             maybe_crash("pre_commit", fault_group)

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import logging
 
+from . import catalog_support
 from .envelope import PendingRecord
 from .errors import SchemaEvolutionRefused
 from .faults import maybe_crash
 from .planner import stream_event_id
 from .spill import StagedEvent
+from .typed_types import UnsupportedType, native_type
 
 log = logging.getLogger("cdc_flight.spill_protocol")
 
@@ -103,6 +105,37 @@ def _enrich_descriptors(applier, event: PendingRecord) -> None:
             source_schema=event.schema,
             source_table=event.table,
             target=event.qualified_table,
+        )
+    for name, descriptor in descriptors.items():
+        try:
+            native_type(descriptor)
+        except (UnsupportedType, ValueError, TypeError) as exc:
+            raise SchemaEvolutionRefused(
+                f"source catalog descriptor for {event.qualified_table}.{name} is not "
+                f"deliverable through the strict native authority: {exc}",
+                source_schema=event.schema,
+                source_table=event.table,
+                target=event.qualified_table,
+                detected_lsn=event.lsn,
+            ) from exc
+    watcher = getattr(provider, "__self__", None)
+    if watcher is not None and hasattr(watcher, "event_shape_missing"):
+        missing = watcher.event_shape_missing(event, set(descriptors))
+    elif not catalog_support.has_event_schema(event):
+        missing = ()
+    else:
+        missing = tuple(
+            sorted(set(descriptors) - catalog_support.delivered_event_fields(event))
+        )
+    if missing:
+        raise SchemaEvolutionRefused(
+            f"source catalog/event shape is incomplete for {event.qualified_table}; "
+            f"the connector delivered no field(s) {list(missing)!r}; refusing the "
+            "spill boundary rather than staging a partial row",
+            source_schema=event.schema,
+            source_table=event.table,
+            target=event.qualified_table,
+            detected_lsn=event.lsn,
         )
     for attribute in ("key_descriptors", "before_descriptors", "after_descriptors"):
         getattr(event, attribute).update(descriptors)

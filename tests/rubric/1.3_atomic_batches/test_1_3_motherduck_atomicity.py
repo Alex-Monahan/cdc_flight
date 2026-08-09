@@ -30,7 +30,14 @@ import uuid
 
 import duckdb
 import pytest
-from support.applier_lab import FakeCommitter, begin, end, keyed, snap
+from support.applier_lab import (
+    FakeCommitter,
+    begin,
+    end,
+    fixture_descriptors,
+    keyed,
+    snap,
+)
 
 from cdc_flight import destination as dest_mod
 from cdc_flight.applier import Applier
@@ -254,6 +261,9 @@ def test_motherduck_fenced_spilled_overlap_is_dropped_without_owner(md_case, md_
         lease=lease,
         runner_id="md-overlap-runner",
         completion=completion,
+        # Direct lab construction has no CatalogWatcher; supply the same explicit
+        # fixture descriptor authority used by the other Applier matrix tests.
+        descriptor_provider=fixture_descriptors,
         control_schema=control_schema,
     )
     committer = FakeCommitter()

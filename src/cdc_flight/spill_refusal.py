@@ -22,6 +22,7 @@ def record_schema_refusal(applier, refused: SchemaEvolutionRefused) -> None:
         target_table=refused.target,
         detected_lsn=refused.detected_lsn,
         reason=str(refused),
+        control_schema=applier.control_schema,
     )
 
 

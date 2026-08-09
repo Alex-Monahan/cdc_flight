@@ -30,10 +30,11 @@ class CatalogDescriptorReader:
             rows = self.con.execute(
                 "SELECT t.oid::bigint, n.nspname, t.typname, t.typtype, "
                 "t.typcategory, t.typbasetype::bigint, t.typelem::bigint, "
-                "t.typrelid::bigint, COALESCE(r.rngsubtype, 0)::bigint, "
+                "t.typrelid::bigint, COALESCE(r.rngsubtype, mr.rngsubtype, 0)::bigint, "
                 "COALESCE(r.rngmultitypid, 0)::bigint "
                 "FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace "
                 "LEFT JOIN pg_range r ON r.rngtypid=t.oid "
+                "LEFT JOIN pg_range mr ON mr.rngmultitypid=t.oid "
                 "WHERE t.oid = ANY(%s::oid[])",
                 [sorted(pending)],
             ).fetchall()
@@ -214,6 +215,25 @@ class RelationDescriptorProvider:
         return dict(self.relations.get(str(qualified), {}))
 
 
+def provider_for_source(source) -> object:
+    """Build the bounded no-catalog provider from the source catalog once."""
+    requested: list[tuple[str, str, str]] = []
+    for qualified in source.tables:
+        schema, separator, table = str(qualified).partition(".")
+        if not separator or not schema or not table:
+            raise ValueError(
+                f"configured source table {qualified!r} is not qualified; "
+                "catalog descriptor authority cannot be established"
+            )
+        requested.append((schema, table, ""))
+    import psycopg
+
+    with psycopg.connect(source.dsn, autocommit=True) as descriptor_con:
+        return RelationDescriptorProvider.from_tables(
+            descriptor_con, requested
+        ).descriptors_for
+
+
 def _column_facts(
     descriptor: SourceTypeDescriptor, formatted: str, typmod: int | None
 ) -> SourceTypeDescriptor:
@@ -253,4 +273,8 @@ def _kind_for_fact(fact: dict) -> str:
     return fact["name"]
 
 
-__all__ = ["CatalogDescriptorReader", "RelationDescriptorProvider"]
+__all__ = [
+    "CatalogDescriptorReader",
+    "RelationDescriptorProvider",
+    "provider_for_source",
+]

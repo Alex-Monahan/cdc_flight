@@ -73,7 +73,7 @@ import logging
 from dataclasses import dataclass, field
 
 from . import table_lifecycle
-from .control_schema import CONTROL_SCHEMA
+from .config import resolve_control_schema
 from .machines import (
     BASELINE_ABSENT,
     BASELINE_INVALIDATED,
@@ -82,6 +82,7 @@ from .machines import (
     BASELINE_VALID,
     CATALOG_BASELINE,
 )
+from .naming import control_table
 
 log = logging.getLogger("cdc_flight.catalog_baseline")
 
@@ -107,10 +108,14 @@ INVALIDATED = BASELINE_INVALIDATED
 VALID = BASELINE_VALID
 
 
+def _control_table(control_schema: str | None, table: str) -> str:
+    return control_table(resolve_control_schema(control_schema), table)
+
+
 # --------------------------------------------------------------------------- #
 # reading
 # --------------------------------------------------------------------------- #
-def read(con, pipeline: str) -> str:
+def read(con, pipeline: str, *, control_schema: str | None = None) -> str:
     """This pipeline's baseline state, or `absent` when it has no row.
 
     Validated through the machine: a value outside the declared domain raises
@@ -118,7 +123,8 @@ def read(con, pipeline: str) -> str:
     know what this says" and "the baseline is fine" must never share a branch.
     """
     rows = con.execute(
-        f"SELECT state FROM {CONTROL_SCHEMA}.catalog_baseline WHERE pipeline = ?",
+        f"SELECT state FROM {_control_table(control_schema, 'catalog_baseline')} "
+        "WHERE pipeline = ?",
         [pipeline],
     ).fetchall()
     if not rows:
@@ -136,7 +142,8 @@ def trusted(state: str) -> bool:
 
 
 def unrelatable_tables(
-    con, *, pipeline: str, dataset: str, include_owed: bool = False
+    con, *, pipeline: str, dataset: str, include_owed: bool = False,
+    control_schema: str | None = None,
 ) -> list[tuple[str, str, str]]:
     """`(source_schema, source_table, target_table)` for every unrelatable relation.
 
@@ -164,7 +171,7 @@ def unrelatable_tables(
       because it was still owed — which is how a successful run came to persist a
       replacement generation over another relation's rows.
     """
-    states = table_lifecycle.read_all(con, pipeline)
+    states = table_lifecycle.read_all(con, pipeline, control_schema=control_schema)
     protected = {
         name for name, state in states.items()
         if include_owed or state not in table_lifecycle.OWING_WORK
@@ -174,7 +181,8 @@ def unrelatable_tables(
     known = {
         f"{schema}.{table}"
         for schema, table in con.execute(
-            f"SELECT source_schema, source_table FROM {CONTROL_SCHEMA}.source_relations "
+            f"SELECT source_schema, source_table FROM "
+            f"{_control_table(control_schema, 'source_relations')} "
             "WHERE pipeline = ?",
             [pipeline],
         ).fetchall()
@@ -186,7 +194,7 @@ def unrelatable_tables(
         f"{schema}.{table}": (str(schema), str(table), str(target))
         for schema, table, target in con.execute(
             f"SELECT source_schema, source_table, target_table FROM "
-            f"{CONTROL_SCHEMA}.table_state WHERE pipeline = ?",
+            f"{_control_table(control_schema, 'table_state')} WHERE pipeline = ?",
             [pipeline],
         ).fetchall()
     }
@@ -196,23 +204,28 @@ def unrelatable_tables(
         con,
         dataset=dataset,
         tables=[targets[name] for name in sorted(candidates) if name in targets],
+        control_schema=control_schema,
     )
     return [targets[name] for name in sorted(held)]
 
 
 def unrelatable_relations(
-    con, *, pipeline: str, dataset: str, include_owed: bool = False
+    con, *, pipeline: str, dataset: str, include_owed: bool = False,
+    control_schema: str | None = None,
 ) -> list[str]:
     """The qualified names of `unrelatable_tables`."""
     return [
         f"{schema}.{table}"
         for schema, table, _target in unrelatable_tables(
-            con, pipeline=pipeline, dataset=dataset, include_owed=include_owed
+            con, pipeline=pipeline, dataset=dataset, include_owed=include_owed,
+            control_schema=control_schema,
         )
     ]
 
 
-def unrebuilt_relations(con, *, pipeline: str, dataset: str) -> list[str]:
+def unrebuilt_relations(
+    con, *, pipeline: str, dataset: str, control_schema: str | None = None
+) -> list[str]:
     """Unrelatable **and still owed**: the relations nothing has rebuilt yet.
 
     The third question, and it is not the same as either of the other two. It exists
@@ -226,23 +239,29 @@ def unrebuilt_relations(con, *, pipeline: str, dataset: str) -> list[str]:
     "Not rebuilt" is the honest predicate for that exclusion: no identity, holds rows,
     **and** `TABLE_LIFECYCLE` still owes the work.
     """
-    owing = set(table_lifecycle.owing_work(con, pipeline))
+    owing = set(table_lifecycle.owing_work(con, pipeline, control_schema=control_schema))
     return [
         name
         for name in unrelatable_relations(
-            con, pipeline=pipeline, dataset=dataset, include_owed=True
+            con, pipeline=pipeline, dataset=dataset, include_owed=True,
+            control_schema=control_schema,
         )
         if name in owing
     ]
 
 
-def owing_relations_with_rows(con, *, pipeline: str) -> list[str]:
+def owing_relations_with_rows(
+    con, *, pipeline: str, dataset: str, control_schema: str | None = None
+) -> list[str]:
     """Return every owing lifecycle name, including an empty or absent target.
 
     Trust belongs to ``TABLE_LIFECYCLE``.  Row presence is only an observation about
     the retained image; it cannot discharge ``awaiting_snapshot`` or ``in_progress``.
+    The optional ``dataset`` parameter remains for compatibility with callers that used
+    the old row-count helper.
     """
-    return table_lifecycle.owing_work(con, pipeline)
+    del dataset
+    return table_lifecycle.owing_work(con, pipeline, control_schema=control_schema)
 
 
 # --------------------------------------------------------------------------- #
@@ -300,7 +319,7 @@ class BaselineCheck:
 
 
 def _write(con, *, pipeline: str, frm: str, to: str, reason: str, runner_id: str | None,
-           unreconciled: list[str] | None) -> str:
+           unreconciled: list[str] | None, control_schema: str | None = None) -> str:
     """The one place `catalog_baseline.state` is written. Edge-checked, then written.
 
     `check()` first and unconditionally: an undeclared edge here is a claim about
@@ -321,10 +340,11 @@ def _write(con, *, pipeline: str, frm: str, to: str, reason: str, runner_id: str
     con.execute("BEGIN TRANSACTION")
     try:
         con.execute(
-            f"DELETE FROM {CONTROL_SCHEMA}.catalog_baseline WHERE pipeline = ?", [pipeline]
+            f"DELETE FROM {_control_table(control_schema, 'catalog_baseline')} "
+            "WHERE pipeline = ?", [pipeline]
         )
         con.execute(
-            f"INSERT INTO {CONTROL_SCHEMA}.catalog_baseline "
+            f"INSERT INTO {_control_table(control_schema, 'catalog_baseline')} "
             "(pipeline, state, reason, unreconciled_json, runner_id, marked_at, updated_at) "
             "VALUES (?,?,?,?,?,?,?)",
             [
@@ -344,7 +364,7 @@ def _write(con, *, pipeline: str, frm: str, to: str, reason: str, runner_id: str
 
 def mark_unconfirmed(
     con, *, pipeline: str, dataset: str, runner_id: str | None = None,
-    reconcile: bool = True,
+    reconcile: bool = True, control_schema: str | None = None,
 ) -> BaselineCheck:
     """Record, BEFORE the engine starts, that this run has not confirmed the baseline.
 
@@ -374,9 +394,11 @@ def mark_unconfirmed(
     related are computed **now**, from durable state, and the mark is `invalidated`
     rather than `stale` so the names are durable too.
     """
-    was = read(con, pipeline)
+    was = read(con, pipeline, control_schema=control_schema)
     owed = (
-        unrelatable_tables(con, pipeline=pipeline, dataset=dataset)
+        unrelatable_tables(
+            con, pipeline=pipeline, dataset=dataset, control_schema=control_schema
+        )
         if reconcile and not trusted(was)
         else []
     )
@@ -390,6 +412,7 @@ def mark_unconfirmed(
         state = _write(
             con, pipeline=pipeline, frm=was, to=INVALIDATED, reason=reason,
             runner_id=runner_id, unreconciled=unreconciled,
+            control_schema=control_schema,
         )
         log.error(
             "the catalog baseline is INVALIDATED: %s. Their observed identities will "
@@ -401,6 +424,7 @@ def mark_unconfirmed(
         state = _write(
             con, pipeline=pipeline, frm=was, to=STALE, reason=reason,
             runner_id=runner_id, unreconciled=None,
+            control_schema=control_schema,
         )
     from . import faults
 
@@ -434,12 +458,13 @@ def mark_unconfirmed(
                 "the catalog baseline was never confirmed and this relation's rows "
                 "cannot be related to any identity at the source"
             ),
+            control_schema=control_schema,
         )
         # Read back rather than trusting the return count: `unmarked` decides whether a
         # relation is later handed to the DESTRUCTIVE fail-safe, and "how many rows did
         # the UPDATE touch" is not the same claim as "this relation is in the owed
         # queue". Durable evidence for a decision about destroying a table.
-        queued = set(table_lifecycle.owing_work(con, pipeline))
+        queued = set(table_lifecycle.owing_work(con, pipeline, control_schema=control_schema))
         unmarked = [name for name in unreconciled if name not in queued]
         log.error(
             "%s relation(s) are owed a fresh image because their identity cannot be "
@@ -469,6 +494,7 @@ def confirm(
     check: BaselineCheck,
     successful_polls: int,
     runner_id: str | None = None,
+    control_schema: str | None = None,
 ) -> BaselineCheck:
     """Promote to `valid` if — and only if — this run earned it.
 
@@ -512,7 +538,8 @@ def confirm(
     # queued it and whenever.
     remaining = (
         unrelatable_relations(
-            con, pipeline=pipeline, dataset=dataset, include_owed=True
+            con, pipeline=pipeline, dataset=dataset, include_owed=True,
+            control_schema=control_schema,
         )
         if check.reconciling
         else []
@@ -521,7 +548,9 @@ def confirm(
     # evidence.  The durable lifecycle alone is authoritative: an owing table is
     # untrusted until the replacement image reaches `complete`.
     remaining = sorted(set(remaining) | set(
-        owing_relations_with_rows(con, pipeline=pipeline)
+        owing_relations_with_rows(
+            con, pipeline=pipeline, dataset=dataset, control_schema=control_schema
+        )
     ))
     if remaining:
         check.unreconciled = remaining
@@ -533,6 +562,7 @@ def confirm(
             check.state = _write(
                 con, pipeline=pipeline, frm=check.state, to=INVALIDATED,
                 reason=check.reason, runner_id=runner_id, unreconciled=remaining,
+                control_schema=control_schema,
             )
         return check
     from . import faults
@@ -552,11 +582,12 @@ def confirm(
     check.state = _write(
         con, pipeline=pipeline, frm=check.state, to=VALID, reason=check.reason,
         runner_id=runner_id, unreconciled=None,
+        control_schema=control_schema,
     )
     return check
 
 
-def forget(con, pipeline: str) -> None:
+def forget(con, pipeline: str, *, control_schema: str | None = None) -> None:
     """Drop the claim along with the catalog it was about. Idempotent.
 
     Called from `recovery.begin()` in the SAME transaction that deletes
@@ -564,11 +595,12 @@ def forget(con, pipeline: str) -> None:
     our relations' oids, and a claim about a registry that no longer exists is worse
     than no claim — it would suppress the reconciliation of the registry that replaces it.
     """
-    was = read(con, pipeline)
+    was = read(con, pipeline, control_schema=control_schema)
     if was == ABSENT:
         return
     CATALOG_BASELINE.check(was, ABSENT)
     con.execute(
-        f"DELETE FROM {CONTROL_SCHEMA}.catalog_baseline WHERE pipeline = ?", [pipeline]
+        f"DELETE FROM {_control_table(control_schema, 'catalog_baseline')} "
+        "WHERE pipeline = ?", [pipeline]
     )
     log.info("catalog baseline %s -> absent (the recorded source catalog is forgotten)", was)

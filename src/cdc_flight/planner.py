@@ -21,13 +21,18 @@ for the table, so what they read is genuinely the pre-group state.
 
 from __future__ import annotations
 
-from . import apply_sql, destination, naming, table_work
+import logging
+
+from . import apply_sql, catalog_support, destination, naming, table_work
 from .assembler import UNIT_CONTROL, UNIT_SNAPSHOT_CHUNK, CompleteUnit
 from .config import TRUNCATE_IGNORE, TRUNCATE_REPLICATE
 from .envelope import KIND_TRUNCATE, PendingRecord
 from .errors import SchemaEvolutionRefused, ToastBaseMissing
 from .snapshot import SnapshotTable
 from .table_work import TableWork
+from .typed_types import UnsupportedType, native_type
+
+log = logging.getLogger("cdc_flight.planner")
 
 
 class GroupPlan:
@@ -51,8 +56,11 @@ class GroupPlan:
         watermarks: dict[str, int] | None = None,
         descriptor_provider=None,
         toast_policy_provider=None,
+        toast_admission_provider=None,
+        toast_admission_end_provider=None,
         binary_handling_mode: str = "base64",
         hstore_handling_mode: str = "map",
+        control_schema: str | None = None,
     ):
         self.con = con
         self.commit_id = commit_id
@@ -67,10 +75,16 @@ class GroupPlan:
         self.watermarks = watermarks or {}
         self.descriptor_provider = descriptor_provider
         self.toast_policy_provider = toast_policy_provider
+        self.toast_admission_provider = toast_admission_provider
+        self.toast_admission_end_provider = toast_admission_end_provider
         self.binary_handling_mode = binary_handling_mode
         self.hstore_handling_mode = hstore_handling_mode
+        self._control_schema = control_schema
         self.watermark_fenced_events = 0
         self._catalog_descriptor_cache: dict[str, dict] = {}
+        #: The assembler's unit id is the stable PostgreSQL transaction id, even when
+        #: a spilled event's individual envelope omitted transaction metadata.
+        self._active_txn_id: str | None = None
 
         self.work: dict[str, TableWork] = {}
         self.stats: dict = {
@@ -130,41 +144,55 @@ class GroupPlan:
         # some of its events carry LSNs below C. Fencing those would be silent loss.
         commit_lsn = unit.last_lsn if unit.kind != UNIT_SNAPSHOT_CHUNK else None
         fence_below = self.watermarks if commit_lsn else {}
+        self._active_txn_id = unit.txn_id
 
-        if unit.spill_unit_seq is not None:
-            self.staged_units = True
-            for staged in self.spill.load(
-                commit_id=self.commit_id, unit_seq=unit.spill_unit_seq
-            ):
-                if self._below_watermark(staged.event, commit_lsn, fence_below):
+        unit_succeeded = False
+        try:
+            if unit.spill_unit_seq is not None:
+                self.staged_units = True
+                for staged in self.spill.load(
+                    commit_id=self.commit_id, unit_seq=unit.spill_unit_seq
+                ):
+                    if self._below_watermark(staged.event, commit_lsn, fence_below):
+                        continue
+                    self._collect(
+                        staged.event,
+                        snapshot=snapshot_state,
+                        target=staged.target,
+                        event_id=staged.event_id,
+                    )
+            for event in unit.events:
+                if self._below_watermark(event, commit_lsn, fence_below):
                     continue
-                self._collect(
-                    staged.event,
-                    snapshot=snapshot_state,
-                    target=staged.target,
-                    event_id=staged.event_id,
+                self._collect(event, snapshot=snapshot_state)
+
+            if unit.kind == UNIT_SNAPSHOT_CHUNK:
+                if unit.snapshot_last_for_table and snapshot_state is not None:
+                    self._swaps.append(snapshot_state)
+                if unit.snapshot_last:
+                    self._swap_all = True
+                unit_succeeded = True
+                return
+
+            # The source transaction has ended. Every key must be back to at most one
+            # row (a deferred constraint relaxes uniqueness only *inside* a
+            # transaction), and that assertion is what makes the fold
+            # source-transaction-preserving rather than merely group-wide (Codex 1).
+            for item in self.work.values():
+                table_work.end_transaction(item)
+            if unit.txn_id:
+                self.stats["first_txn_id"] = self.stats["first_txn_id"] or unit.txn_id
+                self.stats["last_txn_id"] = unit.txn_id
+            unit_succeeded = True
+        finally:
+            if (
+                unit.txn_id
+                and self.toast_admission_end_provider is not None
+            ):
+                self.toast_admission_end_provider(
+                    unit.txn_id, commit=unit_succeeded
                 )
-        for event in unit.events:
-            if self._below_watermark(event, commit_lsn, fence_below):
-                continue
-            self._collect(event, snapshot=snapshot_state)
-
-        if unit.kind == UNIT_SNAPSHOT_CHUNK:
-            if unit.snapshot_last_for_table and snapshot_state is not None:
-                self._swaps.append(snapshot_state)
-            if unit.snapshot_last:
-                self._swap_all = True
-            return
-
-        # The source transaction has ended. Every key must be back to at most one row
-        # (a deferred constraint relaxes uniqueness only *inside* a transaction), and
-        # that assertion is what makes the fold source-transaction-preserving rather
-        # than merely group-wide (Codex 1).
-        for item in self.work.values():
-            table_work.end_transaction(item)
-        if unit.txn_id:
-            self.stats["first_txn_id"] = self.stats["first_txn_id"] or unit.txn_id
-            self.stats["last_txn_id"] = unit.txn_id
+            self._active_txn_id = None
 
     def _below_watermark(
         self, event: PendingRecord, commit_lsn: int | None, watermarks: dict[str, int]
@@ -214,19 +242,44 @@ class GroupPlan:
                 else stream_event_id(event)
             )
         self._enrich_descriptors(event)
-        if self.toast_policy_provider is not None and snapshot is None:
+        if snapshot is None and (
+            self.toast_admission_provider is not None
+            or self.toast_policy_provider is not None
+        ):
             try:
-                policy = self.toast_policy_provider(
-                    event.qualified_table, event_lsn=event.lsn
-                )
+                if self.toast_admission_provider is not None:
+                    admitted = self.toast_admission_provider(
+                        event.qualified_table,
+                        event_lsn=event.lsn,
+                        txn_id=self._active_txn_id or event.txn_id,
+                    )
+                else:
+                    policy = self.toast_policy_provider(
+                        event.qualified_table, event_lsn=event.lsn
+                    )
+                    admitted = policy is None or policy.accepts_event(event.lsn)
             except TypeError as exc:
                 # Keep the narrow compatibility seam for embedders that supplied a
                 # legacy one-argument provider; the production CatalogWatcher uses
                 # the event-LSN close operation above.
-                if "event_lsn" not in str(exc):
+                if "event_lsn" not in str(exc) and "txn_id" not in str(exc):
                     raise
-                policy = self.toast_policy_provider(event.qualified_table)
-            if policy is not None and not policy.accepts_event(event.lsn):
+                provider = (
+                    self.toast_admission_provider
+                    or self.toast_policy_provider
+                )
+                try:
+                    result = provider(event.qualified_table, event_lsn=event.lsn)
+                except TypeError as retry_exc:
+                    if "event_lsn" not in str(retry_exc):
+                        raise
+                    result = provider(event.qualified_table)
+                admitted = (
+                    result is None
+                    or result is True
+                    or getattr(result, "accepts_event", lambda _lsn: False)(event.lsn)
+                )
+            if not admitted:
                 raise ToastBaseMissing(
                     f"{event.qualified_table}: residual TOAST column(s) have no "
                     "verified REPLICA IDENTITY FULL; automatic refetch/resnapshot "
@@ -301,17 +354,39 @@ class GroupPlan:
                 source_table=event.table,
                 target=qualified,
             )
-        required = set()
-        for image in (event.key, event.before, event.after):
-            required.update(image or {})
-        missing = sorted(name for name in required if name not in catalog_descriptors)
+        for name, descriptor in catalog_descriptors.items():
+            try:
+                native_type(descriptor)
+            except (UnsupportedType, ValueError, TypeError) as exc:
+                raise SchemaEvolutionRefused(
+                    f"source catalog descriptor for {qualified}.{name} is not "
+                    f"deliverable through the strict native authority: {exc}",
+                    source_schema=event.schema,
+                    source_table=event.table,
+                    target=qualified,
+                    detected_lsn=event.lsn,
+                ) from exc
+        watcher = getattr(self.descriptor_provider, "__self__", None)
+        if watcher is not None and hasattr(watcher, "event_shape_missing"):
+            missing = watcher.event_shape_missing(event, set(catalog_descriptors))
+        elif not catalog_support.has_event_schema(event):
+            missing = ()
+        else:
+            missing = tuple(
+                sorted(
+                    set(catalog_descriptors)
+                    - catalog_support.delivered_event_fields(event)
+                )
+            )
         if missing:
             raise SchemaEvolutionRefused(
-                f"catalog descriptor authority is incomplete for {qualified}; "
-                f"missing {missing!r}; the source unit is held for automatic retry",
+                f"source catalog/event shape is incomplete for {qualified}; "
+                f"the connector delivered no field(s) {list(missing)!r}; refusing "
+                "table creation/commit rather than creating a partial table",
                 source_schema=event.schema,
                 source_table=event.table,
                 target=qualified,
+                detected_lsn=event.lsn,
             )
         for attribute in ("key_descriptors", "before_descriptors", "after_descriptors"):
             descriptors = getattr(event, attribute)
@@ -532,9 +607,7 @@ class GroupPlan:
             for column in columns
         ]
         destination.write_column_presence_batch(
-            self.con,
-            presence_rows,
-            control_schema=getattr(self.snapshots, "control_schema", None),
+            self.con, presence_rows, control_schema=self._control_schema
         )
 
         if self.staged_units and clear_spill:

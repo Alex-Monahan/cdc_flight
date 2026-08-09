@@ -222,6 +222,109 @@ def test_two_connection_identity_downgrade_after_verification_is_not_admitted(sa
             cleanup.execute(f"DROP TABLE IF EXISTS {qualified}")
 
 
+def test_two_connection_downgrade_after_post_commit_recheck_is_refused_at_admission(
+    sandbox,
+):
+    """The residual r6 schedule must be checked again while admitting the event."""
+    publication = "cdc_flight_pub"
+    qualified = "app.p2b_toast_admission_window"
+    with psycopg.connect(sandbox.source.dsn, autocommit=True) as setup:
+        setup.execute(f"DROP TABLE IF EXISTS {qualified}")
+        setup.execute(
+            "CREATE TABLE app.p2b_toast_admission_window "
+            "(id integer PRIMARY KEY, payload bytea)"
+        )
+        setup.execute(f"ALTER PUBLICATION {publication} ADD TABLE {qualified}")
+        setup.execute(
+            "ALTER TABLE app.p2b_toast_admission_window REPLICA IDENTITY FULL"
+        )
+        oid = int(
+            setup.execute(
+                "SELECT c.oid FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = 'app' AND c.relname = 'p2b_toast_admission_window'"
+            ).fetchone()[0]
+        )
+        activation = int(
+            setup.execute(
+                "SELECT (pg_current_wal_insert_lsn() - '0/0'::pg_lsn)::bigint"
+            ).fetchone()[0]
+        )
+
+    relation = SourceRelation(
+        schema="app",
+        table="p2b_toast_admission_window",
+        oid=oid,
+        published=True,
+        replica_identity="f",
+        full_activation_lsn=activation,
+        columns=(
+            SourceColumn(
+                1,
+                "id",
+                23,
+                "integer",
+                descriptor=SourceTypeDescriptor(23, "pg_catalog.int4", "int4"),
+                attstorage="p",
+            ),
+            SourceColumn(
+                2,
+                "payload",
+                17,
+                "bytea",
+                descriptor=SourceTypeDescriptor(17, "pg_catalog.bytea", "bytea"),
+                attstorage="x",
+            ),
+        ),
+    )
+    watcher = CatalogWatcher(
+        dsn=sandbox.source.dsn,
+        primary_dsn=sandbox.source.dsn,
+        publication=publication,
+        schema="app",
+        schemas={"app"},
+        include={qualified},
+        known={qualified: relation},
+        emit_marker=False,
+        confirm_polls=1,
+    )
+    try:
+        with (
+            psycopg.connect(sandbox.source.dsn, autocommit=True) as write,
+            psycopg.connect(sandbox.source.dsn, autocommit=True) as racer,
+        ):
+            observed = _ensure_toast_policies(
+                watcher,
+                write,
+                {qualified: relation},
+                activation_lsn=activation - 1,
+            )
+            admitted = observed[qualified]
+            assert admitted.full_invalidation_lsn is None
+
+            # This is the exact r6 window: the unlocked post-COMMIT recheck has
+            # returned FULL, then another connection changes the source before the
+            # event reaches the admission comparison.
+            racer.execute(
+                "ALTER TABLE app.p2b_toast_admission_window "
+                "REPLICA IDENTITY DEFAULT"
+            )
+            racer.execute(
+                "UPDATE app.p2b_toast_admission_window "
+                "SET payload = decode('aabbcc', 'hex') WHERE id = 1"
+            )
+            event_lsn = int(
+                racer.execute(
+                    "SELECT (pg_current_wal_insert_lsn() - '0/0'::pg_lsn)::bigint"
+                ).fetchone()[0]
+            )
+            assert watcher.admit_toast_event(qualified, event_lsn) is False
+    finally:
+        with psycopg.connect(sandbox.source.dsn, autocommit=True) as cleanup:
+            cleanup.execute(f"ALTER PUBLICATION {publication} DROP TABLE {qualified}")
+            cleanup.execute(f"DROP TABLE IF EXISTS {qualified}")
+
+
 def test_two_connection_downgrade_after_post_sample_verification_is_not_admitted(sandbox):
     """The r4 pause after verification #2 must fail closed under a held relation lock."""
     publication = "cdc_flight_pub"

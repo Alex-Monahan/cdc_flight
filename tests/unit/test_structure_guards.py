@@ -13,9 +13,9 @@ from pathlib import Path
 import pytest
 
 _BASELINE_SELECTED = {
-    "not motherduck and not slow": 1441,
-    "slow and not motherduck": 127,
-    "motherduck": 35,
+    "not motherduck and not slow": 1497,
+    "slow and not motherduck": 135,
+    "motherduck": 31,
 }
 
 
@@ -67,6 +67,48 @@ def test_type_apply_owners_are_split_by_cohesion_not_line_count():
     assert callable(identity_codec.canonical_jsonb_identity)
     assert schema_registry.SchemaRegistry.__module__ == "cdc_flight.schema_registry"
     assert typed_materialization.insert_rows.__module__ == "cdc_flight.typed_materialization"
+
+
+def test_type_registry_owners_have_real_dependency_boundaries():
+    """The guard checks ownership/import direction, not an arbitrary line count."""
+    from cdc_flight import schema_backfill, schema_ddl, schema_registry, schema_shadow
+
+    assert schema_registry.SchemaRegistry._create_strict.__module__ == "cdc_flight.schema_ddl"
+    assert schema_registry.SchemaRegistry._create.__module__ == "cdc_flight.schema_ddl"
+    assert schema_registry.SchemaRegistry.convert_column_to_union.__module__ == "cdc_flight.schema_shadow"
+    assert schema_registry.SchemaRegistry.backfill_columns.__module__ == "cdc_flight.schema_backfill"
+    assert schema_registry.SchemaRegistry.backfill_constant_columns.__module__ == "cdc_flight.schema_backfill"
+    assert schema_ddl.OWNER == "destination-ddl"
+    assert schema_shadow.OWNER == "typed-shadow"
+    assert schema_backfill.OWNER == "destination-backfill"
+    registry_source = Path(schema_registry.__file__).read_text()
+    assert "typed_materialization" not in registry_source
+    assert "identity_descriptors" not in registry_source
+    assert "def _create(" not in registry_source
+    assert "def _create_strict(" not in registry_source
+    assert "def convert_column_to_union(" not in registry_source
+    assert "def backfill_columns(" not in registry_source
+    assert "CREATE TABLE" in Path(schema_ddl.__file__).read_text()
+    assert "_copy_rows_with_identity" in Path(schema_shadow.__file__).read_text()
+    assert "SchemaBackfillRefused" in Path(schema_backfill.__file__).read_text()
+    for owner in (schema_ddl, schema_shadow, schema_backfill):
+        owner_source = Path(owner.__file__).read_text()
+        assert "schema_registry" not in owner_source
+
+
+def test_commit_protocol_owns_the_durability_boundary():
+    """Applier lifecycle and commit durability are separate real owners."""
+    from cdc_flight import applier, commit_protocol
+
+    assert commit_protocol.commit_group.__module__ == "cdc_flight.commit_protocol"
+    assert applier.Applier.commit_group.__module__ == "cdc_flight.applier"
+    applier_source = Path(applier.__file__).read_text()
+    protocol_source = Path(commit_protocol.__file__).read_text()
+    assert 'self.con.execute("BEGIN TRANSACTION")' not in applier_source
+    assert 'self.con.execute("COMMIT")' not in applier_source
+    assert 'self.con.execute("BEGIN TRANSACTION")' in protocol_source
+    assert 'self.con.execute("COMMIT")' in protocol_source
+    assert commit_protocol.OWNER == "commit-durability"
 
 
 def test_snapshot_protocol_and_notifications_share_one_public_module():

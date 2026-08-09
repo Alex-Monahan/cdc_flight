@@ -11,7 +11,7 @@ import json
 import time
 from dataclasses import dataclass, field
 
-from .destination import CONTROL_SCHEMA
+from .config import resolve_control_schema
 from .errors import SchemaEvolutionRefused
 from .machines import (
     ADMISSION_EXTERNAL,
@@ -22,6 +22,7 @@ from .machines import (
     CHANGE_PENDING,
     require_admission_state,
 )
+from .naming import control_table
 from .schema_evolution import ColumnChange, SourceColumn
 from .typed_types import SourceTypeDescriptor
 
@@ -59,10 +60,7 @@ class SourceRelation:
     publication_all_tables: bool = False
     is_partition: bool = False
     admission_state: str | _AdmissionStateUnset | None = _ADMISSION_STATE_UNSET
-    #: Source LSN boundary after which residual TOAST events were generated under
-    #: verified REPLICA IDENTITY FULL.
     full_activation_lsn: int | None = None
-    #: Exclusive upper bound of that same verified FULL interval.
     full_invalidation_lsn: int | None = None
 
     def __post_init__(self) -> None:
@@ -72,7 +70,11 @@ class SourceRelation:
         state = require_admission_state(state)
         object.__setattr__(self, "admission_state", state)
         try:
-            boundary = int(self.full_activation_lsn) if self.full_activation_lsn is not None else None
+            boundary = (
+                int(self.full_activation_lsn)
+                if self.full_activation_lsn is not None
+                else None
+            )
         except (TypeError, ValueError):
             boundary = None
         object.__setattr__(
@@ -214,32 +216,35 @@ def _missing_value(raw: str | None, type_name: str) -> object | None:
     return text.replace('\\"', '"').replace('\\\\', '\\')
 
 
-def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
+def read_known_relations(
+    con, pipeline: str, *, control_schema: str | None = None
+) -> dict[str, SourceRelation]:
     rows = con.execute(
         f"SELECT source_schema, source_table, relation_oid, relation_filenode, "
         "relation_type_oid, "
         "published, replica_identity, full_activation_lsn, full_invalidation_lsn, "
         "columns_json, admission_state "
-        f"FROM {CONTROL_SCHEMA}.source_relations WHERE pipeline = ?",
+        f"FROM {control_table(resolve_control_schema(control_schema), 'source_relations')} "
+        "WHERE pipeline = ?",
         [pipeline],
     ).fetchall()
     known: dict[str, SourceRelation] = {}
     for row in rows:
-        if len(row) == 10:
-            # Read-only compatibility for a pre-invalidation test double or a
-            # destination that has not completed the additive migration yet.  The
-            # real control-schema SELECT above always returns eleven fields.
+        # Keep the reader tolerant of the pre-interval shape used by old embedded
+        # callers while the durable control-schema migration is rolling forward.
+        # This is state-column compatibility only; it never invents a descriptor or
+        # an identity candidate.
+        if len(row) == 9:
             (
-                schema,
-                table,
-                oid,
-                relfilenode,
-                relation_type_oid,
-                published,
-                identity,
-                full_activation_lsn,
-                columns_json,
-                admission_state,
+                schema, table, oid, relfilenode, relation_type_oid, published,
+                identity, columns_json, admission_state,
+            ) = row
+            full_activation_lsn = None
+            full_invalidation_lsn = None
+        elif len(row) == 10:
+            (
+                schema, table, oid, relfilenode, relation_type_oid, published,
+                identity, full_activation_lsn, columns_json, admission_state,
             ) = row
             full_invalidation_lsn = None
         else:
@@ -288,9 +293,6 @@ def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
             published=bool(published),
             replica_identity=identity or "d",
             columns=columns,
-            # This is a durable read, so NULL must reach the machine boundary and be
-            # refused; it is not an observation that may derive a default from `published`.
-            admission_state=admission_state,
             full_activation_lsn=(
                 int(full_activation_lsn)
                 if full_activation_lsn is not None and int(full_activation_lsn) > 0
@@ -298,17 +300,19 @@ def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
             ),
             full_invalidation_lsn=(
                 int(full_invalidation_lsn)
-                if (
-                    full_invalidation_lsn is not None
-                    and int(full_invalidation_lsn) > 0
-                )
+                if full_invalidation_lsn is not None and int(full_invalidation_lsn) > 0
                 else None
             ),
+            # This is a durable read, so NULL must reach the machine boundary and be
+            # refused; it is not an observation that may derive a default from `published`.
+            admission_state=admission_state,
         )
     return known
 
 
-def _durable_descriptor(raw: dict, *, schema: str, table: str) -> SourceTypeDescriptor:
+def _durable_descriptor(
+    raw: dict, *, schema: str, table: str
+) -> SourceTypeDescriptor:
     """Load only catalog-authoritative descriptors from durable state."""
     serialized = raw.get("descriptor")
     if not serialized:
@@ -332,9 +336,12 @@ def _durable_descriptor(raw: dict, *, schema: str, table: str) -> SourceTypeDesc
         ) from exc
 
 
-def seed_from_table_state(con, pipeline: str) -> set[str]:
+def seed_from_table_state(
+    con, pipeline: str, *, control_schema: str | None = None
+) -> set[str]:
     rows = con.execute(
-        f"SELECT source_schema, source_table FROM {CONTROL_SCHEMA}.table_state "
+        f"SELECT source_schema, source_table FROM "
+        f"{control_table(resolve_control_schema(control_schema), 'table_state')} "
         "WHERE pipeline = ?",
         [pipeline],
     ).fetchall()

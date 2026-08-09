@@ -53,7 +53,7 @@ def _copy_rows_with_identity(
     changed_sql = changed_sql or {}
     column_indexes = {column: index + 1 for index, column in enumerate(old_columns)}
     target_columns = list(target_types)
-    from .typed_types import encode_value
+    from .typed_types import adapt_value, encode_value
 
     for row in rows:
         rowid = row[0]
@@ -84,7 +84,18 @@ def _copy_rows_with_identity(
                 expressions.append(changed_sql[column])
             elif column in changed_python:
                 descriptor = descriptors.get(column) or table.source_descriptors.get(column)
-                encoded = encode_value(raw.get(column), descriptor) if descriptor is not None else raw.get(column)
+                target = target_native.get(column)
+                if descriptor is not None and target is not None:
+                    # Shadow copies use the same source->native adapter as the
+                    # streaming path.  In particular, a multirange source is
+                    # deliberately VARCHAR at both destinations and must retain
+                    # PostgreSQL's canonical text rather than the old structural
+                    # list representation.
+                    encoded = adapt_value(raw.get(column), target)
+                elif descriptor is not None:
+                    encoded = encode_value(raw.get(column), descriptor)
+                else:
+                    encoded = raw.get(column)
                 expression, bound = _typed_parameter(encoded, target_native.get(column))
                 expressions.append(expression)
                 params.extend(bound)
@@ -177,7 +188,9 @@ def delete_keys(con, table: TableSchema, key_columns: tuple[str, ...], keys: lis
 def _key_parameter(value: Any, table: TableSchema, column: str) -> tuple[str, list[Any]]:
     native = table.native_types.get(column)
     if native is not None:
-        return _typed_parameter(value, native)
+        from .typed_types import adapt_value
+
+        return _typed_parameter(adapt_value(value, native), native)
     return "?", [value]
 
 

@@ -168,10 +168,16 @@ def summary(watcher) -> dict:
         "catalog_publication_ownership": watcher.publication_ownership,
         "catalog_pending_admission": sorted(pending_admission),
         "catalog_admission_errors": admission_errors,
+        "catalog_schema_refusals": sorted(watcher._schema_refusals),
         "catalog_schema_liveness": schema_liveness,
         "toast_efficient_tables": sum(policy.efficient for policy in toast_policies),
         "toast_fallback_tables": sum(policy.route is ToastRoute.FALLBACK for policy in toast_policies),
         "toast_residual_columns": sum(len(policy.residual_columns) for policy in toast_policies),
+        "toast_policy_builds": watcher.toast_policy_builds,
+        "toast_policy_cache_hits": watcher.toast_policy_cache_hits,
+        "toast_admission_checks": watcher.toast_admission_checks,
+        "toast_source_revalidations": watcher.toast_source_revalidations,
+        "toast_admission_rejections": watcher.toast_admission_rejections,
     }
 
 
@@ -179,6 +185,7 @@ def observe_unit(watcher, unit) -> None:
     """Fence a late schema event by probing before its unit is appended."""
     candidates: list[str] = []
     field_sets: dict[str, set[str]] = {}
+    shape_records: dict[str, list[object]] = {}
     for record in unit.events:
         if not record.schema or not record.table:
             continue
@@ -187,7 +194,9 @@ def observe_unit(watcher, unit) -> None:
         for image in (record.before, record.after, record.key):
             if image:
                 fields.update(image)
+        fields.update(delivered_event_fields(record))
         field_sets.setdefault(name, set()).update(fields)
+        shape_records.setdefault(name, []).append(record)
         with watcher._lock:
             relation = watcher.known.get(name)
             known_names = (
@@ -210,6 +219,16 @@ def observe_unit(watcher, unit) -> None:
         )
         if fields - known_names or descriptor_changed:
             candidates.append(name)
+        if relation and relation.columns:
+            catalog_names = {
+                column.destination_name for column in relation.columns
+            }
+            # Probe only the record currently being collected.  Re-scanning
+            # ``shape_records[name]`` here made a 5,000-row source transaction
+            # quadratic; the complete per-unit pass below rechecks every record
+            # once after any synchronous catalog poll.
+            if event_shape_missing(watcher, record, catalog_names):
+                candidates.append(name)
     if candidates and watcher.dsn:
         # Never suppress a second probe after a failed or empty observation. A source
         # may have committed another DDL between callbacks; a one-shot guard would
@@ -240,6 +259,124 @@ def observe_unit(watcher, unit) -> None:
                 source_table=table,
                 target=name,
             )
+        catalog_names = {
+            column.destination_name for column in relation.columns
+        }
+        for record in shape_records.get(name, ()):
+            missing = event_shape_missing(watcher, record, catalog_names)
+            if missing:
+                schema, _, table = name.partition(".")
+                raise SchemaShapeUnexplained(
+                    f"source catalog/event shape is incomplete for {name}: the "
+                    f"connector delivered no schema field(s) {missing!r}; refusing "
+                    "table creation/commit rather than truncating the source row",
+                    source_schema=schema,
+                    source_table=table,
+                    target=name,
+                    detected_lsn=getattr(record, "lsn", None),
+                )
+
+
+def delivered_event_fields(record) -> set[str]:
+    """Return fields the connector delivered, including schema-only NULL fields."""
+    fields: set[str] = set()
+    for image, schema in (
+        (getattr(record, "key", None), getattr(record, "key_schema", None)),
+        (getattr(record, "before", None), getattr(record, "before_schema", None)),
+        (getattr(record, "after", None), getattr(record, "after_schema", None)),
+    ):
+        if image:
+            fields.update(naming.normalize(str(name)) for name in image)
+        if isinstance(schema, dict):
+            for field_schema in schema.get("fields", ()) or ():
+                if not isinstance(field_schema, dict):
+                    continue
+                field_name = field_schema.get("field", field_schema.get("name"))
+                if field_name is not None:
+                    fields.add(naming.normalize(str(field_name)))
+    return fields
+
+
+def event_shape_missing(watcher, record, catalog_names: set[str]) -> tuple[str, ...]:
+    """Return source columns absent from one event, honoring fenced epochs."""
+    # The inverse gate is about the connector's *published schema*, not a sparse
+    # value image.  Synthetic replay records and older embedded callers may carry
+    # only ``before``/``after`` mappings; those have no claim about omitted fields.
+    # Stock schema-enabled Debezium records do carry a Connect struct schema, and
+    # that is the evidence required to distinguish an omitted unknown datatype from
+    # an ordinary sparse update.
+    if not has_event_schema(record):
+        return ()
+    delivered = delivered_event_fields(record)
+    if not catalog_names or not getattr(record, "is_data", True):
+        return ()
+    with watcher._lock:
+        changes = tuple(
+            change
+            for change in watcher._live()
+            if change.qualified == record.qualified_table
+            and change.kind == CHANGE_SCHEMA
+        )
+    # A catalog schema change is a two-epoch window.  The watcher may still hold the
+    # old relation while the fenced change is live, or may already hold the new
+    # relation while an older WAL unit is being replayed.  Both shapes are valid until
+    # the fence is settled; treating the currently held relation as the only valid
+    # shape would reject a replayed unit from the other side of the fence.
+    expected = set(catalog_names)
+    event_lsn = getattr(record, "lsn", None)
+    for change in changes:
+        new_relation = getattr(change, "new_relation", None)
+        new_names = (
+            {column.destination_name for column in new_relation.columns}
+            if new_relation is not None
+            else set()
+        )
+        if not new_names:
+            continue
+        old_names = set(catalog_names)
+        if new_names == old_names:
+            # The catalog has already advanced. Reconstruct the prior epoch from the
+            # attnum-preserving diff, including add/drop/rename transitions.
+            old_names = set(new_names)
+            for column in change.column_changes:
+                old_name = column.destination_old_name
+                new_name = column.destination_new_name
+                if column.kind in {"added", "renamed"} and new_name:
+                    old_names.discard(new_name)
+                if column.kind in {"dropped", "renamed"} and old_name:
+                    old_names.add(old_name)
+        old_only = old_names - new_names
+        new_only = new_names - old_names
+        has_old_shape = bool(delivered & old_only)
+        has_new_shape = bool(delivered & new_only)
+        # The Connect struct is stronger evidence than the watcher's polling LSN:
+        # ``detected_lsn`` is sampled when the poll notices the DDL and can therefore
+        # be *after* a post-DDL DML event.  A complete struct that exactly matches one
+        # epoch identifies that epoch even when the catalog poll learned about it late.
+        if delivered == new_names:
+            expected = new_names
+        elif delivered == old_names:
+            expected = old_names
+        elif has_new_shape and not has_old_shape:
+            expected = new_names
+        elif has_old_shape and not has_new_shape:
+            expected = old_names
+        else:
+            detected = getattr(change, "detected_lsn", None)
+            if event_lsn is not None and detected is not None:
+                expected = (
+                    old_names if int(event_lsn) < int(detected) else new_names
+                )
+    return tuple(sorted(expected - delivered))
+
+
+def has_event_schema(record) -> bool:
+    """Whether a record carries an explicit Connect struct shape to gate."""
+    return any(
+        isinstance(getattr(record, name, None), dict)
+        and isinstance(getattr(record, name, {}).get("fields"), list)
+        for name in ("key_schema", "before_schema", "after_schema")
+    )
 
 
 def _descriptor_changed(known: dict, incoming: dict, fields: set[str]) -> bool:

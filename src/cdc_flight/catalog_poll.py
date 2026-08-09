@@ -22,7 +22,7 @@ from .machines import (
 from .schema_evolution import SourceColumn, descriptor_from_type_name
 from .states import IllegalTransition, UnknownState
 from .toast import classify_relation
-from .typed_types import SourceTypeDescriptor
+from .typed_types import SourceTypeDescriptor, UnsupportedType, native_type
 
 log = logging.getLogger("cdc_flight.catalog_poll")
 
@@ -125,10 +125,13 @@ def _post_commit_full_state(conn, relation, boundary):
             full_activation_lsn=boundary,
             full_invalidation_lsn=None,
         )
-    sampled = conn.execute(observation_mod.ACTIVATION_LSN_SQL).fetchone()
-    invalidation = _positive_lsn(sampled[0] if sampled else None)
+    # The post-COMMIT check is deliberately not treated as an atomic boundary: a
+    # second connection may have changed identity between COMMIT and this read, and
+    # a WAL sample taken now could be after unrelated DML.  Close immediately after
+    # activation and route every later event through the existing automatic
+    # refetch/resnapshot path until a fresh FULL interval is established.
     return _closed_full_relation(
-        replace(relation, replica_identity="d"), boundary, invalidation
+        replace(relation, replica_identity="d"), boundary, int(boundary) + 1
     )
 
 
@@ -346,6 +349,10 @@ def poll_quietly(watcher):
         )
         return []
     except Exception as exc:  # pragma: no cover - exercised through the thread
+        if isinstance(exc, SchemaEvolutionRefused) and hasattr(
+            watcher, "remember_schema_refusal"
+        ):
+            watcher.remember_schema_refusal(exc)
         _mark_liveness_error(watcher)
         watcher.last_error = f"{type(exc).__name__}: {exc}"
         log.warning("catalog poll failed: %s", watcher.last_error)
@@ -414,7 +421,20 @@ def poll(watcher):
                 for raw in parsed_columns[index]
                 if raw.get("type_oid")
             )
-        descriptors = descriptor_reader.resolve(all_type_oids)
+        try:
+            descriptors = descriptor_reader.resolve(all_type_oids)
+        except (SchemaEvolutionRefused, UnsupportedType, ValueError, KeyError) as exc:
+            source_row = rows[0] if rows else ("", "")
+            source_schema = str(getattr(exc, "source_schema", None) or source_row[0])
+            source_table = str(getattr(exc, "source_table", None) or source_row[1])
+            target = getattr(exc, "target", None) or f"{source_schema}.{source_table}"
+            raise SchemaEvolutionRefused(
+                f"source catalog descriptor authority failed for {target}: {exc}",
+                source_schema=source_schema,
+                source_table=source_table,
+                target=target,
+                detected_lsn=lsn,
+            ) from exc
         for index, row in enumerate(rows):
             raw_columns = parsed_columns[index]
             columns = tuple(
@@ -438,6 +458,18 @@ def poll(watcher):
                 )
                 for raw in (raw_columns or [])
             )
+            for column in columns:
+                try:
+                    native_type(column.descriptor)
+                except (UnsupportedType, ValueError) as exc:
+                    raise SchemaEvolutionRefused(
+                        f"source catalog descriptor for {row[0]}.{row[1]}."
+                        f"{column.destination_name} is not deliverable: {exc}",
+                        source_schema=str(row[0]),
+                        source_table=str(row[1]),
+                        target=f"{row[0]}.{row[1]}",
+                        detected_lsn=lsn,
+                    ) from exc
             observed[f"{row[0]}.{row[1]}"] = SourceRelation(
                 schema=row[0],
                 table=row[1],

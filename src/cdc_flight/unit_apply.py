@@ -49,6 +49,16 @@ def apply_units(
             if applier.catalog is not None
             else None
         ),
+        toast_admission_provider=(
+            getattr(applier.catalog, "admit_toast_event", None)
+            if applier.catalog is not None
+            else None
+        ),
+        toast_admission_end_provider=(
+            getattr(applier.catalog, "end_toast_admission", None)
+            if applier.catalog is not None
+            else None
+        ),
         binary_handling_mode=(
             getattr(applier.catalog, "binary_handling_mode", applier.binary_handling_mode)
             if applier.catalog is not None
@@ -59,6 +69,7 @@ def apply_units(
             if applier.catalog is not None
             else applier.hstore_handling_mode
         ),
+        control_schema=applier.control_schema,
     )
     for unit in group:
         if unit.fenced:

@@ -328,7 +328,7 @@ def mark_canonical_range_text(
     if kind in range_kinds and isinstance(value, str):
         return value if isinstance(value, CanonicalRangeText) else CanonicalRangeText(value)
     if kind == "multirange" and isinstance(value, str):
-        return value if isinstance(value, CanonicalRangeText) else CanonicalRangeText(value)
+        return canonical_multirange_text(value, source)
     if kind in {"struct", "composite"} and isinstance(value, Mapping):
         return {
             name: mark_canonical_range_text(
@@ -604,8 +604,9 @@ def native_type(
     if kind == "multirange":
         if descriptor.range_subtype is None:
             raise UnsupportedType(f"multirange {descriptor.qualified_name} has no range subtype")
-        range_native = native_type(descriptor.range_subtype, for_key=for_key)
-        return NativeType("LIST", f"{range_native.sql}[]", descriptor, children=(range_native,), indexable=False)
+        # Stock Debezium emits this unknown JDBC type as opaque PostgreSQL text;
+        # local DuckDB and MotherDuck share one indexable VARCHAR representation.
+        return NativeType("VARCHAR", "VARCHAR", descriptor)
     if kind in {"bit", "varbit"}:
         fields = (("bits", NativeType("BLOB", "BLOB", descriptor)), ("bit_length", NativeType("INTEGER", "INTEGER", descriptor)))
         return NativeType("STRUCT", "STRUCT(bits BLOB,bit_length INTEGER)", descriptor, fields=fields, indexable=False)
@@ -753,6 +754,8 @@ def encode_value(value: Any, descriptor: SourceTypeDescriptor | NativeType) -> A
     if kind in {"range", "daterange", "int4range", "int8range", "numrange", "tsrange", "tstzrange"}:
         return _encode_range(value, source)
     if kind == "multirange":
+        if isinstance(value, CanonicalRangeText):
+            return str(value)
         if isinstance(value, str):
             value = _multirange_parts(value)
         if not isinstance(value, (list, tuple)):
@@ -779,6 +782,11 @@ def adapt_value(value: Any, target: NativeType) -> Any:
     source = target.source
     if source is None:
         return value
+    if (
+        _kind_name(source.kind, source.qualified_name) == "multirange"
+        and target.kind == "VARCHAR"
+    ):
+        return canonical_multirange_text(value, source)
     encoded = encode_value(value, source)
     if target.kind == "NUMERIC_UNION":
         if isinstance(encoded, UnionValue):
@@ -1006,6 +1014,115 @@ def _multirange_parts(value: str) -> list[str]:
     if part:
         parts.append(part)
     return parts
+
+
+def canonical_multirange_text(
+    value: Any, source: SourceTypeDescriptor
+) -> CanonicalRangeText:
+    """Return the one PostgreSQL-text representation used by both destinations.
+
+    ``include.unknown.datatypes=true`` reaches the JSON engine through the pinned
+    ``binary.handling.mode=base64`` converter, so an opaque multirange byte value is
+    observed here as base64 text.  Decode only that opaque transport form; a source
+    event already marked ``CanonicalRangeText`` is retained byte-for-byte.  Lists
+    remain a compatibility/value-boundary form for existing snapshot and identity
+    tests and are rendered into the same canonical range text before binding.
+    """
+    if source.range_subtype is None:
+        raise UnsupportedType(f"multirange {source.qualified_name} has no range subtype")
+    if isinstance(value, CanonicalRangeText):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        try:
+            text = bytes(value).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise InvalidTypedValue(
+                f"multirange {source.qualified_name} is not UTF-8 text"
+            ) from exc
+        return _canonical_multirange_text_candidate(text, source)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("{") and text.endswith("}"):
+            return _canonical_multirange_text_candidate(text, source)
+        try:
+            decoded = base64.b64decode(text, validate=True).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            raise InvalidTypedValue(
+                f"{value!r} is neither PostgreSQL multirange text nor opaque UTF-8 bytes"
+            ) from None
+        return _canonical_multirange_text_candidate(decoded, source)
+    if isinstance(value, (list, tuple)):
+        return _render_multirange_parts(value, source)
+    raise InvalidTypedValue(f"{value!r} is not a multirange value")
+
+
+def _canonical_multirange_text_candidate(
+    text: str, source: SourceTypeDescriptor
+) -> CanonicalRangeText:
+    stripped = str(text).strip()
+    try:
+        _multirange_parts(stripped)
+    except InvalidTypedValue:
+        raise InvalidTypedValue(
+            f"{text!r} is not PostgreSQL multirange text"
+        ) from None
+    return CanonicalRangeText(stripped)
+
+
+def _render_multirange_parts(
+    values: list | tuple, source: SourceTypeDescriptor
+) -> CanonicalRangeText:
+    """Render compatibility range values after PostgreSQL equality merging."""
+    from . import identity_codec
+
+    encoded = [
+        _encode_range(item, source.range_subtype)
+        for item in values
+    ]
+    normalized = [
+        identity_codec._normalise_range(item, source.range_subtype)
+        for item in encoded
+    ]
+    merged = identity_codec._merge_ranges(
+        [item for item in normalized if not item["empty"]],
+        source.range_subtype,
+    )
+    return CanonicalRangeText(
+        "{" + ",".join(_render_range_text(item, source.range_subtype) for item in merged) + "}"
+    )
+
+
+def _render_range_text(value: dict[str, Any], source: SourceTypeDescriptor) -> str:
+    if value["empty"]:
+        return "empty"
+    lower = _render_range_bound(value["lower"], source.range_subtype)
+    upper = _render_range_bound(value["upper"], source.range_subtype)
+    return (
+        ("[" if value["lower_inclusive"] else "(")
+        + lower
+        + ","
+        + upper
+        + ("]" if value["upper_inclusive"] else ")")
+    )
+
+
+def _render_range_bound(value: Any, source: SourceTypeDescriptor | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, UnionValue):
+        value = value.value
+    if isinstance(value, Decimal):
+        text = format(value, "f")
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        text = text or "0"
+    elif isinstance(value, (date, datetime, time)):
+        text = value.isoformat()
+    else:
+        text = str(value)
+    if any(char in text for char in ',()[]{}"\\') or text == "":
+        return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return text
 
 
 def _range_separator(value: str) -> int | None:
@@ -1311,6 +1428,7 @@ __all__ = [
     "UnionValue",
     "UnsupportedType",
     "adapt_value",
+    "canonical_multirange_text",
     "encode_value",
     "mark_canonical_range_text",
     "native_type",

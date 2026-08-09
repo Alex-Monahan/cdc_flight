@@ -60,7 +60,7 @@ from . import (
 from .assembler import CompleteUnit, TransactionAssembler
 from .catalog_apply import CatalogCoordinator, CatalogPlan
 from .commit_group import CommitResult, OpenGroup
-from .config import ApplierConfig
+from .config import ApplierConfig, resolve_control_schema
 from .destination import AlertSink, Lease, ResumePoint
 from .envelope import KIND_SNAPSHOT_BOUNDARY, PendingRecord, decode
 from .errors import (
@@ -103,6 +103,7 @@ class Applier:
         completion: SnapshotCompletion | None = None,
         snapshot_audit=None, descriptor_provider=None,
         binary_handling_mode: str = "base64", hstore_handling_mode: str = "map",
+        control_schema: str | None = None,
     ):
         self.con = con
         self.pipeline = pipeline
@@ -116,6 +117,7 @@ class Applier:
         self.runner_id = runner_id
         self.verifier = verifier
         self.transactional_ddl = transactional_ddl
+        self.control_schema = resolve_control_schema(control_schema)
         #: `catalog.CatalogWatcher` or None. The only source of DROP TABLE knowledge
         #: (rubric 1.5): logical decoding does not carry DDL at all.
         self.catalog = catalog
@@ -164,10 +166,18 @@ class Applier:
             get_registry=lambda: self.registry,
             epoch=resume_point.snapshot_epoch,
             transactional_ddl=transactional_ddl,
+            control_schema=self.control_schema,
             on_swap=snapshot_audit,
         )
-        self.spill = SpillBuffer(con, binary_mode=self.binary_handling_mode, hstore_mode=self.hstore_handling_mode)
-        self.alerts = AlertSink(con, pipeline=pipeline)
+        self.spill = SpillBuffer(
+            con,
+            binary_mode=self.binary_handling_mode,
+            hstore_mode=self.hstore_handling_mode,
+            control_schema=self.control_schema,
+        )
+        self.alerts = AlertSink(
+            con, pipeline=pipeline, control_schema=self.control_schema
+        )
         # rubric 1.9: an illegal table-lifecycle transition must reach an operator, and
         # the only connection that survives this group's rollback is the sink's.
         self.snapshots.alerts = self.alerts
@@ -178,6 +188,7 @@ class Applier:
             drop_mode=config.drop_mode,
             registry_of=lambda: self.registry,
             lifecycle_con=self.con,
+            control_schema=self.control_schema,
             max_destructive_per_group=config.drop_max_per_group,
             allow_mass_drop=config.drop_allow_mass,
         )
@@ -231,7 +242,9 @@ class Applier:
         self.table_counts: dict[str, int] = {}
         self.last_commit_id = resume_point.commit_id
         self.error: BaseException | None = None
-        self._next_commit_id = destination.next_commit_id(con, pipeline)
+        self._next_commit_id = destination.next_commit_id(
+            con, pipeline, control_schema=self.control_schema
+        )
         self._pending_offset_blob: bytes | None = None
         self._pending_offset_key_blob: bytes | None = None
 

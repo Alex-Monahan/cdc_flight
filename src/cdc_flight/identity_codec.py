@@ -583,7 +583,12 @@ _IDENTITY_TEXT_KINDS = frozenset(
 
 def _identity_tree(value: Any, descriptor: Any) -> Any:
     """Encode one value recursively according to source semantics."""
-    from .typed_types import CanonicalRangeText, encode_value
+    from .typed_types import (
+        CanonicalRangeText,
+        _multirange_parts,
+        canonical_multirange_text,
+        encode_value,
+    )
 
     if descriptor is None:
         return _identity_runtime(value)
@@ -622,8 +627,8 @@ def _identity_tree(value: Any, descriptor: Any) -> Any:
         "tsrange", "tstzrange",
     }:
         return {"range_text": str(value)}
-    if isinstance(value, CanonicalRangeText) and kind == "multirange":
-        return {"multirange_text": str(value)}
+    if kind == "multirange" and isinstance(value, (str, bytes, bytearray, memoryview)):
+        value = _multirange_parts(str(canonical_multirange_text(value, source)))
     encoded = encode_value(value, descriptor)
     if encoded is None and kind != "jsonb":
         return None
@@ -756,6 +761,11 @@ def _identity_value(
         descriptor = descriptors.get(column) or table.source_descriptors.get(column)
         source_kind = str(getattr(descriptor, "kind", "")).lower() if descriptor else ""
         semantic_value = _unwrap_destination_union(value, source_kind)
+        native = getattr(table, "native_types", {}).get(column)
+        if source_kind == "multirange" and getattr(native, "kind", None) == "VARCHAR":
+            from .typed_types import canonical_multirange_text
+
+            semantic_value = canonical_multirange_text(semantic_value, descriptor)
         fingerprint = descriptor.fingerprint if descriptor is not None else "legacy"
         if (semantic_value is None or _union_contains_null(semantic_value)) and source_kind != "jsonb":
             components.append({"descriptor": fingerprint, "state": "sql_null"})

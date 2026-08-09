@@ -183,6 +183,13 @@ class LiveDiscoveryCoordinator:
                     keep_catalog=discovery_handoff_enabled,
                     stop_when=discovery_ready if discovery_handoff_enabled else None,
                 )
+                # A background catalog poll can discover an incomplete strict
+                # descriptor after startup.  The watcher is quiesced by
+                # ``run_engine_bounded`` before this point, so persist that refusal
+                # before completion evaluates durable obligations.  Otherwise the
+                # refusal would exist only in process memory and a quiet run could
+                # publish a partial destination as successful.
+                self._persist_catalog_refusals()
                 self.health.stop()
                 self.health = None
 
@@ -311,6 +318,21 @@ class LiveDiscoveryCoordinator:
             watcher_quiesced = True
             if self.watcher is not None:
                 watcher_quiesced = self.watcher.stop()
+            if watcher_quiesced:
+                try:
+                    self._persist_catalog_refusals()
+                except Exception:
+                    # Preserve the original exception/summary while making the
+                    # persistence failure visible in teardown diagnostics.  The
+                    # normal path above is the completion gate; this branch covers
+                    # supervisor failures that unwind before completion.
+                    self.summary_extra["catalog_schema_refusal_flush_error"] = (
+                        "could not persist catalog schema refusal during teardown"
+                    )
+                    log.error(
+                        "could not persist catalog schema refusals during teardown",
+                        exc_info=True,
+                    )
             if watcher_quiesced and self.ownership.retire_if_quiescent(
                 reason="discovery_coordinator_teardown"
             ):
@@ -336,6 +358,28 @@ class LiveDiscoveryCoordinator:
                         "could not persist source-catalog observations during teardown",
                         exc_info=True,
                     )
+
+    def _persist_catalog_refusals(self) -> None:
+        """Make watcher-side descriptor refusals durable before completion."""
+        if self.watcher is None:
+            return
+        refusals = self.watcher.schema_refusals()
+        for refused in refusals:
+            if not refused.source_schema or not refused.source_table:
+                continue
+            dest_mod.record_schema_refusal(
+                self.con,
+                pipeline=self.destination.pipeline_name,
+                source_schema=refused.source_schema,
+                source_table=refused.source_table,
+                target_table=refused.target,
+                detected_lsn=refused.detected_lsn,
+                reason=str(refused),
+            )
+        if refusals:
+            self.summary_extra["catalog_schema_refusals"] = [
+                str(refused) for refused in refusals
+            ]
 
     def _resume_properties(self) -> dict:
         """Make the second engine an explicit stream resume."""

@@ -55,7 +55,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 
 from . import (
     catalog_admission as admission_mod,
@@ -108,6 +108,22 @@ DROP_IGNORE = "ignore"
 #: (`cdc_flight.source_marker`).
 MARKER_PREFIX = "cdcf"
 
+
+@dataclass
+class _ToastAdmissionContext:
+    """One source transaction held across the complete unit admission.
+
+    The relation lock is deliberately held until the applier has admitted every
+    event in the source unit.  Reusing only the boolean decision would reopen the
+    r6 race: a concurrent ``REPLICA IDENTITY DEFAULT`` could happen between two
+    events.  Keeping the source transaction open makes the lock cover every
+    event-admission decision while still doing one catalog read per residual table.
+    """
+
+    txn_id: str
+    conn: object
+    decisions: dict[str, tuple[tuple, bool]] = field(default_factory=dict)
+
 def _queued(change: CatalogChange) -> CatalogChange:
     return catalog_state.queued(change)
 
@@ -116,9 +132,13 @@ def _missing_value(raw: str | None, type_name: str) -> object | None:
     return catalog_state._missing_value(raw, type_name)
 
 
-def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
+def read_known_relations(
+    con, pipeline: str, *, control_schema: str | None = None
+) -> dict[str, SourceRelation]:
     try:
-        return catalog_state.read_known_relations(con, pipeline)
+        return catalog_state.read_known_relations(
+            con, pipeline, control_schema=control_schema
+        )
     except Exception as exc:
         from .errors import SchemaEvolutionRefused
 
@@ -134,6 +154,7 @@ def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
             destination.record_schema_refusal(
                 con,
                 pipeline=pipeline,
+                control_schema=control_schema,
                 source_schema=exc.source_schema,
                 source_table=exc.source_table,
                 target_table=exc.target,
@@ -151,8 +172,12 @@ def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
         raise
 
 
-def seed_from_table_state(con, pipeline: str) -> set[str]:
-    return catalog_state.seed_from_table_state(con, pipeline)
+def seed_from_table_state(
+    con, pipeline: str, *, control_schema: str | None = None
+) -> set[str]:
+    return catalog_state.seed_from_table_state(
+        con, pipeline, control_schema=control_schema
+    )
 
 
 class CatalogWatcher:
@@ -243,6 +268,12 @@ class CatalogWatcher:
         self.hstore_handling_mode = str(hstore_handling_mode)
 
         self._lock = threading.Lock()
+        #: A dedicated primary connection is reused for locked admission scopes.
+        #: Each scope is one complete decoded PostgreSQL transaction, so its source
+        #: relation locks cover every event-admission decision in that unit.
+        self._toast_admission_lock = threading.Lock()
+        self._toast_admission_conn = None
+        self._toast_admission_contexts: dict[str, _ToastAdmissionContext] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         #: Every change this run is still carrying, whatever state it is in. The
@@ -260,6 +291,16 @@ class CatalogWatcher:
             name: SCHEMA_VISIBLE for name in self.schemas
         }
         self._admission_errors: dict[str, str] = {}
+        self._schema_refusals: dict[str, object] = {}
+        #: TOAST classification is stable for one observed catalog generation. Keep
+        #: the event path from rebuilding the same table policy for every record;
+        #: source revalidation remains a separate admission operation below.
+        self._toast_policy_cache: dict[str, tuple[tuple, object]] = {}
+        self.toast_policy_builds = 0
+        self.toast_policy_cache_hits = 0
+        self.toast_admission_checks = 0
+        self.toast_source_revalidations = 0
+        self.toast_admission_rejections = 0
         #: `name -> the CatalogChange object that is in state `unconfirmed``.
         #: It used to be `name -> ((kind, new_oid), count)` while the observation's own
         #: object was thrown away and a *new* one constructed for the confirming poll -
@@ -343,6 +384,7 @@ class CatalogWatcher:
         """
         self._stop.set()
         if self._thread is None:
+            self._close_toast_admission_connection()
             return True
         self._thread.join(timeout=self.quiesce_timeout)
         alive = self._thread.is_alive()
@@ -353,7 +395,25 @@ class CatalogWatcher:
                 self.quiesce_timeout,
             )
         self.quiesced = not alive
+        if self.quiesced:
+            self._close_toast_admission_connection()
         return self.quiesced
+
+    def _close_toast_admission_connection(self) -> None:
+        """Close reusable admission connections after all callbacks quiesce."""
+        with self._toast_admission_lock:
+            contexts = tuple(self._toast_admission_contexts.values())
+            self._toast_admission_contexts.clear()
+            for context in contexts:
+                try:
+                    context.conn.execute("ROLLBACK")
+                except Exception:
+                    log.debug("could not roll back toast admission scope", exc_info=True)
+                context.conn.close()
+            conn = self._toast_admission_conn
+            self._toast_admission_conn = None
+            if conn is not None:
+                conn.close()
 
     def _connect(self):
         """A source connection whose queries are BOUNDED, not just its handshake.
@@ -377,6 +437,19 @@ class CatalogWatcher:
 
     def poll_quietly(self) -> list[CatalogChange]:
         return catalog_poll.poll_quietly(self)
+
+    def remember_schema_refusal(self, refused) -> None:
+        name = refused.target or (
+            f"{refused.source_schema}.{refused.source_table}"
+            if refused.source_schema and refused.source_table
+            else "catalog"
+        )
+        with self._lock:
+            self._schema_refusals[str(name)] = refused
+
+    def schema_refusals(self) -> tuple[object, ...]:
+        with self._lock:
+            return tuple(self._schema_refusals.values())
 
     # -- polling ------------------------------------------------------------ #
     def poll(self) -> list[CatalogChange]:
@@ -409,15 +482,47 @@ class CatalogWatcher:
         observation already carries the source type identity, so DML can use it as
         the authoritative descriptor without issuing a catalog query per event.
         """
+        from .errors import SchemaEvolutionRefused
+        from .typed_types import UnsupportedType, native_type
+
         with self._lock:
             relation = self.known.get(str(qualified))
             if relation is None:
                 return {}
-            return {
+            descriptors = {
                 column.destination_name: column.descriptor
                 for column in relation.columns
                 if column.descriptor is not None
             }
+        for name, descriptor in descriptors.items():
+            try:
+                native_type(descriptor)
+            except (UnsupportedType, ValueError) as exc:
+                raise SchemaEvolutionRefused(
+                    f"source catalog descriptor for {qualified}.{name} is not "
+                    f"deliverable through the strict native authority: {exc}",
+                    source_schema=str(qualified).partition(".")[0],
+                    source_table=str(qualified).partition(".")[2],
+                    target=str(qualified),
+                ) from exc
+        return descriptors
+
+    @staticmethod
+    def _toast_policy_key(relation: SourceRelation) -> tuple:
+        return (
+            int(relation.oid),
+            relation.replica_identity,
+            relation.full_activation_lsn,
+            relation.full_invalidation_lsn,
+            tuple(
+                (
+                    column.destination_name,
+                    column.type_identity,
+                    column.attstorage,
+                )
+                for column in relation.columns
+            ),
+        )
 
     def toast_policy_for(self, qualified: str, *, event_lsn: int | None = None):
         """Return the route, closing an observed FULL interval at an event LSN."""
@@ -441,7 +546,12 @@ class CatalogWatcher:
                     relation = replace(relation, full_invalidation_lsn=candidate)
                     self.known[str(qualified)] = relation
                     self._dirty[str(qualified)] = relation
-            return classify_relation(
+            cache_key = self._toast_policy_key(relation)
+            cached = self._toast_policy_cache.get(str(qualified))
+            if cached is not None and cached[0] == cache_key:
+                self.toast_policy_cache_hits += 1
+                return cached[1]
+            policy = classify_relation(
                 relation.qualified,
                 relation.columns,
                 replica_identity=relation.replica_identity,
@@ -450,6 +560,155 @@ class CatalogWatcher:
                 full_activation_lsn=relation.full_activation_lsn,
                 full_invalidation_lsn=relation.full_invalidation_lsn,
             )
+            self._toast_policy_cache[str(qualified)] = (cache_key, policy)
+            self.toast_policy_builds += 1
+            return policy
+
+    def _close_toast_interval(self, qualified: str, event_lsn: int | None) -> None:
+        """Record a conservative upper bound after locked source revalidation fails."""
+        with self._lock:
+            relation = self.known.get(str(qualified))
+            if relation is None or relation.full_activation_lsn is None:
+                return
+            activation = int(relation.full_activation_lsn)
+            try:
+                candidate = int(event_lsn) if event_lsn is not None else activation + 1
+            except (TypeError, ValueError):
+                candidate = activation + 1
+            if candidate <= activation:
+                candidate = activation + 1
+            if relation.full_invalidation_lsn is None or candidate < int(
+                relation.full_invalidation_lsn
+            ):
+                relation = replace(relation, full_invalidation_lsn=candidate)
+                self.known[str(qualified)] = relation
+                self._dirty[str(qualified)] = relation
+                self._toast_policy_cache.pop(str(qualified), None)
+
+    def admit_toast_event(
+        self,
+        qualified: str,
+        event_lsn: int | None = None,
+        txn_id: str | None = None,
+    ) -> bool:
+        """Validate one residual event inside its source-unit admission scope.
+
+        The policy cache answers the cheap generation question.  For a residual
+        table, the first event of a complete source unit opens a source transaction,
+        locks the relation, and re-reads ``relreplident``.  The transaction stays
+        open until :meth:`end_toast_admission` after the unit's last event has been
+        admitted.  A concurrent ``REPLICA IDENTITY DEFAULT`` therefore cannot slip
+        between two event decisions.  Direct callers that omit ``txn_id`` retain a
+        short, one-event scope for probes and tests.
+        """
+        from .naming import quote
+        from .toast import ToastRoute
+
+        self.toast_admission_checks += 1
+        policy = self.toast_policy_for(qualified, event_lsn=event_lsn)
+        if policy is None:
+            return True
+        if not policy.accepts_event(event_lsn):
+            self.toast_admission_rejections += 1
+            return False
+        if policy.route is not ToastRoute.REPLICA_IDENTITY_FULL:
+            return True
+        with self._lock:
+            relation = self.known.get(str(qualified))
+        if relation is None:
+            self.toast_admission_rejections += 1
+            return False
+        admission_key = (
+            self._toast_policy_key(relation),
+            str(txn_id),
+        ) if txn_id is not None else None
+        with self._toast_admission_lock:
+            context = (
+                self._toast_admission_contexts.get(str(txn_id))
+                if txn_id is not None
+                else None
+            )
+            try:
+                if context is not None:
+                    cached = context.decisions.get(str(qualified))
+                    if cached is not None and cached[0] == admission_key:
+                        if not cached[1] or not policy.accepts_event(event_lsn):
+                            self.toast_admission_rejections += 1
+                            return False
+                        return True
+                    conn = context.conn
+                else:
+                    conn = self._toast_admission_conn
+                    self._toast_admission_conn = None
+                if conn is None or conn.closed:
+                    conn = catalog_poll.connect(
+                        self, autocommit=False, dsn=self.primary_dsn
+                    )
+                if context is None:
+                    conn.execute("BEGIN TRANSACTION")
+                if txn_id is not None and context is None:
+                    context = _ToastAdmissionContext(str(txn_id), conn)
+                    self._toast_admission_contexts[str(txn_id)] = context
+                conn.execute(
+                    f"LOCK TABLE {quote(relation.schema)}.{quote(relation.table)} "
+                    "IN ACCESS SHARE MODE NOWAIT"
+                )
+                row = conn.execute(
+                    "SELECT relreplident FROM pg_class WHERE oid = %s", [relation.oid]
+                ).fetchone()
+                self.toast_source_revalidations += 1
+                current_full = bool(row and str(row[0]).lower() == "f")
+                accepted = current_full and policy.accepts_event(event_lsn)
+                if context is not None:
+                    context.decisions[str(qualified)] = (admission_key, accepted)
+                else:
+                    conn.execute("COMMIT")
+                    self._toast_admission_conn = conn
+                if not accepted:
+                    self._close_toast_interval(qualified, event_lsn)
+                    self.toast_admission_rejections += 1
+                return accepted
+            except Exception:
+                if context is not None:
+                    self._toast_admission_contexts.pop(str(context.txn_id), None)
+                if conn is not None:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except Exception:
+                        log.debug("could not roll back toast admission probe", exc_info=True)
+                    conn.close()
+                self._close_toast_interval(qualified, event_lsn)
+                self.toast_admission_rejections += 1
+                return False
+
+    def end_toast_admission(self, txn_id: str, *, commit: bool) -> None:
+        """Release the source locks after a complete unit is admitted.
+
+        ``commit=False`` is used when folding or destination planning rejects the
+        unit.  The source-side transaction is observational, so either outcome only
+        releases its locks; the destination transaction remains the durability
+        authority.
+        """
+        key = str(txn_id)
+        with self._toast_admission_lock:
+            context = self._toast_admission_contexts.pop(key, None)
+            if context is None:
+                return
+            try:
+                context.conn.execute("COMMIT" if commit else "ROLLBACK")
+                if self._toast_admission_conn is None or self._toast_admission_conn.closed:
+                    self._toast_admission_conn = context.conn
+                else:
+                    context.conn.close()
+            except Exception:
+                try:
+                    context.conn.execute("ROLLBACK")
+                except Exception:
+                    log.debug("could not roll back toast admission scope", exc_info=True)
+                context.conn.close()
+
+    def event_shape_missing(self, record, catalog_names: set[str]) -> tuple[str, ...]:
+        return catalog_support.event_shape_missing(self, record, catalog_names)
 
     def snapshot_names(self) -> tuple[str, ...]:
         """Logical relations whose snapshot callbacks are expected at startup.
@@ -1027,6 +1286,7 @@ class CatalogWatcher:
         with self._lock:
             self.known.pop(name, None)
             self._dirty.pop(name, None)
+            self._toast_policy_cache.pop(name, None)
             stale = self._unconfirmed.pop(name, None)
             if stale is not None:
                 stale.to(CHANGE_SUPERSEDED)

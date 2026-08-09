@@ -229,7 +229,6 @@ def run(
             replication,
             control_schema=control_schema,
         )
-
         if reset_state:
             # Journalled BEFORE the first destructive step, and before the generic
             # resume below picks it up (Codex r1 MAJOR-4).
@@ -473,6 +472,22 @@ def run(
                 binary_handling_mode=props.get("binary.handling.mode", "base64"),
                 hstore_handling_mode=props.get("hstore.handling.mode", "map"),
             ).start()
+            catalog_refusals = watcher.schema_refusals()
+            for refused in catalog_refusals:
+                if refused.source_schema and refused.source_table:
+                    dest_mod.record_schema_refusal(
+                        con,
+                        pipeline=dest.pipeline_name,
+                        source_schema=refused.source_schema,
+                        source_table=refused.source_table,
+                        target_table=refused.target,
+                        detected_lsn=refused.detected_lsn,
+                        reason=str(refused),
+                    )
+            if catalog_refusals:
+                summary_extra["catalog_schema_refusals"] = [
+                    str(refused) for refused in catalog_refusals
+                ]
             discovered = watcher.new_relations()
             if discovered:
                 dest_mod.request_snapshot(
@@ -535,24 +550,12 @@ def run(
             # from PostgreSQL and retain only the immutable descriptor map for this
             # run.  A missing or failed read propagates as a startup refusal; there
             # is no legacy fallback here.
-            import psycopg
+            from .catalog_descriptors import provider_for_source
 
-            from .catalog_descriptors import RelationDescriptorProvider
-
-            requested_tables = []
-            for qualified in source.tables:
-                schema, separator, table = qualified.partition(".")
-                if not separator or not schema or not table:
-                    raise EngineFailure(
-                        f"configured source table {qualified!r} is not qualified; "
-                        "catalog descriptor authority cannot be established",
-                        dict(summary_extra),
-                    )
-                requested_tables.append((schema, table, ""))
-            with psycopg.connect(source.dsn, autocommit=True) as descriptor_con:
-                descriptor_provider = RelationDescriptorProvider.from_tables(
-                    descriptor_con, requested_tables
-                ).descriptors_for
+            try:
+                descriptor_provider = provider_for_source(source)
+            except ValueError as exc:
+                raise EngineFailure(str(exc), dict(summary_extra)) from exc
 
         interrupted_resnapshot = resnapshot_recovery_mod.requeue_interrupted(
             con,
