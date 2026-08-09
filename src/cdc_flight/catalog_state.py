@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass, field
 
 from .destination import CONTROL_SCHEMA
+from .errors import SchemaEvolutionRefused
 from .machines import (
     ADMISSION_EXTERNAL,
     ADMISSION_PENDING,
@@ -21,7 +22,7 @@ from .machines import (
     CHANGE_PENDING,
     require_admission_state,
 )
-from .schema_evolution import ColumnChange, SourceColumn, descriptor_from_type_name
+from .schema_evolution import ColumnChange, SourceColumn
 from .typed_types import SourceTypeDescriptor
 
 CHANGE_DROPPED = "dropped"
@@ -232,16 +233,7 @@ def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
                     raw.get("missing_value_text"), str(raw["type_name"])
                 ),
                 attstorage=(str(raw["attstorage"]) if raw.get("attstorage") else None),
-                descriptor=(
-                    SourceTypeDescriptor.from_dict(raw["descriptor"])
-                    if raw.get("descriptor")
-                    else descriptor_from_type_name(
-                        str(raw["type_name"]),
-                        oid=int(raw["type_oid"]),
-                        typmod=(int(raw["typmod"]) if raw.get("typmod") is not None else None),
-                        nullable=bool(raw.get("nullable", True)),
-                    )
-                ),
+                descriptor=_durable_descriptor(raw, schema=schema, table=table),
             )
             for raw in raw_columns
         )
@@ -266,6 +258,30 @@ def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
             ),
         )
     return known
+
+
+def _durable_descriptor(raw: dict, *, schema: str, table: str) -> SourceTypeDescriptor:
+    """Load only catalog-authoritative descriptors from durable state."""
+    serialized = raw.get("descriptor")
+    if not serialized:
+        raise SchemaEvolutionRefused(
+            f"catalog descriptor authority is incomplete for {schema}.{table}."
+            f"{raw.get('name', '<unknown>')}: refusing to infer type "
+            f"OID {raw.get('type_oid')} from {raw.get('type_name')!r}",
+            source_schema=str(schema),
+            source_table=str(table),
+            target=f"{schema}.{table}",
+        )
+    try:
+        return SourceTypeDescriptor.from_dict(serialized)
+    except (TypeError, ValueError, KeyError) as exc:
+        raise SchemaEvolutionRefused(
+            f"catalog descriptor authority is corrupt for {schema}.{table}."
+            f"{raw.get('name', '<unknown>')}: refusing to infer type",
+            source_schema=str(schema),
+            source_table=str(table),
+            target=f"{schema}.{table}",
+        ) from exc
 
 
 def seed_from_table_state(con, pipeline: str) -> set[str]:

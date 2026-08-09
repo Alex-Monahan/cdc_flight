@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-import json
 import logging
-import math
-from collections.abc import Mapping
 from typing import Any
 
-from .errors import SchemaBackfillRefused, SchemaEvolutionRefused
-from .identity_codec import _identity_candidates, _identity_value
-from .naming import CDCF_COMMIT_ID, CDCF_EVENT_ID, CDCF_TOTAL_ORDER, quote
+from .identity_codec import (
+    _identity_candidates,
+    _identity_value,
+    canonical_jsonb_text,
+)
+from .naming import CDCF_EVENT_ID, quote
 from .schema_registry import TableSchema, _normalise_type, _type_sql_equal
 
 BOOLEAN, BIGINT, DOUBLE, JSON_T, VARCHAR = "BOOLEAN", "BIGINT", "DOUBLE", "JSON", "VARCHAR"
@@ -18,6 +18,8 @@ DELETE_CHUNK = 2000
 MAX_PARAMS_PER_STATEMENT = 40_000
 MAX_ROWS_PER_STATEMENT = 5_000
 ARROW_CHUNK = 100_000
+
+log = logging.getLogger("cdc_flight.typed_materialization")
 
 def _copy_rows_with_identity(
     con,
@@ -31,6 +33,7 @@ def _copy_rows_with_identity(
     changed_sql: dict[str, str] | None = None,
     changed_python: frozenset[str] = frozenset(),
     union_columns: frozenset[str] = frozenset(),
+    carry_existing_identity: bool = False,
 ) -> None:
     """Copy existing rows while using the canonical Python identity encoder.
 
@@ -58,13 +61,20 @@ def _copy_rows_with_identity(
         rowid = row[0]
         raw = {column: row[index] for column, index in column_indexes.items()}
         key_values = tuple(raw[column] for column in key_columns)
-        identity = _identity_value(
-            table,
-            key_values,
-            descriptors=identity_descriptors,
-            key_columns=key_columns,
-            union_columns=union_columns,
-        )
+        if carry_existing_identity and "cdcf_internal_id" in raw:
+            # This value was produced from the source image before the typed swap.
+            # Re-encoding a value read through DuckDB would make destination display
+            # precision, timezone, UNION member names, or numeric scale part of the
+            # source identity contract.
+            identity = raw["cdcf_internal_id"]
+        else:
+            identity = _identity_value(
+                table,
+                key_values,
+                descriptors=identity_descriptors,
+                key_columns=key_columns,
+                union_columns=union_columns,
+            )
         expressions: list[str] = []
         params: list[Any] = []
         for column in target_columns:
@@ -473,6 +483,15 @@ def insert_rows(
 
 def _arrow_native_supported(native: Any, physical: str) -> bool:
     kind = getattr(native, "kind", None)
+    source = getattr(native, "source", None)
+    seen: set[int] = set()
+    while source is not None and getattr(source, "domain_base", None) is not None and id(source) not in seen:
+        seen.add(id(source))
+        source = source.domain_base
+    # JSONB's PostgreSQL equality is semantic.  Arrow would bind the already
+    # encoded text directly and bypass the canonical JSONB text path below.
+    if source is not None and str(getattr(source, "kind", "")).lower() == "jsonb":
+        return False
     if kind in {"UNION", "MAP", "STRUCT", "NUMERIC_VARIABLE", "INTERVAL", "TIMETZ"}:
         return False
     if kind == "LIST":
@@ -711,6 +730,13 @@ def _typed_parameter(value: Any, native: Any) -> tuple[str, list[Any]]:
             return "CAST(CAST(? AS JSON) AS VARIANT)", [value]
         raise ValueError(f"value for VARIANT is not validated JSON text: {value!r}")
     if native.kind == "JSON":
+        source = native.source
+        seen: set[int] = set()
+        while source is not None and getattr(source, "domain_base", None) is not None and id(source) not in seen:
+            seen.add(id(source))
+            source = source.domain_base
+        if source is not None and str(getattr(source, "kind", "")).lower() == "jsonb":
+            value = canonical_jsonb_text(value)
         if isinstance(value, JsonbNull):
             return "JSON 'null'", []
         if isinstance(value, str):
@@ -842,10 +868,9 @@ def _typed_assignment(table: TableSchema, column: str, value: Any) -> tuple[str,
 __all__ = [
     "_copy_rows_with_identity",
     "_typed_assignment",
+    "bulk_insert",
     "delete_keys",
     "insert_rows",
     "insert_typed_rows",
     "update_rows",
-    "bulk_insert",
 ]
-

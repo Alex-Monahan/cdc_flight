@@ -85,6 +85,18 @@ def test_declared_physical_row_product_realizes_or_refuses_every_cell():
     assert all(result.kind in {"exercised", "refused"} for result in results)
     assert all(result.reason for result in results)
     assert {result.kind for result in results} == {"exercised", "refused"}
+    # A green matrix is not evidence that every product cell was reachable. Keep a
+    # quantitative floor, and require every uncovered cell to come from the explicit
+    # state-machine precondition rather than a swallowed runtime exception.
+    assert sum(result.covered for result in results) >= 1000
+    assert all(
+        result.covered or result.reason.startswith("unreachable:")
+        for result in results
+    )
+    assert all(
+        result.covered or "machine_owner=" in result.proof
+        for result in results
+    )
 
 
 def test_commit_cell_reports_real_destination_transaction_evidence():
@@ -97,6 +109,23 @@ def test_commit_cell_reports_real_destination_transaction_evidence():
     result = exercise_cell(cell)
     assert result.kind == "exercised"
     assert getattr(result, "proof", "").startswith("destination:")
+
+
+def test_schema_refusal_uses_the_real_applier_spill_refusal_seam():
+    """Refusal recovery must exercise Applier -> spill_refusal, not a test writer."""
+    cell = next(
+        item
+        for item in declared_cells()
+        if item == type(item)(
+            "insert", "value", "start", "spill", "schema_refusal", "keyed", "pre"
+        )
+    )
+    result = exercise_cell(cell)
+    assert result.kind == "refused"
+    assert result.covered
+    assert "seam=Applier._handle_spill_refusal->spill_refusal.handle" in result.proof
+    assert "awaiting_snapshot=true" in result.proof
+    assert "retry=automatic" in result.proof
 
 
 @pytest.mark.parametrize(

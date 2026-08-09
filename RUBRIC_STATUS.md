@@ -209,6 +209,34 @@ The historical blocks below preserve the **Phase-0 baseline**. The summary
 table is the current score, and the 2026-08-08 FIX ROUND blocks under 2.4,
 2.5, and 2.6 record the new executed evidence for those items.
 
+### FIX ROUND 3 correction (2026-08-08)
+
+The FIX ROUND 2 claims below are historical, not closure evidence: the r2 re-review
+reproduced counterexamples behind a green suite. FIX ROUND 3 first ran those exact
+counterexamples as failing regressions, then changed the implementation and attacked
+each result from a second angle. The current scores remain **2.4 = 5/5, 2.5 = 5/5,
+2.6 = 4/5** only because the evidence below and the required final lanes pass; 2.6's
+5/5 marker-preserving upgrade is intentionally deferred under the binding stock
+Debezium policy.
+
+| r2 finding | round-3 evidence now required for closure |
+|---|---|
+| JSONB `1`/`1.0` identity false negative | Six PostgreSQL equality classes, recursively nested, delete one row on local DuckDB and MotherDuck; the source-key binder also canonicalizes JSONB text before SQL. |
+| identity recomputed from shadow-swap readback | 37 full-type property cases compare source-derived identity with the stored post-swap identity, including real/double, both numeric scales, two DST-zone timestamptz values, NULL/empty/nested arrays, composites, maps, ranges, multiranges, a JSONB domain, and unicode. |
+| activation boundary crossed relation generations | Same complete `(oid, relfilenode, relation_type_oid)` carries the boundary; a changed token and FULL loss invalidate it and force a fresh same-connection verification path. |
+| descriptor fallback guessed types | Live and persisted misses fail closed; the production catalog wrapper records a durable refusal and `awaiting_snapshot`, so recovery is automatic rather than a startup deadlock. |
+| interval key rejection | PostgreSQL creation audit says interval is a valid source key; the destination marks it non-indexable, uses the internal canonical identity, and creation/migration/replay pass. |
+| physical-row matrix gaps | The matrix uses the real Applier refusal seam, asserts a covered floor and machine-derived uncovered reasons, and re-raises unexpected exceptions. |
+
+N1 is explicitly dismissed by the user's 2026-08-08 directive: this code is still in
+testing, so state written by a previous build does not require migration. No identity
+format versioning, legacy-build candidate lookup, or conversion backfill was added.
+The current-version descriptor history used by a typed shadow swap is a separate,
+active-build schema-evolution mechanism and is covered by the 2.5 property tests.
+
+Final required-lane evidence for this round is 1,458 default tests, 128 slow tests,
+37 MotherDuck tests, and a clean `make lint` run.
+
 ### TODO 1.1 / 1.2 / 1.3 — the transactional applier (implemented 2026-07-30)
 
 One mechanism, three items. `src/cdc_flight/applier.py` owns the destination
@@ -1798,6 +1826,18 @@ recursively incomplete trees. Numeric inserts, replay, spill, and the assignment
 seam use the same idempotent adapter; UPDATEs of NaN, Infinity, and -Infinity
 retain their `special` UNION tag.
 
+**FIX ROUND 3 current evidence.** `identity_codec.py` is now the sole canonical
+typed identity owner. Its recursive JSONB canonicalizer uses exact decimal tokens,
+last-object-key-wins, sorted object keys, and one numeric class for `1`, `1.0`,
+`1e2`, trailing-zero variants, and negative zero. `test_2_4_fix3_regressions.py`
+proves the six equality classes locally; `test_2_4_json_variant_motherduck.py`
+proves the same six classes against MotherDuck. The PostgreSQL source-key audit
+also found `json` has no PostgreSQL B-tree operator class (so it is not a valid
+source primary-key type), while `jsonb` is valid and uses the indexed JSON
+representation at both runtimes. Interval is valid in PostgreSQL but is now
+explicitly internal-identity-only at the destination. The strict descriptor miss
+test proves the automatic refusal → durable `awaiting_snapshot` route.
+
 `most types text/json=1, core scalars well (nested as text)=3, (nested as json)=4, full=5`
 
 **Historical pre-fix evidence** (`p02` `colsD_wide_types`,
@@ -1854,6 +1894,20 @@ Evidence: `tests/rubric/2.5_union_type_changes/`, including the real PostgreSQL
 DDL+DML fence and the type-change-plus-key-move regression. The exact required
 lanes were green after these changes.
 
+**FIX ROUND 3 current evidence.** The shadow copier carries an existing
+`cdcf_internal_id` verbatim whenever a current-version type change already has
+one; for indexable keys that become internal during the swap, the codec
+canonicalizes source semantics (including PostgreSQL binary32 `real`) before the
+new ID is created. The 37-case property test
+`test_2_5_fix3_regressions.py::test_full_24_type_list_source_identity_survives_typed_shadow_swap`
+compares the source-derived ID with the post-swap stored ID for every declared
+scalar/recursive type and the additional range, multirange, JSONB-domain, nested,
+NULL/empty-array, unicode, numeric-scale, and DST cases. The four exact r2
+readback values (real `1.23` → `1.2300000190734863`, numeric `1.0` → `Decimal('1.0000')`,
+timestamptz `+02:00` → local-zone readback, and an array with a NULL element) also
+delete to zero rows after the swap. This proves the current-version migration
+contract; it is not an old-build compatibility claim.
+
 `error=1, drop and add=3, widening automatic=4, MotherDuck UNION types=5`
 
 **Historical pre-fix evidence** (`p02` step D). `ALTER COLUMN col_smallint TYPE text` then inserting
@@ -1881,11 +1935,17 @@ declared operation × field-state × base-state × storage × outcome/fault ×
 identity × schema-epoch product is realized by the generated 2,880-cell matrix,
 with explicit refusal cells where the stock runtime cannot prove attribution.
 The real executor drives the production GroupPlan, TableWork fold, SchemaRegistry,
-SpillBuffer, typed swap, and destination transaction. It reports 272 committed
-cells and 2,608 refused cells; 1,519 results are covered by a declared owner and
-1,361 combinations are explicitly `covered=false` because their axes are
-mutually unreachable (for example keyless ambiguous-delete or a delete that
-cannot require a missing TOAST base). No unreachable cell is counted as exercised.
+SpillBuffer, typed swap, and destination transaction. The round-2 totals were not
+retained: after the round-3 machine-derived unreachability rules, the matrix reports
+**2,880 cells, 188 exercised, 2,692 refused, 1,020 covered, and 1,860 explicitly
+unreachable**. No unreachable cell is counted as exercised.
+
+**FIX ROUND 3 current evidence.** The test requires at least 1,000 covered cells,
+requires every uncovered reason to begin with `unreachable:` and include its machine
+owner, and re-raises every unexpected `BaseException`. Schema-refusal cells
+instantiate the real `Applier._handle_spill_refusal -> spill_refusal.handle` seam
+and prove durable `awaiting_snapshot` plus automatic retry. The dedicated seam
+regression and unexpected-exception regression pass.
 
 Evidence: `tests/rubric/2.6_toast_sparse_updates/`, including a real PostgreSQL
 pre-FULL event-boundary race using the reviewer’s pre-sample plus insert-LSN

@@ -9,7 +9,9 @@ from dataclasses import replace
 from . import catalog_support as observation_mod
 from . import faults as faults_mod
 from .catalog_descriptors import CatalogDescriptorReader
+from .catalog_generation import identities_equal, identity_for
 from .catalog_state import FENCED, SourceRelation, _missing_value
+from .errors import SchemaEvolutionRefused
 from .machines import (
     CATALOG_SCHEMA_LIVENESS,
     SCHEMA_EMPTY,
@@ -27,9 +29,12 @@ log = logging.getLogger("cdc_flight.catalog_poll")
 
 def _column_descriptor(raw: dict, descriptors: dict[int, SourceTypeDescriptor]) -> SourceTypeDescriptor:
     oid = int(raw["type_oid"])
-    descriptor = descriptors.get(oid) or descriptor_from_type_name(
-        str(raw["type_name"]), oid=oid, nullable=bool(raw.get("nullable", True))
-    )
+    descriptor = descriptors.get(oid)
+    if descriptor is None:
+        raise SchemaEvolutionRefused(
+            f"catalog descriptor authority is incomplete for source type OID {oid}; "
+            "refusing to infer a type from its display name"
+        )
     typmod = raw.get("typmod")
     if typmod is not None:
         descriptor = replace(descriptor, typmod=int(typmod))
@@ -99,13 +104,23 @@ def _ensure_toast_policies(
         previous_boundary = positive_lsn(
             getattr(previous, "full_activation_lsn", None)
         )
-        if (
-            current_boundary is None
-            and previous_boundary is not None
-        ):
-            relation = replace(
-                relation, full_activation_lsn=previous_boundary
-            )
+        previous_identity = identity_for(previous) if previous is not None else None
+        current_identity = identity_for(relation)
+        same_complete_generation = (
+            previous_identity is not None
+            and current_identity.complete
+            and previous_identity.complete
+            and identities_equal(current_identity, previous_identity)
+        )
+        # An activation LSN belongs to one physical relation generation and one
+        # verified FULL state. Never carry it by qualified name across DROP/CREATE,
+        # OID reuse, relfilenode rewrite, or a missing generation token.
+        if not same_complete_generation or str(relation.replica_identity).lower() != "f":
+            relation = replace(relation, full_activation_lsn=None)
+            current_boundary = None
+            updated[qualified] = relation
+        elif current_boundary is None and previous_boundary is not None:
+            relation = replace(relation, full_activation_lsn=previous_boundary)
             updated[qualified] = relation
         policy = classify_relation(
             qualified,

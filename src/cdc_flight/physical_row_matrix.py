@@ -332,26 +332,26 @@ def _recovery_proof(con, *, transaction_open: bool) -> str:
     return "rollback=clean; retry_boundary=open"
 
 
-def _durable_schema_recovery(con, *, source: str, target: str, reason: str) -> str:
-    """Use the same durable refusal/resnapshot obligation as the production applier."""
-    schema, _, table = source.partition(".")
-    destination_mod.record_schema_refusal(
-        con,
-        pipeline="physical-row-matrix",
-        source_schema=schema,
-        source_table=table,
-        target_table=target,
-        detected_lsn=1,
-        reason=reason,
-    )
+def _applier_schema_recovery(applier, refused, events: list[PendingRecord]) -> str:
+    """Exercise the production rollback + durable spill-refusal owner."""
+    applier.group.txn_open = True
+    applier._handle_spill_refusal(refused, events)
     awaiting = destination_mod.tables_awaiting_snapshot(
-        con, "physical-row-matrix"
+        applier.con, "physical-row-matrix"
     )
-    if (schema, table, target) not in awaiting:
+    if (
+        refused.source_schema,
+        refused.source_table,
+        refused.target,
+    ) not in awaiting:
         raise RuntimeError(
-            f"schema refusal for {source} was durable but did not enter awaiting_snapshot"
+            f"schema refusal for {refused.target} was durable but did not enter "
+            "awaiting_snapshot"
         )
-    return "schema_refusal=durable; awaiting_snapshot=true; retry=automatic"
+    return (
+        "seam=Applier._handle_spill_refusal->spill_refusal.handle; "
+        "schema_refusal=durable; awaiting_snapshot=true; retry=automatic"
+    )
 
 
 def _base_table(con, target: str, identity: str) -> None:
@@ -385,19 +385,79 @@ def _result(
     return PhysicalRowResult(cell, kind, reason, proof, covered)
 
 
-def _not_reachable(cell: PhysicalRowCell, owner: str) -> PhysicalRowResult:
+def _not_reachable(cell: PhysicalRowCell, reason: str) -> PhysicalRowResult:
     return _result(
         cell,
         "refused",
-        f"{owner} does not claim this declared combination",
-        f"owner={owner}; covered=false; no destination write was reported",
+        f"unreachable:{reason}",
+        f"machine_owner={reason}; covered=false; no destination write was reported",
         covered=False,
     )
 
 
-def _exercise_cell(con, cell: PhysicalRowCell, index: int) -> PhysicalRowResult:
+def _unreachable_reason(cell: PhysicalRowCell) -> str | None:
+    """Derive only state-machine-impossible cells, not runtime failures."""
+    if cell.schema_epoch == "mixed" and cell.outcome != "schema_refusal":
+        return "schema_epoch_mixed->SchemaEvolutionRefused"
+    if (
+        cell.outcome == "commit"
+        and cell.operation == "insert"
+        and cell.field_state == FieldState.UNCHANGED_TOAST.value
+    ):
+        return "insert_unchanged_toast->no_prior_row_to_merge"
+    if cell.outcome == "ambiguous_delete":
+        if cell.identity == "keyless":
+            return "keyless_identity->no_source_key_attribution"
+        if cell.operation != "delete":
+            return "ambiguous_delete->DELETE_only"
+    if cell.outcome == "toast_base_missing":
+        if cell.operation in {"insert", "delete"}:
+            return "toast_base_missing->insert_delete_have_no_toast_base_read"
+        if cell.field_state != FieldState.UNCHANGED_TOAST.value:
+            return "toast_base_missing->unchanged_toast_only"
+        if cell.base_state != "missing":
+            return "toast_base_missing->requires_missing_base"
+    if cell.outcome == "commit" and cell.identity == "keyless" and cell.operation == "key_move":
+        return "keyless_key_move->no_source_key_tuple"
+    if cell.outcome == "commit" and cell.identity == "keyless" and cell.operation == "delete":
+        return "keyless_delete->no_event_identity_base"
+    if (
+        cell.outcome == "commit"
+        and cell.identity == "keyless"
+        and cell.operation == "insert"
+        and cell.field_state == FieldState.ABSENT.value
+    ):
+        return "keyless_insert_absent->no_complete_source_image"
+    if (
+        cell.outcome == "commit"
+        and cell.identity == "keyless"
+        and cell.operation == "update"
+        and cell.field_state == FieldState.ABSENT.value
+    ):
+        return "keyless_update_absent->no_complete_source_image"
+    if (
+        cell.outcome == "commit"
+        and cell.identity == "keyless"
+        and cell.operation == "update"
+        and cell.field_state == FieldState.UNCHANGED_TOAST.value
+        and cell.base_state != "missing"
+    ):
+        return "keyless_update_unchanged_toast->no_source_row_identity"
+    if (
+        cell.outcome == "commit"
+        and cell.operation in {"update", "key_move"}
+        and cell.base_state == "missing"
+    ):
+        return "sparse_update->requires_verified_destination_base"
+    if cell.outcome == "swap_fault" and cell.schema_epoch != "pre":
+        return "swap_fault->mixed_schema_refusal_precedes_swap"
+    return None
+
+
+def _exercise_cell(
+    con, cell: PhysicalRowCell, index: int, *, matrix_applier=None
+) -> PhysicalRowResult:
     target = f"matrix_rows_{index}"
-    source = f"app.matrix_{index}"
     ensure_base = cell.base_state == "start" and cell.outcome != "swap_fault" and not (
         cell.schema_epoch == "mixed" and cell.outcome == "schema_refusal"
     )
@@ -406,18 +466,9 @@ def _exercise_cell(con, cell: PhysicalRowCell, index: int) -> PhysicalRowResult:
     # keyless row has no source identity to attribute and a keyed DELETE does not need
     # a physical base in order to be safe; neither can honestly be labeled
     # AmbiguousDelete/ToastBaseMissing merely because the product contains that axis.
-    if cell.outcome == "ambiguous_delete" and cell.identity == "keyless":
-        return _not_reachable(cell, "TableWork.keyless_identity")
-    if cell.outcome == "toast_base_missing" and (
-        cell.operation == "delete"
-        or (cell.operation == "key_move" and cell.base_state != "missing")
-        or (
-            cell.operation == "update"
-            and cell.base_state != "missing"
-            and cell.field_state != FieldState.UNCHANGED_TOAST.value
-        )
-    ):
-        return _not_reachable(cell, "TableWork._missing_toast_base")
+    unreachable = _unreachable_reason(cell)
+    if unreachable is not None:
+        return _not_reachable(cell, unreachable)
 
     from .apply_sql import SchemaRegistry
     from .planner import GroupPlan, stream_event_id
@@ -504,13 +555,9 @@ def _exercise_cell(con, cell: PhysicalRowCell, index: int) -> PhysicalRowResult:
         con.execute("COMMIT")
         txn_open = False
         if cell.outcome != "commit":
-            return _result(
-                cell,
-                "refused",
-                f"{cell.outcome}: its declared owner did not raise for this realized row state",
-                "destination:GroupPlan->TableWork->SchemaRegistry; transaction=committed; "
-                "covered=false; declared error owner not reached",
-                covered=False,
+            raise AssertionError(
+                f"declared physical-row owner {cell.outcome!r} did not raise for "
+                f"realized cell {cell!r}"
             )
         return _result(
             cell,
@@ -520,28 +567,15 @@ def _exercise_cell(con, cell: PhysicalRowCell, index: int) -> PhysicalRowResult:
             f"storage={cell.storage}; identity={cell.identity}",
         )
     except (AmbiguousDelete, ToastBaseMissing, SchemaEvolutionRefused, faults.InjectedFault) as exc:
-        with contextlib.suppress(Exception):
-            con.execute("ROLLBACK")
-        txn_open = False
-        recovery = _recovery_proof(con, transaction_open=txn_open)
         if isinstance(exc, SchemaEvolutionRefused):
-            try:
-                recovery = (
-                    recovery
-                    + "; "
-                    + _durable_schema_recovery(
-                        con, source=source, target=target, reason=str(exc)
-                    )
-                )
-            except BaseException as recovery_error:
-                return _result(
-                    cell,
-                    "refused",
-                    f"{exc}; durable recovery failed: {recovery_error}",
-                    "destination:real transaction; owner=SchemaEvolutionRefused; "
-                    f"{recovery}; schema_refusal=UNPROVEN",
-                    covered=False,
-                )
+            if matrix_applier is None:
+                raise AssertionError("matrix Applier seam was not supplied") from exc
+            recovery = _applier_schema_recovery(matrix_applier, exc, events)
+        else:
+            with contextlib.suppress(Exception):
+                con.execute("ROLLBACK")
+            txn_open = False
+            recovery = _recovery_proof(con, transaction_open=txn_open)
         proof = (
             "destination:GroupPlan->TableWork->SchemaRegistry; "
             f"owner={type(exc).__name__}; {recovery}"
@@ -552,18 +586,10 @@ def _exercise_cell(con, cell: PhysicalRowCell, index: int) -> PhysicalRowResult:
             SchemaEvolutionRefused: "schema_refusal",
             faults.InjectedFault: "swap_fault",
         }.get(type(exc), cell.outcome))
-    except BaseException as exc:
+    except BaseException:
         with contextlib.suppress(Exception):
             con.execute("ROLLBACK")
-        txn_open = False
-        return _result(
-            cell,
-            "refused",
-            f"{type(exc).__name__}: {exc}",
-            "destination:real transaction; owner=unexpected; "
-            f"{_recovery_proof(con, transaction_open=txn_open)}",
-            covered=False,
-        )
+        raise
 
 
 def exercise_cells(cells: tuple[PhysicalRowCell, ...]) -> tuple[PhysicalRowResult, ...]:
@@ -574,13 +600,36 @@ def exercise_cells(cells: tuple[PhysicalRowCell, ...]) -> tuple[PhysicalRowResul
 
         ensure_dataset(con, "matrix")
         ensure_control_schema(con)
+        from pathlib import Path
+
+        from .applier import Applier
+        from .config import ApplierConfig
+        from .destination import Lease, ResumePoint
+        from .snapshot_completion import SnapshotCompletion
+
+        matrix_applier = Applier(
+            con,
+            pipeline="physical-row-matrix",
+            namespace="matrix",
+            dataset="matrix",
+            topic_prefix="cdcflight",
+            offset_path=Path("physical-row-matrix.offsets.dat"),
+            resume_point=ResumePoint(),
+            config=ApplierConfig(verify_offset_file=False),
+            lease=Lease("physical-row-matrix", ttl_seconds=600),
+            runner_id="physical-row-matrix",
+            completion=SnapshotCompletion.streaming_only(),
+        )
         results = []
         for index, cell in enumerate(cells, 1):
             try:
-                results.append(_exercise_cell(con, cell, index))
+                results.append(
+                    _exercise_cell(con, cell, index, matrix_applier=matrix_applier)
+                )
             finally:
                 with contextlib.suppress(Exception):
                     con.execute(f'DROP TABLE IF EXISTS "matrix"."matrix_rows_{index}"')
+        matrix_applier.alerts.close()
         return tuple(results)
     finally:
         con.close()

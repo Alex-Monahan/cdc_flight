@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from support.motherduck_probe import assert_runtime, connect, scratch_database
 
@@ -161,6 +163,61 @@ def test_motherduck_nested_composite_jsonb_key_deletes_existing_row():
                 [(1, {"inner_key": {"doc": '{"a":1}', "n": 7}, "note": "x"})],
             )
             assert con.execute('SELECT count(*) FROM typed."nested_key"').fetchone()[0] == 0
+        finally:
+            con.close()
+
+
+def test_motherduck_jsonb_identity_equality_classes_delete_one_row():
+    """MotherDuck must use the same PostgreSQL JSONB numeric classes as local DuckDB."""
+    token = motherduck_token()
+    if not token:
+        pytest.skip("`motherduck_token` not set")
+
+    jsonb = _source("jsonb", 3802)
+    text = _source("text", 25)
+    compound = SourceTypeDescriptor(
+        9300,
+        "app.jsonb_identity_compound",
+        "composite",
+        composite_fields=(("doc", jsonb), ("note", text)),
+    )
+    equality_classes = (
+        ('{"v":1}', '{"v":1.0}'),
+        ('{"v":1e2}', '{"v":100}'),
+        ('{"v":1.2300}', '{"v":1.23}'),
+        ('{"v":-0.0}', '{"v":0}'),
+        ('{"a":1,"a":2}', '{"a":2}'),
+        ('{"b":[1,{"z":1,"a":2}]}', '{"b":[1.0,{"a":2,"z":1.0}]}'),
+    )
+    with scratch_database(token, "cdc_p2b_jsonb_identity_classes") as database:
+        con = connect(token, database)
+        try:
+            assert_runtime(con)
+            con.execute("CREATE SCHEMA typed")
+            registry = SchemaRegistry(con, "typed")
+            registry.ensure_typed(
+                "jsonb_identity",
+                columns={"compound": compound, "payload": text},
+                key_columns=("compound",),
+            )
+            table = registry.get("jsonb_identity")
+            assert table.internal_identity
+            for left, right in equality_classes:
+                insert_rows(
+                    con,
+                    table,
+                    ["compound", "payload"],
+                    [[{"doc": json.loads(left), "note": "same"}, "kept"]],
+                )
+                delete_keys(
+                    con,
+                    table,
+                    ("compound",),
+                    [({"doc": json.loads(right), "note": "same"},)],
+                )
+                assert con.execute(
+                    'SELECT count(*) FROM typed."jsonb_identity"'
+                ).fetchone()[0] == 0
         finally:
             con.close()
 

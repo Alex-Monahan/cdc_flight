@@ -11,8 +11,15 @@ import json
 import math
 from typing import Any
 
+from .identity_codec import (  # noqa: F401
+    _identity_candidates,
+    _identity_runtime,
+    _identity_tree,
+    _identity_value,
+    identity_value,
+)
 from .naming import CDCF_COMMIT_ID, CDCF_EVENT_ID, CDCF_TOTAL_ORDER
-from .schema_registry import (
+from .schema_registry import (  # noqa: F401
     SchemaRegistry,
     TableSchema,
     _is_numeric_inner_union,
@@ -25,14 +32,7 @@ from .schema_registry import (
     assert_identity_is_unique,
     widen,
 )
-from .identity_codec import (
-    _identity_candidates,
-    _identity_runtime,
-    _identity_tree,
-    _identity_value,
-    identity_value,
-)
-from .typed_materialization import (
+from .typed_materialization import (  # noqa: F401
     _copy_rows_with_identity,
     _typed_assignment,
     bulk_insert,
@@ -109,14 +109,14 @@ def bind(value: Any, column_type: str) -> Any:
 
 
 __all__ = [
-    "BOOLEAN",
     "BIGINT",
-    "DOUBLE",
-    "JSON_T",
-    "VARCHAR",
+    "BOOLEAN",
     "CDCF_COMMIT_ID",
     "CDCF_EVENT_ID",
     "CDCF_TOTAL_ORDER",
+    "DOUBLE",
+    "JSON_T",
+    "VARCHAR",
     "SchemaRegistry",
     "TableSchema",
     "assert_identity_is_unique",

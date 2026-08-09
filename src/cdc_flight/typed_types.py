@@ -475,7 +475,10 @@ def native_type(
     if kind in {"timetz", "zonedtime"}:
         return NativeType("TIMETZ", "TIMETZ", descriptor)
     if kind in {"interval"}:
-        return NativeType("INTERVAL", "INTERVAL", descriptor)
+        # DuckDB accepts INTERVAL values but cannot use INTERVAL in an index/PRIMARY
+        # KEY. Keep the native value column and route source-key identity through the
+        # canonical codec, just like LIST/STRUCT/MAP and variable NUMERIC.
+        return NativeType("INTERVAL", "INTERVAL", descriptor, indexable=False)
     if kind in {"uuid"}:
         return NativeType("UUID", "UUID", descriptor)
     if kind == "json":

@@ -13,9 +13,9 @@ from pathlib import Path
 import pytest
 
 _BASELINE_SELECTED = {
-    "not motherduck and not slow": 1398,
+    "not motherduck and not slow": 1450,
     "slow and not motherduck": 127,
-    "motherduck": 35,
+    "motherduck": 36,
 }
 
 
@@ -56,6 +56,17 @@ def test_catalog_helpers_share_one_public_module():
     assert state_matrix.catalog_support is catalog_support
     for removed in ("catalog_observation", "catalog_reporting", "catalog_runtime"):
         assert importlib.util.find_spec(f"cdc_flight.{removed}") is None
+
+
+def test_type_apply_owners_are_split_by_cohesion_not_line_count():
+    """The round-3 type split has explicit owners; a line-count proxy is not a design proof."""
+    from cdc_flight import apply_sql, identity_codec, schema_registry, typed_materialization
+
+    assert len(Path(apply_sql.__file__).read_text().splitlines()) < 200
+    assert callable(identity_codec._identity_value)
+    assert callable(identity_codec.canonical_jsonb_identity)
+    assert schema_registry.SchemaRegistry.__module__ == "cdc_flight.schema_registry"
+    assert typed_materialization.insert_rows.__module__ == "cdc_flight.typed_materialization"
 
 
 def test_snapshot_protocol_and_notifications_share_one_public_module():

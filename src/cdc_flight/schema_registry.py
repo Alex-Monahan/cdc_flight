@@ -20,6 +20,8 @@ from .naming import CDCF_EVENT_ID, quote
 
 BOOLEAN, BIGINT, DOUBLE, JSON_T, VARCHAR = "BOOLEAN", "BIGINT", "DOUBLE", "JSON", "VARCHAR"
 
+log = logging.getLogger("cdc_flight.schema_registry")
+
 
 def widen(current: str | None, incoming: str | None) -> str | None:
     """Least type that holds both; ambiguous changes remain conservative text."""
@@ -604,6 +606,11 @@ class SchemaRegistry:
                 key_columns=key_columns,
                 identity_descriptors={**old_descriptors, **descriptors},
                 changed_python=frozenset(changed_python),
+                carry_existing_identity=(
+                    table.internal_identity
+                    and "cdcf_internal_id" in old_raw_types
+                    and tuple(table.source_key_columns or table.key_columns) == tuple(key_columns)
+                ),
             )
             self.con.execute(f"DROP TABLE {table.qualified}")
             from . import faults
@@ -829,6 +836,12 @@ class SchemaRegistry:
                     identity_descriptors=identity_descriptors,
                     changed_sql={column: expression},
                     union_columns=frozenset({column}),
+                    carry_existing_identity=(
+                        table.internal_identity
+                        and "cdcf_internal_id" in table.raw_types
+                        and tuple(table.source_key_columns or table.key_columns)
+                        == tuple(source_key_columns or (column,))
+                    ),
                 )
             else:
                 select_expressions = [
@@ -1410,7 +1423,6 @@ def _typed_assignment(*args, **kwargs):
 __all__ = [
     "SchemaRegistry",
     "TableSchema",
-    "assert_identity_is_unique",
     "_is_numeric_inner_union",
     "_is_top_level_union",
     "_normalise_type",
@@ -1418,6 +1430,6 @@ __all__ = [
     "_type_sql_equal",
     "_union_member_names",
     "_union_members",
+    "assert_identity_is_unique",
     "widen",
 ]
-

@@ -117,7 +117,38 @@ def _missing_value(raw: str | None, type_name: str) -> object | None:
 
 
 def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
-    return catalog_state.read_known_relations(con, pipeline)
+    try:
+        return catalog_state.read_known_relations(con, pipeline)
+    except Exception as exc:
+        from .errors import SchemaEvolutionRefused
+
+        if not isinstance(exc, SchemaEvolutionRefused):
+            raise
+        # A durable descriptor miss is not a startup deadlock and is never repaired
+        # by guessing. Record the same refusal/awaiting-snapshot obligation used by
+        # the live applier, then let the next catalog observation drive a fresh
+        # relation read and single-table resnapshot.
+        if exc.source_schema and exc.source_table:
+            from . import destination
+
+            destination.record_schema_refusal(
+                con,
+                pipeline=pipeline,
+                source_schema=exc.source_schema,
+                source_table=exc.source_table,
+                target_table=exc.target,
+                detected_lsn=exc.detected_lsn,
+                reason=str(exc),
+            )
+            log.error(
+                "durable catalog descriptor refusal for %s.%s; automatic "
+                "catalog reread/resnapshot is now owed: %s",
+                exc.source_schema,
+                exc.source_table,
+                exc,
+            )
+            return {}
+        raise
 
 
 def seed_from_table_state(con, pipeline: str) -> set[str]:
