@@ -140,6 +140,10 @@ test-all: ## run everything: MotherDuck smoke test + slow fault injection
 
 .PHONY: test-md
 test-md: ## run only the MotherDuck tests
+	@test -n "$${motherduck_token:-$${MOTHERDUCK_TOKEN:-}}" || { \
+		echo "ERROR: make test-md requires motherduck_token or MOTHERDUCK_TOKEN" >&2; \
+		exit 2; \
+	}
 	$(UV) run pytest -m motherduck --durations=20
 
 .PHONY: test-slow

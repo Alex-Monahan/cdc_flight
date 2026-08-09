@@ -24,8 +24,16 @@ from cdc_flight import state_interactions, state_matrix
 from cdc_flight.machines import (
     ADMISSION_ERROR,
     ADMISSION_EXTERNAL,
+    CHANGE_APPLIED,
+    CHANGE_DUE,
+    CHANGE_MARKED,
     CHANGE_PENDING,
     CHANGE_REFUSED,
+    CHANGE_SUPERSEDED,
+    SCHEMA_EMPTY,
+    SCHEMA_ERROR,
+    SCHEMA_UNAVAILABLE,
+    SCHEMA_VISIBLE,
 )
 from cdc_flight.states import Domain, IllegalTransition, Machine, UnknownState, ranked
 
@@ -476,6 +484,44 @@ def test_production_interaction_gate_consumes_both_states():
     assert admitted.kind == "exercised"
     assert publication_error.kind == "refused"
     assert refused_change.kind == "refused"
+
+
+def test_catalog_liveness_matrix_has_an_independent_safety_oracle():
+    """An unavailable schema is never an admitted catalog-change route.
+
+    ``state_matrix`` supplies the real owners and production gate.  The expected
+    disposition here is the safety contract, kept independent of the gate's own
+    condition so an accidentally permissive liveness policy cannot make every
+    cell look like a valid execution.
+    """
+    ready_changes = frozenset(
+        {
+            CHANGE_PENDING,
+            CHANGE_MARKED,
+            CHANGE_DUE,
+            CHANGE_APPLIED,
+            CHANGE_SUPERSEDED,
+        }
+    )
+    blocked_liveness = frozenset(
+        {SCHEMA_EMPTY, SCHEMA_UNAVAILABLE, SCHEMA_ERROR}
+    )
+    for change in m.CATALOG_CHANGE.reachable_states():
+        for liveness in m.CATALOG_SCHEMA_LIVENESS.reachable_states():
+            result = state_matrix.exercise_cell(
+                ("catalog_change", "catalog_schema_liveness"), change, liveness
+            )
+            expected = (
+                "exercised"
+                if change in ready_changes and liveness == SCHEMA_VISIBLE
+                else "refused"
+            )
+            assert result.kind == expected, (
+                f"catalog_change={change}, liveness={liveness}: "
+                f"expected {expected}, got {result.kind}: {result.reason}"
+            )
+            if liveness in blocked_liveness:
+                assert result.kind == "refused"
 
 
 def test_interacting_pair_matrix_is_the_declared_matrix():

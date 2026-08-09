@@ -137,9 +137,18 @@ def test_a_rewound_source_is_detected(tmp_path_factory, postgres_cluster):
         box.reseed()
         box.run(reset_state=True, max_seconds=150)
         current = box.pg_query("SELECT (pg_current_wal_lsn() - '0/0')::bigint")[0][0]
-        # A destination that has seen further than the source can possibly have written.
+        # A one-byte synthetic lead is enough to construct the exact comparison while
+        # making any concurrent source writer an explicit failed precondition. A fixed
+        # 10 MB lead could be consumed by another xdist worker and turn a correct source
+        # into a false test pass.
+        durable_lsn = int(current) + 1
         box.duck_write(
-            "UPDATE _cdc_flight.debezium_offsets SET last_lsn = ?", [int(current) + 10_000_000]
+            "UPDATE _cdc_flight.debezium_offsets SET last_lsn = ?", [durable_lsn]
+        )
+        observed = box.pg_query("SELECT (pg_current_wal_lsn() - '0/0')::bigint")[0][0]
+        assert int(observed) < durable_lsn, (
+            "the rewound-source precondition was consumed before the supervisor ran: "
+            f"current={observed}, durable={durable_lsn}"
         )
         recovered = box.run(max_seconds=240)
         assert recovered["slot_check"]["decision"] == "source_lsn_regressed", (
