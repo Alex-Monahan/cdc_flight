@@ -138,9 +138,9 @@ def test_real_multirange_four_step_omission_is_a_loud_automatic_refusal(sandbox)
         assert all(item["returncode"] != 0 for item in (insert, update, delete))
 
         assert sandbox.duck_query(
-            "SELECT state FROM _cdc_flight.schema_refusals WHERE "
+            "SELECT state, refusal_class FROM _cdc_flight.schema_refusals WHERE "
             "source_schema = 'app' AND source_table = 'multirange_probe_refusal'"
-        ) == [("pending",)]
+        ) == [("quarantined", "SchemaEvolutionRefused")]
         assert sandbox.duck_query(
             "SELECT snapshot_state FROM _cdc_flight.table_state WHERE "
             "source_schema = 'app' AND source_table = 'multirange_probe_refusal'"

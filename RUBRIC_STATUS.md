@@ -691,7 +691,7 @@ correct assumptions in the notes below:
 | 2.1 | Added / dropped columns handled | **5** | Catalog-fenced attnum diffs add and backfill existing rows, physically drop destination columns, and continue through live CDC; the add/drop E2E compares source and destination before and after both DDLs. |
 | 2.2 | Renamed columns handled well | **5** | Same-attnum/type changes use a true destination rename, including a late-row merge/fence path; the E2E has one logical column, one rename audit event, and no data loss. |
 | 2.3 | New tables and schemas auto-discovered | **5** | A 10-second (configurable) all-schema watcher admits table-scoped publication members and performs an in-process targeted re-snapshot on the same main slot; new-table and new-schema existing rows arrive without config edit or restart. |
-| 2.4 | Postgres types → native MotherDuck types | ~~1~~ → **5** | The current contract is exact-or-refuse under the PostgreSQL type **output function** (`SELECT`/COPY/`format('%s', value)`), not the `::text` cast: `money` and `inet` round-trip, while stock-Debezium XML prologs and wrong-shaped `int2vector` values refuse durably. The generated corpus and catalog sweep pass on local DuckDB and real MotherDuck. |
+| 2.4 | Postgres types → native MotherDuck types | ~~1~~ → **5** | The current contract is exact-or-refuse under the PostgreSQL type **output function** (`SELECT`/COPY/`format('%s', value)`), not the `::text` cast: `xml`, `money`, `inet`, and the other obscure text types land losslessly as `VARCHAR`; only the separately documented stock `int2vector` Connect-shape refusal remains. The 86-value generated corpus and catalog sweep pass on local DuckDB and real MotherDuck. |
 | 2.5 | Data type changes supported | ~~3~~ → **5** | The typed shadow path, spill/replay path, and source-semantic multirange identity use the same `VARCHAR` resolver; real PostgreSQL equality classes and MotherDuck key-gain/shadow evidence pass. A full Debezium-driven MotherDuck multirange stream was not separately run, as recorded in the round-7 limits. |
 | 2.6 | TOAST columns handled well | **4** | Sparse physical-row folding, durable NULL-vs-JSONB-root-null ambiguity refusal, and a bounded relation-lock activation fence close the soundness defects. The real-owner matrix is non-circular. Stock Debezium still lacks a marker-preserving efficient channel, so the policy ceiling remains 4. |
 | 3.1 | Backfill scalable / parallelized | 3 | 120 k rows in ~28 s single-threaded (`snapshot.max.threads=1`); works but does not scale, untested past 120 k. |
@@ -701,7 +701,7 @@ correct assumptions in the notes below:
 | 3.5 | Per-table CDC / full refresh / incremental refresh | 3 | CDC only. |
 | 3.6 | Backfill when CDC falls too far behind | 1 | Lag is never measured, so nothing can trigger on it. |
 | 3.7 | Failed backfill resumes midway | 1 | Debezium restarts the initial snapshot from scratch, and the partial snapshot is already appended. |
-| 4.0 | Blast-radius containment for permanently unprocessable rows/tables | **5** | A bad table becomes durable, observable quarantine; every affected run is NOT-OK and alerted, healthy tables continue, the slot advances only after the resnapshot debt is durable, and `quarantined → pending → complete` automatically re-snapshots current source state. Real PostgreSQL measured slot-local WAL stayed below 1 MB. |
+| 4.0 | Blast-radius containment for permanently unprocessable rows/tables | **5** | A bad table becomes durable, observable quarantine; every affected run is NOT-OK and alerted once, healthy tables continue, both slot positions advance, and `quarantined → pending → complete` automatically re-snapshots current source state. Four-run live `ADD COLUMN box` and `box/oidvector/xid8` probes kept retained WAL below 1 MB. |
 | 4.1 | Recover from failed / lost slot | 1 | **Proven**: slot dropped → engine fails to start, process exits **0** in 1 s, slot never recreated, permanent silent no-op. |
 | 4.2 | Concurrent Flight instances | 1 | Two simultaneous runs both exit 0; same-slot runs silently no-op, different-slot runs silently duplicate into the same tables. |
 | 4.3 | Recover from problematic WAL / offset state | 1 | A bad offset kills the engine; there is no backfill, no retry, and the failure is reported as success. |
@@ -3249,10 +3249,13 @@ The final focused Round 9 regression file has **41 passed** tests. The only
 deliberately unclosed item is the binding 2.6 marker-preserving 5/5 path; no
 other Round 9 claim is being made beyond the evidence above.
 
-## FIX ROUND 10 closure — rubric 2.4 / 2.5 / 2.6 / 4.0 (2026-08-10)
+## FIX ROUND 10 historical closure — superseded by FIX ROUND 11 (2026-08-10)
 
-The honest post-fix scores are **2.4 = 5/5**, **2.5 = 5/5**, **2.6 = 4/5**,
-and **4.0 = 5/5**. 2.6 remains deliberately capped by the binding policy:
+This section records the pre-Round-11 implementation and is retained for audit
+history. Its XML refusal and its containment measurements were disproved by the
+Round-10 rereview; the current scores and dispositions are in the FIX ROUND 11
+section below. At that earlier point the recorded scores were **2.4 = 4/5**,
+**2.5 = 5/5**, **2.6 = 4/5**, and **4.0 = 3/5**. 2.6 remains deliberately capped by the binding policy:
 stock Debezium's marker-preserving efficient TOAST channel is deferred. No
 previous-build migration or compatibility work was added.
 
@@ -3443,3 +3446,185 @@ claimed (2.6 = 4/5); no physical-standby run is claimed; and the existing
 MotherDuck multirange evidence is resolver/key-gain evidence rather than a separate
 full stock-Debezium multirange stream. No migration between previous repository
 builds was implemented.
+
+## FIX ROUND 11 closure — rubric 2.4 / 2.5 / 2.6 / 4.0 (2026-08-10)
+
+**SATISFIED: yes.** The current honest scores are **2.4 = 5/5, 2.5 = 5/5,
+2.6 = 4/5, and 4.0 = 5/5**. The 2.6 marker-preserving 5/5 remains deferred by
+the binding stock-Debezium policy. The Round-10 XML refusal, locale-dependent
+money synthesis, refusal-class split, repeated alerts, unconditional retry,
+first-table scope guess, source-drop dead end, missing corpus artifact, and
+previous-build migration machinery are addressed below.
+
+### XML: admitted at PostgreSQL's output-function boundary
+
+The categorical XML refusal at the old `typed_types.py:778` site is gone. XML
+resolves to allowlisted `VARCHAR` and uses the same opaque transport path as the
+other output-text types. The code comment records the product decision: PostgreSQL
+`xml_out` removes a default `version="1.0"` declaration before `SELECT`, COPY, and
+`format('%s', value)` expose the value; this is PostgreSQL normalization, not a
+Debezium loss. `standalone="yes"` and `version="1.1"` declarations remain.
+
+`tests/support/fix9_opaque.py` now creates the corpus by executing PostgreSQL
+expressions, reads the oracle with `format('%s', value)`, and compares destination
+rows exactly. It contains eight XML cases, including a default prolog, an encoding
+prolog, `standalone="yes"`, `version="1.1"`, a comment, nesting, Unicode, and a
+plain document. The local PostgreSQL→DuckDB run matched **8/8 XML values** and the
+real MotherDuck run matched **8/8 XML values**. There was no residual XML deviation
+to authorize or hide: the only normalization is the source output function's
+documented default-prolog removal, and the tests assert the exact resulting bytes.
+
+### Full output-function re-derivation
+
+The old verdicts were audited systematically. The actual verdicts that depended on
+the wrong `::text`/hard-coded oracle were exactly `xml`, `money`, and `inet`; the
+remaining rows below are the complete opaque-type control set re-run through the
+correct output-function oracle, plus the `bpchar` difference noted by the review.
+
+| type | prior/stale verdict | Round-11 output-function re-derivation and current verdict |
+|---|---|---|
+| `tsquery` | admitted as opaque text under the old corpus | **15/15 exact; admitted as `VARCHAR`** |
+| `jsonpath` | admitted as opaque text under the old corpus | **15/15 exact; admitted as `VARCHAR`** |
+| `pg_lsn` | admitted as opaque text under the old corpus | **8/8 exact; admitted as `VARCHAR`** |
+| `tsvector` | admitted as opaque text under the old corpus | **10/10 exact; admitted as `VARCHAR`** |
+| `cidr` | admitted as opaque text under the old corpus | **8/8 exact; admitted as `VARCHAR`** |
+| `macaddr` | admitted as opaque text under the old corpus | **5/5 exact; admitted as `VARCHAR`** |
+| `macaddr8` | admitted as opaque text under the old corpus | **5/5 exact; admitted as `VARCHAR`** |
+| `inet` | the old `::text` comparison treated the redundant host mask as required and refused the connector spelling | **6/6 exact against `format`; admitted losslessly as `VARCHAR`** |
+| `money` | admitted with a C/en_US `$` synthesis, which was wrong under `en_GB` | **6/6 exact under the source locale; C and `en_GB.UTF-8` unit cases produce `$`/`£`, and mismatched decoration refuses loudly** |
+| `xml` | refused because the default prolog was incorrectly attributed to Debezium | **8/8 exact against `format`; admitted as `VARCHAR`** |
+| `bpchar` (oracle control) | `::text` can strip trailing blanks, although no Round-10 opaque acceptance/refusal was based on that result | output-function audit retained the source bytes; no verdict change or stale refusal |
+| `int2vector` (wire-shape control) | text-shaped values were allowed, but stock Debezium's list-shaped Connect payload was refused | unchanged and honest: the **four** stock list-shaped values remain a loud shape refusal; this is not an output-oracle/XML deviation |
+
+The first seven plus `cidr`/MAC rows are the retained proof artifact for the prior
+66-value claim: 15 + 15 + 8 + 10 + 8 + 5 + 5 = **66**. Adding six `inet`, six
+`money`, and eight `xml` values gives **86 exact delivered values**. The local and
+MotherDuck tests compare every one; no expected destination value is hand-written.
+The source-range tests' `::text` displays are equality evidence, not an opaque
+accept/refuse decision, and were not used to admit a value through this boundary.
+
+### One refusal-class authority and complete origin inventory
+
+`errors.CANONICAL_REFUSAL_CLASS` is the only durable class:
+`SchemaEvolutionRefused`. `SchemaEvolutionRefused`, `SchemaBackfillRefused`, and
+`SchemaShapeUnexplained` require a registered `refusal_origin`; their constructor
+sets the canonical class and exposes the origin only as diagnostic metadata.
+`destination.record_schema_refusal()` no longer accepts a caller-supplied class and
+always writes the canonical value. The durable identity is independent of origin
+and exception wording, and a changing bad row image does not change it.
+
+The code currently contains **59** direct production refusal raises. The declaration
+map and structural test enumerate all of them by module:
+
+| module | registered origin |
+|---|---|
+| `catalog` | `catalog_state` |
+| `catalog_descriptors` | `catalog_descriptor` |
+| `catalog_poll` | `catalog_poll` |
+| `catalog_state` | `catalog_state` |
+| `catalog_support` | `catalog_shape` |
+| `planner` | `typed_planner` |
+| `schema_backfill` | `schema_backfill` |
+| `schema_ddl` | `schema_ddl` |
+| `schema_epoch` | `schema_epoch` |
+| `schema_evolution` | `schema_evolution` |
+| `schema_registry` | `schema_registry` |
+| `schema_shadow` | `schema_shadow` |
+| `spill_protocol` | `spill_protocol` |
+| `table_work` | `table_work` |
+
+`test_every_production_refusal_raise_declares_a_registered_origin` parses every
+production AST raise, requires the module declaration and literal origin, rejects
+any `refusal_class=` constructor keyword, and asserts the seen module set equals the
+declaration set. A future production origin therefore cannot bypass the authority
+without failing the default test. Scoped refusals all go through the durable writer;
+an unscoped defensive refusal raises a critical unscoped alert, advances no table,
+and cannot report a successful run rather than being guessed onto `rows[0]`.
+
+The catalog batch wrappers and `_contextualize_schema_refusal()` now scope only an
+explicit single relation. A two-table regression proves that a descriptor failure
+does not quarantine the first, healthy relation in the group.
+
+### Literal 4.0 containment probes
+
+All values below came from the clone's PostgreSQL 18 cluster on **15434**. `retained
+WAL` is `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)`; both LSN columns were
+read from `pg_replication_slots` after each run.
+
+Probe 1 — live `ALTER TABLE ... ADD COLUMN v box`, with a healthy co-published peer:
+
+| run | restart_lsn | confirmed_flush_lsn | retained WAL (B) |
+|---|---|---|---:|
+| bad 1 | `F/8F7EA178` | `F/8F7EA1B0` | 4,216 |
+| bad 2 | `F/8F7EA9D8` | `F/8F7EBF58` | 6,024 |
+| bad 3 | `F/8F7EBC10` | `F/8F7EBF58` | 135,872 |
+| bad 4 | `F/8F7EBC10` | `F/8F7EBF58` | 142,208 |
+
+Probe 2 — one live DDL adding `box`, `oidvector`, and `xid8` columns:
+
+| run | restart_lsn | confirmed_flush_lsn | retained WAL (B) |
+|---|---|---|---:|
+| 1 | `F/90297B30` | `F/90297B68` | 12,752 |
+| 2 | `F/9029D360` | `F/9029D8F0` | 1,632 |
+| 3 | `F/9029FAC8` | `F/902A0070` | 2,112 |
+| 4 | `F/902A2248` | `F/902A29A0` | 2,544 |
+
+Probe 3 — the permanently bad row image changed on every source transaction
+(`bad-image-2` through `bad-image-5`). It is the same four-run measured series as
+Probe 2: the row-image changes did not reset the descriptor refusal identity; the
+durable live-table state ended `quarantined` with class `SchemaEvolutionRefused`.
+
+Probe 4 — the healthy peer in that same four-run series received **all five rows**:
+`peer-1` through `peer-5`. Its rows were committed while the bad table was
+quarantined, and the four runs were all NOT-OK because the bad table still owed a
+current-source resnapshot. The exact alert assertion is one
+`schema_table_quarantined` row for the refusal fingerprint, not one alert per run.
+
+The repaired-source continuation drops the unsupported column, inserts the current
+source row, and passes two further runs. The refusal becomes `resolved` only after a
+complete resnapshot, `table_state.snapshot_state` becomes `complete`, and the
+destination contains both current rows. The source-absent policy has a focused
+2-case regression: a quarantined source that is positively observed absent reaches
+complete/resolve before the drop projection, so the old permanent dead end is gone.
+
+### Round-10 finding dispositions
+
+| finding | disposition |
+|---|---|
+| R10-1 BLOCKER, XML refused on `::text` premise | **Fixed.** XML is admitted and exact against PostgreSQL output-function bytes on both runtimes. |
+| R10-2 BLOCKER, live unsupported DDL froze both slot positions | **Fixed.** Catalog observation retains the complete source shape, schema evolution routes the unsupported column through the common refusal writer, and the four-run box/oidvector/xid8 probes contain the table while the peer progresses. |
+| R10-3 MAJOR, money hard-coded C/en_US | **Fixed.** `SHOW lc_monetary` is carried in the catalog descriptor; C/en_US and `en_GB.UTF-8` are rendered exactly, and unknown locales refuse instead of fabricating a symbol. |
+| R10-4 MINOR, duplicate critical alert per run | **Fixed.** Alert insertion is deduplicated by pipeline plus refusal fingerprint and is asserted as exactly one in the live probe. |
+| R10-5 MINOR, unconditional quarantine retry | **Fixed.** Reactivation requires source absence or a changed relation/descriptor fingerprint; unchanged or unavailable source evidence does not retry. |
+| R10-6 MINOR, first-table scope guess | **Fixed.** Commit/spill/catalog batch contextualization is fail-closed for multiple candidates, with a direct two-relation regression. |
+| R10-7 MINOR, source DROP never discharges | **Fixed.** Positive final source absence first completes lifecycle, then resolves the refusal and applies the drop policy. |
+| R10-8 NIT, alert after COMMIT inside rollback handler | **Fixed.** Alerting runs after the durable transaction and cannot mask or double-record the refusal. |
+| R10-9 NIT, 66-value proof absent from the tree | **Fixed.** The generated 66-value opaque corpus plus 6 `inet`, 6 `money`, and 8 XML values is now retained and executed on both runtimes. |
+| R10-10 NIT, previous-build control-schema migration | **Fixed.** The create-only current DDL removed `_ADDED_COLUMNS`, ALTER/backfill helpers, and commit-log key conversion. Previous-build state remains explicitly out of scope; PostgreSQL source-schema evolution remains supported. |
+
+### Round-11 evidence and limits
+
+The focused regression set passed **152 tests** (four deselected). The local
+output-function corpus passed after expansion with **86 exact delivered values**;
+the real MotherDuck corpus printed and passed:
+`total=86, counts={tsquery:15, jsonpath:15, pg_lsn:8, tsvector:10, xml:8,
+money:6, inet:6, cidr:8, macaddr:5, macaddr8:5}`. The four `int2vector` values
+remain the separately asserted stock Connect-shape refusal.
+
+The final required lanes used PostgreSQL 18 on port **15434** and are green:
+
+| lane | result |
+|---|---:|
+| `CDC_TEST_PGPORT=15434 make test` | **1,628 passed** in 249.64s |
+| `CDC_TEST_PGPORT=15434 make test-slow` (run 1) | **144 passed** in 1,057.52s |
+| `CDC_TEST_PGPORT=15434 make test-slow` (run 2) | **144 passed** in 1,040.87s |
+| `CDC_TEST_PGPORT=15434 make test-md` | **32 passed** in 443.60s |
+| `CDC_TEST_PGPORT=15434 make lint` | **All checks passed** |
+
+The final commit SHA is recorded in the Round-11 handoff summary. Deliberately
+unproven limits remain:
+the stock marker-preserving TOAST channel (therefore 2.6 = 4/5), physical-standby
+containment, and money locales beyond the explicitly supported C/POSIX, en_US, and
+en_GB families. No Debezium fork, converter/SMT, Java, Maven, or Gradle artifact was
+introduced, and no previous-build identity migration or compatibility sidecar was
+implemented.

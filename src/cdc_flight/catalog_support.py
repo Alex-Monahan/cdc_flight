@@ -258,6 +258,7 @@ def observe_unit(watcher, unit) -> None:
                 source_schema=schema,
                 source_table=table,
                 target=name,
+                refusal_origin="catalog_shape",
             )
         catalog_names = {
             column.destination_name for column in relation.columns
@@ -274,6 +275,7 @@ def observe_unit(watcher, unit) -> None:
                     source_table=table,
                     target=name,
                     detected_lsn=getattr(record, "lsn", None),
+                    refusal_origin="catalog_shape",
                 )
 
 

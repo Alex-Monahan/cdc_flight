@@ -358,7 +358,7 @@ class GroupPlan:
                 target=target,
                 detected_lsn=event.lsn,
                 input_fingerprint=input_fingerprint(event),
-                refusal_class="value_encoding",
+                refusal_origin="typed_planner",
             ) from exc
         table_work.collect(item, event, row, event_id, probe=self, patch=patch)
         image = event.after if event.op != "d" else event.before
@@ -388,6 +388,7 @@ class GroupPlan:
                 source_schema=event.schema,
                 source_table=event.table,
                 target=event.qualified_table,
+                refusal_origin="typed_planner",
             )
         qualified = event.qualified_table
         if qualified not in self._catalog_descriptor_cache:
@@ -400,6 +401,7 @@ class GroupPlan:
                     source_schema=event.schema,
                     source_table=event.table,
                     target=qualified,
+                    refusal_origin="typed_planner",
                 ) from exc
             self._catalog_descriptor_cache[qualified] = dict(catalog_descriptors or {})
         catalog_descriptors = self._catalog_descriptor_cache[qualified]
@@ -410,6 +412,7 @@ class GroupPlan:
                 source_schema=event.schema,
                 source_table=event.table,
                 target=qualified,
+                refusal_origin="typed_planner",
             )
         for name, descriptor in catalog_descriptors.items():
             try:
@@ -422,6 +425,7 @@ class GroupPlan:
                     source_table=event.table,
                     target=qualified,
                     detected_lsn=event.lsn,
+                    refusal_origin="typed_planner",
                 ) from exc
         watcher = getattr(self.descriptor_provider, "__self__", None)
         if watcher is not None and hasattr(watcher, "event_shape_missing"):
@@ -444,6 +448,7 @@ class GroupPlan:
                 source_table=event.table,
                 target=qualified,
                 detected_lsn=event.lsn,
+                refusal_origin="typed_planner",
             )
         for attribute in ("key_descriptors", "before_descriptors", "after_descriptors"):
             descriptors = getattr(event, attribute)

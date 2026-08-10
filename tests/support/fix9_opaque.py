@@ -14,6 +14,17 @@ CORPUS = {
             "to_tsquery('fat:B*')",
             "''::tsquery",
             "to_tsquery('fat & rat')",
+            "to_tsquery('fat | rat')",
+            "to_tsquery('!fat')",
+            "to_tsquery('(fat & rat) | cat')",
+            "to_tsquery('fat <-> rat')",
+            "to_tsquery('fat <2> rat')",
+            "to_tsquery('fat:* & rat:*')",
+            "plainto_tsquery('simple', 'fat rat')",
+            "phraseto_tsquery('simple', 'fat rat')",
+            "websearch_to_tsquery('simple', 'fat or rat')",
+            "to_tsquery('simple', 'blue:*')",
+            "to_tsquery('english', 'fat & rat')",
         ],
     ),
     "jsonpath": (
@@ -23,11 +34,31 @@ CORPUS = {
             "'1 + 2'::jsonpath",
             "'$.a + $.b'::jsonpath",
             "'-$.a'::jsonpath",
+            "'lax $.a'::jsonpath",
+            "'$.a[*]'::jsonpath",
+            "'$.a[0 to 2]'::jsonpath",
+            "'$.a.*'::jsonpath",
+            "'$.**.a'::jsonpath",
+            "'$ ? (@ == 1)'::jsonpath",
+            "'$.a ? (@ > 1)'::jsonpath",
+            "'$.a.type()'::jsonpath",
+            "'$.a.size()'::jsonpath",
+            "'$.a ? (@ like_regex \"foo\")'::jsonpath",
+            "'$.a[0]'::jsonpath",
         ],
     ),
     "pg_lsn": (
         "pg_lsn",
-        ["'0/16B6A0'::pg_lsn", "'0/16B6A1'::pg_lsn", "'1/0'::pg_lsn", "'F/F'::pg_lsn"],
+        [
+            "'0/16B6A0'::pg_lsn",
+            "'0/16B6A1'::pg_lsn",
+            "'1/0'::pg_lsn",
+            "'F/F'::pg_lsn",
+            "'0/0'::pg_lsn",
+            "'0/FFFFFFFF'::pg_lsn",
+            "'10/20'::pg_lsn",
+            "'ABC/DEF'::pg_lsn",
+        ],
     ),
     "tsvector": (
         "tsvector",
@@ -36,6 +67,12 @@ CORPUS = {
             "to_tsvector('simple', '')",
             "setweight(to_tsvector('simple', 'blue'), 'A')",
             "to_tsvector('english', 'the quick brown fox')",
+            "to_tsvector('simple', 'one two three')",
+            "to_tsvector('simple', 'Café naïve')",
+            "to_tsvector('english', 'PostgreSQL database')",
+            "to_tsvector('simple', 'foo-bar')",
+            "setweight(to_tsvector('simple', 'title'), 'B')",
+            "to_tsvector('english', 'the and or')",
         ],
     ),
     "xml": (
@@ -45,11 +82,22 @@ CORPUS = {
             "xmlparse(document '<a/>')",
             "xmlparse(document '<?xml version=\"1.0\"?><prolog/>')",
             "xmlparse(document '<?xml version=\"1.0\" encoding=\"UTF-8\"?><unicode>é</unicode>')",
+            "xmlcomment('round11')",
+            "xmlelement(name root, xmlelement(name child, 'x'))",
+            "xmlparse(document '<?xml version=\"1.0\" standalone=\"yes\"?><standalone/>')",
+            "xmlparse(document '<?xml version=\"1.1\"?><v11/>')",
         ],
     ),
     "money": (
         "money",
-        ["12.34::money", "(-0.01)::money", "0::money", "999999.99::money"],
+        [
+            "12.34::money",
+            "(-0.01)::money",
+            "0::money",
+            "999999.99::money",
+            "1234.56::money",
+            "1000000.00::money",
+        ],
     ),
     "inet": (
         "inet",
@@ -69,6 +117,10 @@ CORPUS = {
             "'2001:db8::/32'::cidr",
             "'198.51.100.0/25'::cidr",
             "'::/0'::cidr",
+            "'10.0.0.0/8'::cidr",
+            "'172.16.0.0/12'::cidr",
+            "'2001:db8:1::/48'::cidr",
+            "'192.0.2.128/25'::cidr",
         ],
     ),
     "macaddr": (
@@ -78,6 +130,7 @@ CORPUS = {
             "'ff:ff:ff:ff:ff:ff'::macaddr",
             "'00:00:00:00:00:00'::macaddr",
             "'12:34:56:78:9a:bc'::macaddr",
+            "'01:23:45:67:89:ab'::macaddr",
         ],
     ),
     "macaddr8": (
@@ -87,6 +140,7 @@ CORPUS = {
             "'ff:ff:ff:ff:ff:ff:ff:ff'::macaddr8",
             "'00:00:00:00:00:00:00:00'::macaddr8",
             "'12:34:56:78:9a:bc:de:f0'::macaddr8",
+            "'01:23:45:67:89:ab:cd:ef'::macaddr8",
         ],
     ),
     "int2vector": (
@@ -101,10 +155,13 @@ CORPUS = {
 }
 
 EXACT_CORPUS = dict(CORPUS)
-# XML declarations are stripped by stock Debezium.  Since the value at the
-# connector boundary cannot distinguish a source document that had a declaration
-# from one that never had one, the safe contract is refuse-all XML.
-UNDELIVERABLE_TEXT_TYPES = frozenset({"xml"})
+# The corpus is generated and compared against PostgreSQL's output function.  A
+# default XML declaration is removed by ``xml_out`` itself (not by Debezium), so
+# both the declaration-bearing source expression and the connector value compare
+# to the same output-function bytes. ``int2vector`` remains the one deliberate
+# value-shape refusal: stock Debezium exposes it as a Connect array rather than
+# the PostgreSQL text payload represented by this corpus.
+UNDELIVERABLE_TEXT_TYPES = frozenset()
 
 
 def capture_environment(tables: list[str]) -> dict[str, str]:

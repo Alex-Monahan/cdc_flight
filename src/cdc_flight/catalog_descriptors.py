@@ -8,6 +8,8 @@ query per column/type.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 
@@ -21,8 +23,20 @@ from .typed_types import SourceTypeDescriptor, UnsupportedType, native_type
 class CatalogDescriptorReader:
     con: object
     cache: dict[int, SourceTypeDescriptor] = field(default_factory=dict)
+    _money_locale: str | None = field(default=None, init=False, repr=False)
+    _money_locale_read: bool = field(default=False, init=False, repr=False)
 
     def resolve(self, oids: Iterable[int]) -> dict[int, SourceTypeDescriptor]:
+        if not self._money_locale_read:
+            self._money_locale_read = True
+            try:
+                row = self.con.execute("SHOW lc_monetary").fetchone()
+                self._money_locale = str(row[0]) if row and row[0] is not None else "C"
+            except Exception:
+                # Lightweight descriptor unit doubles do not expose GUCs.  The
+                # PostgreSQL source authority still has the safe C default used by
+                # PostgreSQL when no locale metadata can be queried.
+                self._money_locale = "C"
         wanted = {int(oid) for oid in oids if oid}
         facts: dict[int, dict] = {}
         pending = set(wanted)
@@ -120,6 +134,11 @@ class CatalogDescriptorReader:
                 range_subtype=(build(range_subtype) if range_subtype else None),
                 map_key=map_key,
                 map_value=map_value,
+                metadata=(
+                    (("lc_monetary", self._money_locale),)
+                    if oid == 790 and self._money_locale
+                    else ()
+                ),
             )
             building.remove(oid)
             self.cache[oid] = descriptor
@@ -198,24 +217,26 @@ class RelationDescriptorProvider:
                 (str(schema), str(table), str(target))
                 for schema, table, target in requested
             )
+            scoped = source_tables[0] if len(source_tables) == 1 else None
             raise SchemaEvolutionRefused(
                 f"catalog descriptor authority failed for {len(source_tables)} "
                 f"source relation(s): {exc}",
-                source_schema=(source_tables[0][0] if source_tables else None),
-                source_table=(source_tables[0][1] if source_tables else None),
-                target=(source_tables[0][2] if source_tables else None),
-                refusal_class="catalog_descriptor",
+                source_schema=(scoped[0] if scoped else None),
+                source_table=(scoped[1] if scoped else None),
+                target=(scoped[2] if scoped else None),
+                refusal_origin="catalog_descriptor",
                 source_tables=source_tables,
             ) from exc
         missing = sorted(oids - set(descriptors))
         if missing:
+            scoped = requested[0] if len(requested) == 1 else None
             raise SchemaEvolutionRefused(
                 "catalog descriptor authority is incomplete for OID(s) "
                 + ", ".join(str(oid) for oid in missing),
-                source_schema=(str(requested[0][0]) if requested else None),
-                source_table=(str(requested[0][1]) if requested else None),
-                target=(str(requested[0][2]) if requested else None),
-                refusal_class="catalog_descriptor",
+                source_schema=(str(scoped[0]) if scoped else None),
+                source_table=(str(scoped[1]) if scoped else None),
+                target=(str(scoped[2]) if scoped else None),
+                refusal_origin="catalog_descriptor",
                 source_tables=tuple(
                     (str(schema), str(table), str(target))
                     for schema, table, target in requested
@@ -237,13 +258,89 @@ class RelationDescriptorProvider:
                     source_schema=str(schema),
                     source_table=str(table),
                     target=f"{schema}.{table}",
-                    refusal_class="catalog_descriptor",
+                    refusal_origin="catalog_descriptor",
                 ) from exc
             result.setdefault(f"{schema}.{table}", {})[normalize(str(name))] = descriptor
         return cls(result)
 
     def descriptors_for(self, qualified: str) -> dict[str, SourceTypeDescriptor]:
         return dict(self.relations.get(str(qualified), {}))
+
+
+def relation_descriptor_fingerprint(
+    relation_oid: int,
+    columns: Iterable[tuple[str, int, int, int | None, str, SourceTypeDescriptor]],
+) -> str:
+    """Hash the source relation facts used by the quarantine retry gate.
+
+    The relation OID catches drop/recreate.  Column names, order, type OIDs, typmods,
+    formatted names, and the complete recursively resolved descriptor catch source
+    schema/type changes.  It intentionally does not inspect row values: a changing
+    bad row image is not permission to retry an unchanged schema forever.
+    """
+    payload = {
+        "relation_oid": int(relation_oid),
+        "columns": [
+            {
+                "name": str(name),
+                "attnum": int(attnum),
+                "type_oid": int(type_oid),
+                "typmod": int(typmod) if typmod is not None else None,
+                "formatted": str(formatted),
+                "descriptor": descriptor.fingerprint,
+            }
+            for name, attnum, type_oid, typmod, formatted, descriptor in columns
+        ],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def source_relation_fingerprint(
+    dsn: str, source_schema: str, source_table: str
+) -> tuple[bool, str | None]:
+    """Read one current source relation for the quarantine reactivation decision.
+
+    ``(False, None)`` is positive source-absence evidence.  A read/authority error
+    returns ``(True, None)`` so an uncertain source state cannot reactivate a stale
+    table; the next ordinary catalog poll remains the repair trigger.
+    """
+    import psycopg
+
+    try:
+        with psycopg.connect(dsn, autocommit=True) as con:
+            rows = con.execute(
+                "SELECT c.oid::bigint, a.attname, a.attnum, a.atttypid::bigint, "
+                "a.atttypmod, format_type(a.atttypid, a.atttypmod) "
+                "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "LEFT JOIN pg_attribute a ON a.attrelid = c.oid "
+                "AND a.attnum > 0 AND NOT a.attisdropped "
+                "WHERE n.nspname = %s AND c.relname = %s "
+                "AND c.relkind IN ('r', 'p', 'f', 'm') "
+                "ORDER BY a.attnum",
+                [source_schema, source_table],
+            ).fetchall()
+            if not rows:
+                exists = con.execute(
+                    "SELECT 1 FROM pg_class c JOIN pg_namespace n "
+                    "ON n.oid = c.relnamespace WHERE n.nspname = %s "
+                    "AND c.relname = %s AND c.relkind IN ('r', 'p', 'f', 'm')",
+                    [source_schema, source_table],
+                ).fetchone()
+                return bool(exists), None
+            reader = CatalogDescriptorReader(con)
+            descriptors = reader.resolve({int(row[3]) for row in rows})
+            facts = []
+            for _relation_oid, name, attnum, type_oid, typmod, formatted in rows:
+                descriptor = _column_facts(
+                    descriptors[int(type_oid)], str(formatted), typmod
+                )
+                facts.append(
+                    (str(name), int(attnum), int(type_oid), typmod, str(formatted), descriptor)
+                )
+            return True, relation_descriptor_fingerprint(int(rows[0][0]), facts)
+    except Exception:
+        return True, None
 
 
 def provider_for_source(source) -> object:
@@ -308,4 +405,6 @@ __all__ = [
     "CatalogDescriptorReader",
     "RelationDescriptorProvider",
     "provider_for_source",
+    "relation_descriptor_fingerprint",
+    "source_relation_fingerprint",
 ]

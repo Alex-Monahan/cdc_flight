@@ -18,7 +18,7 @@ from support.fix9_opaque import (
 from support.fixtures import Sandbox
 
 from cdc_flight.catalog_descriptors import CatalogDescriptorReader
-from cdc_flight.typed_types import InvalidTypedValue, UnsupportedType, adapt_value, native_type
+from cdc_flight.typed_types import UnsupportedType, adapt_value, native_type
 
 # This is a source-generated correctness guard, not a fault-injection timing
 # proof. Keep it in the default lane so it cannot starve the slow lane's
@@ -32,6 +32,8 @@ def test_postgresql_generated_opaque_corpus_is_lossless_or_refused_on_local_duck
     sandbox = Sandbox("fix9_pg_generated", tmp_path / "sandbox", postgres_cluster)
     try:
         assert sandbox.source.port == int(os.environ["CDC_TEST_PGPORT"])
+        assert len(EXACT_CORPUS["xml"][1]) == 8
+        assert not UNDELIVERABLE_TEXT_TYPES
         sandbox.reseed()
         tables = create_corpus(sandbox, EXACT_CORPUS)
         capture = capture_environment(tables)
@@ -41,9 +43,9 @@ def test_postgresql_generated_opaque_corpus_is_lossless_or_refused_on_local_duck
             populate_corpus(sandbox)
             # Values were generated and rendered by PostgreSQL above; no expected
             # row value is hand-written below.
-            # XML declarations and int2vector are refusal cases.  money and inet
-            # are deliberately in the exact corpus: their comparison is against
-            # PostgreSQL's output function, not a value::text cast.
+            # Every XML value is admitted and compared with PostgreSQL's output
+            # function.  int2vector is the separate stock wire-shape refusal;
+            # money and inet are deliberately in the exact corpus too.
             results = []
             for _attempt in range(7):
                 result = sandbox.run(
@@ -53,7 +55,7 @@ def test_postgresql_generated_opaque_corpus_is_lossless_or_refused_on_local_duck
                 )
                 results.append(result)
                 assert result["ok"] is False, result
-            for name in (*UNDELIVERABLE_TEXT_TYPES, "int2vector"):
+            for name in ("int2vector",):
                 assert sandbox.duck_query(
                     "SELECT state FROM _cdc_flight.schema_refusals "
                     "WHERE source_schema='app' AND source_table=?",
@@ -64,8 +66,9 @@ def test_postgresql_generated_opaque_corpus_is_lossless_or_refused_on_local_duck
                     "WHERE table_schema='cdc_raw' AND table_name=?",
                     [f"cdcflight_app_p2b_r9_{name}"],
                 ) == []
+            matched_counts = {}
             for name in EXACT_CORPUS:
-                if name == "int2vector" or name in UNDELIVERABLE_TEXT_TYPES:
+                if name == "int2vector":
                     continue
                 source = source_connector_text(sandbox, name)
                 destination = sandbox.duck_query(
@@ -73,6 +76,11 @@ def test_postgresql_generated_opaque_corpus_is_lossless_or_refused_on_local_duck
                     'ORDER BY "id"'
                 )
                 assert destination == source, name
+                matched_counts[name] = len(source)
+            print(
+                "round11 local output-function corpus exact: "
+                f"total={sum(matched_counts.values())}, counts={matched_counts}"
+            )
         finally:
             drop_corpus(sandbox, EXACT_CORPUS)
     finally:
@@ -103,7 +111,7 @@ def test_source_catalog_sweep_has_an_explicit_decision_for_every_builtin_type(
         "nummultirange", "tsmultirange", "tstzmultirange", "datemultirange",
         "int8multirange",
     }
-    value_refused = {"xml": "<a>fat</a>"}
+    value_refused = {}
     with psycopg.connect(postgres_cluster.dsn, autocommit=True) as con:
         rows = con.execute(
             "SELECT t.oid::bigint, t.typname FROM pg_type t "
@@ -129,8 +137,7 @@ def test_source_catalog_sweep_has_an_explicit_decision_for_every_builtin_type(
             if name in opaque_allowed:
                 assert resolved.sql == "VARCHAR", name
             if name in value_refused:
-                with pytest.raises(InvalidTypedValue):
-                    adapt_value(value_refused[name], resolved)
+                adapt_value(value_refused[name], resolved)
         else:
             with pytest.raises(UnsupportedType):
                 native_type(descriptor)

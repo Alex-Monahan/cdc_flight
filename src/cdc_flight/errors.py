@@ -7,6 +7,31 @@ not pay that cost just to name an exception.
 
 from __future__ import annotations
 
+# A refusal's durable class is deliberately not an origin label.  Origins are
+# useful diagnostics, but letting each raise site choose the durable class made
+# the same source condition alternate between ``pending`` and ``quarantined``.
+# This declaration is the one authority shared by the exception boundary and the
+# structural test: adding a production refusal module requires adding its origin
+# here and declaring that origin at every raise site.
+REFUSAL_ORIGIN_BY_MODULE = {
+    "catalog": "catalog_state",
+    "catalog_descriptors": "catalog_descriptor",
+    "catalog_poll": "catalog_poll",
+    "catalog_state": "catalog_state",
+    "catalog_support": "catalog_shape",
+    "planner": "typed_planner",
+    "schema_backfill": "schema_backfill",
+    "schema_ddl": "schema_ddl",
+    "schema_epoch": "schema_epoch",
+    "schema_evolution": "schema_evolution",
+    "schema_registry": "schema_registry",
+    "schema_shadow": "schema_shadow",
+    "spill_protocol": "spill_protocol",
+    "table_work": "table_work",
+}
+REFUSAL_ORIGINS = frozenset(REFUSAL_ORIGIN_BY_MODULE.values())
+CANONICAL_REFUSAL_CLASS = "SchemaEvolutionRefused"
+
 
 class EngineFailure(RuntimeError):
     """The Debezium engine terminated abnormally.
@@ -181,9 +206,15 @@ class SchemaEvolutionRefused(ValueError):
         target: str | None = None,
         detected_lsn: int | None = None,
         input_fingerprint: str | None = None,
-        refusal_class: str | None = None,
+        source_fingerprint: str | None = None,
+        refusal_origin: str,
         source_tables: tuple[tuple[str, str, str | None], ...] = (),
     ):
+        if refusal_origin not in REFUSAL_ORIGINS:
+            raise ValueError(
+                f"unregistered schema refusal origin {refusal_origin!r}; "
+                "add it to REFUSAL_ORIGIN_BY_MODULE before raising"
+            )
         super().__init__(message)
         self.source_schema = source_schema
         self.source_table = source_table
@@ -197,9 +228,14 @@ class SchemaEvolutionRefused(ValueError):
         #: batched source query.  Every affected relation must receive the same
         #: scoped quarantine; choosing rows[0] would leave its siblings uncontained.
         self.source_tables = tuple(source_tables)
-        #: Stable architecture origin, kept separate from the human reason so every
-        #: refusal path can share one quarantine identity.
-        self.refusal_class = refusal_class or type(self).__name__
+        #: Stable source-schema evidence used to decide whether a quarantined table's
+        #: blocking condition has changed.  It is separate from the retry identity:
+        #: row-image changes must not create an unbounded retry loop.
+        self.source_fingerprint = source_fingerprint
+        #: Diagnostics only.  The durable class below is centrally fixed and cannot
+        #: be supplied by a call site.
+        self.refusal_origin = refusal_origin
+        self.refusal_class = CANONICAL_REFUSAL_CLASS
         #: Spill handling can durably record before the outer commit owner sees the
         #: same exception.  The flag prevents one failure from counting twice.
         self.refusal_recorded = False

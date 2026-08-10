@@ -389,7 +389,8 @@ class LiveDiscoveryCoordinator:
                     target_table=target_table,
                     detected_lsn=refused.detected_lsn,
                     reason=str(refused),
-                    refusal_class=refused.refusal_class,
+                    input_fingerprint=refused.input_fingerprint,
+                    source_fingerprint=refused.source_fingerprint,
                 )
         if refusals:
             self.summary_extra["catalog_schema_refusals"] = [

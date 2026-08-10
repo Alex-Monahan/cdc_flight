@@ -172,37 +172,47 @@ def finish_source_missing_tables(
                 )
                 + f" at source WAL position {evidence.wal_lsn}"
             )
-            if not applied:
-                state = table_lifecycle.read(
-                    con,
-                    pipeline=pipeline,
-                    source_schema=schema,
-                    source_table=table,
-                    control_schema=control_schema,
-                )
-                if state != table_lifecycle.AWAITING:
-                    table_lifecycle.transition(
-                        con,
-                        pipeline=pipeline,
-                        source_schema=schema,
-                        source_table=table,
-                        to=table_lifecycle.AWAITING,
-                        reason="normalizing a source-missing re-snapshot obligation",
-                        control_schema=control_schema,
-                    )
+            state = table_lifecycle.read(
+                con,
+                pipeline=pipeline,
+                source_schema=schema,
+                source_table=table,
+                control_schema=control_schema,
+            )
+            if state != table_lifecycle.AWAITING:
                 table_lifecycle.transition(
                     con,
                     pipeline=pipeline,
                     source_schema=schema,
                     source_table=table,
-                    to=table_lifecycle.COMPLETE,
-                    reason=(
-                        "the final source observation proved the relation absent; "
-                        "the retained image is a logged drop"
-                    ),
-                    snapshot_lsn=evidence.wal_lsn,
+                    to=table_lifecycle.AWAITING,
+                    reason="normalizing a source-missing re-snapshot obligation",
                     control_schema=control_schema,
                 )
+            table_lifecycle.transition(
+                con,
+                pipeline=pipeline,
+                source_schema=schema,
+                source_table=table,
+                to=table_lifecycle.COMPLETE,
+                reason=(
+                    "the final source observation proved the relation absent; "
+                    "the retained image is a logged drop"
+                    if not applied
+                    else "the final source observation proved the relation absent before DROP_REPLICATE"
+                ),
+                snapshot_lsn=evidence.wal_lsn,
+                control_schema=control_schema,
+            )
+            # A dropped source has a complete, verified absence result.  It is the
+            # one quarantine trigger that can discharge without publishing rows.
+            dest_mod.resolve_schema_refusal(
+                con,
+                pipeline=pipeline,
+                source_schema=schema,
+                source_table=table,
+                control_schema=control_schema,
+            )
             projection.project_snapshot_completion(
                 con,
                 pipeline=pipeline,

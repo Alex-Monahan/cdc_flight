@@ -229,7 +229,9 @@ class DDLOwner:
             self.con.execute(f"CREATE TABLE {table.qualified} ({definitions}{constraint})")
         except Exception as exc:
             raise SchemaEvolutionRefused(
-                f"cannot create typed destination {table.name}: {exc}", target=table.name
+                f"cannot create typed destination {table.name}: {exc}",
+                target=table.name,
+                refusal_origin="schema_ddl",
             ) from exc
         table.columns = {
             column: _normalise_type(ctype) for column, ctype in columns.items()
@@ -295,6 +297,7 @@ class DDLOwner:
                 f"cannot rebind primary-key identity {drop_column!r} on {table.name}: "
                 "the replacement key is not present in the destination schema",
                 target=table.name,
+                refusal_origin="schema_ddl",
             )
         temp_name = f"{table.name}__cdcf_pk_rebind"
         definitions = ", ".join(
@@ -328,6 +331,7 @@ class DDLOwner:
                 f"{key_columns!r} on {table.name}: the destination identity is not "
                 "unique or the table could not be rebuilt",
                 target=table.name,
+                refusal_origin="schema_ddl",
             ) from exc
         table.columns = columns
         table.raw_types = raw_types

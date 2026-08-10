@@ -109,7 +109,7 @@ GLOBAL_UNKNOWN_DECISIONS = (
     ("jsonpath", 4072, '$."a"'),
     ("pg_lsn", 3220, "0/16B6A0"),
     ("tsvector", 3614, "'fat':1 'rat':2"),
-    ("xml", 142, '<?xml version="1.0"?><a>fat</a>'),
+    ("xml", 142, "<a>fat</a>"),
     ("money", 790, "$12.34"),
     ("inet", 869, "192.0.2.1/24"),
     ("cidr", 650, "192.0.2.0/24"),
@@ -127,10 +127,6 @@ GLOBAL_UNKNOWN_DECISIONS = (
 def test_every_allowlisted_unknown_type_is_varchar_and_transport_only(kind, oid, text):
     descriptor = _source(kind, oid)
     assert native_type(descriptor).sql == "VARCHAR"
-    if kind == "xml":
-        with pytest.raises(InvalidTypedValue):
-            adapt_value(text, native_type(descriptor))
-        return
     if kind in {"tsquery", "jsonpath", "pg_lsn"}:
         import base64
 
@@ -190,7 +186,10 @@ def _permanently_bad_event(txn: str, order: int, lsn: int):
         lsn,
         table="bad_opaque",
         key={"id": 1},
-        after={"id": 1, "payload": b"\xff"},
+        # The row image deliberately changes with every source transaction.  The
+        # refusal fingerprint is descriptor/shape identity, not a hash of a bad
+        # payload, so a moving poison row cannot keep the slot pinned forever.
+        after={"id": 1, "payload": b"\xff" + txn.encode("ascii")},
     )
     int4 = _source("int4", 23)
     event.key_descriptors = {"id": int4}
@@ -302,37 +301,36 @@ def test_identical_refusal_quarantines_one_table_and_advances_a_healthy_peer(
 
 @pytest.fixture(scope="module")
 def postgres_bad_healthy_containment(sandbox):
-    """The real three-run XML refusal/healthy-peer slot probe from rubric 4.0."""
+    """The real three-run box refusal/healthy-peer slot probe from rubric 4.0."""
     box = sandbox
     box.reseed()
     box.sql(
         [
-            "CREATE TABLE app.bad_xml (id integer PRIMARY KEY, value xml)",
+            "CREATE TABLE app.bad_box (id integer PRIMARY KEY, value box)",
             "CREATE TABLE app.healthy_peer (id integer PRIMARY KEY, name text)",
-            "ALTER PUBLICATION cdc_flight_pub ADD TABLE app.bad_xml, app.healthy_peer",
+            "ALTER PUBLICATION cdc_flight_pub ADD TABLE app.bad_box, app.healthy_peer",
         ],
         one_transaction=True,
     )
-    box.env["CDC_TABLES"] = "bad_xml,healthy_peer"
+    box.env["CDC_TABLES"] = "bad_box,healthy_peer"
     box.env["CDC_AUTO_DISCOVERY"] = "0"
     box.env["CDC_CATALOG_POLL_SECONDS"] = "1"
     try:
-        baseline = box.run(reset_state=True, max_seconds=180)
+        baseline = box.run(reset_state=True, max_seconds=20)
         assert baseline["ok"] is True, baseline
         metrics = [_slot_metrics(box)]
         box.sql(
             [
-                "INSERT INTO app.bad_xml VALUES "
-                "(1, xmlparse(document '<?xml version=\"1.0\"?><bad/>'))",
+                "INSERT INTO app.bad_box VALUES (1, '((0,0),(1,1))'::box)",
                 "INSERT INTO app.healthy_peer VALUES (1, 'durable')",
             ],
             one_transaction=True,
         )
         runs = []
         run_diagnostics = []
-        for _ in range(3):
+        for _ in range(4):
             run = box.run(
-                max_seconds=150,
+                max_seconds=20,
                 min_records=1,
                 expect_success=False,
             )
@@ -351,14 +349,14 @@ def postgres_bad_healthy_containment(sandbox):
         quarantine_state = {
             "refusal": box.duck_query(
                 "SELECT state, refusal_fingerprint, refusal_class "
-                "FROM _cdc_flight.schema_refusals WHERE source_table='bad_xml'"
+                "FROM _cdc_flight.schema_refusals WHERE source_table='bad_box'"
             ),
             "healthy": box.duck_query(
                 f"SELECT id, name FROM {box.table('cdcflight_app_healthy_peer')}"
             ),
             "lifecycle": box.duck_query(
                 "SELECT snapshot_state FROM _cdc_flight.table_state "
-                "WHERE source_table='bad_xml'"
+                "WHERE source_table='bad_box'"
             ),
             "alerts": box.duck_query(
                 "SELECT count(*) FROM _cdc_flight.alerts "
@@ -369,13 +367,13 @@ def postgres_bad_healthy_containment(sandbox):
         # quarantined -> pending trigger and publish a complete current-source
         # image before resolving the refusal; a following run proves the normal
         # stream remains healthy after that hand-off.
-        box.sql("ALTER TABLE app.bad_xml DROP COLUMN value")
-        box.sql("INSERT INTO app.bad_xml VALUES (2)")
+        box.sql("ALTER TABLE app.bad_box DROP COLUMN value")
+        box.sql("INSERT INTO app.bad_box VALUES (2)")
         repair_runs = []
         for _ in range(2):
             repair_runs.append(
                 box.run(
-                    max_seconds=180,
+                    max_seconds=30,
                     min_records=1,
                     expect_success=False,
                 )
@@ -395,7 +393,7 @@ def postgres_bad_healthy_containment(sandbox):
 
 @pytest.mark.slow
 @pytest.mark.e2e
-def test_bad_xml_is_quarantined_without_stopping_a_healthy_peer(
+def test_bad_box_is_quarantined_without_stopping_a_healthy_peer(
     postgres_bad_healthy_containment,
 ):
     scenario = postgres_bad_healthy_containment
@@ -403,10 +401,10 @@ def test_bad_xml_is_quarantined_without_stopping_a_healthy_peer(
     state = scenario["quarantine_state"]
     assert state["refusal"][0][0] == "quarantined"
     assert state["refusal"][0][1]
-    assert state["refusal"][0][2] == "value_encoding"
+    assert state["refusal"][0][2] == "SchemaEvolutionRefused"
     assert state["healthy"] == [(1, "durable")]
     assert state["lifecycle"] == [("awaiting_snapshot",)]
-    assert state["alerts"][0][0] >= 1
+    assert state["alerts"][0][0] == 1
 
 
 @pytest.mark.slow
@@ -418,14 +416,14 @@ def test_repaired_source_leaves_quarantine_only_after_a_full_resnapshot(
     box = scenario["box"]
     assert scenario["repair_runs"][-1]["ok"] is True, scenario["repair_runs"]
     assert box.duck_query(
-        "SELECT state FROM _cdc_flight.schema_refusals WHERE source_table='bad_xml'"
+        "SELECT state FROM _cdc_flight.schema_refusals WHERE source_table='bad_box'"
     ) == [("resolved",)]
     assert box.duck_query(
         "SELECT snapshot_state FROM _cdc_flight.table_state "
-        "WHERE source_table='bad_xml'"
+        "WHERE source_table='bad_box'"
     ) == [("complete",)]
     assert box.duck_query(
-        f"SELECT id FROM {box.table('cdcflight_app_bad_xml')} ORDER BY id"
+        f"SELECT id FROM {box.table('cdcflight_app_bad_box')} ORDER BY id"
     ) == [(1,), (2,)]
 
 
@@ -442,7 +440,7 @@ def test_bad_healthy_scenario_records_slot_progress_and_bounded_wal(
         and metric["retained_wal"] >= 0
         for metric in metrics
     ), metrics
-    bad_runs = metrics[1:4]
+    bad_runs = metrics[1:5]
     # Containment is not proved by a later repair run.  While the bad table is
     # quarantined, the healthy peer's source transaction must still be durably
     # acknowledged and the main slot must move past it.
@@ -456,4 +454,4 @@ def test_bad_healthy_scenario_records_slot_progress_and_bounded_wal(
     assert all(metric["slot_wal_window"] >= 0 for metric in bad_runs), metrics
     if "PYTEST_XDIST_WORKER" not in os.environ:
         assert max(metric["slot_wal_window"] for metric in bad_runs) < 1_000_000, metrics
-    print(f"round10 bad+healthy slot metrics: {metrics}")
+    print(f"round11 bad-box+healthy slot metrics: {metrics}")

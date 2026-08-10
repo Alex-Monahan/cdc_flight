@@ -87,6 +87,7 @@ def _enrich_descriptors(applier, event: PendingRecord) -> None:
             source_schema=event.schema,
             source_table=event.table,
             target=event.qualified_table,
+            refusal_origin="spill_protocol",
         )
     try:
         descriptors = provider(event.qualified_table)
@@ -97,6 +98,7 @@ def _enrich_descriptors(applier, event: PendingRecord) -> None:
             source_schema=event.schema,
             source_table=event.table,
             target=event.qualified_table,
+            refusal_origin="spill_protocol",
         ) from exc
     if not descriptors:
         raise SchemaEvolutionRefused(
@@ -105,6 +107,7 @@ def _enrich_descriptors(applier, event: PendingRecord) -> None:
             source_schema=event.schema,
             source_table=event.table,
             target=event.qualified_table,
+            refusal_origin="spill_protocol",
         )
     for name, descriptor in descriptors.items():
         try:
@@ -117,6 +120,7 @@ def _enrich_descriptors(applier, event: PendingRecord) -> None:
                 source_table=event.table,
                 target=event.qualified_table,
                 detected_lsn=event.lsn,
+                refusal_origin="spill_protocol",
             ) from exc
     watcher = getattr(provider, "__self__", None)
     if watcher is not None and hasattr(watcher, "event_shape_missing"):
@@ -136,6 +140,7 @@ def _enrich_descriptors(applier, event: PendingRecord) -> None:
             source_table=event.table,
             target=event.qualified_table,
             detected_lsn=event.lsn,
+            refusal_origin="spill_protocol",
         )
     for attribute in ("key_descriptors", "before_descriptors", "after_descriptors"):
         getattr(event, attribute).update(descriptors)

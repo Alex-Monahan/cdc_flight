@@ -25,6 +25,7 @@ def persist(
     pipeline: str,
     tables: list[tuple[str, str, str]],
     control_schema: str | None,
+    source_dsn: str | None = None,
 ) -> None:
     """Route setup-time refusals through the common scoped durable writer.
 
@@ -41,6 +42,14 @@ def persist(
         targets = (tables[0],)
     if not targets:
         return
+    if source_dsn and refused.source_schema and refused.source_table and not refused.source_fingerprint:
+        from .catalog_descriptors import source_relation_fingerprint
+
+        exists, fingerprint = source_relation_fingerprint(
+            source_dsn, refused.source_schema, refused.source_table
+        )
+        if exists and fingerprint:
+            refused.source_fingerprint = fingerprint
     for schema, table, target in targets:
         refused.source_schema = refused.source_schema or schema
         refused.source_table = refused.source_table or table
@@ -54,7 +63,7 @@ def persist(
             detected_lsn=refused.detected_lsn,
             reason=str(refused),
             input_fingerprint=refused.input_fingerprint,
-            refusal_class=refused.refusal_class,
+            source_fingerprint=refused.source_fingerprint,
             control_schema=control_schema,
         )
     refused.refusal_recorded = True

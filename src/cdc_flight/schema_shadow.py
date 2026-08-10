@@ -107,6 +107,7 @@ class ShadowOwner:
                         f"{current_type} does not match {desired_type}; a typed "
                         "shadow conversion is required",
                         target=table.name,
+                        refusal_origin="schema_shadow",
                     )
             _copy_rows_with_identity(
                 self.con,
@@ -131,6 +132,7 @@ class ShadowOwner:
             raise SchemaEvolutionRefused(
                 f"typed key shadow conversion failed for {table.name}: {exc}",
                 target=table.name,
+                refusal_origin="schema_shadow",
             ) from exc
 
         self.forget(table.name)
@@ -161,6 +163,7 @@ class ShadowOwner:
             raise SchemaEvolutionRefused(
                 f"cannot convert {name}.{column}: destination table does not exist",
                 target=name,
+                refusal_origin="schema_shadow",
             )
         if table.internal_identity and not table.key_metadata_loaded:
             raise SchemaEvolutionRefused(
@@ -168,6 +171,7 @@ class ShadowOwner:
                 "identity but no durable source-key metadata; automatic resnapshot "
                 "must establish the catalog-authoritative key before typed evolution",
                 target=name,
+                refusal_origin="schema_shadow",
             )
         old_source = (
             old_descriptor
@@ -199,6 +203,7 @@ class ShadowOwner:
                     f"physical type {declared!r} disagrees with descriptor type "
                     f"{new_native.sql!r}",
                     target=name,
+                    refusal_origin="schema_shadow",
                 )
             table.source_descriptors[column] = new_source
             table.native_types[column] = _physical_union_native(
@@ -213,6 +218,7 @@ class ShadowOwner:
                     f"cannot convert {name}.{column}: physical numeric UNION does "
                     "not match the old source descriptor",
                     target=name,
+                    refusal_origin="schema_shadow",
                 )
             old_member_name = union_member_name(old_source)
             union_sql = (
@@ -260,6 +266,7 @@ class ShadowOwner:
             raise SchemaEvolutionRefused(
                 f"cannot convert {name}.{column}: no destination identity is available",
                 target=name,
+                refusal_origin="schema_shadow",
             )
         ddl = (
             f"CREATE TABLE {quote(self.dataset)}.{quote(shadow)} "
@@ -312,6 +319,7 @@ class ShadowOwner:
             raise SchemaEvolutionRefused(
                 f"typed UNION shadow conversion failed for {name}.{column}: {exc}",
                 target=name,
+                refusal_origin="schema_shadow",
             ) from exc
         self.forget(name)
         table = self.get(name)

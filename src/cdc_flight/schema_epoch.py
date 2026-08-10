@@ -44,6 +44,7 @@ def _type_change_epoch(event, change, table: str) -> str | None:
             source_table=event.table,
             target=table,
             detected_lsn=None,
+            refusal_origin="schema_epoch",
         )
     if len(observed) > 1:
         return "mixed"
@@ -97,6 +98,7 @@ def refuse_mixed_schema_epoch(events: list, actions: list) -> None:
                         source_table=event.table,
                         target=table,
                         detected_lsn=min(action.change.detected_lsn for action in actions),
+                        refusal_origin="schema_epoch",
                     )
                 if epoch is not None:
                     epochs.setdefault(table, set()).add(epoch)
@@ -117,6 +119,7 @@ def refuse_mixed_schema_epoch(events: list, actions: list) -> None:
                         detected_lsn=min(
                             action.change.detected_lsn for action in actions
                         ),
+                        refusal_origin="schema_epoch",
                     )
                 if old in fields:
                     epoch = "pre"
@@ -137,6 +140,7 @@ def refuse_mixed_schema_epoch(events: list, actions: list) -> None:
         source_table=source_table,
         target=table,
         detected_lsn=min(action.change.detected_lsn for action in actions),
+        refusal_origin="schema_epoch",
     )
 
 

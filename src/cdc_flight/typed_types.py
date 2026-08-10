@@ -776,11 +776,11 @@ def encode_value(value: Any, descriptor: SourceTypeDescriptor | NativeType) -> A
             raise UnsupportedType(f"multirange {source.qualified_name} has no range subtype")
         return [encode_value(item, source.range_subtype) for item in value]
     if kind == "xml":
-        raise InvalidTypedValue(
-            f"{source.qualified_name} is UNDELIVERABLE through stock Debezium: "
-            "the connector strips XML declaration prologs, so the delivered value "
-            "cannot be proven equal to PostgreSQL's output-function value"
-        )
+        # PostgreSQL's xml_out is the source boundary: its default version=1.0
+        # declaration is already absent from SELECT/COPY/format('%s', value), and
+        # stock Debezium delivers that same text.  Admit the opaque output bytes;
+        # the output-function corpus proves the normalization on both runtimes.
+        return _decode_opaque_text(value, source)
     if kind == "money":
         return _money_output_text(value, source)
     if kind in {"inet", "cidr"}:
@@ -1448,27 +1448,53 @@ def _decode_opaque_text(value: Any, source: SourceTypeDescriptor) -> str:
 
 
 def _money_output_text(value: Any, source: SourceTypeDescriptor) -> OpaqueText:
-    """Render the stock wire number as PostgreSQL ``money_out`` under ``lc=C``.
+    """Render the stock wire number using the source ``money_out`` locale.
 
-    The project-local PostgreSQL cluster is initialized with ``--locale=C`` and the
-    connector's money adapter delivers the numeric amount without the currency
-    decoration.  PostgreSQL's output function for that locale is ``$1,234.56`` (and
-    ``-$1,234.56``), so rebuilding that spelling is lossless for the configured source
-    rather than accepting the wrong ``::text`` oracle.  Already rendered output text
-    is retained for connector versions that expose the decoration themselves.
+    Debezium's PostgreSQL money converter supplies the numeric amount, while the
+    PostgreSQL output function supplies the locale decoration.  The locale is read
+    once by the catalog descriptor authority and carried in descriptor metadata;
+    silently using C/en_US here would admit a value the source never had.
     """
 
+    locale_name = dict(source.metadata).get("lc_monetary", "C")
+    normalized_locale = str(locale_name).lower().replace("-", "_")
+    if (
+        normalized_locale in {"c", "posix"}
+        or normalized_locale.startswith(("c.", "posix."))
+        or normalized_locale.startswith("en_us")
+    ):
+        symbol = "$"
+    elif normalized_locale.startswith("en_gb"):
+        symbol = "£"
+    else:
+        raise UnsupportedType(
+            f"{source.qualified_name} has unsupported lc_monetary={locale_name!r}; "
+            "the money output function cannot be reconstructed exactly"
+        )
+
     if isinstance(value, OpaqueText):
-        return value
+        text = str(value).strip()
+        if text.startswith(symbol) or text.startswith(f"-{symbol}"):
+            return OpaqueText(text)
+        raise InvalidTypedValue(
+            f"{source.qualified_name} money text {text!r} does not match "
+            f"the source lc_monetary={locale_name!r} output"
+        )
     if isinstance(value, (bytes, bytearray, memoryview)):
         value = _decode_opaque_text(value, source)
     if isinstance(value, str):
         text = value.strip()
-        if text.startswith("$") or text.startswith("-$"):
-            return OpaqueText(text)
+        if text[:1] in {"$", "£", "€", "₹"} or text.startswith(("-$", "-£", "-€", "-₹")):
+            if text.startswith(symbol) or text.startswith(f"-{symbol}"):
+                return OpaqueText(text)
+            raise InvalidTypedValue(
+                f"{source.qualified_name} money text {text!r} does not match "
+                f"the source lc_monetary={locale_name!r} output"
+            )
         value = text
     try:
-        amount = Decimal(str(value)).quantize(Decimal("0.01"))
+        raw_amount = Decimal(str(value))
+        amount = raw_amount.quantize(Decimal("0.01"))
     except (InvalidOperation, ValueError, TypeError) as exc:
         raise InvalidTypedValue(
             f"{source.qualified_name} stock Debezium money value {value!r} "
@@ -1479,9 +1505,14 @@ def _money_output_text(value: Any, source: SourceTypeDescriptor) -> OpaqueText:
             f"{source.qualified_name} stock Debezium money value {value!r} "
             "is not a finite decimal amount"
         )
+    if raw_amount != amount:
+        raise InvalidTypedValue(
+            f"{source.qualified_name} stock Debezium money value {value!r} "
+            "has more precision than PostgreSQL money_out can represent"
+        )
     negative = amount < 0
     rendered = f"{abs(amount):,.2f}"
-    return OpaqueText(f"-${rendered}" if negative else f"${rendered}")
+    return OpaqueText(f"-{symbol}{rendered}" if negative else f"{symbol}{rendered}")
 
 
 def _kind_name(kind: Any, qualified_name: str) -> str:

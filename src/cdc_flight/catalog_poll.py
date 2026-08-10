@@ -22,7 +22,7 @@ from .machines import (
 from .schema_evolution import SourceColumn, descriptor_from_type_name
 from .states import IllegalTransition, UnknownState
 from .toast import classify_relation
-from .typed_types import SourceTypeDescriptor, UnsupportedType, native_type
+from .typed_types import SourceTypeDescriptor, UnsupportedType
 
 log = logging.getLogger("cdc_flight.catalog_poll")
 
@@ -33,7 +33,8 @@ def _column_descriptor(raw: dict, descriptors: dict[int, SourceTypeDescriptor]) 
     if descriptor is None:
         raise SchemaEvolutionRefused(
             f"catalog descriptor authority is incomplete for source type OID {oid}; "
-            "refusing to infer a type from its display name"
+            "refusing to infer a type from its display name",
+            refusal_origin="catalog_poll",
         )
     typmod = raw.get("typmod")
     if typmod is not None:
@@ -424,22 +425,32 @@ def poll(watcher):
         try:
             descriptors = descriptor_reader.resolve(all_type_oids)
         except (SchemaEvolutionRefused, UnsupportedType, ValueError, KeyError) as exc:
-            source_row = rows[0] if rows else ("", "")
-            source_schema = str(getattr(exc, "source_schema", None) or source_row[0])
-            source_table = str(getattr(exc, "source_table", None) or source_row[1])
-            target = getattr(exc, "target", None) or f"{source_schema}.{source_table}"
-            source_tables = tuple(
+            source_tables = tuple(dict.fromkeys(
                 (str(row[0]), str(row[1]), f"{row[0]}.{row[1]}")
                 for row in rows
                 if len(row) >= 2
-            )
+            ))
+            explicit_schema = getattr(exc, "source_schema", None)
+            explicit_table = getattr(exc, "source_table", None)
+            if explicit_schema and explicit_table:
+                source_schema = str(explicit_schema)
+                source_table = str(explicit_table)
+                target = getattr(exc, "target", None) or f"{source_schema}.{source_table}"
+            elif len(source_tables) == 1:
+                source_schema, source_table, target = source_tables[0]
+            else:
+                # A batch failure is not evidence that the first row caused it.
+                # Keep the complete affected-relation set for the durable router,
+                # but leave the wrapper itself unscoped so no healthy table is
+                # guessed as the origin.
+                source_schema = source_table = target = None
             raise SchemaEvolutionRefused(
                 f"source catalog descriptor authority failed for {target}: {exc}",
                 source_schema=source_schema,
                 source_table=source_table,
                 target=target,
                 detected_lsn=lsn,
-                refusal_class="catalog_descriptor",
+                refusal_origin="catalog_poll",
                 source_tables=source_tables,
             ) from exc
         for index, row in enumerate(rows):
@@ -465,18 +476,13 @@ def poll(watcher):
                 )
                 for raw in (raw_columns or [])
             )
-            for column in columns:
-                try:
-                    native_type(column.descriptor)
-                except (UnsupportedType, ValueError) as exc:
-                    raise SchemaEvolutionRefused(
-                        f"source catalog descriptor for {row[0]}.{row[1]}."
-                        f"{column.destination_name} is not deliverable: {exc}",
-                        source_schema=str(row[0]),
-                        source_table=str(row[1]),
-                        target=f"{row[0]}.{row[1]}",
-                        detected_lsn=lsn,
-                    ) from exc
+            # Catalog observation records the complete source shape even when a
+            # descriptor has no native destination representation.  Admission owns
+            # the refusal: preserving the column list prevents a later row from
+            # becoming an unscoped ``SchemaShapeUnexplained`` failure and lets the
+            # refusal be quarantined table-by-table while healthy co-published tables
+            # continue.  Descriptor authority is still strict in ``CatalogWatcher`` /
+            # planner before any value is admitted.
             observed[f"{row[0]}.{row[1]}"] = SourceRelation(
                 schema=row[0],
                 table=row[1],

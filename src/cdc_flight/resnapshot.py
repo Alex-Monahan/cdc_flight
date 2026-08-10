@@ -636,6 +636,7 @@ def run(
                     refused=refused,
                     pipeline=pipeline,
                     tables=tables,
+                    source_dsn=source.dsn,
                     control_schema=control_schema,
                 )
             reassert_owed(

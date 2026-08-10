@@ -21,7 +21,7 @@ def _assignment(table, column: str, value: Any):
             f"cannot backfill {table.name}.{column}: the source value is not "
             "deliverable through the current destination type",
             target=table.name,
-            refusal_class="schema_backfill",
+            refusal_origin="schema_backfill",
         ) from exc
 
 
@@ -95,14 +95,16 @@ class BackfillOwner:
                     f"cannot backfill keyless table {name}: the source returned no "
                     f"rows for an added column while {destination_rows} destination "
                     "changelog rows already exist; no stable identity or source value "
-                    "proves what those rows should contain"
+                    "proves what those rows should contain",
+                    refusal_origin="schema_backfill",
                 )
             return
         values = tuple(rows[0][: len(value_columns)])
         if any(tuple(row[: len(value_columns)]) != values for row in rows[1:]):
             raise SchemaBackfillRefused(
                 f"cannot backfill keyless table {name}: added-column values are not "
-                "uniform and the source has no stable row identity"
+                "uniform and the source has no stable row identity",
+                refusal_origin="schema_backfill",
             )
         set_parts: list[str] = []
         params: list[Any] = []

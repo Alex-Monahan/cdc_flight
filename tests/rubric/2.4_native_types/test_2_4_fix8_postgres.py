@@ -91,7 +91,7 @@ def _insert(sandbox, table: str, *, updated: bool = False) -> None:
             "'$.\"a\"'::jsonpath",
             "'0/16B6A0'::pg_lsn",
             "'''fat'':1 ''rat'':2'::tsvector",
-            "NULL::xml",
+            "xmlparse(document '<?xml version=\"1.0\"?><fat/>')",
             "'12.34'::money",
             "'192.0.2.1'::inet",
             "'192.0.2.0/24'::cidr",
@@ -104,7 +104,7 @@ def _insert(sandbox, table: str, *, updated: bool = False) -> None:
             "'$.\"b\"'::jsonpath",
             "'0/16B6A1'::pg_lsn",
             "'''blue'':1'::tsvector",
-            "NULL::xml",
+            "xmlparse(document '<?xml version=\"1.0\"?><blue/>')",
             "'23.45'::money",
             "'198.51.100.2'::inet",
             "'198.51.100.0/24'::cidr",
@@ -167,8 +167,9 @@ def test_stock_ten_type_probe_runs_under_both_unknown_modes(
         )
         if include_unknown == "true":
             # The passing r8 assertion remains the guard for money and inet.
-            # XML declaration values are exercised separately by the corrected
-            # output-function corpus because stock Debezium strips their prolog.
+            # XML declaration values exercise the same PostgreSQL output-function
+            # boundary as the generated corpus; xml_out removes only the default
+            # prolog before the stock connector transports the value.
             assert inserted["ok"] is True, inserted
             assert _destination_row(sandbox, target) == _source_output(sandbox, table)
 

@@ -323,6 +323,7 @@ def _durable_descriptor(
             source_schema=str(schema),
             source_table=str(table),
             target=f"{schema}.{table}",
+            refusal_origin="catalog_state",
         )
     try:
         return SourceTypeDescriptor.from_dict(serialized)
@@ -333,6 +334,7 @@ def _durable_descriptor(
             source_schema=str(schema),
             source_table=str(table),
             target=f"{schema}.{table}",
+            refusal_origin="catalog_state",
         ) from exc
 
 

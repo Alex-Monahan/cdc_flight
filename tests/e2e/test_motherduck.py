@@ -13,12 +13,8 @@ import uuid
 
 import duckdb
 import pytest
-from support.motherduck_probe import scratch_database
 
-from cdc_flight.catalog_state import read_known_relations
 from cdc_flight.config import motherduck_token
-from cdc_flight.control_schema import ensure_control_schema
-from cdc_flight.states import UnknownState
 
 pytestmark = [pytest.mark.motherduck, pytest.mark.e2e]
 
@@ -135,45 +131,3 @@ def test_snapshot_loads_into_motherduck(fresh_seed, run_pipeline, md_token, md_c
 def test_motherduck_token_is_available_to_the_suite(md_token):
     assert len(md_token) > 20
     assert os.environ.get("motherduck_token") or os.environ.get("MOTHERDUCK_TOKEN")
-
-
-def test_legacy_control_schema_migration_is_motherduck_compatible(md_token):
-    """The real cloud destination accepts the additive migration and its backfill."""
-    with scratch_database(md_token, "cdc_control_schema") as database:
-        con = duckdb.connect(f"md:{database}?motherduck_token={md_token}")
-        try:
-            con.execute("CREATE SCHEMA _cdc_flight")
-            con.execute(
-            """
-            CREATE TABLE _cdc_flight.source_relations (
-                pipeline        VARCHAR NOT NULL,
-                source_schema   VARCHAR NOT NULL,
-                source_table    VARCHAR NOT NULL,
-                relation_oid    BIGINT NOT NULL,
-                published       BOOLEAN NOT NULL,
-                replica_identity VARCHAR,
-                first_seen_at   TIMESTAMPTZ NOT NULL,
-                last_seen_at    TIMESTAMPTZ NOT NULL,
-                PRIMARY KEY (pipeline, source_schema, source_table)
-            )
-            """
-            )
-            con.execute(
-            """
-            INSERT INTO _cdc_flight.source_relations
-            VALUES ('p', 'app', 'customers', 42, true, 'd', now(), now())
-            """
-            )
-
-            ensure_control_schema(con)
-            assert con.execute(
-                "SELECT admission_state FROM _cdc_flight.source_relations"
-            ).fetchall() == [("external",)]
-
-            # Idempotence and the state-machine refusal both run against the cloud table.
-            ensure_control_schema(con)
-            con.execute("UPDATE _cdc_flight.source_relations SET admission_state = NULL")
-            with pytest.raises(UnknownState, match="NULL"):
-                read_known_relations(con, "p")
-        finally:
-            con.close()

@@ -482,7 +482,8 @@ def run(
                         con, pipeline=dest.pipeline_name, source_schema=source_schema,
                         source_table=source_table, target_table=target_table,
                         detected_lsn=refused.detected_lsn, reason=str(refused),
-                        refusal_class=refused.refusal_class,
+                        input_fingerprint=refused.input_fingerprint,
+                        source_fingerprint=refused.source_fingerprint,
                     )
             if catalog_refusals:
                 summary_extra["catalog_schema_refusals"] = [

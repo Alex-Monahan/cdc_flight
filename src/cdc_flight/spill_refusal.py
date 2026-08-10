@@ -25,6 +25,32 @@ from .errors import SchemaEvolutionRefused
 log = logging.getLogger("cdc_flight.spill_refusal")
 
 
+def _capture_source_fingerprint(applier, refused: SchemaEvolutionRefused) -> None:
+    """Capture the current source schema before durable quarantine.
+
+    Some schema refusals are raised by the destination schema phase, after the
+    catalog watcher has already supplied the event but before that exception has a
+    relation fingerprint attached.  The quarantine retry gate needs a baseline to
+    distinguish a real source-schema repair from an unchanged retry.  Read the
+    source relation here while the watcher connection is still available; an
+    unavailable read deliberately leaves the field unknown and therefore blocks
+    automatic reactivation.
+    """
+    if refused.source_fingerprint or not refused.source_schema or not refused.source_table:
+        return
+    catalog = getattr(applier, "catalog", None)
+    dsn = getattr(catalog, "dsn", None)
+    if not dsn:
+        return
+    from .catalog_descriptors import source_relation_fingerprint
+
+    exists, fingerprint = source_relation_fingerprint(
+        dsn, refused.source_schema, refused.source_table
+    )
+    if exists and fingerprint:
+        refused.source_fingerprint = fingerprint
+
+
 def record_schema_refusal(applier, refused: SchemaEvolutionRefused) -> None:
     if not refused.source_schema or not refused.source_table:
         applier.unscoped_refusals += 1
@@ -41,6 +67,7 @@ def record_schema_refusal(applier, refused: SchemaEvolutionRefused) -> None:
         return
     from . import destination
 
+    _capture_source_fingerprint(applier, refused)
     destination.record_schema_refusal(
         applier.con,
         pipeline=applier.pipeline,
@@ -50,7 +77,7 @@ def record_schema_refusal(applier, refused: SchemaEvolutionRefused) -> None:
         detected_lsn=refused.detected_lsn,
         reason=str(refused),
         input_fingerprint=refused.input_fingerprint,
-        refusal_class=refused.refusal_class,
+        source_fingerprint=refused.source_fingerprint,
         control_schema=applier.control_schema,
     )
     refused.refusal_recorded = True
@@ -58,11 +85,21 @@ def record_schema_refusal(applier, refused: SchemaEvolutionRefused) -> None:
 
 def handle(applier, refused: SchemaEvolutionRefused, events) -> None:
     """Rollback the spill transaction, then durably queue automatic recovery."""
-    event = next((item for item in events if item.schema and item.table), None)
-    if event is not None:
-        refused.source_schema = refused.source_schema or event.schema
-        refused.source_table = refused.source_table or event.table
-        refused.target = refused.target or event.qualified_table
+    candidates = {
+        (item.schema, item.table, item.qualified_table)
+        for item in events
+        if item.schema and item.table
+    }
+    if not refused.source_schema and not refused.source_table:
+        if len(refused.source_tables) == 1:
+            refused.source_schema, refused.source_table, refused.target = (
+                refused.source_tables[0]
+            )
+        elif len(candidates) == 1:
+            refused.source_schema, refused.source_table, refused.target = (
+                next(iter(candidates))
+            )
+    if candidates:
         lsns = [int(item.lsn) for item in events if item.lsn is not None]
         if refused.detected_lsn is None and lsns:
             refused.detected_lsn = max(lsns)

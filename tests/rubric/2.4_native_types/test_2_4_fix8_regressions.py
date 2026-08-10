@@ -31,14 +31,14 @@ def _opaque_wire(text: str) -> str:
 
 # The first three are the stock Debezium opaque/base64 cases from the r7 probe.
 # The lossless plain-text members arrive as ordinary PostgreSQL output text.
-# XML with a declaration is an explicit refusal case because stock Debezium
-# strips that declaration before the value reaches this process.
+# XML values are compared with PostgreSQL's output-function spelling. A default
+# XML declaration is removed by PostgreSQL's own ``xml_out`` function.
 OPAQUE_TEN_TYPE_PROBE = (
     ("tsquery", 3615, _opaque_wire("'fat' & 'rat'"), "'fat' & 'rat'"),
     ("jsonpath", 4072, _opaque_wire('$."a"'), '$."a"'),
     ("pg_lsn", 3220, _opaque_wire("0/16B6A0"), "0/16B6A0"),
     ("tsvector", 3614, "'fat':1 'rat':2", "'fat':1 'rat':2"),
-    ("xml", 142, '<?xml version="1.0"?><a>fat</a>', '<?xml version="1.0"?><a>fat</a>'),
+    ("xml", 142, "<a>fat</a>", "<a>fat</a>"),
     ("money", 790, "12.34", "$12.34"),
     ("inet", 869, "192.0.2.1", "192.0.2.1"),
     ("cidr", 650, "192.0.2.0/24", "192.0.2.0/24"),
@@ -57,10 +57,6 @@ def test_stock_unknown_wire_is_stored_as_source_canonical_text(
 ):
     """The r7 ten-type wire values must not be admitted as literal base64."""
     source = _source(kind, oid)
-    if kind == "xml":
-        with pytest.raises(InvalidTypedValue):
-            adapt_value(wire, native_type(source))
-        return
     assert adapt_value(wire, native_type(source)) == canonical
 
 

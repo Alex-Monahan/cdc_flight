@@ -1,4 +1,4 @@
-"""The `_cdc_flight` control schema: its DDL, and the one migration it has needed.
+"""The `_cdc_flight` control schema and its create-only DDL.
 
 Split out of `destination.py` (Codex B6). That module is the destination *connection*
 and the readers and writers that use it; three hundred lines of `CREATE TABLE IF NOT
@@ -13,12 +13,9 @@ a commit message.
 from __future__ import annotations
 
 import contextlib
-import logging
 
 from .config import DEFAULT_CONTROL_SCHEMA, resolve_control_schema
-from .naming import control_table, quote
-
-log = logging.getLogger("cdc_flight.control_schema")
+from .naming import quote
 
 # Keep the published default DDL byte-for-byte compatible with the original
 # deployment.  A non-default schema is rendered with ``quote`` by ``control_ddl``.
@@ -182,6 +179,7 @@ CONTROL_DDL = [
             detected_lsn    BIGINT,
             reason          VARCHAR NOT NULL,
             refusal_fingerprint VARCHAR,
+            source_fingerprint VARCHAR,
             refusal_class  VARCHAR NOT NULL DEFAULT 'SchemaEvolutionRefused',
             state           VARCHAR NOT NULL DEFAULT 'pending',
             refused_at      TIMESTAMPTZ NOT NULL,
@@ -354,242 +352,21 @@ def control_ddl(control_schema: str | None = None) -> list[str]:
     ]
 
 
-#: Columns of `commit_log`, in DDL order, used by the key migration below.
-_COMMIT_LOG_COLUMNS = (
-    "commit_id", "pipeline", "runner_id", "opened_at", "committed_at", "trigger",
-    "unit_count", "event_count", "fenced_units", "spilled", "first_txn_id",
-    "last_txn_id", "first_lsn", "last_lsn", "max_source_ts", "tables_touched",
-)
-
-
-class ControlSchemaFailed(RuntimeError):
-    """A control-schema migration could not be shown to have happened.
-
-    Loud on purpose (Codex r1 MINOR-1). Every `ALTER` exception used to be read as "a
-    concurrent runner won the race", with no re-check: a permission failure, an
-    unsupported DDL, a network error or a real MotherDuck error all looked like success,
-    and the writer that depends on the column then failed silently on every write.
-    """
-
-
-#: Columns added to control tables after they first shipped. `CREATE TABLE IF NOT
-#: EXISTS` cannot add a column, and these tables already exist on destinations that
-#: have run an earlier version - including the shared MotherDuck development database -
-#: so without this every write naming a new column would fail with "column not found".
-_ADDED_COLUMNS = {
-    "heartbeat": (
-        ("phase_since", "TIMESTAMPTZ"),
-        ("terminal_reason", "VARCHAR"),
-        ("phase_history", "VARCHAR"),
-    ),
-    "recovery_state": (
-        ("captured_json", "VARCHAR"),
-        ("state_dir", "VARCHAR"),
-    ),
-    "slot_state": (
-        ("verdict", "VARCHAR"),
-        ("verdict_message", "VARCHAR"),
-        ("verdict_at", "TIMESTAMPTZ"),
-    ),
-    "source_relations": (
-        ("columns_json", "VARCHAR"),
-        ("relation_filenode", "BIGINT"),
-        ("relation_type_oid", "BIGINT"),
-        ("full_activation_lsn", "BIGINT"),
-        ("full_invalidation_lsn", "BIGINT"),
-        # MotherDuck/DuckDB reject constraints in ALTER TABLE ... ADD COLUMN.
-        # The state is backfilled and checked below in this same transaction; the
-        # application/state-machine boundary is the invariant for already-created
-        # destinations whose additive column is necessarily nullable.
-        ("admission_state", "VARCHAR"),
-    ),
-    "column_presence": (
-        ("patch_digest", "VARCHAR"),
-    ),
-}
-
-# Defaults for additive columns are deliberately values, not SQL fragments. They are
-# bound as parameters by `_backfill_added_column`, which keeps the migration portable
-# across DuckDB and MotherDuck and avoids reintroducing an inline ADD COLUMN constraint.
-_ADDED_COLUMN_DEFAULTS = {
-    ("source_relations", "admission_state"): "external",
-}
-
-
 def ensure_control_schema(con, control_schema: str | None = None) -> None:
-    """Create and migrate the control schema as one idempotent transaction.
+    """Create the current control schema as one idempotent transaction.
 
-    MotherDuck supports the DDL used here transactionally, but does not support an
-    inline constraint on ``ALTER TABLE ... ADD COLUMN``. Keeping the DDL, additive
-    columns, and their backfills in one transaction means a failed migration cannot
-    leave a half-created control schema that later writers mistake for a valid one.
+    This repository is still in testing; control state written by an earlier build is
+    explicitly out of scope. There is deliberately no ALTER/backfill/legacy-copy path
+    here. A fresh destination gets the complete current DDL, and an old destination
+    must be recreated by the test/deployment harness rather than silently converted by
+    the application.
     """
-    configured = resolve_control_schema(control_schema)
     con.execute("BEGIN TRANSACTION")
     try:
-        _migrate_commit_log_key(con, configured)
-        for statement in control_ddl(configured):
+        for statement in control_ddl(control_schema):
             con.execute(statement)
-        for table, columns in _ADDED_COLUMNS.items():
-            _migrate_added_columns(con, configured, table, columns)
         con.execute("COMMIT")
     except BaseException:
         with contextlib.suppress(Exception):
             con.execute("ROLLBACK")
         raise
-
-
-def _table_columns(con, control_schema: str, table: str) -> set[str]:
-    """The columns `table` currently has. Raises if the question cannot be answered.
-
-    "I could not read the metadata" is NOT "the table is fine" (Codex r2 MINOR-1). The
-    first cut caught every exception here, returned `None`, and `_migrate_added_columns`
-    then returned silently — which recreates the exact silent-writer-failure the loud
-    `ALTER` branch exists to prevent, one step earlier. The `CREATE TABLE IF NOT EXISTS`
-    statements have already run by the time this is called, so an empty result means the
-    table genuinely has no columns we can see, and that is worth failing on too.
-    """
-    try:
-        # ``PRAGMA table_info('schema.table')`` parses the qualified name as a
-        # mini-language and cannot represent a schema containing a double quote.
-        # Information-schema parameters keep the configurable identifier as data,
-        # and the catalog predicate prevents MotherDuck's cross-database catalog
-        # view from merging same-named tables from another attached database.
-        rows = con.execute(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_catalog = current_database() "
-            "AND table_schema = ? AND table_name = ?",
-            [control_schema, table],
-        ).fetchall()
-        actual = {str(row[0]) for row in rows}
-        if not actual:
-            raise RuntimeError(
-                f"{control_table(control_schema, table)} has no introspectable physical columns"
-            )
-        return actual
-    except Exception as exc:
-        raise ControlSchemaFailed(
-            f"could not read the columns of {control_table(control_schema, table)} ({exc}), so the "
-            "late-added columns cannot be shown to exist. Refusing to continue: every "
-            "write naming one of them would fail silently for the life of this "
-            "destination."
-        ) from exc
-
-
-def _migrate_added_columns(
-    con, control_schema: str, table: str, columns: tuple[tuple[str, str], ...]
-) -> None:
-    """Add late-arriving columns to an already-created control table. Idempotent.
-
-    A failed `ALTER` is **re-checked, not assumed benign**: the only reading of the
-    exception that is safe to step over is "the column is there now", and the way to
-    know that is to look. Anything else raises, because the alternative is a writer that
-    silently fails on every statement for the life of the destination (Codex r1 MINOR-1).
-    """
-    qualified = control_table(control_schema, table)
-    existing = _table_columns(con, control_schema, table)
-    for column, sql_type in columns:
-        if column in existing:
-            _backfill_added_column(con, control_schema, table, column)
-            continue
-        log.warning("adding %s.%s.%s", control_schema, table, column)
-        try:
-            con.execute(f"ALTER TABLE {qualified} ADD COLUMN {quote(column)} {sql_type}")
-        except Exception as exc:
-            after = _table_columns(con, control_schema, table)
-            if column in after:
-                # The only benign reading: a concurrent runner added it between our
-                # read and our ALTER. Verified rather than assumed.
-                log.info(
-                    "%s.%s.%s already existed by the time the ALTER ran (a concurrent "
-                    "runner won the race)", control_schema, table, column,
-                )
-                _backfill_added_column(con, control_schema, table, column)
-                continue
-            raise ControlSchemaFailed(
-                f"could not add {qualified}.{quote(column)} ({exc}), and it is "
-                "still absent. Refusing to continue: every write naming that column "
-                "would fail silently for the life of this destination. Grant the DDL "
-                f"privilege, or drop {qualified} if it is empty."
-            ) from exc
-        _backfill_added_column(con, control_schema, table, column)
-
-
-def _backfill_added_column(con, control_schema: str, table: str, column: str) -> None:
-    """Fill an additive column's logical default without relying on DDL constraints."""
-    default = _ADDED_COLUMN_DEFAULTS.get((table, column))
-    if default is None:
-        return
-    qualified = control_table(control_schema, table)
-    column_identifier = (
-        column if control_schema == DEFAULT_CONTROL_SCHEMA else quote(column)
-    )
-    try:
-        con.execute(
-            f"UPDATE {qualified} SET {column_identifier} = ? "
-            f"WHERE {column_identifier} IS NULL",
-            [default],
-        )
-        remaining = con.execute(
-            f"SELECT count(*) FROM {qualified} WHERE {column_identifier} IS NULL"
-        ).fetchone()[0]
-    except Exception as exc:
-        raise ControlSchemaFailed(
-            f"could not backfill {qualified}.{quote(column)} ({exc}); the "
-            "control-schema transaction is being rolled back"
-        ) from exc
-    if remaining:
-        raise ControlSchemaFailed(
-            f"backfill left {remaining} NULL value(s) in "
-            f"{qualified}.{quote(column)}; refusing to publish a partially "
-            "initialized state column"
-        )
-
-
-def _commit_log_primary_key(con, control_schema: str) -> tuple[str, ...] | None:
-    """The column list of `commit_log`'s PRIMARY KEY, or None if unknowable."""
-    try:
-        rows = con.execute(
-            "SELECT constraint_column_names FROM duckdb_constraints() "
-            "WHERE schema_name = ? AND table_name = 'commit_log' "
-            "AND constraint_type = 'PRIMARY KEY'",
-            [control_schema],
-        ).fetchall()
-    except Exception:  # pragma: no cover - a destination without duckdb_constraints()
-        log.debug("could not read commit_log constraints", exc_info=True)
-        return None
-    if not rows:
-        return ()
-    return tuple(str(c) for c in rows[0][0])
-
-
-def _migrate_commit_log_key(con, control_schema: str) -> None:
-    """Move `commit_log` from `PRIMARY KEY (commit_id)` to `(pipeline, commit_id)`.
-
-    Needed because `CREATE TABLE IF NOT EXISTS` cannot change a key, and a
-    destination that already hosts a pipeline would otherwise reject the *first*
-    commit of a second pipeline: ids are now allocated per pipeline, so a new
-    pipeline starts again at 1 (Codex 9). MEASURED against the shared MotherDuck
-    development database, which already had the global key.
-
-    Runs before any commit group opens a transaction, and is a no-op once done.
-    """
-    existing = _commit_log_primary_key(con, control_schema)
-    if existing is None or existing == () or set(existing) == {"pipeline", "commit_id"}:
-        return
-    log.warning(
-        "migrating %s.commit_log from PRIMARY KEY %s to (pipeline, commit_id)",
-        control_schema, existing,
-    )
-    columns = ", ".join(_COMMIT_LOG_COLUMNS)
-    qualified = control_table(control_schema, "commit_log")
-    old = control_table(control_schema, "commit_log__cdcf_oldkey")
-    con.execute(f"DROP TABLE IF EXISTS {old}")
-    con.execute(f"ALTER TABLE {qualified} RENAME TO {quote('commit_log__cdcf_oldkey')}")
-    for statement in control_ddl(control_schema):
-        if ".commit_log (" in statement:
-            con.execute(statement)
-    con.execute(
-        f"INSERT INTO {qualified} ({columns}) SELECT {columns} FROM {old}"
-    )
-    con.execute(f"DROP TABLE {old}")

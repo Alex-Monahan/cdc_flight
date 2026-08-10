@@ -155,6 +155,7 @@ class SchemaRegistry(
                 f"destination key metadata for {table.name} is corrupt; refusing "
                 "to guess a source identity",
                 target=table.name,
+                refusal_origin="schema_registry",
             ) from exc
 
     def _persist_key_metadata(self, table: TableSchema) -> None:
@@ -260,6 +261,7 @@ class SchemaRegistry(
                             f"cannot add source column {name}.{col}: destination DDL "
                             "failed, so the catalog baseline cannot be persisted",
                             target=name,
+                            refusal_origin="schema_registry",
                         ) from exc
                     raise
                 table.columns[col] = ctype
@@ -274,6 +276,7 @@ class SchemaRegistry(
                         "the safe widening lattice; refusing to persist an unadopted "
                         "catalog baseline",
                         target=name,
+                        refusal_origin="schema_registry",
                     )
                 continue
             raw = table.raw_types.get(col, existing)
@@ -288,7 +291,9 @@ class SchemaRegistry(
                     f"a catalog baseline as {widened}"
                 )
                 if strict:
-                    raise SchemaEvolutionRefused(message, target=name)
+                    raise SchemaEvolutionRefused(
+                        message, target=name, refusal_origin="schema_registry"
+                    )
                 log.warning(message)
                 continue
             try:
@@ -304,7 +309,9 @@ class SchemaRegistry(
                     f"{existing} to {widened}: {exc}"
                 )
                 if strict:
-                    raise SchemaEvolutionRefused(message, target=name) from exc
+                    raise SchemaEvolutionRefused(
+                        message, target=name, refusal_origin="schema_registry"
+                    ) from exc
                 log.warning(message)
         return table, False
 
@@ -366,6 +373,7 @@ class SchemaRegistry(
                             "typed shadow conversion must run before post-change "
                             "events are admitted",
                             target=name,
+                            refusal_origin="schema_registry",
                         )
                     key_status_changed = (column in previous_key_columns) != (
                         column in requested_key_columns
@@ -390,6 +398,7 @@ class SchemaRegistry(
                             f"from {existing_type} as {physical_type}; a typed shadow "
                             "repair is required",
                             target=name,
+                            refusal_origin="schema_registry",
                         )
                     continue
                 try:
@@ -402,6 +411,7 @@ class SchemaRegistry(
                         f"cannot add typed source column {name}.{column}: destination "
                         "DDL failed, so the catalog baseline cannot be persisted",
                         target=name,
+                        refusal_origin="schema_registry",
                     ) from exc
                 table.columns[column] = _normalise_type(physical_type)
                 table.raw_types[column] = physical_type
@@ -443,6 +453,7 @@ class SchemaRegistry(
                                 f"{name}.{column} from {physical} as {target.sql}; "
                                 "a typed shadow conversion is required",
                                 target=name,
+                                refusal_origin="schema_registry",
                             )
                         table.native_types[column] = target
                     else:
@@ -502,6 +513,7 @@ class SchemaRegistry(
                 "provide a replacement identity, so the destination refuses to "
                 "continue without a lossless row key",
                 target=name,
+                refusal_origin="schema_registry",
             )
         try:
             self.con.execute(
@@ -512,6 +524,7 @@ class SchemaRegistry(
                 f"cannot drop source column {name}.{column}: destination DDL failed, "
                 "so the catalog baseline cannot be persisted",
                 target=name,
+                refusal_origin="schema_registry",
             ) from exc
         table.columns.pop(column, None)
         table.raw_types.pop(column, None)
@@ -549,6 +562,7 @@ class SchemaRegistry(
                     f"cannot rename source column {name}.{old} -> {new}: destination "
                     "DDL failed, so the catalog baseline cannot be persisted",
                     target=name,
+                    refusal_origin="schema_registry",
                 ) from exc
             table.columns[new] = table.columns.pop(old)
             table.raw_types[new] = table.raw_types.pop(old)
@@ -603,6 +617,7 @@ class SchemaRegistry(
                         f"cannot finish late rename {name}.{old} -> {new}: destination "
                         "DDL failed, so the catalog baseline cannot be persisted",
                         target=name,
+                        refusal_origin="schema_registry",
                     ) from exc
                 table.columns.pop(old, None)
                 table.raw_types.pop(old, None)

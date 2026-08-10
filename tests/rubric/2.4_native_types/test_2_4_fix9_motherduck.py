@@ -45,6 +45,8 @@ def test_postgresql_generated_opaque_corpus_is_lossless_or_refused_on_motherduck
     con = None
     try:
         assert sandbox.source.port == int(os.environ["CDC_TEST_PGPORT"])
+        assert len(EXACT_CORPUS["xml"][1]) == 8
+        assert not UNDELIVERABLE_TEXT_TYPES
         sandbox.reseed()
         tables = create_corpus(sandbox, EXACT_CORPUS)
         env.update(capture_environment(tables))
@@ -70,7 +72,7 @@ def test_postgresql_generated_opaque_corpus_is_lossless_or_refused_on_motherduck
 
             con = connect(token, database)
             control = motherduck_case["control_schema"]
-            for name in (*UNDELIVERABLE_TEXT_TYPES, "int2vector"):
+            for name in ("int2vector",):
                 assert con.execute(
                     f'SELECT state FROM "{database}"."{control}"."schema_refusals" '
                     "WHERE source_schema='app' AND source_table=?",
@@ -81,12 +83,18 @@ def test_postgresql_generated_opaque_corpus_is_lossless_or_refused_on_motherduck
                     f"WHERE table_schema='{dataset}' AND table_name=?",
                     [f"cdcflight_app_p2b_r9_{name}"],
                 ).fetchall() == []
+            matched_counts = {}
             for name in EXACT_CORPUS:
-                if name == "int2vector" or name in UNDELIVERABLE_TEXT_TYPES:
+                if name == "int2vector":
                     continue
                 source = source_connector_text(sandbox, name)
                 destination = _md_rows(con, database, dataset, name)
                 assert destination == source, name
+                matched_counts[name] = len(source)
+            print(
+                "round11 MotherDuck output-function corpus exact: "
+                f"total={sum(matched_counts.values())}, counts={matched_counts}"
+            )
         finally:
             drop_corpus(sandbox, EXACT_CORPUS)
     finally:

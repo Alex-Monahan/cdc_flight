@@ -166,7 +166,8 @@ def read_known_relations(
                     target_table=target_table,
                     detected_lsn=exc.detected_lsn,
                     reason=str(exc),
-                    refusal_class=exc.refusal_class,
+                    input_fingerprint=exc.input_fingerprint,
+                    source_fingerprint=exc.source_fingerprint,
                 )
             log.error(
                 "durable catalog descriptor refusal for %s source relation(s); "
@@ -488,6 +489,7 @@ class CatalogWatcher:
         observation already carries the source type identity, so DML can use it as
         the authoritative descriptor without issuing a catalog query per event.
         """
+        from .catalog_descriptors import relation_descriptor_fingerprint
         from .errors import SchemaEvolutionRefused
         from .typed_types import UnsupportedType, native_type
 
@@ -500,6 +502,21 @@ class CatalogWatcher:
                 for column in relation.columns
                 if column.descriptor is not None
             }
+            source_fingerprint = relation_descriptor_fingerprint(
+                relation.oid,
+                (
+                    (
+                        column.name,
+                        column.attnum,
+                        column.type_oid,
+                        column.typmod,
+                        column.type_name,
+                        column.descriptor,
+                    )
+                    for column in relation.columns
+                    if column.descriptor is not None
+                ),
+            )
         for name, descriptor in descriptors.items():
             try:
                 native_type(descriptor)
@@ -510,6 +527,8 @@ class CatalogWatcher:
                     source_schema=str(qualified).partition(".")[0],
                     source_table=str(qualified).partition(".")[2],
                     target=str(qualified),
+                    source_fingerprint=source_fingerprint,
+                    refusal_origin="catalog_state",
                 ) from exc
         return descriptors
 

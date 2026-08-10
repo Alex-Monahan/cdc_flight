@@ -241,6 +241,7 @@ def _key_token(
                 source_schema=item.source_schema,
                 source_table=item.source_table,
                 target=item.target,
+                refusal_origin="table_work",
             )
         try:
             rendered = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
@@ -351,6 +352,7 @@ def collect(
                 source_schema=item.source_schema,
                 source_table=item.source_table,
                 target=item.target,
+                refusal_origin="table_work",
             )
     item.events += 1
     if patch.has_marker() and event.op in {"c", "r"}:
@@ -816,6 +818,7 @@ def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
             source_schema=item.source_schema,
             source_table=item.source_table,
             target=item.target,
+            refusal_origin="table_work",
         )
     if created:
         created_in_txn.add(item.target)

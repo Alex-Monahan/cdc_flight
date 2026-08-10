@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from . import destination
+from .catalog_descriptors import source_relation_fingerprint
 from .errors import SchemaEvolutionRefused
 
 
@@ -33,16 +34,31 @@ def run_owed(
     )
     for schema, table, target in owed:
         if f"{schema}.{table}" in quarantined_names:
-            # Declared quarantined -> pending trigger.  The owed marker remains
-            # durable before the throwaway snapshot reads current source state.
-            destination.reactivate_schema_refusal(
+            # A new run is not a retry trigger.  Re-enter only on positive source
+            # absence or a changed relation/descriptor fingerprint; this keeps a
+            # deterministic refusal from reopening an unbounded snapshot loop.
+            source_exists, source_fingerprint = source_relation_fingerprint(
+                source.dsn, schema, table
+            )
+            if destination.quarantine_retry_allowed(
                 con,
                 pipeline=pipeline,
                 source_schema=schema,
                 source_table=table,
-                target_table=target,
+                source_exists=source_exists,
+                source_fingerprint=source_fingerprint,
                 control_schema=control_schema,
-            )
+            ):
+                # The owed marker remains durable before the throwaway snapshot reads
+                # current source state.
+                destination.reactivate_schema_refusal(
+                    con,
+                    pipeline=pipeline,
+                    source_schema=schema,
+                    source_table=table,
+                    target_table=target,
+                    control_schema=control_schema,
+                )
     pending_names = {
         f"{schema}.{table}"
         for schema, table, _reason in destination.pending_schema_refusals(
@@ -115,7 +131,7 @@ def run_owed(
                         detected_lsn=refused.detected_lsn,
                         reason=str(refused),
                         input_fingerprint=refused.input_fingerprint,
-                        refusal_class=refused.refusal_class,
+                        source_fingerprint=refused.source_fingerprint,
                         control_schema=control_schema,
                     )
                     refused.refusal_recorded = True

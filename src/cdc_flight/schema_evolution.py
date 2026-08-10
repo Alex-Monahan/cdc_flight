@@ -30,7 +30,7 @@ from dataclasses import dataclass
 
 from . import naming
 from .errors import SchemaEvolutionRefused
-from .typed_types import SourceTypeDescriptor, native_type
+from .typed_types import SourceTypeDescriptor, UnsupportedType, native_type
 
 COLUMN_ADDED = "added"
 COLUMN_DROPPED = "dropped"
@@ -267,6 +267,7 @@ def apply_column_changes(registry, table_name: str, changes: Iterable[ColumnChan
                         "descriptor is missing, so the safe widening lattice cannot "
                         "prove a native UNION member",
                         target=table_name,
+                        refusal_origin="schema_evolution",
                     )
                 old_descriptor = change.old_descriptor or descriptor_from_type_name(
                     change.old_type_name or "text", oid=change.old_type_oid
@@ -274,12 +275,20 @@ def apply_column_changes(registry, table_name: str, changes: Iterable[ColumnChan
                 new_descriptor = change.new_descriptor or descriptor_from_type_name(
                     change.type_name or "text", oid=change.type_oid
                 )
-                registry.convert_column_to_union(
-                    table_name,
-                    change.destination_new_name,
-                    old_descriptor,
-                    new_descriptor,
-                )
+                try:
+                    registry.convert_column_to_union(
+                        table_name,
+                        change.destination_new_name,
+                        old_descriptor,
+                        new_descriptor,
+                    )
+                except (UnsupportedType, ValueError) as exc:
+                    raise SchemaEvolutionRefused(
+                        f"cannot change source column {table_name}.{change.destination_new_name}: "
+                        f"the source descriptor is not deliverable: {exc}",
+                        target=table_name,
+                        refusal_origin="schema_evolution",
+                    ) from exc
         elif change.kind == COLUMN_DROPPED and change.destination_old_name:
             registry.drop_column(table_name, change.destination_old_name)
     for change in changes:
@@ -290,11 +299,19 @@ def apply_column_changes(registry, table_name: str, changes: Iterable[ColumnChan
             descriptor = change.new_descriptor or descriptor_from_type_name(
                 change.type_name or "text", oid=change.type_oid
             )
-            registry.ensure_typed(
-                table_name,
-                columns={change.destination_new_name: descriptor},
-                key_columns=registry.get(table_name).key_columns,
-            )
+            try:
+                registry.ensure_typed(
+                    table_name,
+                    columns={change.destination_new_name: descriptor},
+                    key_columns=registry.get(table_name).key_columns,
+                )
+            except (UnsupportedType, ValueError) as exc:
+                raise SchemaEvolutionRefused(
+                    f"cannot add source column {table_name}.{change.destination_new_name}: "
+                    f"the source descriptor is not deliverable: {exc}",
+                    target=table_name,
+                    refusal_origin="schema_evolution",
+                ) from exc
         elif change.kind == COLUMN_TYPE_CHANGED and change.destination_new_name:
             old_descriptor = change.old_descriptor or descriptor_from_type_name(
                 change.old_type_name or "text", oid=change.old_type_oid
@@ -302,12 +319,20 @@ def apply_column_changes(registry, table_name: str, changes: Iterable[ColumnChan
             new_descriptor = change.new_descriptor or descriptor_from_type_name(
                 change.type_name or "text", oid=change.type_oid
             )
-            registry.convert_column_to_union(
-                table_name,
-                change.destination_new_name,
-                old_descriptor,
-                new_descriptor,
-            )
+            try:
+                registry.convert_column_to_union(
+                    table_name,
+                    change.destination_new_name,
+                    old_descriptor,
+                    new_descriptor,
+                )
+            except (UnsupportedType, ValueError) as exc:
+                raise SchemaEvolutionRefused(
+                    f"cannot change source column {table_name}.{change.destination_new_name}: "
+                    f"the source descriptor is not deliverable: {exc}",
+                    target=table_name,
+                    refusal_origin="schema_evolution",
+                ) from exc
 
 
 def descriptor_from_type_name(
