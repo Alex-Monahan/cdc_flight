@@ -38,6 +38,7 @@ import time
 from dataclasses import dataclass, field
 
 from .machines import SOURCE_HEALTH_STATES
+from .source_marker import IDLE_HEARTBEAT, SourceMarker
 
 log = logging.getLogger("cdc_flight.source_health")
 
@@ -61,6 +62,8 @@ DEFAULT_MAX_IDLE_LAG_BYTES = 64 * 1024
 _SLOT_SQL = """
 SELECT s.active,
        s.confirmed_flush_lsn IS NOT NULL AS has_confirmed,
+       CASE WHEN s.confirmed_flush_lsn IS NULL THEN NULL
+            ELSE (s.confirmed_flush_lsn - '0/0')::BIGINT END AS confirmed_pos,
        COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), s.confirmed_flush_lsn), 0)::BIGINT
 FROM pg_replication_slots s
 WHERE s.slot_name = %s
@@ -75,6 +78,7 @@ class SlotSample:
     exists: bool = False
     active: bool = False
     lag_bytes: int | None = None
+    confirmed_pos: int | None = None
     error: str | None = None
 
     @property
@@ -99,6 +103,12 @@ class SourceHealth:
 
     dsn: str
     slot_name: str
+    #: A separate write route for the one-shot transactional marker used to make
+    #: the post-commit hand-off observable on a quiet source.  It is deliberately
+    #: not the Debezium replication connection; in a hot-standby topology this is
+    #: the primary DSN.
+    primary_dsn: str | None = None
+    source_marker: SourceMarker | None = None
     max_lag_bytes: int = DEFAULT_MAX_IDLE_LAG_BYTES
     interval: float = 0.5
     connect_timeout: int = 5
@@ -217,11 +227,12 @@ class SourceHealth:
             return SlotSample(at=now, error=f"{type(exc).__name__}: {exc}")
         if row is None:
             return SlotSample(at=now, exists=False)
-        active, has_confirmed, lag = row
+        active, has_confirmed, confirmed_pos, lag = row
         return SlotSample(
             at=now,
             exists=True,
             active=bool(active),
+            confirmed_pos=(int(confirmed_pos) if has_confirmed else None),
             lag_bytes=int(lag) if has_confirmed else None,
         )
 
@@ -277,6 +288,84 @@ class SourceHealth:
             if self._lag_decreased_at is None:
                 return 0.0
             return time.monotonic() - self._lag_decreased_at
+
+    def wait_for_confirmed(self, target: int, *, timeout: float) -> bool:
+        """Wait while the live connector publishes a durable LSN to PostgreSQL.
+
+        ``markBatchFinished()`` acknowledges records only after the destination
+        transaction commits.  Debezium sends that acknowledgement to the logical
+        slot on its next poll, so stopping immediately after a quiet callback can
+        leave ``confirmed_flush_lsn`` behind a perfectly durable destination.  Keep
+        the engine alive for this short, bounded hand-off; a timeout is a failed
+        proof, never a reason to claim the slot advanced.
+        """
+        target = int(target)
+        deadline = time.monotonic() + max(0.0, timeout)
+        while time.monotonic() < deadline:
+            sample = self.last
+            if (
+                sample is not None
+                and sample.confirmed_pos is not None
+                and sample.confirmed_pos >= target
+            ):
+                return True
+            time.sleep(min(self.interval, max(0.01, deadline - time.monotonic())))
+        sample = self.last
+        return bool(
+            sample is not None
+            and sample.confirmed_pos is not None
+            and sample.confirmed_pos >= target
+        )
+
+    def confirmed_at_least(self, target: int) -> bool:
+        """Return the last sampled slot proof without waiting."""
+        sample = self.last
+        return bool(
+            sample is not None
+            and sample.confirmed_pos is not None
+            and sample.confirmed_pos >= int(target)
+        )
+
+    def emit_idle_marker(self, target: int) -> bool:
+        """Emit one transactional source marker on the separate primary route.
+
+        Debezium only sends slot feedback while its replication loop receives a
+        message.  A quiet source can therefore leave a destination commit durable
+        while ``confirmed_flush_lsn`` remains frozen until the next business
+        transaction.  The marker is an offset-only, whole PostgreSQL transaction;
+        its own destination control-unit commit is what makes acknowledging the
+        marker (and everything before it) safe under Invariant O.
+        """
+        marker = self.source_marker
+        dsn = self.primary_dsn
+        if marker is None or not dsn:
+            return False
+        try:
+            import psycopg
+
+            with psycopg.connect(
+                dsn,
+                autocommit=True,
+                connect_timeout=self.connect_timeout,
+                options=f"-c statement_timeout={self.query_timeout_ms}",
+                keepalives=1,
+                keepalives_idle=1,
+                keepalives_interval=1,
+                keepalives_count=2,
+                tcp_user_timeout=self.query_timeout_ms,
+            ) as conn:
+                return marker.emit(
+                    conn,
+                    IDLE_HEARTBEAT,
+                    {"slot": self.slot_name, "durable_lsn": int(target)},
+                )
+        except Exception as exc:
+            marker.last_error = f"{type(exc).__name__}: {exc}"
+            log.error(
+                "could not emit the transactional idle marker on the primary: %s",
+                marker.last_error,
+            )
+            return False
 
     def state(self, *, dark_after: float = 0.0) -> str:
         """The fold's classification, as ONE declared value (rubric 1.9).
@@ -366,7 +455,15 @@ class SourceHealth:
             "slot_health": self.state(),
             "slot_exists": sample.exists,
             "slot_active": sample.active,
+            "slot_confirmed_pos": sample.confirmed_pos,
             "slot_lag_bytes": sample.lag_bytes,
             "slot_streaming_for_sec": round(self.streaming_for, 1),
             "slot_lag_steady_for_sec": round(self.lag_steady_for, 1),
+            **(
+                {
+                    "source_marker": self.source_marker.summary()
+                }
+                if self.source_marker is not None
+                else {}
+            ),
         }

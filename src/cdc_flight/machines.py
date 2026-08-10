@@ -644,13 +644,16 @@ SCHEMA_REFUSAL = Machine(
         (REFUSAL_RESOLVED, REFUSAL_RESOLVED),
         (REFUSAL_RESOLVED, REFUSAL_PENDING),
         (REFUSAL_QUARANTINED, REFUSAL_QUARANTINED),
+        # The blocking condition may clear.  Re-entry is not discharge: the table
+        # remains owed until a complete replacement snapshot takes it to current.
+        (REFUSAL_QUARANTINED, REFUSAL_PENDING),
     ),
-    terminal=(REFUSAL_RESOLVED, REFUSAL_QUARANTINED),
+    terminal=(REFUSAL_RESOLVED,),
     initial=REFUSAL_ABSENT,
     durable="_cdc_flight.schema_refusals.state",
     purpose=(
-        "Has a schema transition been refused, and is it either discharged or durably "
-        "quarantined after an identical retry proved it cannot be delivered?"
+        "Has a schema transition been refused, discharged by a complete snapshot, or "
+        "held in a quarantine that can be reactivated when the source is repaired?"
     ),
 )
 

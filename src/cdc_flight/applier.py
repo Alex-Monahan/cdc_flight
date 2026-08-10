@@ -178,6 +178,11 @@ class Applier:
         self.alerts = AlertSink(
             con, pipeline=pipeline, control_schema=self.control_schema
         )
+        # One durable admission snapshot per applier/run.  GroupPlan receives this
+        # set; it must not query control state once per table or schema epoch.
+        self.blocked_schema_tables = destination.blocked_schema_tables(
+            con, pipeline, control_schema=self.control_schema
+        )
         # rubric 1.9: an illegal table-lifecycle transition must reach an operator, and
         # the only connection that survives this group's rollback is the sink's.
         self.snapshots.alerts = self.alerts
@@ -236,6 +241,7 @@ class Applier:
         self.truncates_logged = 0
         self.resnapshot_discarded_events = 0
         self.quarantined_events = 0
+        self.unscoped_refusals = 0
         #: rubric 4.7: undecidable folds turned into automatic table rebuilds
         self.ambiguous_resnapshots_queued = 0
         #: events dropped because their transaction is already inside a table's image
@@ -311,6 +317,8 @@ class Applier:
             "snapshot_swaps": self.snapshots.swaps,
             "discarded_tail_events": self.assembler.discarded_tail_events,
             "quarantined_events": self.quarantined_events,
+            "blocked_schema_tables": sorted(self.blocked_schema_tables),
+            "unscoped_refusals": self.unscoped_refusals,
             "orphan_end_markers": self.assembler.orphan_end_markers,
             "implicit_txn_opens": self.assembler.implicit_txn_opens,
             "last_commit_id": self.last_commit_id,
@@ -572,7 +580,30 @@ class Applier:
         self.ambiguous_resnapshots_queued += int(recorded)
 
     def _record_schema_refusal(self, refused: SchemaEvolutionRefused) -> None:
+        if refused.refusal_recorded:
+            return
         spill_refusal.record_schema_refusal(self, refused)
+        if refused.source_schema and refused.source_table:
+            self.blocked_schema_tables.add(
+                f"{refused.source_schema}.{refused.source_table}"
+            )
+
+    def _contextualize_schema_refusal(self, refused: SchemaEvolutionRefused) -> None:
+        """Attach the source table before rollback erases the failed group context."""
+        events = [event for unit in self.group.units for event in unit.events]
+        event = next(
+            (item for item in events if item.schema and item.table),
+            None,
+        )
+        if event is None:
+            return
+        refused.source_schema = refused.source_schema or event.schema
+        refused.source_table = refused.source_table or event.table
+        refused.target = refused.target or event.qualified_table
+        if refused.detected_lsn is None:
+            lsns = [int(item.lsn) for item in events if item.lsn is not None]
+            if lsns:
+                refused.detected_lsn = max(lsns)
 
     def _handle_spill_refusal(
         self, refused: SchemaEvolutionRefused, events: list[PendingRecord]

@@ -460,9 +460,6 @@ def run(
                 replicated=catalog_mod.seed_from_table_state(
                     con, dest.pipeline_name, control_schema=control_schema
                 ),
-                # `unmarked`, NOT a recomputation. By here the marking above has put
-                # every unrelatable relation in the owed queue and the blocking
-                # re-snapshot has already rebuilt it from the current source relation.
                 unrelatable=set(baseline.unmarked),
                 poll_seconds=catalog_cfg.poll_seconds,
                 emit_marker=catalog_cfg.emit_marker,
@@ -475,15 +472,17 @@ def run(
             ).start()
             catalog_refusals = watcher.schema_refusals()
             for refused in catalog_refusals:
-                if refused.source_schema and refused.source_table:
+                source_tables = refused.source_tables or (
+                    ((refused.source_schema, refused.source_table, refused.target),)
+                    if refused.source_schema and refused.source_table
+                    else ()
+                )
+                for source_schema, source_table, target_table in source_tables:
                     dest_mod.record_schema_refusal(
-                        con,
-                        pipeline=dest.pipeline_name,
-                        source_schema=refused.source_schema,
-                        source_table=refused.source_table,
-                        target_table=refused.target,
-                        detected_lsn=refused.detected_lsn,
-                        reason=str(refused),
+                        con, pipeline=dest.pipeline_name, source_schema=source_schema,
+                        source_table=source_table, target_table=target_table,
+                        detected_lsn=refused.detected_lsn, reason=str(refused),
+                        refusal_class=refused.refusal_class,
                     )
             if catalog_refusals:
                 summary_extra["catalog_schema_refusals"] = [

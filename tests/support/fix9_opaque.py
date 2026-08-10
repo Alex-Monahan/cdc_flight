@@ -43,8 +43,8 @@ CORPUS = {
         [
             "xmlelement(name a, 'fat')",
             "xmlparse(document '<a/>')",
-            "xmlelement(name root, xmlelement(name a, 'x'))",
-            "xmlparse(document '<x attr=\"1\">é</x>')",
+            "xmlparse(document '<?xml version=\"1.0\"?><prolog/>')",
+            "xmlparse(document '<?xml version=\"1.0\" encoding=\"UTF-8\"?><unicode>é</unicode>')",
         ],
     ),
     "money": (
@@ -101,10 +101,10 @@ CORPUS = {
 }
 
 EXACT_CORPUS = dict(CORPUS)
-# The stock PostgreSQL adapter exposes these two values in a semantic spelling
-# that is not PostgreSQL's literal ``value::text`` (currency/host formatting is
-# discarded).  They remain in the generated corpus and are explicitly refused.
-STOCK_UNLOSSLESS_TEXT_TYPES = frozenset({"money", "inet"})
+# XML declarations are stripped by stock Debezium.  Since the value at the
+# connector boundary cannot distinguish a source document that had a declaration
+# from one that never had one, the safe contract is refuse-all XML.
+UNDELIVERABLE_TEXT_TYPES = frozenset({"xml"})
 
 
 def capture_environment(tables: list[str]) -> dict[str, str]:
@@ -163,12 +163,12 @@ def drop_corpus(sandbox, corpus: dict = CORPUS) -> None:
 
 
 def source_connector_text(sandbox, name: str) -> list[tuple]:
-    """Read the source value exactly as PostgreSQL renders it.
+    """Read the source value through PostgreSQL's type output function.
 
-    This deliberately does not substitute Debezium's semantic adapters.  A
-    mismatch here is evidence for a refusal, not permission to normalize the
-    destination value into the connector's spelling.
+    ``value::text`` is a cast, not the type output function. In particular,
+    ``inet_out`` omits the redundant host mask for a host address. ``format``
+    with ``%s`` invokes the same output-function rendering used by SELECT/COPY.
     """
     return sandbox.pg_query(
-        f"SELECT id, value::text FROM app.p2b_r9_{name} ORDER BY id"
+        f"SELECT id, format('%s', value) FROM app.p2b_r9_{name} ORDER BY id"
     )

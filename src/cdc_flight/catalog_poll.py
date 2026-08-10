@@ -428,12 +428,19 @@ def poll(watcher):
             source_schema = str(getattr(exc, "source_schema", None) or source_row[0])
             source_table = str(getattr(exc, "source_table", None) or source_row[1])
             target = getattr(exc, "target", None) or f"{source_schema}.{source_table}"
+            source_tables = tuple(
+                (str(row[0]), str(row[1]), f"{row[0]}.{row[1]}")
+                for row in rows
+                if len(row) >= 2
+            )
             raise SchemaEvolutionRefused(
                 f"source catalog descriptor authority failed for {target}: {exc}",
                 source_schema=source_schema,
                 source_table=source_table,
                 target=target,
                 detected_lsn=lsn,
+                refusal_class="catalog_descriptor",
+                source_tables=source_tables,
             ) from exc
         for index, row in enumerate(rows):
             raw_columns = parsed_columns[index]

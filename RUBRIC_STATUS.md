@@ -16,10 +16,10 @@ defines only some of 1–5 (e.g. `1 / 2 / 5`) an intermediate score is used and 
 mapping is justified in the item's notes.
 
 > **Item count.** The rubric's own preamble says "42 rubric items", but the
-> document contains **40** numbered items (8 + 6 + 7 + 6 + 4 + 2 + 4 + 3).
-> `TODO.md`'s Phase 1–8 task list also enumerates 40. All 40 are scored below;
-> no item is skipped. If two items were lost in the v2→v3 re-categorisation they
-> need to be restored before Phase 9.2 sign-off.
+> document contains **40** numbered baseline items (8 + 6 + 7 + 6 + 4 + 2 + 4 +
+> 3). The user-added blast-radius item **4.0** is now also scored below, for
+> **41 current items**. `TODO.md`'s Phase 1–8 task list enumerates the original
+> 40; no baseline item is skipped.
 
 ### Scope: two layers, and which one you are reading
 
@@ -691,7 +691,7 @@ correct assumptions in the notes below:
 | 2.1 | Added / dropped columns handled | **5** | Catalog-fenced attnum diffs add and backfill existing rows, physically drop destination columns, and continue through live CDC; the add/drop E2E compares source and destination before and after both DDLs. |
 | 2.2 | Renamed columns handled well | **5** | Same-attnum/type changes use a true destination rename, including a late-row merge/fence path; the E2E has one logical column, one rename audit event, and no data loss. |
 | 2.3 | New tables and schemas auto-discovered | **5** | A 10-second (configurable) all-schema watcher admits table-scoped publication members and performs an in-process targeted re-snapshot on the same main slot; new-table and new-schema existing rows arrive without config edit or restart. |
-| 2.4 | Postgres types → native MotherDuck types | ~~1~~ → **5** | The current opaque/unknown-type contract is exact-or-refuse: strict UTF-8 decoded text is stored verbatim as `VARCHAR`; stock `money`/`inet` formatting gaps and the wrong-shaped `int2vector` transport refuse durably. PostgreSQL-generated corpus and catalog-sweep evidence pass on local DuckDB and real MotherDuck. |
+| 2.4 | Postgres types → native MotherDuck types | ~~1~~ → **5** | The current contract is exact-or-refuse under the PostgreSQL type **output function** (`SELECT`/COPY/`format('%s', value)`), not the `::text` cast: `money` and `inet` round-trip, while stock-Debezium XML prologs and wrong-shaped `int2vector` values refuse durably. The generated corpus and catalog sweep pass on local DuckDB and real MotherDuck. |
 | 2.5 | Data type changes supported | ~~3~~ → **5** | The typed shadow path, spill/replay path, and source-semantic multirange identity use the same `VARCHAR` resolver; real PostgreSQL equality classes and MotherDuck key-gain/shadow evidence pass. A full Debezium-driven MotherDuck multirange stream was not separately run, as recorded in the round-7 limits. |
 | 2.6 | TOAST columns handled well | **4** | Sparse physical-row folding, durable NULL-vs-JSONB-root-null ambiguity refusal, and a bounded relation-lock activation fence close the soundness defects. The real-owner matrix is non-circular. Stock Debezium still lacks a marker-preserving efficient channel, so the policy ceiling remains 4. |
 | 3.1 | Backfill scalable / parallelized | 3 | 120 k rows in ~28 s single-threaded (`snapshot.max.threads=1`); works but does not scale, untested past 120 k. |
@@ -701,6 +701,7 @@ correct assumptions in the notes below:
 | 3.5 | Per-table CDC / full refresh / incremental refresh | 3 | CDC only. |
 | 3.6 | Backfill when CDC falls too far behind | 1 | Lag is never measured, so nothing can trigger on it. |
 | 3.7 | Failed backfill resumes midway | 1 | Debezium restarts the initial snapshot from scratch, and the partial snapshot is already appended. |
+| 4.0 | Blast-radius containment for permanently unprocessable rows/tables | **5** | A bad table becomes durable, observable quarantine; every affected run is NOT-OK and alerted, healthy tables continue, the slot advances only after the resnapshot debt is durable, and `quarantined → pending → complete` automatically re-snapshots current source state. Real PostgreSQL measured slot-local WAL stayed below 1 MB. |
 | 4.1 | Recover from failed / lost slot | 1 | **Proven**: slot dropped → engine fails to start, process exits **0** in 1 s, slot never recreated, permanent silent no-op. |
 | 4.2 | Concurrent Flight instances | 1 | Two simultaneous runs both exit 0; same-slot runs silently no-op, different-slot runs silently duplicate into the same tables. |
 | 4.3 | Recover from problematic WAL / offset state | 1 | A bad offset kills the engine; there is no backfill, no retry, and the failure is reported as success. |
@@ -1852,7 +1853,7 @@ run-time error instead of a review finding.
 | `catalog_change` | where is one DDL fact in observe → confirm → fence → apply | 9 | 31 | **memory only** |
 | `publication_admission` | has a discovered relation been admitted to the publication, and who owns that decision | 6 | 23 | `_cdc_flight.source_relations.admission_state` |
 | `catalog_schema_liveness` | is a watched schema visibly queryable before absence can mean a drop | 4 | 16 | **memory only** |
-| `schema_refusal` | has a refused schema transition acquired a durable remediation obligation | 4 | 7 | `_cdc_flight.schema_refusals.state` |
+| `schema_refusal` | has a refused schema transition acquired a durable remediation obligation | 4 | 8 | `_cdc_flight.schema_refusals.state` |
 | `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
 | `snapshot_completion` | have all ordered snapshot callbacks arrived | 6 | 9 | **memory only** |
 | `runtime_root_lifecycle` | is the disposable root reusable or committed to cleanup | 6 | 10 | project-local root and parent markers |
@@ -3113,6 +3114,9 @@ MotherDuck/native resolver coverage are not being conflated.
 
 ## FIX ROUND 9 closure — rubric 2.4 / 2.5 / 2.6 (2026-08-09)
 
+This section preserves round-9's historical claims and measurements; it was
+superseded by the round-10 findings and evidence below.
+
 Current scores are **2.4 = 5/5**, **2.5 = 5/5**, and **2.6 = 4/5**.
 Round 9 is **SATISFIED: yes** for the requested 2.4/2.5/2.6 findings. The
 2.6 score is still honestly capped by the binding stock-Debezium policy:
@@ -3229,7 +3233,7 @@ the unverified `_VERIFIED_TEXT_KINDS` plain-string admission; **R8-4 (NIT)**
 removes the dead `_OBSCURE_EXTENSIONS`/unreachable fallback branches; and
 **R8-5 (NIT)** was handled by removing the two exact orphan 15434 probe slots.
 
-### Final required lanes
+### Round 9 historical lane results (superseded below)
 
 All commands used this clone's native PostgreSQL 18 instance on port **15434**;
 no Docker or alternate PostgreSQL port was used:
@@ -3244,3 +3248,198 @@ no Docker or alternate PostgreSQL port was used:
 The final focused Round 9 regression file has **41 passed** tests. The only
 deliberately unclosed item is the binding 2.6 marker-preserving 5/5 path; no
 other Round 9 claim is being made beyond the evidence above.
+
+## FIX ROUND 10 closure — rubric 2.4 / 2.5 / 2.6 / 4.0 (2026-08-10)
+
+The honest post-fix scores are **2.4 = 5/5**, **2.5 = 5/5**, **2.6 = 4/5**,
+and **4.0 = 5/5**. 2.6 remains deliberately capped by the binding policy:
+stock Debezium's marker-preserving efficient TOAST channel is deferred. No
+previous-build migration or compatibility work was added.
+
+### Correct oracle; money and inet restored
+
+The corpus helper now reads PostgreSQL's type output function with:
+
+```sql
+SELECT id, format('%s', value) FROM app.<table> ORDER BY id
+```
+
+That is the same display path used by `SELECT value`, COPY text output, and
+the type's `*_out` function. `value::text` is a cast and is not a valid oracle
+for this comparison: for an `inet` host it adds the redundant `/32` (or
+`/128`), while the PostgreSQL output is `192.0.2.1` (or `2001:db8::1`). The
+round-9 `::text`-based refusal was therefore an oracle error, not connector
+evidence.
+
+`inet` and `money` are back in the seed and in the passing end-to-end probe;
+the inverted round-9 failure assertion is reverted. The type boundary accepts
+psycopg address objects on the catalog ADD-column path and preserves their
+output spelling. It formats stock Debezium's numeric money spelling to the
+PostgreSQL output spelling. The corrected PostgreSQL-generated corpus has 46
+values: **38 byte-exact** output-function comparisons (including all money and
+inet values) and **8 loud refusals** (four XML declaration values and four
+stock `int2vector` list-shaped values), on both local DuckDB and MotherDuck.
+The retained stock-Debezium proof also covers **66 generated values across
+seven opaque types** byte-exactly, including all eight values that broke round
+8: tsquery (15), jsonpath (15), pg_lsn (8), tsvector (10), cidr (8), macaddr
+(5), and macaddr8 (5).
+
+### XML is UNDELIVERABLE, never silently admitted
+
+Stock Debezium removes an XML declaration prolog. The corpus includes
+PostgreSQL-generated values such as `<?xml version="1.0"?><prolog/>` and the
+UTF-8 declaration case. Non-NULL XML now raises `InvalidTypedValue` with an
+explicit stock-Debezium UNDELIVERABLE reason before destination admission;
+NULL remains a SQL NULL and is handled normally. The local DuckDB and real
+MotherDuck corpus tests assert the refusal state is durable `quarantined` and
+that no XML destination image is created. The separate stock ten-type probe
+keeps the NULL XML case and passing money/inet assertions, so no XML path has a
+third, silent-divergence outcome.
+
+The source-derived PG18 sweep covers **76** non-array `pg_catalog` base/
+multirange types: 44 have a direct native decision and 32 raise
+`UnsupportedType`; recursive arrays use their element descriptors. At the
+value seam, every exercised type is either equal to the output-function corpus
+or refuses. There is no admitted value that differs from the corrected source
+oracle.
+
+### Quarantine state machine, alerting, stale marking, and recovery
+
+The declared refusal machine is now:
+
+```text
+absent -> pending -> quarantined -> pending -> resolved
+             ^          |             ^          ^
+             |          +--self-------+          |
+             +--same refusal retry               |
+                         (full current-source snapshot)
+```
+
+The actual declared edges are `absent → pending`, repeated pending refusal
+`→ quarantined`, `quarantined → pending` when the owed-table recovery queue
+reevaluates the condition, and `pending → resolved` only after a complete
+replacement snapshot. There is no direct quarantine-to-current edge. The
+reactivation trigger runs before the throwaway snapshot reads source data.
+
+Every refusal writes the source-scoped durable record and
+`table_state.snapshot_state='awaiting_snapshot'`. Quarantine writes one durable
+`schema_quarantine` event and an independent critical
+`schema_table_quarantined` alert whose message explicitly says the destination
+image is stale/unavailable until a full re-snapshot. The retained physical image
+is not destroyed merely to hide it; consumers must gate on this durable control
+state/alert, so it cannot be mistaken for current data. A quarantined run is
+NOT-OK, including when healthy tables continue: the real XML bad-table/healthy-
+peer scenario reports all three blocking runs as `ok=false`, and the in-process
+seven-run scenario records the alert and durable awaiting marker.
+
+After the source XML column is repaired, the automatic reactivation path runs a
+full current-source snapshot. Only after the atomic shadow swap (or verified
+empty result) completes does `resolve_schema_refusal` accept the transition;
+the repair proof ends in `resolved`, `snapshot_state='complete'`, and destination
+rows `(1),(2)`. The healthy peer remains current throughout.
+
+Slot safety is structural: the refusal and resnapshot debt are committed before
+the run may acknowledge the source unit; quarantined streaming events are skipped
+only after that durable `awaiting_snapshot` mark; no code path resolves a refusal
+unless the lifecycle is complete. The current-source full snapshot does not need
+the quarantined table's skipped WAL, which is why advancing past it is sound.
+The bounded handoff emits a transactional offset-only source marker on the
+explicit primary route and waits for the live connector's `confirmed_flush_lsn`;
+failure to confirm is an EngineFailure, never success. This preserves Invariant O:
+no table can become current without the completed snapshot.
+
+### Real slot/WAL evidence
+
+The corrected bad-table/healthy-peer PostgreSQL scenario was run serially with
+three bad runs followed by two repair runs. Values are LSN text plus byte counts;
+`slot_wal_window` is `confirmed_flush_lsn - restart_lsn`, the table-local safety
+measure:
+
+| phase | restart_lsn | confirmed_flush_lsn | retained WAL | slot WAL window |
+|---|---|---|---:|---:|
+| baseline | E/67AAD830 | E/67AAD868 | 3,368 | 56 |
+| bad 1 | E/67AAD830 | E/67AAD868 | 5,256 | 56 |
+| bad 2 | E/67AAE4A8 | E/67AAFC30 | 6,520 | 6,024 |
+| bad 3 | E/67AAF7C8 | E/67AAFC30 | 76,320 | 1,128 |
+| repair 1 | E/67AAFD70 | E/67AC2DE8 | 80,224 | 77,944 |
+| repair 2 | E/67AC2848 | E/67AC2DE8 | 55,624 | 1,440 |
+
+The confirmed position advances during the quarantine sequence (by bad run 2,
+not only after repair), and the quarantine-window slot-local maximum is 6,024
+bytes. The full focused test asserts monotonic confirmed positions and a serial
+window below 1 MB.
+
+The corrected real PostgreSQL ADD COLUMN scenario uses
+`ALTER TABLE app.customers ADD COLUMN v inet DEFAULT '192.0.2.1'::inet` plus a
+healthy `orders` insert. It now succeeds rather than refusing the supported inet
+value. Measured slot values were:
+
+| phase | restart_lsn | confirmed_flush_lsn | retained WAL | slot WAL window |
+|---|---|---|---:|---:|
+| baseline | E/690061B0 | E/690061E8 | 1,264 | 56 |
+| after DDL/data | E/690065F0 | E/69007610 | 5,104 | 4,128 |
+| later run 1 | E/690065F0 | E/69007610 | 110,104 | 4,128 |
+| later run 2 | E/690065F0 | E/69007610 | 124,960 | 4,128 |
+
+The source and destination rows match exactly, all runs are successful, and the
+slot's confirmed position advances. This is specifically a successful supported
+inet ADD-column path; the old r9 outage was caused by mishandling the psycopg
+address object, not a permanently unprocessable inet refusal.
+
+### Refusal-origin containment inventory
+
+The common scoped writer is now the sole durable route. The inventory is:
+
+| origin family | examples | common route |
+|---|---|---|
+| typed value/admission | planner decode, `InvalidTypedValue`, unsupported OID/descriptor | planner/applier contextualize the source table, then `spill_refusal.record_schema_refusal` |
+| schema epoch/DDL | epoch mismatch, schema DDL, shadow/UNION construction | `SchemaEvolutionRefused` carries class/source scope; catalog apply or commit protocol calls the writer |
+| catalog/descriptor | catalog poll, catalog state, descriptor resolution, publication admission | watcher retains scoped refusals; pipeline/discovery flushes each through the writer before reporting |
+| ADD-column backfill | typed assignment and keyless/non-uniform backfill | `SchemaBackfillRefused(refusal_class='schema_backfill')`, catalog apply catches and scopes it |
+| spill/replay | spill encode/decode and staged event materialization | spill handler rolls back, records the refusal, and queues the independent snapshot |
+| commit boundary | any refusal raised while applying a whole PostgreSQL transaction | commit protocol contextualizes before rollback, records, and re-raises so the run is NOT-OK |
+| resnapshot setup/retry | descriptor/setup refusal before an Applier exists | `resnapshot_refusal.persist` scopes requested/source tables; batcher continues healthy batches |
+| no source scope | a defensive catch-all that cannot identify an owner | critical `schema_refusal_unscoped` alert, no table advancement, and non-successful run; never guessed onto an arbitrary table |
+
+The stable retry identity is table plus refusal class and descriptor/input identity,
+not exception wording, transaction metadata, or a changing row's LSN. Pending
+refusals retry as one-table snapshots; one failing batch cannot suppress the healthy
+batch. A source scope is mandatory for containment; the explicit unscoped route is
+fail-closed rather than silently claiming containment.
+
+### Round-9 minor and nit dispositions
+
+* R9-7: removed the production opaque-admission name-suffix test bypass; OID
+  allowlisting is the only admission authority.
+* R9-8: restored non-NULL `inet` and `money` seed values and the original passing
+  assertion.
+* R9-9: `blocked_schema_tables` is read once by the Applier per run and passed into
+  each `GroupPlan`; commit groups no longer query MotherDuck for it individually.
+* R9-10: the stable fingerprint is now its own `schema_refusals.refusal_fingerprint`
+  field, with `refusal_class` separate; the human `reason` has no machine hash prefix.
+* R9-11: removed exactly the 16 named stale schemas from `cdc_flight_dev` and
+  verified they are absent; unrelated account/database schemas were not touched.
+
+### Required lane results and limits
+
+All commands below used the clone's own PostgreSQL 18 cluster on **15434**, with
+no Docker and no other PostgreSQL port:
+
+| lane | result |
+|---|---:|
+| `CDC_TEST_PGPORT=15434 make test` | **1,623 passed** in 132.95s |
+| `CDC_TEST_PGPORT=15434 make test-slow` | **143 passed** in 1,026.42s |
+| `CDC_TEST_PGPORT=15434 make test-md` | **33 passed** in 404.88s |
+| `CDC_TEST_PGPORT=15434 make lint` | **All checks passed** |
+
+The slow lane initially reproduced one real startup-bound failure (142 passed,
+1 failed): a four-run multirange refusal test expired while the Debezium source
+task was starting under lane load, before it reached its table assertion. The
+test now uses a larger finite per-run budget and the full lane then passed 143/143;
+this is recorded as a timing-dependence fix, not as flaky-test suppression.
+
+Unproven limits remain deliberate: marker-preserving stock-Debezium TOAST is not
+claimed (2.6 = 4/5); no physical-standby run is claimed; and the existing
+MotherDuck multirange evidence is resolver/key-gain evidence rather than a separate
+full stock-Debezium multirange stream. No migration between previous repository
+builds was implemented.

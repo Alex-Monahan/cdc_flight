@@ -184,6 +184,14 @@ def build_properties(
         # `cdc_flight.consumer.OffsetFlushVerifier` cannot tell a policy no-op
         # from Debezium swallowing a flush failure (Opus B2).
         "offset.flush.interval.ms": OFFSET_FLUSH_INTERVAL_MS_ALWAYS,
+        # Keep PostgreSQL's connector-managed feedback cadence below the bounded
+        # commit -> slot-confirmation hand-off.  This is deliberately the status
+        # update interval, not `heartbeat.interval.ms`: heartbeat records would
+        # reset the ordinary source-idle detector and turn a quiet run into a
+        # max-seconds run.  With `lsn.flush.mode=connector`, the status update reads
+        # the connector's already-flushed offset; it cannot advance the slot past a
+        # destination commit that has not happened.
+        "status.update.interval.ms": "1000",
         # PINNED, not left to the default. See LSN_FLUSH_MODE_SAFE above: this is
         # the one path that can confirm WAL to Postgres without ever reading the
         # offset store, i.e. the one thing that could break Invariant O from

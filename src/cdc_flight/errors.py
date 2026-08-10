@@ -181,6 +181,8 @@ class SchemaEvolutionRefused(ValueError):
         target: str | None = None,
         detected_lsn: int | None = None,
         input_fingerprint: str | None = None,
+        refusal_class: str | None = None,
+        source_tables: tuple[tuple[str, str, str | None], ...] = (),
     ):
         super().__init__(message)
         self.source_schema = source_schema
@@ -191,6 +193,16 @@ class SchemaEvolutionRefused(ValueError):
         #: a genuinely new refusal.  It deliberately excludes operation/transaction
         #: metadata so a snapshot ``r`` can be compared with the original ``c``.
         self.input_fingerprint = input_fingerprint
+        #: A catalog-authority refusal can cover more than the first relation in a
+        #: batched source query.  Every affected relation must receive the same
+        #: scoped quarantine; choosing rows[0] would leave its siblings uncontained.
+        self.source_tables = tuple(source_tables)
+        #: Stable architecture origin, kept separate from the human reason so every
+        #: refusal path can share one quarantine identity.
+        self.refusal_class = refusal_class or type(self).__name__
+        #: Spill handling can durably record before the outer commit owner sees the
+        #: same exception.  The flag prevents one failure from counting twice.
+        self.refusal_recorded = False
 
 
 class SchemaBackfillRefused(SchemaEvolutionRefused):

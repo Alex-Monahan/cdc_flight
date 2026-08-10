@@ -21,11 +21,9 @@ for the table, so what they read is genuinely the pre-group state.
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import logging
-from collections.abc import Mapping
 
 from . import apply_sql, catalog_support, destination, naming, table_work
 from .assembler import UNIT_CONTROL, UNIT_SNAPSHOT_CHUNK, CompleteUnit
@@ -39,36 +37,22 @@ from .typed_types import InvalidTypedValue, UnsupportedType, native_type
 log = logging.getLogger("cdc_flight.planner")
 
 
-def _fingerprintable(value):
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        return {"__bytes__": base64.b64encode(bytes(value)).decode("ascii")}
-    if isinstance(value, Mapping):
-        return {
-            str(key): _fingerprintable(item)
-            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-        }
-    if isinstance(value, (list, tuple)):
-        return [_fingerprintable(item) for item in value]
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    return {"__repr__": repr(value)}
-
-
 def input_fingerprint(event: PendingRecord) -> str:
-    """Identify the durable row image that caused a value refusal.
+    """Identify the durable refusal boundary, independent of row contents.
 
-    PostgreSQL operation, transaction, order, and LSN metadata are intentionally not
-    included: an automatic re-snapshot represents the same row with a different
-    Debezium operation.  Type-descriptor fingerprints remain part of the evidence so
-    a later source schema epoch is not mistaken for the same input.
+    PostgreSQL operation, transaction, order, LSN, key, and row image are intentionally
+    not included.  A source repair that changes only the bad value must not reset the
+    quarantine identity or create a new retry forever.  The descriptor fingerprints
+    remain: a later source schema epoch is a new deliverability decision.
     """
 
-    image = event.after if event.op != "d" else event.before
-    descriptors = getattr(event, "after_descriptors", {})
+    descriptors = {
+        name: descriptor
+        for attribute in ("key_descriptors", "before_descriptors", "after_descriptors")
+        for name, descriptor in getattr(event, attribute, {}).items()
+    }
     payload = {
         "table": event.qualified_table,
-        "key": _fingerprintable(event.key),
-        "image": _fingerprintable(image),
         "descriptors": {
             str(name): getattr(descriptor, "fingerprint", repr(descriptor))
             for name, descriptor in sorted(descriptors.items())
@@ -105,6 +89,7 @@ class GroupPlan:
         hstore_handling_mode: str = "map",
         pipeline: str | None = None,
         control_schema: str | None = None,
+        blocked_tables: set[str] | None = None,
     ):
         self.con = con
         self.commit_id = commit_id
@@ -125,14 +110,12 @@ class GroupPlan:
         self.hstore_handling_mode = hstore_handling_mode
         self.pipeline = pipeline or ""
         self._control_schema = control_schema
-        # A quarantined table is a durable refusal terminal.  Read the set once at
-        # plan construction so the entire PostgreSQL transaction is folded with one
-        # stable admission decision, while healthy co-published tables still fold.
-        self.quarantined_tables = (
-            destination.quarantined_tables(con, self.pipeline, control_schema=control_schema)
-            if con is not None and self.pipeline
-            else set()
-        )
+        # The applier snapshots this durable admission set once per run.  A plan never
+        # issues a control-plane query per schema epoch/table: all units in this commit
+        # group therefore share one refusal decision and healthy co-published tables
+        # remain eligible.
+        self.blocked_tables = set(blocked_tables or ())
+        self.quarantined_tables = self.blocked_tables  # compatibility for summaries
         self.watermark_fenced_events = 0
         self._catalog_descriptor_cache: dict[str, dict] = {}
         #: The assembler's unit id is the stable PostgreSQL transaction id, even when
@@ -279,12 +262,11 @@ class GroupPlan:
         """
         if not event.schema or not event.table:
             return
-        if event.qualified_table in self.quarantined_tables:
-            # The source transaction remains whole and is still acknowledged only
-            # after the normal commit-group durability protocol.  We simply omit this
-            # table's row work; healthy tables in the same PostgreSQL transaction keep
-            # folding normally, and the resume point advances over the quarantined
-            # input instead of retaining WAL forever.
+        if snapshot is None and event.qualified_table in self.blocked_tables:
+            # The refusal/lifecycle row was committed before this run could advance
+            # the slot.  A full snapshot is the only permitted re-entry path; ordinary
+            # stream rows are skipped while the source WAL is safely represented by
+            # the current-source snapshot obligation.
             self._count_event(event)
             self.stats["quarantined_events"] += 1
             return
@@ -376,6 +358,7 @@ class GroupPlan:
                 target=target,
                 detected_lsn=event.lsn,
                 input_fingerprint=input_fingerprint(event),
+                refusal_class="value_encoding",
             ) from exc
         table_work.collect(item, event, row, event_id, probe=self, patch=patch)
         image = event.after if event.op != "d" else event.before

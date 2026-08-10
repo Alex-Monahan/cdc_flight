@@ -24,6 +24,7 @@ from .ownership import DestinationOwnership
 from .run_state import RunOutcome, RunPhaseWriter
 from .snapshot_completion import SnapshotCompletion
 from .source_health import SourceHealth
+from .source_marker import SourceMarker
 from .supervisor import run_engine_bounded
 
 log = logging.getLogger("cdc_flight.discovery_coordinator")
@@ -144,6 +145,15 @@ class LiveDiscoveryCoordinator:
                 self.health = SourceHealth(
                     dsn=self.source.dsn,
                     slot_name=self.replication.slot_name,
+                    primary_dsn=self.source.primary_dsn,
+                    source_marker=(
+                        getattr(self.watcher, "marker", None)
+                        or SourceMarker(
+                            prefix=self.catalog_cfg.marker_prefix,
+                            enabled=self.catalog_cfg.emit_marker,
+                            max_writes=self.catalog_cfg.marker_max_writes or None,
+                        )
+                    ),
                     max_lag_bytes=self.run_cfg.idle_max_lag_bytes,
                 ).start()
                 if self.phases.phase != PHASE_STREAMING:
@@ -365,17 +375,22 @@ class LiveDiscoveryCoordinator:
             return
         refusals = self.watcher.schema_refusals()
         for refused in refusals:
-            if not refused.source_schema or not refused.source_table:
-                continue
-            dest_mod.record_schema_refusal(
-                self.con,
-                pipeline=self.destination.pipeline_name,
-                source_schema=refused.source_schema,
-                source_table=refused.source_table,
-                target_table=refused.target,
-                detected_lsn=refused.detected_lsn,
-                reason=str(refused),
+            source_tables = refused.source_tables or (
+                ((refused.source_schema, refused.source_table, refused.target),)
+                if refused.source_schema and refused.source_table
+                else ()
             )
+            for source_schema, source_table, target_table in source_tables:
+                dest_mod.record_schema_refusal(
+                    self.con,
+                    pipeline=self.destination.pipeline_name,
+                    source_schema=source_schema,
+                    source_table=source_table,
+                    target_table=target_table,
+                    detected_lsn=refused.detected_lsn,
+                    reason=str(refused),
+                    refusal_class=refused.refusal_class,
+                )
         if refusals:
             self.summary_extra["catalog_schema_refusals"] = [
                 str(refused) for refused in refusals

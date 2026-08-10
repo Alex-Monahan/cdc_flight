@@ -120,6 +120,10 @@ def run_engine_bounded(
     drain_until = 0.0
     catalog_unresolved: list[str] = []
     intermediate_handoff = False
+    initial_durable_lsn = int(
+        getattr(getattr(handler, "resume_point", None), "last_lsn", 0) or 0
+    )
+    acknowledgement_timeout: dict[str, int | float] | None = None
 
     def pending_fenced():
         if catalog is None:
@@ -231,6 +235,52 @@ def run_engine_bounded(
         else:
             outcome.record("engine_finished")
     finally:
+        # The destination commit and Debezium acknowledgement are deliberately
+        # separate.  PostgreSQL receives the slot feedback on the connector's next
+        # poll, so closing the engine at the first quiet instant can leave
+        # confirmed_flush_lsn behind a durable MotherDuck commit.  Keep the live
+        # connector open for one bounded feedback hand-off before sealing callback
+        # admission.  A timeout is a failed proof, not a successful run with a
+        # merely lagging slot.
+        durable_lsn = int(
+            getattr(getattr(handler, "resume_point", None), "last_lsn", 0) or 0
+        )
+        if (
+            health is not None
+            and durable_lsn > initial_durable_lsn
+            and health.ever_sampled
+            and not getattr(getattr(handler, "cfg", None), "resnapshot", False)
+            and outcome.value not in {"source_dark", "hung"}
+        ):
+            wait_seconds = min(run.close_timeout, 10.0)
+            marker_emitted = False
+            if not health.confirmed_at_least(durable_lsn):
+                # A quiet source does not necessarily deliver another poll after
+                # markBatchFinished().  Give the live connector one whole,
+                # offset-only PostgreSQL transaction to carry the already durable
+                # destination position to the slot.  The write is on the explicit
+                # primary route, never Debezium's replication connection.
+                marker_emitted = health.emit_idle_marker(durable_lsn)
+            if not health.wait_for_confirmed(durable_lsn, timeout=wait_seconds):
+                sample = health.last
+                acknowledgement_timeout = {
+                    "durable_lsn": durable_lsn,
+                    "confirmed_pos": (
+                        sample.confirmed_pos
+                        if sample is not None
+                        else None
+                    ),
+                    "wait_seconds": wait_seconds,
+                    "marker_emitted": marker_emitted,
+                }
+                outcome.record("engine_error")
+                log.error(
+                    "the source slot did not confirm durable LSN %s within %.1fs "
+                    "(observed=%s)",
+                    durable_lsn,
+                    wait_seconds,
+                    acknowledgement_timeout["confirmed_pos"],
+                )
         # Seal admission BEFORE shutdown does anything that can touch the destination.
         # New callbacks are now recorded no-ops. An already-admitted callback still owns
         # the connection until `wait_for_quiescence()` proves it has left.
@@ -331,10 +381,20 @@ def run_engine_bounded(
         summary["source_dark_detected_after_sec"] = source_dark_after
     if health is not None:
         summary.update(health.summary())
+    if acknowledgement_timeout is not None:
+        summary["slot_acknowledgement_timeout"] = acknowledgement_timeout
     if engine.suppressed_message:
         summary["suppressed_engine_message"] = engine.suppressed_message
 
     failure = engine.failure
+    if acknowledgement_timeout is not None:
+        raise EngineFailure(
+            "the destination committed through durable LSN "
+            f"{acknowledgement_timeout['durable_lsn']}, but the live source slot "
+            "did not confirm that LSN before shutdown; refusing to report a "
+            "successful or contained run",
+            summary,
+        )
     if not applier_quiesced:
         raise EngineFailure(
             "an admitted Debezium callback did not quiesce after callback admission "

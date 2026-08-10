@@ -10,6 +10,7 @@ design rests on.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -431,23 +432,55 @@ def write_column_presence_batch(
     )
 
 
-_REFUSAL_FINGERPRINT_PREFIX = "input_fingerprint="
+def _stable_refusal_fingerprint(
+    *,
+    source_schema: str,
+    source_table: str,
+    refusal_class: str,
+    input_fingerprint: str | None,
+) -> str:
+    """Return the durable identity shared by every refusal origin.
+
+    Row-value refusals supply the descriptor/table fingerprint from the planner.  All
+    other origins still get a stable table-and-origin identity; human exception text
+    is deliberately excluded because backend wording and LSNs change between retries.
+    """
+    if input_fingerprint:
+        return str(input_fingerprint)
+    payload = f"{source_schema}.{source_table}:{refusal_class}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _refusal_reason(reason: str, input_fingerprint: str | None) -> str:
-    if not input_fingerprint:
-        return reason
-    return f"{_REFUSAL_FINGERPRINT_PREFIX}{input_fingerprint}\n{reason}"
-
-
-def _refusal_fingerprint(reason: str | None) -> str | None:
-    if not reason:
-        return None
-    first, _, _rest = str(reason).partition("\n")
-    if not first.startswith(_REFUSAL_FINGERPRINT_PREFIX):
-        return None
-    value = first.removeprefix(_REFUSAL_FINGERPRINT_PREFIX)
-    return value or None
+def _ensure_awaiting_snapshot(
+    con,
+    *,
+    pipeline: str,
+    source_schema: str,
+    source_table: str,
+    target_table: str | None,
+    reason: str,
+    control_schema: str | None,
+) -> None:
+    """Keep the physical table visibly stale while any refusal is unresolved."""
+    current = table_lifecycle.read(
+        con,
+        pipeline=pipeline,
+        source_schema=source_schema,
+        source_table=source_table,
+        control_schema=control_schema,
+    )
+    if current == AWAITING_SNAPSHOT:
+        return
+    table_lifecycle.transition(
+        con,
+        pipeline=pipeline,
+        source_schema=source_schema,
+        source_table=source_table,
+        to=AWAITING_SNAPSHOT,
+        reason=reason,
+        target_table=target_table,
+        control_schema=control_schema,
+    )
 
 
 def _next_table_event_seq(con, *, pipeline: str, control_schema: str | None) -> int:
@@ -471,68 +504,79 @@ def record_schema_refusal(
     detected_lsn: int | None,
     reason: str,
     input_fingerprint: str | None = None,
+    refusal_class: str = "SchemaEvolutionRefused",
     control_schema: str | None = None,
 ) -> str:
-    """Persist a refusal, quarantining a table after the same durable input retries.
+    """Persist one scoped refusal and quarantine only its source table on repeat.
 
     The refusal row is an explicit durability boundary.  A first value refusal is
     pending and requests the existing automatic rebuild.  If that rebuild reads the
     same row image and fails again, the row becomes ``quarantined`` and the table is
-    moved out of the rebuild queue.  That state is visible in both control tables and
-    is stable across all later runs; other tables can therefore continue advancing.
+    moved out of ordinary row admission.  Quarantine remains ``awaiting_snapshot``:
+    it is visibly stale, is selected by the recovery queue, and can be reactivated when
+    the source/schema condition clears.  The source slot may advance only after this
+    obligation is durable, because the future full snapshot reads current source state.
     """
     con.execute("BEGIN TRANSACTION")
     try:
         previous = con.execute(
-            f"SELECT state, reason FROM {_control_table(control_schema, 'schema_refusals')} "
+            f"SELECT state, refusal_fingerprint, refusal_class "
+            f"FROM {_control_table(control_schema, 'schema_refusals')} "
             "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
             [pipeline, source_schema, source_table],
         ).fetchone()
         before = previous[0] if previous else REFUSAL_ABSENT
         if before == REFUSAL_QUARANTINED:
             SCHEMA_REFUSAL.check(before, REFUSAL_QUARANTINED)
-            con.execute("COMMIT")
-            return REFUSAL_QUARANTINED
-
-        stored_fingerprint = _refusal_fingerprint(previous[1] if previous else None)
-        repeated_input = (
-            before == REFUSAL_PENDING
-            and input_fingerprint is not None
-            and input_fingerprint == stored_fingerprint
-        )
-        serialized_reason = _refusal_reason(reason, input_fingerprint)
-        if repeated_input:
-            SCHEMA_REFUSAL.check(before, REFUSAL_QUARANTINED)
-            con.execute(
-                f"UPDATE {_control_table(control_schema, 'schema_refusals')} SET "
-                "target_table = ?, detected_lsn = ?, reason = ?, state = ?, refused_at = ? "
-                "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
-                [
-                    target_table, detected_lsn, serialized_reason,
-                    REFUSAL_QUARANTINED, now(), pipeline, source_schema, source_table,
-                ],
-            )
-            current = table_lifecycle.read(
+            _ensure_awaiting_snapshot(
                 con,
                 pipeline=pipeline,
                 source_schema=source_schema,
                 source_table=source_table,
+                target_table=target_table,
+                reason="a quarantined refusal remains stale until a full resnapshot",
                 control_schema=control_schema,
             )
-            if current != table_lifecycle.NONE:
-                table_lifecycle.transition(
-                    con,
-                    pipeline=pipeline,
-                    source_schema=source_schema,
-                    source_table=source_table,
-                    to=table_lifecycle.NONE,
-                    reason=(
-                        "identical durable input refused twice; table is quarantined "
-                        "and removed from the automatic snapshot queue"
-                    ),
-                    target_table=target_table,
-                    control_schema=control_schema,
-                )
+            con.execute("COMMIT")
+            return REFUSAL_QUARANTINED
+
+        stored_fingerprint = previous[1] if previous else None
+        stored_class = previous[2] if previous else None
+        fingerprint = _stable_refusal_fingerprint(
+            source_schema=source_schema,
+            source_table=source_table,
+            refusal_class=refusal_class,
+            input_fingerprint=input_fingerprint,
+        )
+        repeated_input = (
+            before == REFUSAL_PENDING
+            and fingerprint == stored_fingerprint
+            and (stored_class or refusal_class) == refusal_class
+        )
+        if repeated_input:
+            SCHEMA_REFUSAL.check(before, REFUSAL_QUARANTINED)
+            con.execute(
+                f"UPDATE {_control_table(control_schema, 'schema_refusals')} SET "
+                "target_table = ?, detected_lsn = ?, reason = ?, "
+                "refusal_fingerprint = ?, refusal_class = ?, state = ?, refused_at = ? "
+                "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+                [
+                    target_table, detected_lsn, reason, fingerprint, refusal_class,
+                    REFUSAL_QUARANTINED, now(), pipeline, source_schema, source_table,
+                ],
+            )
+            _ensure_awaiting_snapshot(
+                con,
+                pipeline=pipeline,
+                source_schema=source_schema,
+                source_table=source_table,
+                target_table=target_table,
+                reason=(
+                    "identical durable input refused twice; table is quarantined and "
+                    "marked stale pending a full resnapshot"
+                ),
+                control_schema=control_schema,
+            )
             existing_event = con.execute(
                 f"SELECT 1 FROM {_control_table(control_schema, 'table_events')} "
                 "WHERE pipeline = ? AND commit_id = 0 AND event = 'schema_quarantine' "
@@ -553,10 +597,30 @@ def record_schema_refusal(
                     target_table=target_table,
                     applied=False,
                     lsn=detected_lsn,
-                    detail=serialized_reason,
+                    detail=reason,
                     control_schema=control_schema,
                 )
             con.execute("COMMIT")
+            raise_alert(
+                con,
+                pipeline=pipeline,
+                severity="critical",
+                code="schema_table_quarantined",
+                message=(
+                    f"{source_schema}.{source_table} is quarantined after a repeated "
+                    "schema/value refusal; its destination image is stale/unavailable "
+                    "until a full resnapshot completes"
+                ),
+                context={
+                    "source_schema": source_schema,
+                    "source_table": source_table,
+                    "target_table": target_table,
+                    "refusal_class": refusal_class,
+                    "refusal_fingerprint": fingerprint,
+                    "resnapshot_required": True,
+                },
+                control_schema=control_schema,
+            )
             log.error(
                 "quarantined %s.%s after an identical durable input refused twice",
                 source_schema, source_table,
@@ -567,19 +631,20 @@ def record_schema_refusal(
         con.execute(
             f"INSERT OR REPLACE INTO {_control_table(control_schema, 'schema_refusals')} "
             "(pipeline, source_schema, source_table, target_table, detected_lsn, "
-            "reason, state, refused_at) VALUES (?,?,?,?,?,?,?,?)",
+            "reason, refusal_fingerprint, refusal_class, state, refused_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
             [
                 pipeline, source_schema, source_table, target_table, detected_lsn,
-                serialized_reason, REFUSAL_PENDING, now(),
+                reason, fingerprint, refusal_class, REFUSAL_PENDING, now(),
             ],
         )
-        mark_awaiting_snapshot(
+        _ensure_awaiting_snapshot(
             con,
             pipeline=pipeline,
             source_schema=source_schema,
             source_table=source_table,
             target_table=target_table,
-            state=AWAITING_SNAPSHOT,
+            reason="a schema/value refusal made the destination image stale",
             control_schema=control_schema,
         )
         existing_event = con.execute(
@@ -602,7 +667,7 @@ def record_schema_refusal(
                 target_table=target_table,
                 applied=False,
                 lsn=detected_lsn,
-                detail=serialized_reason,
+                detail=reason,
                 control_schema=control_schema,
             )
         con.execute("COMMIT")
@@ -638,6 +703,106 @@ def quarantined_tables(
     }
 
 
+def blocked_schema_tables(
+    con, pipeline: str, *, control_schema: str | None = None
+) -> set[str]:
+    """Return quarantined tables whose ordinary CDC admission is permanently held.
+
+    ``pending`` is intentionally absent.  A pending refusal must be retried so the
+    same durable origin can either succeed after repair or take the declared
+    ``pending -> quarantined`` edge.  Once quarantined, the full current-source
+    resnapshot is the only re-entry path and streaming rows are skipped safely.
+    """
+    return {
+        f"{schema}.{table}"
+        for schema, table in con.execute(
+            f"SELECT source_schema, source_table FROM "
+            f"{_control_table(control_schema, 'schema_refusals')} "
+            "WHERE pipeline = ? AND state = ?",
+            [pipeline, REFUSAL_QUARANTINED],
+        ).fetchall()
+    }
+
+
+def reactivate_schema_refusal(
+    con,
+    *,
+    pipeline: str,
+    source_schema: str,
+    source_table: str,
+    target_table: str | None = None,
+    control_schema: str | None = None,
+) -> bool:
+    """Move quarantine back to pending before its automatic full resnapshot.
+
+    This is the declared ``quarantined -> pending`` trigger.  It durably preserves
+    ``table_state=awaiting_snapshot`` before any source read, so a slot advance can
+    never make the table appear current without the later snapshot swap/empty proof.
+    """
+    con.execute("BEGIN TRANSACTION")
+    try:
+        row = con.execute(
+            f"SELECT state FROM {_control_table(control_schema, 'schema_refusals')} "
+            "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+            [pipeline, source_schema, source_table],
+        ).fetchone()
+        if row is None or str(row[0]) != REFUSAL_QUARANTINED:
+            con.execute("COMMIT")
+            return False
+        SCHEMA_REFUSAL.check(REFUSAL_QUARANTINED, REFUSAL_PENDING)
+        con.execute(
+            f"UPDATE {_control_table(control_schema, 'schema_refusals')} "
+            "SET state = ?, refused_at = ? "
+            "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+            [REFUSAL_PENDING, now(), pipeline, source_schema, source_table],
+        )
+        _ensure_awaiting_snapshot(
+            con,
+            pipeline=pipeline,
+            source_schema=source_schema,
+            source_table=source_table,
+            target_table=target_table,
+            reason="a quarantined refusal was automatically reactivated for a full resnapshot",
+            control_schema=control_schema,
+        )
+        existing_event = con.execute(
+            f"SELECT 1 FROM {_control_table(control_schema, 'table_events')} "
+            "WHERE pipeline = ? AND commit_id = 0 AND event = 'schema_reactivation' "
+            "AND source_schema = ? AND source_table = ?",
+            [pipeline, source_schema, source_table],
+        ).fetchone()
+        if existing_event is None:
+            write_table_event(
+                con,
+                pipeline=pipeline,
+                commit_id=0,
+                seq=_next_table_event_seq(
+                    con, pipeline=pipeline, control_schema=control_schema
+                ),
+                event="schema_reactivation",
+                source_schema=source_schema,
+                source_table=source_table,
+                target_table=target_table,
+                applied=False,
+                lsn=None,
+                detail=(
+                    "blocking condition may have cleared; a complete current-source "
+                    "resnapshot is now required before resolution"
+                ),
+                control_schema=control_schema,
+            )
+        con.execute("COMMIT")
+        log.warning(
+            "reactivated quarantined table %s.%s for an automatic full resnapshot",
+            source_schema,
+            source_table,
+        )
+        return True
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+
+
 def resolve_schema_refusal(
     con, *, pipeline: str, source_schema: str, source_table: str,
     control_schema: str | None = None,
@@ -660,6 +825,19 @@ def resolve_schema_refusal(
     SCHEMA_REFUSAL.check(before, REFUSAL_RESOLVED)
     if before == REFUSAL_RESOLVED:
         return False
+    lifecycle = table_lifecycle.read(
+        con,
+        pipeline=pipeline,
+        source_schema=source_schema,
+        source_table=source_table,
+        control_schema=control_schema,
+    )
+    if lifecycle != table_lifecycle.COMPLETE:
+        raise RuntimeError(
+            f"cannot resolve schema refusal for {source_schema}.{source_table} "
+            f"while table lifecycle is {lifecycle!r}; a completed full resnapshot "
+            "must publish current data first"
+        )
     con.execute(
         f"UPDATE {_control_table(control_schema, 'schema_refusals')} SET state = ? "
         "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",

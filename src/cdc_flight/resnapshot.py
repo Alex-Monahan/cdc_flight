@@ -118,7 +118,7 @@ from dataclasses import dataclass, field
 from . import destination as dest_mod
 from . import reconcile as reconcile_mod
 from . import resnapshot_projection as projection
-from . import table_lifecycle
+from . import resnapshot_refusal, table_lifecycle
 from .applier import Applier
 from .config import (
     DROP_LOG,
@@ -130,7 +130,7 @@ from .config import (
 )
 from .debezium_props import build_properties
 from .destination import ResumePoint
-from .errors import EngineFailure, SchemaEvolutionRefused
+from .errors import EngineFailure
 from .naming import control_table, quote
 from .ownership import DestinationOwnership
 from .resnapshot_projection import ProjectionEvent
@@ -202,16 +202,6 @@ class ResnapshotOutcome:
             - set(self.dropped)
             - set(self.quarantined)
         )
-
-def _schema_refusal_cause(error: BaseException) -> SchemaEvolutionRefused | None:
-    seen: set[int] = set()
-    current: BaseException | None = error
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        if isinstance(current, SchemaEvolutionRefused):
-            return current
-        current = current.__cause__ or current.__context__
-    return None
 
 def _record_snapshot_swap_audit(
     con,
@@ -639,6 +629,15 @@ def run(
                 recovery.marker,
             )
         else:
+            refused = resnapshot_refusal.cause(exc)
+            if refused is not None:
+                resnapshot_refusal.persist(
+                    con,
+                    refused=refused,
+                    pipeline=pipeline,
+                    tables=tables,
+                    control_schema=control_schema,
+                )
             reassert_owed(
                 con,
                 pipeline=pipeline,
@@ -646,7 +645,6 @@ def run(
                 terminal=outcome,
                 control_schema=control_schema,
             )
-            refused = _schema_refusal_cause(exc)
             durable_quarantine = dest_mod.quarantined_tables(
                 con, pipeline, control_schema=control_schema
             )

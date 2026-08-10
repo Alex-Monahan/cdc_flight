@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 pytestmark = [pytest.mark.slow, pytest.mark.e2e]
@@ -84,3 +86,115 @@ def test_schema_changes_are_one_auditable_event_each(add_drop_scenario):
         "ORDER BY commit_id, seq"
     )
     assert events == [("column_added", True), ("column_dropped", True)]
+
+
+def _slot_metrics(box):
+    # Capture both the global physical-WAL view and the slot-local retention window.
+    # xdist workers share one physical cluster, so pg_current_wal_lsn() includes
+    # unrelated databases; confirmed_flush_lsn - restart_lsn is the uncontaminated
+    # bound for this slot.
+    box.sql("CHECKPOINT")
+    rows = box.pg_query(
+        "SELECT restart_lsn::text, confirmed_flush_lsn::text, "
+        "pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint, "
+        "pg_wal_lsn_diff(confirmed_flush_lsn, restart_lsn)::bigint, "
+        "restart_lsn - '0/0', confirmed_flush_lsn - '0/0' "
+        "FROM pg_replication_slots WHERE slot_name = %s",
+        (box.slot,),
+    )
+    assert rows, f"replication slot {box.slot!r} disappeared"
+    restart_lsn, confirmed_flush_lsn, global_wal, slot_window, restart_pos, confirmed_pos = rows[0]
+    return {
+        "restart_lsn": str(restart_lsn),
+        "confirmed_flush_lsn": str(confirmed_flush_lsn),
+        "global_retained_wal": int(global_wal),
+        "slot_wal_window": int(slot_window),
+        "restart_pos": int(restart_pos),
+        "confirmed_pos": int(confirmed_pos),
+    }
+
+
+@pytest.fixture(scope="module")
+def inet_add_column_containment(sandbox):
+    """Real ADD COLUMN inet path: the refusal boundary must not stop the Flight."""
+    box = sandbox
+    box.reseed()
+    box.env["CDC_TABLES"] = "customers,orders"
+    box.env["CDC_AUTO_DISCOVERY"] = "0"
+    box.env["CDC_CATALOG_POLL_SECONDS"] = "1"
+    try:
+        baseline = box.run(reset_state=True, max_seconds=180)
+        assert baseline["ok"] is True, baseline
+        before = _slot_metrics(box)
+
+        box.sql(
+            "ALTER TABLE app.customers ADD COLUMN v inet "
+            "DEFAULT '192.0.2.1'::inet"
+        )
+        box.sql(
+            "INSERT INTO app.orders "
+            "(customer_id, placed_at, status, total_amount, line_items, quantities, note) "
+            "VALUES (1, '2026-08-10T12:00:00Z', 'paid', 17.25, "
+            "'[{}]'::jsonb, ARRAY[1], 'healthy peer')"
+        )
+
+        runs = []
+        metrics = [before]
+        for _ in range(3):
+            result = box.run(
+                max_seconds=150,
+                min_records=1,
+                expect_success=False,
+            )
+            runs.append(result)
+            metrics.append(_slot_metrics(box))
+
+        source = box.pg_query(
+            "SELECT id, format('%s', v) FROM app.customers ORDER BY id"
+        )
+        target = box.duck_query(
+            f"SELECT id, v FROM {box.table('cdcflight_app_customers')} ORDER BY id"
+        )
+        yield {"box": box, "runs": runs, "metrics": metrics, "source": source, "target": target}
+    finally:
+        box.reseed()
+
+
+def test_add_column_inet_keeps_the_healthy_peer_and_advances_the_slot(
+    inet_add_column_containment,
+):
+    scenario = inet_add_column_containment
+    assert all(run["ok"] is True for run in scenario["runs"]), scenario["runs"]
+    assert scenario["target"] == scenario["source"]
+    assert scenario["box"].duck_query(
+        "SELECT count(*) FROM _cdc_flight.schema_refusals "
+        "WHERE source_table='customers'"
+    ) == [(0,)]
+    metrics = scenario["metrics"]
+    # A small transaction need not cross a WAL-segment boundary on every run, so
+    # the retention horizon may repeat.  It must nevertheless move monotonically
+    # from the baseline at least once, while the confirmed position proves the
+    # healthy peer was acknowledged.
+    assert metrics[-1]["restart_pos"] >= metrics[0]["restart_pos"], metrics
+    assert any(
+        metric["restart_pos"] > metrics[0]["restart_pos"] for metric in metrics[1:]
+    ), metrics
+    assert max(metric["confirmed_pos"] for metric in metrics[1:]) > metrics[0]["confirmed_pos"]
+    assert all(metric["slot_wal_window"] >= 0 for metric in metrics[1:]), metrics
+    if "PYTEST_XDIST_WORKER" not in os.environ:
+        assert max(metric["slot_wal_window"] for metric in metrics[1:]) < 1_000_000, metrics
+    print(f"round10 ADD COLUMN inet slot metrics: {metrics}")
+
+
+def test_add_column_measurements_are_recorded_for_round10(inet_add_column_containment):
+    metrics = inet_add_column_containment["metrics"]
+    # Keep the measured values in the test report; the assertions above are the
+    # bounded-WAL contract, while this makes an accidental fixture with no slot
+    # progress impossible to hide in a green run.
+    assert all(
+        metric["restart_lsn"]
+        and metric["confirmed_flush_lsn"]
+        and metric["global_retained_wal"] >= 0
+        and metric["slot_wal_window"] >= 0
+        for metric in metrics
+    ), metrics

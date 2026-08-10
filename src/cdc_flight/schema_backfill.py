@@ -10,6 +10,21 @@ from .naming import quote
 OWNER = "destination-backfill"
 
 
+def _assignment(table, column: str, value: Any):
+    """Route every typed ADD-column value failure through schema refusal."""
+    from .typed_materialization import _typed_assignment
+
+    try:
+        return _typed_assignment(table, column, value)
+    except Exception as exc:
+        raise SchemaBackfillRefused(
+            f"cannot backfill {table.name}.{column}: the source value is not "
+            "deliverable through the current destination type",
+            target=table.name,
+            refusal_class="schema_backfill",
+        ) from exc
+
+
 class BackfillOwner:
     """Mixin containing only source-read backfill mutations."""
 
@@ -22,8 +37,6 @@ class BackfillOwner:
         rows: list[tuple],
     ) -> None:
         """Copy current source values into newly added columns in this transaction."""
-        from .typed_materialization import _typed_assignment
-
         if not key_columns or not value_columns or not rows:
             return
         table = self.get(name)
@@ -41,12 +54,12 @@ class BackfillOwner:
             set_parts: list[str] = []
             params: list[Any] = []
             for column, value in zip(value_columns, values, strict=True):
-                expression, bound = _typed_assignment(table, column, value)
+                expression, bound = _assignment(table, column, value)
                 set_parts.append(f"{quote(column)} = {expression}")
                 params.extend(bound)
             where_parts: list[str] = []
             for column, value in zip(key_columns, keys, strict=True):
-                expression, bound = _typed_assignment(table, column, value)
+                expression, bound = _assignment(table, column, value)
                 where_parts.append(
                     f"{quote(column)} IS NOT DISTINCT FROM {expression}"
                 )
@@ -65,8 +78,6 @@ class BackfillOwner:
         rows: list[tuple],
     ) -> None:
         """Backfill a keyless destination only when source values are uniform."""
-        from .typed_materialization import _typed_assignment
-
         if not value_columns:
             return
         table = self.get(name)
@@ -96,7 +107,7 @@ class BackfillOwner:
         set_parts: list[str] = []
         params: list[Any] = []
         for column, value in zip(value_columns, values, strict=True):
-            expression, bound = _typed_assignment(table, column, value)
+            expression, bound = _assignment(table, column, value)
             set_parts.append(f"{quote(column)} = {expression}")
             params.extend(bound)
         self.con.execute(

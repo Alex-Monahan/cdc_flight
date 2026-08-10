@@ -181,6 +181,8 @@ CONTROL_DDL = [
             target_table    VARCHAR,
             detected_lsn    BIGINT,
             reason          VARCHAR NOT NULL,
+            refusal_fingerprint VARCHAR,
+            refusal_class  VARCHAR NOT NULL DEFAULT 'SchemaEvolutionRefused',
             state           VARCHAR NOT NULL DEFAULT 'pending',
             refused_at      TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (pipeline, source_schema, source_table)

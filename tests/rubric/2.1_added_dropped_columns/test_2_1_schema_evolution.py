@@ -309,9 +309,8 @@ def test_nonuniform_keyless_backfill_records_a_durable_refusal_and_is_idempotent
             detected_lsn=100,
             reason=reason,
         )
-        assert destination.pending_schema_refusals(con, "p") == [
-            ("app", "readings", reason)
-        ]
+        assert destination.pending_schema_refusals(con, "p") == []
+        assert destination.quarantined_tables(con, "p") == {"app.readings"}
         assert con.execute(
             "SELECT snapshot_state FROM _cdc_flight.table_state "
             "WHERE pipeline = 'p' AND source_table = 'readings'"
@@ -320,6 +319,20 @@ def test_nonuniform_keyless_backfill_records_a_durable_refusal_and_is_idempotent
             "SELECT count(*) FROM _cdc_flight.table_events "
             "WHERE pipeline = 'p' AND event = 'schema_refusal'"
         ).fetchone()[0] == 1
+        assert con.execute(
+            "SELECT count(*) FROM _cdc_flight.table_events "
+            "WHERE pipeline = 'p' AND event = 'schema_quarantine'"
+        ).fetchone()[0] == 1
+        assert destination.reactivate_schema_refusal(
+            con,
+            pipeline="p",
+            source_schema="app",
+            source_table="readings",
+            target_table="cdcflight_app_readings",
+        ) is True
+        assert destination.pending_schema_refusals(con, "p") == [
+            ("app", "readings", reason)
+        ]
         con.execute("BEGIN")
         table_lifecycle.transition(
             con,

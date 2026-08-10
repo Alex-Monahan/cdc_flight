@@ -8,6 +8,9 @@ in-process laboratory.
 
 from __future__ import annotations
 
+import os
+from ipaddress import IPv4Address, IPv4Interface
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
@@ -21,6 +24,38 @@ from cdc_flight.typed_types import (
     adapt_value,
     native_type,
 )
+
+
+def _slot_metrics(box):
+    # restart_lsn is the retention horizon, while confirmed_flush_lsn is the durable
+    # consumer position.  Capture both: a small test transaction can advance the
+    # latter without crossing a WAL-segment boundary for the former.
+    box.sql("CHECKPOINT")
+    rows = box.pg_query(
+        "SELECT restart_lsn::text, confirmed_flush_lsn::text, "
+        "pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint, "
+        "pg_wal_lsn_diff(confirmed_flush_lsn, restart_lsn)::bigint, "
+        "restart_lsn - '0/0', confirmed_flush_lsn - '0/0' "
+        "FROM pg_replication_slots WHERE slot_name = %s",
+        (box.slot,),
+    )
+    assert rows, f"replication slot {box.slot!r} disappeared"
+    (
+        restart_lsn,
+        confirmed_flush_lsn,
+        retained_wal,
+        slot_wal_window,
+        restart_pos,
+        confirmed_pos,
+    ) = rows[0]
+    return {
+        "restart_lsn": str(restart_lsn),
+        "confirmed_flush_lsn": str(confirmed_flush_lsn),
+        "retained_wal": int(retained_wal),
+        "slot_wal_window": int(slot_wal_window),
+        "restart_pos": int(restart_pos),
+        "confirmed_pos": int(confirmed_pos),
+    }
 
 
 def _source(kind: str, oid: int) -> SourceTypeDescriptor:
@@ -47,6 +82,14 @@ def test_base64_byte_transport_with_non_utf8_bytes_is_refused():
         adapt_value("//8=", native_type(source))
 
 
+def test_inet_catalog_backfill_uses_postgresql_output_not_the_text_cast():
+    """The ADD COLUMN path receives psycopg ipaddress objects, not Debezium text."""
+    source = _source("inet", 869)
+    target = native_type(source)
+    assert adapt_value(IPv4Address("192.0.2.1"), target) == "192.0.2.1"
+    assert adapt_value(IPv4Interface("192.0.2.1/24"), target) == "192.0.2.1/24"
+
+
 def test_opaque_transport_has_no_hand_rolled_type_grammar_or_false_verified_set():
     """The implementation proof is transport-only, not an exemplar parser."""
     source = Path("src/cdc_flight/typed_types.py").read_text()
@@ -66,8 +109,8 @@ GLOBAL_UNKNOWN_DECISIONS = (
     ("jsonpath", 4072, '$."a"'),
     ("pg_lsn", 3220, "0/16B6A0"),
     ("tsvector", 3614, "'fat':1 'rat':2"),
-    ("xml", 142, "<a>fat</a>"),
-    ("money", 790, "12.34"),
+    ("xml", 142, '<?xml version="1.0"?><a>fat</a>'),
+    ("money", 790, "$12.34"),
     ("inet", 869, "192.0.2.1/24"),
     ("cidr", 650, "192.0.2.0/24"),
     ("macaddr", 829, "08:00:2b:01:02:03"),
@@ -84,7 +127,7 @@ GLOBAL_UNKNOWN_DECISIONS = (
 def test_every_allowlisted_unknown_type_is_varchar_and_transport_only(kind, oid, text):
     descriptor = _source(kind, oid)
     assert native_type(descriptor).sql == "VARCHAR"
-    if kind in {"money", "inet"}:
+    if kind == "xml":
         with pytest.raises(InvalidTypedValue):
             adapt_value(text, native_type(descriptor))
         return
@@ -184,7 +227,7 @@ def _co_published_attempt(txn: str):
 def test_identical_refusal_quarantines_one_table_and_advances_a_healthy_peer(
     tmp_path: Path,
 ):
-    """Three consecutive attempts cannot turn one permanent row into an outage."""
+    """A quarantine is stale, loud, and still has a durable recovery obligation."""
     path = tmp_path / "r9-quarantine.duckdb"
 
     first = Lab(path)
@@ -203,11 +246,11 @@ def test_identical_refusal_quarantines_one_table_and_advances_a_healthy_peer(
     try:
         with pytest.raises(SchemaEvolutionRefused):
             second.run(_co_published_attempt("r9-2"))
-        refusal_reason = second.scalar(
-            "SELECT reason FROM _cdc_flight.schema_refusals "
+        refusal_fingerprint = second.scalar(
+            "SELECT refusal_fingerprint FROM _cdc_flight.schema_refusals "
             "WHERE source_table='bad_opaque'"
         )
-        assert refusal_reason.count("input_fingerprint=") == 1
+        assert refusal_fingerprint
         assert second.scalar(
             "SELECT state FROM _cdc_flight.schema_refusals "
             "WHERE source_table='bad_opaque'"
@@ -215,27 +258,202 @@ def test_identical_refusal_quarantines_one_table_and_advances_a_healthy_peer(
         assert second.scalar(
             "SELECT snapshot_state FROM _cdc_flight.table_state "
             "WHERE source_table='bad_opaque'"
-        ) == "none"
+        ) == "awaiting_snapshot"
+        assert second.scalar(
+            "SELECT count(*) FROM _cdc_flight.alerts "
+            "WHERE pipeline='lab' AND code='schema_table_quarantined'"
+        ) == 1
     finally:
         second.applier.lease.release(second.con)
         second.close()
 
-    third = Lab(path)
+    for run_number in range(3, 10):
+        attempt = Lab(path)
+        try:
+            attempt.run(_co_published_attempt(f"r9-{run_number}"))
+            assert attempt.applier.stats()["quarantined_events"] > 0
+            assert attempt.rows("cdcflight_app_healthy_peer", '"id", "name"') == [
+                (2, "durable")
+            ]
+            assert not attempt.exists("cdcflight_app_bad_opaque")
+            assert attempt.scalar(
+                "SELECT last_lsn FROM _cdc_flight.debezium_offsets WHERE pipeline='lab'"
+            ) == 110
+            assert attempt.scalar(
+                "SELECT state FROM _cdc_flight.schema_refusals "
+                "WHERE source_table='bad_opaque'"
+            ) == "quarantined"
+            assert attempt.scalar(
+                "SELECT snapshot_state FROM _cdc_flight.table_state "
+                "WHERE source_table='bad_opaque'"
+            ) == "awaiting_snapshot"
+            assert attempt.scalar(
+                "SELECT count(*) FROM _cdc_flight.alerts "
+                "WHERE pipeline='lab' AND code='schema_table_quarantined'"
+            ) == 1
+            assert attempt.scalar(
+                "SELECT count(*) FROM _cdc_flight.table_events "
+                "WHERE source_table='bad_opaque' AND event='schema_quarantine'"
+            ) == 1
+        finally:
+            attempt.applier.lease.release(attempt.con)
+            attempt.close()
+
+
+@pytest.fixture(scope="module")
+def postgres_bad_healthy_containment(sandbox):
+    """The real three-run XML refusal/healthy-peer slot probe from rubric 4.0."""
+    box = sandbox
+    box.reseed()
+    box.sql(
+        [
+            "CREATE TABLE app.bad_xml (id integer PRIMARY KEY, value xml)",
+            "CREATE TABLE app.healthy_peer (id integer PRIMARY KEY, name text)",
+            "ALTER PUBLICATION cdc_flight_pub ADD TABLE app.bad_xml, app.healthy_peer",
+        ],
+        one_transaction=True,
+    )
+    box.env["CDC_TABLES"] = "bad_xml,healthy_peer"
+    box.env["CDC_AUTO_DISCOVERY"] = "0"
+    box.env["CDC_CATALOG_POLL_SECONDS"] = "1"
     try:
-        third.run(_co_published_attempt("r9-3"))
-        assert third.rows("cdcflight_app_healthy_peer", '"id", "name"') == [(2, "durable")]
-        assert not third.exists("cdcflight_app_bad_opaque")
-        assert third.scalar(
-            "SELECT last_lsn FROM _cdc_flight.debezium_offsets WHERE pipeline='lab'"
-        ) == 110
-        assert third.scalar(
-            "SELECT count(*) FROM _cdc_flight.schema_refusals "
-            "WHERE source_table='bad_opaque' AND state='quarantined'"
-        ) == 1
-        assert third.scalar(
-            "SELECT count(*) FROM _cdc_flight.table_events "
-            "WHERE source_table='bad_opaque' AND event='schema_quarantine'"
-        ) == 1
+        baseline = box.run(reset_state=True, max_seconds=180)
+        assert baseline["ok"] is True, baseline
+        metrics = [_slot_metrics(box)]
+        box.sql(
+            [
+                "INSERT INTO app.bad_xml VALUES "
+                "(1, xmlparse(document '<?xml version=\"1.0\"?><bad/>'))",
+                "INSERT INTO app.healthy_peer VALUES (1, 'durable')",
+            ],
+            one_transaction=True,
+        )
+        runs = []
+        run_diagnostics = []
+        for _ in range(3):
+            run = box.run(
+                max_seconds=150,
+                min_records=1,
+                expect_success=False,
+            )
+            runs.append(run)
+            run_diagnostics.append(
+                {
+                    key: run.get(key)
+                    for key in (
+                        "ok", "stop_reason", "records", "batches",
+                        "commit_groups", "quarantined_events", "error_type",
+                        "error_cause_type", "tables_awaiting_snapshot_unhandled",
+                    )
+                }
+            )
+            metrics.append(_slot_metrics(box))
+        quarantine_state = {
+            "refusal": box.duck_query(
+                "SELECT state, refusal_fingerprint, refusal_class "
+                "FROM _cdc_flight.schema_refusals WHERE source_table='bad_xml'"
+            ),
+            "healthy": box.duck_query(
+                f"SELECT id, name FROM {box.table('cdcflight_app_healthy_peer')}"
+            ),
+            "lifecycle": box.duck_query(
+                "SELECT snapshot_state FROM _cdc_flight.table_state "
+                "WHERE source_table='bad_xml'"
+            ),
+            "alerts": box.duck_query(
+                "SELECT count(*) FROM _cdc_flight.alerts "
+                "WHERE code='schema_table_quarantined'"
+            ),
+        }
+        # Repair the source schema.  The next run must exercise the declared
+        # quarantined -> pending trigger and publish a complete current-source
+        # image before resolving the refusal; a following run proves the normal
+        # stream remains healthy after that hand-off.
+        box.sql("ALTER TABLE app.bad_xml DROP COLUMN value")
+        box.sql("INSERT INTO app.bad_xml VALUES (2)")
+        repair_runs = []
+        for _ in range(2):
+            repair_runs.append(
+                box.run(
+                    max_seconds=180,
+                    min_records=1,
+                    expect_success=False,
+                )
+            )
+            metrics.append(_slot_metrics(box))
+        yield {
+            "box": box,
+            "runs": runs,
+            "run_diagnostics": run_diagnostics,
+            "repair_runs": repair_runs,
+            "metrics": metrics,
+            "quarantine_state": quarantine_state,
+        }
     finally:
-        third.applier.lease.release(third.con)
-        third.close()
+        box.reseed()
+
+
+@pytest.mark.slow
+@pytest.mark.e2e
+def test_bad_xml_is_quarantined_without_stopping_a_healthy_peer(
+    postgres_bad_healthy_containment,
+):
+    scenario = postgres_bad_healthy_containment
+    assert all(run["ok"] is False for run in scenario["runs"]), scenario["runs"]
+    state = scenario["quarantine_state"]
+    assert state["refusal"][0][0] == "quarantined"
+    assert state["refusal"][0][1]
+    assert state["refusal"][0][2] == "value_encoding"
+    assert state["healthy"] == [(1, "durable")]
+    assert state["lifecycle"] == [("awaiting_snapshot",)]
+    assert state["alerts"][0][0] >= 1
+
+
+@pytest.mark.slow
+@pytest.mark.e2e
+def test_repaired_source_leaves_quarantine_only_after_a_full_resnapshot(
+    postgres_bad_healthy_containment,
+):
+    scenario = postgres_bad_healthy_containment
+    box = scenario["box"]
+    assert scenario["repair_runs"][-1]["ok"] is True, scenario["repair_runs"]
+    assert box.duck_query(
+        "SELECT state FROM _cdc_flight.schema_refusals WHERE source_table='bad_xml'"
+    ) == [("resolved",)]
+    assert box.duck_query(
+        "SELECT snapshot_state FROM _cdc_flight.table_state "
+        "WHERE source_table='bad_xml'"
+    ) == [("complete",)]
+    assert box.duck_query(
+        f"SELECT id FROM {box.table('cdcflight_app_bad_xml')} ORDER BY id"
+    ) == [(1,), (2,)]
+
+
+@pytest.mark.slow
+@pytest.mark.e2e
+def test_bad_healthy_scenario_records_slot_progress_and_bounded_wal(
+    postgres_bad_healthy_containment,
+):
+    scenario = postgres_bad_healthy_containment
+    metrics = scenario["metrics"]
+    assert all(
+        metric["restart_lsn"]
+        and metric["confirmed_flush_lsn"]
+        and metric["retained_wal"] >= 0
+        for metric in metrics
+    ), metrics
+    bad_runs = metrics[1:4]
+    # Containment is not proved by a later repair run.  While the bad table is
+    # quarantined, the healthy peer's source transaction must still be durably
+    # acknowledged and the main slot must move past it.
+    assert bad_runs[-1]["confirmed_pos"] > metrics[0]["confirmed_pos"], (
+        scenario["run_diagnostics"], metrics
+    )
+    assert all(
+        later["confirmed_pos"] >= earlier["confirmed_pos"]
+        for earlier, later in pairwise(bad_runs)
+    ), (scenario["run_diagnostics"], metrics)
+    assert all(metric["slot_wal_window"] >= 0 for metric in bad_runs), metrics
+    if "PYTEST_XDIST_WORKER" not in os.environ:
+        assert max(metric["slot_wal_window"] for metric in bad_runs) < 1_000_000, metrics
+    print(f"round10 bad+healthy slot metrics: {metrics}")

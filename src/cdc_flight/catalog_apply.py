@@ -120,6 +120,7 @@ class CatalogCoordinator:
             return CatalogPlan()
 
         due = self.catalog.due(durable_lsn)
+        blocked_changes: list[CatalogChange] = []
         if self._lifecycle_con is not None:
             owing = set(
                 table_lifecycle.owing_work(
@@ -128,9 +129,23 @@ class CatalogCoordinator:
                     control_schema=self.control_schema,
                 )
             )
+            blocked_refusals = destination.blocked_schema_tables(
+                self._lifecycle_con,
+                self.pipeline,
+                control_schema=self.control_schema,
+            )
             eligible: list[CatalogChange] = []
             for change in due:
-                if change.kind == CHANGE_DROPPED and change.qualified in owing:
+                if change.qualified in blocked_refusals:
+                    change.to(CHANGE_DEFERRED)
+                    blocked_changes.append(change)
+                    log.warning(
+                        "deferring %s for %s while its schema/value refusal is "
+                        "pending or quarantined; the full resnapshot owns convergence",
+                        change.kind,
+                        change.qualified,
+                    )
+                elif change.kind == CHANGE_DROPPED and change.qualified in owing:
                     # A source-side drop observed while the retained image is still
                     # awaiting its replacement snapshot is not a final drop policy
                     # decision. Keep the catalog fact live, but do not let a stale
@@ -149,6 +164,19 @@ class CatalogCoordinator:
         actions: list[CatalogAction] = []
         refused: list[tuple[CatalogChange, str]] = []
         alerts: list[dict] = []
+        for change in blocked_changes:
+            alerts.append(
+                {
+                    "severity": "critical",
+                    "code": "schema_change_deferred_for_refusal",
+                    "on_rollback": False,
+                    "message": (
+                        f"{change.kind} for {change.qualified} was deferred because "
+                        "the table is stale/unavailable pending a full resnapshot"
+                    ),
+                    "context": {**change.context(), "resnapshot_required": True},
+                }
+            )
 
         new_changes = [change for change in due if change.kind == CHANGE_NEW]
         if len(new_changes) > 1:

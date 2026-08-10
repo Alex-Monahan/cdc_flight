@@ -94,7 +94,19 @@ def test_real_multirange_four_step_omission_is_a_loud_automatic_refusal(sandbox)
         conn.execute(f"ALTER PUBLICATION {publication} ADD TABLE {qualified}")
 
     def run_refused() -> dict:
-        result = sandbox.run(extra_env=capture, expect_success=False)
+        # This four-run probe is intentionally a real JVM/source-task sequence.  The
+        # slow lane can have another worker holding the host under load, and the
+        # sandbox's ordinary 120-second run bound is then close enough to Debezium's
+        # finite task-start bound that a refusal probe can fail before the connector
+        # ever reaches the table.  Give this probe a larger, still finite budget so
+        # its assertion remains about the omission/refusal rather than host startup
+        # scheduling.
+        result = sandbox.run(
+            max_seconds=240,
+            timeout=360,
+            extra_env=capture,
+            expect_success=False,
+        )
         assert result["returncode"] != 0, result
         assert result.get("ok") is False, result
         assert "multirange_probe_refusal" in result.get("output", ""), result
@@ -103,7 +115,12 @@ def test_real_multirange_four_step_omission_is_a_loud_automatic_refusal(sandbox)
     try:
         # Empty, insert, update, delete: every attempt is loud; none can create a
         # partial destination image or advance the durable source point.
-        empty = sandbox.run(reset_state=True, extra_env=capture)
+        empty = sandbox.run(
+            reset_state=True,
+            max_seconds=240,
+            timeout=360,
+            extra_env=capture,
+        )
         assert empty["ok"] is True, empty
 
         sandbox.sql(

@@ -21,6 +21,7 @@ from .machines import (
     CATALOG_CHANGE,
     CATALOG_SCHEMA_LIVENESS,
     LIFECYCLE_ABSENT,
+    LIFECYCLE_COMPLETE,
     PUBLICATION_ADMISSION,
     SCHEMA_REFUSAL,
     SNAPSHOT_AWAITING_CALLBACKS,
@@ -243,6 +244,27 @@ def _schema_refusal(target: str):
             detected_lsn=1,
             reason="matrix schema refusal probe",
         )
+    if target in {"quarantined", "resolved"}:
+        # A quarantine is reached only by the same durable input being refused
+        # twice.  The resolved path deliberately starts from pending, then proves
+        # the independent lifecycle owner has published a complete replacement
+        # image before the refusal owner is allowed to discharge it.
+        if target == "quarantined":
+            destination.record_schema_refusal(
+                con,
+                **kwargs,
+                target_table="customers",
+                detected_lsn=1,
+                reason="matrix schema refusal probe",
+            )
+        else:
+            table_lifecycle.transition(
+                con,
+                **kwargs,
+                to=LIFECYCLE_COMPLETE,
+                reason="matrix completed replacement snapshot",
+                target_table="customers",
+            )
     if target == "resolved":
         con.execute("BEGIN TRANSACTION")
         destination.resolve_schema_refusal(con, **kwargs)

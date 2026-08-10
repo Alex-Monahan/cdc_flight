@@ -71,6 +71,7 @@ def apply_units(
         ),
         pipeline=applier.pipeline,
         control_schema=applier.control_schema,
+        blocked_tables=applier.blocked_schema_tables,
     )
     for unit in group:
         if unit.fenced:

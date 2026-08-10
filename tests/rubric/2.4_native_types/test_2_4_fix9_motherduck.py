@@ -7,7 +7,7 @@ import os
 import pytest
 from support.fix9_opaque import (
     EXACT_CORPUS,
-    STOCK_UNLOSSLESS_TEXT_TYPES,
+    UNDELIVERABLE_TEXT_TYPES,
     capture_environment,
     create_corpus,
     drop_corpus,
@@ -58,22 +58,19 @@ def test_postgresql_generated_opaque_corpus_is_lossless_or_refused_on_motherduck
             )
             assert baseline["ok"] is True, baseline
             populate_corpus(sandbox)
-            for attempt in range(4):
+            for _attempt in range(7):
                 result = sandbox.run(
                     destination="motherduck",
                     extra_env=env,
                     max_seconds=240,
                     timeout=420,
-                    expect_success=attempt == 3,
+                    expect_success=False,
                 )
-                if attempt < 3:
-                    assert result["ok"] is False, result
-                else:
-                    assert result["ok"] is True, result
+                assert result["ok"] is False, result
 
             con = connect(token, database)
             control = motherduck_case["control_schema"]
-            for name in (*STOCK_UNLOSSLESS_TEXT_TYPES, "int2vector"):
+            for name in (*UNDELIVERABLE_TEXT_TYPES, "int2vector"):
                 assert con.execute(
                     f'SELECT state FROM "{database}"."{control}"."schema_refusals" '
                     "WHERE source_schema='app' AND source_table=?",
@@ -85,18 +82,11 @@ def test_postgresql_generated_opaque_corpus_is_lossless_or_refused_on_motherduck
                     [f"cdcflight_app_p2b_r9_{name}"],
                 ).fetchall() == []
             for name in EXACT_CORPUS:
-                if name == "int2vector" or name in STOCK_UNLOSSLESS_TEXT_TYPES:
+                if name == "int2vector" or name in UNDELIVERABLE_TEXT_TYPES:
                     continue
                 source = source_connector_text(sandbox, name)
                 destination = _md_rows(con, database, dataset, name)
                 assert destination == source, name
-            third = sandbox.run(
-                destination="motherduck",
-                extra_env=env,
-                max_seconds=240,
-                timeout=420,
-            )
-            assert third["ok"] is True, third
         finally:
             drop_corpus(sandbox, EXACT_CORPUS)
     finally:

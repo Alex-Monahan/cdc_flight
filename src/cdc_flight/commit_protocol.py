@@ -187,6 +187,7 @@ def commit_group(self, trigger: str) -> CommitResult:
                 # later phase write, so the gate is closed in all cases.
                 COMMIT_ACK.leave()
     except SchemaEvolutionRefused as refused:
+        self._contextualize_schema_refusal(refused)
         self._rollback_quietly()
         self._record_schema_refusal(refused)
         raise

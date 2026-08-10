@@ -148,24 +148,30 @@ def read_known_relations(
         # by guessing. Record the same refusal/awaiting-snapshot obligation used by
         # the live applier, then let the next catalog observation drive a fresh
         # relation read and single-table resnapshot.
-        if exc.source_schema and exc.source_table:
+        source_tables = exc.source_tables or (
+            ((exc.source_schema, exc.source_table, exc.target),)
+            if exc.source_schema and exc.source_table
+            else ()
+        )
+        if source_tables:
             from . import destination
 
-            destination.record_schema_refusal(
-                con,
-                pipeline=pipeline,
-                control_schema=control_schema,
-                source_schema=exc.source_schema,
-                source_table=exc.source_table,
-                target_table=exc.target,
-                detected_lsn=exc.detected_lsn,
-                reason=str(exc),
-            )
+            for source_schema, source_table, target_table in source_tables:
+                destination.record_schema_refusal(
+                    con,
+                    pipeline=pipeline,
+                    control_schema=control_schema,
+                    source_schema=source_schema,
+                    source_table=source_table,
+                    target_table=target_table,
+                    detected_lsn=exc.detected_lsn,
+                    reason=str(exc),
+                    refusal_class=exc.refusal_class,
+                )
             log.error(
-                "durable catalog descriptor refusal for %s.%s; automatic "
-                "catalog reread/resnapshot is now owed: %s",
-                exc.source_schema,
-                exc.source_table,
+                "durable catalog descriptor refusal for %s source relation(s); "
+                "automatic catalog reread/resnapshot is now owed: %s",
+                len(source_tables),
                 exc,
             )
             return {}

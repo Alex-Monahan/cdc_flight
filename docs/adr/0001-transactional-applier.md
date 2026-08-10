@@ -2929,19 +2929,20 @@ persistence: `memory only` · initial: `unavailable` · terminal: none
 | `visible` | `unavailable` | no |
 | `visible` | `visible` | no |
 
-**`schema_refusal`** — Has a schema transition been refused, and is it either discharged or durably quarantined after an identical retry proved it cannot be delivered?
+**`schema_refusal`** — Has a schema transition been refused, and is it either discharged or durably quarantined after an identical retry proved it cannot be delivered? Quarantine is recoverable: the automatic current-source re-snapshot first moves it back to `pending`, and only a completed replacement image can resolve it.
 
-persistence: `_cdc_flight.schema_refusals.state` · initial: `absent` · terminal: resolved, quarantined
+persistence: `_cdc_flight.schema_refusals.state` · initial: `absent` · terminal: resolved
 
 | from | to | terminal |
 |---|---|---|
 | `absent` | `pending` | no |
 | `pending` | `pending` | no |
 | `pending` | `resolved` | yes |
-| `pending` | `quarantined` | yes |
+| `pending` | `quarantined` | no |
 | `resolved` | `pending` | no |
 | `resolved` | `resolved` | yes |
-| `quarantined` | `quarantined` | yes |
+| `quarantined` | `quarantined` | no |
+| `quarantined` | `pending` | no |
 
 **`catalog_baseline`** — Can the relation identities this run observes be related to the rows the destination already holds, or must they be reconciled before they are adopted?
 
@@ -3402,7 +3403,7 @@ transition table.
 | `catalog_change` | where is one DDL fact in observe → confirm → fence → apply | 9 | 31 | **memory only** |
 | `publication_admission` | has a discovered relation been admitted to the publication, and who owns that decision | 6 | 23 | `_cdc_flight.source_relations.admission_state` |
 | `catalog_schema_liveness` | is a watched schema visibly queryable before absence can mean a drop | 4 | 16 | **memory only** |
-| `schema_refusal` | has a refused schema transition acquired a durable remediation obligation | 4 | 7 | `_cdc_flight.schema_refusals.state` |
+| `schema_refusal` | has a refused schema transition acquired a durable remediation obligation | 4 | 8 | `_cdc_flight.schema_refusals.state` |
 | `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
 | `snapshot_completion` | have all ordered snapshot callbacks arrived | 6 | 9 | **memory only** |
 | `runtime_root_lifecycle` | is the disposable root reusable or committed to cleanup | 6 | 10 | project-local root and parent markers |

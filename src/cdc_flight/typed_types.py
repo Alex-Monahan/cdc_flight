@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import ipaddress
 import json
 import math
 import re
@@ -774,11 +775,33 @@ def encode_value(value: Any, descriptor: SourceTypeDescriptor | NativeType) -> A
         if source.range_subtype is None:
             raise UnsupportedType(f"multirange {source.qualified_name} has no range subtype")
         return [encode_value(item, source.range_subtype) for item in value]
-    if kind in _UNLOSSLESS_STOCK_TEXT_KINDS:
+    if kind == "xml":
         raise InvalidTypedValue(
-            f"{source.qualified_name} stock Debezium text does not preserve "
-            "PostgreSQL ::text"
+            f"{source.qualified_name} is UNDELIVERABLE through stock Debezium: "
+            "the connector strips XML declaration prologs, so the delivered value "
+            "cannot be proven equal to PostgreSQL's output-function value"
         )
+    if kind == "money":
+        return _money_output_text(value, source)
+    if kind in {"inet", "cidr"}:
+        # Debezium's wire value is text, but the catalog ADD-column backfill uses
+        # psycopg's native ipaddress objects.  Their ``str`` spelling is PostgreSQL's
+        # output-function spelling: an IPv4Address has no synthetic /32, while an
+        # IPv4Interface retains an explicit prefix.  Do not route these through the
+        # old ``::text`` oracle.
+        if isinstance(
+            value,
+            (
+                ipaddress.IPv4Address,
+                ipaddress.IPv6Address,
+                ipaddress.IPv4Interface,
+                ipaddress.IPv6Interface,
+                ipaddress.IPv4Network,
+                ipaddress.IPv6Network,
+            ),
+        ):
+            return OpaqueText(str(value))
+        return _decode_opaque_text(value, source)
     if kind in _OPAQUE_TEXT_KINDS:
         if not _opaque_descriptor_allowed(source, kind):
             raise UnsupportedType(
@@ -1424,6 +1447,43 @@ def _decode_opaque_text(value: Any, source: SourceTypeDescriptor) -> str:
     )
 
 
+def _money_output_text(value: Any, source: SourceTypeDescriptor) -> OpaqueText:
+    """Render the stock wire number as PostgreSQL ``money_out`` under ``lc=C``.
+
+    The project-local PostgreSQL cluster is initialized with ``--locale=C`` and the
+    connector's money adapter delivers the numeric amount without the currency
+    decoration.  PostgreSQL's output function for that locale is ``$1,234.56`` (and
+    ``-$1,234.56``), so rebuilding that spelling is lossless for the configured source
+    rather than accepting the wrong ``::text`` oracle.  Already rendered output text
+    is retained for connector versions that expose the decoration themselves.
+    """
+
+    if isinstance(value, OpaqueText):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        value = _decode_opaque_text(value, source)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("$") or text.startswith("-$"):
+            return OpaqueText(text)
+        value = text
+    try:
+        amount = Decimal(str(value)).quantize(Decimal("0.01"))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise InvalidTypedValue(
+            f"{source.qualified_name} stock Debezium money value {value!r} "
+            "is not a finite decimal amount"
+        ) from exc
+    if not amount.is_finite():
+        raise InvalidTypedValue(
+            f"{source.qualified_name} stock Debezium money value {value!r} "
+            "is not a finite decimal amount"
+        )
+    negative = amount < 0
+    rendered = f"{abs(amount):,.2f}"
+    return OpaqueText(f"-${rendered}" if negative else f"${rendered}")
+
+
 def _kind_name(kind: Any, qualified_name: str) -> str:
     value = str(kind or "unknown").lower().strip()
     name = qualified_name.rsplit(".", 1)[-1].lower()
@@ -1516,11 +1576,6 @@ _OPAQUE_TEXT_KINDS = frozenset({
     "tsquery", "jsonpath", "pg_lsn", "tsvector", "xml", "money", "inet", "cidr",
     "macaddr", "macaddr8", "int2vector",
 })
-# Stock Debezium's PostgreSQL adapters discard information that appears in the
-# source type's literal ``::text``.  Keep their DDL representation available for
-# NULL-only schemas, but refuse every non-NULL value rather than store a semantic
-# spelling as if it were lossless.
-_UNLOSSLESS_STOCK_TEXT_KINDS = frozenset({"money", "inet"})
 _BASE64_OPAQUE_KINDS = frozenset({"tsquery", "jsonpath", "pg_lsn"})
 _OPAQUE_TEXT_OIDS = {
     "tsquery": frozenset({3615}),
@@ -1552,17 +1607,7 @@ def _opaque_descriptor_allowed(
     is the allowlist key here.
     """
 
-    if descriptor.oid in _OPAQUE_TEXT_OIDS.get(kind, ()):
-        return True
-    # A typed shadow/UNION epoch deliberately receives a new descriptor OID while
-    # retaining the authoritative built-in name with one of the internal testable
-    # suffixes.  Do not broaden this to the whole pg_catalog namespace: OID
-    # authority remains the production admission boundary.
-    qualified = str(descriptor.qualified_name)
-    return qualified in {
-        f"pg_catalog.{kind}.{suffix}"
-        for suffix in ("shadow", "current", "special")
-    }
+    return descriptor.oid in _OPAQUE_TEXT_OIDS.get(kind, ())
 
 
 __all__ = [

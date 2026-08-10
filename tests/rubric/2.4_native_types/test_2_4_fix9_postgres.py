@@ -8,7 +8,7 @@ import psycopg
 import pytest
 from support.fix9_opaque import (
     EXACT_CORPUS,
-    STOCK_UNLOSSLESS_TEXT_TYPES,
+    UNDELIVERABLE_TEXT_TYPES,
     capture_environment,
     create_corpus,
     drop_corpus,
@@ -41,21 +41,19 @@ def test_postgresql_generated_opaque_corpus_is_lossless_or_refused_on_local_duck
             populate_corpus(sandbox)
             # Values were generated and rendered by PostgreSQL above; no expected
             # row value is hand-written below.
-            # The non-lossless stock adapters are separate source tables/rows.  A
-            # run reaches the next durable refusal only after the previous table is
-            # quarantined, so four attempts are expected: money, inet, int2vector,
-            # then the healthy remainder can advance and finish.
-            for attempt in range(4):
+            # XML declarations and int2vector are refusal cases.  money and inet
+            # are deliberately in the exact corpus: their comparison is against
+            # PostgreSQL's output function, not a value::text cast.
+            results = []
+            for _attempt in range(7):
                 result = sandbox.run(
                     extra_env=capture,
                     max_seconds=180,
-                    expect_success=attempt == 3,
+                    expect_success=False,
                 )
-                if attempt < 3:
-                    assert result["ok"] is False, result
-                else:
-                    assert result["ok"] is True, result
-            for name in (*STOCK_UNLOSSLESS_TEXT_TYPES, "int2vector"):
+                results.append(result)
+                assert result["ok"] is False, result
+            for name in (*UNDELIVERABLE_TEXT_TYPES, "int2vector"):
                 assert sandbox.duck_query(
                     "SELECT state FROM _cdc_flight.schema_refusals "
                     "WHERE source_schema='app' AND source_table=?",
@@ -67,7 +65,7 @@ def test_postgresql_generated_opaque_corpus_is_lossless_or_refused_on_local_duck
                     [f"cdcflight_app_p2b_r9_{name}"],
                 ) == []
             for name in EXACT_CORPUS:
-                if name == "int2vector" or name in STOCK_UNLOSSLESS_TEXT_TYPES:
+                if name == "int2vector" or name in UNDELIVERABLE_TEXT_TYPES:
                     continue
                 source = source_connector_text(sandbox, name)
                 destination = sandbox.duck_query(
@@ -75,8 +73,6 @@ def test_postgresql_generated_opaque_corpus_is_lossless_or_refused_on_local_duck
                     'ORDER BY "id"'
                 )
                 assert destination == source, name
-            third = sandbox.run(extra_env=capture, max_seconds=180)
-            assert third["ok"] is True, third
         finally:
             drop_corpus(sandbox, EXACT_CORPUS)
     finally:
@@ -107,7 +103,7 @@ def test_source_catalog_sweep_has_an_explicit_decision_for_every_builtin_type(
         "nummultirange", "tsmultirange", "tstzmultirange", "datemultirange",
         "int8multirange",
     }
-    value_refused = {"money": "12.34", "inet": "192.0.2.1"}
+    value_refused = {"xml": "<a>fat</a>"}
     with psycopg.connect(postgres_cluster.dsn, autocommit=True) as con:
         rows = con.execute(
             "SELECT t.oid::bigint, t.typname FROM pg_type t "

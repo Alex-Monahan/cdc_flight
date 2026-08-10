@@ -170,11 +170,15 @@ class RelationDescriptorProvider:
 
     @classmethod
     def from_tables(cls, con, tables: Iterable[tuple[str, str, str]]) -> RelationDescriptorProvider:
-        requested = sorted({(str(schema), str(table)) for schema, table, _target in tables})
+        requested = sorted(
+            {(str(schema), str(table), str(target)) for schema, table, target in tables}
+        )
         if not requested:
             return cls({})
-        predicates = " OR ".join("(n.nspname = %s AND c.relname = %s)" for _ in requested)
-        params = [value for pair in requested for value in pair]
+        predicates = " OR ".join(
+            "(n.nspname = %s AND c.relname = %s)" for _ in requested
+        )
+        params = [value for schema, table, _target in requested for value in (schema, table)]
         rows = con.execute(
             "SELECT n.nspname, c.relname, a.attname, a.atttypid::bigint, "
             "a.atttypmod, format_type(a.atttypid, a.atttypmod) "
@@ -187,12 +191,35 @@ class RelationDescriptorProvider:
         ).fetchall()
         oids = {int(row[3]) for row in rows}
         reader = CatalogDescriptorReader(con)
-        descriptors = reader.resolve(oids)
+        try:
+            descriptors = reader.resolve(oids)
+        except SchemaEvolutionRefused as exc:
+            source_tables = tuple(
+                (str(schema), str(table), str(target))
+                for schema, table, target in requested
+            )
+            raise SchemaEvolutionRefused(
+                f"catalog descriptor authority failed for {len(source_tables)} "
+                f"source relation(s): {exc}",
+                source_schema=(source_tables[0][0] if source_tables else None),
+                source_table=(source_tables[0][1] if source_tables else None),
+                target=(source_tables[0][2] if source_tables else None),
+                refusal_class="catalog_descriptor",
+                source_tables=source_tables,
+            ) from exc
         missing = sorted(oids - set(descriptors))
         if missing:
             raise SchemaEvolutionRefused(
                 "catalog descriptor authority is incomplete for OID(s) "
-                + ", ".join(str(oid) for oid in missing)
+                + ", ".join(str(oid) for oid in missing),
+                source_schema=(str(requested[0][0]) if requested else None),
+                source_table=(str(requested[0][1]) if requested else None),
+                target=(str(requested[0][2]) if requested else None),
+                refusal_class="catalog_descriptor",
+                source_tables=tuple(
+                    (str(schema), str(table), str(target))
+                    for schema, table, target in requested
+                ),
             )
         result: dict[str, dict[str, SourceTypeDescriptor]] = {}
         for schema, table, name, oid, typmod, formatted in rows:
@@ -206,7 +233,11 @@ class RelationDescriptorProvider:
                 native_type(descriptor)
             except (UnsupportedType, ValueError) as exc:
                 raise SchemaEvolutionRefused(
-                    f"catalog descriptor authority is incomplete for {schema}.{table}.{name}"
+                    f"catalog descriptor authority is incomplete for {schema}.{table}.{name}",
+                    source_schema=str(schema),
+                    source_table=str(table),
+                    target=f"{schema}.{table}",
+                    refusal_class="catalog_descriptor",
                 ) from exc
             result.setdefault(f"{schema}.{table}", {})[normalize(str(name))] = descriptor
         return cls(result)

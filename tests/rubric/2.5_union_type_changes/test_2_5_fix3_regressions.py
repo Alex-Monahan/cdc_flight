@@ -12,13 +12,32 @@ from support.type_matrix import nested_matrix, scalar_matrix
 
 from cdc_flight.apply_sql import SchemaRegistry, delete_keys, insert_rows
 from cdc_flight.identity_codec import _identity_tree, identity_value
-from cdc_flight.typed_types import CanonicalRangeText, InvalidTypedValue, SourceTypeDescriptor
-
-_UNLOSSLESS_STOCK_TEXT_TYPES = frozenset({"money", "inet"})
+from cdc_flight.typed_types import CanonicalRangeText, SourceTypeDescriptor
 
 
 def _source(kind: str, oid: int, **kwargs) -> SourceTypeDescriptor:
     return SourceTypeDescriptor(oid, f"pg_catalog.{kind}", kind, **kwargs)
+
+
+def _swap_descriptor(source: SourceTypeDescriptor, suffix: str, oid_delta: int):
+    """Model a new UNION epoch without forging a PostgreSQL type identity.
+
+    Production opaque admission is OID-authoritative.  These tests previously
+    relied on a production-only name suffix to bypass that boundary; keep the
+    catalog OID for the two real opaque builtins and vary descriptor metadata to
+    represent the epoch instead.
+    """
+    opaque_oids = {142, 650, 774, 790, 829, 869, 3614, 3615, 3220, 4072}
+    if source.oid in opaque_oids:
+        return replace(
+            source,
+            metadata=(*source.metadata, ("union_epoch", suffix)),
+        )
+    return replace(
+        source,
+        oid=(source.oid or 1) + oid_delta,
+        qualified_name=f"{source.qualified_name}.{suffix}",
+    )
 
 
 def _wrapped(child: SourceTypeDescriptor, oid: int) -> SourceTypeDescriptor:
@@ -369,11 +388,7 @@ def test_full_24_type_list_source_identity_survives_typed_shadow_swap(
     name, source, source_value
 ):
     """A typed swap rewrites the row to the one current source identity."""
-    new_source = replace(
-        source,
-        oid=(source.oid or 1) + 50000,
-        qualified_name=f"{source.qualified_name}.shadow",
-    )
+    new_source = _swap_descriptor(source, "shadow", 50000)
     con = duckdb.connect(":memory:", config={
         "storage_compatibility_version": "v1.5.0",
         "variant_minimum_shredding_size": "-1",
@@ -386,15 +401,6 @@ def test_full_24_type_list_source_identity_survives_typed_shadow_swap(
             columns={"key": source, "payload": _source("text", 25)},
             key_columns=("key",),
         )
-        if source.kind in _UNLOSSLESS_STOCK_TEXT_TYPES:
-            with pytest.raises(InvalidTypedValue):
-                insert_rows(
-                    con,
-                    registry.get("full_type_identity"),
-                    ["key", "payload"],
-                    [[source_value, "kept"]],
-                )
-            return
         insert_rows(
             con,
             registry.get("full_type_identity"),
@@ -632,11 +638,7 @@ def test_full_declared_type_identity_matches_readback_and_current_swap(
     name, source, source_value
 ):
     """Every declared source value has one identity before/after a typed swap."""
-    new_source = replace(
-        source,
-        oid=(source.oid or 1) + 70000,
-        qualified_name=f"{source.qualified_name}.current",
-    )
+    new_source = _swap_descriptor(source, "current", 70000)
     con = duckdb.connect(":memory:", config={
         "storage_compatibility_version": "v1.5.0",
         "variant_minimum_shredding_size": "-1",
@@ -649,10 +651,6 @@ def test_full_declared_type_identity_matches_readback_and_current_swap(
             key_columns=("key",),
         )
         table = registry.get("identity_property")
-        if source.kind in _UNLOSSLESS_STOCK_TEXT_TYPES:
-            with pytest.raises(InvalidTypedValue):
-                insert_rows(con, table, ["key", "payload"], [[source_value, "kept"]])
-            return
         insert_rows(con, table, ["key", "payload"], [[source_value, "kept"]])
         source_id = identity_value(table, (source_value,), key_columns=("key",))
         readback = con.execute('SELECT "key" FROM typed."identity_property"').fetchone()[0]
@@ -677,11 +675,7 @@ def test_special_values_are_stable_through_readback_and_shadow_swap(
     name, source, source_value
 ):
     """NaN, infinities, and signed zero share one current canonical tree."""
-    new_source = replace(
-        source,
-        oid=(source.oid or 1) + 80000,
-        qualified_name=f"{source.qualified_name}.special",
-    )
+    new_source = _swap_descriptor(source, "special", 80000)
     con = duckdb.connect(":memory:", config={
         "storage_compatibility_version": "v1.5.0",
         "variant_minimum_shredding_size": "-1",
