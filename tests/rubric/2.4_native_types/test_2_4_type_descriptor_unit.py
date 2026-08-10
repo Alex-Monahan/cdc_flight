@@ -410,6 +410,52 @@ def test_nested_values_are_not_stringified(source):
     assert target.sql != "VARCHAR"
 
 
+def _matrix_sql_cases():
+    scalar_sql = (
+        "SMALLINT",
+        "INTEGER",
+        "BIGINT",
+        "FLOAT",
+        "DOUBLE",
+        "BOOLEAN",
+        "VARCHAR",
+        "BLOB",
+        "DATE",
+        "TIME",
+        "TIMESTAMP",
+        "TIMESTAMPTZ",
+        "TIMETZ",
+        "INTERVAL",
+        "UUID",
+        "JSON",
+        "VARIANT",
+        "UNION(finite DECIMAL(12,4),special DOUBLE)",
+        "STRUCT(coefficient BIGNUM,scale INTEGER,special DOUBLE)",
+        "ENUM('pending','paid')",
+        "VARCHAR",
+        "VARCHAR",
+    )
+    nested_sql = (
+        "INTEGER[]",
+        "INTEGER[][]",
+        "MAP(VARCHAR,VARCHAR)",
+        'STRUCT("id" INTEGER,"label" VARCHAR)',
+        "INTEGER[]",
+    )
+    return tuple(zip(scalar_matrix(), scalar_sql, strict=True)) + tuple(
+        zip(nested_matrix(), nested_sql, strict=True)
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_sql"),
+    _matrix_sql_cases(),
+    ids=lambda case: case[0].qualified_name if isinstance(case, tuple) else str(case),
+)
+def test_scalar_and_nested_matrix_sql_is_pinned(source, expected_sql):
+    assert native_type(source).sql == expected_sql
+
+
 @pytest.mark.parametrize("value, expected", [
     ("NaN", "special"),
     ("Infinity", "special"),

@@ -619,8 +619,13 @@ def native_type(
             ("vector", NativeType("MAP", "MAP(SMALLINT,DOUBLE)", descriptor, indexable=False)),
         )
         return NativeType("STRUCT", "STRUCT(dimensions SMALLINT,vector MAP(SMALLINT,DOUBLE))", descriptor, fields=fields, indexable=False)
-    if kind in _OBSCURE_TEXT_KINDS or descriptor.extension in _OBSCURE_EXTENSIONS:
+    if kind in _OPAQUE_TEXT_KINDS or kind in _VERIFIED_TEXT_KINDS:
         return NativeType("VARCHAR", "VARCHAR", descriptor)
+    if kind in _OBSCURE_TEXT_KINDS or descriptor.extension in _OBSCURE_EXTENSIONS:
+        raise UnsupportedType(
+            f"source type {descriptor.qualified_name!r} (kind={descriptor.kind!r}, "
+            f"oid={descriptor.oid}) has no verified native destination representation"
+        )
     raise UnsupportedType(
         f"source type {descriptor.qualified_name!r} (kind={descriptor.kind!r}, oid={descriptor.oid}) "
         "has no verified native destination representation"
@@ -706,6 +711,8 @@ def encode_value(value: Any, descriptor: SourceTypeDescriptor | NativeType) -> A
                 raise InvalidTypedValue(f"{value!r} is not a boolean")
             return lowered in {"true", "t", "1"}
         return bool(value)
+    if kind in {"char", "bpchar", "varchar", "text", "citext", "name", "string"}:
+        return str(value)
     if kind in {"bytea", "bytes", "blob"}:
         return _decode_bytes(value)
     if kind == "array":
@@ -763,7 +770,16 @@ def encode_value(value: Any, descriptor: SourceTypeDescriptor | NativeType) -> A
         if source.range_subtype is None:
             raise UnsupportedType(f"multirange {source.qualified_name} has no range subtype")
         return [encode_value(item, source.range_subtype) for item in value]
-    if kind in _OBSCURE_TEXT_KINDS or target.kind == "VARCHAR":
+    if kind in _OPAQUE_TEXT_KINDS:
+        return _canonical_opaque_text(value, source)
+    if kind in _VERIFIED_TEXT_KINDS:
+        return str(value)
+    if kind in _OBSCURE_TEXT_KINDS:
+        raise UnsupportedType(
+            f"source type {source.qualified_name!r} (kind={source.kind!r}, oid={source.oid}) "
+            "has no verified value codec"
+        )
+    if target.kind == "VARCHAR" and source is None:
         return str(value)
     return value
 
@@ -1326,6 +1342,153 @@ def _connect_enum_labels(schema: Mapping[str, Any], parameters: Mapping[str, Any
     return tuple(str(item) for item in (labels or ()))
 
 
+def _canonical_opaque_text(value: Any, source: SourceTypeDescriptor) -> str:
+    """Decode one allowlisted opaque PostgreSQL value to canonical text.
+
+    Debezium's stock PostgreSQL connector routes a small set of JDBC ``OTHER``
+    values through the configured base64 binary converter.  The destination is
+    intentionally still ``VARCHAR`` for these types, but only after this seam has
+    proved that the bytes are UTF-8 and that the decoded value has the source
+    type's canonical PostgreSQL text shape.  An unrecognised opaque value never
+    reaches the generic string fallback.
+    """
+
+    kind = _kind_name(source.kind, source.qualified_name)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        try:
+            text = bytes(value).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise InvalidTypedValue(
+                f"{source.qualified_name} opaque value is not UTF-8 text"
+            ) from exc
+    elif isinstance(value, str):
+        text = value.strip()
+    else:
+        raise InvalidTypedValue(
+            f"{source.qualified_name} opaque value must be text or base64 bytes"
+        )
+
+    try:
+        return _canonical_opaque_text_candidate(kind, text)
+    except InvalidTypedValue:
+        try:
+            decoded = base64.b64decode(text, validate=True).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
+            raise InvalidTypedValue(
+                f"{source.qualified_name} is neither canonical PostgreSQL text "
+                "nor valid base64-encoded UTF-8 text"
+            ) from exc
+        try:
+            return _canonical_opaque_text_candidate(kind, decoded)
+        except InvalidTypedValue as decoded_error:
+            raise InvalidTypedValue(
+                f"{source.qualified_name} decoded value is not canonical PostgreSQL text"
+            ) from decoded_error
+
+
+def _canonical_opaque_text_candidate(kind: str, text: str) -> str:
+    if not text or any(ord(char) < 32 and char not in "\t\n\r" for char in text):
+        raise InvalidTypedValue("opaque text is empty or contains control characters")
+    if kind == "pg_lsn":
+        return _canonical_pg_lsn(text)
+    if kind == "jsonpath":
+        if not text.startswith("$") or not _balanced_path_text(text):
+            raise InvalidTypedValue("jsonpath text is not a canonical PostgreSQL path")
+        return text
+    if kind == "tsquery":
+        if not _valid_tsquery_text(text):
+            raise InvalidTypedValue("tsquery text is not canonical PostgreSQL text")
+        return text
+    raise InvalidTypedValue(f"{kind} has no opaque text verifier")
+
+
+def _canonical_pg_lsn(text: str) -> str:
+    match = re.fullmatch(r"([0-9A-Fa-f]+)/([0-9A-Fa-f]+)", text)
+    if match is None:
+        raise InvalidTypedValue("pg_lsn text must be HEX/HEX")
+    high, low = (part.upper() for part in match.groups())
+    if (len(high) > 1 and high.startswith("0")) or (len(low) > 1 and low.startswith("0")):
+        raise InvalidTypedValue("pg_lsn text is not canonical")
+    if int(high, 16) > 0xFFFFFFFF or int(low, 16) > 0xFFFFFFFF:
+        raise InvalidTypedValue("pg_lsn text is outside PostgreSQL's 64-bit range")
+    return f"{high}/{low}"
+
+
+def _balanced_path_text(text: str) -> bool:
+    pairs = {")": "(", "]": "[", "}": "{"}
+    opening = set(pairs.values())
+    stack: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for char in text:
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char in opening:
+            stack.append(char)
+        elif char in pairs and (not stack or stack.pop() != pairs[char]):
+            return False
+    return quote is None and not stack and not escaped
+
+
+def _valid_tsquery_text(text: str) -> bool:
+    """Recognise the lexical language emitted by PostgreSQL ``tsquery_out``."""
+
+    index = 0
+    terms = 0
+    while index < len(text):
+        if text[index].isspace():
+            index += 1
+            continue
+        if text[index] == "'":
+            index += 1
+            closed = False
+            escaped = False
+            while index < len(text):
+                char = text[index]
+                index += 1
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == "'":
+                    closed = True
+                    break
+            if not closed or escaped:
+                return False
+            if index < len(text) and text[index] == ":":
+                index += 1
+                if index < len(text) and text[index] == "*":
+                    index += 1
+                else:
+                    start = index
+                    while index < len(text) and text[index] in "ABCD":
+                        index += 1
+                    if index == start:
+                        return False
+            terms += 1
+            continue
+        if text[index] in "!&|()":
+            index += 1
+            continue
+        if text.startswith("<->", index):
+            index += 3
+            continue
+        phrase = re.match(r"<\d+>", text[index:])
+        if phrase is not None:
+            index += len(phrase.group(0))
+            continue
+        return False
+    return terms > 0
+
+
 def _kind_name(kind: Any, qualified_name: str) -> str:
     value = str(kind or "unknown").lower().strip()
     name = qualified_name.rsplit(".", 1)[-1].lower()
@@ -1404,6 +1567,10 @@ def _from_jsonable(value: Any) -> Any:
     return value
 
 
+_OPAQUE_TEXT_KINDS = frozenset({"tsquery", "jsonpath", "pg_lsn"})
+_VERIFIED_TEXT_KINDS = frozenset({
+    "tsvector", "xml", "money", "inet", "cidr", "macaddr", "macaddr8",
+})
 _OBSCURE_TEXT_KINDS = frozenset({
     "inet", "cidr", "macaddr", "macaddr8", "ltree", "tsvector", "tsquery", "pg_lsn",
     "jsonpath", "xml", "money", "regproc", "regprocedure", "regoper", "regoperator",

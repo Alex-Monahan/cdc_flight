@@ -507,10 +507,11 @@ class CatalogWatcher:
                 ) from exc
         return descriptors
 
-    @staticmethod
-    def _toast_policy_key(relation: SourceRelation) -> tuple:
+    def _toast_policy_key(self, relation: SourceRelation) -> tuple:
         return (
             int(relation.oid),
+            relation.relfilenode,
+            relation.relation_type_oid,
             relation.replica_identity,
             relation.full_activation_lsn,
             relation.full_invalidation_lsn,
@@ -522,6 +523,7 @@ class CatalogWatcher:
                 )
                 for column in relation.columns
             ),
+            self._epoch,
         )
 
     def toast_policy_for(self, qualified: str, *, event_lsn: int | None = None):

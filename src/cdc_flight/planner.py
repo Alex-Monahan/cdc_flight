@@ -30,7 +30,7 @@ from .envelope import KIND_TRUNCATE, PendingRecord
 from .errors import SchemaEvolutionRefused, ToastBaseMissing
 from .snapshot import SnapshotTable
 from .table_work import TableWork
-from .typed_types import UnsupportedType, native_type
+from .typed_types import InvalidTypedValue, UnsupportedType, native_type
 
 log = logging.getLogger("cdc_flight.planner")
 
@@ -294,15 +294,25 @@ class GroupPlan:
             event,
             snapshot is not None,
         )
-        patch = table_work.patch_for(
-            event,
-            self.commit_id,
-            event_id,
-            snapshot=item.snapshot,
-            binary_mode=self.binary_handling_mode,
-            hstore_mode=self.hstore_handling_mode,
-        )
-        row = patch.encoded_values()
+        try:
+            patch = table_work.patch_for(
+                event,
+                self.commit_id,
+                event_id,
+                snapshot=item.snapshot,
+                binary_mode=self.binary_handling_mode,
+                hstore_mode=self.hstore_handling_mode,
+            )
+            row = patch.encoded_values()
+        except InvalidTypedValue as exc:
+            raise SchemaEvolutionRefused(
+                f"source value for {event.qualified_table} is not a verified "
+                f"native representation: {exc}",
+                source_schema=event.schema,
+                source_table=event.table,
+                target=target,
+                detected_lsn=event.lsn,
+            ) from exc
         table_work.collect(item, event, row, event_id, probe=self, patch=patch)
         image = event.after if event.op != "d" else event.before
         # Complete INSERT/snapshot images cannot create the late-rename NULL vs

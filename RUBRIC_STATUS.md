@@ -3013,3 +3013,100 @@ Ordered by how much other work they unblock, not by rubric number.
 5. **Heartbeats** (4.4, 4.5, 4.6, and half of 6.1). Cheap relative to the above,
    and 4.4 comes almost free with `heartbeat.action.query` +
    `pg_logical_emit_message`, which 7.4 already proves lands.
+
+## FIX ROUND 8 closure — rubric 2.4 / 2.5 / 2.6 (2026-08-09)
+
+The honest post-fix scores are **2.4 = 5/5**, **2.5 = 5/5**, and
+**2.6 = 4/5**. The 2.6 score remains capped by the binding stock-Debezium
+policy: marker-preserving efficient TOAST is deferred. The r7
+`NEW-ID-MIGRATION` finding is rejected under the explicit user directive that
+this code is still in testing and state written by an older build is out of
+scope; it is not counted against the current-version 2.5 score.
+
+### Opaque unknown delivery
+
+The previous all-purpose obscure-text fallback is gone. The allowlist is now
+per type:
+
+| Source type | Stock `include=true` delivery | Decision | Canonical destination text |
+|---|---|---|---|
+| `tsquery` | base64 `J2ZhdCcgJiAncmF0Jw==` | strict base64 → UTF-8 → tsquery-text verifier | `'fat' & 'rat'` |
+| `jsonpath` | base64 `JC4iYSI=` | strict base64 → UTF-8 → `$`/delimiter verifier | `$."a"` |
+| `pg_lsn` | base64 `MC8xNkI2QTA=` | strict base64 → UTF-8 → canonical `HEX/HEX` and 64-bit-range verifier | `0/16B6A0` |
+| `tsvector` | plain text | explicit verified plain-text allowlist | `'fat':1 'rat':2` |
+| `xml` | plain text | explicit verified plain-text allowlist | `<a>fat</a>` |
+| `money` | plain text | explicit verified plain-text allowlist | `12.34` |
+| `inet` | plain text | explicit verified plain-text allowlist | `192.0.2.1` |
+| `cidr` | plain text | explicit verified plain-text allowlist | `192.0.2.0/24` |
+| `macaddr` | plain text | explicit verified plain-text allowlist | `08:00:2b:01:02:03` |
+| `macaddr8` | plain text | explicit verified plain-text allowlist | `08:00:2b:01:02:03:04:05` |
+
+The real stock-Debezium PostgreSQL 18 probe is
+`tests/rubric/2.4_native_types/test_2_4_fix8_postgres.py`, run on this clone's
+`CDC_TEST_PGPORT=15434`. Its two parameter cases passed. The probe changed all
+ten values in a later UPDATE; the destination matched the source's canonical
+semantic text on both reads. For the two plain representations whose PostgreSQL
+display includes incidental formatting, the evidence compared
+`money::numeric::text` and `host(inet)`; the connector's plain text was `12.34`
+and `192.0.2.1`.
+
+The remaining former obscure kinds (`opaque`, `ltree`, the unverified `reg*`
+family, and related kinds) now refuse at `native_type()` instead of becoming
+`VARCHAR`. A malformed payload for one of the three known opaque kinds raises
+`InvalidTypedValue`, which the planner converts to `SchemaEvolutionRefused`
+before any destination write. Thus an unknown value cannot silently bypass the
+strict typed contract or the automatic refusal/re-snapshot route.
+
+With `include.unknown.datatypes=false`, stock Debezium omitted exactly
+`tsquery_value`, `jsonpath_value`, and `pg_lsn_value`; the generic
+catalog/event-shape gate refused loudly, persisted
+`schema_refusals.state='pending'` and `table_state.snapshot_state='awaiting_snapshot'`,
+and created no destination table. The unit probe also proves an unclassified
+`opaque` descriptor is rejected and that byte and string base64 transport are
+lossless for all three decoded types.
+
+### M1 policy cache
+
+`CatalogWatcher._toast_policy_key` now includes OID, `relfilenode`,
+`relation_type_oid`, replica identity and interval bounds, the complete column
+identity/storage tuple, and the watcher's `_epoch`. The required generation
+probe changed relfilenode `100 → 200` and incremented epoch; it rebuilt the
+policy (`builds=2`, `hits=0`). A second-angle probe changed relation-type OID
+and epoch independently; each transition rebuilt. Source relation revalidation
+for FULL admission remains unchanged.
+
+On a representative 20-column relation, 100,000 policy calls measured
+**3.215297 s** uncached versus **0.457029 s** cached: one build, 99,999 hits,
+and **7.04×** speedup after the key change.
+
+### Scalar SQL regression pin
+
+`test_scalar_and_nested_matrix_sql_is_pinned` now asserts the exact
+`native_type(descriptor).sql` for every scalar matrix entry and all deterministic
+nested entries: integer/floating/boolean/text/blob/temporal/UUID mappings,
+JSON/VARIANT, both numeric forms, enum, map, struct, arrays, and the domain-over-
+array case. This catches a `TIMESTAMPTZ → TIMESTAMP` regression rather than
+only checking that a non-empty SQL string exists.
+
+### Rejected migration finding and non-regressions
+
+`NEW-ID-MIGRATION` is explicitly **REJECTED under the user directive**. No
+identity versioning, legacy candidate lookup, compatibility sidecar, or
+conversion backfill machinery exists. The current build has one current
+canonical identity format only; PostgreSQL source-schema evolution within the
+current build remains supported and was not weakened.
+
+Required lanes, all using the clone's PostgreSQL 18 instance on port 15434,
+with no Docker and no alternate PostgreSQL port, are:
+
+| Lane | Result |
+|---|---:|
+| `CDC_TEST_PGPORT=15434 make test` | **1,555 passed** |
+| `CDC_TEST_PGPORT=15434 make test-slow` | **138 passed** |
+| `CDC_TEST_PGPORT=15434 make test-md` | **32 passed** |
+| `CDC_TEST_PGPORT=15434 make lint` | **All checks passed** |
+
+Unproven limits are deliberate: no MotherDuck-specific ten-type opaque probe
+was added, no physical-standby run was claimed, and the marker-preserving 2.6
+5/5 path remains deferred. The stock local ten-type probe and the existing
+MotherDuck/native resolver coverage are not being conflated.
