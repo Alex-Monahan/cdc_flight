@@ -33,18 +33,6 @@ TABLE_TRUE = "app.p2b_opaque_ten_true"
 TABLE_FALSE = "app.p2b_opaque_ten_false"
 TARGET_TRUE = "cdcflight_app_p2b_opaque_ten_true"
 TARGET_FALSE = "cdcflight_app_p2b_opaque_ten_false"
-VALUE_COLUMNS = (
-    "tsquery_value",
-    "jsonpath_value",
-    "pg_lsn_value",
-    "tsvector_value",
-    "xml_value",
-    "money_value",
-    "inet_value",
-    "cidr_value",
-    "macaddr_value",
-    "macaddr8_value",
-)
 
 
 def _capture(include_unknown: str, table: str) -> dict[str, str]:
@@ -84,60 +72,22 @@ def _drop_probe(sandbox, *tables: str) -> None:
             conn.execute(f"DROP TABLE IF EXISTS {table}")
 
 
-def _insert(sandbox, table: str, *, updated: bool = False) -> None:
-    if not updated:
-        values = (
-            "'''fat'' & ''rat'''::tsquery",
-            "'$.\"a\"'::jsonpath",
-            "'0/16B6A0'::pg_lsn",
-            "'''fat'':1 ''rat'':2'::tsvector",
-            "'<a>fat</a>'::xml",
-            "'12.34'::money",
-            "'192.0.2.1'::inet",
-            "'192.0.2.0/24'::cidr",
-            "'08:00:2b:01:02:03'::macaddr",
-            "'08:00:2b:01:02:03:04:05'::macaddr8",
-        )
-    else:
-        values = (
-            "'''blue'''::tsquery",
-            "'$.\"b\"'::jsonpath",
-            "'0/16B6A1'::pg_lsn",
-            "'''blue'':1'::tsvector",
-            "'<b>blue</b>'::xml",
-            "'23.45'::money",
-            "'198.51.100.2'::inet",
-            "'198.51.100.0/24'::cidr",
-            "'08:00:2b:04:05:06'::macaddr",
-            "'08:00:2b:04:05:06:07:08'::macaddr8",
-        )
+def _insert(sandbox, table: str) -> None:
+    values = (
+        "'''fat'' & ''rat'''::tsquery",
+        "'$.\"a\"'::jsonpath",
+        "'0/16B6A0'::pg_lsn",
+        "'''fat'':1 ''rat'':2'::tsvector",
+        "'<a>fat</a>'::xml",
+        "'12.34'::money",
+        "'192.0.2.1'::inet",
+        "'192.0.2.0/24'::cidr",
+        "'08:00:2b:01:02:03'::macaddr",
+        "'08:00:2b:01:02:03:04:05'::macaddr8",
+    )
     sandbox.sql(
         f"INSERT INTO {table} VALUES (1, {', '.join(values)})"
-        if not updated
-        else f"UPDATE {table} SET "
-        + ", ".join(f"{column} = {value}" for column, value in zip(VALUE_COLUMNS, values, strict=True))
-        + " WHERE id = 1"
     )
-
-
-def _source_canonical(sandbox, table: str) -> tuple:
-    # The stock connector's text converters intentionally omit money's locale
-    # currency symbol and inet's redundant /32 host mask.  These are still the
-    # source type's canonical semantic text forms for this probe.
-    expressions = {
-        **{column: f"{column}::text" for column in VALUE_COLUMNS},
-        "money_value": "money_value::numeric::text",
-        "inet_value": "host(inet_value)",
-    }
-    columns = ", ".join(expressions[column] for column in VALUE_COLUMNS)
-    return sandbox.pg_query(f"SELECT {columns} FROM {table} WHERE id = 1")[0]
-
-
-def _destination_row(sandbox, target: str) -> tuple:
-    columns = ", ".join(f'"{column}"' for column in VALUE_COLUMNS)
-    return sandbox.duck_query(
-        f'SELECT {columns} FROM cdc_raw."{target}" WHERE "id" = 1'
-    )[0]
 
 
 @pytest.mark.parametrize(
@@ -162,18 +112,27 @@ def test_stock_ten_type_probe_runs_under_both_unknown_modes(
         assert empty["ok"] is True, empty
 
         _insert(sandbox, table)
-        inserted = sandbox.run(
-            extra_env=capture,
-            expect_success=include_unknown == "true",
-        )
+        inserted = sandbox.run(extra_env=capture, expect_success=False)
         if include_unknown == "true":
-            assert inserted["ok"] is True, inserted
-            assert _destination_row(sandbox, target) == _source_canonical(sandbox, table)
-
-            _insert(sandbox, table, updated=True)
-            updated = sandbox.run(extra_env=capture)
-            assert updated["ok"] is True, updated
-            assert _destination_row(sandbox, target) == _source_canonical(sandbox, table)
+            # PostgreSQL's literal money/inet text is not present at the stock
+            # connector boundary (currency/host formatting is discarded).  The
+            # strict value seam therefore refuses this mixed table instead of
+            # admitting the semantic spellings as literal source text.  The
+            # lossless members are covered independently by FIX ROUND 9's
+            # PostgreSQL-generated corpus.
+            assert inserted["ok"] is False, inserted
+            output = inserted.get("output", "").lower()
+            assert "money" in output or "inet" in output, inserted
+            assert sandbox.duck_query(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'cdc_raw' AND table_name = ?",
+                [target],
+            ) == []
+            assert sandbox.duck_query(
+                "SELECT state FROM _cdc_flight.schema_refusals "
+                "WHERE source_schema = 'app' AND source_table = ?",
+                [table.removeprefix("app.")],
+            ) == [("pending",)]
         else:
             assert inserted["ok"] is False, inserted
             output = inserted.get("output", "").lower()

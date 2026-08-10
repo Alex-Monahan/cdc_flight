@@ -180,12 +180,17 @@ class SchemaEvolutionRefused(ValueError):
         source_table: str | None = None,
         target: str | None = None,
         detected_lsn: int | None = None,
+        input_fingerprint: str | None = None,
     ):
         super().__init__(message)
         self.source_schema = source_schema
         self.source_table = source_table
         self.target = target
         self.detected_lsn = detected_lsn
+        #: Stable source-row evidence used to distinguish a deterministic retry from
+        #: a genuinely new refusal.  It deliberately excludes operation/transaction
+        #: metadata so a snapshot ``r`` can be compared with the original ``c``.
+        self.input_fingerprint = input_fingerprint
 
 
 class SchemaBackfillRefused(SchemaEvolutionRefused):

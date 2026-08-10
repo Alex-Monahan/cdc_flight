@@ -12,7 +12,9 @@ from support.type_matrix import nested_matrix, scalar_matrix
 
 from cdc_flight.apply_sql import SchemaRegistry, delete_keys, insert_rows
 from cdc_flight.identity_codec import _identity_tree, identity_value
-from cdc_flight.typed_types import CanonicalRangeText, SourceTypeDescriptor
+from cdc_flight.typed_types import CanonicalRangeText, InvalidTypedValue, SourceTypeDescriptor
+
+_UNLOSSLESS_STOCK_TEXT_TYPES = frozenset({"money", "inet"})
 
 
 def _source(kind: str, oid: int, **kwargs) -> SourceTypeDescriptor:
@@ -384,6 +386,15 @@ def test_full_24_type_list_source_identity_survives_typed_shadow_swap(
             columns={"key": source, "payload": _source("text", 25)},
             key_columns=("key",),
         )
+        if source.kind in _UNLOSSLESS_STOCK_TEXT_TYPES:
+            with pytest.raises(InvalidTypedValue):
+                insert_rows(
+                    con,
+                    registry.get("full_type_identity"),
+                    ["key", "payload"],
+                    [[source_value, "kept"]],
+                )
+            return
         insert_rows(
             con,
             registry.get("full_type_identity"),
@@ -638,6 +649,10 @@ def test_full_declared_type_identity_matches_readback_and_current_swap(
             key_columns=("key",),
         )
         table = registry.get("identity_property")
+        if source.kind in _UNLOSSLESS_STOCK_TEXT_TYPES:
+            with pytest.raises(InvalidTypedValue):
+                insert_rows(con, table, ["key", "payload"], [[source_value, "kept"]])
+            return
         insert_rows(con, table, ["key", "payload"], [[source_value, "kept"]])
         source_id = identity_value(table, (source_value,), key_columns=("key",))
         readback = con.execute('SELECT "key" FROM typed."identity_property"').fetchone()[0]

@@ -189,13 +189,14 @@ def build_properties(
         # offset store, i.e. the one thing that could break Invariant O from
         # outside our code (Opus B-2).
         "lsn.flush.mode": LSN_FLUSH_MODE_SAFE,
-        # ADR 0001 §4.10 / Opus m10: `stopSourceTasks()` waits only
-        # `task.management.timeout.ms` before `taskService.shutdownNow()`
-        # (`AsyncEngineConfig.java:25,76-80`), so a flush timeout larger than it
-        # would be hard-killed mid-write during shutdown. Keep the pair aligned,
-        # with task management the larger of the two.
+        # ADR 0001 §4.10 / Opus m10: Debezium uses this bound for both source-task
+        # start and stop (`AsyncEngineConfig.startSourceTasks`,
+        # `AsyncEngineConfig.java:76-80`). Thirty seconds is too short for a
+        # stock JVM/pgoutput task to start when the six-worker slow lane is under
+        # load; 120 seconds remains finite and leaves the supervisor's own
+        # close/source-dark bounds responsible for declaring a wedged run.
         "offset.flush.timeout.ms": "5000",
-        "task.management.timeout.ms": "30000",
+        "task.management.timeout.ms": "120000",
         # --- batching / latency ----------------------------------------------
         "max.batch.size": str(max_batch_size),
         "max.queue.size": str(max_batch_size * 4),

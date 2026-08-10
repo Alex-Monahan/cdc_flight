@@ -43,6 +43,7 @@ from . import faults as faults_mod
 from . import reconcile as reconcile_mod
 from . import recovery as recovery_mod
 from . import resnapshot as resnapshot_mod
+from . import resnapshot_batches as resnapshot_batches_mod
 from . import resnapshot_recovery as resnapshot_recovery_mod
 from .completion_stage import PostEngineCompletion
 from .config import (
@@ -612,38 +613,37 @@ def run(
             )
         if owed and not will_snapshot_everything and acquisition.resnapshot_enabled():
             phases.to(PHASE_SNAPSHOTTING, detail=f"{len(owed)} table(s) owed")
-            resnap = resnapshot_mod.run(
-                con,
-                source=source,
-                replication=replication,
-                pipeline=dest.pipeline_name,
-                dataset=dest.dataset_name,
-                tables=owed,
-                settings=settings,
-                run_cfg=run_cfg,
-                lease=lease,
-                runner_id=runner_id,
-                transactional_ddl=transactional_ddl,
-                epoch_base=reconciliation.resume_point.snapshot_epoch,
-                reason=f"{len(owed)} table(s) marked awaiting_snapshot",
-                namespace=namespace,
-                ownership=ownership,
-                new_relations={relation.qualified for relation in discovered},
-                drop_mode=applier_cfg.drop_mode,
-                control_schema=control_schema,
+            resnapshot_passes, latest_resnapshot, snapshot_epoch = (
+                resnapshot_batches_mod.run_owed(
+                    con,
+                    source=source,
+                    replication=replication,
+                    pipeline=dest.pipeline_name,
+                    dataset=dest.dataset_name,
+                    owed=owed,
+                    settings=settings,
+                    run_cfg=run_cfg,
+                    lease=lease,
+                    runner_id=runner_id,
+                    transactional_ddl=transactional_ddl,
+                    epoch_base=reconciliation.resume_point.snapshot_epoch,
+                    namespace=namespace,
+                    ownership=ownership,
+                    new_relations={relation.qualified for relation in discovered},
+                    drop_mode=applier_cfg.drop_mode,
+                    control_schema=control_schema,
+                    resnapshot_run=resnapshot_mod.run,
+                )
             )
-            summary_extra.update(resnap.as_dict())
+            summary_extra.update(latest_resnapshot)
+            summary_extra["resnapshot_passes"] = resnapshot_passes
+            reconciliation.resume_point.snapshot_epoch = max(
+                reconciliation.resume_point.snapshot_epoch, snapshot_epoch
+            )
             if watcher is not None and discovered:
                 watcher.complete_discoveries(
                     {relation.qualified for relation in discovered}
                 )
-            # The re-snapshot callback advanced the durable epoch in the same
-            # transaction as each completed image.  Keep the in-memory point aligned
-            # for the main applier without reopening a post-image write window.
-            reconciliation.resume_point.snapshot_epoch = max(
-                reconciliation.resume_point.snapshot_epoch,
-                resnap.snapshot_epoch,
-            )
         elif owed:
             log.warning(
                 "%s table(s) are marked awaiting_snapshot and are NOT being "

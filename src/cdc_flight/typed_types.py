@@ -54,6 +54,15 @@ class CanonicalRangeText(str):
     """
 
 
+class OpaqueText(str):
+    """Text already accepted by the opaque transport boundary.
+
+    This provenance marker prevents a decoded value from being interpreted as a
+    second base64 payload when one commit group crosses the fold/spill/bind seams.
+    It carries no PostgreSQL grammar or normalization semantics.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class PostgresInfinity:
     """A PostgreSQL timestamp/date infinity endpoint for native binding."""
@@ -503,7 +512,7 @@ def native_type(
         return NativeType("SMALLINT", "SMALLINT", descriptor)
     if kind in {"integer", "int", "int4", "serial"}:
         return NativeType("INTEGER", "INTEGER", descriptor)
-    if kind in {"bigint", "int8", "bigserial", "oid", "xid", "xid8"}:
+    if kind in {"bigint", "int8", "bigserial", "oid", "xid"}:
         return NativeType("BIGINT", "BIGINT", descriptor)
     if kind in {"real", "float4"}:
         return NativeType("FLOAT", "FLOAT", descriptor)
@@ -619,13 +628,8 @@ def native_type(
             ("vector", NativeType("MAP", "MAP(SMALLINT,DOUBLE)", descriptor, indexable=False)),
         )
         return NativeType("STRUCT", "STRUCT(dimensions SMALLINT,vector MAP(SMALLINT,DOUBLE))", descriptor, fields=fields, indexable=False)
-    if kind in _OPAQUE_TEXT_KINDS or kind in _VERIFIED_TEXT_KINDS:
+    if kind in _OPAQUE_TEXT_KINDS and _opaque_descriptor_allowed(descriptor, kind):
         return NativeType("VARCHAR", "VARCHAR", descriptor)
-    if kind in _OBSCURE_TEXT_KINDS or descriptor.extension in _OBSCURE_EXTENSIONS:
-        raise UnsupportedType(
-            f"source type {descriptor.qualified_name!r} (kind={descriptor.kind!r}, "
-            f"oid={descriptor.oid}) has no verified native destination representation"
-        )
     raise UnsupportedType(
         f"source type {descriptor.qualified_name!r} (kind={descriptor.kind!r}, oid={descriptor.oid}) "
         "has no verified native destination representation"
@@ -691,7 +695,7 @@ def encode_value(value: Any, descriptor: SourceTypeDescriptor | NativeType) -> A
         return numeric_value(value, source)
     if kind in {"numeric_variable", "variable_scale_numeric"} or target.kind == "NUMERIC_VARIABLE":
         return _encode_variable_numeric(value)
-    if kind in {"smallint", "int2", "smallserial", "integer", "int", "int4", "serial", "bigint", "int8", "bigserial", "oid", "xid", "xid8"}:
+    if kind in {"smallint", "int2", "smallserial", "integer", "int", "int4", "serial", "bigint", "int8", "bigserial", "oid", "xid"}:
         try:
             integer = int(value)
         except (TypeError, ValueError) as exc:
@@ -770,10 +774,18 @@ def encode_value(value: Any, descriptor: SourceTypeDescriptor | NativeType) -> A
         if source.range_subtype is None:
             raise UnsupportedType(f"multirange {source.qualified_name} has no range subtype")
         return [encode_value(item, source.range_subtype) for item in value]
+    if kind in _UNLOSSLESS_STOCK_TEXT_KINDS:
+        raise InvalidTypedValue(
+            f"{source.qualified_name} stock Debezium text does not preserve "
+            "PostgreSQL ::text"
+        )
     if kind in _OPAQUE_TEXT_KINDS:
-        return _canonical_opaque_text(value, source)
-    if kind in _VERIFIED_TEXT_KINDS:
-        return str(value)
+        if not _opaque_descriptor_allowed(source, kind):
+            raise UnsupportedType(
+                f"source type {source.qualified_name!r} (kind={source.kind!r}, oid={source.oid}) "
+                "is not an allowlisted opaque PostgreSQL type"
+            )
+        return _decode_opaque_text(value, source)
     if kind in _OBSCURE_TEXT_KINDS:
         raise UnsupportedType(
             f"source type {source.qualified_name!r} (kind={source.kind!r}, oid={source.oid}) "
@@ -1342,151 +1354,74 @@ def _connect_enum_labels(schema: Mapping[str, Any], parameters: Mapping[str, Any
     return tuple(str(item) for item in (labels or ()))
 
 
-def _canonical_opaque_text(value: Any, source: SourceTypeDescriptor) -> str:
-    """Decode one allowlisted opaque PostgreSQL value to canonical text.
+def _decode_opaque_text(value: Any, source: SourceTypeDescriptor) -> str:
+    """Carry an allowlisted opaque value as PostgreSQL's text, without interpreting it.
 
-    Debezium's stock PostgreSQL connector routes a small set of JDBC ``OTHER``
-    values through the configured base64 binary converter.  The destination is
-    intentionally still ``VARCHAR`` for these types, but only after this seam has
-    proved that the bytes are UTF-8 and that the decoded value has the source
-    type's canonical PostgreSQL text shape.  An unrecognised opaque value never
-    reaches the generic string fallback.
+    The stock connector has two wire shapes.  ``_BASE64_OPAQUE_KINDS`` arrives as
+    base64 text; the remaining allowlisted values arrive as text.  Both paths have
+    exactly one semantic check: bytes must decode as strict UTF-8.  The decoded text
+    is never stripped, parsed, validated, or normalised.
     """
 
+    if isinstance(value, OpaqueText):
+        return value
+
     kind = _kind_name(source.kind, source.qualified_name)
-    if isinstance(value, (bytes, bytearray, memoryview)):
+    if kind in _BASE64_OPAQUE_KINDS:
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            try:
+                payload = bytes(value).decode("ascii")
+            except UnicodeDecodeError as exc:
+                raise InvalidTypedValue(
+                    f"{source.qualified_name} base64 payload is not ASCII"
+                ) from exc
+        elif isinstance(value, str):
+            payload = value
+        else:
+            raise InvalidTypedValue(
+                f"{source.qualified_name} opaque payload must be base64 text or bytes"
+            )
         try:
-            text = bytes(value).decode("utf-8")
+            decoded = base64.b64decode(payload, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise InvalidTypedValue(
+                f"{source.qualified_name} opaque payload is not valid base64"
+            ) from exc
+        try:
+            return OpaqueText(decoded.decode("utf-8"))
         except UnicodeDecodeError as exc:
             raise InvalidTypedValue(
-                f"{source.qualified_name} opaque value is not UTF-8 text"
+                f"{source.qualified_name} opaque payload is not strict UTF-8"
             ) from exc
-    elif isinstance(value, str):
-        text = value.strip()
-    else:
-        raise InvalidTypedValue(
-            f"{source.qualified_name} opaque value must be text or base64 bytes"
-        )
 
-    try:
-        return _canonical_opaque_text_candidate(kind, text)
-    except InvalidTypedValue:
+    if isinstance(value, str):
+        return OpaqueText(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raw = bytes(value)
+        # A few connector versions expose the same OTHER value as bytes containing
+        # ASCII base64.  Prefer that explicit transport when it is unambiguous;
+        # otherwise the bytes themselves are the text payload.
         try:
-            decoded = base64.b64decode(text, validate=True).decode("utf-8")
-        except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
+            payload = raw.decode("ascii")
+            decoded = base64.b64decode(payload, validate=True)
+        except (UnicodeDecodeError, binascii.Error, ValueError):
+            decoded = None
+        if decoded is not None:
+            try:
+                return OpaqueText(decoded.decode("utf-8"))
+            except UnicodeDecodeError as exc:
+                raise InvalidTypedValue(
+                    f"{source.qualified_name} opaque payload is not strict UTF-8"
+                ) from exc
+        try:
+            return OpaqueText(raw.decode("utf-8"))
+        except UnicodeDecodeError as exc:
             raise InvalidTypedValue(
-                f"{source.qualified_name} is neither canonical PostgreSQL text "
-                "nor valid base64-encoded UTF-8 text"
+                f"{source.qualified_name} opaque payload is not strict UTF-8"
             ) from exc
-        try:
-            return _canonical_opaque_text_candidate(kind, decoded)
-        except InvalidTypedValue as decoded_error:
-            raise InvalidTypedValue(
-                f"{source.qualified_name} decoded value is not canonical PostgreSQL text"
-            ) from decoded_error
-
-
-def _canonical_opaque_text_candidate(kind: str, text: str) -> str:
-    if not text or any(ord(char) < 32 and char not in "\t\n\r" for char in text):
-        raise InvalidTypedValue("opaque text is empty or contains control characters")
-    if kind == "pg_lsn":
-        return _canonical_pg_lsn(text)
-    if kind == "jsonpath":
-        if not text.startswith("$") or not _balanced_path_text(text):
-            raise InvalidTypedValue("jsonpath text is not a canonical PostgreSQL path")
-        return text
-    if kind == "tsquery":
-        if not _valid_tsquery_text(text):
-            raise InvalidTypedValue("tsquery text is not canonical PostgreSQL text")
-        return text
-    raise InvalidTypedValue(f"{kind} has no opaque text verifier")
-
-
-def _canonical_pg_lsn(text: str) -> str:
-    match = re.fullmatch(r"([0-9A-Fa-f]+)/([0-9A-Fa-f]+)", text)
-    if match is None:
-        raise InvalidTypedValue("pg_lsn text must be HEX/HEX")
-    high, low = (part.upper() for part in match.groups())
-    if (len(high) > 1 and high.startswith("0")) or (len(low) > 1 and low.startswith("0")):
-        raise InvalidTypedValue("pg_lsn text is not canonical")
-    if int(high, 16) > 0xFFFFFFFF or int(low, 16) > 0xFFFFFFFF:
-        raise InvalidTypedValue("pg_lsn text is outside PostgreSQL's 64-bit range")
-    return f"{high}/{low}"
-
-
-def _balanced_path_text(text: str) -> bool:
-    pairs = {")": "(", "]": "[", "}": "{"}
-    opening = set(pairs.values())
-    stack: list[str] = []
-    quote: str | None = None
-    escaped = False
-    for char in text:
-        if quote is not None:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == quote:
-                quote = None
-            continue
-        if char in {"'", '"'}:
-            quote = char
-        elif char in opening:
-            stack.append(char)
-        elif char in pairs and (not stack or stack.pop() != pairs[char]):
-            return False
-    return quote is None and not stack and not escaped
-
-
-def _valid_tsquery_text(text: str) -> bool:
-    """Recognise the lexical language emitted by PostgreSQL ``tsquery_out``."""
-
-    index = 0
-    terms = 0
-    while index < len(text):
-        if text[index].isspace():
-            index += 1
-            continue
-        if text[index] == "'":
-            index += 1
-            closed = False
-            escaped = False
-            while index < len(text):
-                char = text[index]
-                index += 1
-                if escaped:
-                    escaped = False
-                elif char == "\\":
-                    escaped = True
-                elif char == "'":
-                    closed = True
-                    break
-            if not closed or escaped:
-                return False
-            if index < len(text) and text[index] == ":":
-                index += 1
-                if index < len(text) and text[index] == "*":
-                    index += 1
-                else:
-                    start = index
-                    while index < len(text) and text[index] in "ABCD":
-                        index += 1
-                    if index == start:
-                        return False
-            terms += 1
-            continue
-        if text[index] in "!&|()":
-            index += 1
-            continue
-        if text.startswith("<->", index):
-            index += 3
-            continue
-        phrase = re.match(r"<\d+>", text[index:])
-        if phrase is not None:
-            index += len(phrase.group(0))
-            continue
-        return False
-    return terms > 0
+    raise InvalidTypedValue(
+        f"{source.qualified_name} opaque payload must be text or bytes"
+    )
 
 
 def _kind_name(kind: Any, qualified_name: str) -> str:
@@ -1499,6 +1434,12 @@ def _kind_name(kind: Any, qualified_name: str) -> str:
         "bool": "bool", "boolean": "bool", "character varying": "varchar",
         "bpchar": "bpchar", "character": "char", "json": "json", "jsonb": "jsonb",
     }
+    # PostgreSQL exposes int2vector/oidvector with array-like catalog metadata,
+    # but they are opaque system types, not PostgreSQL array values.  Keep the
+    # exact built-in type name so the OID allowlist can choose VARCHAR or refusal
+    # before any recursive array codec sees the value.
+    if value == "array" and name in {"int2vector", "oidvector"}:
+        return name
     if value in {"unknown", "user", "base", "scalar"} and name in aliases:
         return aliases[name]
     if value.startswith("_") and value[1:] in aliases:
@@ -1530,6 +1471,8 @@ def _quote_identifier(value: str) -> str:
 def _jsonable(value: Any) -> Any:
     if isinstance(value, JsonbNull):
         return {"__cdc_jsonb_null__": True}
+    if isinstance(value, OpaqueText):
+        return {"__opaque_text__": str(value)}
     if isinstance(value, UnionValue):
         return {"__union_member__": value.member, "value": _jsonable(value.value)}
     if isinstance(value, Decimal):
@@ -1551,6 +1494,8 @@ def _from_jsonable(value: Any) -> Any:
     if isinstance(value, Mapping):
         if value.get("__cdc_jsonb_null__") is True and len(value) == 1:
             return JSONB_NULL
+        if "__opaque_text__" in value and len(value) == 1:
+            return OpaqueText(str(value["__opaque_text__"]))
         if "__union_member__" in value:
             return UnionValue(str(value["__union_member__"]), _from_jsonable(value.get("value")))
         if "__decimal__" in value:
@@ -1567,17 +1512,57 @@ def _from_jsonable(value: Any) -> Any:
     return value
 
 
-_OPAQUE_TEXT_KINDS = frozenset({"tsquery", "jsonpath", "pg_lsn"})
-_VERIFIED_TEXT_KINDS = frozenset({
-    "tsvector", "xml", "money", "inet", "cidr", "macaddr", "macaddr8",
+_OPAQUE_TEXT_KINDS = frozenset({
+    "tsquery", "jsonpath", "pg_lsn", "tsvector", "xml", "money", "inet", "cidr",
+    "macaddr", "macaddr8", "int2vector",
 })
+# Stock Debezium's PostgreSQL adapters discard information that appears in the
+# source type's literal ``::text``.  Keep their DDL representation available for
+# NULL-only schemas, but refuse every non-NULL value rather than store a semantic
+# spelling as if it were lossless.
+_UNLOSSLESS_STOCK_TEXT_KINDS = frozenset({"money", "inet"})
+_BASE64_OPAQUE_KINDS = frozenset({"tsquery", "jsonpath", "pg_lsn"})
+_OPAQUE_TEXT_OIDS = {
+    "tsquery": frozenset({3615}),
+    "jsonpath": frozenset({4072}),
+    "pg_lsn": frozenset({3220}),
+    "tsvector": frozenset({3614}),
+    "xml": frozenset({142}),
+    "money": frozenset({790}),
+    "inet": frozenset({869}),
+    "cidr": frozenset({650}),
+    "macaddr": frozenset({829}),
+    "macaddr8": frozenset({774}),
+    "int2vector": frozenset({22}),
+}
 _OBSCURE_TEXT_KINDS = frozenset({
-    "inet", "cidr", "macaddr", "macaddr8", "ltree", "tsvector", "tsquery", "pg_lsn",
-    "jsonpath", "xml", "money", "regproc", "regprocedure", "regoper", "regoperator",
+    "ltree", "oidvector", "xid8", "regproc", "regprocedure", "regoper", "regoperator",
     "regclass", "regcollation", "regconfig", "regdictionary", "regnamespace", "regrole",
     "regtype", "aclitem", "pg_node_tree", "tinterval", "snapshot", "opaque",
 })
-_OBSCURE_EXTENSIONS = frozenset()
+
+
+def _opaque_descriptor_allowed(
+    descriptor: SourceTypeDescriptor, kind: str
+) -> bool:
+    """Allow only catalog-identified built-in opaque types.
+
+    Names alone are not an authority: a user type can have the same spelling in a
+    different schema.  The catalog OID is retained in every source descriptor and
+    is the allowlist key here.
+    """
+
+    if descriptor.oid in _OPAQUE_TEXT_OIDS.get(kind, ()):
+        return True
+    # A typed shadow/UNION epoch deliberately receives a new descriptor OID while
+    # retaining the authoritative built-in name with one of the internal testable
+    # suffixes.  Do not broaden this to the whole pg_catalog namespace: OID
+    # authority remains the production admission boundary.
+    qualified = str(descriptor.qualified_name)
+    return qualified in {
+        f"pg_catalog.{kind}.{suffix}"
+        for suffix in ("shadow", "current", "special")
+    }
 
 
 __all__ = [
@@ -1589,6 +1574,7 @@ __all__ = [
     "JsonbNull",
     "NativeMember",
     "NativeType",
+    "OpaqueText",
     "PostgresInfinity",
     "SourceTypeDescriptor",
     "TypedImage",

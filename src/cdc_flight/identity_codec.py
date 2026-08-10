@@ -572,11 +572,10 @@ def _time_identity(value: Any, *, zoned: bool) -> dict[str, Any]:
 _IDENTITY_TEXT_KINDS = frozenset(
     {
         "char", "bpchar", "varchar", "text", "citext", "name", "string",
-        "inet", "cidr", "macaddr", "macaddr8", "ltree", "tsvector", "tsquery",
-        "pg_lsn", "jsonpath", "xml", "money", "regproc", "regprocedure", "regoper",
-        "regoperator", "regclass", "regcollation", "regconfig", "regdictionary",
-        "regnamespace", "regrole", "regtype", "aclitem", "pg_node_tree", "tinterval",
-        "snapshot", "opaque",
+        # These are the only opaque kinds whose descriptor/value seam can reach
+        # identity_codec: encode_value rejects every non-allowlisted opaque kind.
+        "tsquery", "jsonpath", "pg_lsn", "tsvector", "xml", "cidr", "macaddr",
+        "macaddr8", "int2vector",
     }
 )
 
@@ -658,7 +657,7 @@ def _identity_tree(value: Any, descriptor: Any) -> Any:
         return {"timestamptz": encoded.astimezone(UTC).isoformat()}
     if kind == "interval":
         return {"interval": _interval_units(encoded)}
-    if kind in {"smallint", "int2", "smallserial", "integer", "int", "int4", "serial", "bigint", "int8", "bigserial", "oid", "xid", "xid8"}:
+    if kind in {"smallint", "int2", "smallserial", "integer", "int", "int4", "serial", "bigint", "int8", "bigserial", "oid", "xid"}:
         return {"integer": str(int(encoded))}
     if kind in {"boolean", "bool", "bit1"}:
         return {"boolean": bool(encoded)}

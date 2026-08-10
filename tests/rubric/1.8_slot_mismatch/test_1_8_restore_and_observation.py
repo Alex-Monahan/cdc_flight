@@ -137,11 +137,11 @@ def test_a_rewound_source_is_detected(tmp_path_factory, postgres_cluster):
         box.reseed()
         box.run(reset_state=True, max_seconds=150)
         current = box.pg_query("SELECT (pg_current_wal_lsn() - '0/0')::bigint")[0][0]
-        # A one-byte synthetic lead is enough to construct the exact comparison while
-        # making any concurrent source writer an explicit failed precondition. A fixed
-        # 10 MB lead could be consumed by another xdist worker and turn a correct source
-        # into a false test pass.
-        durable_lsn = int(current) + 1
+        # Use a bounded but deliberately large synthetic lead. A one-byte lead can be
+        # consumed by another xdist worker during the recovery subprocess, turning a
+        # correct source into a false test pass; 1 GiB is far below the LSN range and
+        # comfortably exceeds the disposable lane's concurrent WAL budget.
+        durable_lsn = int(current) + 1_000_000_000
         box.duck_write(
             "UPDATE _cdc_flight.debezium_offsets SET last_lsn = ?", [durable_lsn]
         )

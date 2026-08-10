@@ -235,6 +235,7 @@ class Applier:
         self.truncates_applied = 0
         self.truncates_logged = 0
         self.resnapshot_discarded_events = 0
+        self.quarantined_events = 0
         #: rubric 4.7: undecidable folds turned into automatic table rebuilds
         self.ambiguous_resnapshots_queued = 0
         #: events dropped because their transaction is already inside a table's image
@@ -309,6 +310,7 @@ class Applier:
             "deferred_events": self.deferred_events,
             "snapshot_swaps": self.snapshots.swaps,
             "discarded_tail_events": self.assembler.discarded_tail_events,
+            "quarantined_events": self.quarantined_events,
             "orphan_end_markers": self.assembler.orphan_end_markers,
             "implicit_txn_opens": self.assembler.implicit_txn_opens,
             "last_commit_id": self.last_commit_id,

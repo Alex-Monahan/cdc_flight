@@ -626,23 +626,31 @@ CATALOG_SCHEMA_LIVENESS = Machine(
 REFUSAL_ABSENT = "absent"
 REFUSAL_PENDING = "pending"
 REFUSAL_RESOLVED = "resolved"
+REFUSAL_QUARANTINED = "quarantined"
 
 SCHEMA_REFUSAL = Machine(
     "schema_refusal",
-    states=(REFUSAL_ABSENT, REFUSAL_PENDING, REFUSAL_RESOLVED),
+    states=(
+        REFUSAL_ABSENT,
+        REFUSAL_PENDING,
+        REFUSAL_RESOLVED,
+        REFUSAL_QUARANTINED,
+    ),
     edges=(
         (REFUSAL_ABSENT, REFUSAL_PENDING),
         (REFUSAL_PENDING, REFUSAL_PENDING),
         (REFUSAL_PENDING, REFUSAL_RESOLVED),
+        (REFUSAL_PENDING, REFUSAL_QUARANTINED),
         (REFUSAL_RESOLVED, REFUSAL_RESOLVED),
         (REFUSAL_RESOLVED, REFUSAL_PENDING),
+        (REFUSAL_QUARANTINED, REFUSAL_QUARANTINED),
     ),
-    terminal=(REFUSAL_RESOLVED,),
+    terminal=(REFUSAL_RESOLVED, REFUSAL_QUARANTINED),
     initial=REFUSAL_ABSENT,
     durable="_cdc_flight.schema_refusals.state",
     purpose=(
-        "Has a schema transition been refused with a durable remediation obligation, "
-        "and has that obligation been discharged?"
+        "Has a schema transition been refused, and is it either discharged or durably "
+        "quarantined after an identical retry proved it cannot be delivered?"
     ),
 )
 

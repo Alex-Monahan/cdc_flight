@@ -691,7 +691,7 @@ correct assumptions in the notes below:
 | 2.1 | Added / dropped columns handled | **5** | Catalog-fenced attnum diffs add and backfill existing rows, physically drop destination columns, and continue through live CDC; the add/drop E2E compares source and destination before and after both DDLs. |
 | 2.2 | Renamed columns handled well | **5** | Same-attnum/type changes use a true destination rename, including a late-row merge/fence path; the E2E has one logical column, one rename audit event, and no data loss. |
 | 2.3 | New tables and schemas auto-discovered | **5** | A 10-second (configurable) all-schema watcher admits table-scoped publication members and performs an in-process targeted re-snapshot on the same main slot; new-table and new-schema existing rows arrive without config edit or restart. |
-| 2.4 | Postgres types → native MotherDuck types | ~~1~~ → **5** | Stock Debezium 3.6 with `include.unknown.datatypes=true` delivers `int4multirange`/`nummultirange` as Connect `STRING` base64 transport; the one strict resolver stores PostgreSQL canonical text as indexable `VARCHAR` on both runtimes. The real local four-step stream, refusal path, source `=` classes, and direct MotherDuck resolver/key evidence pass. |
+| 2.4 | Postgres types → native MotherDuck types | ~~1~~ → **5** | The current opaque/unknown-type contract is exact-or-refuse: strict UTF-8 decoded text is stored verbatim as `VARCHAR`; stock `money`/`inet` formatting gaps and the wrong-shaped `int2vector` transport refuse durably. PostgreSQL-generated corpus and catalog-sweep evidence pass on local DuckDB and real MotherDuck. |
 | 2.5 | Data type changes supported | ~~3~~ → **5** | The typed shadow path, spill/replay path, and source-semantic multirange identity use the same `VARCHAR` resolver; real PostgreSQL equality classes and MotherDuck key-gain/shadow evidence pass. A full Debezium-driven MotherDuck multirange stream was not separately run, as recorded in the round-7 limits. |
 | 2.6 | TOAST columns handled well | **4** | Sparse physical-row folding, durable NULL-vs-JSONB-root-null ambiguity refusal, and a bounded relation-lock activation fence close the soundness defects. The real-owner matrix is non-circular. Stock Debezium still lacks a marker-preserving efficient channel, so the policy ceiling remains 4. |
 | 3.1 | Backfill scalable / parallelized | 3 | 120 k rows in ~28 s single-threaded (`snapshot.max.threads=1`); works but does not scale, untested past 120 k. |
@@ -1852,7 +1852,7 @@ run-time error instead of a review finding.
 | `catalog_change` | where is one DDL fact in observe → confirm → fence → apply | 9 | 31 | **memory only** |
 | `publication_admission` | has a discovered relation been admitted to the publication, and who owns that decision | 6 | 23 | `_cdc_flight.source_relations.admission_state` |
 | `catalog_schema_liveness` | is a watched schema visibly queryable before absence can mean a drop | 4 | 16 | **memory only** |
-| `schema_refusal` | has a refused schema transition acquired a durable remediation obligation | 3 | 5 | `_cdc_flight.schema_refusals.state` |
+| `schema_refusal` | has a refused schema transition acquired a durable remediation obligation | 4 | 7 | `_cdc_flight.schema_refusals.state` |
 | `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
 | `snapshot_completion` | have all ordered snapshot callbacks arrived | 6 | 9 | **memory only** |
 | `runtime_root_lifecycle` | is the disposable root reusable or committed to cleanup | 6 | 10 | project-local root and parent markers |
@@ -3110,3 +3110,137 @@ Unproven limits are deliberate: no MotherDuck-specific ten-type opaque probe
 was added, no physical-standby run was claimed, and the marker-preserving 2.6
 5/5 path remains deferred. The stock local ten-type probe and the existing
 MotherDuck/native resolver coverage are not being conflated.
+
+## FIX ROUND 9 closure — rubric 2.4 / 2.5 / 2.6 (2026-08-09)
+
+Current scores are **2.4 = 5/5**, **2.5 = 5/5**, and **2.6 = 4/5**.
+Round 9 is **SATISFIED: yes** for the requested 2.4/2.5/2.6 findings. The
+2.6 score is still honestly capped by the binding stock-Debezium policy:
+marker-preserving efficient TOAST remains deferred. A 2.4 score of 5 means
+that every type in the tested global surface is either carried as the exact
+PostgreSQL text available at the connector boundary or refused; it does not
+claim that a value whose stock wire representation has already lost formatting
+was delivered.
+
+### Decode-or-refuse, with no grammar recognisers
+
+`typed_types._decode_opaque_text` now has one value rule:
+
+`base64 payload → bytes → strict UTF-8 decode → VARCHAR verbatim`.
+
+For an already-text wire shape, the text is carried verbatim. There is no
+PostgreSQL grammar parser, shape validator, normalizer, stripping, case
+conversion, or canonicalisation in this path. A strict UTF-8 failure on an
+unambiguous base64/bytes transport, invalid base64 transport, or wrong non-text
+value raises `InvalidTypedValue`; a base64-designated wire value is never
+reclassified as already-decoded text. Already-decoded text is accepted only
+when it carries the explicit `OpaqueText` provenance marker, and no grammar is
+used to create that marker. The planner converts that into
+`SchemaEvolutionRefused` before a destination row is
+written. The catalog OID allowlist is admission authority, so a same-named user
+type cannot enter this path. `int2vector` is `VARCHAR` only for a genuine text
+payload; the stock Connect list-shaped payload is rejected rather than admitted
+as an empty `SMALLINT[]`. Successfully decoded text carries an internal
+`OpaqueText` provenance marker through fold/spill/bind, so the same text is never
+reinterpreted as a second base64 payload.
+
+The regression guard and source scan prove that these hand-rolled recognisers
+are gone: `_canonical_opaque_text_candidate`, `_balanced_path_text`,
+`_valid_tsquery_text`, `_canonical_pg_lsn`, `_VERIFIED_TEXT_KINDS`, and
+`_OBSCURE_EXTENSIONS` do not occur in the implementation. The pre-existing
+multirange codec is the standing range/multirange directive and is separate from
+the removed Round 8 opaque-type grammar.
+
+### PostgreSQL-generated corpus: exact text or refusal
+
+`tests/support/fix9_opaque.py` creates and populates every case by executing
+PostgreSQL expressions on the source; expected values are read back as
+`value::text`, never hand-written. The corpus contains 46 rows:
+
+| PostgreSQL type(s) | Local DuckDB | Real MotherDuck |
+|---|---|---|
+| `tsquery`, `jsonpath`, `pg_lsn`, `tsvector`, `xml`, `cidr`, `macaddr`, `macaddr8` (32 rows) | every destination `(id, value)` exactly equals source `(id, value::text)` | same exact equality |
+| `money` (4), `inet` (6) | non-NULL values refuse; no destination table; durable refusal reaches `quarantined` | same |
+| `int2vector` (4) | stock list-shaped delivery refuses; no destination table; durable refusal reaches `quarantined` | same |
+
+The `money` and `inet` refusals are intentional: PostgreSQL 18's literal
+`money::text` retains currency formatting while stock Debezium exposes the
+numeric spelling, and stock `inet` text loses default host masks (`/32` or
+`/128`). Storing those connector spellings as if they were source `::text`
+would be silent corruption. The tests run four attempts so the three durable
+value refusals quarantine independently and the remaining exact corpus can
+finish. Both runtimes passed the same generated source comparison.
+
+The PostgreSQL 18 catalog sweep is source-derived rather than an exemplar list:
+it found **76** non-array `pg_catalog` base/multirange rows, with **44** direct
+native decisions (including six multiranges and the allowlisted opaque DDL
+types) and **32** loud `UnsupportedType` refusals. The value seam additionally
+refuses non-NULL `money`, `inet`, and list-shaped `int2vector`; no type is
+admitted with a value different from the source representation. Arrays are
+covered recursively through their element descriptors. The source sweep and
+value checks pass in the local PostgreSQL lane; the generated corpus passes on
+both runtimes.
+
+### Table-scoped refusal, bounded retry, and slot progress
+
+`input_fingerprint(event)` excludes operation/transaction/LSN metadata while
+including the qualified table, key, row image, and descriptor fingerprints. A
+first refusal is durable `pending`. If automatic recovery reads the identical
+durable input again, `record_schema_refusal` atomically changes that table to
+`quarantined`, removes it from the automatic snapshot queue, writes the durable
+`schema_quarantine` table event, and makes later repeats a no-op. The planner
+loads this state per table and skips only quarantined rows; healthy co-published
+tables remain eligible. The resnapshot batcher retries pending refusals as
+single-table work and then runs the remaining healthy tables.
+
+The exact three-run bad/healthy scenario is in
+`test_identical_refusal_quarantines_one_table_and_advances_a_healthy_peer`:
+
+1. Run 1 refuses `bad_opaque`, records `pending`, and leaves the healthy peer
+   owed rather than falsely acknowledging either table.
+2. Run 2 re-reads the same durable bad row, records the same fingerprint, moves
+   only `bad_opaque` to durable `quarantined`, changes its table lifecycle to
+   `none`, and emits exactly one `schema_quarantine` event.
+3. Run 3 skips the quarantined table, creates and durably writes
+   `healthy_peer`, advances the durable offset to LSN 110, and does not create
+   the bad destination table.
+
+This proves the permanent refusal is bounded to two attempts, does not consume
+the healthy table's slot after quarantine, and permits WAL progress. The local
+and MotherDuck generated-corpus runs exercise the same durable quarantine route
+for `money`, `inet`, and `int2vector`.
+
+### Round 8 findings and scope
+
+The cache-key generation fence and scalar SQL pinning remain unchanged and
+passed their mutation probes. R8's transport-verification finding is closed by
+the strict decode-or-refuse seam; its dead duplicate/fallback branches are gone
+and opaque admission is OID-authoritative. The exact orphan slots
+`probe_15434_p2b_n4_baseline` and `probe_15434_p2b_n4_baseline_stages` were
+removed. No identity migration, legacy sidecar, compatibility candidate lookup,
+or cross-build backfill was added; that user-excluded class remains out of
+scope. No forked Debezium artifact, custom converter/SMT, or Java/Gradle/Maven
+project was used.
+
+The R8 sub-findings are closed explicitly: **R8-1 (BLOCKER)** has no grammar
+recognisers and uses strict decode-or-refuse; **R8-2 (MAJOR)** refuses the wrong
+`int2vector` list shape and carries only verified text; **R8-3 (MINOR)** removes
+the unverified `_VERIFIED_TEXT_KINDS` plain-string admission; **R8-4 (NIT)**
+removes the dead `_OBSCURE_EXTENSIONS`/unreachable fallback branches; and
+**R8-5 (NIT)** was handled by removing the two exact orphan 15434 probe slots.
+
+### Final required lanes
+
+All commands used this clone's native PostgreSQL 18 instance on port **15434**;
+no Docker or alternate PostgreSQL port was used:
+
+| Lane | Result |
+|---|---:|
+| `CDC_TEST_PGPORT=15434 make test` | **1622 passed** |
+| `CDC_TEST_PGPORT=15434 make test-slow` | **138 passed** |
+| `CDC_TEST_PGPORT=15434 make test-md` | **33 passed** |
+| `CDC_TEST_PGPORT=15434 make lint` | **All checks passed** |
+
+The final focused Round 9 regression file has **41 passed** tests. The only
+deliberately unclosed item is the binding 2.6 marker-preserving 5/5 path; no
+other Round 9 claim is being made beyond the evidence above.

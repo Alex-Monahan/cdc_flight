@@ -130,7 +130,7 @@ from .config import (
 )
 from .debezium_props import build_properties
 from .destination import ResumePoint
-from .errors import EngineFailure
+from .errors import EngineFailure, SchemaEvolutionRefused
 from .naming import control_table, quote
 from .ownership import DestinationOwnership
 from .resnapshot_projection import ProjectionEvent
@@ -159,6 +159,7 @@ class ResnapshotOutcome:
     emptied: list[str] = field(default_factory=list)
     logged_drops: list[str] = field(default_factory=list)
     dropped: list[str] = field(default_factory=list)
+    quarantined: list[str] = field(default_factory=list)
     consistent_lsn: int | None = None
     slot_consistent_lsn: int | None = None
     snapshot_record_lsn: int | None = None
@@ -177,6 +178,7 @@ class ResnapshotOutcome:
             "resnapshot_emptied": self.emptied,
             "resnapshot_logged_drops": self.logged_drops,
             "resnapshot_dropped": self.dropped,
+            "resnapshot_quarantined": self.quarantined,
             "resnapshot_consistent_lsn": self.consistent_lsn,
             "resnapshot_slot_consistent_lsn": self.slot_consistent_lsn,
             "resnapshot_snapshot_record_lsn": self.snapshot_record_lsn,
@@ -198,8 +200,18 @@ class ResnapshotOutcome:
             - set(self.emptied)
             - set(self.logged_drops)
             - set(self.dropped)
+            - set(self.quarantined)
         )
 
+def _schema_refusal_cause(error: BaseException) -> SchemaEvolutionRefused | None:
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, SchemaEvolutionRefused):
+            return current
+        current = current.__cause__ or current.__context__
+    return None
 
 def _record_snapshot_swap_audit(
     con,
@@ -634,6 +646,29 @@ def run(
                 terminal=outcome,
                 control_schema=control_schema,
             )
+            refused = _schema_refusal_cause(exc)
+            durable_quarantine = dest_mod.quarantined_tables(
+                con, pipeline, control_schema=control_schema
+            )
+            quarantined_requested = sorted(
+                qualified
+                for qualified in outcome.requested
+                if qualified in durable_quarantine
+            )
+            if refused is not None and quarantined_requested:
+                outcome.quarantined = quarantined_requested
+                outcome.engine_stop_reason = "schema_refusal_quarantined"
+                outcome.reason = (
+                    "identical durable input refused again; the table is durably "
+                    "quarantined and healthy co-published tables may proceed"
+                )
+                assert_every_requested_table_completed(outcome)
+                recovery.consume()
+                log.error(
+                    "RE-SNAPSHOT quarantined %s after deterministic schema refusal",
+                    ", ".join(quarantined_requested),
+                )
+                return outcome
             recovery.consume()
         raise
     finally:
@@ -663,20 +698,22 @@ def reassert_owed(
     terminal: ResnapshotOutcome,
     control_schema: str | None = None,
 ) -> list[str]:
-    """Put every non-terminal requested table back on the durable to-do list.
-
-    The two terminal states are `swapped` (a complete image with a published
-    watermark) and `emptied` (verified empty at the source). Everything else has to be
-    `awaiting_snapshot` when this function returns, whatever intermediate state the
-    engine left it in, or the next run cannot know it is owed.
-    """
+    """Reassert non-terminal requested tables, excluding terminal/quarantined ones."""
     finished = (
         set(terminal.swapped)
         | set(terminal.emptied)
         | set(terminal.logged_drops)
         | set(terminal.dropped)
+        | set(terminal.quarantined)
     )
-    owed = [t for t in tables if f"{t[0]}.{t[1]}" not in finished]
+    durable_quarantine = dest_mod.quarantined_tables(
+        con, pipeline, control_schema=control_schema
+    )
+    owed = [
+        t for t in tables
+        if f"{t[0]}.{t[1]}" not in finished
+        and f"{t[0]}.{t[1]}" not in durable_quarantine
+    ]
     if not owed:
         return []
     dest_mod.request_snapshot(

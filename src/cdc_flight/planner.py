@@ -21,7 +21,11 @@ for the table, so what they read is genuinely the pre-group state.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import logging
+from collections.abc import Mapping
 
 from . import apply_sql, catalog_support, destination, naming, table_work
 from .assembler import UNIT_CONTROL, UNIT_SNAPSHOT_CHUNK, CompleteUnit
@@ -33,6 +37,45 @@ from .table_work import TableWork
 from .typed_types import InvalidTypedValue, UnsupportedType, native_type
 
 log = logging.getLogger("cdc_flight.planner")
+
+
+def _fingerprintable(value):
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return {"__bytes__": base64.b64encode(bytes(value)).decode("ascii")}
+    if isinstance(value, Mapping):
+        return {
+            str(key): _fingerprintable(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_fingerprintable(item) for item in value]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return {"__repr__": repr(value)}
+
+
+def input_fingerprint(event: PendingRecord) -> str:
+    """Identify the durable row image that caused a value refusal.
+
+    PostgreSQL operation, transaction, order, and LSN metadata are intentionally not
+    included: an automatic re-snapshot represents the same row with a different
+    Debezium operation.  Type-descriptor fingerprints remain part of the evidence so
+    a later source schema epoch is not mistaken for the same input.
+    """
+
+    image = event.after if event.op != "d" else event.before
+    descriptors = getattr(event, "after_descriptors", {})
+    payload = {
+        "table": event.qualified_table,
+        "key": _fingerprintable(event.key),
+        "image": _fingerprintable(image),
+        "descriptors": {
+            str(name): getattr(descriptor, "fingerprint", repr(descriptor))
+            for name, descriptor in sorted(descriptors.items())
+        },
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=repr)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 class GroupPlan:
@@ -60,6 +103,7 @@ class GroupPlan:
         toast_admission_end_provider=None,
         binary_handling_mode: str = "base64",
         hstore_handling_mode: str = "map",
+        pipeline: str | None = None,
         control_schema: str | None = None,
     ):
         self.con = con
@@ -79,7 +123,16 @@ class GroupPlan:
         self.toast_admission_end_provider = toast_admission_end_provider
         self.binary_handling_mode = binary_handling_mode
         self.hstore_handling_mode = hstore_handling_mode
+        self.pipeline = pipeline or ""
         self._control_schema = control_schema
+        # A quarantined table is a durable refusal terminal.  Read the set once at
+        # plan construction so the entire PostgreSQL transaction is folded with one
+        # stable admission decision, while healthy co-published tables still fold.
+        self.quarantined_tables = (
+            destination.quarantined_tables(con, self.pipeline, control_schema=control_schema)
+            if con is not None and self.pipeline
+            else set()
+        )
         self.watermark_fenced_events = 0
         self._catalog_descriptor_cache: dict[str, dict] = {}
         #: The assembler's unit id is the stable PostgreSQL transaction id, even when
@@ -95,6 +148,7 @@ class GroupPlan:
             "first_lsn": None,
             "last_lsn": None,
             "max_source_ts": None,
+            "quarantined_events": 0,
         }
         #: `_cdc_flight.table_events` rows this plan produced, in source order
         self.table_events: list[dict] = []
@@ -225,6 +279,15 @@ class GroupPlan:
         """
         if not event.schema or not event.table:
             return
+        if event.qualified_table in self.quarantined_tables:
+            # The source transaction remains whole and is still acknowledged only
+            # after the normal commit-group durability protocol.  We simply omit this
+            # table's row work; healthy tables in the same PostgreSQL transaction keep
+            # folding normally, and the resume point advances over the quarantined
+            # input instead of retaining WAL forever.
+            self._count_event(event)
+            self.stats["quarantined_events"] += 1
+            return
         if target is None:
             target = (
                 snapshot.shadow
@@ -312,6 +375,7 @@ class GroupPlan:
                 source_table=event.table,
                 target=target,
                 detected_lsn=event.lsn,
+                input_fingerprint=input_fingerprint(event),
             ) from exc
         table_work.collect(item, event, row, event_id, probe=self, patch=patch)
         image = event.after if event.op != "d" else event.before

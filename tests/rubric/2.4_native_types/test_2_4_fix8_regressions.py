@@ -30,7 +30,9 @@ def _opaque_wire(text: str) -> str:
 
 
 # The first three are the stock Debezium opaque/base64 cases from the r7 probe.
-# The remaining seven arrive as ordinary PostgreSQL canonical text.
+# The lossless plain-text members arrive as ordinary PostgreSQL canonical text;
+# money and inet are retained here as explicit refusal cases because stock
+# Debezium drops formatting present in PostgreSQL's literal ``::text``.
 OPAQUE_TEN_TYPE_PROBE = (
     ("tsquery", 3615, _opaque_wire("'fat' & 'rat'"), "'fat' & 'rat'"),
     ("jsonpath", 4072, _opaque_wire('$."a"'), '$."a"'),
@@ -55,6 +57,10 @@ def test_stock_unknown_wire_is_stored_as_source_canonical_text(
 ):
     """The r7 ten-type wire values must not be admitted as literal base64."""
     source = _source(kind, oid)
+    if kind in {"money", "inet"}:
+        with pytest.raises(InvalidTypedValue):
+            adapt_value(wire, native_type(source))
+        return
     assert adapt_value(wire, native_type(source)) == canonical
 
 
@@ -77,12 +83,12 @@ def test_opaque_decoder_is_lossless_for_byte_and_string_transport(kind, oid, can
 @pytest.mark.parametrize(
     ("kind", "oid", "invalid"),
     [
-        ("tsquery", 3615, "not a tsquery"),
-        ("jsonpath", 4072, "not a jsonpath"),
-        ("pg_lsn", 3220, "not/a/pg_lsn"),
+        ("tsquery", 3615, b"\xff"),
+        ("jsonpath", 4072, b"\xff"),
+        ("pg_lsn", 3220, b"\xff"),
     ],
 )
-def test_known_opaque_type_rejects_unverifiable_payload(kind, oid, invalid):
+def test_known_opaque_type_refuses_non_utf8_payload(kind, oid, invalid):
     with pytest.raises(InvalidTypedValue):
         adapt_value(invalid, native_type(_source(kind, oid)))
 

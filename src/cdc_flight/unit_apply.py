@@ -69,6 +69,7 @@ def apply_units(
             if applier.catalog is not None
             else applier.hstore_handling_mode
         ),
+        pipeline=applier.pipeline,
         control_schema=applier.control_schema,
     )
     for unit in group:
@@ -103,6 +104,7 @@ def apply_units(
     applier.truncates_applied += plan.truncates_applied
     applier.truncates_logged += plan.truncates_logged
     applier.watermark_fenced_events += plan.watermark_fenced_events
+    applier.quarantined_events += stats.get("quarantined_events", 0)
     if applier.group.is_snapshot and stats.get("last_lsn"):
         applier.last_snapshot_lsn = stats["last_lsn"]
     applier.group.source_tables |= plan.source_tables
