@@ -460,6 +460,7 @@ def run(
                 replicated=catalog_mod.seed_from_table_state(
                     con, dest.pipeline_name, control_schema=control_schema
                 ),
+                gone=catalog_mod.gone_from_table_state(con, dest.pipeline_name, control_schema=control_schema),
                 unrelatable=set(baseline.unmarked),
                 poll_seconds=catalog_cfg.poll_seconds,
                 emit_marker=catalog_cfg.emit_marker,
@@ -631,7 +632,7 @@ def run(
                     ownership=ownership,
                     new_relations={relation.qualified for relation in discovered},
                     drop_mode=applier_cfg.drop_mode,
-                    control_schema=control_schema,
+                    control_schema=control_schema, catalog=watcher,
                     resnapshot_run=resnapshot_mod.run,
                 )
             )
@@ -898,7 +899,6 @@ def shutdown_and_exit(code: int = 0, timeout: float = 15.0) -> None:
     watchdog.start()
     try:
         import jpype
-
         if jpype.isJVMStarted():
             jpype.shutdownJVM()
     except Exception:

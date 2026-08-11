@@ -135,8 +135,13 @@ def test_real_multirange_four_step_omission_is_a_loud_automatic_refusal(sandbox)
         update = run_refused()
         sandbox.sql("DELETE FROM app.multirange_probe_refusal WHERE id = 1")
         delete = run_refused()
-        assert all(item["returncode"] != 0 for item in (insert, update, delete))
-
+        # A positive source-fingerprint change may authorize one current-source
+        # rebuild. If the same omitted schema shape is still observed afterwards,
+        # the next refusal must reach terminal quarantine again.
+        repeat = run_refused()
+        assert all(
+            item["returncode"] != 0 for item in (insert, update, delete, repeat)
+        )
         assert sandbox.duck_query(
             "SELECT state, refusal_class FROM _cdc_flight.schema_refusals WHERE "
             "source_schema = 'app' AND source_table = 'multirange_probe_refusal'"

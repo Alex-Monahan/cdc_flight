@@ -823,7 +823,7 @@ CREATE TABLE IF NOT EXISTS _cdc_flight.table_state (
     key_columns     VARCHAR[],
     snapshot_state  VARCHAR     NOT NULL,   -- none|in_progress|complete|awaiting_snapshot
                                             -- rev 9: this is `machines.TABLE_LIFECYCLE`,
-                                            --  with `absent` as the pseudo-state for "no
+                                            --  with `absent`/`gone` as pseudo-states for "no
                                             --  row". ONE writer (`table_lifecycle.py`),
                                             --  every write edge-checked, every read
                                             --  parsed. See §20/A55 and §A51.1.
@@ -2691,7 +2691,7 @@ var" with "the slot was externally advanced", and the rubric's band is a *count*
 
 **`table_lifecycle`** — Does this destination table hold a trustworthy image of its source relation, and if not, who owes the work?
 
-persistence: `_cdc_flight.table_state.snapshot_state` · initial: `absent` · terminal: `absent`, `complete`
+persistence: `_cdc_flight.table_state.snapshot_state` · initial: `absent` · terminal: `absent`, `complete`, `gone`
 
 | from | to | terminal |
 |---|---|---|
@@ -2701,6 +2701,7 @@ persistence: `_cdc_flight.table_state.snapshot_state` · initial: `absent` · te
 | `awaiting_snapshot` | `absent` | yes |
 | `awaiting_snapshot` | `awaiting_snapshot` | no |
 | `awaiting_snapshot` | `complete` | yes |
+| `awaiting_snapshot` | `gone` | yes |
 | `awaiting_snapshot` | `in_progress` | no |
 | `awaiting_snapshot` | `none` | no |
 | `complete` | `absent` | yes |
@@ -2716,6 +2717,8 @@ persistence: `_cdc_flight.table_state.snapshot_state` · initial: `absent` · te
 | `none` | `awaiting_snapshot` | no |
 | `none` | `in_progress` | no |
 | `none` | `none` | no |
+| `gone` | `absent` | yes |
+| `gone` | `awaiting_snapshot` | no |
 
 **`run_phase`** — Where is this run right now, readable from the destination while it runs?
 
@@ -2943,6 +2946,7 @@ persistence: `_cdc_flight.schema_refusals.state` · initial: `absent` · termina
 | `resolved` | `resolved` | yes |
 | `quarantined` | `quarantined` | no |
 | `quarantined` | `pending` | no |
+| `quarantined` | `resolved` | yes |
 
 **`catalog_baseline`** — Can the relation identities this run observes be related to the rows the destination already holds, or must they be reconciled before they are adopted?
 
@@ -3394,7 +3398,7 @@ transition table.
 
 | machine | owns | states | edges | persistence |
 |---|---|---|---|---|
-| `table_lifecycle` | is this destination table a trustworthy image, and who owes the work | 5 | 21 | `_cdc_flight.table_state.snapshot_state` |
+| `table_lifecycle` | is this destination table a trustworthy image, and who owes the work | 6 | 24 | `_cdc_flight.table_state.snapshot_state` |
 | `run_phase` | where is this run, readable from the destination while it runs | 9 | 24 | `_cdc_flight.heartbeat.phase` |
 | `run_outcome` | why did this run stop — cause before symptom | 10 | 45 (a **precedence**: escalations only) | `heartbeat.terminal_reason`, `last_run.json` |
 | `acquisition_recovery` | what has this destructive recovery already done | 5 | 9 | `_cdc_flight.recovery_state.phase` |
@@ -3403,7 +3407,7 @@ transition table.
 | `catalog_change` | where is one DDL fact in observe → confirm → fence → apply | 9 | 31 | **memory only** |
 | `publication_admission` | has a discovered relation been admitted to the publication, and who owns that decision | 6 | 23 | `_cdc_flight.source_relations.admission_state` |
 | `catalog_schema_liveness` | is a watched schema visibly queryable before absence can mean a drop | 4 | 16 | **memory only** |
-| `schema_refusal` | has a refused schema transition acquired a durable remediation obligation | 4 | 8 | `_cdc_flight.schema_refusals.state` |
+| `schema_refusal` | has a refused schema transition acquired a durable remediation obligation | 4 | 9 | `_cdc_flight.schema_refusals.state` |
 | `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
 | `snapshot_completion` | have all ordered snapshot callbacks arrived | 6 | 9 | **memory only** |
 | `runtime_root_lifecycle` | is the disposable root reusable or committed to cleanup | 6 | 10 | project-local root and parent markers |

@@ -78,6 +78,16 @@ class UnsafeDebeziumProperty(RuntimeError):
     """
 
 
+class TypedValueError(ValueError):
+    """A declared source value cannot cross the typed destination boundary.
+
+    ``UnsupportedType`` and ``InvalidTypedValue`` are deliberately different
+    diagnostics, but they are one containment class.  Every admission boundary
+    catches this base so adding a sibling typed-value error cannot bypass the
+    refusal architecture.
+    """
+
+
 # --------------------------------------------------------------------------- #
 # transactional applier (ADR 0001 §3, §4)
 # --------------------------------------------------------------------------- #

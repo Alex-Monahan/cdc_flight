@@ -123,11 +123,15 @@ class SourceHealth:
     _last: SlotSample | None = field(default=None, repr=False)
     _not_streaming_since: float | None = field(default=None, repr=False)
     _streaming_since: float | None = field(default=None, repr=False)
-    _lag_decreased_at: float | None = field(default=None, repr=False)
+    _stream_interruptions: int = field(default=0, repr=False)
+    _interruption_confirmed_pos: int | None = field(default=None, repr=False)
+    _recovered_after_interruption: bool = field(default=False, repr=False)
+    _lag_stable_since: float | None = field(default=None, repr=False)
     _prev_lag: int | None = field(default=None, repr=False)
     #: when the sampler last started failing outright, and whether it ever worked
     _unknown_since: float | None = field(default=None, repr=False)
     _ever_sampled: bool = field(default=False, repr=False)
+    _ever_streamed: bool = field(default=False, repr=False)
     _unknown_samples: int = field(default=0, repr=False)
 
     # -- lifecycle ---------------------------------------------------------- #
@@ -154,7 +158,29 @@ class SourceHealth:
         network, and they are the ones TODO 4.6(b) is about.
         """
         with self._lock:
+            was_streaming = self._last is not None and self._last.streaming
+            if (
+                was_streaming
+                and not sample.streaming
+                # Slot creation/snapshot startup can briefly attach and detach
+                # before PostgreSQL has published any confirmed position. That is
+                # not a delivery interruption; counting it would fail closed on
+                # every fresh snapshot run.
+                and self._last.confirmed_pos is not None
+            ):
+                self._stream_interruptions += 1
+                self._interruption_confirmed_pos = self._last.confirmed_pos
+                self._recovered_after_interruption = False
+            elif (
+                self._interruption_confirmed_pos is not None
+                and sample.streaming
+                and sample.confirmed_pos is not None
+                and sample.confirmed_pos > self._interruption_confirmed_pos
+            ):
+                self._recovered_after_interruption = True
             self._last = sample
+            if sample.streaming:
+                self._ever_streamed = True
             # `unknown` used to be treated as "streaming" here, which RESET the
             # not-streaming clock: a blackholed Postgres therefore reported
             # `not_streaming_for == 0` and `run_engine_bounded`'s --max-seconds
@@ -179,16 +205,16 @@ class SourceHealth:
             else:
                 self._streaming_since = None
 
-            # "Still catching up" == the backlog is shrinking. A backlog that
-            # has stopped shrinking means nothing more is coming, even when it
-            # is large (see `may_declare_idle`).
+            # A backlog is stable only while its value is unchanged. The old
+            # ``lag_decreased_at`` clock was not reset when lag INCREASED, so a
+            # continuously growing source could eventually be misclassified as a
+            # flat, finished backlog. That was the remaining false-green shape in
+            # the walsender probe.
             lag = sample.lag_bytes
-            if lag is not None and self._prev_lag is not None and lag < self._prev_lag:
-                self._lag_decreased_at = sample.at
             if lag is not None:
+                if self._prev_lag is None or lag != self._prev_lag:
+                    self._lag_stable_since = sample.at
                 self._prev_lag = lag
-            if self._lag_decreased_at is None:
-                self._lag_decreased_at = sample.at
 
     # -- sampling ----------------------------------------------------------- #
     def sample_once(self) -> SlotSample:
@@ -259,6 +285,18 @@ class SourceHealth:
             return time.monotonic() - self._streaming_since
 
     @property
+    def stream_interruptions(self) -> int:
+        """Number of observed streaming -> non-streaming transitions this run."""
+        with self._lock:
+            return self._stream_interruptions
+
+    @property
+    def recovered_after_interruption(self) -> bool:
+        """Whether confirmed WAL advanced after the last observed interruption."""
+        with self._lock:
+            return self._recovered_after_interruption
+
+    @property
     def unknown_for(self) -> float:
         """Seconds the source has continuously been *unaskable*.
 
@@ -282,12 +320,18 @@ class SourceHealth:
             return self._ever_sampled
 
     @property
-    def lag_steady_for(self) -> float:
-        """Seconds since the slot's backlog last got smaller."""
+    def ever_streamed(self) -> bool:
+        """True once a walsender has actually been observed on this slot."""
         with self._lock:
-            if self._lag_decreased_at is None:
+            return self._ever_streamed
+
+    @property
+    def lag_steady_for(self) -> float:
+        """Seconds since the slot's observed backlog last changed."""
+        with self._lock:
+            if self._lag_stable_since is None:
                 return 0.0
-            return time.monotonic() - self._lag_decreased_at
+            return time.monotonic() - self._lag_stable_since
 
     def wait_for_confirmed(self, target: int, *, timeout: float) -> bool:
         """Wait while the live connector publishes a durable LSN to PostgreSQL.
@@ -418,12 +462,29 @@ class SourceHealth:
             return False  # not sampled yet - the run has barely started
         if sample.unknown:
             return not self._ever_sampled
+        # ``streaming_for`` is derived from the last observed transition.  A stale
+        # active sample cannot prove that the walsender is still attached: the
+        # walsender-kill path can release the slot immediately after that sample and
+        # Debezium then sits in its restart backoff while the supervisor's idle timer
+        # expires.  Require a recent successful observation before accepting the
+        # continuously-streaming proof; the sampler will publish the inactive state
+        # on its next bounded poll instead of allowing stale state to become success.
+        if time.monotonic() - sample.at > max(self.interval * 3.0, 1.0):
+            return False
         # (1) A walsender must have been attached to our slot for the whole quiet
         #     window. This is the signal that catches the B5 failure: during a
         #     retriable restart the slot is released, and the connector briefly
         #     re-attaches between attempts - so a point-in-time check is not
         #     enough, but a sustained one is.
         if self.streaming_for < min_seconds:
+            return False
+        # A reconnect is not completion evidence.  In particular, a walsender can
+        # attach again while Debezium is still in its retry path; accepting even a
+        # briefly small backlog there resurrects the original B5 bug when the source
+        # writer is still ahead of the next sampler observation.  Once the confirmed
+        # position has advanced after the interruption, the ordinary lag-stability
+        # proof applies again.
+        if self._stream_interruptions and not self._recovered_after_interruption:
             return False
         # (2) And the backlog must either be gone, or have stopped shrinking.
         #     MEASURED: after a reconnect, `confirmed_flush_lsn` stops tracking
@@ -449,7 +510,10 @@ class SourceHealth:
                 "slot_error": sample.error,
                 "slot_unknown_for_sec": round(self.unknown_for, 1),
                 "slot_ever_sampled": self.ever_sampled,
+                "slot_ever_streamed": self.ever_streamed,
                 "slot_not_streaming_for_sec": round(self.not_streaming_for, 1),
+                "slot_stream_interruptions": self.stream_interruptions,
+                "slot_recovered_after_interruption": self.recovered_after_interruption,
             }
         return {
             "slot_health": self.state(),
@@ -458,7 +522,10 @@ class SourceHealth:
             "slot_confirmed_pos": sample.confirmed_pos,
             "slot_lag_bytes": sample.lag_bytes,
             "slot_streaming_for_sec": round(self.streaming_for, 1),
+            "slot_ever_streamed": self.ever_streamed,
             "slot_lag_steady_for_sec": round(self.lag_steady_for, 1),
+            "slot_stream_interruptions": self.stream_interruptions,
+            "slot_recovered_after_interruption": self.recovered_after_interruption,
             **(
                 {
                     "source_marker": self.source_marker.summary()

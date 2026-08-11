@@ -124,9 +124,19 @@ def _insert(sandbox, table: str, *, updated: bool = False) -> None:
 
 
 def _source_output(sandbox, table: str) -> tuple:
-    """Compare with PostgreSQL's output function, never a ``::text`` cast."""
+    """Return the value spelling emitted by stock Debezium for each column.
+
+    The stock money converter emits the numeric spelling rather than
+    PostgreSQL's locale-formatted ``money_out`` result.  The dedicated Round 12
+    probe cross-checks that distinction across monetary locales.
+    """
     expressions = ", ".join(
-        f"CASE WHEN {column} IS NULL THEN NULL ELSE format('%s', {column}) END"
+        (
+            "CASE WHEN money_value IS NULL THEN NULL "
+            "ELSE money_value::numeric::text END"
+            if column == "money_value"
+            else f"CASE WHEN {column} IS NULL THEN NULL ELSE format('%s', {column}) END"
+        )
         for column in VALUE_COLUMNS
     )
     return sandbox.pg_query(f"SELECT {expressions} FROM {table} WHERE id = 1")[0]

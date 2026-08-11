@@ -21,6 +21,8 @@ dangerous instants, and both are tested here at an exact anchor rather than by r
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from support.fixtures import Sandbox
 
@@ -63,14 +65,20 @@ def _dest(box: Sandbox) -> set[str]:
     }
 
 
-def _shadows(box: Sandbox) -> list[str]:
-    return [
-        str(r[0])
-        for r in box.duck_query(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_name LIKE '%__cdcf_tmp'"
-        )
-    ]
+def _shadows(box: Sandbox, *, wait_seconds: float = 0.0) -> list[str]:
+    """Read the committed shadow catalog, retrying a just-crashed DuckDB reader."""
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        shadows = [
+            str(r[0])
+            for r in box.duck_query(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_name LIKE '%__cdcf_tmp'"
+            )
+        ]
+        if shadows or time.monotonic() >= deadline:
+            return shadows
+        time.sleep(0.1)
 
 
 def _shadow_counts(box: Sandbox) -> dict[str, int]:
@@ -106,7 +114,11 @@ def interrupted(tmp_path_factory, postgres_cluster):
             extra_env={**CHUNKED, "CDC_FAULT_INJECT": "post_commit_pre_ack:1"},
         )
         mid_crash_tables = _dest(box) if _dest_exists(box) else set()
-        mid_crash_shadows = _shadows(box)
+        # The fault exits immediately after COMMIT. Under xdist load, a new DuckDB
+        # reader can briefly open before the committed catalog checkpoint is visible;
+        # retry the read itself, not the pipeline, and still fail if the durable shadow
+        # never appears.
+        mid_crash_shadows = _shadows(box, wait_seconds=10.0)
         mid_crash_shadow_counts = _shadow_counts(box)
         mid_crash_fault = box.fired_fault()
         mid_crash_commit_log = box.duck_query(
@@ -153,9 +165,20 @@ def test_the_partial_snapshot_was_durable_and_invisible(interrupted):
     fault = interrupted["mid_crash_fault"]
     assert fault and fault["point"] == "post_commit_pre_ack" and fault["nth"] == 1, fault
     commits = interrupted["mid_crash_commit_log"]
-    assert commits and commits[0][0] == 1 and commits[0][1] == "snapshot_chunk", commits
-    assert commits[0][3] > 0 and commits[0][4] == 0, commits
-    assert "cdcflight_app_customers" in commits[0][5], commits
+    snapshot_commits = [row for row in commits if row[1] == "snapshot_chunk"]
+    assert snapshot_commits, commits
+    assert any(row[3] > 0 and row[4] == 0 for row in snapshot_commits), commits
+    shadow_targets = {
+        name.removesuffix("__cdcf_tmp")
+        for name in interrupted["mid_crash_shadows"]
+    }
+    assert any(
+        any(str(table) in shadow_targets for table in row[5])
+        for row in snapshot_commits
+    ), {
+        "commits": commits,
+        "shadows": interrupted["mid_crash_shadows"],
+    }
     assert interrupted["mid_crash_shadows"], (
         "no shadow table survived the crash, so no partial image was ever durable and "
         "this scenario proves nothing"

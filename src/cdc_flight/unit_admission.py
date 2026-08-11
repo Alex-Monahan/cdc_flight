@@ -9,7 +9,7 @@ from . import table_lifecycle
 from .assembler import UNIT_SNAPSHOT_CHUNK, UNIT_TXN
 from .config import DROP_LOG
 from .envelope import KIND_SNAPSHOT_BOUNDARY
-from .errors import SchemaShapeUnexplained
+from .errors import SchemaEvolutionRefused
 from .snapshot_completion import SnapshotObservationError
 
 log = logging.getLogger("cdc_flight.unit_admission")
@@ -22,7 +22,7 @@ def add_unit(applier, unit) -> None:
     if applier.catalog is not None:
         try:
             applier.catalog.observe_unit(unit)
-        except SchemaShapeUnexplained as refused:
+        except SchemaEvolutionRefused as refused:
             refused.detected_lsn = (
                 refused.detected_lsn or unit.commit_lsn or unit.last_lsn or None
             )

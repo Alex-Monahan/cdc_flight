@@ -5,6 +5,10 @@ from __future__ import annotations
 from . import destination
 from .catalog_descriptors import source_relation_fingerprint
 from .errors import SchemaEvolutionRefused
+from .resnapshot_source_policy import (
+    discharge_quarantined_source_missing,
+    gather_emptiness_evidence,
+)
 
 
 def run_owed(
@@ -26,12 +30,14 @@ def run_owed(
     new_relations: set[str],
     drop_mode: str,
     control_schema: str | None,
+    catalog=None,
     resnapshot_run,
 ) -> tuple[list[dict], dict, int]:
     """Retry pending refusals alone, then rebuild healthy tables together."""
     quarantined_names = destination.quarantined_tables(
         con, pipeline, control_schema=control_schema
     )
+    discharged_names: set[str] = set()
     for schema, table, target in owed:
         if f"{schema}.{table}" in quarantined_names:
             # A new run is not a retry trigger.  Re-enter only on positive source
@@ -40,7 +46,7 @@ def run_owed(
             source_exists, source_fingerprint = source_relation_fingerprint(
                 source.dsn, schema, table
             )
-            if destination.quarantine_retry_allowed(
+            retry_allowed = destination.quarantine_retry_allowed(
                 con,
                 pipeline=pipeline,
                 source_schema=schema,
@@ -48,7 +54,31 @@ def run_owed(
                 source_exists=source_exists,
                 source_fingerprint=source_fingerprint,
                 control_schema=control_schema,
-            ):
+            )
+            if retry_allowed and not source_exists:
+                # Positive absence is a terminal discharge, never a trigger for a
+                # throwaway snapshot of a relation that no longer exists.
+                evidence = gather_emptiness_evidence(
+                    source.dsn,
+                    pending=[(schema, table, target)],
+                    snapshot_phase_ended=True,
+                    tables_seen=set(),
+                )
+                discharged_names.update(
+                    discharge_quarantined_source_missing(
+                        con,
+                        pipeline=pipeline,
+                        dataset=dataset,
+                        tables=[(schema, table, target)],
+                        evidence=evidence,
+                        namespace=namespace,
+                        snapshot_epoch=epoch_base,
+                        control_schema=control_schema,
+                    )
+                )
+                if catalog is not None:
+                    catalog.forget(f"{schema}.{table}")
+            elif retry_allowed:
                 # The owed marker remains durable before the throwaway snapshot reads
                 # current source state.
                 destination.reactivate_schema_refusal(
@@ -72,10 +102,18 @@ def run_owed(
         f"{table[0]}.{table[1]}" for batch in retry_batches for table in batch
     }
     remaining = [
-        table for table in owed if f"{table[0]}.{table[1]}" not in retry_names
+        table for table in owed
+        if f"{table[0]}.{table[1]}" not in retry_names
+        and f"{table[0]}.{table[1]}" not in quarantined_names
+        and f"{table[0]}.{table[1]}" not in discharged_names
     ]
     batches = [*retry_batches, *([remaining] if remaining else [])]
     passes: list[dict] = []
+    if discharged_names:
+        passes.append({
+            "source_missing_discharged": sorted(discharged_names),
+            "resnapshot_cancelled": True,
+        })
     snapshot_epoch = epoch_base
     for batch in batches:
         batch_names = ", ".join(f"{schema}.{table}" for schema, table, _ in batch)

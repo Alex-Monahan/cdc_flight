@@ -98,6 +98,7 @@ AWAITING_SNAPSHOT = "awaiting_snapshot"
 SNAPSHOT_NONE = table_lifecycle.NONE
 SNAPSHOT_IN_PROGRESS = table_lifecycle.IN_PROGRESS
 SNAPSHOT_COMPLETE = table_lifecycle.COMPLETE
+SNAPSHOT_GONE = table_lifecycle.GONE
 SNAPSHOT_STATES = LIFECYCLE_DURABLE_VALUES
 
 #: States that mean "this table does not hold a trustworthy image of the source".
@@ -553,6 +554,13 @@ def record_schema_refusal(
             before == REFUSAL_PENDING and fingerprint == stored_fingerprint
         )
         if repeated_input:
+            # A retry may reach this writer through a source-catalog path that has
+            # no new fingerprint. Preserve the first positive fingerprint instead
+            # of replacing it with NULL: otherwise the next run mistakes the same
+            # unchanged relation for repaired evidence and reactivates quarantine.
+            recorded_source_fingerprint = (
+                source_fingerprint if source_fingerprint is not None else previous[2]
+            )
             SCHEMA_REFUSAL.check(before, REFUSAL_QUARANTINED)
             con.execute(
                 f"UPDATE {_control_table(control_schema, 'schema_refusals')} SET "
@@ -561,7 +569,8 @@ def record_schema_refusal(
                 "state = ?, refused_at = ? "
                 "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
                 [
-                    target_table, detected_lsn, reason, fingerprint, source_fingerprint,
+                    target_table, detected_lsn, reason, fingerprint,
+                    recorded_source_fingerprint,
                     canonical_class, REFUSAL_QUARANTINED, now(), pipeline,
                     source_schema, source_table,
                 ],
@@ -731,7 +740,7 @@ def blocked_schema_tables(
     ``pending -> quarantined`` edge.  Once quarantined, the full current-source
     resnapshot is the only re-entry path and streaming rows are skipped safely.
     """
-    return {
+    blocked = {
         f"{schema}.{table}"
         for schema, table in con.execute(
             f"SELECT source_schema, source_table FROM "
@@ -740,6 +749,16 @@ def blocked_schema_tables(
             [pipeline, REFUSAL_QUARANTINED],
         ).fetchall()
     }
+    blocked.update(
+        f"{schema}.{table}"
+        for schema, table in con.execute(
+            f"SELECT source_schema, source_table FROM "
+            f"{_control_table(control_schema, 'table_state')} "
+            "WHERE pipeline = ? AND snapshot_state = ?",
+            [pipeline, table_lifecycle.GONE],
+        ).fetchall()
+    )
+    return blocked
 
 
 def quarantine_retry_allowed(
@@ -769,8 +788,12 @@ def quarantine_retry_allowed(
         return False
     if not source_exists:
         return True
-    if not source_fingerprint or row[1] is None:
+    if not source_fingerprint:
         return False
+    if row[1] is None:
+        # A source read that successfully produced a fingerprint is positive repair
+        # evidence even when the original refusal recorded no source fingerprint.
+        return True
     return str(source_fingerprint) != str(row[1])
 
 
@@ -882,11 +905,12 @@ def resolve_schema_refusal(
         source_table=source_table,
         control_schema=control_schema,
     )
-    if lifecycle != table_lifecycle.COMPLETE:
+    if lifecycle not in {table_lifecycle.COMPLETE, table_lifecycle.GONE}:
         raise RuntimeError(
             f"cannot resolve schema refusal for {source_schema}.{source_table} "
             f"while table lifecycle is {lifecycle!r}; a completed full resnapshot "
-            "must publish current data first"
+            "must publish current data first, or the source must be positively "
+            "discharged as gone"
         )
     con.execute(
         f"UPDATE {_control_table(control_schema, 'schema_refusals')} SET state = ? "
@@ -1155,6 +1179,41 @@ def read_snapshot_states(
     return table_lifecycle.read_all(con, pipeline, control_schema=control_schema)
 
 
+def replacement_snapshot_is_current(
+    con,
+    *,
+    pipeline: str,
+    source_schema: str,
+    source_table: str,
+    relation,
+    control_schema: str | None = None,
+) -> bool:
+    """Return whether a completed image is for this exact replacement relation.
+
+    ``snapshot_state=complete`` alone is not enough: a baseline/recreate check can
+    mark an old image complete while a new catalog fact is still due. The durable
+    snapshot LSN and source relation generation together identify the completed
+    replacement, so a merely marked ``complete`` state cannot suppress work.
+    """
+    row = con.execute(
+        f"SELECT ts.snapshot_lsn, sr.relation_oid, sr.relation_filenode, "
+        f"sr.relation_type_oid FROM {_control_table(control_schema, 'table_state')} ts "
+        f"LEFT JOIN {_control_table(control_schema, 'source_relations')} sr "
+        "ON sr.pipeline = ts.pipeline AND sr.source_schema = ts.source_schema "
+        "AND sr.source_table = ts.source_table "
+        "WHERE ts.pipeline = ? AND ts.source_schema = ? AND ts.source_table = ? "
+        "AND ts.snapshot_state = ?",
+        [pipeline, source_schema, source_table, table_lifecycle.COMPLETE],
+    ).fetchone()
+    if row is None or row[0] is None or row[1] != getattr(relation, "oid", None):
+        return False
+    for index, attribute in ((2, "relfilenode"), (3, "relation_type_oid")):
+        observed = getattr(relation, attribute, None)
+        if observed is not None and row[index] is not None and row[index] != observed:
+            return False
+    return True
+
+
 def promote_interrupted_snapshots(
     con, pipeline: str, *, control_schema: str | None = None
 ) -> list[str]:
@@ -1333,10 +1392,15 @@ def register_table(
     registered, and re-registering it would overwrite whatever lifecycle state it is
     genuinely in (a re-snapshot in flight, a rebuild owed) with "never snapshotted".
     """
-    if table_lifecycle.read(
+    lifecycle = table_lifecycle.read(
         con, pipeline=pipeline, source_schema=source_schema, source_table=source_table,
         control_schema=control_schema,
-    ) != table_lifecycle.ABSENT:
+    )
+    if lifecycle == table_lifecycle.GONE:
+        # A same-name replacement must first be discovered and routed through the
+        # catalog/re-snapshot owner. Never let a stream row reopen a gone table.
+        return
+    if lifecycle != table_lifecycle.ABSENT:
         return
     table_lifecycle.transition(
         con,

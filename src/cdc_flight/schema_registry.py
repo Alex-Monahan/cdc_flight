@@ -330,7 +330,12 @@ class SchemaRegistry(
         internal identity primary key; the source key columns remain ordinary typed
         columns and are retained for source attribution.
         """
-        from .typed_types import NativeType, SourceTypeDescriptor, native_type
+        from .typed_types import (
+            NativeType,
+            SourceTypeDescriptor,
+            TypedValueError,
+            native_type,
+        )
 
         table = self.get(name)
         requested_key_columns = tuple(key_columns)
@@ -350,7 +355,15 @@ class SchemaRegistry(
             if isinstance(descriptor, str):
                 physical_columns[column] = descriptor
                 continue
-            target = native_type(descriptor, for_key=column in key_columns)
+            try:
+                target = native_type(descriptor, for_key=column in key_columns)
+            except TypedValueError as exc:
+                raise SchemaEvolutionRefused(
+                    f"cannot materialize {name}.{column}: the source descriptor "
+                    f"is not deliverable through the native destination: {exc}",
+                    target=name,
+                    refusal_origin="schema_registry",
+                ) from exc
             resolved[column] = target
             physical_columns[column] = target.sql
             source_descriptor = target.source if isinstance(descriptor, NativeType) else descriptor

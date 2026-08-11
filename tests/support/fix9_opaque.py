@@ -220,12 +220,15 @@ def drop_corpus(sandbox, corpus: dict = CORPUS) -> None:
 
 
 def source_connector_text(sandbox, name: str) -> list[tuple]:
-    """Read the source value through PostgreSQL's type output function.
+    """Read the value spelling stock Debezium delivers for this corpus.
 
-    ``value::text`` is a cast, not the type output function. In particular,
-    ``inet_out`` omits the redundant host mask for a host address. ``format``
-    with ``%s`` invokes the same output-function rendering used by SELECT/COPY.
+    Most opaque values are delivered by their PostgreSQL output function, so
+    ``format('%s', value)`` is the independent oracle.  Stock Debezium's built-in
+    PostgreSQL money converter delivers the numeric spelling rather than the
+    locale-decorated ``money_out`` display; the dedicated Round-12 live probe
+    cross-checks that wire spelling under four locales.
     """
+    expression = "value::numeric::text" if name == "money" else "format('%s', value)"
     return sandbox.pg_query(
-        f"SELECT id, format('%s', value) FROM app.p2b_r9_{name} ORDER BY id"
+        f"SELECT id, {expression} FROM app.p2b_r9_{name} ORDER BY id"
     )

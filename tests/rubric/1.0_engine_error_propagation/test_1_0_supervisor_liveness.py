@@ -30,17 +30,21 @@ mid-stream. Run with `make test-slow`.
 from __future__ import annotations
 
 import json
+import threading
 import time
 
 import pytest
 
 CUSTOMERS = '"cdc_raw"."cdcflight_app_customers"'
-#: Raised from 60 000 when the applier landed: the kill has to arrive while
-#: delivery is still in progress, and 60 000 rows are now streamed and applied in
-#: under the 12 s this test used to wait, which made it vacuous (it asserted
-#: `delivered == ROWS` against a run that had already finished).
-ROWS = 250_000
+#: The kill predicate below uses the durable slot position, not a guessed sleep.
+#: The workload is produced behind a durable prefix barrier, so its size is a
+#: bounded source-writing budget rather than a timing surrogate.
+ROWS = 80_000
 SENTINEL = "wskill-"
+# Build a sizeable, source-committed WAL tail before the kill and hold the producer
+# there. A single future transaction is too easy for Debezium to consume between two
+# sampler observations; the kill proof needs a measured backlog, not a lucky instant.
+PREKILL_TAIL_ROWS = 60_000
 
 
 @pytest.mark.slow
@@ -48,36 +52,125 @@ def test_walsender_kill_never_reports_ok_on_partial_delivery(sandbox):
     sandbox.reseed()
     sandbox.run(reset_state=True, max_seconds=200, idle_seconds=8, timeout=400)
 
-    sandbox.sql(
-        f"INSERT INTO app.customers (name, email) SELECT "
-        f"'{SENTINEL}' || i, '{SENTINEL}' || i || '@example.com' "
-        f"FROM generate_series(1, {ROWS}) i"
+    chunk = 1_000
+    proc = sandbox.spawn(max_seconds=500, idle_seconds=8)
+    sandbox.wait_for_slot_active(process=proc, timeout=120, poll_seconds=0.1)
+    before_lsn = int(
+        sandbox.pg_query(
+            "SELECT COALESCE(confirmed_flush_lsn - '0/0', 0) "
+            "FROM pg_replication_slots WHERE slot_name = %s",
+            (sandbox.slot,),
+        )[0][0]
     )
+    prefix_rows = 4 * chunk
+    for start in range(1, prefix_rows + 1, chunk):
+        sandbox.sql(
+            f"INSERT INTO app.customers (name, email) SELECT "
+            f"'{SENTINEL}' || i, '{SENTINEL}' || i || '@example.com' "
+            f"FROM generate_series({start}, {start + chunk - 1}) i"
+        )
 
-    proc = sandbox.spawn(max_seconds=600, idle_seconds=8)
+    tail_committed = 0
+    writer_errors: list[BaseException] = []
+    writer_done = threading.Event()
+    tail_ready = threading.Event()
+    release_all = threading.Event()
+
+    def write_tail() -> None:
+        nonlocal tail_committed
+        try:
+            for start in range(prefix_rows + 1, ROWS + 1, chunk):
+                sandbox.sql(
+                    f"INSERT INTO app.customers (name, email) SELECT "
+                    f"'{SENTINEL}' || i, '{SENTINEL}' || i || '@example.com' "
+                    f"FROM generate_series({start}, {start + chunk - 1}) i"
+                )
+                tail_committed += chunk
+                if tail_committed >= PREKILL_TAIL_ROWS and not release_all.is_set():
+                    tail_ready.set()
+                    release_all.wait()
+        except BaseException as exc:  # report the source-writer cause below
+            writer_errors.append(exc)
+        finally:
+            writer_done.set()
+
+    writer = threading.Thread(target=write_tail, name="fix12-walsender-writer")
+    writer.start()
     try:
-        # Wait until the connector is genuinely streaming (the slot is held), then
-        # give it long enough to be part-way through, and cut the connection.
-        deadline = time.monotonic() + 120
+        progress_deadline = time.monotonic() + 180
+        prefix_durable = None
+        while time.monotonic() < progress_deadline:
+            if proc.poll() is not None:
+                raise AssertionError(
+                    "the pipeline exited before the durable prefix barrier "
+                    f"(returncode={proc.returncode})"
+                )
+            if writer_errors:
+                raise AssertionError("source workload writer failed") from writer_errors[0]
+            position = sandbox.pg_query(
+                "SELECT COALESCE(confirmed_flush_lsn - '0/0', 0) "
+                "FROM pg_replication_slots WHERE slot_name = %s AND active",
+                (sandbox.slot,),
+            )
+            if position and before_lsn < int(position[0][0]):
+                prefix_durable = int(position[0][0])
+                break
+            time.sleep(0.1)
+        assert prefix_durable is not None, (
+            "the durable slot position never crossed the source-produced prefix; "
+            f"before={before_lsn}"
+        )
+
+        # Wait until the destination has durably acknowledged the prefix while the
+        # concurrently written tail has already created future WAL.  This is a
+        # source/destination state predicate, not a guessed sleep.
+        deadline = time.monotonic() + 180
         killed = 0
         while time.monotonic() < deadline:
-            time.sleep(2)
-            if sandbox.pg_query(
-                "SELECT active FROM pg_replication_slots WHERE slot_name = %s AND active",
+            if proc.poll() is not None:
+                break
+            if writer_errors:
+                raise AssertionError("source workload writer failed") from writer_errors[0]
+            position = sandbox.pg_query(
+                "SELECT COALESCE(confirmed_flush_lsn - '0/0', 0) "
+                "FROM pg_replication_slots WHERE slot_name = %s AND active",
                 (sandbox.slot,),
+            )
+            current = int(
+                sandbox.pg_query("SELECT pg_current_wal_lsn() - '0/0'")[0][0]
+            )
+            if (
+                position
+                and int(position[0][0]) > before_lsn
+                and tail_ready.is_set()
+                and current - int(position[0][0]) >= 256 * 1024
+                and not writer_done.is_set()
             ):
-                time.sleep(5)  # stream for a while so the kill lands mid-delivery
                 killed = sandbox.kill_walsender()
                 break
+            if writer_done.is_set():
+                break
+            time.sleep(0.05)
         assert killed == 1, (
-            "could not terminate the walsender for this run's slot, so the test "
-            "would be vacuous"
+            "could not terminate the walsender after the durable prefix and before "
+            "the concurrently written tail finished; the test would be vacuous"
         )
+        # Keep producing the remaining source workload while Debezium handles the
+        # walsender failure. The pre-kill gate already proved a substantial future
+        # WAL tail; releasing the remainder ensures a successful recovery has to
+        # deliver the complete declared workload.
+        release_all.set()
         returncode = proc.wait(timeout=600)
     finally:
+        release_all.set()
         if proc.poll() is None:  # pragma: no cover - only on an unexpected hang
             proc.kill()
             proc.wait(timeout=30)
+        writer.join(timeout=180)
+        if writer.is_alive():
+            raise AssertionError("the source workload writer did not finish")
+        if writer_errors:
+            raise AssertionError("source workload writer failed") from writer_errors[0]
 
     summary = sandbox.last_summary()
     delivered = sandbox.scalar(

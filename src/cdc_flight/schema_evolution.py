@@ -30,7 +30,7 @@ from dataclasses import dataclass
 
 from . import naming
 from .errors import SchemaEvolutionRefused
-from .typed_types import SourceTypeDescriptor, UnsupportedType, native_type
+from .typed_types import SourceTypeDescriptor, TypedValueError, native_type
 
 COLUMN_ADDED = "added"
 COLUMN_DROPPED = "dropped"
@@ -282,7 +282,7 @@ def apply_column_changes(registry, table_name: str, changes: Iterable[ColumnChan
                         old_descriptor,
                         new_descriptor,
                     )
-                except (UnsupportedType, ValueError) as exc:
+                except (TypedValueError, ValueError) as exc:
                     raise SchemaEvolutionRefused(
                         f"cannot change source column {table_name}.{change.destination_new_name}: "
                         f"the source descriptor is not deliverable: {exc}",
@@ -305,7 +305,7 @@ def apply_column_changes(registry, table_name: str, changes: Iterable[ColumnChan
                     columns={change.destination_new_name: descriptor},
                     key_columns=registry.get(table_name).key_columns,
                 )
-            except (UnsupportedType, ValueError) as exc:
+            except (TypedValueError, ValueError) as exc:
                 raise SchemaEvolutionRefused(
                     f"cannot add source column {table_name}.{change.destination_new_name}: "
                     f"the source descriptor is not deliverable: {exc}",
@@ -326,7 +326,7 @@ def apply_column_changes(registry, table_name: str, changes: Iterable[ColumnChan
                     old_descriptor,
                     new_descriptor,
                 )
-            except (UnsupportedType, ValueError) as exc:
+            except (TypedValueError, ValueError) as exc:
                 raise SchemaEvolutionRefused(
                     f"cannot change source column {table_name}.{change.destination_new_name}: "
                     f"the source descriptor is not deliverable: {exc}",

@@ -134,7 +134,12 @@ def test_every_allowlisted_unknown_type_is_varchar_and_transport_only(kind, oid,
     else:
         wire = text
     assert adapt_value(wire, native_type(descriptor)) == text
-    assert adapt_value(wire.encode("ascii"), native_type(descriptor)) == text
+    if kind == "money":
+        assert adapt_value(wire.encode("ascii"), native_type(descriptor)) == wire.encode(
+            "ascii"
+        )
+    else:
+        assert adapt_value(wire.encode("ascii"), native_type(descriptor)) == text
 
 
 REFUSED_UNKNOWN_TYPES = (
@@ -171,12 +176,22 @@ def test_int2vector_non_text_connect_shape_is_refused_not_admitted_as_an_array()
 
 @pytest.mark.parametrize(
     ("kind", "oid"),
-    [(kind, oid) for kind, oid, _text in GLOBAL_UNKNOWN_DECISIONS],
-    ids=[kind for kind, _oid, _text in GLOBAL_UNKNOWN_DECISIONS],
+    [
+        (kind, oid)
+        for kind, oid, _text in GLOBAL_UNKNOWN_DECISIONS
+        if kind != "money"
+    ],
+    ids=[kind for kind, _oid, _text in GLOBAL_UNKNOWN_DECISIONS if kind != "money"],
 )
 def test_every_allowlisted_opaque_type_refuses_non_utf8_transport(kind, oid):
     with pytest.raises(InvalidTypedValue):
         adapt_value(b"\xff", native_type(_source(kind, oid)))
+
+
+def test_money_never_refuses_or_rewrites_an_opaque_payload():
+    target = native_type(_source("money", 790))
+    for payload in (b"\xff", "₹1,237.89"):
+        assert adapt_value(payload, target) is payload
 
 
 def _permanently_bad_event(txn: str, order: int, lsn: int):

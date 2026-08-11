@@ -235,7 +235,7 @@ RECREATE_CONVERGENCE_CELLS = tuple(
 
 
 def test_recreate_matrix_documents_non_image_lifecycle_ownership():
-    assert {"absent", "none", "in_progress"} == (
+    assert {"absent", "none", "in_progress", "gone"} == (
         TABLE_LIFECYCLE.reachable_states()
         - {LIFECYCLE_COMPLETE, LIFECYCLE_AWAITING}
     )

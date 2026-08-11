@@ -48,9 +48,10 @@ export ARROW_DEFAULT_MEMORY_POOL ?= system
 PYTEST_WORKERS ?= 12
 PYTEST_XDIST_ARGS ?= -n $(PYTEST_WORKERS) --dist=loadscope --max-worker-restart=0
 # The slow lane contains real crash/snapshot timing proofs and heavy DuckDB/JPype
-# subprocesses. Four workers is the measured stable limit on this host: six concurrent
-# JVMs can make Debezium's finite source-task startup bound expire before it connects.
-PYTEST_SLOW_WORKERS ?= 4
+# subprocesses. Two workers is the measured stable limit on this host: four concurrent
+# JVMs can make the bounded source-task and discovery processes abort or outlive their
+# outer fixture, even though each case converges serially.
+PYTEST_SLOW_WORKERS ?= 2
 PYTEST_SLOW_XDIST_ARGS ?= -n $(PYTEST_SLOW_WORKERS) --dist=loadscope --max-worker-restart=0
 # MotherDuck uses one database per worker and a unique control schema per test.
 PYTEST_MD_WORKERS ?= 8

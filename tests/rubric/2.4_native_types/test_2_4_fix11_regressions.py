@@ -12,7 +12,6 @@ import pytest
 
 from cdc_flight import destination, errors
 from cdc_flight.typed_types import (
-    InvalidTypedValue,
     SourceTypeDescriptor,
     adapt_value,
     native_type,
@@ -40,7 +39,7 @@ def test_xml_values_use_the_postgresql_output_function_boundary():
         assert adapt_value(wire, target) == expected_output_function_value
 
 
-def test_money_uses_the_source_money_out_locale_and_rejects_wrong_decoration():
+def test_money_carries_connector_text_without_locale_logic():
     c_source = SourceTypeDescriptor(790, "pg_catalog.money", "money")
     gb_source = SourceTypeDescriptor(
         790,
@@ -48,12 +47,11 @@ def test_money_uses_the_source_money_out_locale_and_rejects_wrong_decoration():
         "money",
         metadata=(("lc_monetary", "en_GB.UTF-8"),),
     )
-    assert adapt_value("1234.56", native_type(c_source)) == "$1,234.56"
-    assert adapt_value("1234.56", native_type(gb_source)) == "£1,234.56"
-    assert adapt_value("-1.00", native_type(gb_source)) == "-£1.00"
+    assert adapt_value("1234.56", native_type(c_source)) == "1234.56"
+    assert adapt_value("1234.56", native_type(gb_source)) == "1234.56"
+    assert adapt_value("-1.00", native_type(gb_source)) == "-1.00"
     assert adapt_value("£1,234.56", native_type(gb_source)) == "£1,234.56"
-    with pytest.raises(InvalidTypedValue, match="lc_monetary"):
-        adapt_value("$1,234.56", native_type(gb_source))
+    assert adapt_value("$1,234.56", native_type(gb_source)) == "$1,234.56"
 
 
 def test_refusal_identity_does_not_change_with_origin_class(tmp_path):
@@ -139,13 +137,27 @@ def test_every_production_refusal_raise_declares_a_registered_origin():
     source_root = ROOT / "src" / "cdc_flight"
     refusal_names = {"SchemaEvolutionRefused", "SchemaBackfillRefused", "SchemaShapeUnexplained"}
     seen_modules: set[str] = set()
+
+    def callee_name(node):
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return node.attr
+        return None
+
+    def exception_names(node):
+        if isinstance(node, (ast.Tuple, ast.List)):
+            return {name for child in node.elts for name in exception_names(child)}
+        name = callee_name(node)
+        return {name} if name else set()
+
     for path in sorted(source_root.glob("*.py")):
         tree = ast.parse(path.read_text(), filename=str(path))
         module = path.stem
         for node in ast.walk(tree):
             if not isinstance(node, ast.Raise) or not isinstance(node.exc, ast.Call):
                 continue
-            if not isinstance(node.exc.func, ast.Name) or node.exc.func.id not in refusal_names:
+            if callee_name(node.exc.func) not in refusal_names:
                 continue
             seen_modules.add(module)
             origin = next(
@@ -157,6 +169,15 @@ def test_every_production_refusal_raise_declares_a_registered_origin():
             assert module in declarations, module
             assert origin == declarations[module], (module, origin)
             assert not any(keyword.arg == "refusal_class" for keyword in node.exc.keywords)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ExceptHandler):
+                continue
+            caught = exception_names(node.type)
+            if caught & refusal_names:
+                assert "SchemaEvolutionRefused" in caught, (path.name, node.lineno, caught)
+                assert not caught & (refusal_names - {"SchemaEvolutionRefused"}), (
+                    path.name, node.lineno, caught
+                )
     declarations = getattr(errors, "REFUSAL_ORIGIN_BY_MODULE", {})
     assert seen_modules == set(declarations), (
         seen_modules,

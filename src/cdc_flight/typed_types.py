@@ -28,12 +28,14 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
+from .errors import TypedValueError
 
-class UnsupportedType(ValueError):
+
+class UnsupportedType(TypedValueError):
     """A source type without an allowlisted, native destination representation."""
 
 
-class InvalidTypedValue(ValueError):
+class InvalidTypedValue(TypedValueError):
     """A value that cannot be represented by its declared source descriptor."""
 
 
@@ -338,6 +340,10 @@ def mark_canonical_range_text(
     if kind in range_kinds and isinstance(value, str):
         return value if isinstance(value, CanonicalRangeText) else CanonicalRangeText(value)
     if kind == "multirange" and isinstance(value, str):
+        # Stock Debezium already carries PostgreSQL's multirange output text.  The
+        # marker records that fact; the helper only unwraps the connector's
+        # base64 transport form and never parses, canonicalizes, or re-renders the
+        # server's value before the destination sees it.
         return canonical_multirange_text(value, source)
     if kind in {"struct", "composite"} and isinstance(value, Mapping):
         return {
@@ -769,7 +775,11 @@ def encode_value(value: Any, descriptor: SourceTypeDescriptor | NativeType) -> A
         if isinstance(value, CanonicalRangeText):
             return str(value)
         if isinstance(value, str):
-            value = _multirange_parts(value)
+            # A source event is already PostgreSQL's multirange output text.  The
+            # only permitted transformation here is unwrapping the connector's
+            # base64 transport marker; no range grammar or equality logic belongs
+            # on this value path.
+            return value
         if not isinstance(value, (list, tuple)):
             raise InvalidTypedValue(f"{value!r} is not a multirange value")
         if source.range_subtype is None:
@@ -782,7 +792,10 @@ def encode_value(value: Any, descriptor: SourceTypeDescriptor | NativeType) -> A
         # the output-function corpus proves the normalization on both runtimes.
         return _decode_opaque_text(value, source)
     if kind == "money":
-        return _money_output_text(value, source)
+        # PostgreSQL/stock Debezium already supplied the money output text.  Money
+        # is intentionally an opaque VARCHAR transport boundary: no locale lookup,
+        # formatting, parsing, validation, or reconstruction is allowed here.
+        return value
     if kind in {"inet", "cidr"}:
         # Debezium's wire value is text, but the catalog ADD-column backfill uses
         # psycopg's native ipaddress objects.  Their ``str`` spelling is PostgreSQL's
@@ -1070,14 +1083,14 @@ def _multirange_parts(value: str) -> list[str]:
 def canonical_multirange_text(
     value: Any, source: SourceTypeDescriptor
 ) -> CanonicalRangeText:
-    """Return the one PostgreSQL-text representation used by both destinations.
+    """Unwrap the connector transport without rewriting PostgreSQL's text.
 
     ``include.unknown.datatypes=true`` reaches the JSON engine through the pinned
     ``binary.handling.mode=base64`` converter, so an opaque multirange byte value is
     observed here as base64 text.  Decode only that opaque transport form; a source
     event already marked ``CanonicalRangeText`` is retained byte-for-byte.  Lists
     remain a compatibility/value-boundary form for existing snapshot and identity
-    tests and are rendered into the same canonical range text before binding.
+    tests and are rendered only because they are not delivered source text.
     """
     if source.range_subtype is None:
         raise UnsupportedType(f"multirange {source.qualified_name} has no range subtype")
@@ -1090,34 +1103,21 @@ def canonical_multirange_text(
             raise InvalidTypedValue(
                 f"multirange {source.qualified_name} is not UTF-8 text"
             ) from exc
-        return _canonical_multirange_text_candidate(text, source)
+        return CanonicalRangeText(text)
     if isinstance(value, str):
         text = value.strip()
         if text.startswith("{") and text.endswith("}"):
-            return _canonical_multirange_text_candidate(text, source)
+            return CanonicalRangeText(value)
         try:
             decoded = base64.b64decode(text, validate=True).decode("utf-8")
         except (binascii.Error, UnicodeDecodeError, ValueError):
-            raise InvalidTypedValue(
-                f"{value!r} is neither PostgreSQL multirange text nor opaque UTF-8 bytes"
-            ) from None
-        return _canonical_multirange_text_candidate(decoded, source)
+            # Plain connector text is already the value.  Do not reject it merely
+            # because Python cannot prove its grammar.
+            return CanonicalRangeText(value)
+        return CanonicalRangeText(decoded)
     if isinstance(value, (list, tuple)):
         return _render_multirange_parts(value, source)
     raise InvalidTypedValue(f"{value!r} is not a multirange value")
-
-
-def _canonical_multirange_text_candidate(
-    text: str, source: SourceTypeDescriptor
-) -> CanonicalRangeText:
-    stripped = str(text).strip()
-    try:
-        _multirange_parts(stripped)
-    except InvalidTypedValue:
-        raise InvalidTypedValue(
-            f"{text!r} is not PostgreSQL multirange text"
-        ) from None
-    return CanonicalRangeText(stripped)
 
 
 def _render_multirange_parts(
@@ -1447,74 +1447,6 @@ def _decode_opaque_text(value: Any, source: SourceTypeDescriptor) -> str:
     )
 
 
-def _money_output_text(value: Any, source: SourceTypeDescriptor) -> OpaqueText:
-    """Render the stock wire number using the source ``money_out`` locale.
-
-    Debezium's PostgreSQL money converter supplies the numeric amount, while the
-    PostgreSQL output function supplies the locale decoration.  The locale is read
-    once by the catalog descriptor authority and carried in descriptor metadata;
-    silently using C/en_US here would admit a value the source never had.
-    """
-
-    locale_name = dict(source.metadata).get("lc_monetary", "C")
-    normalized_locale = str(locale_name).lower().replace("-", "_")
-    if (
-        normalized_locale in {"c", "posix"}
-        or normalized_locale.startswith(("c.", "posix."))
-        or normalized_locale.startswith("en_us")
-    ):
-        symbol = "$"
-    elif normalized_locale.startswith("en_gb"):
-        symbol = "£"
-    else:
-        raise UnsupportedType(
-            f"{source.qualified_name} has unsupported lc_monetary={locale_name!r}; "
-            "the money output function cannot be reconstructed exactly"
-        )
-
-    if isinstance(value, OpaqueText):
-        text = str(value).strip()
-        if text.startswith(symbol) or text.startswith(f"-{symbol}"):
-            return OpaqueText(text)
-        raise InvalidTypedValue(
-            f"{source.qualified_name} money text {text!r} does not match "
-            f"the source lc_monetary={locale_name!r} output"
-        )
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        value = _decode_opaque_text(value, source)
-    if isinstance(value, str):
-        text = value.strip()
-        if text[:1] in {"$", "£", "€", "₹"} or text.startswith(("-$", "-£", "-€", "-₹")):
-            if text.startswith(symbol) or text.startswith(f"-{symbol}"):
-                return OpaqueText(text)
-            raise InvalidTypedValue(
-                f"{source.qualified_name} money text {text!r} does not match "
-                f"the source lc_monetary={locale_name!r} output"
-            )
-        value = text
-    try:
-        raw_amount = Decimal(str(value))
-        amount = raw_amount.quantize(Decimal("0.01"))
-    except (InvalidOperation, ValueError, TypeError) as exc:
-        raise InvalidTypedValue(
-            f"{source.qualified_name} stock Debezium money value {value!r} "
-            "is not a finite decimal amount"
-        ) from exc
-    if not amount.is_finite():
-        raise InvalidTypedValue(
-            f"{source.qualified_name} stock Debezium money value {value!r} "
-            "is not a finite decimal amount"
-        )
-    if raw_amount != amount:
-        raise InvalidTypedValue(
-            f"{source.qualified_name} stock Debezium money value {value!r} "
-            "has more precision than PostgreSQL money_out can represent"
-        )
-    negative = amount < 0
-    rendered = f"{abs(amount):,.2f}"
-    return OpaqueText(f"-{symbol}{rendered}" if negative else f"{symbol}{rendered}")
-
-
 def _kind_name(kind: Any, qualified_name: str) -> str:
     value = str(kind or "unknown").lower().strip()
     name = qualified_name.rsplit(".", 1)[-1].lower()
@@ -1654,6 +1586,7 @@ __all__ = [
     "PostgresInfinity",
     "SourceTypeDescriptor",
     "TypedImage",
+    "TypedValueError",
     "UnionValue",
     "UnsupportedType",
     "adapt_value",

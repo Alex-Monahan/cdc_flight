@@ -16,27 +16,15 @@ from dataclasses import dataclass, field, replace
 from .errors import SchemaEvolutionRefused
 from .naming import normalize
 from .schema_evolution import descriptor_from_type_name
-from .typed_types import SourceTypeDescriptor, UnsupportedType, native_type
+from .typed_types import SourceTypeDescriptor, TypedValueError, native_type
 
 
 @dataclass
 class CatalogDescriptorReader:
     con: object
     cache: dict[int, SourceTypeDescriptor] = field(default_factory=dict)
-    _money_locale: str | None = field(default=None, init=False, repr=False)
-    _money_locale_read: bool = field(default=False, init=False, repr=False)
 
     def resolve(self, oids: Iterable[int]) -> dict[int, SourceTypeDescriptor]:
-        if not self._money_locale_read:
-            self._money_locale_read = True
-            try:
-                row = self.con.execute("SHOW lc_monetary").fetchone()
-                self._money_locale = str(row[0]) if row and row[0] is not None else "C"
-            except Exception:
-                # Lightweight descriptor unit doubles do not expose GUCs.  The
-                # PostgreSQL source authority still has the safe C default used by
-                # PostgreSQL when no locale metadata can be queried.
-                self._money_locale = "C"
         wanted = {int(oid) for oid in oids if oid}
         facts: dict[int, dict] = {}
         pending = set(wanted)
@@ -134,11 +122,6 @@ class CatalogDescriptorReader:
                 range_subtype=(build(range_subtype) if range_subtype else None),
                 map_key=map_key,
                 map_value=map_value,
-                metadata=(
-                    (("lc_monetary", self._money_locale),)
-                    if oid == 790 and self._money_locale
-                    else ()
-                ),
             )
             building.remove(oid)
             self.cache[oid] = descriptor
@@ -252,7 +235,7 @@ class RelationDescriptorProvider:
                 # composite, missing array child, incomplete map, or unsupported
                 # descendant must not be converted into a guessed VARCHAR.
                 native_type(descriptor)
-            except (UnsupportedType, ValueError) as exc:
+            except (TypedValueError, ValueError) as exc:
                 raise SchemaEvolutionRefused(
                     f"catalog descriptor authority is incomplete for {schema}.{table}.{name}",
                     source_schema=str(schema),

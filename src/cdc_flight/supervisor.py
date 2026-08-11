@@ -151,7 +151,10 @@ def run_engine_bounded(
     # per run, shared with the phase writer that publishes it (Codex r1 MAJOR-2).
     outcome = outcome if outcome is not None else RunOutcome("max_seconds")
     idle_blocked_by_source = 0
+    idle_candidate_since: float | None = None
     source_dark_after: float | None = None
+    source_not_streaming_after: float | None = None
+    source_unrecovered_after: float | None = None
     close_hung = False
     try:
         while thread.is_alive():
@@ -196,6 +199,38 @@ def run_engine_bounded(
                     or health.may_declare_idle(min_seconds=run.idle_seconds)
                 )
                 if source_idle and completion.phase_ended:
+                    # The asynchronous slot sampler's last active observation can
+                    # race a walsender termination at the exact idle boundary. Keep
+                    # an idle candidate open for at least two sampler intervals and
+                    # require a fresh observation taken after the candidate began.
+                    # This is a state proof, not another arbitrary workload sleep.
+                    health_interval = getattr(health, "interval", None)
+                    if health is not None and health_interval is not None:
+                        if idle_candidate_since is None:
+                            idle_candidate_since = time.monotonic()
+                            time.sleep(0.05)
+                            continue
+                        candidate_age = time.monotonic() - idle_candidate_since
+                        latest = getattr(health, "last", None)
+                        latest_at = getattr(latest, "at", None)
+                        required_confirmation = max(float(health_interval) * 2.0, 1.0)
+                        if (
+                            candidate_age < required_confirmation
+                            or latest_at is None
+                            or latest_at < idle_candidate_since
+                        ):
+                            time.sleep(0.05)
+                            continue
+                        # The source may have changed state after the first
+                        # ``source_idle`` calculation. Re-run the actual proof at
+                        # the end of the candidate window; freshness alone cannot
+                        # turn a walsender kill that happened during this window
+                        # into an idle verdict.
+                        if not health.may_declare_idle(min_seconds=run.idle_seconds):
+                            idle_candidate_since = None
+                            time.sleep(0.05)
+                            continue
+                    idle_candidate_since = None
                     if catalog is not None and not intermediate_handoff and not final_poll_done:
                         # The synchronous final poll. A DROP that happened after the
                         # last scheduled poll is seen by THIS run, and it is also the
@@ -224,6 +259,27 @@ def run_engine_bounded(
                     catalog_unresolved = unresolved
                     outcome.record("idle")
                     break
+                idle_candidate_since = None
+                if (
+                    health is not None
+                    and getattr(health, "ever_streamed", health.ever_sampled)
+                    and health.not_streaming_for >= run.idle_seconds
+                ):
+                    outcome.record("engine_error")
+                    source_not_streaming_after = round(elapsed, 2)
+                    break
+                if (
+                    health is not None
+                    and getattr(health, "stream_interruptions", 0) > 0
+                    and not getattr(health, "recovered_after_interruption", True)
+                ):
+                    # A retry may reattach a walsender without having delivered the
+                    # WAL that was outstanding when it disconnected.  A quiet timer
+                    # after that transition is not a completion proof; fail loudly
+                    # unless the confirmed slot position advanced after recovery.
+                    outcome.record("engine_error")
+                    source_unrecovered_after = round(elapsed, 2)
+                    break
                 idle_blocked_by_source += 1
                 if not source_idle and idle_blocked_by_source % 20 == 1:
                     log.warning(
@@ -231,6 +287,8 @@ def run_engine_bounded(
                         handler.seconds_since_last_batch,
                         health.summary(),
                     )
+            else:
+                idle_candidate_since = None
             time.sleep(0.25)
         else:
             outcome.record("engine_finished")
@@ -379,6 +437,10 @@ def run_engine_bounded(
         # to exit - the process still has to tear down a JVM whose connector is blocked
         # on a dead socket, which is another minute (Opus MINOR-5).
         summary["source_dark_detected_after_sec"] = source_dark_after
+    if source_not_streaming_after is not None:
+        summary["source_not_streaming_detected_after_sec"] = source_not_streaming_after
+    if source_unrecovered_after is not None:
+        summary["source_unrecovered_detected_after_sec"] = source_unrecovered_after
     if health is not None:
         summary.update(health.summary())
     if acknowledgement_timeout is not None:
@@ -430,6 +492,23 @@ def run_engine_bounded(
             f"the source has been unreachable for {health.unknown_for:.1f}s "
             f"({health.summary()}); the delivery cannot be shown to be complete, so "
             "this run is not a success (TODO 4.6(b))",
+            summary,
+        )
+
+    if outcome.value == "engine_error":
+        message = (
+            (
+                "the connector experienced a streaming interruption without a "
+                "post-interruption confirmed WAL advance; the delivery cannot be "
+                "shown complete "
+                if source_unrecovered_after is not None
+                else "the connector stopped streaming before a source-corroborated "
+                "idle boundary; the delivery cannot be shown complete "
+            )
+            + f"({health.summary() if health is not None else 'no source health'})"
+        )
+        raise EngineFailure(
+            message,
             summary,
         )
 

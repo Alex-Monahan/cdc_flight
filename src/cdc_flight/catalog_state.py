@@ -20,6 +20,7 @@ from .machines import (
     CHANGE_MARKED,
     CHANGE_OBSERVED,
     CHANGE_PENDING,
+    LIFECYCLE_GONE,
     require_admission_state,
 )
 from .naming import control_table
@@ -344,7 +345,20 @@ def seed_from_table_state(
     rows = con.execute(
         f"SELECT source_schema, source_table FROM "
         f"{control_table(resolve_control_schema(control_schema), 'table_state')} "
-        "WHERE pipeline = ?",
-        [pipeline],
+        "WHERE pipeline = ? AND snapshot_state <> ?",
+        [pipeline, LIFECYCLE_GONE],
+    ).fetchall()
+    return {f"{schema}.{table}" for schema, table in rows}
+
+
+def gone_from_table_state(
+    con, pipeline: str, *, control_schema: str | None = None
+) -> set[str]:
+    """Return terminal source names that may only re-enter via a new generation."""
+    rows = con.execute(
+        f"SELECT source_schema, source_table FROM "
+        f"{control_table(resolve_control_schema(control_schema), 'table_state')} "
+        "WHERE pipeline = ? AND snapshot_state = ?",
+        [pipeline, LIFECYCLE_GONE],
     ).fetchall()
     return {f"{schema}.{table}" for schema, table in rows}

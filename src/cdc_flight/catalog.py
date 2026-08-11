@@ -187,6 +187,14 @@ def seed_from_table_state(
     )
 
 
+def gone_from_table_state(
+    con, pipeline: str, *, control_schema: str | None = None
+) -> set[str]:
+    return catalog_state.gone_from_table_state(
+        con, pipeline, control_schema=control_schema
+    )
+
+
 class CatalogWatcher:
     """Polls the source catalog on its own connection. Owns no destination state."""
 
@@ -204,6 +212,7 @@ class CatalogWatcher:
         publication_ownership: str = "flight",
         known: dict[str, SourceRelation] | None = None,
         replicated: set[str] | None = None,
+        gone: set[str] | None = None,
         unrelatable: set[str] | None = None,
         poll_seconds: float = 10.0,
         connect_timeout: int = 5,
@@ -243,6 +252,10 @@ class CatalogWatcher:
         self.publication_ownership = publication_ownership
         #: qualified names we have a destination table for
         self.replicated = set(replicated or ())
+        #: Terminal source names are kept separately from active destination names.
+        #: A same-name replacement must be a catalog `recreated` observation, not a
+        #: first stream row that reopens a stale table.
+        self.gone = set(gone or ())
         #: Relations the destination holds rows for whose observed identity may NOT be
         #: adopted as history (rubric 1.9, `machines.CATALOG_BASELINE`). Computed once
         #: per run from durable state by `catalog_baseline.unrelatable_relations` and
@@ -491,7 +504,7 @@ class CatalogWatcher:
         """
         from .catalog_descriptors import relation_descriptor_fingerprint
         from .errors import SchemaEvolutionRefused
-        from .typed_types import UnsupportedType, native_type
+        from .typed_types import TypedValueError, native_type
 
         with self._lock:
             relation = self.known.get(str(qualified))
@@ -520,7 +533,7 @@ class CatalogWatcher:
         for name, descriptor in descriptors.items():
             try:
                 native_type(descriptor)
-            except (UnsupportedType, ValueError) as exc:
+            except (TypedValueError, ValueError) as exc:
                 raise SchemaEvolutionRefused(
                     f"source catalog descriptor for {qualified}.{name} is not "
                     f"deliverable through the strict native authority: {exc}",
@@ -884,6 +897,7 @@ class CatalogWatcher:
             interesting = (
                 self.include
                 | self.replicated
+                | self.gone
                 | set(self.known)
                 | {c.qualified for c in self._live() if c.kind in DESTRUCTIVE}
             )
@@ -976,6 +990,10 @@ class CatalogWatcher:
                 )
                 if previous is None:
                     if current is None:
+                        if name in self.gone:
+                            # The source remains absent after a terminal discharge;
+                            # do not rediscover the same DROP on every run.
+                            continue
                         if name not in self.replicated or queued:
                             continue
                         # We hold a destination table for it and the source does not
@@ -1031,7 +1049,25 @@ class CatalogWatcher:
                             self.known[name] = current
                             self._dirty[name] = current
                         continue
-                    if name in self.replicated or name in self.include or self.auto_discover:
+                    if name in self.gone:
+                        # The old source generation was discharged as gone. A present
+                        # relation with this name is a new generation even when the
+                        # source OID happens to be reused, so it must be rebuilt before
+                        # any stream row can be admitted.
+                        self.gone.discard(name)
+                        self.replicated.add(name)
+                        self.known[name] = current
+                        self._dirty[name] = current
+                        added.append(
+                            self._change(
+                                CHANGE_RECREATED,
+                                current,
+                                lsn,
+                                old_oid=None,
+                                new_oid=current.oid,
+                            )
+                        )
+                    elif name in self.replicated or name in self.include or self.auto_discover:
                         # First sight. Record the oid; report `new` only for something
                         # we have never replicated (rubric 2.3's hook).
                         self.known[name] = current
@@ -1318,6 +1354,17 @@ class CatalogWatcher:
             if stale is not None:
                 stale.to(CHANGE_SUPERSEDED)
                 self.superseded += 1
+            for change in self._changes:
+                if change.qualified == name and change.state not in {
+                    CHANGE_APPLIED,
+                    CHANGE_SUPERSEDED,
+                }:
+                    change.to(CHANGE_SUPERSEDED)
+                    self.superseded += 1
+            self._changes = [
+                change for change in self._changes
+                if change.state not in {CHANGE_APPLIED, CHANGE_SUPERSEDED}
+            ]
             self.replicated.discard(name)
 
     def observe_replicated(self, names: set[str]) -> None:

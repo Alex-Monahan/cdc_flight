@@ -65,6 +65,10 @@ LIFECYCLE_IN_PROGRESS = "in_progress"
 LIFECYCLE_COMPLETE = "complete"
 #: owed a full rebuild — the queue `cdc_flight.resnapshot` works from
 LIFECYCLE_AWAITING = "awaiting_snapshot"
+#: the source relation was positively observed gone while its rebuild obligation
+#: was outstanding. This is terminal, but deliberately not `absent`: retaining the
+#: durable disposition prevents a dropped quarantined table from looking current.
+LIFECYCLE_GONE = "gone"
 
 TABLE_LIFECYCLE = Machine(
     "table_lifecycle",
@@ -74,6 +78,7 @@ TABLE_LIFECYCLE = Machine(
         LIFECYCLE_IN_PROGRESS,
         LIFECYCLE_COMPLETE,
         LIFECYCLE_AWAITING,
+        LIFECYCLE_GONE,
     ),
     edges=(
         # -- row creation ------------------------------------------------- #
@@ -98,6 +103,12 @@ TABLE_LIFECYCLE = Machine(
         # a process killed inside a snapshot left a table owed work and invisible to
         # everything, including the recovery journal's "is the rebuild finished?" test.
         (LIFECYCLE_IN_PROGRESS, LIFECYCLE_AWAITING),
+        # A quarantined relation can be discharged by a fenced source-absence proof;
+        # it must never be promoted to `complete` because no current image exists.
+        (LIFECYCLE_AWAITING, LIFECYCLE_GONE),
+        # A same-name/new-generation relation is discovered after the old terminal
+        # disposition; it is owed a replacement image before any stream admission.
+        (LIFECYCLE_GONE, LIFECYCLE_AWAITING),
         # -- idempotent re-assertion -------------------------------------- #
         # `request_snapshot` is documented idempotent and `reassert_owed` re-marks a
         # table that is already owed; both are no-ops that must not raise.
@@ -113,8 +124,9 @@ TABLE_LIFECYCLE = Machine(
         (LIFECYCLE_IN_PROGRESS, LIFECYCLE_ABSENT),
         (LIFECYCLE_COMPLETE, LIFECYCLE_ABSENT),
         (LIFECYCLE_AWAITING, LIFECYCLE_ABSENT),
+        (LIFECYCLE_GONE, LIFECYCLE_ABSENT),
     ),
-    terminal=(LIFECYCLE_COMPLETE, LIFECYCLE_ABSENT),
+    terminal=(LIFECYCLE_COMPLETE, LIFECYCLE_GONE, LIFECYCLE_ABSENT),
     initial=LIFECYCLE_ABSENT,
     durable="_cdc_flight.table_state.snapshot_state",
     purpose=(
@@ -647,6 +659,9 @@ SCHEMA_REFUSAL = Machine(
         # The blocking condition may clear.  Re-entry is not discharge: the table
         # remains owed until a complete replacement snapshot takes it to current.
         (REFUSAL_QUARANTINED, REFUSAL_PENDING),
+        # A fenced source DROP cancels the obligation because no replacement image
+        # can ever arrive; the table lifecycle records the paired terminal `gone`.
+        (REFUSAL_QUARANTINED, REFUSAL_RESOLVED),
     ),
     terminal=(REFUSAL_RESOLVED,),
     initial=REFUSAL_ABSENT,

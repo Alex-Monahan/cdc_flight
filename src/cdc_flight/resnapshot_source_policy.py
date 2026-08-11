@@ -259,3 +259,123 @@ def finish_source_missing_tables(
         con.execute("ROLLBACK")
         raise
     return logged, dropped
+
+
+def discharge_quarantined_source_missing(
+    con,
+    *,
+    pipeline: str,
+    dataset: str,
+    tables: list[tuple[str, str, str]],
+    evidence: EmptinessEvidence,
+    namespace: str | None = None,
+    snapshot_epoch: int | None = None,
+    control_schema: str | None = None,
+) -> list[str]:
+    """Cancel quarantined rebuilds whose source relation is positively gone.
+
+    This is not an empty-table completion and it is not a normal DROP_LOG path. A
+    quarantined destination image is already untrusted, so retaining it would leave
+    stale rows queryable after the obligation is cancelled. The target and shadow are
+    removed in the same transaction that moves ``awaiting_snapshot -> gone`` and
+    resolves the refusal. ``gone`` remains durable so a same-name replacement must
+    explicitly reopen a new source generation before it can become current.
+    """
+    candidates: list[tuple[str, str, str]] = []
+    for schema, table, target in tables:
+        qualified = f"{schema}.{table}"
+        if (
+            qualified in evidence.source_missing
+            and evidence.snapshot_phase_ended
+            and evidence.wal_lsn is not None
+        ):
+            candidates.append((schema, table, target))
+    if not candidates:
+        return []
+
+    discharged: list[str] = []
+    con.execute("BEGIN TRANSACTION")
+    try:
+        for schema, table, target in candidates:
+            qualified = f"{schema}.{table}"
+            shadow = naming.shadow_table(target)
+            con.execute(f"DROP TABLE IF EXISTS {quote(dataset)}.{quote(shadow)}")
+            con.execute(f"DROP TABLE IF EXISTS {quote(dataset)}.{quote(target)}")
+            state = table_lifecycle.read(
+                con,
+                pipeline=pipeline,
+                source_schema=schema,
+                source_table=table,
+                control_schema=control_schema,
+            )
+            if state != table_lifecycle.AWAITING:
+                table_lifecycle.transition(
+                    con,
+                    pipeline=pipeline,
+                    source_schema=schema,
+                    source_table=table,
+                    to=table_lifecycle.AWAITING,
+                    reason="normalizing a quarantined source-missing obligation",
+                    target_table=target,
+                    control_schema=control_schema,
+                )
+            table_lifecycle.transition(
+                con,
+                pipeline=pipeline,
+                source_schema=schema,
+                source_table=table,
+                to=table_lifecycle.GONE,
+                reason=(
+                    "the source relation was positively observed absent while its "
+                    "quarantined resnapshot was owed; the stale destination image "
+                    "was removed"
+                ),
+                target_table=target,
+                snapshot_lsn=evidence.wal_lsn,
+                control_schema=control_schema,
+            )
+            detail = (
+                "quarantined source relation was positively observed absent; "
+                "the owed resnapshot was cancelled, the stale destination image was "
+                f"removed, and the lifecycle was discharged as gone at source WAL "
+                f"position {evidence.wal_lsn}"
+            )
+            projection.project_snapshot_completion(
+                con,
+                pipeline=pipeline,
+                namespace=namespace,
+                source_schema=schema,
+                source_table=table,
+                target_table=target,
+                snapshot_lsn=evidence.wal_lsn,
+                commit_id=0,
+                events=(
+                    ProjectionEvent(
+                        "source_missing_discharge",
+                        detail,
+                        table_event="dropped",
+                        table_event_detail=detail,
+                        seq=0,
+                        applied=True,
+                    ),
+                ),
+                snapshot_epoch=snapshot_epoch,
+                control_schema=control_schema,
+            )
+            dest_mod.forget_source_relation(
+                con,
+                pipeline=pipeline,
+                source_schema=schema,
+                source_table=table,
+                control_schema=control_schema,
+            )
+            discharged.append(qualified)
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+    log.warning(
+        "discharged %s quarantined source-missing relation(s) as gone: %s",
+        len(discharged), ", ".join(discharged),
+    )
+    return discharged

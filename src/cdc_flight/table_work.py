@@ -65,6 +65,7 @@ from .errors import (
     DestinationIdentityCollision,
     SchemaEvolutionRefused,
     ToastBaseMissing,
+    TypedValueError,
 )
 from .naming import CDCF_COMMIT_ID, CDCF_EVENT_ID, CDCF_TOTAL_ORDER
 from .row_patch import RowPatch
@@ -254,9 +255,19 @@ def _key_token(
             from .typed_types import native_type
 
             item.descriptors[column] = descriptor
-            item.native_columns[column] = native_type(
-                descriptor, for_key=column in item.key_columns
-            )
+            try:
+                item.native_columns[column] = native_type(
+                    descriptor, for_key=column in item.key_columns
+                )
+            except TypedValueError as exc:
+                raise SchemaEvolutionRefused(
+                    f"{item.target}.{column}: source descriptor is not "
+                    f"deliverable through the native destination: {exc}",
+                    source_schema=item.source_schema,
+                    source_table=item.source_table,
+                    target=item.target,
+                    refusal_origin="table_work",
+                ) from exc
             item.native_fingerprints[column] = descriptor.fingerprint
             item.columns[column] = item.native_columns[column].sql
     result = tuple(token)

@@ -32,7 +32,7 @@ def test_stock_connector_is_configured_to_deliver_unknown_datatypes():
     assert props["include.unknown.datatypes"] == "true"
 
 
-def test_opaque_multirange_base64_becomes_canonical_varchar_text():
+def test_opaque_multirange_base64_unwraps_to_source_varchar_text():
     integer = SourceTypeDescriptor(23, "pg_catalog.int4", "int4")
     int4range = SourceTypeDescriptor(
         3904, "pg_catalog.int4range", "range", range_subtype=integer

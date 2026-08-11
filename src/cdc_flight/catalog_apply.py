@@ -29,7 +29,12 @@ from .catalog import (
 )
 from .config import DROP_IGNORE, DROP_REPLICATE
 from .errors import SchemaEvolutionRefused
-from .machines import CHANGE_DEFERRED, CHANGE_REFUSED, require_admission_state
+from .machines import (
+    CHANGE_DEFERRED,
+    CHANGE_REFUSED,
+    CHANGE_SUPERSEDED,
+    require_admission_state,
+)
 from .schema_evolution import apply_column_changes
 
 log = logging.getLogger("cdc_flight.catalog_apply")
@@ -136,7 +141,57 @@ class CatalogCoordinator:
             )
             eligible: list[CatalogChange] = []
             for change in due:
-                if change.qualified in blocked_refusals:
+                lifecycle = table_lifecycle.read(
+                    self._lifecycle_con,
+                    pipeline=self.pipeline,
+                    source_schema=change.schema,
+                    source_table=change.table,
+                    control_schema=self.control_schema,
+                )
+                if change.kind == CHANGE_DROPPED and lifecycle == table_lifecycle.GONE:
+                    # A quarantined source drop was already discharged by the
+                    # current-source absence proof. Do not run ordinary DROP policy
+                    # afterward and delete the durable `gone` disposition.
+                    change.to(CHANGE_SUPERSEDED)
+                    log.info(
+                        "suppressing catalog drop for %s: its quarantine was already "
+                        "discharged as gone",
+                        change.qualified,
+                    )
+                elif (
+                    change.kind == CHANGE_RECREATED
+                    and lifecycle == table_lifecycle.COMPLETE
+                    and destination.replacement_snapshot_is_current(
+                        self._lifecycle_con,
+                        pipeline=self.pipeline,
+                        source_schema=change.schema,
+                        source_table=change.table,
+                        relation=change.new_relation,
+                        control_schema=self.control_schema,
+                    )
+                ):
+                    # An owed/repaired table may have completed its replacement
+                    # snapshot before this already-fenced catalog observation reaches
+                    # the main stream.  Reopening a current image here would create a
+                    # second obligation; the non-NULL snapshot LSN and matching
+                    # relation generation prove that this generation crossed the
+                    # snapshot boundary. A merely marked COMPLETE state does not.
+                    change.to(CHANGE_SUPERSEDED)
+                    log.info(
+                        "suppressing duplicate recreate for %s after its replacement "
+                        "snapshot completed",
+                        change.qualified,
+                    )
+                # ``gone`` blocks ordinary streaming, but a present relation is a
+                # new generation and must be allowed to take GONE -> AWAITING so a
+                # complete replacement snapshot can establish current data.
+                elif (
+                    change.qualified in blocked_refusals
+                    and not (
+                        change.kind == CHANGE_RECREATED
+                        and lifecycle == table_lifecycle.GONE
+                    )
+                ):
                     change.to(CHANGE_DEFERRED)
                     blocked_changes.append(change)
                     log.warning(
