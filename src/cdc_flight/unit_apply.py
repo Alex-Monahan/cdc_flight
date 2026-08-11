@@ -71,7 +71,9 @@ def apply_units(
         ),
         pipeline=applier.pipeline,
         control_schema=applier.control_schema,
-        blocked_tables=applier.blocked_schema_tables,
+        # Quarantined relations plus any relation whose stream this run holds out
+        # of a retained image pending a replacement snapshot (round 13, R12-2).
+        blocked_tables=applier.blocked_schema_tables | applier.group.held_tables,
     )
     for unit in group:
         if unit.fenced:

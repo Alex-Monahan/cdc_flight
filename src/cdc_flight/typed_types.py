@@ -635,6 +635,18 @@ def native_type(
             ("vector", NativeType("MAP", "MAP(SMALLINT,DOUBLE)", descriptor, indexable=False)),
         )
         return NativeType("STRUCT", "STRUCT(dimensions SMALLINT,vector MAP(SMALLINT,DOUBLE))", descriptor, fields=fields, indexable=False)
+    if kind == "money":
+        # The ONE deliberate carve-out from the opaque-type OID allowlist below.
+        # Standing directive: `money` must never refuse, block or quarantine a
+        # table; it flows into VARCHAR verbatim under any `lc_monetary`.  The
+        # allowlist (`_OPAQUE_TEXT_OIDS["money"] == {790}`) made that false for a
+        # descriptor spelling money with any other OID -- a non-default catalog,
+        # an extension or a re-created type -- because `encode_value` resolves the
+        # native type BEFORE it reaches its own unconditional money branch, so the
+        # refusal happened here instead.  Resolving money by kind alone keeps the
+        # promise where it is actually made.  Every OTHER opaque kind keeps the
+        # OID allowlist exactly as it is: names alone remain no authority there.
+        return NativeType("VARCHAR", "VARCHAR", descriptor)
     if kind in _OPAQUE_TEXT_KINDS and _opaque_descriptor_allowed(descriptor, kind):
         return NativeType("VARCHAR", "VARCHAR", descriptor)
     raise UnsupportedType(
@@ -799,7 +811,12 @@ def encode_value(value: Any, descriptor: SourceTypeDescriptor | NativeType) -> A
         # of this branch that can raise.  It is placed above the generic opaque
         # branch precisely so that neither the descriptor allowlist nor
         # `_decode_opaque_text`'s transport heuristics can ever refuse a `money`
-        # column: money must never block a table under any `lc_monetary`.
+        # column: money must never block a table under any `lc_monetary`.  The
+        # claim used to be false one line earlier: `native_type` above still ran
+        # the money descriptor through the opaque OID allowlist and raised
+        # `UnsupportedType` for any OID other than 790 before this branch could
+        # be reached.  `native_type` now resolves money by kind alone, so the
+        # whole call really cannot raise for a money descriptor.
         return value
     if kind in {"inet", "cidr"}:
         # Debezium's wire value is text, but the catalog ADD-column backfill uses

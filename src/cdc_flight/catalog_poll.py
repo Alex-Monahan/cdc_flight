@@ -11,7 +11,7 @@ from . import faults as faults_mod
 from .catalog_descriptors import CatalogDescriptorReader
 from .catalog_generation import identities_equal, identity_for
 from .catalog_state import FENCED, SourceRelation, _missing_value
-from .errors import AdmissionError, SchemaEvolutionRefused
+from .errors import AdmissionError, SchemaEvolutionRefused, as_schema_refusal
 from .machines import (
     CATALOG_SCHEMA_LIVENESS,
     SCHEMA_EMPTY,
@@ -349,11 +349,24 @@ def poll_quietly(watcher):
             watcher.machine_error,
         )
         return []
+    except AdmissionError as admission:
+        # Handle the CLASS, not one instance of it.  This used to be an
+        # `isinstance(exc, SchemaEvolutionRefused)` test inside the bare
+        # `except Exception` below, so every other admission sibling
+        # (`UnsupportedType`, `InvalidTypedValue`, anything added later) was
+        # silently downgraded to an in-memory `last_error` string that evaporated
+        # on restart — the exact bypass `AdmissionError` exists to prevent, hidden
+        # where the structural guards cannot see it.  `as_schema_refusal`
+        # normalizes a sibling into the one durable refusal class; a real
+        # `SchemaEvolutionRefused` is returned unchanged with its richer context.
+        refusal = as_schema_refusal(admission, refusal_origin="catalog_poll")
+        if hasattr(watcher, "remember_schema_refusal"):
+            watcher.remember_schema_refusal(refusal)
+        _mark_liveness_error(watcher)
+        watcher.last_error = f"{type(admission).__name__}: {admission}"
+        log.warning("catalog poll refused durably: %s", watcher.last_error)
+        return []
     except Exception as exc:  # pragma: no cover - exercised through the thread
-        if isinstance(exc, SchemaEvolutionRefused) and hasattr(
-            watcher, "remember_schema_refusal"
-        ):
-            watcher.remember_schema_refusal(exc)
         _mark_liveness_error(watcher)
         watcher.last_error = f"{type(exc).__name__}: {exc}"
         log.warning("catalog poll failed: %s", watcher.last_error)

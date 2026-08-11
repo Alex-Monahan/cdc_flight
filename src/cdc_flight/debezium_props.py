@@ -123,6 +123,41 @@ SKIP_NOTHING = "none"
 SKIP_TRUNCATE = "t"
 
 
+#: DELIBERATE, NARROW, ENUMERATED DEVIATION (rubric 2.4, round 13).
+#:
+#: PostgreSQL renders `money` with the *session's* `lc_monetary`, and stock
+#: Debezium 3.6 parses that rendering with a locale-blind numeric parser
+#: (`PostgresValueConverter.convertMoney` -> `new BigDecimal(...)`).  Under any
+#: COMMA-DECIMAL `lc_monetary` — `de_DE.UTF-8`, `fr_FR.UTF-8`, `pt_BR.UTF-8`,
+#: `es_ES`, `it_IT`, `nl_NL`, `ru_RU`, `tr_TR`, `id_ID`, i.e. most of Europe and
+#: Latin America — the connector's own change-event producer throws
+#: `ConnectException: Failed to parse money value: 100,50 €` /
+#: `NumberFormatException`, MEASURED on this branch before this property existed.
+#: That failure happens inside the connector, before any value reaches Python, so
+#: no Python-side carry can help: nothing is delivered at all.
+#:
+#: `driver.options` is a stock Debezium pass-through (no fork, no converter, no
+#: SMT): `driver.*` properties are given to the JDBC driver, and pgjdbc forwards
+#: `options` verbatim as the PostgreSQL startup-packet `options` string.  Pinning
+#: `lc_monetary=C` on the connector's own sessions makes `money_out` emit a
+#: dot-decimal rendering that the stock converter always parses, for every source
+#: `lc_monetary`.
+#:
+#: THE DEVIATION, stated exactly: the destination VARCHAR then holds the value's
+#: locale-independent NUMERIC spelling (`100.50`, `1234.56`) — which is precisely
+#: what stock Debezium already delivered under every dot-decimal locale — and not
+#: the source session's decorated rendering (`100,50 €`, `₹1,234.56`).  Under the
+#: standing directive ("money should never be a blocker; just have it flow across
+#: into a VARCHAR column as simply as possible") this is the right trade: it is
+#: the SAME value on every locale rather than a whole-Flight outage on half of
+#: them.  It is asserted exactly (not fuzzily) by
+#: `tests/rubric/2.4_native_types/test_2_4_fix13_regressions.py` and recorded in
+#: `RUBRIC_STATUS.md`.  Nothing here synthesizes a value: PostgreSQL still writes
+#: the text and Debezium still delivers it; only the connector session's locale
+#: is pinned.
+MONEY_LOCALE_NEUTRAL_OPTIONS = "-c lc_monetary=C"
+
+
 def build_properties(
     source: SourceConfig,
     replication: ReplicationConfig,
@@ -161,6 +196,13 @@ def build_properties(
         "database.user": source.user,
         "database.password": source.password,
         "database.dbname": source.dbname,
+        # --- connector session locale (see MONEY_LOCALE_NEUTRAL_OPTIONS) ------
+        # Stock Debezium pass-through: `driver.*` properties are handed to the
+        # JDBC driver (`CommonConnectorConfig.DRIVER_CONFIG_PREFIX = "driver."`),
+        # and pgjdbc's `options` parameter is forwarded verbatim in the startup
+        # packet, so it applies to BOTH the snapshot connection and the
+        # replication (walsender) connection that renders streamed `money`.
+        "driver.options": MONEY_LOCALE_NEUTRAL_OPTIONS,
         # --- logical decoding -------------------------------------------------
         # pgoutput is built into Postgres: no wal2json / decoderbufs extension.
         # (Rubric 7.1 wants exactly this.)

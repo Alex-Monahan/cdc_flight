@@ -610,14 +610,14 @@ def record_schema_refusal(
                     detail=reason,
                     control_schema=control_schema,
                 )
-            alert_marker = f'%"refusal_fingerprint": "{fingerprint}"%'
-            alert_exists = con.execute(
-                f"SELECT 1 FROM {_control_table(control_schema, 'alerts')} "
-                "WHERE pipeline = ? AND code = 'schema_table_quarantined' "
-                "AND context LIKE ? LIMIT 1",
-                [pipeline, alert_marker],
-            ).fetchone()
-            if alert_exists is None:
+            if not alert_marker_exists(
+                con,
+                pipeline=pipeline,
+                code="schema_table_quarantined",
+                marker_key="refusal_fingerprint",
+                marker_value=fingerprint,
+                control_schema=control_schema,
+            ):
                 quarantine_alert = {
                     "source_schema": source_schema,
                     "source_table": source_table,
@@ -777,6 +777,16 @@ def quarantine_retry_allowed(
     automatic triggers are positive source absence (the drop policy must discharge it)
     or a changed relation/descriptor fingerprint.  An unavailable catalog read is
     deliberately not a trigger.
+
+    A stored ``source_fingerprint`` of NULL (an older refusal, or one recorded from a
+    seam that had no source read) is ADOPTED, not treated as evidence.  The r11 fix
+    made a NULL return True so a NULL quarantine could not be a permanent dead end;
+    because nothing ever wrote the observed fingerprint back, the same NULL was read
+    on every subsequent run and the table was reactivated and re-refused once per
+    run for ever, contradicting the paragraph above.  The first successful source
+    read now becomes the comparison baseline and by itself authorizes nothing; a
+    LATER change to that baseline is still detected, so the dead end stays closed
+    and the retry is bounded rather than per-run.
     """
     row = con.execute(
         f"SELECT state, source_fingerprint FROM "
@@ -791,9 +801,25 @@ def quarantine_retry_allowed(
     if not source_fingerprint:
         return False
     if row[1] is None:
-        # A source read that successfully produced a fingerprint is positive repair
-        # evidence even when the original refusal recorded no source fingerprint.
-        return True
+        # Adopt the baseline on the caller's own control connection.  The guard on
+        # `source_fingerprint IS NULL` keeps this idempotent and stops it from
+        # clobbering a fingerprint another writer recorded meanwhile; the row must
+        # still be quarantined, so an interleaved reactivation is not undone either.
+        con.execute(
+            f"UPDATE {_control_table(control_schema, 'schema_refusals')} "
+            "SET source_fingerprint = ? WHERE pipeline = ? AND source_schema = ? "
+            "AND source_table = ? AND state = ? AND source_fingerprint IS NULL",
+            [
+                str(source_fingerprint), pipeline, source_schema, source_table,
+                REFUSAL_QUARANTINED,
+            ],
+        )
+        log.info(
+            "adopted source fingerprint %s as the quarantine baseline for %s.%s; "
+            "a later change to it is an automatic retry trigger",
+            source_fingerprint, source_schema, source_table,
+        )
+        return False
     return str(source_fingerprint) != str(row[1])
 
 
@@ -1036,6 +1062,40 @@ class AlertSink:
             with contextlib.suppress(Exception):
                 self._sink.close()
             self._sink = None
+
+
+def alert_marker_exists(
+    con,
+    *,
+    pipeline: str,
+    code: str,
+    marker_key: str,
+    marker_value: str,
+    control_schema: str | None = None,
+) -> bool:
+    """Whether an alert of `code` already carries this context marker.
+
+    The shared probe behind "at most one alert per (relation, condition)".  An alert
+    that describes a *standing* condition — a quarantine, a permanently deferred
+    change — must be raised once, not once per poll: the same condition re-observed
+    every few seconds otherwise grows `alerts` without bound and buries the signal
+    it exists to give.  Callers put a stable fingerprint in the alert's JSON context
+    and probe for it here before emitting.
+
+    A failed probe returns False (emit anyway): losing an alert is worse than
+    duplicating one, and this must never raise into a caller's decision path.
+    """
+    marker = f'%"{marker_key}": "{marker_value}"%'
+    try:
+        row = con.execute(
+            f"SELECT 1 FROM {_control_table(control_schema, 'alerts')} "
+            "WHERE pipeline = ? AND code = ? AND context LIKE ? LIMIT 1",
+            [pipeline, code, marker],
+        ).fetchone()
+    except Exception:  # pragma: no cover - dedup must never mask the caller
+        log.warning("could not probe existing %s alerts", code, exc_info=True)
+        return False
+    return row is not None
 
 
 def raise_alert(

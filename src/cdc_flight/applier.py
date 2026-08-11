@@ -136,6 +136,14 @@ class Applier:
         self.snapshot_completion = completion or SnapshotCompletion.full_snapshot()
         #: the consistent point of the snapshot this run applied, if any
         self.last_snapshot_lsn: int | None = None
+        #: The highest source LSN this run has RECEIVED from the connector, seeded
+        #: with the durable resume point.  This is the per-slot reference the idle
+        #: proof needs: `pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)`
+        #: is CLUSTER-wide, so any other database in the same PostgreSQL cluster
+        #: inflates it without a single byte of it being ours (review r12, R12-3:
+        #: a co-tenant made every bounded run burn its whole `--max-seconds`).
+        #: `highest_source_lsn - confirmed_flush_lsn` is ours and only ours.
+        self.highest_source_lsn: int = int(resume_point.last_lsn or 0)
 
         self.registry = apply_sql.SchemaRegistry(
             con, dataset, constraints=config.destination_constraints
@@ -185,6 +193,15 @@ class Applier:
         self.blocked_schema_tables = destination.blocked_schema_tables(
             con, pipeline, control_schema=self.control_schema
         )
+        #: Relations whose streaming rows this run holds out of a RETAINED
+        #: destination image because they owe a replacement snapshot under
+        #: `CDC_DROP_MODE=log` (see `unit_admission.hold_log_owed_tail`).  Kept
+        #: separate from `blocked_schema_tables` because the durable authority is
+        #: the table lifecycle, not a schema refusal.  DIAGNOSTICS AND ALERT
+        #: DEDUPLICATION ONLY: the set the planner actually reads is
+        #: `OpenGroup.held_tables`, which expires with the group that observed the
+        #: obligation, because that obligation can be discharged mid-run.
+        self.held_streaming_tables: set[str] = set()
         # rubric 1.9: an illegal table-lifecycle transition must reach an operator, and
         # the only connection that survives this group's rollback is the sink's.
         self.snapshots.alerts = self.alerts
@@ -320,6 +337,7 @@ class Applier:
             "discarded_tail_events": self.assembler.discarded_tail_events,
             "quarantined_events": self.quarantined_events,
             "blocked_schema_tables": sorted(self.blocked_schema_tables),
+            "held_streaming_tables": sorted(self.held_streaming_tables),
             "unscoped_refusals": self.unscoped_refusals,
             "orphan_end_markers": self.assembler.orphan_end_markers,
             "implicit_txn_opens": self.assembler.implicit_txn_opens,
@@ -475,6 +493,8 @@ class Applier:
 
             source_records += 1
             rec = decode(raw, topic_prefix=self.topic_prefix)
+            if rec.lsn is not None:
+                self.highest_source_lsn = max(self.highest_source_lsn, int(rec.lsn))
             if rec.is_data:
                 data_in_batch += 1
             else:
@@ -580,6 +600,33 @@ class Applier:
         if alert is not None:
             self.group.pending_alerts.append(alert)
         self.ambiguous_resnapshots_queued += int(recorded)
+
+    def hold_streaming_tail(self, tables) -> None:
+        """Hold these relations' ordinary stream rows out of a retained image.
+
+        See `unit_admission.hold_log_owed_tail`.  One deduplicated alert per
+        relation per run: the durable authority is `table_state.snapshot_state`,
+        which already records the replacement-snapshot obligation, so a second
+        durable row here would be a second writer of the same fact.
+        """
+        for qualified in tables:
+            # The GROUP decides what is skipped; the run-scoped set is diagnostics
+            # and alert deduplication only. See `OpenGroup.held_tables`.
+            self.group.held_tables.add(qualified)
+            if qualified in self.held_streaming_tables:
+                continue
+            self.held_streaming_tables.add(qualified)
+            self.alerts.raise_alert(
+                severity="warning",
+                code="streaming_tail_held_for_resnapshot",
+                message=(
+                    f"{qualified} owes a replacement snapshot under drop_mode=log; "
+                    "its streaming rows are held out of the retained destination "
+                    "image until that snapshot completes. Other relations in the "
+                    "same transaction are unaffected."
+                ),
+                context={"source_relation": qualified, "resnapshot_required": True},
+            )
 
     def _record_schema_refusal(self, refused: SchemaEvolutionRefused) -> None:
         if refused.refusal_recorded:

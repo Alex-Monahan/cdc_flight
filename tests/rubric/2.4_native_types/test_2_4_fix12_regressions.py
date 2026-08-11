@@ -446,16 +446,17 @@ def test_all_typed_exception_classes_and_external_catches_are_closed():
             if names & (typed_classes | errors_classes):
                 assert "AdmissionError" in names, (path.name, node.lineno, names)
     assert boundary_files, "no admission containment boundary catches the common base"
-    # A new class discovered above is covered by every boundary because Python
-    # dispatches all AdmissionError subclasses through the same handler.
-    assert all(
-        any(
-            "AdmissionError" in _exception_names(node.type)
-            for node in ast.walk(ast.parse((ROOT / "src" / "cdc_flight" / name).read_text()))
-            if isinstance(node, ast.ExceptHandler)
-        )
-        for name in boundary_files
-    )
+    # ROUND 13: the assertion that used to stand here was VACUOUS and is removed
+    # rather than left as protection that is not there. It re-parsed the same files
+    # `boundary_files` had just been defined as "files containing an AdmissionError
+    # handler" and asserted they contain an AdmissionError handler, so widening a
+    # boundary to `except Exception` passed it (review r12, R12-5). The real,
+    # non-tautological catch-side assertion is
+    # `test_2_4_fix13_regressions.py::test_every_declared_containment_boundary_still_catches_the_common_base`,
+    # which compares against a checked-in inventory of the boundary modules. This
+    # test keeps its raise-side assertions, which are not vacuous; note that its
+    # enumeration is deliberately narrow (two files) and is SUPERSEDED by fix13's
+    # package-wide enumeration.
 
 
 def _value_error_class_names(tree: ast.AST) -> set[str]:

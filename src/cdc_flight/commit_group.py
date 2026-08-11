@@ -81,6 +81,15 @@ class OpenGroup:
     pending_alerts: list[dict] = field(default_factory=list)
     #: source tables this group actually wrote, handed to the watcher after COMMIT
     source_tables: set[str] = field(default_factory=set)
+    #: relations whose ordinary stream rows THIS GROUP holds out of a retained
+    #: destination image because they owe a replacement snapshot under
+    #: `CDC_DROP_MODE=log` (`unit_admission.hold_log_owed_tail`).  It belongs to the
+    #: group, not to the applier, and that is load-bearing: the durable obligation can
+    #: be discharged mid-run (a replacement snapshot completes and the relation becomes
+    #: `complete`), and a run-scoped hold would go on skipping its post-snapshot rows
+    #: for the rest of the run while still reporting success — silent loss. Group scope
+    #: makes the hold expire with the group that observed the obligation.
+    held_tables: set[str] = field(default_factory=set)
     def __bool__(self) -> bool:
         return bool(self.units)
 

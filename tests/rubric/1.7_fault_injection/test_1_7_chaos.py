@@ -120,6 +120,42 @@ def _runs() -> list[tuple[int, int, bool]]:
 
 RUNS = _runs()
 
+# --------------------------------------------------------------------------- #
+# The per-node time bound, DERIVED from this test's own declared budgets.
+# --------------------------------------------------------------------------- #
+#: ROUND 13 (review r12, R12-4).  This node hit the project-wide 600 s
+#: `pytest-timeout` default (`pyproject.toml`), and that default was never a bound
+#: derived from anything this test declares: the 12-iteration case declares, in
+#: its own call sites, up to `300 + 12 * (200 + 4 * 260)` seconds of bounded
+#: subprocess time.  600 s sat above its healthy cost (~210-235 s measured) and
+#: below its first budget blowout, which makes it a coin flip rather than a gate —
+#: and it fired at 600.22 s on the reviewer's host while the test was still making
+#: progress, so it reported a timeout where there was no hang.
+#:
+#: Two things are done about that, not one.
+#:  1. The cause of the blowout is FIXED, not accommodated: a bounded run used to
+#:     burn its entire `--max-seconds` whenever anything else in the same
+#:     PostgreSQL cluster wrote WAL, because `SourceHealth` measured the backlog
+#:     against the cluster-wide `pg_current_wal_lsn()`.  It now measures the
+#:     per-slot backlog (`source_health.outstanding_bytes`).  Measured on this
+#:     host, one co-tenant database: before, `max_seconds` in 61.98 s; after,
+#:     `idle` in 12.10 s.
+#:  2. The remaining bound is DERIVED here from the same constants the call sites
+#:     use, so it cannot drift from them.  Every individual pipeline run below is
+#:     separately and tightly bounded by `subprocess.run(timeout=...)`, which
+#:     fails loudly with the run's own output; this node-level timeout is a
+#:     backstop against a hang in the PYTHON half (a psycopg call, the fixture),
+#:     which nothing else bounds.  It is deliberately not a lane budget.
+CHAOS_BASELINE_TIMEOUT = 300
+CHAOS_FAULT_RUN_MAX_SECONDS = 120
+CHAOS_FAULT_RUN_TIMEOUT = 200
+CHAOS_RECOVERY_MAX_SECONDS = 200
+CHAOS_RECOVERY_TIMEOUT = 260
+CHAOS_RECOVERY_ATTEMPTS = 4
+CHAOS_NODE_TIMEOUT = CHAOS_BASELINE_TIMEOUT + max(
+    iterations for _seed, iterations, _cover in RUNS
+) * (CHAOS_FAULT_RUN_TIMEOUT + CHAOS_RECOVERY_ATTEMPTS * CHAOS_RECOVERY_TIMEOUT)
+
 
 def _plan(rng: random.Random, iterations: int) -> list[str]:
     """A shuffled cover of the anchor set, extended with random draws if asked."""
@@ -246,6 +282,7 @@ def _assert_equal_to_source(box: Sandbox, note: str) -> None:
 
 
 @pytest.mark.slow
+@pytest.mark.timeout(CHAOS_NODE_TIMEOUT)
 @pytest.mark.parametrize(("seed", "iterations", "must_cover"), RUNS)
 def test_random_faults_at_random_anchors_never_break_the_ledger(
     tmp_path_factory, postgres_cluster, seed, iterations, must_cover
@@ -257,7 +294,7 @@ def test_random_faults_at_random_anchors_never_break_the_ledger(
     fired_anchors: set[str] = set()
     try:
         box.reseed()
-        box.run(reset_state=True, max_seconds=150)
+        box.run(reset_state=True, max_seconds=150, timeout=CHAOS_BASELINE_TIMEOUT)
         _assert_equal_to_source(box, "baseline")
 
         for iteration, point in enumerate(points, start=1):
@@ -271,7 +308,12 @@ def test_random_faults_at_random_anchors_never_break_the_ledger(
 
             box.clear_fired_fault()
             env = {"CDC_FAULT_INJECT": f"{point}:{nth}", **ARMING.get(point, {})}
-            box.run(max_seconds=120, timeout=200, expect_success=False, extra_env=env)
+            box.run(
+                max_seconds=CHAOS_FAULT_RUN_MAX_SECONDS,
+                timeout=CHAOS_FAULT_RUN_TIMEOUT,
+                expect_success=False,
+                extra_env=env,
+            )
             fired = box.fired_fault()
             assert fired is not None and fired["point"] == point, (
                 f"iteration {iteration}: the plan armed {point}:{nth} and it did not "
@@ -293,11 +335,11 @@ def test_random_faults_at_random_anchors_never_break_the_ledger(
                 "CDC_FAULT_INJECT": f"{during_recovery}:2",
                 **ARMING.get(during_recovery, {}),
             }
-            for attempt in range(4):
+            for attempt in range(CHAOS_RECOVERY_ATTEMPTS):
                 box.clear_fired_fault()
                 recovered = box.run(
-                    max_seconds=200,
-                    timeout=260,
+                    max_seconds=CHAOS_RECOVERY_MAX_SECONDS,
+                    timeout=CHAOS_RECOVERY_TIMEOUT,
                     expect_success=False,
                     # Only the FIRST attempt is hostile; the rest must be allowed to
                     # converge or the harness proves nothing about recovery at all.

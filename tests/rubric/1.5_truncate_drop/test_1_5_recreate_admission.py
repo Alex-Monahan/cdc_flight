@@ -31,7 +31,6 @@ from cdc_flight.machines import (
     LIFECYCLE_COMPLETE,
     TABLE_LIFECYCLE,
 )
-from cdc_flight.snapshot_completion import SnapshotObservationError
 
 
 @pytest.fixture
@@ -72,7 +71,7 @@ def test_a_recreated_table_quarantines_the_destination_and_says_why(lab):
     assert box.applier.stats()["tables_awaiting_snapshot"] == ["app.customers"]
 
 
-def test_log_mode_recreate_refuses_new_relation_stream_until_resnapshot(lab):
+def test_log_mode_recreate_holds_new_relation_stream_until_resnapshot(lab):
     old = _catalog_relation("customers", 16384)
     new = _catalog_relation("customers", 16385)
     watcher = _watcher(present={new.qualified: new.oid})
@@ -99,9 +98,26 @@ def test_log_mode_recreate_refuses_new_relation_stream_until_resnapshot(lab):
     box.run([heartbeat(175)])
     _assert_recreated_boundary(box, new)
 
-    with pytest.raises(SnapshotObservationError, match="awaiting_snapshot"):
-        box.run(txn("3", [keyed("3", 1, 300, 4, "new-lifecycle")]))
+    # ROUND 13 (review r12, BLOCKER R12-2): this used to raise an uncontained
+    # `SnapshotObservationError` that killed the run — and, with a healthy
+    # co-published peer, killed every subsequent run too, freezing both slot LSNs.
+    # The protection asserted here is STRICTLY STRONGER than the old raise: the
+    # new lifecycle's rows are held out of the retained image, the retained image
+    # is byte-for-byte what it was, the relation is still owed a replacement
+    # snapshot, and the run survives so anything else in the same transaction
+    # still commits.
+    box.run(txn("3", [keyed("3", 1, 300, 4, "new-lifecycle")]))
     assert box.exists(CUSTOMERS)
+    assert rows(box, CUSTOMERS) == [(1,), (2,), (3,)]
+    assert box.applier.held_streaming_tables == {"app.customers"}
+    assert box.q(
+        "SELECT snapshot_state FROM _cdc_flight.table_state "
+        "WHERE source_table = 'customers'"
+    ) == [("awaiting_snapshot",)]
+    assert box.q(
+        "SELECT count(*) FROM _cdc_flight.alerts "
+        "WHERE code = 'streaming_tail_held_for_resnapshot'"
+    ) == [(1,)]
 
 
 def test_log_mode_recreate_same_group_is_quarantined_after_group_dml(lab):
@@ -323,9 +339,16 @@ def test_log_mode_recreate_while_flight_is_stopped_keeps_the_boundary(lab):
         _queue_recreated(restarted_watcher, new)
         restarted.run([heartbeat(175)])
         _assert_recreated_boundary(restarted, new)
-        with pytest.raises(SnapshotObservationError, match="awaiting_snapshot"):
-            restarted.run(txn("3", [keyed("3", 1, 300, 4, "new-lifecycle")]))
+        # ROUND 13: the boundary survives a restart, and it is now a HOLD rather
+        # than a run-killing refusal (review r12, BLOCKER R12-2).
+        restarted.run(txn("3", [keyed("3", 1, 300, 4, "new-lifecycle")]))
         assert restarted.exists(CUSTOMERS)
+        assert rows(restarted, CUSTOMERS) == [(1,), (2,), (3,)]
+        assert restarted.applier.held_streaming_tables == {"app.customers"}
+        assert restarted.q(
+            "SELECT snapshot_state FROM _cdc_flight.table_state "
+            "WHERE source_table = 'customers'"
+        ) == [("awaiting_snapshot",)]
     finally:
         restarted.close()
 

@@ -99,7 +99,7 @@ class EmptySnapshotHealth:
     unknown_for = 0.0
     not_streaming_for = 0.0
 
-    def may_declare_idle(self, *, min_seconds):
+    def may_declare_idle(self, *, min_seconds, received_high_water=None):
         return True
 
     def summary(self):
@@ -237,7 +237,7 @@ class SettlingSourceHealth:
     def _settled(self) -> bool:
         return self._settles_at is not None and time.monotonic() >= self._settles_at
 
-    def may_declare_idle(self, *, min_seconds):
+    def may_declare_idle(self, *, min_seconds, received_high_water=None):
         self.idle_questions += 1
         return self._settled
 

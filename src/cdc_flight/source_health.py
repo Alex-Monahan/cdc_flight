@@ -440,7 +440,37 @@ class SourceHealth:
             "streaming" if sample.streaming else "not_streaming"
         )
 
-    def may_declare_idle(self, *, min_seconds: float) -> bool:
+    def outstanding_bytes(self, received_high_water: int | None) -> int | None:
+        """OUR undelivered backlog, in bytes, or ``None`` when it cannot be read.
+
+        ``slot_lag_bytes`` is ``pg_wal_lsn_diff(pg_current_wal_lsn(),
+        confirmed_flush_lsn)`` — the WAL PostgreSQL must RETAIN, which is a
+        CLUSTER-wide quantity.  Another database in the same cluster moves
+        ``pg_current_wal_lsn()`` on every 0.5 s sample without a single byte of
+        it being ours, which is exactly how review r12 (R12-3) measured every
+        bounded run burning its whole ``--max-seconds`` under an ordinary
+        neighbour: 60.44 s with a co-tenant against 10.55 s without.
+
+        The per-slot reference is the highest source LSN the connector has
+        actually DELIVERED to this run (seeded with the durable resume point, so
+        a run that receives nothing still has one).  What that reference minus
+        ``confirmed_flush_lsn`` measures is precisely "delivered to us and not
+        yet durable", which is what "are we behind?" means and what rubric B5 is
+        about.  It is unaffected by a co-tenant and it does not need a second
+        clock to tell growth from catch-up.
+        """
+        sample = self.last
+        if sample is None or sample.lag_bytes is None:
+            return None
+        if received_high_water is None or sample.confirmed_pos is None:
+            # No per-slot reference available: fall back to the retained-WAL
+            # figure rather than inventing a smaller one.
+            return sample.lag_bytes
+        return max(0, int(received_high_water) - int(sample.confirmed_pos))
+
+    def may_declare_idle(
+        self, *, min_seconds: float, received_high_water: int | None = None
+    ) -> bool:
         """Corroborate a quiet timer against the source.
 
         Requires the source to have agreed *continuously* for `min_seconds`, not
@@ -478,33 +508,38 @@ class SourceHealth:
         #     enough, but a sustained one is.
         if self.streaming_for < min_seconds:
             return False
-        # ROUND 12, WITHDRAWN AFTER MEASUREMENT. This is where round 12 additionally
-        # required `confirmed_pos` to have advanced *past* the position held at the
-        # last streaming -> not-streaming transition. That obligation is unsatisfiable
-        # for a run with nothing left to deliver: `confirmed_flush_lsn` only moves
-        # when the connector flushes a NEW offset, so a connector that blipped once
-        # during start-up and then streamed cleanly for the whole run could never
-        # satisfy it. Measured consequences on this tree: ordinary runs became unable
-        # to declare idle and burned their whole `--max-seconds`; armed fault anchors
-        # in `tests/rubric/1.1_exactly_once_pk` and `tests/rubric/1.7_fault_injection`
-        # were pre-empted by the resulting failure; and the slow lane's own
-        # walsender/sigkill scenarios timed out waiting for a slot the interruption
-        # gate was keeping detached. The counters below are kept as DIAGNOSTICS in
-        # `summary()`, but they are not a verdict. What actually closes B5 is the pair
-        # above and below: a walsender attached CONTINUOUSLY for the whole quiet
-        # window, and a backlog that is either gone or exactly unchanged for it (the
-        # `lag_stable_since` clock, which any change resets — a source writer still
-        # ahead of us therefore cannot look flat).
-        #
-        # (2) And the backlog must either be gone, or have stopped shrinking.
-        #     MEASURED: after a reconnect, `confirmed_flush_lsn` stops tracking
-        #     `pg_current_wal_lsn()` and freezes ~1.8 MB behind even once every
-        #     row has been delivered, so "lag is small" alone is not a usable
-        #     completion test - it would burn the run to `--max-seconds`. A lag
-        #     that is still *decreasing* is unambiguous catch-up; one that has
-        #     been flat for the whole quiet window means nothing more is coming.
-        if sample.lag_bytes is None or sample.lag_bytes <= self.max_lag_bytes:
+        # (2) And OUR backlog must be gone.  ROUND 13 (review r12, R12-3 and
+        #     R12-6).  Round 12 measured this against `pg_current_wal_lsn()`,
+        #     which is cluster-wide: the reviewer proved that one ordinary
+        #     co-tenant database writing WAL made this branch unsatisfiable and
+        #     cost every bounded run its entire `--max-seconds` (60.44 s against
+        #     10.55 s, one file swapped).  `outstanding_bytes` measures the
+        #     per-slot quantity instead — delivered to us, not yet confirmed —
+        #     so an unrelated writer cannot make us look behind, and a backlog
+        #     that grows *because we are behind* still does.
+        outstanding = self.outstanding_bytes(received_high_water)
+        if outstanding is None or outstanding <= self.max_lag_bytes:
             return True
+        # (3) ROUND 12's withdrawn obligation, restored CONDITIONALLY, which is
+        #     what makes it satisfiable (review r12, R12-6, and its own prescribed
+        #     fix).  Round 12 required unconditionally that `confirmed_pos` have
+        #     advanced past the position held at the last streaming ->
+        #     not-streaming transition; that is unsatisfiable for a run with
+        #     nothing left to deliver, because `confirmed_flush_lsn` only moves
+        #     when the connector flushes a NEW offset — so a connector that
+        #     blipped once at start-up and then streamed cleanly could never
+        #     satisfy it, ordinary runs burned their whole `--max-seconds`, and
+        #     armed fault anchors were pre-empted.  Reaching here means there IS
+        #     something outstanding, which is exactly the B5 shape the obligation
+        #     exists for: streaming, a walsender interruption with real bytes
+        #     undelivered, and a reattachment whose `confirmed_pos` never advances
+        #     past the interruption.  A run with nothing outstanding returned True
+        #     above and never sees this gate.
+        if self._stream_interruptions and not self._recovered_after_interruption:
+            return False
+        #     Otherwise: a backlog still *changing* is unambiguous catch-up; one
+        #     that has been exactly flat for the whole quiet window means nothing
+        #     more is coming.
         return self.lag_steady_for >= min_seconds
 
     def summary(self) -> dict:

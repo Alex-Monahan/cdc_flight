@@ -14,6 +14,7 @@ commit-time proof which could turn a source error into an acknowledged, lost uni
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass, field
 
@@ -41,6 +42,26 @@ log = logging.getLogger("cdc_flight.catalog_apply")
 
 # Canonical definition lives in destination; re-export the name for local callers.
 AWAITING_SNAPSHOT = destination.AWAITING_SNAPSHOT
+
+
+def _deferral_fingerprint(change: CatalogChange, lifecycle: str | None) -> str:
+    """Identify one (relation, blocking condition) pair for alert deduplication.
+
+    The relation generation tokens are part of the identity on purpose: a *later,
+    different* change on the same quarantined relation is a new condition and
+    deserves its own single alert, while the same change re-observed on every poll
+    is the same standing condition and deserves no second one.
+    """
+    material = "|".join(
+        (
+            change.qualified,
+            change.kind,
+            repr(change.old_identity),
+            repr(change.new_identity),
+            str(lifecycle),
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
 
 @dataclass(frozen=True)
@@ -110,6 +131,28 @@ class CatalogCoordinator:
     def enabled(self) -> bool:
         return self.catalog is not None and self.drop_mode != DROP_IGNORE
 
+    def _deferral_alert_is_new(self, fingerprint: str) -> bool:
+        """Whether this blocked change has never been alerted about.
+
+        The durable `alerts` table is deliberately the ONLY memory here.  An
+        in-process "already emitted" set would be wrong in both directions: it
+        forgets across restarts, and — because a deferral alert carries
+        ``on_rollback: False`` and is therefore *discarded* with a rolled-back
+        group — it would permanently suppress an alert that was never written.
+        Probing the table means a lost alert is re-emitted next poll and a
+        written one is never duplicated.
+        """
+        if self._lifecycle_con is None:
+            return True
+        return not destination.alert_marker_exists(
+            self._lifecycle_con,
+            pipeline=self.pipeline,
+            code="schema_change_deferred_for_refusal",
+            marker_key="deferral_fingerprint",
+            marker_value=fingerprint,
+            control_schema=self.control_schema,
+        )
+
     # ------------------------------------------------------------------ #
     # planning
     # ------------------------------------------------------------------ #
@@ -125,7 +168,10 @@ class CatalogCoordinator:
             return CatalogPlan()
 
         due = self.catalog.due(durable_lsn)
-        blocked_changes: list[CatalogChange] = []
+        #: (change, blocking lifecycle) pairs; the lifecycle is part of the alert
+        #: dedup identity, so a table blocked for a *different* reason later still
+        #: gets its own single alert.
+        blocked_changes: list[tuple[CatalogChange, str | None]] = []
         if self._lifecycle_con is not None:
             owing = set(
                 table_lifecycle.owing_work(
@@ -193,7 +239,7 @@ class CatalogCoordinator:
                     )
                 ):
                     change.to(CHANGE_DEFERRED)
-                    blocked_changes.append(change)
+                    blocked_changes.append((change, lifecycle))
                     log.warning(
                         "deferring %s for %s while its schema/value refusal is "
                         "pending or quarantined; the full resnapshot owns convergence",
@@ -219,7 +265,15 @@ class CatalogCoordinator:
         actions: list[CatalogAction] = []
         refused: list[tuple[CatalogChange, str]] = []
         alerts: list[dict] = []
-        for change in blocked_changes:
+        for change, lifecycle in blocked_changes:
+            fingerprint = _deferral_fingerprint(change, lifecycle)
+            if not self._deferral_alert_is_new(fingerprint):
+                # A permanently quarantined table re-observes the same blocked
+                # change on every poll; alerting once per poll grew `alerts`
+                # without bound (39 -> 78 -> 117 rows over three runs of ONE
+                # table) and buried the signal.  The condition is standing, so
+                # the alert is raised once per (relation, blocking condition).
+                continue
             alerts.append(
                 {
                     "severity": "critical",
@@ -229,7 +283,11 @@ class CatalogCoordinator:
                         f"{change.kind} for {change.qualified} was deferred because "
                         "the table is stale/unavailable pending a full resnapshot"
                     ),
-                    "context": {**change.context(), "resnapshot_required": True},
+                    "context": {
+                        **change.context(),
+                        "resnapshot_required": True,
+                        "deferral_fingerprint": fingerprint,
+                    },
                 }
             )
 

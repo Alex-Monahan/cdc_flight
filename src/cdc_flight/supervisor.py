@@ -13,6 +13,7 @@ below is the contract.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -20,9 +21,10 @@ from typing import TYPE_CHECKING
 
 from . import table_lifecycle
 from .applier import Applier
-from .config import RunConfig
+from .config import RunConfig, resolve_control_schema
 from .errors import EngineFailure
 from .machines import PHASE_DRAINING
+from .naming import control_table
 from .run_state import RunOutcome
 from .snapshot_completion import SnapshotCompletion
 from .source_health import SourceHealth
@@ -194,7 +196,15 @@ def run_engine_bounded(
             if enough and quiet and warmed_up and not handler.busy:
                 source_idle = (
                     health is None
-                    or health.may_declare_idle(min_seconds=run.idle_seconds)
+                    or health.may_declare_idle(
+                        min_seconds=run.idle_seconds,
+                        # The per-slot backlog reference (round 13, review r12
+                        # R12-3): what the connector delivered to THIS run, not
+                        # what the whole cluster wrote.
+                        received_high_water=getattr(
+                            handler, "highest_source_lsn", None
+                        ),
+                    )
                 )
                 if source_idle and completion.phase_ended:
                     # The asynchronous slot sampler's last active observation can
@@ -224,7 +234,12 @@ def run_engine_bounded(
                         # the end of the candidate window; freshness alone cannot
                         # turn a walsender kill that happened during this window
                         # into an idle verdict.
-                        if not health.may_declare_idle(min_seconds=run.idle_seconds):
+                        if not health.may_declare_idle(
+                            min_seconds=run.idle_seconds,
+                            received_high_water=getattr(
+                                handler, "highest_source_lsn", None
+                            ),
+                        ):
                             idle_candidate_since = None
                             time.sleep(0.05)
                             continue
@@ -467,6 +482,8 @@ def run_engine_bounded(
         if failure is not None:
             parts.append(f"debezium engine: {failure}")
         message = " | ".join(parts) or "the engine failed without a message"
+        if failure is not None and cause is None:
+            _record_connector_failure(handler, str(failure), summary)
         outcome.record("engine_error")
         summary["stop_reason"] = outcome.value
         raise EngineFailure(message, summary) from cause
@@ -645,3 +662,87 @@ def run_engine_bounded(
 
     summary["ok"] = True
     return summary
+
+
+#: The offset stock Debezium reports with a change-event-producer failure. It names
+#: an LSN and a transaction, and deliberately NOT a relation - see
+#: `_record_connector_failure`.
+_CONNECTOR_OFFSET_RE = re.compile(r"\blsn=(\d+)")
+_CONNECTOR_TXID_RE = re.compile(r"\btxId=(\d+)")
+
+
+def _record_connector_failure(handler, failure: str, summary: dict) -> None:
+    """Make a CONNECTOR-thrown failure durable, observable and BOUNDED.
+
+    ROUND 13, review r12 BLOCKER R12-1's second half.  A failure raised inside
+    stock Debezium's own change-event producer happens before any value crosses
+    into Python, so none of this repository's containment boundaries can ever see
+    it: nothing is delivered.  What round 12 measured was rubric-4.0 level 1 with
+    `schema_refusals` EMPTY and, decisively, **no alert of any kind** — the run
+    died identically four times over and the only durable trace was an unrelated
+    pre-existing warning.  That clause is what this closes: the failure is
+    recorded once, at `critical`, carrying the connector's own reported offset,
+    and a deterministic re-failure at the same offset does not multiply the
+    record (which is the R12-7 defect in a different place).
+
+    What this deliberately does NOT do is attribute the failure to a relation.
+    Debezium reports an offset, not a relation, for a value-conversion failure;
+    inferring one from the message text would be a fabrication, and quarantining
+    the wrong table is worse than quarantining none.  `RUBRIC_STATUS.md` states
+    that residual limit rather than implying it is closed.  The one production
+    trigger this project knows of — `money` under a comma-decimal `lc_monetary`
+    — is eliminated at the source instead, by pinning the connector session's
+    monetary locale (`debezium_props.MONEY_LOCALE_NEUTRAL_OPTIONS`).
+    """
+    alerts = getattr(handler, "alerts", None)
+    if alerts is None:
+        return
+    lsn = _CONNECTOR_OFFSET_RE.search(failure)
+    txid = _CONNECTOR_TXID_RE.search(failure)
+    marker = lsn.group(1) if lsn else "unknown"
+    summary["connector_failure_offset_lsn"] = marker
+    context = {
+        "connector_offset_lsn": marker,
+        "connector_txid": txid.group(1) if txid else None,
+        "connector_error": failure[:2000],
+        "relation_attributed": False,
+    }
+    if _connector_alert_exists(handler, marker):
+        summary["connector_failure_alert"] = "already_recorded"
+        return
+    summary["connector_failure_alert"] = "recorded"
+    alerts.raise_alert(
+        severity="critical",
+        code="connector_event_failure",
+        message=(
+            "the Debezium connector's own change-event producer failed at source "
+            f"offset lsn={marker}; nothing was delivered, so no relation can be "
+            "attributed and the slot has not advanced past it. This run made no "
+            "progress and will re-read the same WAL until the source condition is "
+            "resolved."
+        ),
+        context=context,
+    )
+
+
+def _connector_alert_exists(handler, marker: str) -> bool:
+    """True when this exact connector offset already has a durable alert."""
+    con = getattr(handler, "con", None)
+    if con is None or marker == "unknown":
+        return False
+    try:
+        table = control_table(
+            resolve_control_schema(getattr(handler, "control_schema", None)), "alerts"
+        )
+        row = con.execute(
+            f"SELECT 1 FROM {table} WHERE pipeline = ? AND code = ? "
+            "AND context LIKE ? LIMIT 1",
+            [
+                handler.pipeline,
+                "connector_event_failure",
+                f'%"connector_offset_lsn": "{marker}"%',
+            ],
+        ).fetchone()
+    except Exception:  # pragma: no cover - alerting must never mask the cause
+        return False
+    return row is not None
