@@ -11,7 +11,7 @@ from . import faults as faults_mod
 from .catalog_descriptors import CatalogDescriptorReader
 from .catalog_generation import identities_equal, identity_for
 from .catalog_state import FENCED, SourceRelation, _missing_value
-from .errors import SchemaEvolutionRefused
+from .errors import AdmissionError, SchemaEvolutionRefused
 from .machines import (
     CATALOG_SCHEMA_LIVENESS,
     SCHEMA_EMPTY,
@@ -22,7 +22,7 @@ from .machines import (
 from .schema_evolution import SourceColumn, descriptor_from_type_name
 from .states import IllegalTransition, UnknownState
 from .toast import classify_relation
-from .typed_types import SourceTypeDescriptor, TypedValueError
+from .typed_types import SourceTypeDescriptor
 
 log = logging.getLogger("cdc_flight.catalog_poll")
 
@@ -424,7 +424,7 @@ def poll(watcher):
             )
         try:
             descriptors = descriptor_reader.resolve(all_type_oids)
-        except (SchemaEvolutionRefused, TypedValueError, ValueError, KeyError) as exc:
+        except (AdmissionError, ValueError, KeyError) as exc:
             source_tables = tuple(dict.fromkeys(
                 (str(row[0]), str(row[1]), f"{row[0]}.{row[1]}")
                 for row in rows

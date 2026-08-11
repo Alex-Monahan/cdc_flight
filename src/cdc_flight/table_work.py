@@ -61,11 +61,12 @@ from typing import Any
 from . import apply_sql, naming
 from .envelope import KIND_TRUNCATE, PendingRecord
 from .errors import (
+    AdmissionError,
     AmbiguousDelete,
     DestinationIdentityCollision,
     SchemaEvolutionRefused,
     ToastBaseMissing,
-    TypedValueError,
+    as_schema_refusal,
 )
 from .naming import CDCF_COMMIT_ID, CDCF_EVENT_ID, CDCF_TOTAL_ORDER
 from .row_patch import RowPatch
@@ -259,7 +260,7 @@ def _key_token(
                 item.native_columns[column] = native_type(
                     descriptor, for_key=column in item.key_columns
                 )
-            except TypedValueError as exc:
+            except AdmissionError as exc:
                 raise SchemaEvolutionRefused(
                     f"{item.target}.{column}: source descriptor is not "
                     f"deliverable through the native destination: {exc}",
@@ -812,7 +813,14 @@ def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
             table, created = registry.ensure_typed(
                 item.target, columns=typed_columns, key_columns=item.key_columns
             )
-        except SchemaEvolutionRefused as refused:
+        except AdmissionError as error:
+            refused = as_schema_refusal(
+                error,
+                refusal_origin="table_work",
+                source_schema=item.source_schema,
+                source_table=item.source_table,
+                target=item.target,
+            )
             refused.source_schema = refused.source_schema or item.source_schema
             refused.source_table = refused.source_table or item.source_table
             refused.target = refused.target or item.target

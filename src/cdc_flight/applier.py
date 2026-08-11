@@ -64,9 +64,11 @@ from .config import ApplierConfig, resolve_control_schema
 from .destination import AlertSink, Lease, ResumePoint
 from .envelope import KIND_SNAPSHOT_BOUNDARY, PendingRecord, decode
 from .errors import (
+    AdmissionError,
     AmbiguousDelete,
     DestinationIdentityCollision,
     SchemaEvolutionRefused,
+    as_schema_refusal,
 )
 from .faults import maybe_crash
 from .snapshot import SnapshotCoordinator
@@ -774,7 +776,8 @@ class Applier:
             return spill_protocol.stage_events(
                 self, events, unit_seq=unit_seq, snapshot=snapshot
             )
-        except SchemaEvolutionRefused as refused:
+        except AdmissionError as error:
+            refused = as_schema_refusal(error, refusal_origin="spill_protocol")
             self._handle_spill_refusal(refused, events)
             raise
 

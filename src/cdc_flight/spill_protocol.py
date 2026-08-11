@@ -6,11 +6,11 @@ import logging
 
 from . import catalog_support
 from .envelope import PendingRecord
-from .errors import SchemaEvolutionRefused
+from .errors import AdmissionError, SchemaEvolutionRefused
 from .faults import maybe_crash
 from .planner import stream_event_id
 from .spill import StagedEvent
-from .typed_types import TypedValueError, native_type
+from .typed_types import native_type
 
 log = logging.getLogger("cdc_flight.spill_protocol")
 
@@ -112,7 +112,7 @@ def _enrich_descriptors(applier, event: PendingRecord) -> None:
     for name, descriptor in descriptors.items():
         try:
             native_type(descriptor)
-        except (TypedValueError, ValueError, TypeError) as exc:
+        except (AdmissionError, ValueError, TypeError) as exc:
             raise SchemaEvolutionRefused(
                 f"source catalog descriptor for {event.qualified_table}.{name} is not "
                 f"deliverable through the strict native authority: {exc}",

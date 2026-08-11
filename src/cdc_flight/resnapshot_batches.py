@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from . import destination
 from .catalog_descriptors import source_relation_fingerprint
-from .errors import SchemaEvolutionRefused
+from .errors import AdmissionError, as_schema_refusal
 from .resnapshot_source_policy import (
     discharge_quarantined_source_missing,
     gather_emptiness_evidence,
@@ -146,7 +146,8 @@ def run_owed(
             )
             detail = result.as_dict()
             snapshot_epoch = max(snapshot_epoch, result.snapshot_epoch)
-        except SchemaEvolutionRefused as refused:
+        except AdmissionError as error:
+            refused = as_schema_refusal(error, refusal_origin="schema_backfill")
             # The refusal writer has already scoped this batch's table.  Continue
             # with healthy tables so one bad relation cannot stop their snapshot.
             if not refused.refusal_recorded:

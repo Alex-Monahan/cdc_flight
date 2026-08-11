@@ -26,7 +26,13 @@ from .catalog_apply import CatalogAction
 from .config import TRUNCATE_REPLICATE
 from .destination import DUCKDB_CONNECT_CONFIG, ensure_dataset
 from .envelope import KIND_DATA, PendingRecord
-from .errors import AmbiguousDelete, SchemaEvolutionRefused, ToastBaseMissing
+from .errors import (
+    AdmissionError,
+    AmbiguousDelete,
+    SchemaEvolutionRefused,
+    ToastBaseMissing,
+    as_schema_refusal,
+)
 from .schema_evolution import COLUMN_TYPE_CHANGED, ColumnChange
 from .spill import SpillBuffer, StagedEvent
 from .typed_types import (
@@ -514,7 +520,9 @@ def _exercise_cell(
             rollback_clean=True,
             state_transition="destination_commit",
         )
-    except (AmbiguousDelete, ToastBaseMissing, SchemaEvolutionRefused, faults.InjectedFault) as exc:
+    except (AmbiguousDelete, ToastBaseMissing, AdmissionError, faults.InjectedFault) as exc:
+        if isinstance(exc, AdmissionError):
+            exc = as_schema_refusal(exc, refusal_origin="typed_planner")
         owner_outcome = {
             AmbiguousDelete: "ambiguous_delete",
             ToastBaseMissing: "toast_base_missing",

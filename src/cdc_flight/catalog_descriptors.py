@@ -13,10 +13,10 @@ import json
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 
-from .errors import SchemaEvolutionRefused
+from .errors import AdmissionError, SchemaEvolutionRefused
 from .naming import normalize
 from .schema_evolution import descriptor_from_type_name
-from .typed_types import SourceTypeDescriptor, TypedValueError, native_type
+from .typed_types import SourceTypeDescriptor, native_type
 
 
 @dataclass
@@ -195,7 +195,7 @@ class RelationDescriptorProvider:
         reader = CatalogDescriptorReader(con)
         try:
             descriptors = reader.resolve(oids)
-        except SchemaEvolutionRefused as exc:
+        except AdmissionError as exc:
             source_tables = tuple(
                 (str(schema), str(table), str(target))
                 for schema, table, target in requested
@@ -235,7 +235,7 @@ class RelationDescriptorProvider:
                 # composite, missing array child, incomplete map, or unsupported
                 # descendant must not be converted into a guessed VARCHAR.
                 native_type(descriptor)
-            except (TypedValueError, ValueError) as exc:
+            except (AdmissionError, ValueError) as exc:
                 raise SchemaEvolutionRefused(
                     f"catalog descriptor authority is incomplete for {schema}.{table}.{name}",
                     source_schema=str(schema),

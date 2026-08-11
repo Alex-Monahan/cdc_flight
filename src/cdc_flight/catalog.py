@@ -140,10 +140,11 @@ def read_known_relations(
             con, pipeline, control_schema=control_schema
         )
     except Exception as exc:
-        from .errors import SchemaEvolutionRefused
+        from .errors import AdmissionError, as_schema_refusal
 
-        if not isinstance(exc, SchemaEvolutionRefused):
+        if not isinstance(exc, AdmissionError):
             raise
+        exc = as_schema_refusal(exc, refusal_origin="catalog_state")
         # A durable descriptor miss is not a startup deadlock and is never repaired
         # by guessing. Record the same refusal/awaiting-snapshot obligation used by
         # the live applier, then let the next catalog observation drive a fresh
@@ -503,8 +504,8 @@ class CatalogWatcher:
         the authoritative descriptor without issuing a catalog query per event.
         """
         from .catalog_descriptors import relation_descriptor_fingerprint
-        from .errors import SchemaEvolutionRefused
-        from .typed_types import TypedValueError, native_type
+        from .errors import AdmissionError, SchemaEvolutionRefused
+        from .typed_types import native_type
 
         with self._lock:
             relation = self.known.get(str(qualified))
@@ -533,7 +534,7 @@ class CatalogWatcher:
         for name, descriptor in descriptors.items():
             try:
                 native_type(descriptor)
-            except (TypedValueError, ValueError) as exc:
+            except (AdmissionError, ValueError) as exc:
                 raise SchemaEvolutionRefused(
                     f"source catalog descriptor for {qualified}.{name} is not "
                     f"deliverable through the strict native authority: {exc}",

@@ -691,8 +691,8 @@ correct assumptions in the notes below:
 | 2.1 | Added / dropped columns handled | **5** | Catalog-fenced attnum diffs add and backfill existing rows, physically drop destination columns, and continue through live CDC; the add/drop E2E compares source and destination before and after both DDLs. |
 | 2.2 | Renamed columns handled well | **5** | Same-attnum/type changes use a true destination rename, including a late-row merge/fence path; the E2E has one logical column, one rename audit event, and no data loss. |
 | 2.3 | New tables and schemas auto-discovered | **5** | A 10-second (configurable) all-schema watcher admits table-scoped publication members and performs an in-process targeted re-snapshot on the same main slot; new-table and new-schema existing rows arrive without config edit or restart. |
-| 2.4 | Postgres types → native MotherDuck types | ~~1~~ → **5** | The current contract is exact-or-refuse under the PostgreSQL type **output function** (`SELECT`/COPY/`format('%s', value)`), not the `::text` cast: `xml`, `money`, `inet`, and the other obscure text types land losslessly as `VARCHAR`; only the separately documented stock `int2vector` Connect-shape refusal remains. The 86-value generated corpus and catalog sweep pass on local DuckDB and real MotherDuck. |
-| 2.5 | Data type changes supported | ~~3~~ → **5** | The typed shadow path, spill/replay path, and source-semantic multirange identity use the same `VARCHAR` resolver; real PostgreSQL equality classes and MotherDuck key-gain/shadow evidence pass. A full Debezium-driven MotherDuck multirange stream was not separately run, as recorded in the round-7 limits. |
+| 2.4 | Postgres types → native MotherDuck types | ~~1~~ → **5** | No type is refused for a value reason. `xml`, `inet`, `cidr` and the other opaque text types land losslessly as `VARCHAR`, byte-exact against the PostgreSQL **output function** (`SELECT`/COPY/`format('%s', value)`, not the `::text` cast) — 86/86 on local DuckDB and on real MotherDuck. `money` is a plain `VARCHAR` transport boundary that **carries stock Debezium's delivered text unchanged** and can never refuse, raise or quarantine under any `lc_monetary`, proven live under `C`, `en_US.UTF-8`, `en_GB.UTF-8` and `en_IN.UTF-8` (the last two non-ASCII). **Stated precisely, because round 11's sentence was read too widely:** the connector delivers money's *numeric* spelling (`1234.56`), not the locale-decorated `money_out` rendering (`₹1,234.56`), so `money` is lossless but is deliberately **not** covered by the byte-exact-against-the-output-function claim — carrying the delivered value is the binding directive and reconstruction is forbidden. The only refusals left are the declared no-verified-codec types and stock Debezium's list-shaped `int2vector` Connect payload, both contained. |
+| 2.5 | Data type changes supported | ~~3~~ → **5** | Unregressed in round 12 and re-verified. The typed shadow path, spill/replay path, and source-semantic multirange identity use the same `VARCHAR` resolver; real PostgreSQL equality classes and MotherDuck key-gain/shadow evidence pass. A full Debezium-driven MotherDuck multirange stream was not separately run, as recorded in the round-7 limits. |
 | 2.6 | TOAST columns handled well | **4** | Sparse physical-row folding, durable NULL-vs-JSONB-root-null ambiguity refusal, and a bounded relation-lock activation fence close the soundness defects. The real-owner matrix is non-circular. Stock Debezium still lacks a marker-preserving efficient channel, so the policy ceiling remains 4. |
 | 3.1 | Backfill scalable / parallelized | 3 | 120 k rows in ~28 s single-threaded (`snapshot.max.threads=1`); works but does not scale, untested past 120 k. |
 | 3.2 | Backfills atomic | 1 | Snapshot rows are appended straight into the live table; no shadow table, no swap. |
@@ -701,7 +701,7 @@ correct assumptions in the notes below:
 | 3.5 | Per-table CDC / full refresh / incremental refresh | 3 | CDC only. |
 | 3.6 | Backfill when CDC falls too far behind | 1 | Lag is never measured, so nothing can trigger on it. |
 | 3.7 | Failed backfill resumes midway | 1 | Debezium restarts the initial snapshot from scratch, and the partial snapshot is already appended. |
-| 4.0 | Blast-radius containment for permanently unprocessable rows/tables | **5** | A bad table becomes durable, observable quarantine; every affected run is NOT-OK and alerted once, healthy tables continue, both slot positions advance, and `quarantined → pending → complete` automatically re-snapshots current source state. Four-run live `ADD COLUMN box` and `box/oidvector/xid8` probes kept retained WAL below 1 MB. |
+| 4.0 | Blast-radius containment for permanently unprocessable rows/tables | **5** | A bad table becomes durable, observable quarantine; every affected run is NOT-OK and alerted once, healthy tables continue, both slot positions advance, and `quarantined → pending → complete` automatically re-snapshots current source state. Round 12 closed the two remaining escapes: **every** admission/typed-value error now derives from one `errors.AdmissionError` base that every containment boundary catches, so a sibling raised below a boundary can no longer bypass the refusal architecture (proved by two source-level escape probes); and a **`DROP TABLE` of a quarantined source now discharges** to a terminal `gone` disposition with the owed re-snapshot cancelled rather than orphaned and the slot still advancing, alongside its TRUNCATE / rename / recreate neighbours. Four-run live `ADD COLUMN box`, `box/oidvector/xid8` and quarantined-lifecycle probes keep both slot positions moving on every run with retained WAL bounded. **This score is contingent on the round-12 supervisor regression fixed in the same round** — see the round-12 section below. |
 | 4.1 | Recover from failed / lost slot | 1 | **Proven**: slot dropped → engine fails to start, process exits **0** in 1 s, slot never recreated, permanent silent no-op. |
 | 4.2 | Concurrent Flight instances | 1 | Two simultaneous runs both exit 0; same-slot runs silently no-op, different-slot runs silently duplicate into the same tables. |
 | 4.3 | Recover from problematic WAL / offset state | 1 | A bad offset kills the engine; there is no backfill, no retry, and the failure is reported as success. |
@@ -3628,3 +3628,116 @@ containment, and money locales beyond the explicitly supported C/POSIX, en_US, a
 en_GB families. No Debezium fork, converter/SMT, Java, Maven, or Gradle artifact was
 introduced, and no previous-build identity migration or compatibility sidecar was
 implemented.
+
+---
+
+## FIX ROUND 12 closure — rubric 2.4 / 2.5 / 2.6 / 4.0 (2026-08-11)
+
+Round 12 was implemented across two sessions: the first produced `5c32e81`, deliberately labelled
+UNVERIFIED because the agent stopped before running a single lane. This section records what the
+second session **measured**, including what it found wrong with `5c32e81`.
+
+### `money` no longer has a locale, a template, or a way to fail
+
+`_money_output_text` and its `{C, en_US, en_GB}` allowlist are deleted. `catalog_descriptors` no longer
+reads `SHOW lc_monetary`; no locale table of any kind survives in `typed_types.py`. The whole
+implementation is `return value` (`typed_types.py:794-803`), placed **above** the generic opaque branch
+so that neither the descriptor allowlist nor `_decode_opaque_text`'s transport heuristics can refuse a
+`money` column. Proven live under four monetary locales — `C`, `en_US.UTF-8`, `en_GB.UTF-8` (`£`),
+`en_IN.UTF-8` (`₹`) — each a successful run with zero refusals and the destination `VARCHAR` equal to
+the connector's delivered text
+(`tests/rubric/2.4_native_types/test_2_4_fix12_regressions.py::test_money_live_connector_text_survives_four_monetary_locales`).
+
+### One admission base class, and a new exception cannot escape
+
+`errors.AdmissionError(ValueError)` is the single root for `UnsupportedType`, `InvalidTypedValue`,
+`SchemaEvolutionRefused`, `SchemaBackfillRefused` and `SchemaShapeUnexplained`. Every containment
+boundary catches the base. The closure is enforced by tests that enumerate the classes **from the
+source AST and from `vars(module)`**, not from a hand-maintained list, and it was attacked from two
+directions in a scratch copy of the source:
+
+| escape probe | result |
+|---|---|
+| a new `class ScratchAdmissionSibling(ValueError)` in `errors.py` that skips the base | `test_all_typed_exception_classes_and_external_catches_are_closed` **FAILS** |
+| one boundary narrowed from `except AdmissionError` to `except SchemaEvolutionRefused` | **3 tests FAIL**, including `test_planner_contains_a_sibling_typed_value_error_at_the_common_boundary`, which pushes a real sibling through `GroupPlan._collect` and observes it escape |
+
+### The quarantined-source lifecycle matrix
+
+One healthy co-published peer, four quarantined relations, four different source lifecycle events,
+four subsequent runs with both slot positions and retained WAL recorded on each:
+
+| source event while quarantined | `table_state.snapshot_state` | `schema_refusals.state` | destination image |
+|---|---|---|---|
+| `DROP TABLE` | `gone` (terminal) | `resolved` | removed |
+| `TRUNCATE` | `awaiting_snapshot` | `quarantined` | retained |
+| `ALTER TABLE … RENAME TO` | `gone` (terminal) | `resolved` | removed |
+| `DROP` + `CREATE` same name, new OID/relfilenode | `complete` | `resolved` | present, holds the recreated row |
+
+The peer receives every row; `restart_lsn` and `confirmed_flush_lsn` are asserted **distinct on each of
+the four runs**, i.e. neither is frozen. `table_lifecycle` gains the terminal `gone` state (6 states,
+24 edges) and `schema_refusal` gains its ninth edge.
+
+**Slot-safety invariant re-verified.** `resolve_schema_refusal` raises unless the lifecycle is
+`COMPLETE` or `GONE`; `COMPLETE` is reachable only by publishing current source state; `GONE` is
+reachable only from `discharge_quarantined_source_missing`, which removes the target and shadow in the
+same transaction; `GONE` is in `blocked_schema_tables`, `register_table` refuses to reopen it from a
+stream row, and only a catalog `CHANGE_RECREATED` may take `GONE → AWAITING`, which owes a fresh image.
+No path returns a quarantined table to "current" without a completed re-snapshot.
+
+### ⛔ A round-12 regression found and fixed in the same round
+
+`5c32e81` added two mid-loop escapes to `supervisor.run_engine_bounded` that recorded `engine_error`
+and ended the run as soon as a quiet stream met a source that would not corroborate idle, backed by a
+new `SourceHealth` obligation that `confirmed_flush_lsn` advance past the position held at the last
+streaming → not-streaming transition. That obligation is **unsatisfiable for a run with nothing left to
+deliver**, because `confirmed_flush_lsn` only moves when the connector flushes a new offset. The
+measured consequences on this host:
+
+* the default lane went **1628 passed / 227 s at `f8aeb33`** → **2 failed / 1670 passed / 393 s at
+  `5c32e81`**, with armed fault anchors in rubric **1.1** and **1.7** pre-empted by the new failure and
+  `last_run.json` naming the wrong cause (`applied_events: 0`);
+* ordinary runs could no longer declare idle and burned their entire `--max-seconds`;
+* in production it would turn a transient source blip into a run that delivers nothing, advances
+  neither LSN, and hands the WAL back to grow — the rubric-4.0 level-1 shape reached through the
+  supervisor rather than through the type system.
+
+Both escapes are removed and the interruption obligation is withdrawn from every verdict (it survives
+as a diagnostic in the run summary). What closes B5 is unchanged and kept: a walsender attached
+**continuously** for the whole quiet window, a backlog that is gone or **exactly unchanged** for it
+(round 12's stricter `lag_stable_since` clock), round 12's sampler-freshness guard, and the
+pre-existing end-of-run `--max-seconds` + not-streaming failure. Pinned by two new unit regressions in
+`tests/rubric/1.0_engine_error_propagation/test_1_0_supervisor_unit.py`, both of which **fail** against
+the `5c32e81` supervisor.
+
+### Lane baselines re-measured from real collection
+
+`pytest -m "<expr>" --collect-only -q` reports **1674 / 146 / 32** items, of which **10 / 1 / 1** belong
+to `tests/unit/test_structure_guards.py`, giving `_BASELINE_SELECTED` of **1664 / 145 / 31**. The
+previously committed `1662 / 145 / 31` was correct for `5c32e81`; the `+2` is this round's two
+supervisor regressions.
+
+### Final lanes, PostgreSQL 18 on port 15434, all green
+
+| lane | result | time |
+|---|---|---:|
+| `CDC_TEST_PGPORT=15434 make test` | **1,674 passed** | 378.71s |
+| `CDC_TEST_PGPORT=15434 make test-slow` (run 1) | **146 passed** | 2,417.57s |
+| `CDC_TEST_PGPORT=15434 make test-slow` (run 2) | **146 passed** | 2,405.66s |
+| `CDC_TEST_PGPORT=15434 make test-md` | **32 passed** | 559.52s |
+| `make lint` | **All checks passed!** | — |
+
+The slow lane's remaining red node, `1.6_snapshot_consistency::test_the_partial_snapshot_was_durable_and_invisible`,
+was the order-dependent scenario the r11 review had already named at `f8aeb33`: `post_commit_pre_ack:1`
+fires on the first commit group, a group closes once per Debezium batch, and a three-row table can be
+the whole first batch — in which case its snapshot completes and its shadow is swapped away inside that
+group, so the crash lands after a finished table rather than inside an unfinished one. The scenario now
+captures only `app.customers`, whose 3,000 preloaded rows exceed Debezium's 2,048-row default batch, so
+a partial image is structural rather than lucky. No anchor, assertion, timeout or comparison set was
+relaxed.
+
+Deliberately unproven limits carried forward: the stock marker-preserving TOAST channel (2.6 stays
+4/5); `money` byte-equality with `money_out`, which carrying the delivered value precludes by design;
+the list-input multirange renderer, which is a hand-rolled `multirange_out` that is unreachable from a
+delivered source value but still present on the snapshot/identity compat path. No Debezium fork,
+converter/SMT, Java, Maven or Gradle artifact was introduced, and no previous-build identity migration
+or compatibility sidecar was added.

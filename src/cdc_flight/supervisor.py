@@ -153,8 +153,6 @@ def run_engine_bounded(
     idle_blocked_by_source = 0
     idle_candidate_since: float | None = None
     source_dark_after: float | None = None
-    source_not_streaming_after: float | None = None
-    source_unrecovered_after: float | None = None
     close_hung = False
     try:
         while thread.is_alive():
@@ -260,26 +258,19 @@ def run_engine_bounded(
                     outcome.record("idle")
                     break
                 idle_candidate_since = None
-                if (
-                    health is not None
-                    and getattr(health, "ever_streamed", health.ever_sampled)
-                    and health.not_streaming_for >= run.idle_seconds
-                ):
-                    outcome.record("engine_error")
-                    source_not_streaming_after = round(elapsed, 2)
-                    break
-                if (
-                    health is not None
-                    and getattr(health, "stream_interruptions", 0) > 0
-                    and not getattr(health, "recovered_after_interruption", True)
-                ):
-                    # A retry may reattach a walsender without having delivered the
-                    # WAL that was outstanding when it disconnected.  A quiet timer
-                    # after that transition is not a completion proof; fail loudly
-                    # unless the confirmed slot position advanced after recovery.
-                    outcome.record("engine_error")
-                    source_unrecovered_after = round(elapsed, 2)
-                    break
+                # A quiet stream that the source refuses to call idle is NOT a
+                # verdict yet.  A walsender that has detached — including one that
+                # detached and has not re-confirmed a position — is exactly the
+                # state Debezium's own retriable-restart backoff exists to repair,
+                # and that backoff is measured in tens of seconds.  Ending the run
+                # here would abandon a connector that is about to reattach, deliver
+                # nothing, advance neither LSN, and leave the WAL to grow: a
+                # transient source blip would become a permanently failing run.
+                # The safety property r11 asked for does not need an early exit —
+                # `may_declare_idle` already refuses to call this state idle, so a
+                # run in it CANNOT report success. It burns its own `--max-seconds`
+                # budget instead, and the end-of-run verdict below turns the
+                # unrepaired case into a loud failure with the delivery named.
                 idle_blocked_by_source += 1
                 if not source_idle and idle_blocked_by_source % 20 == 1:
                     log.warning(
@@ -437,10 +428,6 @@ def run_engine_bounded(
         # to exit - the process still has to tear down a JVM whose connector is blocked
         # on a dead socket, which is another minute (Opus MINOR-5).
         summary["source_dark_detected_after_sec"] = source_dark_after
-    if source_not_streaming_after is not None:
-        summary["source_not_streaming_detected_after_sec"] = source_not_streaming_after
-    if source_unrecovered_after is not None:
-        summary["source_unrecovered_detected_after_sec"] = source_unrecovered_after
     if health is not None:
         summary.update(health.summary())
     if acknowledgement_timeout is not None:
@@ -496,19 +483,12 @@ def run_engine_bounded(
         )
 
     if outcome.value == "engine_error":
-        message = (
-            (
-                "the connector experienced a streaming interruption without a "
-                "post-interruption confirmed WAL advance; the delivery cannot be "
-                "shown complete "
-                if source_unrecovered_after is not None
-                else "the connector stopped streaming before a source-corroborated "
-                "idle boundary; the delivery cannot be shown complete "
-            )
-            + f"({health.summary() if health is not None else 'no source health'})"
-        )
+        # A fail-closed backstop. Every engine_error origin above raises with its own
+        # named cause; reaching here means one was recorded with no diagnosis, which
+        # must never become a successful run.
         raise EngineFailure(
-            message,
+            "the run was classified as an engine error with no more specific cause "
+            f"({health.summary() if health is not None else 'no source health'})",
             summary,
         )
 

@@ -155,10 +155,10 @@ class ShadowOwner:
         new_descriptor: Any,
     ) -> Any:
         """Convert one source column through the sole typed shadow-swap path."""
+        from .errors import AdmissionError
         from .typed_materialization import _copy_rows_with_identity
         from .typed_types import (
             SourceTypeDescriptor,
-            TypedValueError,
             native_type,
             union_member_name,
         )
@@ -192,7 +192,7 @@ class ShadowOwner:
         try:
             old_native = native_type(old_source, for_key=source_key)
             new_native = native_type(new_source, for_key=source_key)
-        except TypedValueError as exc:
+        except AdmissionError as exc:
             raise SchemaEvolutionRefused(
                 f"cannot convert {name}.{column}: source descriptor is not "
                 f"deliverable through the native destination: {exc}",

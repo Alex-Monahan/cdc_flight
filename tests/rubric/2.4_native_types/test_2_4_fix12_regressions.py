@@ -17,7 +17,6 @@ from cdc_flight.envelope import KIND_DATA, PendingRecord
 from cdc_flight.typed_types import (
     InvalidTypedValue,
     SourceTypeDescriptor,
-    TypedValueError,
     UnsupportedType,
     adapt_value,
     native_type,
@@ -26,7 +25,7 @@ from cdc_flight.typed_types import (
 ROOT = Path(__file__).resolve().parents[3]
 
 
-class SyntheticTypedFailure(TypedValueError):
+class SyntheticTypedFailure(errors.AdmissionError):
     """A test-only sibling used to attack the planner's common catch boundary."""
 
 
@@ -310,8 +309,11 @@ def test_quarantined_drop_is_discharged_without_resnapshot_or_slot_starvation(sa
 
 
 def test_every_typed_value_error_has_one_common_base():
-    assert issubclass(UnsupportedType, errors.TypedValueError)
-    assert issubclass(InvalidTypedValue, errors.TypedValueError)
+    assert issubclass(UnsupportedType, errors.AdmissionError)
+    assert issubclass(InvalidTypedValue, errors.AdmissionError)
+    assert issubclass(errors.SchemaEvolutionRefused, errors.AdmissionError)
+    assert issubclass(errors.SchemaBackfillRefused, errors.AdmissionError)
+    assert issubclass(errors.SchemaShapeUnexplained, errors.AdmissionError)
 
 
 def test_planner_contains_a_sibling_typed_value_error_at_the_common_boundary(monkeypatch):
@@ -357,29 +359,30 @@ def test_planner_contains_a_sibling_typed_value_error_at_the_common_boundary(mon
 
 def test_typed_value_catch_boundaries_name_the_common_base():
     """The source guard makes concrete sibling catches impossible to reintroduce."""
-    tree = ast.parse((ROOT / "src" / "cdc_flight" / "planner.py").read_text())
-    catches = [
-        node
-        for node in ast.walk(tree)
+    concrete = {
+        "UnsupportedType",
+        "InvalidTypedValue",
+        "SchemaEvolutionRefused",
+        "SchemaBackfillRefused",
+        "SchemaShapeUnexplained",
+    }
+    for path in sorted((ROOT / "src" / "cdc_flight").glob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ExceptHandler):
+                continue
+            names = _exception_names(node.type)
+            assert not names & concrete or "AdmissionError" in names, (
+                path.name,
+                node.lineno,
+                names,
+            )
+    assert all(
+        "TypedValueError" not in _exception_names(node.type)
+        for path in sorted((ROOT / "src" / "cdc_flight").glob("*.py"))
+        for node in ast.walk(ast.parse(path.read_text()))
         if isinstance(node, ast.ExceptHandler)
-        and isinstance(node.type, ast.Name)
-        and node.type.id in {"InvalidTypedValue", "UnsupportedType"}
-    ]
-    assert catches == []
-    assert any(
-        isinstance(node, ast.ExceptHandler)
-        and isinstance(node.type, ast.Name)
-        and node.type.id == "TypedValueError"
-        for node in ast.walk(tree)
     )
-
-
-def _class_names(tree: ast.AST) -> set[str]:
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef):
-            names.add(node.name)
-    return names
 
 
 def _exception_names(node: ast.AST | None) -> set[str]:
@@ -398,12 +401,12 @@ def _exception_names(node: ast.AST | None) -> set[str]:
 
 
 def test_all_typed_exception_classes_and_external_catches_are_closed():
-    """The code, not a hand-maintained list, defines the closure being tested."""
+    """The code, not a hand-maintained list, defines the admission closure."""
     typed_path = ROOT / "src" / "cdc_flight" / "typed_types.py"
     typed_tree = ast.parse(typed_path.read_text())
     typed_classes = _value_error_class_names(typed_tree)
     assert typed_classes
-    assert all(_inherits(typed_tree, name, "TypedValueError") for name in typed_classes)
+    assert all(_inherits(typed_tree, name, "AdmissionError") for name in typed_classes)
     assert typed_classes == {"UnsupportedType", "InvalidTypedValue"}
     import cdc_flight.typed_types as typed_module
 
@@ -415,7 +418,17 @@ def test_all_typed_exception_classes_and_external_catches_are_closed():
         and issubclass(value, ValueError)
     }
     assert set(runtime_classes) == typed_classes
-    assert all(issubclass(value, TypedValueError) for value in runtime_classes.values())
+    assert all(issubclass(value, errors.AdmissionError) for value in runtime_classes.values())
+
+    errors_path = ROOT / "src" / "cdc_flight" / "errors.py"
+    errors_tree = ast.parse(errors_path.read_text())
+    errors_classes = _value_error_class_names(errors_tree) - {"AdmissionError"}
+    assert {
+        "SchemaEvolutionRefused",
+        "SchemaBackfillRefused",
+        "SchemaShapeUnexplained",
+    } <= errors_classes
+    assert all(_inherits(errors_tree, name, "AdmissionError") for name in errors_classes)
 
     boundary_files = []
     for path in sorted((ROOT / "src" / "cdc_flight").glob("*.py")):
@@ -424,20 +437,20 @@ def test_all_typed_exception_classes_and_external_catches_are_closed():
         tree = ast.parse(path.read_text(), filename=str(path))
         handlers = [node for node in ast.walk(tree) if isinstance(node, ast.ExceptHandler)]
         names_by_handler = [(node, _exception_names(node.type)) for node in handlers]
-        if any("TypedValueError" in names for _node, names in names_by_handler):
+        if any("AdmissionError" in names for _node, names in names_by_handler):
             boundary_files.append(path.name)
         for node in ast.walk(tree):
             if not isinstance(node, ast.ExceptHandler):
                 continue
             names = _exception_names(node.type)
-            if names & typed_classes:
-                assert "TypedValueError" in names, (path.name, node.lineno, names)
-    assert boundary_files, "no typed-value containment boundary catches the common base"
+            if names & (typed_classes | errors_classes):
+                assert "AdmissionError" in names, (path.name, node.lineno, names)
+    assert boundary_files, "no admission containment boundary catches the common base"
     # A new class discovered above is covered by every boundary because Python
-    # dispatches all TypedValueError subclasses through the same handler.
+    # dispatches all AdmissionError subclasses through the same handler.
     assert all(
         any(
-            "TypedValueError" in _exception_names(node.type)
+            "AdmissionError" in _exception_names(node.type)
             for node in ast.walk(ast.parse((ROOT / "src" / "cdc_flight" / name).read_text()))
             if isinstance(node, ast.ExceptHandler)
         )
@@ -456,7 +469,7 @@ def _value_error_class_names(tree: ast.AST) -> set[str]:
     }
     return {
         name for name in classes
-        if _inherits_from_any(classes, name, {"ValueError", "TypedValueError"})
+        if _inherits_from_any(classes, name, {"ValueError", "AdmissionError"})
     }
 
 
@@ -490,7 +503,7 @@ def test_a_new_scratch_sibling_would_fail_the_raise_side_guard():
     scratch = ast.parse(source + "\nclass ScratchTypedFailure(ValueError):\n    pass\n")
     with pytest.raises(AssertionError):
         for name in _value_error_class_names(scratch):
-            assert _inherits(scratch, name, "TypedValueError"), name
+            assert _inherits(scratch, name, "AdmissionError"), name
 
 
 def test_quarantined_source_disappearance_is_a_declared_terminal_transition():

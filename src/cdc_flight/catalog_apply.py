@@ -28,7 +28,7 @@ from .catalog import (
     CatalogChange,
 )
 from .config import DROP_IGNORE, DROP_REPLICATE
-from .errors import SchemaEvolutionRefused
+from .errors import AdmissionError, as_schema_refusal
 from .machines import (
     CHANGE_DEFERRED,
     CHANGE_REFUSED,
@@ -421,7 +421,8 @@ class CatalogCoordinator:
                     apply_column_changes(
                         self.registry, action.target, change.column_changes
                     )
-                except SchemaEvolutionRefused as refused:
+                except AdmissionError as error:
+                    refused = as_schema_refusal(error, refusal_origin="schema_evolution")
                     refused.source_schema = refused.source_schema or change.schema
                     refused.source_table = refused.source_table or change.table
                     refused.target = refused.target or action.target
@@ -582,7 +583,8 @@ class CatalogCoordinator:
                     value_columns=value_columns,
                     rows=rows,
                 )
-            except SchemaEvolutionRefused as refused:
+            except AdmissionError as error:
+                refused = as_schema_refusal(error, refusal_origin="schema_backfill")
                 refused.source_schema = refused.source_schema or change.schema
                 refused.source_table = refused.source_table or change.table
                 refused.target = refused.target or action.target

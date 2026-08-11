@@ -78,13 +78,13 @@ class UnsafeDebeziumProperty(RuntimeError):
     """
 
 
-class TypedValueError(ValueError):
-    """A declared source value cannot cross the typed destination boundary.
+class AdmissionError(ValueError):
+    """A source value or schema admission cannot cross a safe boundary.
 
-    ``UnsupportedType`` and ``InvalidTypedValue`` are deliberately different
-    diagnostics, but they are one containment class.  Every admission boundary
-    catches this base so adding a sibling typed-value error cannot bypass the
-    refusal architecture.
+    Typed-value diagnostics and schema-evolution refusals deliberately remain
+    different concrete errors, but they share this root.  Every containment
+    boundary catches the root so a new admission sibling cannot bypass the
+    refusal architecture merely because the boundary predates that sibling.
     """
 
 
@@ -198,7 +198,7 @@ class DestinationIdentityCollision(RuntimeError):
         self.target = target
 
 
-class SchemaEvolutionRefused(ValueError):
+class SchemaEvolutionRefused(AdmissionError):
     """A catalog schema transition cannot be applied without guessing.
 
     This is intentionally distinct from row-shape inference.  A fenced catalog
@@ -257,6 +257,35 @@ class SchemaBackfillRefused(SchemaEvolutionRefused):
 
 class SchemaShapeUnexplained(SchemaEvolutionRefused):
     """A row contains a column shape absent from every observed schema epoch."""
+
+
+def as_schema_refusal(
+    error: AdmissionError,
+    *,
+    refusal_origin: str,
+    source_schema: str | None = None,
+    source_table: str | None = None,
+    target: str | None = None,
+    detected_lsn: int | None = None,
+) -> SchemaEvolutionRefused:
+    """Normalize a common-base error at a containment boundary.
+
+    The normal typed/schema paths preserve their richer
+    ``SchemaEvolutionRefused`` instance.  This fallback is for a future sibling
+    raised below a boundary that has not yet learned its richer context: it still
+    becomes the durable refusal class, rolls back, and cannot escape as an
+    uncategorized ``ValueError``.
+    """
+    if isinstance(error, SchemaEvolutionRefused):
+        return error
+    return SchemaEvolutionRefused(
+        str(error),
+        source_schema=source_schema,
+        source_table=source_table,
+        target=target,
+        detected_lsn=detected_lsn,
+        refusal_origin=refusal_origin,
+    )
 
 
 class NoDurableDestinationRow(RuntimeError):

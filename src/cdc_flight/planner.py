@@ -29,10 +29,10 @@ from . import apply_sql, catalog_support, destination, naming, table_work
 from .assembler import UNIT_CONTROL, UNIT_SNAPSHOT_CHUNK, CompleteUnit
 from .config import TRUNCATE_IGNORE, TRUNCATE_REPLICATE
 from .envelope import KIND_TRUNCATE, PendingRecord
-from .errors import SchemaEvolutionRefused, ToastBaseMissing
+from .errors import AdmissionError, SchemaEvolutionRefused, ToastBaseMissing
 from .snapshot import SnapshotTable
 from .table_work import TableWork
-from .typed_types import TypedValueError, native_type
+from .typed_types import native_type
 
 log = logging.getLogger("cdc_flight.planner")
 
@@ -349,7 +349,9 @@ class GroupPlan:
                 hstore_mode=self.hstore_handling_mode,
             )
             row = patch.encoded_values()
-        except TypedValueError as exc:
+        except AdmissionError as exc:
+            if isinstance(exc, SchemaEvolutionRefused):
+                raise
             raise SchemaEvolutionRefused(
                 f"source value for {event.qualified_table} is not a verified "
                 f"native representation: {exc}",
@@ -417,7 +419,7 @@ class GroupPlan:
         for name, descriptor in catalog_descriptors.items():
             try:
                 native_type(descriptor)
-            except (TypedValueError, ValueError, TypeError) as exc:
+            except (AdmissionError, TypeError) as exc:
                 raise SchemaEvolutionRefused(
                     f"source catalog descriptor for {qualified}.{name} is not "
                     f"deliverable through the strict native authority: {exc}",

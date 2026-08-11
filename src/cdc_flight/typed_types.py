@@ -28,14 +28,14 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
-from .errors import TypedValueError
+from .errors import AdmissionError
 
 
-class UnsupportedType(TypedValueError):
+class UnsupportedType(AdmissionError):
     """A source type without an allowlisted, native destination representation."""
 
 
-class InvalidTypedValue(TypedValueError):
+class InvalidTypedValue(AdmissionError):
     """A value that cannot be represented by its declared source descriptor."""
 
 
@@ -775,10 +775,11 @@ def encode_value(value: Any, descriptor: SourceTypeDescriptor | NativeType) -> A
         if isinstance(value, CanonicalRangeText):
             return str(value)
         if isinstance(value, str):
-            # A source event is already PostgreSQL's multirange output text.  The
-            # only permitted transformation here is unwrapping the connector's
-            # base64 transport marker; no range grammar or equality logic belongs
-            # on this value path.
+            # A source event is already PostgreSQL's multirange output text, and it
+            # is carried verbatim.  The connector's base64 transport marker is
+            # unwrapped one level up, in `adapt_value`/`mark_canonical_range_text`,
+            # which every live value path goes through; no range grammar or
+            # equality logic belongs on this value path either way.
             return value
         if not isinstance(value, (list, tuple)):
             raise InvalidTypedValue(f"{value!r} is not a multirange value")
@@ -792,9 +793,13 @@ def encode_value(value: Any, descriptor: SourceTypeDescriptor | NativeType) -> A
         # the output-function corpus proves the normalization on both runtimes.
         return _decode_opaque_text(value, source)
     if kind == "money":
-        # PostgreSQL/stock Debezium already supplied the money output text.  Money
-        # is intentionally an opaque VARCHAR transport boundary: no locale lookup,
-        # formatting, parsing, validation, or reconstruction is allowed here.
+        # PostgreSQL/stock Debezium already supplied the money text.  Money is an
+        # unconditional VARCHAR transport boundary: no locale lookup, formatting,
+        # parsing, validation or reconstruction, and — deliberately — no path out
+        # of this branch that can raise.  It is placed above the generic opaque
+        # branch precisely so that neither the descriptor allowlist nor
+        # `_decode_opaque_text`'s transport heuristics can ever refuse a `money`
+        # column: money must never block a table under any `lc_monetary`.
         return value
     if kind in {"inet", "cidr"}:
         # Debezium's wire value is text, but the catalog ADD-column backfill uses
@@ -1586,7 +1591,6 @@ __all__ = [
     "PostgresInfinity",
     "SourceTypeDescriptor",
     "TypedImage",
-    "TypedValueError",
     "UnionValue",
     "UnsupportedType",
     "adapt_value",

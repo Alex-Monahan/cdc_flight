@@ -330,10 +330,10 @@ class SchemaRegistry(
         internal identity primary key; the source key columns remain ordinary typed
         columns and are retained for source attribution.
         """
+        from .errors import AdmissionError
         from .typed_types import (
             NativeType,
             SourceTypeDescriptor,
-            TypedValueError,
             native_type,
         )
 
@@ -357,7 +357,7 @@ class SchemaRegistry(
                 continue
             try:
                 target = native_type(descriptor, for_key=column in key_columns)
-            except TypedValueError as exc:
+            except AdmissionError as exc:
                 raise SchemaEvolutionRefused(
                     f"cannot materialize {name}.{column}: the source descriptor "
                     f"is not deliverable through the native destination: {exc}",

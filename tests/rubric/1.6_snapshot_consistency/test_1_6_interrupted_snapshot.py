@@ -51,7 +51,27 @@ pytestmark = pytest.mark.slow
 #: Verified state at the crash: one shadow table, `table_state.snapshot_state='in_progress'`,
 #: no live table at all.
 PRELOAD = 3000
-CHUNKED = {"CDC_COMMIT_MAX_EVENTS": "1000", "CDC_SNAPSHOT_CHUNK_EVENTS": "500"}
+#: ROUND 12. `post_commit_pre_ack:1` fires on the FIRST commit group, and a group is
+#: closed once per Debezium batch — so which table that group contains is decided by
+#: Debezium's batching, not by us. With the whole default capture set, a *small* table
+#: (`app.audit_log` has three seeded rows) can be the entire first batch, in which case
+#: its snapshot COMPLETES and its shadow is swapped away inside that same group. The
+#: crash then lands after a finished table instead of inside an unfinished one, no
+#: shadow survives, and the scenario proves nothing — measured on this host as
+#: `commits=[(1,'snapshot_chunk',1,3,0,['cdcflight_app_audit_log'])], shadows=[]`.
+#: The reviewer named this same node as order-dependent at f8aeb33 (r11 R11-4).
+#:
+#: The precondition is now structural rather than lucky: this scenario captures ONLY
+#: `app.customers`, whose 3 000 preloaded rows exceed Debezium's 2 048-row default
+#: batch, so the first group necessarily holds a PARTIAL customers image. Nothing is
+#: relaxed — every assertion in this module is about `app.customers` and the shadow
+#: catalog, both of which are still compared in full against the source.
+ONLY_CUSTOMERS = {"CDC_TABLES": "customers", "CDC_AUTO_DISCOVERY": "0"}
+CHUNKED = {
+    "CDC_COMMIT_MAX_EVENTS": "1000",
+    "CDC_SNAPSHOT_CHUNK_EVENTS": "500",
+    **ONLY_CUSTOMERS,
+}
 
 
 def _source(box: Sandbox) -> set[str]:

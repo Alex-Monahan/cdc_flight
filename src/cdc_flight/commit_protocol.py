@@ -9,9 +9,10 @@ from __future__ import annotations
 from . import commit_metadata, destination, offsets, self_heal, table_work
 from .commit_group import CommitResult
 from .errors import (
+    AdmissionError,
     AmbiguousDelete,
     DestinationIdentityCollision,
-    SchemaEvolutionRefused,
+    as_schema_refusal,
 )
 from .faults import arm_group, maybe_crash
 from .run_state import COMMIT_ACK
@@ -186,7 +187,8 @@ def commit_group(self, trigger: str) -> CommitResult:
                 # A mark call can raise; a stuck window would silently drop every
                 # later phase write, so the gate is closed in all cases.
                 COMMIT_ACK.leave()
-    except SchemaEvolutionRefused as refused:
+    except AdmissionError as error:
+        refused = as_schema_refusal(error, refusal_origin="typed_planner")
         self._contextualize_schema_refusal(refused)
         self._rollback_quietly()
         self._record_schema_refusal(refused)

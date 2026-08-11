@@ -478,14 +478,24 @@ class SourceHealth:
         #     enough, but a sustained one is.
         if self.streaming_for < min_seconds:
             return False
-        # A reconnect is not completion evidence.  In particular, a walsender can
-        # attach again while Debezium is still in its retry path; accepting even a
-        # briefly small backlog there resurrects the original B5 bug when the source
-        # writer is still ahead of the next sampler observation.  Once the confirmed
-        # position has advanced after the interruption, the ordinary lag-stability
-        # proof applies again.
-        if self._stream_interruptions and not self._recovered_after_interruption:
-            return False
+        # ROUND 12, WITHDRAWN AFTER MEASUREMENT. This is where round 12 additionally
+        # required `confirmed_pos` to have advanced *past* the position held at the
+        # last streaming -> not-streaming transition. That obligation is unsatisfiable
+        # for a run with nothing left to deliver: `confirmed_flush_lsn` only moves
+        # when the connector flushes a NEW offset, so a connector that blipped once
+        # during start-up and then streamed cleanly for the whole run could never
+        # satisfy it. Measured consequences on this tree: ordinary runs became unable
+        # to declare idle and burned their whole `--max-seconds`; armed fault anchors
+        # in `tests/rubric/1.1_exactly_once_pk` and `tests/rubric/1.7_fault_injection`
+        # were pre-empted by the resulting failure; and the slow lane's own
+        # walsender/sigkill scenarios timed out waiting for a slot the interruption
+        # gate was keeping detached. The counters below are kept as DIAGNOSTICS in
+        # `summary()`, but they are not a verdict. What actually closes B5 is the pair
+        # above and below: a walsender attached CONTINUOUSLY for the whole quiet
+        # window, and a backlog that is either gone or exactly unchanged for it (the
+        # `lag_stable_since` clock, which any change resets — a source writer still
+        # ahead of us therefore cannot look flat).
+        #
         # (2) And the backlog must either be gone, or have stopped shrinking.
         #     MEASURED: after a reconnect, `confirmed_flush_lsn` stops tracking
         #     `pg_current_wal_lsn()` and freezes ~1.8 MB behind even once every
