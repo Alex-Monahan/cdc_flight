@@ -180,17 +180,32 @@ ADMISSION_BOUNDARY_MODULES = frozenset(
 # --------------------------------------------------------------------------- #
 # enumeration, derived from the code
 # --------------------------------------------------------------------------- #
-def _names(node: ast.AST | None) -> set[str]:
+def _module_aliases(tree: ast.AST) -> dict[str, str]:
+    """Resolve the local spellings used by exception imports in one module."""
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                aliases[alias.asname or alias.name] = alias.name.rsplit(".", 1)[-1]
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname:
+                    aliases[alias.asname] = alias.name.rsplit(".", 1)[-1]
+    return aliases
+
+
+def _names(node: ast.AST | None, aliases: dict[str, str] | None = None) -> set[str]:
+    aliases = aliases or {}
     if node is None:
         return set()
     if isinstance(node, ast.Name):
-        return {node.id}
+        return {aliases.get(node.id, node.id)}
     if isinstance(node, ast.Attribute):
         return {node.attr}
     if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
         result: set[str] = set()
         for child in node.elts:
-            result |= _names(child)
+            result |= _names(child, aliases)
         return result
     return set()
 
@@ -203,11 +218,12 @@ def _declared_classes(package: Path) -> dict[str, tuple[str, tuple[str, ...]]]:
     declared: dict[str, tuple[str, tuple[str, ...]]] = {}
     for path in sorted(package.rglob("*.py")):
         tree = ast.parse(path.read_text(), filename=str(path))
+        aliases = _module_aliases(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.ClassDef):
                 continue
             bases = tuple(
-                name for base in node.bases for name in _names(base)
+                name for base in node.bases for name in _names(base, aliases)
             )
             assert node.name not in declared, (
                 f"two classes named {node.name} ({declared.get(node.name)}, "
@@ -319,9 +335,10 @@ def test_every_declared_containment_boundary_still_catches_the_common_base():
     with_handler = set()
     for path in sorted(PACKAGE.rglob("*.py")):
         tree = ast.parse(path.read_text(), filename=str(path))
+        aliases = _module_aliases(tree)
         for node in ast.walk(tree):
             if isinstance(node, ast.ExceptHandler) and "AdmissionError" in _names(
-                node.type
+                node.type, aliases
             ):
                 with_handler.add(path.name)
     assert with_handler == set(ADMISSION_BOUNDARY_MODULES), (
@@ -342,10 +359,11 @@ def test_no_handler_names_a_concrete_admission_sibling_without_the_base():
     assert concrete, "the admission hierarchy is empty; the guard would be vacuous"
     for path in sorted(PACKAGE.rglob("*.py")):
         tree = ast.parse(path.read_text(), filename=str(path))
+        aliases = _module_aliases(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.ExceptHandler):
                 continue
-            names = _names(node.type)
+            names = _names(node.type, aliases)
             if names & concrete:
                 assert "AdmissionError" in names, (path.name, node.lineno, names)
 
@@ -418,6 +436,19 @@ def test_an_admission_sibling_in_a_third_file_is_accepted(tmp_path):
     assert closure_violations(scratch, NON_ADMISSION_EXCEPTIONS) == []
 
 
+def test_an_aliased_admission_base_is_resolved_in_a_third_file(tmp_path):
+    """An import alias cannot create a false closure violation."""
+    scratch = tmp_path / "cdc_flight"
+    shutil.copytree(PACKAGE, scratch)
+    target = scratch / "schema_registry.py"
+    target.write_text(
+        target.read_text()
+        + "\n\nfrom .errors import AdmissionError as _ProbeAdmissionBase\n"
+        "\n\nclass ProbeAliasedAdmission(_ProbeAdmissionBase):\n    pass\n"
+    )
+    assert closure_violations(scratch, NON_ADMISSION_EXCEPTIONS) == []
+
+
 def test_a_drop_log_hold_expires_with_its_group_and_never_with_the_run():
     """The hold must be GROUP-scoped, and this is why.
 
@@ -462,6 +493,35 @@ def test_a_drop_log_hold_expires_with_its_group_and_never_with_the_run():
     source = (PACKAGE / "unit_apply.py").read_text()
     assert "applier.group.held_tables" in source
     assert "applier.held_streaming_tables" not in source
+
+
+def test_a_drop_log_hold_alert_is_deduplicated_across_applier_restarts(tmp_path):
+    """The durable marker suppresses a standing alert after a restart."""
+    from support.applier_lab import Lab
+
+    path = tmp_path / "hold-alert.duckdb"
+    first = Lab(path, pipeline="hold-alert")
+    try:
+        first.applier.hold_streaming_tail(["app.owed"])
+        assert first.scalar(
+            "SELECT count(*) FROM _cdc_flight.alerts "
+            "WHERE pipeline = 'hold-alert' AND code = "
+            "'streaming_tail_held_for_resnapshot'"
+        ) == 1
+    finally:
+        first.lease.release(first.con)
+        first.close()
+
+    second = Lab(path, pipeline="hold-alert")
+    try:
+        second.applier.hold_streaming_tail(["app.owed"])
+        assert second.scalar(
+            "SELECT count(*) FROM _cdc_flight.alerts "
+            "WHERE pipeline = 'hold-alert' AND code = "
+            "'streaming_tail_held_for_resnapshot'"
+        ) == 1
+    finally:
+        second.close()
 
 
 def test_a_connector_thrown_failure_is_recorded_once_at_critical():

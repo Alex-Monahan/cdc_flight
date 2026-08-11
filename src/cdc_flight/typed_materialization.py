@@ -461,6 +461,19 @@ def insert_rows(
         # and arbitrary struct paths stay on the typed SQL encoder.  The bounded
         # numeric UNION used for ordinary PostgreSQL NUMERIC is represented by two
         # Arrow staging fields and reconstructed in one INSERT ... SELECT.
+        # PyArrow cannot represent PostgreSQL's explicit temporal infinity marker
+        # as a DATE/TIMESTAMP scalar.  Keep the value lossless and use the same
+        # parameterized CAST path as shadow copies and typed backfills; this is a
+        # narrow fallback for the special value, not a VARCHAR downgrade.
+        if _contains_postgres_infinity(rows):
+            insert_typed_rows(
+                con,
+                table,
+                columns,
+                rows,
+                [table.native_types.get(column) for column in columns],
+            )
+            return
         if _native_arrow_safe(table, columns, rows):
             _bulk_insert_typed_rows(con, table, columns, rows)
             return
@@ -550,6 +563,22 @@ def _native_numeric_union_arrow_safe(
             if _contains_union(row[index], UnionValue):
                 return False
     return found_numeric_union
+
+
+def _contains_postgres_infinity(value: Any) -> bool:
+    """Return whether a typed row contains the explicit temporal sentinel."""
+    from .typed_types import PostgresInfinity
+
+    if isinstance(value, PostgresInfinity):
+        return True
+    if isinstance(value, dict):
+        return any(
+            _contains_postgres_infinity(key) or _contains_postgres_infinity(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_postgres_infinity(item) for item in value)
+    return False
 
 
 def _bulk_insert_typed_rows(con, table: TableSchema, columns: list[str], rows: list[list]) -> None:

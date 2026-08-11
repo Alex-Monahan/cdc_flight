@@ -369,7 +369,15 @@ def event_shape_missing(watcher, record, catalog_names: set[str]) -> tuple[str, 
                 expected = (
                     old_names if int(event_lsn) < int(detected) else new_names
                 )
-    return tuple(sorted(expected - delivered))
+    missing = expected - delivered
+    # Stock Debezium 3.x omits schema/value fields whose JDBC type is an opaque
+    # PostgreSQL array element (notably xml[]), even with
+    # include.unknown.datatypes=true.  Those fields are recoverable from the
+    # source catalog connection by key; they are not permission to create a
+    # partial destination table, so keep them out of the hard completeness refusal
+    # and let the typed planner hydrate them before folding the row.
+    missing -= set(omitted_xml_array_fields(watcher, record, catalog_names))
+    return tuple(sorted(missing))
 
 
 def has_event_schema(record) -> bool:
@@ -379,6 +387,43 @@ def has_event_schema(record) -> bool:
         and isinstance(getattr(record, name, {}).get("fields"), list)
         for name in ("key_schema", "before_schema", "after_schema")
     )
+
+
+def omitted_xml_array_fields(
+    watcher, record, catalog_descriptors: set[str] | dict[str, object]
+) -> tuple[str, ...]:
+    """Return omitted source fields that can be read back without synthesis.
+
+    This is deliberately narrower than "all missing fields": only an array whose
+    catalog descriptor has an XML element is eligible.  The source SELECT is the
+    PostgreSQL value boundary, and the planner still refuses every other unexplained
+    omission rather than guessing a type or silently dropping a column.
+    """
+    delivered = delivered_event_fields(record)
+    names = set(catalog_descriptors)
+    descriptors = (
+        catalog_descriptors
+        if isinstance(catalog_descriptors, dict)
+        else {}
+    )
+    if not descriptors:
+        with watcher._lock:
+            relation = watcher.known.get(getattr(record, "qualified_table", None))
+            descriptors = {
+                column.destination_name: column.descriptor
+                for column in (relation.columns if relation is not None else ())
+            }
+    omitted: list[str] = []
+    for name in sorted(names - delivered):
+        descriptor = descriptors.get(name)
+        if descriptor is None:
+            continue
+        kind = str(getattr(descriptor, "kind", "")).lower()
+        element = getattr(descriptor, "array_element", None)
+        element_kind = str(getattr(element, "kind", "")).lower()
+        if kind == "array" and element_kind == "xml":
+            omitted.append(name)
+    return tuple(omitted)
 
 
 def _descriptor_changed(known: dict, incoming: dict, fields: set[str]) -> bool:
@@ -415,3 +460,90 @@ def read_columns(watcher, relation, key_columns, value_columns) -> list[tuple]:
             f"SELECT {select_list} FROM {quote(relation.schema)}."
             f"{quote(relation.table)}"
         ).fetchall()
+
+
+def read_event_columns(watcher, event, value_columns) -> dict[str, object] | None:
+    """Read omitted opaque-array values for one event from PostgreSQL.
+
+    A primary key is the normal selector.  For a keyless table, the delivered
+    non-omitted image is used as a NULL-safe selector; an unidentifiable multi-row
+    result is refused rather than assigning one source row to another.  The query
+    selects the source columns directly -- no Python rendering or type synthesis.
+    """
+    from .naming import normalize
+
+    with watcher._lock:
+        relation = watcher.known.get(event.qualified_table)
+        source_names = {
+            normalize(column.name): column.name
+            for column in (relation.columns if relation is not None else ())
+        }
+    if not source_names:
+        source_names = {normalize(name): str(name) for name in value_columns}
+        for image in (event.key, event.before, event.after):
+            for name in (image or {}):
+                source_names.setdefault(normalize(name), str(name))
+    with watcher._connect() as conn:
+        return _read_event_columns(conn, event, value_columns, source_names)
+
+
+def read_event_columns_from_connection(con, event, value_columns) -> dict[str, object] | None:
+    """Connection-backed variant used by the bounded resnapshot descriptor provider."""
+    from .naming import normalize
+
+    source_names = {normalize(name): str(name) for name in value_columns}
+    for image in (event.key, event.before, event.after):
+        for name in (image or {}):
+            source_names.setdefault(normalize(name), str(name))
+    return _read_event_columns(con, event, value_columns, source_names)
+
+
+def _read_event_columns(con, event, value_columns, source_names) -> dict[str, object] | None:
+    from .naming import normalize, quote
+
+    values = tuple(normalize(name) for name in value_columns)
+    missing = [name for name in values if name not in source_names]
+    if missing:
+        raise SchemaShapeUnexplained(
+            f"source catalog has no column(s) {missing!r} needed to recover "
+            f"{event.qualified_table}",
+            source_schema=event.schema,
+            source_table=event.table,
+            target=event.qualified_table,
+            refusal_origin="catalog_shape",
+        )
+    predicates: list[str] = []
+    params: list[object] = []
+    key = event.key or {}
+    for raw_name, value in key.items():
+        name = normalize(raw_name)
+        if name in source_names:
+            predicates.append(f"{quote(source_names[name])} IS NOT DISTINCT FROM %s")
+            params.append(value)
+    if not predicates:
+        image = event.before if event.op == "d" else event.after
+        for raw_name, value in (image or {}).items():
+            name = normalize(raw_name)
+            if name not in source_names or name in values:
+                continue
+            predicates.append(f"{quote(source_names[name])} IS NOT DISTINCT FROM %s")
+            params.append(value)
+    select_list = ", ".join(quote(source_names[name]) for name in values)
+    query = (
+        f"SELECT {select_list} FROM {quote(event.schema)}.{quote(event.table)}"
+        + (" WHERE " + " AND ".join(predicates) if predicates else "")
+        + " LIMIT 2"
+    )
+    rows = con.execute(query, params).fetchall()
+    if not rows:
+        return None
+    if len(rows) > 1:
+        raise SchemaShapeUnexplained(
+            f"source row for {event.qualified_table} is not uniquely identifiable "
+            "while recovering an omitted opaque array",
+            source_schema=event.schema,
+            source_table=event.table,
+            target=event.qualified_table,
+            refusal_origin="catalog_shape",
+        )
+    return dict(zip(values, rows[0], strict=True))

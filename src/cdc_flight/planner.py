@@ -29,7 +29,14 @@ from . import apply_sql, catalog_support, destination, naming, table_work
 from .assembler import UNIT_CONTROL, UNIT_SNAPSHOT_CHUNK, CompleteUnit
 from .config import TRUNCATE_IGNORE, TRUNCATE_REPLICATE
 from .envelope import KIND_TRUNCATE, PendingRecord
-from .errors import AdmissionError, SchemaEvolutionRefused, ToastBaseMissing
+from .errors import (
+    AdmissionError,
+    AmbiguousDelete,
+    DestinationIdentityCollision,
+    SchemaEvolutionRefused,
+    ToastBaseMissing,
+)
+from .faults import DestinationFault
 from .snapshot import SnapshotTable
 from .table_work import TableWork
 from .typed_types import native_type
@@ -90,6 +97,7 @@ class GroupPlan:
         pipeline: str | None = None,
         control_schema: str | None = None,
         blocked_tables: set[str] | None = None,
+        contain_table_failure=None,
     ):
         self.con = con
         self.commit_id = commit_id
@@ -110,6 +118,10 @@ class GroupPlan:
         self.hstore_handling_mode = hstore_handling_mode
         self.pipeline = pipeline or ""
         self._control_schema = control_schema
+        #: The applier owns the durable refusal/alert/run-error side effects.  The
+        #: planner owns only the relation boundary and calls it while the commit-group
+        #: transaction is still open.
+        self._contain_table_failure = contain_table_failure
         # The applier snapshots this durable admission set once per run.  A plan never
         # issues a control-plane query per schema epoch/table: all units in this commit
         # group therefore share one refusal decision and healthy co-published tables
@@ -121,6 +133,9 @@ class GroupPlan:
         #: The assembler's unit id is the stable PostgreSQL transaction id, even when
         #: a spilled event's individual envelope omitted transaction metadata.
         self._active_txn_id: str | None = None
+        self._contained_tables: set[str] = set()
+        self._failed_snapshot_targets: set[str] = set()
+        self._failure_fingerprints: dict[str, str] = {}
 
         self.work: dict[str, TableWork] = {}
         self.stats: dict = {
@@ -132,6 +147,8 @@ class GroupPlan:
             "last_lsn": None,
             "max_source_ts": None,
             "quarantined_events": 0,
+            "contained_events": 0,
+            "contained_tables": set(),
         }
         #: `_cdc_flight.table_events` rows this plan produced, in source order
         self.table_events: list[dict] = []
@@ -192,7 +209,7 @@ class GroupPlan:
                 ):
                     if self._below_watermark(staged.event, commit_lsn, fence_below):
                         continue
-                    self._collect(
+                    self._collect_contained(
                         staged.event,
                         snapshot=snapshot_state,
                         target=staged.target,
@@ -201,7 +218,7 @@ class GroupPlan:
             for event in unit.events:
                 if self._below_watermark(event, commit_lsn, fence_below):
                     continue
-                self._collect(event, snapshot=snapshot_state)
+                self._collect_contained(event, snapshot=snapshot_state)
 
             if unit.kind == UNIT_SNAPSHOT_CHUNK:
                 if unit.snapshot_last_for_table and snapshot_state is not None:
@@ -215,8 +232,13 @@ class GroupPlan:
             # row (a deferred constraint relaxes uniqueness only *inside* a
             # transaction), and that assertion is what makes the fold
             # source-transaction-preserving rather than merely group-wide (Codex 1).
-            for item in self.work.values():
-                table_work.end_transaction(item)
+            for item in list(self.work.values()):
+                try:
+                    table_work.end_transaction(item)
+                except (AmbiguousDelete, DestinationIdentityCollision, ToastBaseMissing):
+                    raise
+                except Exception as exc:
+                    self._contain_item_failure(item, exc)
             if unit.txn_id:
                 self.stats["first_txn_id"] = self.stats["first_txn_id"] or unit.txn_id
                 self.stats["last_txn_id"] = unit.txn_id
@@ -262,11 +284,31 @@ class GroupPlan:
         """
         if not event.schema or not event.table:
             return
+        if event.qualified_table in getattr(self, "_contained_tables", ()):
+            self._count_event(event)
+            self.stats["quarantined_events"] += 1
+            return
         if snapshot is None and event.qualified_table in self.blocked_tables:
             # The refusal/lifecycle row was committed before this run could advance
             # the slot.  A full snapshot is the only permitted re-entry path; ordinary
             # stream rows are skipped while the source WAL is safely represented by
             # the current-source snapshot obligation.
+            if event.qualified_table not in self._contained_tables:
+                target = target or self.snapshots.target_table(event.schema, event.table)
+                refused = SchemaEvolutionRefused(
+                    f"{event.qualified_table}: the same blocked source shape was "
+                    "observed again; retaining the table-scoped refusal until a "
+                    "full resnapshot proves repair",
+                    source_schema=event.schema,
+                    source_table=event.table,
+                    target=target,
+                    detected_lsn=event.lsn,
+                    input_fingerprint=self._event_fingerprint(event),
+                    refusal_origin="typed_planner",
+                )
+                self._mark_contained(
+                    event.qualified_table, target, refused, refused
+                )
             self._count_event(event)
             self.stats["quarantined_events"] += 1
             return
@@ -379,6 +421,186 @@ class GroupPlan:
             )
         self.source_tables.add(f"{event.schema}.{event.table}")
 
+    def _collect_contained(
+        self,
+        event: PendingRecord,
+        *,
+        snapshot: SnapshotTable | None,
+        target: str | None = None,
+        event_id: str | None = None,
+    ) -> None:
+        """Run one event through the table boundary without swallowing failures.
+
+        ``Exception`` is intentional here: the materializer calls pyarrow, DuckDB,
+        datetime and third-party adapters, so a package-local admission-class list is
+        not a containment boundary.  Protocol-control exceptions retain their
+        dedicated whole-transaction/self-healing routes; every other exception is
+        converted into the same durable table-scoped refusal.
+        """
+        if event.schema and event.table:
+            self._failure_fingerprints.setdefault(
+                event.qualified_table, self._event_fingerprint(event)
+            )
+        try:
+            self._collect(
+                event,
+                snapshot=snapshot,
+                target=target,
+                event_id=event_id,
+            )
+        except (AmbiguousDelete, DestinationIdentityCollision, ToastBaseMissing):
+            raise
+        except Exception as exc:
+            if isinstance(exc, SchemaEvolutionRefused):
+                # A recognized refusal retains the established whole-transaction
+                # rollback/retry path in commit_protocol.  This broad handler is
+                # specifically the missing architectural containment boundary for
+                # an otherwise-unrecognized third-party or builtin exception.
+                raise
+            resolved_target = target or (
+                snapshot.shadow
+                if snapshot is not None
+                else self.snapshots.target_table(event.schema, event.table)
+            )
+            self._contain_event_failure(event, resolved_target, exc)
+
+    def _contain_event_failure(
+        self, event: PendingRecord, target: str, error: Exception
+    ) -> None:
+        if event.qualified_table in self._contained_tables:
+            return
+        self._failure_fingerprints.setdefault(
+            event.qualified_table, self._event_fingerprint(event)
+        )
+        refused = self._as_contained_refusal(
+            error,
+            source_schema=event.schema,
+            source_table=event.table,
+            target=target,
+            detected_lsn=event.lsn,
+            input_fingerprint=self._failure_fingerprints[event.qualified_table],
+        )
+        self._mark_contained(event.qualified_table, target, refused, error)
+
+    def _contain_item_failure(self, item: TableWork, error: Exception) -> None:
+        qualified = (
+            f"{item.source_schema}.{item.source_table}"
+            if item.source_schema and item.source_table
+            else item.target
+        )
+        if qualified in self._contained_tables:
+            return
+        fingerprint = self._failure_fingerprints.get(qualified)
+        if fingerprint is None:
+            payload = {
+                "table": qualified,
+                "target": item.target,
+                "columns": sorted(item.columns),
+            }
+            encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            fingerprint = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            self._failure_fingerprints[qualified] = fingerprint
+        refused = self._as_contained_refusal(
+            error,
+            source_schema=item.source_schema,
+            source_table=item.source_table,
+            target=item.target,
+            detected_lsn=self.stats.get("last_lsn"),
+            input_fingerprint=fingerprint,
+        )
+        self._mark_contained(qualified, item.target, refused, error)
+
+    @staticmethod
+    def _as_contained_refusal(
+        error: Exception,
+        *,
+        source_schema: str | None,
+        source_table: str | None,
+        target: str | None,
+        detected_lsn: int | None,
+        input_fingerprint: str,
+    ) -> SchemaEvolutionRefused:
+        if isinstance(error, SchemaEvolutionRefused):
+            refused = error
+            refused.source_schema = refused.source_schema or source_schema
+            refused.source_table = refused.source_table or source_table
+            refused.target = refused.target or target
+            refused.detected_lsn = (
+                refused.detected_lsn if refused.detected_lsn is not None else detected_lsn
+            )
+            refused.input_fingerprint = refused.input_fingerprint or input_fingerprint
+            refused.refusal_origin = refused.refusal_origin or "typed_planner"
+            return refused
+        try:
+            detail = str(error)
+        except Exception:
+            detail = "<exception text unavailable>"
+        exception_type = f"{type(error).__module__}.{type(error).__qualname__}"
+        return SchemaEvolutionRefused(
+            f"unrecognised table-scoped materialization failure for "
+            f"{source_schema}.{source_table} ({exception_type}): {detail}",
+            source_schema=source_schema,
+            source_table=source_table,
+            target=target,
+            detected_lsn=detected_lsn,
+            input_fingerprint=input_fingerprint,
+            refusal_origin="typed_planner",
+        )
+
+    def _mark_contained(
+        self,
+        qualified: str,
+        target: str,
+        refused: SchemaEvolutionRefused,
+        original: Exception,
+    ) -> None:
+        """Remove one failed table plan and invoke the durable owner exactly once."""
+        self._contained_tables.add(qualified)
+        self.blocked_tables.add(qualified)
+        self.stats["contained_events"] += 1
+        self.stats["contained_tables"].add(qualified)
+        self.stats["quarantined_events"] += 1
+        self.work.pop(target, None)
+        if target in self.created_in_txn:
+            try:
+                self.con.execute(
+                    f"DROP TABLE IF EXISTS {naming.quote(self.registry.dataset)}."
+                    f"{naming.quote(target)}"
+                )
+            except Exception as cleanup_error:
+                # A destination statement can abort DuckDB/MotherDuck's enclosing
+                # transaction before the Python exception reaches this boundary. Do
+                # not replace the attributable materializer failure with a secondary
+                # "current transaction is aborted" error; the commit protocol will
+                # roll the group back and preserve the original cause.
+                raise original from cleanup_error
+            self.registry.forget(target)
+            self.created_in_txn.discard(target)
+        self.source_tables.discard(qualified)
+        self.stats["tables"].discard(target)
+        self.column_presence = [
+            row for row in self.column_presence if row[0] != target
+        ]
+        self.created_tables.pop(target, None)
+        self._failed_snapshot_targets.add(target)
+        self._swaps = [
+            state
+            for state in self._swaps
+            if state.target != target and state.shadow != target
+        ]
+        if self._contain_table_failure is None:
+            # A GroupPlan constructed by an embedder without the production owner is
+            # not allowed to turn a failure into a silent drop.
+            raise original
+        self._contain_table_failure(refused, original)
+
+    def _event_fingerprint(self, event: PendingRecord) -> str:
+        try:
+            return input_fingerprint(event)
+        except Exception:
+            payload = f"{event.qualified_table}:{event.lsn}:{event.txn_id}"
+            return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
     def _enrich_descriptors(self, event: PendingRecord) -> None:
         """Merge one memoized catalog descriptor map into a row envelope."""
         if not event.qualified_table:
@@ -452,6 +674,15 @@ class GroupPlan:
                 detected_lsn=event.lsn,
                 refusal_origin="typed_planner",
             )
+        recoverable = catalog_support.omitted_xml_array_fields(
+            watcher or self.descriptor_provider,
+            event,
+            catalog_descriptors,
+        )
+        if recoverable:
+            self._hydrate_omitted_xml_arrays(
+                event, recoverable, catalog_descriptors, watcher
+            )
         for attribute in ("key_descriptors", "before_descriptors", "after_descriptors"):
             descriptors = getattr(event, attribute)
             if len(descriptors) >= len(catalog_descriptors) and all(
@@ -489,6 +720,71 @@ class GroupPlan:
                 descriptor = descriptors.get(name) or descriptors.get(naming.normalize(name))
                 if descriptor is not None:
                     image[name] = mark_canonical_range_text(value, descriptor)
+
+    def _hydrate_omitted_xml_arrays(
+        self,
+        event: PendingRecord,
+        columns: tuple[str, ...],
+        catalog_descriptors: dict,
+        watcher,
+    ) -> None:
+        """Restore stock Debezium's omitted xml[] values from PostgreSQL itself."""
+        reader = getattr(watcher, "read_event_columns", None)
+        if reader is None:
+            reader = getattr(self.descriptor_provider, "read_event_columns", None)
+        if reader is None:
+            raise SchemaEvolutionRefused(
+                f"stock Debezium omitted opaque array field(s) {list(columns)!r} "
+                f"for {event.qualified_table}, and no source value reader is "
+                "available; refusing to invent or drop those values",
+                source_schema=event.schema,
+                source_table=event.table,
+                target=event.qualified_table,
+                detected_lsn=event.lsn,
+                refusal_origin="typed_planner",
+            )
+        try:
+            values = reader(event, columns)
+        except AdmissionError:
+            raise
+        except Exception as exc:
+            raise SchemaEvolutionRefused(
+                f"source read for omitted opaque array field(s) {list(columns)!r} "
+                f"failed for {event.qualified_table}: {exc}; refusing to invent "
+                "or drop those values",
+                source_schema=event.schema,
+                source_table=event.table,
+                target=event.qualified_table,
+                detected_lsn=event.lsn,
+                refusal_origin="typed_planner",
+            ) from exc
+        # A DELETE quite correctly has no current source row.  Its key is enough
+        # to remove the destination row; fill only the omitted before-image fields
+        # with SQL NULL so the completeness contract remains explicit.  Every
+        # insert/update/snapshot must have a current row to preserve its values.
+        if values is None:
+            if event.op == "d":
+                values = {name: None for name in columns}
+            else:
+                raise SchemaEvolutionRefused(
+                    f"source row for {event.qualified_table} disappeared while "
+                    f"recovering omitted field(s) {list(columns)!r}; refusing to "
+                    "fabricate a partial image",
+                    source_schema=event.schema,
+                    source_table=event.table,
+                    target=event.qualified_table,
+                    detected_lsn=event.lsn,
+                    refusal_origin="typed_planner",
+                )
+        image_name = "before" if event.op == "d" else "after"
+        image = getattr(event, image_name)
+        if image is None:
+            image = {}
+            setattr(event, image_name, image)
+        descriptors = getattr(event, f"{image_name}_descriptors")
+        for name in columns:
+            image[name] = values[name]
+            descriptors[name] = catalog_descriptors[name]
 
     def _count_event(self, event: PendingRecord) -> None:
         """Group-level bookkeeping every event contributes to, whatever it is.
@@ -645,8 +941,25 @@ class GroupPlan:
         others not", which is the one interleaving rubric 1.3 is about, so it has to
         fire *between* two `table_work.write()` calls (Codex 6).
         """
-        for index, item in enumerate(self.work.values()):
-            table_work.write(self.con, self.registry, item, self.created_in_txn)
+        for index, item in enumerate(list(self.work.values())):
+            try:
+                table_work.write(self.con, self.registry, item, self.created_in_txn)
+            except (AmbiguousDelete, DestinationIdentityCollision, ToastBaseMissing):
+                raise
+            except Exception as exc:
+                if isinstance(exc, (SchemaEvolutionRefused, DestinationFault)):
+                    # A recognized refusal follows the commit protocol's existing
+                    # rollback path.  A destination fault is likewise a whole-group
+                    # protocol failure: its connection may already be unusable, so
+                    # attempting table quarantine would replace the injected cause
+                    # with a secondary "connection closed" error.
+                    raise
+                self._contain_item_failure(item, exc)
+                # The failed table is never eligible for a snapshot swap.  A
+                # just-created destination table may be dropped safely; an existing
+                # table's data is protected by the materializer preflight below and
+                # remains untouched when the failure is raised before DML.
+                continue
             if (
                 not item.snapshot
                 and item.source_schema
@@ -678,6 +991,12 @@ class GroupPlan:
             self.spill.clear(self.commit_id)
 
         swaps = self.snapshots.states() if self._swap_all else self._swaps
+        swaps = [
+            state
+            for state in swaps
+            if state.target not in self._failed_snapshot_targets
+            and state.shadow not in self._failed_snapshot_targets
+        ]
         for state in swaps:
             if self.snapshots.swap(
                 state, commit_id=self.commit_id, snapshot_lsn=self.stats.get("last_lsn")

@@ -584,7 +584,6 @@ def _identity_tree(value: Any, descriptor: Any) -> Any:
     """Encode one value recursively according to source semantics."""
     from .typed_types import (
         CanonicalRangeText,
-        _multirange_parts,
         canonical_multirange_text,
         encode_value,
     )
@@ -627,7 +626,24 @@ def _identity_tree(value: Any, descriptor: Any) -> Any:
     }:
         return {"range_text": str(value)}
     if kind == "multirange" and isinstance(value, (str, bytes, bytearray, memoryview)):
-        value = _multirange_parts(str(canonical_multirange_text(value, source)))
+        # Multirange destinations are deliberately VARCHAR because stock
+        # Debezium delivers PostgreSQL's output text.  Preserve the established
+        # semantic identity for parseable PostgreSQL output, but retain arbitrary
+        # connector/source text verbatim when its grammar is not ours to prove.
+        # The latter is the important safety property: identity formation must not
+        # reject or invent a source value merely because a future PostgreSQL type
+        # spelling is unknown to this Python parser.
+        from .typed_types import _multirange_parts, encode_value
+
+        text = str(canonical_multirange_text(value, source))
+        try:
+            encoded_parts = [
+                encode_value(part, source.range_subtype)
+                for part in _multirange_parts(text)
+            ]
+            return _multirange_identity(encoded_parts, source)
+        except (TypeError, ValueError):
+            return {"multirange_text": text}
     encoded = encode_value(value, descriptor)
     if encoded is None and kind != "jsonb":
         return None

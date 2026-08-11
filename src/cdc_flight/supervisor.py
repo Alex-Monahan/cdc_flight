@@ -482,7 +482,11 @@ def run_engine_bounded(
         if failure is not None:
             parts.append(f"debezium engine: {failure}")
         message = " | ".join(parts) or "the engine failed without a message"
-        if failure is not None and cause is None:
+        # The connector failure is independently observable even when our
+        # supervisor also has a Python-side consequence (for example a snapshot
+        # callback phase error).  The old `cause is None` guard made the durable
+        # connector alert unreachable for exactly that shape.
+        if failure is not None:
             _record_connector_failure(handler, str(failure), summary)
         outcome.record("engine_error")
         summary["stop_reason"] = outcome.value

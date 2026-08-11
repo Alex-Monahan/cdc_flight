@@ -140,6 +140,15 @@ def test_snapshot_mode_override(tmp_path):
     assert props["snapshot.mode"] == "never"
 
 
+def test_non_pinned_property_overrides_are_applied(tmp_path):
+    props = build_properties(
+        SourceConfig(),
+        ReplicationConfig(state_dir=tmp_path),
+        overrides={"max.batch.size": "17"},
+    )
+    assert props["max.batch.size"] == "17"
+
+
 def test_destination_table_name_includes_the_source_schema():
     # Two same-named tables in different schemas must not collide.
     assert destination_table("cdcflight", "app", "customers") == "cdcflight_app_customers"

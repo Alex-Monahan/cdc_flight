@@ -689,9 +689,12 @@ def numeric_value(value: Any, descriptor: SourceTypeDescriptor | None = None) ->
         lowered = value.strip().lower()
         if lowered in {"nan", "+nan", "-nan"}:
             return UnionValue("special", math.nan)
-        if lowered in {"infinity", "+infinity", "inf", "+inf"}:
+        if lowered in {
+            "infinity", "+infinity", "inf", "+inf",
+            "positive_infinity", "positive infinity",
+        }:
             return UnionValue("special", math.inf)
-        if lowered in {"-infinity", "-inf"}:
+        if lowered in {"-infinity", "-inf", "negative_infinity", "negative infinity"}:
             return UnionValue("special", -math.inf)
     try:
         return UnionValue("finite", value if isinstance(value, Decimal) else Decimal(str(value)))
@@ -1255,7 +1258,22 @@ def _date_value(value: Any) -> date:
     if lowered in {"infinity", "+infinity", "-infinity"}:
         return PostgresInfinity(not lowered.startswith("-"))  # type: ignore[return-value]
     if isinstance(value, int):
-        return date(1970, 1, 1) + timedelta(days=value)
+        # Stock Debezium's PostgreSQL converter can carry a date infinity as the
+        # out-of-range java.sql.Date millisecond sentinel instead of the textual
+        # spelling.  It is a value marker, not an epoch-day date; treating it as
+        # days either overflows immediately or fabricates a finite date.
+        date_infinity = _postgres_date_infinity_from_epoch_days(value)
+        if date_infinity is not None:
+            return date_infinity  # type: ignore[return-value]
+        infinity = _postgres_infinity_from_numeric(value)
+        if infinity is not None:
+            return infinity  # type: ignore[return-value]
+        try:
+            return date(1970, 1, 1) + timedelta(days=value)
+        except OverflowError as exc:
+            raise InvalidTypedValue(
+                f"date epoch-day value {value!r} is outside Python's supported range"
+            ) from exc
     try:
         return date.fromisoformat(str(value))
     except ValueError as exc:
@@ -1286,6 +1304,12 @@ def _datetime_value(value: Any, *, zoned: bool) -> datetime:
     if lowered in {"infinity", "+infinity", "-infinity"}:
         return PostgresInfinity(not lowered.startswith("-"))  # type: ignore[return-value]
     if isinstance(value, int):
+        # Debezium's adaptive temporal converters preserve PostgreSQL's two
+        # infinity sentinels as a numeric value.  Check the marker before asking
+        # datetime to materialize a year outside Python's supported range.
+        infinity = _postgres_infinity_from_numeric(value)
+        if infinity is not None:
+            return infinity  # type: ignore[return-value]
         return datetime.fromtimestamp(value / 1_000_000, tz=UTC if zoned else None)
     try:
         result = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
@@ -1294,6 +1318,44 @@ def _datetime_value(value: Any, *, zoned: bool) -> datetime:
         return result
     except ValueError as exc:
         raise InvalidTypedValue(f"{value!r} is not an ISO timestamp") from exc
+
+
+# PostgreSQL's JDBC/stock-Debezium infinity representations.  The first pair is
+# the exact timestamp/date sentinel emitted by PostgresValueConverter; the second
+# pair covers the Long extrema used by its epoch-nanos path.  Keeping this marker
+# recognition exact is important: ordinary, very-large finite epoch values must
+# still fail loudly instead of being silently relabelled as infinity.
+_POSITIVE_POSTGRES_INFINITY_NUMERICS = frozenset(
+    {9223372036825200000, 9223372036854775807}
+)
+_NEGATIVE_POSTGRES_INFINITY_NUMERICS = frozenset(
+    {-9223372036832400000, -9223372036854775808}
+)
+# With Debezium's ``Date`` logical representation, PostgreSQL's two sentinels
+# can arrive through either temporal precision path.  The LocalDate path has
+# the epoch-day values below.  The java.sql.Date path first creates a Date from
+# the millisecond sentinel, then Debezium narrows its epoch day to int32; the
+# two wrapped values are included explicitly as well.  These are markers, not
+# broad ranges, so ordinary out-of-range finite dates still fail loudly.
+_POSTGRES_DATE_INFINITY_EPOCH_DAYS = {
+    -2147472692: True,
+    -2147472691: False,
+    -622191234: True,
+    -625821272: False,
+}
+
+
+def _postgres_infinity_from_numeric(value: int) -> PostgresInfinity | None:
+    if value in _POSITIVE_POSTGRES_INFINITY_NUMERICS:
+        return PostgresInfinity(True)
+    if value in _NEGATIVE_POSTGRES_INFINITY_NUMERICS:
+        return PostgresInfinity(False)
+    return None
+
+
+def _postgres_date_infinity_from_epoch_days(value: int) -> PostgresInfinity | None:
+    positive = _POSTGRES_DATE_INFINITY_EPOCH_DAYS.get(value)
+    return None if positive is None else PostgresInfinity(positive)
 
 
 def _interval_value(value: Any) -> Any:

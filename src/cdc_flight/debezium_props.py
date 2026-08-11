@@ -328,4 +328,8 @@ def build_properties(
     if not source.auto_discovery:
         props["schema.include.list"] = source.schema
         props["table.include.list"] = ",".join(source.tables)
+    # Overrides are an actual configuration seam, not merely a validation probe.
+    # Apply them after the invariant-owned defaults so a non-pinned operator
+    # property reaches Debezium, while the pinned keys remain immutable.
+    props.update({str(key): str(value) for key, value in (overrides or {}).items()})
     return props

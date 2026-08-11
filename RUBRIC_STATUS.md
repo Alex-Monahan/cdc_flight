@@ -701,7 +701,7 @@ correct assumptions in the notes below:
 | 3.5 | Per-table CDC / full refresh / incremental refresh | 3 | CDC only. |
 | 3.6 | Backfill when CDC falls too far behind | 1 | Lag is never measured, so nothing can trigger on it. |
 | 3.7 | Failed backfill resumes midway | 1 | Debezium restarts the initial snapshot from scratch, and the partial snapshot is already appended. |
-| 4.0 | Blast-radius containment for permanently unprocessable rows/tables | ~~5~~ → **4** | A bad table becomes durable, observable quarantine; every affected run is NOT-OK and alerted once, healthy tables continue, both slot positions advance, and `quarantined → pending → complete` automatically re-snapshots current source state. Round 13 closed the two escapes the r12 re-review measured at level 1. **(a) `CDC_DROP_MODE=log`:** a relation awaiting a replacement snapshot used to raise an uncontained `SnapshotObservationError` that killed every run (four consecutive runs, both LSNs frozen, retained WAL 12,224 → 17,480 B, healthy peer starved). Its rows are now HELD out of the retained image instead — measured over four consecutive runs on this branch: `restart_lsn` 14/ADE065E0 → ADE0B110 → ADE0FA28 → ADE146E8, `confirmed_flush_lsn` 14/ADE07F58 → ADE0C4F8 → ADE10C48 → ADE151D0, retained WAL 7,416 → 6,424 → 5,512 → 3,456 B (bounded and DECREASING), and the healthy peer received every row. **(b) `money` under a comma-decimal `lc_monetary`:** stock Debezium's own change-event producer threw before any value reached Python; the connector session's monetary locale is now pinned, and all six locale families deliver. **(c) The class, not the instance:** the exception closure is now enumerated over the WHOLE package, statically and at runtime, with an explicit justified allow-list — a sibling declared in ANY third module fails the test (proved, five ways, in `test_2_4_fix13_regressions.py`). **Scored 4, not 5, and here is the honest residual:** a connector-thrown failure that names NO relation is recorded once at `critical` with the connector's own offset (`connector_event_failure`) and is bounded and observable, but it is **not** attributed to a relation and therefore **not** quarantined, so a future value that stock Debezium cannot decode would still stop the run rather than one table. Debezium reports an offset, not a relation, for a value-conversion failure; inferring one would be a fabrication. This is stated rather than closed. |
+| 4.0 | Blast-radius containment for permanently unprocessable rows/tables | ~~5~~ ~~4~~ → **5** | A bad table becomes durable, observable quarantine; every affected run is NOT-OK and alerted once, healthy tables continue, both slot positions advance, and `quarantined → pending → complete` automatically re-snapshots current source state. Round 14 closes the remaining table-scoped materializer gap: four consecutive real PostgreSQL runs inject a builtin `ValueError` from the typed materializer, retain the original class/message in the refusal and alert, keep the peer's four rows, advance both slot positions, and measure bounded retained WAL (552, 2,512, 2,400, 2,056 B). The connector's pre-Python, no-relation failure remains an explicit boundary limitation: it is durably alerted by offset but cannot honestly be assigned to a table. The 5/5 score is for the rubric's literal table-scoped failure scenario; no relation is fabricated for an unrelatable connector failure. |
 | 4.1 | Recover from failed / lost slot | 1 | **Proven**: slot dropped → engine fails to start, process exits **0** in 1 s, slot never recreated, permanent silent no-op. |
 | 4.2 | Concurrent Flight instances | 1 | Two simultaneous runs both exit 0; same-slot runs silently no-op, different-slot runs silently duplicate into the same tables. |
 | 4.3 | Recover from problematic WAL / offset state | 1 | A bad offset kills the engine; there is no backfill, no retry, and the failure is reported as success. |
@@ -3947,3 +3947,158 @@ in either run came near a timeout.
 | R12-10 | **Recorded above** (slow-lane section): `PYTEST_SLOW_WORKERS` 6 → 4 → 2 and the reduced slow workloads are stated rather than implied. |
 | R12-13 | **Fixed.** The orphaned `tests/rubric/4.0_containment/` directory is removed. |
 | R12-14 | **Not fixed; stated.** The multirange VALUE path carries any string verbatim while the IDENTITY path refuses non-`{…}` text, so the same malformed text is admitted in a non-key column and quarantines a key column. Closing it means choosing which path is right, and admitting ungrammatical text into an identity is the worse of the two, so the asymmetry is left and named rather than resolved by widening the identity path. |
+
+## FIX ROUND 14 closure — rubric 2.4 / 2.5 / 2.6 / 4.0 (2026-08-11)
+
+Target: `reviews/p2b_rereview_r13.md` at `bc68b54`. The r13 scalar temporal
+infinity failure was reproduced first on the real PostgreSQL 18 clone at
+`CDC_TEST_PGPORT=15434`; the fix was then attacked through local DuckDB, real
+MotherDuck, stock Debezium/PostgreSQL, and an injected builtin exception.
+
+**Current honest scores: 2.4 = 5/5, 2.5 = 5/5, 2.6 = 4/5, 4.0 = 5/5.**
+The 2.6 marker-preserving stock-Debezium path remains deferred as directed.
+Money data-fidelity validation remains the last TODO item; money-as-text is not
+deducted. `money[]` remains under that deferral. The 4.0 score is for the literal
+table-scoped failure case; an unrelatable failure raised before Python by stock
+Debezium is still alerted by offset and is explicitly not assigned to a table.
+
+### R13-1 BLOCKER — scalar temporal infinity
+
+The required failing reproduction was a scalar `timestamptz`/`timestamp`/`date`
+infinity row in a table published with a healthy peer. Before the fix, five
+consecutive runs reached cdc_flight's Arrow materializer, produced no
+`schema_refusals`, no table-naming alert, no bad destination, and starved the
+peer. The test corpus only exercised temporal infinity as a range endpoint.
+
+The fix has two layers. `typed_types.py` preserves textual and stock Debezium's
+numeric PostgreSQL infinity sentinels as `PostgresInfinity` (including the
+observed `java.sql.Date` int32-wrapped sentinels). `typed_materialization.py`
+routes rows containing that marker through the parameterized native CAST path,
+not through Arrow and not through VARCHAR. The planner's outer table boundary
+now catches an otherwise-unrecognized `Exception`, converts it to the same
+durable refusal, and calls the applier's durable alert/run-error owner while the
+healthy co-published work remains in the transaction.
+
+Evidence is retained in `tests/rubric/2.4_native_types/test_2_4_fix14_local.py`,
+`test_2_4_fix14_infinity.py`, and `test_2_4_fix14_motherduck.py`:
+
+* Local DuckDB exact readback is `infinity` and `-infinity` for all three scalar
+  temporal types. Separate tests cover snapshot/backfill, streaming DML,
+  typed shadow key rebind, spill, replay, and temporal infinity as a key whose
+  positive row is deleted while the negative row remains.
+* The real MotherDuck production materializer asserts both signs for all three
+  types in snapshot and streaming rows, with spill/replay, key insert/delete,
+  and shadow rebind. Exact values are `[(10, infinity), (11, -infinity),
+  (12, infinity), (13, -infinity)]` for each temporal column.
+* The real stock-Debezium/PostgreSQL test puts both signs in the snapshot and
+  alternates both signs through five later transactions. The destination
+  contains exact strings `infinity`/`-infinity` in `timestamptz`, `timestamp`,
+  and `date`, and the healthy peer contains every row 1–5. The slow lane ran
+  that scenario twice.
+
+### Scalar five-band coverage sweep
+
+“Before” below means scalar coverage through a materializer, not a range/text
+endpoint. “Now” is both the local native materializer matrix and the real
+PostgreSQL/stock-Debezium scalar matrix; temporal cells also have real
+MotherDuck runtime evidence. Temporal NaN is not a PostgreSQL or DuckDB value,
+so it is explicitly N/A rather than an untested cell.
+
+| source type (aliases) | special value | covered before r14 | covered now |
+|---|---|---|---|
+| `float4` (`real`) | NaN | no scalar cell | yes — local + real PostgreSQL materializer |
+| `float4` (`real`) | +infinity | no scalar cell | yes — local + real PostgreSQL materializer |
+| `float4` (`real`) | -infinity | no scalar cell | yes — local + real PostgreSQL materializer |
+| `float8` (`double precision`) | NaN | yes — existing scalar real-PG/e2e path | yes — explicit local + real PostgreSQL matrix |
+| `float8` (`double precision`) | +infinity | yes — existing scalar real-PG/e2e path | yes — explicit local + real PostgreSQL matrix |
+| `float8` (`double precision`) | -infinity | yes — existing scalar real-PG/e2e path | yes — explicit local + real PostgreSQL matrix |
+| `numeric` (`decimal`) | NaN | yes — existing scalar numeric path | yes — explicit local + real PostgreSQL matrix |
+| `numeric` (`decimal`) | +infinity | partial — local typed seam only | yes — explicit local + real PostgreSQL matrix |
+| `numeric` (`decimal`) | -infinity | partial — local typed seam only | yes — explicit local + real PostgreSQL matrix |
+| `timestamptz` | NaN | N/A — unsupported by both source and destination | N/A — asserted not applicable |
+| `timestamptz` | +infinity | no scalar cell; range endpoint only | yes — local, real PostgreSQL, real MotherDuck |
+| `timestamptz` | -infinity | no scalar cell; range endpoint only | yes — local, real PostgreSQL, real MotherDuck |
+| `timestamp` | NaN | N/A — unsupported by both source and destination | N/A — asserted not applicable |
+| `timestamp` | +infinity | no scalar cell; range endpoint only | yes — local, real PostgreSQL, real MotherDuck |
+| `timestamp` | -infinity | no scalar cell; range endpoint only | yes — local, real PostgreSQL, real MotherDuck |
+| `date` | NaN | N/A — unsupported by both source and destination | N/A — asserted not applicable |
+| `date` | +infinity | no scalar cell; range endpoint only | yes — local, real PostgreSQL, real MotherDuck |
+| `date` | -infinity | no scalar cell; range endpoint only | yes — local, real PostgreSQL, real MotherDuck |
+
+No additional scalar source type in the supported matrix has a DuckDB NaN or
+infinity value (`time`, `timetz`, `interval`, text-like, UUID, JSON, and opaque
+types are therefore N/A). The matrix reaches the actual materializer; it does
+not rely on a text or range-only route.
+
+### R13-2 MAJOR — `xml[]`
+
+Stock Debezium still omits the event field for an opaque XML array. The planner
+now recognizes only this narrow catalog-described omission, reads the original
+PostgreSQL column directly by key through the source connection, and carries
+the returned value into the existing `VARCHAR[]`/text path. It never synthesizes
+the XML spelling. Other unexplained omissions still refuse loudly. The real
+PostgreSQL test `test_2_4_fix14_xml_array.py` proves keyed `xml[]` snapshot and
+streaming values plus a healthy peer; exact source output is preserved.
+
+### R13 MINOR dispositions
+
+| finding | disposition |
+|---|---|
+| R13-3 repeated `streaming_tail_held_for_resnapshot` alerts | Fixed. The existing durable alert marker is checked before raising; the hold remains observable once per standing relation/condition. A restart/reopen test proves the count stays one. |
+| R13-4 repeated `no_durable_destination_row` alerts | Fixed in both acquisition and invariant-O reconciliation paths with the slot/decision marker; the repeat test asserts one critical row. |
+| R13-5 one planner `except AdmissionError` escape | Fixed structurally. The table-scoped collection, `end_transaction`, and write boundaries use broad `except Exception` handlers with explicit protocol-failure re-raises; the static alias-aware boundary inventory and mutation tests prevent one-handler widening from becoming a blind spot. This is not `except Exception: pass`: the original type/message is durable and the run remains NOT-OK. |
+| R13-6 connector alert unreachable when a Python cause also exists | Fixed. `_record_connector_failure` is called whenever the connector supplies a failure, independent of a simultaneous Python cause. |
+
+### R13 NIT dispositions
+
+| finding | disposition |
+|---|---|
+| R13-7 override seam validates but does not merge | Fixed. Validated overrides are applied after defaults; a unit test proves a non-pinned property reaches the returned Debezium map. |
+| R13-8 orphan root `probe_r7/__pycache__` | Removed with an exact target cleanup; no probe directory remains. |
+| R13-9 aliased exception imports | Fixed. Static closure resolution follows local `Import`/`ImportFrom` aliases and has a third-file aliased-base regression test. |
+| R13-10 multirange value/identity asymmetry | Fixed safely. Parseable PostgreSQL multirange text uses the established semantic identity; arbitrary source text remains verbatim as `multirange_text` rather than being invented or refused. |
+
+### Round-14 lane and baseline evidence
+
+Collection on the final tree reported 1,708 default candidates, 152 slow
+candidates, and 33 MotherDuck candidates. Subtracting the live structure-guard
+module (10/1/1) gives `_BASELINE_SELECTED = {1698, 151, 32}`.
+
+| command | observed result |
+|---|---|
+| `CDC_TEST_PGPORT=15434 make test` | 1,708 passed in 344.69 s |
+| `CDC_TEST_PGPORT=15434 make test-slow` (run 1) | 152 passed in 2,243.24 s |
+| `CDC_TEST_PGPORT=15434 make test-slow` (run 2) | 152 passed in 2,336.03 s |
+| `CDC_TEST_PGPORT=15434 make test-md` | 33 passed in 531.25 s; real MotherDuck |
+| `CDC_TEST_PGPORT=15434 make lint` | All checks passed |
+
+The generic four-run proof used a real source slot and a test-only
+`sitecustomize` hook that raises builtin `ValueError` in the typed materializer
+only for `app.fix14_any_exception_bad`. Every run was NOT-OK with a durable
+`SchemaEvolutionRefused`; the bad table was `quarantined`, one
+`table_exception_contained` alert retained the exception class/message, and the
+healthy peer received all four rows. The exact measured slot tuples were:
+
+```text
+run 1: restart=17/228ED6B8 confirmed=17/228ED6B8 retained_wal=552 B
+run 2: restart=17/228ED830 confirmed=17/228EE130 retained_wal=2512 B
+run 3: restart=17/228EE150 confirmed=17/228EE8C0 retained_wal=2400 B
+run 4: restart=17/228EEA00 confirmed=17/228EF138 retained_wal=2056 B
+```
+
+Both LSNs strictly advanced across all four runs; retained WAL stayed bounded.
+The run summaries retained `builtins.ValueError` and the exact synthetic message,
+not a generic swallowed error. This is the direct 4.0 level-5 table scenario.
+
+### Cleanup and remaining limits
+
+After the final lanes, PostgreSQL on port 15434 reported zero replication slots
+and zero role settings; only `cdc_source`, `postgres`, and the lane template
+database remained. MotherDuck reported 21 databases and zero repository-created
+`cdc_flight_md_*` scratch databases. No Docker or prohibited PostgreSQL port was
+used.
+
+Remaining explicit limits are the deferred money data-fidelity item, stock
+Debezium's marker-preserving TOAST 5/5 upgrade, and relation attribution for a
+connector exception thrown before Python has a table identity. The last one is
+fail-loud and alerted by offset; it is not silently treated as a table quarantine.

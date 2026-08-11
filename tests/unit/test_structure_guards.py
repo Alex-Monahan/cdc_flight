@@ -12,20 +12,16 @@ from pathlib import Path
 
 import pytest
 
-#: RE-MEASURED IN ROUND 13 from real collection on this tree, not inherited:
-#:   `pytest -m "<expr>" --collect-only -q` reports 1698 / 148 / 32 items, of which
-#:   10 / 1 / 1 belong to this guard module, giving 1688 / 147 / 31 below.
-#:   Round 13 added, in the default lane, 14 nodes in
-#:   `tests/rubric/2.4_native_types/test_2_4_fix13_regressions.py` (the package-wide
-#:   exception closure and its third-file scratch proofs, plus the connector-session
-#:   locale property, and the group-scoped DROP_LOG hold) and 10 in `test_2_4_fix13_minors.py`; and, in the slow lane,
-#:   the two live end-to-end blocker proofs (the money locale-family matrix and the
-#:   `CDC_DROP_MODE=log` four-run containment matrix). 1664 + 24 = 1688 and
-#:   145 + 2 = 147. The MotherDuck lane is unchanged.
+#: RE-MEASURED IN ROUND 14 from real collection on this tree, not inherited:
+#:   `pytest -m "<expr>" --collect-only -q` reports 1708 / 152 / 33 items, of which
+#:   10 / 1 / 1 belong to this guard module, giving 1698 / 151 / 32 below. The
+#:   additions are the scalar-special-value, generic-containment, XML-array,
+#:   MotherDuck, alias-resolution, alert-deduplication, multirange-identity, and
+#:   override-merge proofs for this round.
 _BASELINE_SELECTED = {
-    "not motherduck and not slow": 1688,
-    "slow and not motherduck": 147,
-    "motherduck": 31,
+    "not motherduck and not slow": 1698,
+    "slow and not motherduck": 151,
+    "motherduck": 32,
 }
 
 

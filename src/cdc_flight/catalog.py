@@ -885,6 +885,12 @@ class CatalogWatcher:
             self, relation, key_columns, value_columns
         )
 
+    def read_event_columns(self, event, value_columns):
+        """Recover source fields omitted by stock Debezium's opaque-array path."""
+        from . import catalog_support
+
+        return catalog_support.read_event_columns(self, event, value_columns)
+
     def _compare(self, observed: dict[str, SourceRelation], lsn: int) -> list[CatalogChange]:
         added: list[CatalogChange] = []
         superseded: list[str] = []

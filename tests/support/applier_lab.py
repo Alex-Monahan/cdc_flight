@@ -310,16 +310,29 @@ class Lab:
         resume_lsn: int = 0,
         catalog=None,
         full_snapshot: bool = False,
+        connection=None,
+        dataset: str = DATASET,
+        pipeline: str = "lab",
+        namespace: str = "lab-namespace",
+        topic_prefix: str = TOPIC_PREFIX,
+        control_schema: str | None = None,
         **cfg: Any,
     ) -> None:
         self.path = Path(path)
+        self.dataset = dataset
+        self.pipeline = pipeline
+        self.namespace = namespace
+        self.topic_prefix = topic_prefix
+        self.control_schema = control_schema
         # Native VARIANT tables require the same storage compatibility and
         # shredding settings as the production destination connection.  The lab
         # drives the real applier, so opening a different DuckDB runtime contract
         # would make native merge coverage fail before RowPatch reaches SQL.
-        self.con = duckdb.connect(str(self.path), config=dest_mod.DUCKDB_CONNECT_CONFIG)
-        dest_mod.ensure_control_schema(self.con)
-        dest_mod.ensure_dataset(self.con, DATASET)
+        self.con = connection or duckdb.connect(
+            str(self.path), config=dest_mod.DUCKDB_CONNECT_CONFIG
+        )
+        dest_mod.ensure_control_schema(self.con, control_schema)
+        dest_mod.ensure_dataset(self.con, dataset)
         self.committer = FakeCommitter()
         cfg.setdefault("verify_offset_file", False)
         self.config = ApplierConfig(**cfg)
@@ -331,7 +344,7 @@ class Lab:
             completion.observe_notification("STARTED", {})
         else:
             completion = SnapshotCompletion.streaming_only()
-        self.lease = Lease("lab", ttl_seconds=600)
+        self.lease = Lease(pipeline, ttl_seconds=600, control_schema=control_schema)
         self.lease.acquire(self.con)
         self._fixture_descriptor_map: dict[str, dict[str, SourceTypeDescriptor]] = {}
 
@@ -351,10 +364,10 @@ class Lab:
 
         self.applier = Applier(
             self.con,
-            pipeline="lab",
-            namespace="lab-namespace",
-            dataset=DATASET,
-            topic_prefix=TOPIC_PREFIX,
+            pipeline=pipeline,
+            namespace=namespace,
+            dataset=dataset,
+            topic_prefix=topic_prefix,
             offset_path=self.path.parent / "offsets.dat",
             resume_point=ResumePoint(last_lsn=resume_lsn),
             config=self.config,
@@ -363,6 +376,7 @@ class Lab:
             catalog=catalog,
             completion=completion,
             descriptor_provider=descriptor_provider,
+            control_schema=control_schema,
         )
         self.applier._committer = self.committer
 
@@ -395,19 +409,19 @@ class Lab:
         return self.q(sql, params)[0][0]
 
     def rows(self, table: str, columns: str = "*", order: str = "1") -> list[tuple]:
-        return self.q(f'SELECT {columns} FROM "{DATASET}"."{table}" ORDER BY {order}')
+        return self.q(f'SELECT {columns} FROM "{self.dataset}"."{table}" ORDER BY {order}')
 
     def exists(self, table: str) -> bool:
         return bool(
             self.scalar(
                 "SELECT count(*) FROM information_schema.tables "
                 "WHERE table_schema = ? AND table_name = ?",
-                [DATASET, table],
+                [self.dataset, table],
             )
         )
 
     def target(self, table: str) -> str:
-        return f"{TOPIC_PREFIX}_app_{table}"
+        return f"{self.topic_prefix}_app_{table}"
 
     def shadow(self, table: str) -> str:
         return f"{self.target(table)}__cdcf_tmp"

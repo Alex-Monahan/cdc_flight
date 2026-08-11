@@ -168,11 +168,21 @@ def check_the_slot(
         log.error(
             "%s: %s", verdict.decision, verdict.message,
         )
-        dest_mod.raise_alert(
-            con, pipeline=dest.pipeline_name, severity="critical",
-            code=verdict.decision, message=verdict.message, context=verdict.as_dict(),
+        marker_value = f"{replication.slot_name}:{verdict.decision}"
+        if not dest_mod.alert_marker_exists(
+            con,
+            pipeline=dest.pipeline_name,
+            code=verdict.decision,
+            marker_key="condition_marker",
+            marker_value=marker_value,
             control_schema=dest.control_schema,
-        )
+        ):
+            context = verdict.as_dict() | {"condition_marker": marker_value}
+            dest_mod.raise_alert(
+                con, pipeline=dest.pipeline_name, severity="critical",
+                code=verdict.decision, message=verdict.message, context=context,
+                control_schema=dest.control_schema,
+            )
     if verdict.resnapshot and orphan_file and verdict.decision == "no_durable_destination_row":
         # The one place a re-snapshot is NOT the right automatic answer, and the reason
         # the refusal in ADR 0001 §4.5 survives this whole feature: an `offsets.dat` with

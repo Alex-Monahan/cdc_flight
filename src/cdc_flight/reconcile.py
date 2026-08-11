@@ -23,6 +23,7 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import destination as dest_mod
 from . import recovery as recovery_mod
 from .config import resolve_control_schema
 from .destination import raise_alert
@@ -590,11 +591,21 @@ def check_invariant_o(
             return result
         result["ok"] = False
         result["decision"] = "no_durable_destination_row"
-        raise_alert(
-            con, pipeline=pipeline, severity="critical",
-            code="no_durable_destination_row", message=message, context=result,
+        marker_value = f"{slot_name}:no_durable_destination_row"
+        if not dest_mod.alert_marker_exists(
+            con,
+            pipeline=pipeline,
+            code="no_durable_destination_row",
+            marker_key="condition_marker",
+            marker_value=marker_value,
             control_schema=control_schema,
-        )
+        ):
+            raise_alert(
+                con, pipeline=pipeline, severity="critical",
+                code="no_durable_destination_row", message=message,
+                context=result | {"condition_marker": marker_value},
+                control_schema=control_schema,
+            )
         if raise_on_violation:
             raise NoDurableDestinationRow(
                 f"REFUSING TO START: {message}. snapshot.mode={snapshot_mode!r} does not "

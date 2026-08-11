@@ -506,6 +506,8 @@ def record_schema_refusal(
     input_fingerprint: str | None = None,
     source_fingerprint: str | None = None,
     control_schema: str | None = None,
+    transaction_open: bool = False,
+    deferred_alerts: list[dict] | None = None,
 ) -> str:
     """Persist one scoped refusal and quarantine only its source table on repeat.
 
@@ -526,7 +528,9 @@ def record_schema_refusal(
     source_fingerprint = str(source_fingerprint) if source_fingerprint else None
     quarantine_alert = None
     result = REFUSAL_PENDING
-    con.execute("BEGIN TRANSACTION")
+    owns_transaction = not transaction_open
+    if owns_transaction:
+        con.execute("BEGIN TRANSACTION")
     try:
         previous = con.execute(
             f"SELECT state, refusal_fingerprint, source_fingerprint "
@@ -546,7 +550,8 @@ def record_schema_refusal(
                 reason="a quarantined refusal remains stale until a full resnapshot",
                 control_schema=control_schema,
             )
-            con.execute("COMMIT")
+            if owns_transaction:
+                con.execute("COMMIT")
             return REFUSAL_QUARANTINED
 
         stored_fingerprint = previous[1] if previous else None
@@ -627,7 +632,8 @@ def record_schema_refusal(
                     "resnapshot_required": True,
                 }
             result = REFUSAL_QUARANTINED
-            con.execute("COMMIT")
+            if owns_transaction:
+                con.execute("COMMIT")
         else:
             SCHEMA_REFUSAL.check(before, REFUSAL_PENDING)
             con.execute(
@@ -673,29 +679,40 @@ def record_schema_refusal(
                     detail=reason,
                     control_schema=control_schema,
                 )
-            con.execute("COMMIT")
+            if owns_transaction:
+                con.execute("COMMIT")
     except BaseException:
-        with contextlib.suppress(Exception):
-            con.execute("ROLLBACK")
+        if owns_transaction:
+            with contextlib.suppress(Exception):
+                con.execute("ROLLBACK")
         raise
 
     # This is deliberately outside the transaction/rollback handler.  Alerting is
     # diagnostic; a sink failure must never turn a committed quarantine into a second
     # refusal or mask the durable state transition.
     if quarantine_alert is not None:
-        raise_alert(
-            con,
-            pipeline=pipeline,
-            severity="critical",
-            code="schema_table_quarantined",
-            message=(
+        alert = {
+            "severity": "critical",
+            "code": "schema_table_quarantined",
+            "message": (
                 f"{source_schema}.{source_table} is quarantined after a repeated "
                 "schema/value refusal; its destination image is stale/unavailable "
                 "until a full resnapshot completes"
             ),
-            context=quarantine_alert,
-            control_schema=control_schema,
-        )
+            "context": quarantine_alert,
+        }
+        if deferred_alerts is not None:
+            deferred_alerts.append(alert)
+        else:
+            raise_alert(
+                con,
+                pipeline=pipeline,
+                severity=alert["severity"],
+                code=alert["code"],
+                message=alert["message"],
+                context=alert["context"],
+                control_schema=control_schema,
+            )
         log.error(
             "quarantined %s.%s after an identical durable input refused twice",
             source_schema,

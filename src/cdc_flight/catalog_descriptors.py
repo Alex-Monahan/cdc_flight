@@ -169,14 +169,16 @@ class RelationDescriptorProvider:
     """
 
     relations: dict[str, dict[str, SourceTypeDescriptor]]
+    source_dsn: str | None = None
 
     @classmethod
     def from_tables(cls, con, tables: Iterable[tuple[str, str, str]]) -> RelationDescriptorProvider:
+        source_dsn = getattr(getattr(con, "info", None), "dsn", None)
         requested = sorted(
             {(str(schema), str(table), str(target)) for schema, table, target in tables}
         )
         if not requested:
-            return cls({})
+            return cls({}, source_dsn=source_dsn)
         predicates = " OR ".join(
             "(n.nspname = %s AND c.relname = %s)" for _ in requested
         )
@@ -244,10 +246,30 @@ class RelationDescriptorProvider:
                     refusal_origin="catalog_descriptor",
                 ) from exc
             result.setdefault(f"{schema}.{table}", {})[normalize(str(name))] = descriptor
-        return cls(result)
+        return cls(result, source_dsn=source_dsn)
 
     def descriptors_for(self, qualified: str) -> dict[str, SourceTypeDescriptor]:
         return dict(self.relations.get(str(qualified), {}))
+
+    def read_event_columns(self, event, value_columns):
+        """Recover omitted opaque-array fields through a short source read."""
+        if not self.source_dsn:
+            raise SchemaEvolutionRefused(
+                "the bounded descriptor provider has no source connection for "
+                f"opaque-array recovery of {event.qualified_table}",
+                source_schema=event.schema,
+                source_table=event.table,
+                target=event.qualified_table,
+                refusal_origin="catalog_descriptor",
+            )
+        import psycopg
+
+        from . import catalog_support
+
+        with psycopg.connect(self.source_dsn, autocommit=True) as con:
+            return catalog_support.read_event_columns_from_connection(
+                con, event, value_columns
+            )
 
 
 def relation_descriptor_fingerprint(

@@ -261,6 +261,9 @@ class Applier:
         self.resnapshot_discarded_events = 0
         self.quarantined_events = 0
         self.unscoped_refusals = 0
+        #: Unknown third-party/builtin failures contained at a source-table boundary.
+        #: The run still fails loudly after its healthy co-published work commits.
+        self._contained_failures: list[dict] = []
         #: rubric 4.7: undecidable folds turned into automatic table rebuilds
         self.ambiguous_resnapshots_queued = 0
         #: events dropped because their transaction is already inside a table's image
@@ -339,6 +342,7 @@ class Applier:
             "blocked_schema_tables": sorted(self.blocked_schema_tables),
             "held_streaming_tables": sorted(self.held_streaming_tables),
             "unscoped_refusals": self.unscoped_refusals,
+            "contained_failures": list(self._contained_failures),
             "orphan_end_markers": self.assembler.orphan_end_markers,
             "implicit_txn_opens": self.assembler.implicit_txn_opens,
             "last_commit_id": self.last_commit_id,
@@ -616,6 +620,21 @@ class Applier:
             if qualified in self.held_streaming_tables:
                 continue
             self.held_streaming_tables.add(qualified)
+            # The obligation can survive a process restart.  The run-scoped set
+            # above handles duplicate observations in one run; the durable marker
+            # bounds the alert across runs for the same standing condition.
+            if (
+                getattr(self, "con", None) is not None
+                and destination.alert_marker_exists(
+                    self.con,
+                    pipeline=self.pipeline,
+                    code="streaming_tail_held_for_resnapshot",
+                    marker_key="source_relation",
+                    marker_value=qualified,
+                    control_schema=self.control_schema,
+                )
+            ):
+                continue
             self.alerts.raise_alert(
                 severity="warning",
                 code="streaming_tail_held_for_resnapshot",
@@ -636,6 +655,78 @@ class Applier:
             self.blocked_schema_tables.add(
                 f"{refused.source_schema}.{refused.source_table}"
             )
+
+    def _contain_table_failure(self, refused: SchemaEvolutionRefused, original) -> None:
+        """Persist an arbitrary table failure inside the current commit transaction.
+
+        This is the outermost table-scoped boundary.  It intentionally accepts the
+        already-normalized refusal plus the original exception: the durable reason
+        names the concrete third-party/builtin class, while ``self.error`` makes the
+        run fail closed after the healthy tables in the same PostgreSQL transaction
+        have committed.  No broad handler here suppresses its own persistence error.
+        """
+        if not refused.source_schema or not refused.source_table:
+            # There is no honest table to quarantine.  Keep an unscoped failure loud;
+            # the commit protocol will roll back the whole group and the supervisor
+            # will report it as a run-level failure.
+            raise original
+        spill_refusal.record_schema_refusal(
+            self,
+            refused,
+            transaction_open=True,
+            deferred_alerts=self.group.pending_alerts,
+        )
+        refused.refusal_recorded = True
+        qualified = f"{refused.source_schema}.{refused.source_table}"
+        self.blocked_schema_tables.add(qualified)
+        try:
+            detail = str(original)
+        except Exception:
+            detail = "<exception text unavailable>"
+        exception_type = f"{type(original).__module__}.{type(original).__qualname__}"
+        fingerprint = refused.input_fingerprint or qualified
+        if not destination.alert_marker_exists(
+            self.con,
+            pipeline=self.pipeline,
+            code="table_exception_contained",
+            marker_key="input_fingerprint",
+            marker_value=fingerprint,
+            control_schema=self.control_schema,
+        ):
+            self.group.pending_alerts.append(
+                {
+                    "severity": "critical",
+                    "code": "table_exception_contained",
+                    "message": (
+                        f"{qualified} was contained after an unrecognised "
+                        f"table-scoped materialization failure ({exception_type}); "
+                        "the healthy tables in the source transaction remain eligible"
+                    ),
+                    "context": {
+                        "source_relation": qualified,
+                        "target_table": refused.target,
+                        "input_fingerprint": fingerprint,
+                        "exception_type": exception_type,
+                        "exception_message": detail,
+                        "run_not_ok": True,
+                    },
+                }
+            )
+        self._contained_failures.append(
+            {
+                "source_relation": qualified,
+                "target_table": refused.target,
+                "exception_type": exception_type,
+                "exception_message": detail,
+                "input_fingerprint": fingerprint,
+                "refusal_state": destination.REFUSAL_PENDING,
+            }
+        )
+        # Preserve fail-loud semantics without interrupting this source transaction's
+        # healthy peer.  The supervisor turns the non-None cause into a non-zero run
+        # outcome after the commit/slot-advance path has completed.
+        if self.error is None:
+            self.error = refused
 
     def _contextualize_schema_refusal(self, refused: SchemaEvolutionRefused) -> None:
         """Attach scope only when the failed group identifies exactly one relation."""

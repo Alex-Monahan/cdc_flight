@@ -51,7 +51,13 @@ def _capture_source_fingerprint(applier, refused: SchemaEvolutionRefused) -> Non
         refused.source_fingerprint = fingerprint
 
 
-def record_schema_refusal(applier, refused: SchemaEvolutionRefused) -> None:
+def record_schema_refusal(
+    applier,
+    refused: SchemaEvolutionRefused,
+    *,
+    transaction_open: bool = False,
+    deferred_alerts: list[dict] | None = None,
+) -> None:
     if not refused.source_schema or not refused.source_table:
         applier.unscoped_refusals += 1
         applier.alerts.raise_alert(
@@ -79,6 +85,8 @@ def record_schema_refusal(applier, refused: SchemaEvolutionRefused) -> None:
         input_fingerprint=refused.input_fingerprint,
         source_fingerprint=refused.source_fingerprint,
         control_schema=applier.control_schema,
+        transaction_open=transaction_open,
+        deferred_alerts=deferred_alerts,
     )
     refused.refusal_recorded = True
 
