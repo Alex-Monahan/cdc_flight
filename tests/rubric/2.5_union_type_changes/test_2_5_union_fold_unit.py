@@ -15,7 +15,8 @@ from cdc_flight.apply_sql import (
 )
 from cdc_flight.envelope import KIND_DATA, PendingRecord
 from cdc_flight.row_patch import RowPatch
-from cdc_flight.table_work import TableWork, _key_value, collect, end_transaction, write
+from cdc_flight.table_work import TableWork, collect, end_transaction
+from cdc_flight.table_writer import _key_value, write
 from cdc_flight.typed_types import (
     FieldValue,
     SourceTypeDescriptor,

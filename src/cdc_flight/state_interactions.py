@@ -47,6 +47,7 @@ from .machines import (
     SNAPSHOT_STREAMING,
 )
 
+OWNER = "state-interaction-gates"
 
 @dataclass(frozen=True)
 class InteractionDecision:

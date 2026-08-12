@@ -73,7 +73,7 @@ from .snapshot_completion import SnapshotCompletion
 from .supervisor import run_engine_bounded  # noqa: F401 - compatibility re-export
 
 log = logging.getLogger("cdc_flight.pipeline")
-
+OWNER = "pipeline-orchestration"
 
 # --------------------------------------------------------------------------- #
 # entrypoint

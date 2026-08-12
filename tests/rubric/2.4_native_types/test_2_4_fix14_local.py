@@ -587,6 +587,93 @@ def test_destination_programming_error_is_loud_not_a_table_quarantine(tmp_path, 
         box.close()
 
 
+def test_transaction_control_exception_is_not_a_table_quarantine(tmp_path, monkeypatch):
+    """FIX16 reproduction: a control failure must escape the table boundary."""
+    import duckdb
+
+    original = typed_materialization._bulk_insert_typed_rows
+
+    def begin_inside_destination_transaction(con, table, columns, rows):
+        if table.name.endswith("txn_exception_bad"):
+            # This is the reviewer's probe: it is a transaction-control operation,
+            # not a rejection of a source value or row.
+            con.execute("BEGIN TRANSACTION")
+        return original(con, table, columns, rows)
+
+    monkeypatch.setattr(
+        typed_materialization,
+        "_bulk_insert_typed_rows",
+        begin_inside_destination_transaction,
+    )
+    box = Lab(tmp_path / "txn-exception-reproduction.duckdb")
+    try:
+        with pytest.raises(duckdb.TransactionException):
+            box.run(
+                [
+                    data(
+                        "txn-control",
+                        1,
+                        100,
+                        table="txn_exception_bad",
+                        key={"id": 1},
+                        after={"id": 1, "name": "bad"},
+                    ),
+                    data(
+                        "txn-control",
+                        2,
+                        101,
+                        table="txn_exception_peer",
+                        key={"id": 1},
+                        after={"id": 1, "name": "healthy"},
+                    ),
+                    end(
+                        "txn-control",
+                        2,
+                        102,
+                        {"app.txn_exception_bad": 1, "app.txn_exception_peer": 1},
+                    ),
+                ]
+            )
+        assert box.q(
+            "SELECT count(*) FROM _cdc_flight.schema_refusals "
+            "WHERE source_table = 'txn_exception_bad'"
+        ) == [(0,)]
+        assert box.q(
+            "SELECT count(*) FROM _cdc_flight.alerts "
+            "WHERE code = 'table_exception_contained'"
+        ) == [(0,)]
+    finally:
+        box.close()
+
+
+def test_destination_classifier_is_a_closed_data_boundary():
+    """Only explicit value/row rejections cross the table-containment boundary."""
+    import duckdb
+
+    from cdc_flight import destination_failure
+
+    assert destination_failure.DATA_REJECTION_EXCEPTION_NAMES == (
+        "ConversionException",
+        "ConstraintException",
+        "OutOfRangeException",
+    )
+    assert "TransactionException" not in destination_failure.DATA_REJECTION_EXCEPTION_NAMES
+
+    con = duckdb.connect(":memory:")
+    facade = destination_failure.MaterializationConnection(con)
+    try:
+        with pytest.raises(destination_failure.DestinationDataRejection) as rejected:
+            facade.execute("SELECT CAST('not-an-integer' AS INTEGER)")
+        assert isinstance(rejected.value.original, duckdb.ConversionException)
+
+        con.execute("BEGIN TRANSACTION")
+        with pytest.raises(duckdb.TransactionException):
+            facade.execute("BEGIN TRANSACTION")
+        con.execute("ROLLBACK")
+    finally:
+        con.close()
+
+
 @pytest.mark.slow
 @pytest.mark.e2e
 def test_real_slot_advances_when_a_builtin_materializer_failure_is_injected(sandbox, tmp_path):
@@ -840,3 +927,111 @@ def test_real_destination_error_is_contained_over_four_runs_with_wal_metrics(
                 + ", ".join([*bad_tables, peer])
             )
             conn.execute("DROP TABLE IF EXISTS " + ", ".join([*bad_tables, peer]))
+
+
+@pytest.mark.slow
+@pytest.mark.e2e
+def test_real_transaction_control_failure_fails_run_without_table_attribution(
+    sandbox, tmp_path
+):
+    """A real PostgreSQL run keeps DuckDB transaction-control errors run-scoped."""
+    import os
+
+    import psycopg
+
+    publication = "cdc_flight_pub"
+    bad = "app.r16_txn_control_bad"
+    peer = "app.r16_txn_control_peer"
+    capture = {
+        "CDC_AUTO_DISCOVERY": "0",
+        "CDC_TABLES": "r16_txn_control_bad,r16_txn_control_peer",
+    }
+    _fresh_real_sandbox(sandbox)
+    sandbox.reseed()
+    with psycopg.connect(sandbox.source.dsn, autocommit=True) as conn:
+        conn.execute(f"DROP TABLE IF EXISTS {bad}, {peer}")
+        conn.execute(f"CREATE TABLE {bad} (id integer PRIMARY KEY, name text)")
+        conn.execute(f"CREATE TABLE {peer} (id integer PRIMARY KEY, name text)")
+        conn.execute(f"ALTER PUBLICATION {publication} ADD TABLE {bad}, {peer}")
+
+    hook = tmp_path / "sitecustomize.py"
+    hook.write_text(
+        "from cdc_flight import typed_materialization as _tm\n"
+        "_real = _tm._bulk_insert_typed_rows\n"
+        "def _control(con, table, columns, rows):\n"
+        "    if rows and str(table.name).endswith('r16_txn_control_bad'):\n"
+        "        con.execute('BEGIN TRANSACTION')\n"
+        "    return _real(con, table, columns, rows)\n"
+        "_tm._bulk_insert_typed_rows = _control\n",
+        encoding="utf-8",
+    )
+    pipeline_env = {
+        **capture,
+        "PYTHONPATH": os.pathsep.join(
+            item for item in (str(tmp_path), os.environ.get("PYTHONPATH", "")) if item
+        ),
+    }
+
+    def slot_metrics():
+        sandbox.sql("CHECKPOINT")
+        return sandbox.pg_query(
+            "SELECT restart_lsn::text, confirmed_flush_lsn::text, "
+            "pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint, "
+            "(restart_lsn - '0/0')::bigint, "
+            "(confirmed_flush_lsn - '0/0')::bigint "
+            "FROM pg_replication_slots WHERE slot_name = %s",
+            (sandbox.slot,),
+        )[0]
+
+    try:
+        baseline = sandbox.run(
+            reset_state=True,
+            extra_env=pipeline_env,
+            max_seconds=90,
+            timeout=180,
+        )
+        assert baseline["ok"] is True, baseline
+        before = slot_metrics()
+        sandbox.sql(
+            [
+                f"INSERT INTO {bad} VALUES (1, 'bad')",
+                f"INSERT INTO {peer} VALUES (1, 'healthy')",
+            ],
+            one_transaction=True,
+        )
+        source_lsn = sandbox.pg_query(
+            "SELECT (pg_current_wal_lsn() - '0/0')::bigint"
+        )[0][0]
+        failed = sandbox.run(
+            extra_env=pipeline_env,
+            expect_success=False,
+            max_seconds=90,
+            timeout=180,
+        )
+        after = slot_metrics()
+        assert failed["ok"] is False, failed
+        assert failed["error_cause_type"] == "TransactionException", failed
+        assert "cannot start a transaction within a transaction" in failed[
+            "error"
+        ].lower(), failed
+        assert sandbox.duck_query(
+            "SELECT count(*) FROM _cdc_flight.schema_refusals "
+            "WHERE source_table IN (?, ?)",
+            [bad.rsplit(".", 1)[1], peer.rsplit(".", 1)[1]],
+        ) == [(0,)]
+        assert sandbox.duck_query(
+            "SELECT count(*) FROM _cdc_flight.alerts "
+            "WHERE code = 'table_exception_contained'"
+        ) == [(0,)]
+        assert int(after[4]) == int(before[4]), (before, after)
+        assert int(after[4]) < int(source_lsn), (after, source_lsn)
+        assert int(after[3]) <= int(after[4])
+        assert int(after[2]) >= 0
+        print(
+            "FIX16 transaction-control failure LSN/WAL evidence:",
+            {"before": before, "after": after, "source_lsn": source_lsn},
+        )
+    finally:
+        with psycopg.connect(sandbox.source.dsn, autocommit=True) as conn:
+            conn.execute(f"ALTER PUBLICATION {publication} DROP TABLE {bad}, {peer}")
+            conn.execute(f"DROP TABLE IF EXISTS {bad}, {peer}")

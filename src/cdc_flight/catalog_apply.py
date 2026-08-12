@@ -39,6 +39,7 @@ from .machines import (
 from .schema_evolution import apply_column_changes
 
 log = logging.getLogger("cdc_flight.catalog_apply")
+OWNER = "catalog-application"
 
 # Canonical definition lives in destination; re-export the name for local callers.
 AWAITING_SNAPSHOT = destination.AWAITING_SNAPSHOT

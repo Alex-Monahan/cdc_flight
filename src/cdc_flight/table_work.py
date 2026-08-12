@@ -54,26 +54,21 @@ after the change.
 from __future__ import annotations
 
 import json
-import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import apply_sql, naming
+from . import apply_sql, keyless_work, naming
 from .envelope import KIND_TRUNCATE, PendingRecord
 from .errors import (
     AdmissionError,
     AmbiguousDelete,
-    DestinationIdentityCollision,
     SchemaEvolutionRefused,
     ToastBaseMissing,
-    as_schema_refusal,
 )
 from .naming import CDCF_COMMIT_ID, CDCF_EVENT_ID, CDCF_TOTAL_ORDER
 from .row_patch import RowPatch
 from .toast import is_structural_marker
 from .typed_types import FieldState, FieldValue
-
-log = logging.getLogger("cdc_flight.table_work")
 
 DBZ_COLUMN_TYPES = {
     "dbz_op": apply_sql.VARCHAR,
@@ -92,6 +87,7 @@ APPLIER_COLUMN_TYPES = {
     CDCF_TOTAL_ORDER: apply_sql.BIGINT,
     **DBZ_COLUMN_TYPES,
 }
+OWNER = "table-physical-fold"
 
 class _Start:
     """The row the destination already held under a key, before this group.
@@ -118,17 +114,6 @@ class RowMove:
     source_key: tuple
     target_key: tuple
     patch: RowPatch
-
-
-@dataclass(frozen=True)
-class KeylessOperation:
-    """One source-order physical operation for a keyless table."""
-
-    event_id: str
-    operation: str
-    after: dict[str, Any] | None = None
-    before: dict[str, Any] | None = None
-    image_digest: str | None = None
 
 
 @dataclass
@@ -194,7 +179,7 @@ class TableWork:
     #: Keyless tables have no source-key fold. Keep their physical operations in
     #: source order so a DELETE can consume an INSERT/UPDATE from earlier in the
     #: same transaction and a later identical INSERT cannot be mistaken for it.
-    keyless_operations: list[KeylessOperation] = field(default_factory=list)
+    keyless_operations: list[keyless_work.KeylessOperation] = field(default_factory=list)
     #: Event ids admitted to this in-memory plan. The durable ledger is checked by
     #: the planner before this list is built; this set also catches a duplicate inside
     #: one group without allowing it to become a second physical operation.
@@ -361,7 +346,7 @@ def collect(
         # `work_for` cannot know the table identity from a truncate envelope because
         # Debezium deliberately gives it no message key; keyed tables ignore this.
         item.keyless_operations.append(
-            KeylessOperation(event_id=event_id, operation="t")
+            keyless_work.KeylessOperation(event_id=event_id, operation="t")
         )
         return
     patch = patch or patch_for(event, 0, event_id, snapshot=item.snapshot)
@@ -399,61 +384,8 @@ def collect(
     if patch.has_marker() and event.op in {"c", "r"}:
         _missing_toast_base(item, event)
     if item.keyless:
-        # `cdcf_event_id` remains the destination primary key for INSERT/UPDATE
-        # replay, but it is not the identity of a source row.  A DELETE/UPDATE on a
-        # keyless FULL-identity table must consume the complete before-image instead.
-        # The planner has already checked the durable event ledger; an applied event
-        # is intentionally absent from this source-order operation stream.
-        if (
-            not item.snapshot
-            and probe is not None
-            and hasattr(probe, "keyless_event_applied")
-            and probe.keyless_event_applied(item, event_id)
-        ):
-            return
-        if event_id in item.keyless_event_ids:
-            raise AmbiguousDelete(
-                f"{item.target}: keyless event identity {event_id!r} appeared twice "
-                "in one commit group; refusing to apply an un-attributable physical "
-                "operation",
-                source_schema=item.source_schema,
-                source_table=item.source_table,
-                target=item.target,
-            )
-        if event.op in {"d", "u"}:
-            before = _keyless_complete_image(item, patch if event.op == "d" else _before_patch(event))
-            after = patch.encoded_values() if event.op == "u" else None
-            if event.op == "u":
-                # An UPDATE is a physical replacement, not a changelog INSERT.  A
-                # sparse/TOAST after-image cannot reconstruct the replacement row
-                # without first reading and composing the matched physical row; the
-                # safe outcome is the existing self-healing refusal path.
-                _keyless_complete_image(item, patch, after=True)
-            item.keyless_operations.append(
-                KeylessOperation(
-                    event_id=event_id,
-                    operation=event.op,
-                    before=before,
-                    after=after,
-                    image_digest=patch.digest,
-                )
-            )
-        else:
-            if patch.has_marker():
-                _missing_toast_base(
-                    item, event, reason="keyless sparse change has no safe base"
-                )
-            item.keyless_operations.append(
-                KeylessOperation(
-                    event_id=event_id,
-                    operation=event.op,
-                    after=patch.encoded_values(),
-                    image_digest=patch.digest,
-                )
-            )
-        item.keyless_event_ids.add(event_id)
-        if not item.snapshot:
-            item.keyless_ledger.append((event_id, event.op, patch.digest))
+        # `cdcf_event_id` remains replay bookkeeping, never source-row identity.
+        keyless_work.collect(item, event, row, event_id, probe=probe, patch=patch)
         return
 
     current_values = tuple(
@@ -533,54 +465,6 @@ def collect(
         )
         return
     _place(item, key, patch.encoded_values(), patch=patch)
-
-
-def _before_patch(event: PendingRecord) -> RowPatch:
-    """Decode an UPDATE's old image with the same field-state rules as DELETE."""
-    return RowPatch.from_image(
-        event.before,
-        event.before_descriptors,
-        typed=event.typed_before,
-        complete=True,
-    )
-
-
-def _keyless_complete_image(
-    item: TableWork, patch: RowPatch, *, after: bool = False
-) -> dict[str, Any]:
-    """Return a bindable, complete source image for a keyless physical match."""
-    encoded = patch.encoded_values()
-    source_columns = tuple(
-        column for column in item.native_columns if column not in APPLIER_COLUMN_TYPES
-    )
-    if not source_columns:
-        _missing_toast_base(
-            item,
-            None,
-            reason=(
-                "keyless physical operation has no catalog-authoritative source "
-                "columns"
-            ),
-        )
-    result: dict[str, Any] = {}
-    for column in source_columns:
-        field = patch.field(column)
-        if field.state in {FieldState.UNCHANGED_TOAST, FieldState.ABSENT}:
-            _missing_toast_base(
-                item,
-                None,
-                reason=(
-                    "keyless UPDATE after-image" if after else "keyless DELETE "
-                    "before-image"
-                )
-                + f" has no complete value for column {column!r}",
-            )
-        if field.state not in {FieldState.VALUE, FieldState.EXPLICIT_NULL}:
-            _missing_toast_base(item, None, reason="keyless image has no safe base")
-        # `None` here is an explicit PostgreSQL NULL, not a missing value; the field
-        # state above is what preserves that distinction for the matcher.
-        result[column] = encoded.get(column)
-    return result
 
 
 def truncate(item: TableWork) -> None:
@@ -908,434 +792,5 @@ def _track(item: TableWork, key: tuple, entries: list) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# writing the plan
+# Destination materialization intentionally lives in table_writer.py.
 # --------------------------------------------------------------------------- #
-def write(
-    con,
-    registry,
-    item: TableWork,
-    created_in_txn: set[str],
-    *,
-    pipeline: str | None = None,
-    control_schema: str | None = None,
-) -> None:
-    """Apply one table's plan: `ensure` the shape, delete the touched keys, insert.
-
-    Runs on the caller's connection and never opens or closes a transaction: the
-    commit group owns that (principle 4).
-    """
-    if item.truncated and not item.live and not registry.get(item.target).exists:
-        # A truncate of a table this destination has never held. There is nothing to
-        # empty and nothing to insert, and CREATEing an empty table from a truncate
-        # would invent a shape out of an event that carries no columns at all.
-        item.rows_removed = 0
-        _finish_truncate_audit(item)
-        return
-    # Every source column must have a catalog descriptor. Only the applier's own
-    # control columns have fixed types here; source shape is never inferred from a
-    # Python value.
-    columns = {col: ctype or apply_sql.VARCHAR for col, ctype in item.columns.items()}
-    columns.update(APPLIER_COLUMN_TYPES)
-    for column in item.key_columns:
-        columns.setdefault(column, apply_sql.VARCHAR)
-
-    if item.native_columns:
-        typed_columns = {**columns, **item.native_columns}
-        try:
-            table, created = registry.ensure_typed(
-                item.target, columns=typed_columns, key_columns=item.key_columns
-            )
-        except AdmissionError as error:
-            refused = as_schema_refusal(
-                error,
-                refusal_origin="table_work",
-                source_schema=item.source_schema,
-                source_table=item.source_table,
-                target=item.target,
-            )
-            refused.source_schema = refused.source_schema or item.source_schema
-            refused.source_table = refused.source_table or item.source_table
-            refused.target = refused.target or item.target
-            raise
-    elif item.truncated and registry.get(item.target).exists:
-        # A pure TRUNCATE carries no row image from which a source descriptor could be
-        # obtained. Reuse the already-known destination shape for the table-level
-        # operation; this is not a schema-creation or value-inference path.
-        table, created = registry.get(item.target), False
-    else:
-        raise SchemaEvolutionRefused(
-            f"{item.target}: catalog-authoritative descriptors are incomplete; "
-            "the production typed path cannot create or write an untyped table",
-            source_schema=item.source_schema,
-            source_table=item.source_table,
-            target=item.target,
-            refusal_origin="table_work",
-        )
-    if created:
-        created_in_txn.add(item.target)
-    # A table this transaction created is empty, so the DELETE half of the merge
-    # cannot match anything: skipping it turns a snapshot into a pure bulk insert
-    # instead of N key probes against a growing table.
-    fresh = item.target in created_in_txn
-
-    column_order = [c for c in table.columns if c in columns] + [
-        c for c in columns if c not in table.columns
-    ]
-    column_order = list(dict.fromkeys(column_order))
-
-    if item.keyless:
-        _write_keyless_operations(
-            con,
-            table,
-            item,
-            column_order,
-            fresh=fresh,
-            pipeline=pipeline,
-            control_schema=control_schema,
-        )
-        _finish_truncate_audit(item)
-        try:
-            apply_sql.assert_identity_is_unique(con, table)
-        except DestinationIdentityCollision as collision:
-            collision.source_schema = item.source_schema
-            collision.source_table = item.source_table
-            collision.target = item.target
-            raise
-        return
-
-    delete_keys, rows, partial_updates, moves = _plan(item)
-
-    if item.truncated:
-        # Rubric 1.5, "replicated just like Postgres handles them": the destination
-        # table is emptied, and the rows this group collected *after* the truncate are
-        # inserted below. `DELETE FROM` rather than `TRUNCATE`: it is unambiguously
-        # transactional on both DuckDB and MotherDuck, and the whole point is that a
-        # rolled-back commit group leaves the rows in place.
-        item.rows_removed = 0 if fresh else _delete_all(con, table)
-    elif not item.snapshot and not fresh and delete_keys:
-        keys = [
-            tuple(
-                _key_value(table, col, value)
-                for col, value in zip(item.key_columns, _raw_key(item, key), strict=False)
-            )
-            for key in delete_keys
-        ]
-        apply_sql.delete_keys(con, table, item.key_columns, keys)
-    _finish_truncate_audit(item)
-
-    updates: list[tuple[tuple, dict[str, Any]]] = []
-    for key, patch in partial_updates:
-        source_key = tuple(
-            _key_value(table, column, value)
-            for column, value in zip(item.key_columns, _raw_key(item, key), strict=False)
-        )
-        updates.append((source_key, patch.bindable_values()))
-    for move in moves:
-        assignments = move.patch.bindable_values()
-        target_key = _raw_key(item, move.target_key)
-        source_key_values = _raw_key(item, move.source_key)
-        for column, value in zip(item.key_columns, target_key, strict=False):
-            assignments[column] = value
-        source_key = tuple(
-            _key_value(table, column, value)
-            for column, value in zip(item.key_columns, source_key_values, strict=False)
-        )
-        updates.append((source_key, assignments))
-    if updates:
-        affected = 0 if fresh else apply_sql.update_rows(
-            con, table, item.key_columns, updates
-        )
-        if fresh or affected != len(updates):
-            _missing_toast_base(
-                item,
-                None,
-                reason=(
-                    f"sparse update matched {affected} of {len(updates)} "
-                    "destination base row(s)"
-                ),
-            )
-
-    apply_sql.insert_rows(
-        con,
-        table,
-        column_order,
-        [
-            [
-                (
-                    _typed_value(table, col, row.get(col))
-                    if table.native_types and col in table.native_types
-                    else apply_sql.bind(row.get(col), table.columns.get(col, apply_sql.VARCHAR))
-                )
-                for col in column_order
-            ]
-            for row in rows
-        ],
-    )
-    # A no-op when the destination accepted the PRIMARY KEY on the identity columns
-    # (it then rejects a duplicate on the INSERT itself). Where it could not, this is
-    # what keeps "duplication is impossible" enforced by the destination rather than
-    # asserted by us (Opus M-2).
-    try:
-        apply_sql.assert_identity_is_unique(con, table)
-    except DestinationIdentityCollision as collision:
-        # Rubric 4.7: the same permanent-loop shape as `AmbiguousDelete`. The group must
-        # roll back, and then it replays into the same collision for ever unless somebody
-        # rebuilds the table. Naming the source relation is what lets the applier queue
-        # that rebuild automatically.
-        collision.source_schema = item.source_schema
-        collision.source_table = item.source_table
-        collision.target = item.target
-        raise
-
-
-def _write_keyless_operations(
-    con,
-    table,
-    item: TableWork,
-    column_order: list[str],
-    *,
-    fresh: bool,
-    pipeline: str | None,
-    control_schema: str | None,
-) -> None:
-    """Execute keyless physical operations in source order.
-
-    Consecutive INSERTs stay on the bulk materializer.  DELETE and UPDATE are the
-    boundaries where order matters: each full before-image removes one physical row,
-    then UPDATE inserts its full after-image with the new event identity.  The ledger
-    is written only after all data operations have succeeded, still inside the caller's
-    single transaction.
-    """
-    pending: list[dict[str, Any]] = []
-    table_fresh = fresh
-
-    def flush_inserts() -> None:
-        nonlocal table_fresh
-        if not pending:
-            return
-        apply_sql.insert_rows(
-            con,
-            table,
-            column_order,
-            [
-                [
-                    (
-                        _typed_value(table, column, row.get(column))
-                        if table.native_types and column in table.native_types
-                        else apply_sql.bind(
-                            row.get(column), table.columns.get(column, apply_sql.VARCHAR)
-                        )
-                    )
-                    for column in column_order
-            ]
-            for row in pending
-        ],
-        )
-        pending.clear()
-        # A streaming INSERT may be the first operation against a table created in
-        # this same group.  A later TRUNCATE must still remove that newly inserted
-        # row; after the first successful flush the table is no longer empty merely
-        # because it was created during this transaction.
-        table_fresh = False
-
-    for operation in item.keyless_operations:
-        if operation.operation in {"c", "r"}:
-            if operation.after is not None:
-                pending.append(operation.after)
-            continue
-        flush_inserts()
-        if operation.operation == "t":
-            item.rows_removed = 0 if table_fresh else _delete_all(con, table)
-            table_fresh = False
-            continue
-        if operation.operation not in {"d", "u"}:
-            raise SchemaEvolutionRefused(
-                f"{item.target}: unsupported keyless operation {operation.operation!r}",
-                source_schema=item.source_schema,
-                source_table=item.source_table,
-                target=item.target,
-                refusal_origin="table_work",
-            )
-        if operation.before is None:
-            _missing_toast_base(
-                item,
-                None,
-                reason=f"keyless {operation.operation} has no complete before-image",
-            )
-        affected = apply_sql.delete_matching_row(
-            con,
-            table,
-            tuple(operation.before),
-            operation.before,
-        )
-        if affected != 1:
-            _missing_toast_base(
-                item,
-                None,
-                reason=(
-                    f"keyless {operation.operation} before-image matched "
-                    f"{affected} destination row(s), expected exactly one"
-                ),
-            )
-        if operation.operation == "u":
-            if operation.after is None:
-                _missing_toast_base(
-                    item, None, reason="keyless UPDATE has no complete after-image"
-                )
-            pending.append(operation.after)
-            flush_inserts()
-
-    flush_inserts()
-    if item.keyless_ledger and not item.snapshot and pipeline:
-        from . import destination
-
-        destination_rows = [
-            (
-                item.target,
-                event_id,
-                operation,
-                digest,
-            )
-            for event_id, operation, digest in item.keyless_ledger
-        ]
-        destination.write_keyless_events(
-            con,
-            destination_rows,
-            pipeline=pipeline,
-            control_schema=control_schema,
-        )
-
-
-def _typed_value(table, column: str, value):
-    """Bind a source value to the current physical native declaration."""
-    from .typed_types import adapt_value
-
-    native = table.native_types.get(column)
-    source = table.source_descriptors.get(column)
-    if native is None or source is None:
-        return value
-    return adapt_value(value, native)
-
-
-def _key_value(table, column: str, value):
-    """Encode a key using the same source descriptor as the row path."""
-    from .typed_types import adapt_value
-
-    if table.internal_identity:
-        # Source keys are resolved to the deterministic cdcf_internal_id by
-        # apply_sql. Keeping the source value raw here lets that resolver try the
-        # descriptor that emitted the old UNION member as well as the current one.
-        return value
-
-    native = table.native_types.get(column)
-    source = table.source_descriptors.get(column)
-    if native is None or source is None:
-        return apply_sql.bind(value, table.columns.get(column, apply_sql.VARCHAR))
-    return adapt_value(value, native)
-
-
-def _plan(item: TableWork) -> tuple[
-    list[tuple],
-    list[dict],
-    list[tuple[tuple, RowPatch]],
-    list[RowMove],
-]:
-    """Read the physical fold into full inserts, sparse updates, and key moves.
-
-    A key whose only live entry is `START` is deliberately **absent from both**: the
-    row the destination holds is the row the source holds, nothing in the group
-    changed it, and deleting it would be the loss Opus BLOCKER-2 measured.
-    """
-    delete_keys: list[tuple] = []
-    rows: list[dict] = []
-    partial_updates: list[tuple[tuple, RowPatch]] = []
-    moves: list[RowMove] = []
-    for key, entries in item.live.items():
-        if len(entries) == 1 and entries[0] is START:
-            continue
-        if not entries:
-            delete_keys.append(key)
-            continue
-        if len(entries) == 1:
-            entry = entries[0]
-            if isinstance(entry, RowMove):
-                moves.append(entry)
-            elif isinstance(entry, RowPatch) and not entry.complete:
-                partial_updates.append((key, entry))
-            else:
-                delete_keys.append(key)
-                rows.append(entry.encoded_values() if isinstance(entry, RowPatch) else entry)
-        elif entries:
-            concrete = [entry for entry in entries if entry is not START]
-            if len(concrete) > 1:  # pragma: no cover - `end_transaction` catches it
-                raise AmbiguousDelete(
-                    f"{item.target}: identity {key!r} would be written twice by one "
-                    "commit group (ADR 0001 §18/A35)",
-                    source_schema=item.source_schema,
-                    source_table=item.source_table,
-                    target=item.target,
-                )
-            for entry in concrete:
-                if isinstance(entry, RowPatch) and not entry.complete:
-                    partial_updates.append((key, entry))
-                elif isinstance(entry, RowMove):
-                    moves.append(entry)
-                else:
-                    delete_keys.append(key)
-                    rows.append(
-                        entry.encoded_values() if isinstance(entry, RowPatch) else entry
-                    )
-    move_sources = {move.source_key for move in moves}
-    delete_keys = [key for key in delete_keys if key not in move_sources]
-    return delete_keys, rows, partial_updates, moves
-
-
-def _finish_truncate_audit(item: TableWork) -> None:
-    """Freeze what each truncate of this group removed (Codex 2).
-
-    Positional and immutable, because the markers are written after every table has
-    been applied: holding a reference to the mutable plan and reading one field made
-    two truncates in one transaction report the same number.
-    """
-    counts: list[int | None] = list(item.truncate_marks)
-    if counts:
-        counts[0] = None if item.rows_removed is None else counts[0] + item.rows_removed
-    item.truncate_rows_removed = tuple(counts)
-
-
-def _delete_all(con, table) -> int | None:
-    """Empty one destination table inside the caller's transaction.
-
-    Returns the number of rows removed when the destination reports it (DuckDB and
-    MotherDuck both return a `Count` for a DELETE), so the truncate marker in
-    `_cdc_flight.table_events` records what the destination actually lost. `None`
-    when it cannot be read — the marker then says "unknown" rather than "0".
-    """
-    result = con.execute(f"DELETE FROM {table.qualified}")
-    try:
-        row = result.fetchone()
-    except Exception:  # pragma: no cover - a destination that returns no result set
-        return None
-    if not row or row[0] is None:
-        return None
-    try:
-        return int(row[0])
-    except (TypeError, ValueError):  # pragma: no cover
-        return None
-
-
-def live_names(tables: set[str]) -> set[str]:
-    """Report the table an operator knows about, not the shadow it landed in."""
-    return {
-        t[: -len(naming.SHADOW_SUFFIX)] if t.endswith(naming.SHADOW_SUFFIX) else t
-        for t in tables
-    }
-
-
-def _as_int(value) -> int | None:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None

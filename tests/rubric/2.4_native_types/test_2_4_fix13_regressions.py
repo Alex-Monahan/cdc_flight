@@ -122,6 +122,10 @@ NON_ADMISSION_EXCEPTIONS: dict[str, str] = {
         "rolls back the whole group and retries healthy peers, preserving origin "
         "outside AdmissionError"
     ),
+    "DestinationDataRejection": (
+        "a narrow materializer value/row rejection carrying DML provenance; the "
+        "commit protocol unwraps it only after the whole group rolls back"
+    ),
     "NoDurableDestinationRow": (
         "a start-up safety refusal about the whole destination, before admission"
     ),
@@ -177,6 +181,7 @@ ADMISSION_BOUNDARY_MODULES = frozenset(
         "schema_shadow.py",
         "spill_protocol.py",
         "table_work.py",
+        "table_writer.py",
         "unit_admission.py",
     }
 )
@@ -205,7 +210,7 @@ ADMISSION_BOUNDARY_HANDLERS = frozenset(
         ("schema_shadow.py", "convert_column_to_union"),
         ("spill_protocol.py", "_enrich_descriptors"),
         ("table_work.py", "_key_token"),
-        ("table_work.py", "write"),
+        ("table_writer.py", "write"),
         ("unit_admission.py", "add_unit"),
     }
 )

@@ -81,6 +81,7 @@ from .snapshot_completion import (
 from .spill import SpillBuffer
 
 log = logging.getLogger("cdc_flight.applier")
+OWNER = "applier-lifecycle"
 
 
 class Applier:

@@ -6,7 +6,7 @@ from BEGIN through the guarded COMMIT/ack boundary and post-commit bookkeeping.
 
 from __future__ import annotations
 
-from . import commit_metadata, destination, offsets, self_heal, table_work
+from . import commit_metadata, destination, offsets, self_heal, table_writer
 from .commit_group import CommitResult, OpenGroup
 from .errors import (
     AdmissionError,
@@ -107,7 +107,7 @@ def commit_group(self, trigger: str) -> CommitResult:
             first_lsn=stats["first_lsn"],
             last_lsn=stats["last_lsn"],
             max_source_ts=commit_metadata.epoch_ms(stats["max_source_ts"]),
-            tables_touched=sorted(table_work.live_names(stats["tables"])),
+            tables_touched=sorted(table_writer.live_names(stats["tables"])),
             control_schema=self.control_schema,
         )
         destination.write_resume_point(

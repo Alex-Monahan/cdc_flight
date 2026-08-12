@@ -24,13 +24,21 @@ there is no attempt to commit a torn in-place table.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 
-from . import apply_sql, catalog_support, destination, naming, table_work
+from . import (
+    apply_sql,
+    catalog_support,
+    destination,
+    destination_failure,
+    failure_containment,
+    naming,
+    table_work,
+    table_writer,
+)
 from .assembler import UNIT_CONTROL, UNIT_SNAPSHOT_CHUNK, CompleteUnit
 from .config import TRUNCATE_IGNORE, TRUNCATE_REPLICATE
+from .destination_failure import DestinationDataRejection
 from .envelope import KIND_TRUNCATE, PendingRecord
 from .errors import (
     AdmissionError,
@@ -47,75 +55,7 @@ from .table_work import TableWork
 from .typed_types import native_type
 
 log = logging.getLogger("cdc_flight.planner")
-
-
-def input_fingerprint(event: PendingRecord) -> str:
-    """Identify the durable refusal boundary, independent of row contents.
-
-    PostgreSQL operation, transaction, order, LSN, key, and row image are intentionally
-    not included.  A source repair that changes only the bad value must not reset the
-    quarantine identity or create a new retry forever.  The descriptor fingerprints
-    remain: a later source schema epoch is a new deliverability decision.
-    """
-
-    descriptors = {
-        name: descriptor
-        for attribute in ("key_descriptors", "before_descriptors", "after_descriptors")
-        for name, descriptor in getattr(event, attribute, {}).items()
-    }
-    payload = {
-        "table": event.qualified_table,
-        "descriptors": {
-            str(name): getattr(descriptor, "fingerprint", repr(descriptor))
-            for name, descriptor in sorted(descriptors.items())
-        },
-    }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=repr)
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def _is_destination_execution_error(error: Exception) -> bool:
-    """Recognize the destination driver's execution errors, and only those.
-
-    Only errors that describe a rejected destination value/constraint are table data
-    failures. Binder, catalog, parser, connection, internal, and resource errors are
-    programming/engine failures and must remain loud. The distinction prevents a
-    malformed statement in our own code from becoming a data quarantine.
-    """
-    try:
-        import duckdb
-
-        classes = tuple(
-            getattr(duckdb, name)
-            for name in (
-                "ConversionException",
-                "ConstraintException",
-                "OutOfRangeException",
-                "TransactionException",
-            )
-            if hasattr(duckdb, name)
-        )
-        return bool(classes) and isinstance(error, classes)
-    except ImportError:  # pragma: no cover - DuckDB is a production dependency
-        return type(error).__name__ in {
-            "ConversionException",
-            "ConstraintException",
-            "OutOfRangeException",
-            "TransactionException",
-        }
-
-
-def _is_uncontainable_destination_error(error: Exception) -> bool:
-    """Keep destination programming/engine failures outside table quarantine."""
-    try:
-        import duckdb
-
-        return isinstance(error, duckdb.Error) and not _is_destination_execution_error(error)
-    except ImportError:  # pragma: no cover - DuckDB is a production dependency
-        return (
-            type(error).__module__.split(".", 1)[0] == "duckdb"
-            and not _is_destination_execution_error(error)
-        )
+OWNER = "commit-group-planning"
 
 
 class GroupPlan:
@@ -294,7 +234,7 @@ class GroupPlan:
                 except (AmbiguousDelete, DestinationIdentityCollision, ToastBaseMissing):
                     raise
                 except Exception as exc:
-                    self._contain_item_failure(item, exc)
+                    failure_containment.contain_item_failure(self, item, exc)
             if unit.txn_id:
                 self.stats["first_txn_id"] = self.stats["first_txn_id"] or unit.txn_id
                 self.stats["last_txn_id"] = unit.txn_id
@@ -363,11 +303,11 @@ class GroupPlan:
                     source_table=event.table,
                     target=target,
                     detected_lsn=event.lsn,
-                    input_fingerprint=self._event_fingerprint(event),
+                    input_fingerprint=failure_containment.event_fingerprint(event),
                     refusal_origin="typed_planner",
                 )
-                self._mark_contained(
-                    event.qualified_table, target, refused, refused
+                failure_containment.mark_contained(
+                    self, event.qualified_table, target, refused, refused
                 )
             self._count_event(event)
             self.stats["quarantined_events"] += 1
@@ -461,7 +401,7 @@ class GroupPlan:
                 source_table=event.table,
                 target=target,
                 detected_lsn=event.lsn,
-                input_fingerprint=input_fingerprint(event),
+                    input_fingerprint=failure_containment.input_fingerprint(event),
                 refusal_origin="typed_planner",
             ) from exc
         table_work.collect(item, event, row, event_id, probe=self, patch=patch)
@@ -499,7 +439,7 @@ class GroupPlan:
         """
         if event.schema and event.table:
             self._failure_fingerprints.setdefault(
-                event.qualified_table, self._event_fingerprint(event)
+                event.qualified_table, failure_containment.event_fingerprint(event)
             )
         try:
             self._collect(
@@ -522,157 +462,7 @@ class GroupPlan:
                 if snapshot is not None
                 else self.snapshots.target_table(event.schema, event.table)
             )
-            self._contain_event_failure(event, resolved_target, exc)
-
-    def _contain_event_failure(
-        self, event: PendingRecord, target: str, error: Exception
-    ) -> None:
-        if event.qualified_table in self._contained_tables:
-            return
-        self._failure_fingerprints.setdefault(
-            event.qualified_table, self._event_fingerprint(event)
-        )
-        refused = self._as_contained_refusal(
-            error,
-            source_schema=event.schema,
-            source_table=event.table,
-            target=target,
-            detected_lsn=event.lsn,
-            input_fingerprint=self._failure_fingerprints[event.qualified_table],
-        )
-        self._mark_contained(event.qualified_table, target, refused, error)
-
-    def _contain_item_failure(self, item: TableWork, error: Exception) -> None:
-        qualified = (
-            f"{item.source_schema}.{item.source_table}"
-            if item.source_schema and item.source_table
-            else item.target
-        )
-        if qualified in self._contained_tables:
-            return
-        fingerprint = self._failure_fingerprints.get(qualified)
-        if fingerprint is None:
-            payload = {
-                "table": qualified,
-                "target": item.target,
-                "columns": sorted(item.columns),
-            }
-            encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-            fingerprint = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-            self._failure_fingerprints[qualified] = fingerprint
-        refused = self._as_contained_refusal(
-            error,
-            source_schema=item.source_schema,
-            source_table=item.source_table,
-            target=item.target,
-            detected_lsn=self.stats.get("last_lsn"),
-            input_fingerprint=fingerprint,
-        )
-        self._mark_contained(qualified, item.target, refused, error)
-
-    def _item_fingerprint(self, item: TableWork) -> str:
-        payload = {
-            "table": (
-                f"{item.source_schema}.{item.source_table}"
-                if item.source_schema and item.source_table
-                else item.target
-            ),
-            "target": item.target,
-            "columns": sorted(item.columns),
-        }
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-    @staticmethod
-    def _as_contained_refusal(
-        error: Exception,
-        *,
-        source_schema: str | None,
-        source_table: str | None,
-        target: str | None,
-        detected_lsn: int | None,
-        input_fingerprint: str,
-    ) -> SchemaEvolutionRefused:
-        if isinstance(error, SchemaEvolutionRefused):
-            refused = error
-            refused.source_schema = refused.source_schema or source_schema
-            refused.source_table = refused.source_table or source_table
-            refused.target = refused.target or target
-            refused.detected_lsn = (
-                refused.detected_lsn if refused.detected_lsn is not None else detected_lsn
-            )
-            refused.input_fingerprint = refused.input_fingerprint or input_fingerprint
-            refused.refusal_origin = refused.refusal_origin or "typed_planner"
-            return refused
-        try:
-            detail = str(error)
-        except Exception:
-            detail = "<exception text unavailable>"
-        exception_type = f"{type(error).__module__}.{type(error).__qualname__}"
-        return SchemaEvolutionRefused(
-            f"unrecognised table-scoped materialization failure for "
-            f"{source_schema}.{source_table} ({exception_type}): {detail}",
-            source_schema=source_schema,
-            source_table=source_table,
-            target=target,
-            detected_lsn=detected_lsn,
-            input_fingerprint=input_fingerprint,
-            refusal_origin="typed_planner",
-        )
-
-    def _mark_contained(
-        self,
-        qualified: str,
-        target: str,
-        refused: SchemaEvolutionRefused,
-        original: Exception,
-    ) -> None:
-        """Remove one failed table plan and invoke the durable owner exactly once."""
-        self._contained_tables.add(qualified)
-        self.blocked_tables.add(qualified)
-        self.stats["contained_events"] += 1
-        self.stats["contained_tables"].add(qualified)
-        self.stats["quarantined_events"] += 1
-        self.work.pop(target, None)
-        if target in self.created_in_txn:
-            try:
-                self.con.execute(
-                    f"DROP TABLE IF EXISTS {naming.quote(self.registry.dataset)}."
-                    f"{naming.quote(target)}"
-                )
-            except Exception as cleanup_error:
-                # A destination statement can abort DuckDB/MotherDuck's enclosing
-                # transaction before the Python exception reaches this boundary. Do
-                # not replace the attributable materializer failure with a secondary
-                # "current transaction is aborted" error; the commit protocol will
-                # roll the group back and preserve the original cause.
-                raise original from cleanup_error
-            self.registry.forget(target)
-            self.created_in_txn.discard(target)
-        self.source_tables.discard(qualified)
-        self.stats["tables"].discard(target)
-        self.column_presence = [
-            row for row in self.column_presence if row[0] != target
-        ]
-        self.created_tables.pop(target, None)
-        self._failed_snapshot_targets.add(target)
-        self._swaps = [
-            state
-            for state in self._swaps
-            if state.target != target and state.shadow != target
-        ]
-        if self._contain_table_failure is None:
-            # A GroupPlan constructed by an embedder without the production owner is
-            # not allowed to turn a failure into a silent drop.
-            raise original
-        self._contain_table_failure(refused, original)
-
-    def _event_fingerprint(self, event: PendingRecord) -> str:
-        try:
-            return input_fingerprint(event)
-        except Exception:
-            payload = f"{event.qualified_table}:{event.lsn}:{event.txn_id}"
-            return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+            failure_containment.contain_event_failure(self, event, resolved_target, exc)
 
     def _enrich_descriptors(self, event: PendingRecord) -> None:
         """Merge one memoized catalog descriptor map into a row envelope."""
@@ -1031,11 +821,11 @@ class GroupPlan:
 
         `after_first_table` is the `mid_apply` fault anchor: "some tables written,
         others not", which is the one interleaving rubric 1.3 is about, so it has to
-        fire *between* two `table_work.write()` calls (Codex 6).
+        fire *between* two `table_writer.write()` calls (Codex 6).
         """
         for index, item in enumerate(list(self.work.values())):
             try:
-                table_work.write(
+                    table_writer.write(
                     self.con,
                     self.registry,
                     item,
@@ -1053,40 +843,41 @@ class GroupPlan:
                     # attempting table quarantine would replace the injected cause
                     # with a secondary "connection closed" error.
                     raise
-                if _is_uncontainable_destination_error(exc):
-                    # A malformed SQL statement, broken connection, or engine/resource
-                    # failure is ours/the engine's problem, not source data. Quarantine
-                    # would hide it behind a misleading table refusal.
-                    raise
-                if _is_destination_execution_error(exc):
-                    refused = self._as_contained_refusal(
-                        exc,
+                if isinstance(exc, DestinationDataRejection):
+                    refused = failure_containment.as_contained_refusal(
+                        exc.original,
                         source_schema=item.source_schema,
                         source_table=item.source_table,
                         target=item.target,
                         detected_lsn=self.stats.get("last_lsn"),
-                        input_fingerprint=self._failure_fingerprints.get(
+                        fingerprint=self._failure_fingerprints.get(
                             f"{item.source_schema}.{item.source_table}"
                         )
-                        or self._item_fingerprint(item),
+                        or failure_containment.item_fingerprint(item),
                     )
-                    raise DestinationExecutionFailure(refused, exc) from exc
-                # `table_work.write` may already have issued a DELETE before a
+                    raise DestinationExecutionFailure(refused, exc.original) from exc
+                if destination_failure.is_driver_error(exc):
+                    # A raw driver error did not cross the materializer's DML
+                    # provenance boundary.  It can therefore be transaction
+                    # control, connection/session, parser/catalog, or engine
+                    # state, and must fail the run without a fabricated table.
+                    raise
+                # `table_writer.write` may already have issued a DELETE before a
                 # Python/materializer failure reaches this boundary.  DuckDB has no
                 # savepoint support in the pinned runtime, so containing in-place
                 # would commit a torn table image.  Roll back the complete source
                 # transaction and let the commit owner replay healthy peers with
                 # this relation excluded.
-                refused = self._as_contained_refusal(
+                refused = failure_containment.as_contained_refusal(
                     exc,
                     source_schema=item.source_schema,
                     source_table=item.source_table,
                     target=item.target,
                     detected_lsn=self.stats.get("last_lsn"),
-                    input_fingerprint=self._failure_fingerprints.get(
+                    fingerprint=self._failure_fingerprints.get(
                         f"{item.source_schema}.{item.source_table}"
                     )
-                    or self._item_fingerprint(item),
+                    or failure_containment.item_fingerprint(item),
                 )
                 raise TableWriteFailure(refused, exc) from exc
             if (

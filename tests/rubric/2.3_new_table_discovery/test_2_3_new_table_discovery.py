@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import subprocess
 from pathlib import Path
 
 import duckdb
@@ -91,23 +93,69 @@ def test_catalog_poll_default_is_short_and_configurable():
     assert 0 < CatalogConfig().poll_seconds <= 60
 
 
-def test_discovery_ownership_modules_stay_below_the_maintainability_boundary():
-    """Keep ownership guards; catalog cohesion is asserted separately.
+def _is_ownership_source(source: str) -> bool:
+    """Discover an owner from its module contract or legacy plan/work shape."""
+    tree = ast.parse(source)
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "OWNER"
+            for target in node.targets
+        ):
+            return True
+        if isinstance(node, ast.AnnAssign) and (
+            isinstance(node.target, ast.Name) and node.target.id == "OWNER"
+        ):
+            return True
+        if isinstance(node, ast.ClassDef) and node.name.endswith(("Plan", "Work")):
+            # This recognizes the pre-marker owner shapes in the history. New
+            # owners use OWNER, so adding a module cannot silently evade the scan.
+            return True
+    return False
 
-    ``catalog.py`` was already at 996 lines before this round and now owns the
-    durable descriptor-refusal recovery boundary.  Keeping it in a numeric guard
-    would reward arbitrary extraction.  The public-owner/cohesion guard lives in
-    ``tests/unit/test_structure_guards.py`` instead.
-    """
+
+def _ownership_modules(package: Path) -> tuple[Path, ...]:
+    """Enumerate every maintainability owner from the source tree itself."""
+    return tuple(
+        path
+        for path in sorted(package.glob("*.py"))
+        if _is_ownership_source(path.read_text(encoding="utf-8"))
+    )
+
+
+def test_discovery_ownership_modules_stay_below_the_maintainability_boundary():
+    """Measure the ownership surface declared by production source code."""
     root = Path(__file__).resolve().parents[3]
-    for relative in (
-        "src/cdc_flight/pipeline.py",
-        "src/cdc_flight/applier.py",
-        "src/cdc_flight/resnapshot.py",
-        "src/cdc_flight/resnapshot_projection.py",
-        "src/cdc_flight/state_interactions.py",
-    ):
-        assert len((root / relative).read_text().splitlines()) < 1000, relative
+    modules = _ownership_modules(root / "src" / "cdc_flight")
+    assert modules
+    for path in modules:
+        assert len(path.read_text(encoding="utf-8").splitlines()) < 1000, path.name
+
+
+def test_r16_reproduction_measures_the_grown_table_owners():
+    """The AST surface includes the newly decomposed fold and plan owners."""
+    root = Path(__file__).resolve().parents[3]
+    names = {path.name for path in _ownership_modules(root / "src" / "cdc_flight")}
+    assert {"planner.py", "table_work.py", "table_writer.py", "keyless_work.py"} <= names
+
+
+def test_ownership_guard_would_reject_d291b62_shapes():
+    """The fixed guard identifies both oversized r15 owners in the old tree."""
+    root = Path(__file__).resolve().parents[3]
+    old_sources = {
+        name: subprocess.check_output(
+            ["git", "show", f"d291b62:src/cdc_flight/{name}"],
+            cwd=root,
+            text=True,
+        )
+        for name in ("planner.py", "table_work.py")
+    }
+    old_owners = {
+        name for name, source in old_sources.items() if _is_ownership_source(source)
+    }
+    assert {"planner.py", "table_work.py"} <= old_owners
+    assert {
+        name for name, source in old_sources.items() if len(source.splitlines()) >= 1000
+    } == {"planner.py", "table_work.py"}
 
 
 def test_liveness_is_per_schema_and_error_states_never_mean_mass_drop():

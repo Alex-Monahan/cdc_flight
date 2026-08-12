@@ -324,7 +324,7 @@ def test_production_typed_path_fails_closed_when_catalog_descriptors_are_unavail
 
 
 def test_tablework_numeric_adapter_is_idempotent_for_all_bounded_specials():
-    from cdc_flight.table_work import _typed_value
+    from cdc_flight.table_writer import _typed_value
     from cdc_flight.typed_types import UnionValue
 
     con = duckdb.connect()

@@ -17,6 +17,7 @@ from .config import resolve_control_schema
 from .errors import EngineFailure
 from .naming import control_table
 
+OWNER = "resnapshot-projection"
 
 @dataclass(frozen=True)
 class ProjectionEvent:

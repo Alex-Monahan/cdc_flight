@@ -8,11 +8,166 @@ healthy relations are replayed with only the failed relation excluded.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 
-from . import destination, spill_refusal
+from . import destination, naming, spill_refusal
 
 log = logging.getLogger("cdc_flight.failure_containment")
+OWNER = "failure-containment"
+
+
+def input_fingerprint(event) -> str:
+    """Identify a durable refusal boundary without including the bad value."""
+    descriptors = {
+        name: descriptor
+        for attribute in ("key_descriptors", "before_descriptors", "after_descriptors")
+        for name, descriptor in getattr(event, attribute, {}).items()
+    }
+    payload = {
+        "table": event.qualified_table,
+        "descriptors": {
+            str(name): getattr(descriptor, "fingerprint", repr(descriptor))
+            for name, descriptor in sorted(descriptors.items())
+        },
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=repr)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def event_fingerprint(event) -> str:
+    try:
+        return input_fingerprint(event)
+    except Exception:
+        payload = f"{event.qualified_table}:{event.lsn}:{event.txn_id}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def item_fingerprint(item) -> str:
+    payload = {
+        "table": (
+            f"{item.source_schema}.{item.source_table}"
+            if item.source_schema and item.source_table
+            else item.target
+        ),
+        "target": item.target,
+        "columns": sorted(item.columns),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def as_contained_refusal(
+    error: Exception,
+    *,
+    source_schema: str | None,
+    source_table: str | None,
+    target: str | None,
+    detected_lsn: int | None,
+    fingerprint: str,
+):
+    """Attach one honest relation scope to a table-scoped materializer error."""
+    from .errors import SchemaEvolutionRefused
+
+    if isinstance(error, SchemaEvolutionRefused):
+        error.source_schema = error.source_schema or source_schema
+        error.source_table = error.source_table or source_table
+        error.target = error.target or target
+        error.detected_lsn = (
+            error.detected_lsn if error.detected_lsn is not None else detected_lsn
+        )
+        error.input_fingerprint = error.input_fingerprint or fingerprint
+        error.refusal_origin = error.refusal_origin or "typed_planner"
+        return error
+    try:
+        detail = str(error)
+    except Exception:
+        detail = "<exception text unavailable>"
+    exception_type = f"{type(error).__module__}.{type(error).__qualname__}"
+    return SchemaEvolutionRefused(
+        f"unrecognised table-scoped materialization failure for "
+        f"{source_schema}.{source_table} ({exception_type}): {detail}",
+        source_schema=source_schema,
+        source_table=source_table,
+        target=target,
+        detected_lsn=detected_lsn,
+        input_fingerprint=fingerprint,
+        refusal_origin="typed_planner",
+    )
+
+
+def contain_event_failure(plan, event, target: str, error: Exception) -> None:
+    qualified = event.qualified_table
+    if qualified in plan._contained_tables:
+        return
+    fingerprint = plan._failure_fingerprints.setdefault(
+        qualified, event_fingerprint(event)
+    )
+    refused = as_contained_refusal(
+        error,
+        source_schema=event.schema,
+        source_table=event.table,
+        target=target,
+        detected_lsn=event.lsn,
+        fingerprint=fingerprint,
+    )
+    mark_contained(plan, qualified, target, refused, error)
+
+
+def contain_item_failure(plan, item, error: Exception) -> None:
+    qualified = (
+        f"{item.source_schema}.{item.source_table}"
+        if item.source_schema and item.source_table
+        else item.target
+    )
+    if qualified in plan._contained_tables:
+        return
+    fingerprint = plan._failure_fingerprints.setdefault(
+        qualified, item_fingerprint(item)
+    )
+    refused = as_contained_refusal(
+        error,
+        source_schema=item.source_schema,
+        source_table=item.source_table,
+        target=item.target,
+        detected_lsn=plan.stats.get("last_lsn"),
+        fingerprint=fingerprint,
+    )
+    mark_contained(plan, qualified, item.target, refused, error)
+
+
+def mark_contained(plan, qualified: str, target: str, refused, original: Exception) -> None:
+    """Remove one failed plan and call the independent durable owner once."""
+    plan._contained_tables.add(qualified)
+    plan.blocked_tables.add(qualified)
+    plan.stats["contained_events"] += 1
+    plan.stats["contained_tables"].add(qualified)
+    plan.stats["quarantined_events"] += 1
+    plan.work.pop(target, None)
+    if target in plan.created_in_txn:
+        try:
+            plan.con.execute(
+                f"DROP TABLE IF EXISTS {naming.quote(plan.registry.dataset)}."
+                f"{naming.quote(target)}"
+            )
+        except Exception as cleanup_error:
+            raise original from cleanup_error
+        plan.registry.forget(target)
+        plan.created_in_txn.discard(target)
+    plan.source_tables.discard(qualified)
+    plan.stats["tables"].discard(target)
+    plan.column_presence = [row for row in plan.column_presence if row[0] != target]
+    plan.created_tables.pop(target, None)
+    plan._failed_snapshot_targets.add(target)
+    plan._swaps = [
+        state
+        for state in plan._swaps
+        if state.target != target and state.shadow != target
+    ]
+    if plan._contain_table_failure is None:
+        raise original
+    plan._contain_table_failure(refused, original)
 
 
 def contain_table_failure(applier, refused, original) -> None:

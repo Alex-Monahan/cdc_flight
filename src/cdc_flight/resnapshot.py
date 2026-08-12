@@ -144,6 +144,7 @@ from .snapshot_completion import SnapshotCompletion
 from .source_health import SourceHealth
 
 log = logging.getLogger("cdc_flight.resnapshot")
+OWNER = "resnapshot-protocol"
 
 #: Suffix for the throwaway slot. Kept short: Postgres slot names are limited to 63
 #: characters and the base name is already operator-chosen.

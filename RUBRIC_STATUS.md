@@ -4188,13 +4188,15 @@ policy further, but this branch makes the narrow correctness/performance fix.
 
 ### Destination-raised containment
 
-Destination execution failures are classified narrowly (`ConversionException`,
-`ConstraintException`, `OutOfRangeException`, and `TransactionException`). A
-programming, binder/catalog, connection, or engine error is not silently
-converted into a table problem. For a contained destination error, the whole
-commit group rolls back, an independent sink records a durable refusal and
-attributable alert, and the healthy peer is replayed in a new group. The pipeline
-then remains NOT-OK while the slot advances only after the healthy durable work.
+Destination execution failures are classified by provenance and a closed data
+rejection taxonomy (`ConversionException`, `ConstraintException`, and
+`OutOfRangeException`) rather than by a broad DuckDB superclass. A transaction-
+control, binder/catalog, connection, session, or engine error remains a raw
+run-level failure and is never assigned to a source relation. For a contained
+destination error, the whole commit group rolls back, an independent sink records
+a durable refusal and attributable alert, and the healthy peer is replayed in a
+new group. The pipeline then remains NOT-OK while the slot advances only after
+the healthy durable work.
 
 The real PostgreSQL proof injected a DuckDB `ConversionException` into four
 successive bad tables, one bad table per run, alongside one healthy peer. Every
@@ -4297,3 +4299,128 @@ Remaining explicit limits are the deferred money data-fidelity item, stock
 Debezium's marker-preserving TOAST 5/5 upgrade, and relation attribution for a
 connector exception thrown before Python has a table identity. The last one is
 fail-loud and alerted by offset; it is not silently treated as a table quarantine.
+
+## FIX ROUND 16 closure — destination provenance and ownership decomposition (2026-08-12)
+
+FIX ROUND 16 began from `d291b62eeb801b19b5e0b14890fbf7fea005d4dd` and addressed
+both remaining R15 majors. The branch now has zero blockers and zero majors in
+the reviewed scope.
+
+### NEW-R15-1: destination-failure principle and proof
+
+The boundary is derived from provenance, not from a third-party exception class:
+
+1. Only an exception observed through the table materializer's
+   `MaterializationConnection` is eligible for table containment.
+2. The observed statement must not be transaction-control, session, connection,
+   or engine setup/control SQL.
+3. The driver's class must be one of the closed value/row/column rejection
+   taxonomy: `ConversionException`, `ConstraintException`, or
+   `OutOfRangeException`.
+
+Everything else remains a run-level failure. In particular,
+`TransactionException` is not in the taxonomy. A `SELECT CAST(...)` value
+rejection used by the existing materializer proof is still table-scoped because
+it has materializer provenance and is a value rejection; `BEGIN TRANSACTION`
+inside the already-open destination transaction is control SQL and stays raw.
+`test_destination_classifier_is_a_closed_data_boundary` asserts the exact tuple,
+so adding a broad class later fails the test instead of silently widening the
+boundary.
+
+The two real PostgreSQL directions were run on the project-local PostgreSQL 18
+cluster at port **15434**, with slow workers **2**:
+
+* The genuine `ConversionException` proof passed four successive runs. Each run
+  was NOT-OK, durably refused and alerted exactly the bad relation, replayed the
+  healthy peer, advanced both `restart_lsn` and `confirmed_flush_lsn`, and kept
+  retained WAL bounded. The observed tuples were
+  `(restart_lsn, confirmed_flush_lsn, retained_wal_bytes, restart_integer,
+  confirmed_integer)`:
+
+  ```text
+  ('18/EE6E6C58','18/EE6E7530',2816,107079429208,107079431472)
+  ('18/EE6E76A8','18/EE6E7F10',61232,107079431848,107079434000)
+  ('18/EE6F6528','18/EE6F6D60',2656,107079492904,107079495008)
+  ('18/EE6F6ED8','18/EE6F7710',2600,107079495384,107079497488)
+  ```
+
+* The real control probe executed `BEGIN TRANSACTION` from the materializer
+  while the destination transaction was already open. The run failed with raw
+  `TransactionException`, created no refusal and no `table_exception_contained`
+  alert, and fabricated no `source_relation`. Before/after slot evidence was:
+
+  ```text
+  before=('18/EEC19050','18/EEC19050',592,107084877904,107084877904)
+  after =('18/EEC19050','18/EEC19050',2168,107084877904,107084877904)
+  source_lsn=107084878496
+  ```
+
+  The confirmed LSN correctly did not advance past the failed source transaction;
+  retained WAL remained observable and non-negative. The in-process reproduction
+  also passed: no refusal, no containment alert, and no peer replay was allowed to
+  turn the control failure into a table problem.
+
+### NEW-R15-2: real decomposition and AST guard
+
+The keyless physical fold is now owned by `keyless_work.py` (152 lines), the
+destination materialization/writer by `table_writer.py` (385 lines), and failure
+fingerprinting, durable table removal, and independent refusal delegation by
+`failure_containment.py` (325 lines). `destination_failure.py` (131 lines) owns
+the provenance facade and closed rejection taxonomy. The remaining owners are
+`planner.py` (968 lines) and `table_work.py` (796 lines); the old destination
+writer and keyless implementation were removed from those files, not hidden in
+an unmeasured compatibility file. The compatibility import surfaces used by unit
+tests now point at the canonical writer owner.
+
+The maintainability guard enumerates `src/cdc_flight/*.py` with AST inspection:
+explicit production `OWNER` declarations are discovered from the source, with a
+legacy AST `*Plan`/`*Work` recognition retained so the historical shapes are
+auditable. It no longer has a curated module list. The threshold remains the
+existing strict `<1000` lines; it was not raised or relaxed. The regression
+`test_ownership_guard_would_reject_d291b62_shapes` reads the actual
+`d291b62` sources and proves that it discovers `planner.py` (1177) and
+`table_work.py` (1341), so that state would fail. The current guard and the
+post-decomposition owner test pass.
+
+### R14 minor and nit dispositions
+
+These were carried into R16 as already-closed findings; no unrelated redesign was
+needed. They were re-exercised by the full lanes, and the relevant disposition is:
+
+| finding | R16 disposition |
+|---|---|
+| R14-4 torn table image | Kept the rollback/replay path intact; the focused rollback test and both slow runs passed. |
+| R14-5 temporal infinity over 2,000 keys | Deliberately unchanged; the large-key regression and all lanes passed. |
+| R14-6 third whole-row infinity scan | Deliberately unchanged; the per-cell path remains canonical and all lanes passed. |
+| R14-7 widened admission handler | Updated the structural inventories for the extracted writer; the package-wide closure tests passed. |
+| R14-8 unknown connector offsets | Deliberately unchanged; the alert/fingerprint proofs and all lanes passed. |
+| R14-9 XML-array source connection scope | Deliberately unchanged; the real XML tests and both slow runs passed. |
+| R14-10 recovery DSN credentials | Deliberately unchanged; the configuration/recovery tests and all lanes passed. |
+| R14-11 permanent alert marker | Deliberately unchanged; the recurrence/deduplication tests and all lanes passed. |
+| R14-12 protected connector properties | Deliberately unchanged; the override-pin tests and all lanes passed. |
+| R14-13 refusal attribution | Preserved first-reason attribution while moving the containment owner; closure and real-failure tests passed. |
+| R14-14 explicit quarantine acknowledgement | Deliberately unchanged; acknowledgement remains loud and non-unblocking, and all lanes passed. |
+| deferred `money[]` fidelity | Deliberately not done under the binding user directive; no money-fidelity work was added. |
+
+### R16 collection, lanes, and scores
+
+Real collection was remeasured after the final test changes: **1723 default**,
+**171 slow**, and **46 MotherDuck** candidates. The 10/1/1 structure-guard
+items are excluded, so `_BASELINE_SELECTED` is `{1713, 170, 45}` for default,
+slow, and MotherDuck respectively.
+
+| command | observed result | workers |
+|---|---|---:|
+| `CDC_TEST_PGPORT=15434 make test` | **1723 passed** in 339.69s | 12 |
+| `CDC_TEST_PGPORT=15434 make test-slow` (run 1) | **171 passed** in 2281.47s | 2 |
+| `CDC_TEST_PGPORT=15434 make test-slow` (run 2) | **171 passed** in 2542.51s | 2 |
+| `CDC_TEST_PGPORT=15434 make test-md` | **46 passed** in 1107.74s | 8 |
+| `CDC_TEST_PGPORT=15434 make lint` | **All checks passed** | n/a |
+
+Current honest scores remain **1.2 = 5/5**, **2.4 = 4/5**, **2.5 = 5/5**,
+**2.6 = 4/5**, **4.0 = 5/5**, and **4.7 = 1/5**. R16 restores 4.0 to 5/5
+because both table-scoped and engine/control directions are now proven at the
+correct boundary. 2.4 remains 4/5 for the stock-Debezium omitted `xml[]` value
+after the source row disappears, not for money. 2.6 remains 4/5 because the
+marker-preserving TOAST channel is still deferred. Money validation remains
+deferred. No keyless-delete behavior was changed or reopened.

@@ -28,6 +28,7 @@ REFUSAL_ORIGIN_BY_MODULE = {
     "schema_shadow": "schema_shadow",
     "spill_protocol": "spill_protocol",
     "table_work": "table_work",
+    "table_writer": "table_writer",
 }
 REFUSAL_ORIGINS = frozenset(REFUSAL_ORIGIN_BY_MODULE.values())
 CANONICAL_REFUSAL_CLASS = "SchemaEvolutionRefused"
@@ -191,7 +192,7 @@ class DestinationIdentityCollision(RuntimeError):
         target: str | None = None,
     ):
         super().__init__(message)
-        #: rubric 4.7: set by `table_work.write` so the applier can queue the rebuild
+        #: rubric 4.7: set by `table_writer.write` so the applier can queue the rebuild
         #: that turns this from a permanent failure into a self-healing one.
         self.source_schema = source_schema
         self.source_table = source_table
