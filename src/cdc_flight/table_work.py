@@ -910,7 +910,7 @@ def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
         [
             [
                 (
-                    _typed_value(table, col, row.get(col))
+                    row.get(col)
                     if table.native_types and col in table.native_types
                     else apply_sql.bind(row.get(col), table.columns.get(col, apply_sql.VARCHAR))
                 )
@@ -918,6 +918,7 @@ def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
             ]
             for row in rows
         ],
+        values_are_encoded=True,
     )
     # A no-op when the destination accepted the PRIMARY KEY on the identity columns
     # (it then rejects a duplicate on the INSERT itself). Where it could not, this is
@@ -934,17 +935,6 @@ def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
         collision.source_table = item.source_table
         collision.target = item.target
         raise
-
-
-def _typed_value(table, column: str, value):
-    """Bind a source value to the current physical native declaration."""
-    from .typed_types import adapt_value
-
-    native = table.native_types.get(column)
-    source = table.source_descriptors.get(column)
-    if native is None or source is None:
-        return value
-    return adapt_value(value, native)
 
 
 def _key_value(table, column: str, value):

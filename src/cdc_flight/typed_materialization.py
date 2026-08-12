@@ -11,9 +11,9 @@ from .identity_codec import (
     canonical_jsonb_text,
 )
 from .naming import CDCF_EVENT_ID, quote
-from .schema_registry import TableSchema, _normalise_type, _type_sql_equal
+from .schema_registry import TableSchema, _type_sql_equal
 
-BOOLEAN, BIGINT, DOUBLE, JSON_T, VARCHAR = "BOOLEAN", "BIGINT", "DOUBLE", "JSON", "VARCHAR"
+VARCHAR = "VARCHAR"
 DELETE_CHUNK = 2000
 MAX_PARAMS_PER_STATEMENT = 40_000
 MAX_ROWS_PER_STATEMENT = 5_000
@@ -139,15 +139,7 @@ def delete_keys(con, table: TableSchema, key_columns: tuple[str, ...], keys: lis
         con.execute(f"CREATE OR REPLACE TEMP TABLE {staging} ({defs})")
         if table.native_types and any(column in table.native_types for column in key_columns):
             key_rows = [list(k) for k in keys]
-            native_types = [table.native_types.get(column) for column in key_columns]
-            from .typed_types import UnionValue
-
-            arrow_safe = all(
-                _arrow_native_supported(native, native.sql if native is not None else types[index])
-                and all(not _contains_union(row[index], UnionValue) for row in key_rows)
-                for index, native in enumerate(native_types)
-            )
-            if arrow_safe:
+            if _arrow_route(table, list(key_columns), key_rows):
                 bulk_insert(con, staging, list(key_columns), key_rows, types)
             else:
                 insert_typed_rows(
@@ -155,7 +147,7 @@ def delete_keys(con, table: TableSchema, key_columns: tuple[str, ...], keys: lis
                     table,
                     list(key_columns),
                     key_rows,
-                    native_types,
+                    [table.native_types.get(column) for column in key_columns],
                     target=staging,
                 )
         else:
@@ -325,37 +317,83 @@ def rows_per_statement(n_columns: int) -> int:
     return max(1, min(MAX_ROWS_PER_STATEMENT, MAX_PARAMS_PER_STATEMENT // n_columns))
 
 
-def _arrow_type(sql_type: str):
+_ARROW_NATIVE_UNSUPPORTED = frozenset(
+    {
+        "VARIANT", "UNION", "NUMERIC_UNION", "MAP", "STRUCT",
+        "NUMERIC_VARIABLE", "INTERVAL", "TIMETZ", "ENUM", "LIST",
+    }
+)
+_ARROW_TYPE_NAMES = {
+    alias: factory
+    for factory, aliases in (
+        ("string", ("VARCHAR", "TEXT", "STRING", "JSON", "UUID")),
+        ("binary", ("BLOB", "BYTEA")),
+        ("int16", ("SMALLINT", "INT16")),
+        ("int32", ("INTEGER", "INT", "INT32")),
+        ("int64", ("BIGINT", "INT64", "HUGEINT")),
+        ("float32", ("FLOAT", "REAL", "FLOAT4")),
+        ("float64", ("DOUBLE", "FLOAT8")),
+        ("bool_", ("BOOLEAN",)),
+        ("timestamp_tz", ("TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE")),
+        ("timestamp", ("TIMESTAMP",)),
+        ("date32", ("DATE",)),
+        ("time64", ("TIME",)),
+    )
+    for alias in aliases
+}
+
+
+def _arrow_type(target: Any, *, fallback: bool = True):
+    """Map one resolved native type (or a control-table SQL type) to Arrow."""
     import pyarrow as pa
 
-    upper = str(sql_type).upper()
-    if upper.startswith(("STRUCT(", "MAP(", "LIST(", "UNION(")) or upper.endswith("[]"):
-        return None
-    if upper.startswith("VARCHAR") or upper in {"TEXT", "STRING", JSON_T, "UUID"}:
-        return pa.string()
-    if upper in {"BLOB", "BYTEA"}:
-        return pa.binary()
-    if upper in {"SMALLINT", "INT16"}:
-        return pa.int16()
-    if upper in {"INTEGER", "INT", "INT32"}:
-        return pa.int32()
-    if upper in {BIGINT, "INT64", "HUGEINT"}:
-        return pa.int64()
-    if upper in {"FLOAT", "REAL", "FLOAT4"}:
-        return pa.float32()
-    if upper in {DOUBLE, "FLOAT8"}:
-        return pa.float64()
-    if upper == BOOLEAN:
-        return pa.bool_()
-    if upper in {"TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE"}:
+    kind = getattr(target, "kind", None)
+    if kind is not None:
+        kind = str(kind).upper()
+        source = getattr(target, "source", None)
+        seen: set[int] = set()
+        while source is not None and getattr(source, "domain_base", None) is not None and id(source) not in seen:
+            seen.add(id(source))
+            source = source.domain_base
+        if source is not None and str(getattr(source, "kind", "")).lower() == "jsonb":
+            return None
+        if kind in _ARROW_NATIVE_UNSUPPORTED:
+            return None
+        upper = kind
+    else:
+        upper = str(target).upper()
+        if upper.startswith(("STRUCT(", "MAP(", "LIST(", "UNION(")) or upper.endswith("[]"):
+            return None
+    if upper.startswith("VARCHAR"):
+        upper = "VARCHAR"
+    factory = _ARROW_TYPE_NAMES.get(upper)
+    if factory is None:
+        return pa.string() if fallback else None
+    if factory == "timestamp_tz":
         return pa.timestamp("us", tz="UTC")
-    if upper == "TIMESTAMP":
+    if factory == "timestamp":
         return pa.timestamp("us")
-    if upper == "DATE":
-        return pa.date32()
-    if upper == "TIME":
+    if factory == "time64":
         return pa.time64("us")
-    return pa.string()
+    return getattr(pa, factory)()
+
+
+def _arrow_target_supported(target: Any) -> bool:
+    kind = getattr(target, "kind", None)
+    if kind == "LIST":
+        return bool(target.children) and _arrow_target_supported(target.children[0])
+    if kind is None:
+        from .schema_registry import _normalise_type
+
+        target = _normalise_type(target)
+    return _arrow_type(target, fallback=False) is not None
+
+
+def _arrow_array(values: list[Any], target: Any):
+    """Build one Arrow array through the canonical destination map."""
+    import pyarrow as pa
+
+    return pa.array(values, type=_arrow_type(target))
 
 
 def bulk_insert(
@@ -367,28 +405,11 @@ def bulk_insert(
     *,
     replace: bool = False,
 ) -> None:
-    """Insert many rows through a registered Arrow table.
+    """Insert many rows through one registered Arrow table.
 
-    MEASURED, 2026-07-30, 200 000 rows x 19 columns into local DuckDB inside one
-    transaction:
-
-    | strategy | time |
-    |---|---|
-    | `con.executemany(INSERT … VALUES (?,…))` | **410 s** |
-    | chunked multi-row `INSERT … VALUES (…),(…),…` | **> 7 min**, abandoned |
-    | register an Arrow table + `INSERT … SELECT` | **1.37 s** |
-
-    and against MotherDuck, 1 500 rows: `executemany` 27.9 s (a network round trip
-    *per row*), multi-row `VALUES` 0.65 s, Arrow 1.87 s.
-
-    So Arrow is the only strategy that is fast at both ends, and `executemany` -
-    the obvious way to write this - is 300x slower than it looks even locally.
-    That is what turned one 200 000-row Postgres transaction into a commit group
-    that could not finish inside the slow test's 300 s deadline.
-
-    `pyarrow` is a hard dependency for this reason; if it is somehow missing the
-    code falls back to `executemany` and logs, because a slow apply is better
-    than a failed one.
+    The measured Arrow-versus-VALUES rationale is recorded in
+    ``codex_logs/arrow_analysis.md``; the fallback remains only as a last-resort
+    operational guard when the declared dependency is unavailable.
     """
     if not rows:
         return
@@ -412,7 +433,7 @@ def bulk_insert(
         for index, column in enumerate(columns):
             values = [row[index] for row in batch]
             try:
-                arrays[column] = pa.array(values, type=_arrow_type(column_types[index]))
+                arrays[column] = _arrow_array(values, column_types[index])
             except (pa.ArrowInvalid, pa.ArrowTypeError, OverflowError) as exc:
                 # A typed column must never silently become text.  The caller can
                 # still explicitly request VARCHAR for an obscure source type, but a
@@ -431,7 +452,8 @@ def bulk_insert(
 
 
 def insert_rows(
-    con, table: TableSchema, columns: list[str], rows: list[list]
+    con, table: TableSchema, columns: list[str], rows: list[list], *,
+    values_are_encoded: bool = False,
 ) -> None:
     columns = list(columns)
     rows = [list(row) for row in rows]
@@ -472,13 +494,14 @@ def insert_rows(
                 columns,
                 rows,
                 [table.native_types.get(column) for column in columns],
+                values_are_encoded=values_are_encoded,
             )
             return
-        if _native_arrow_safe(table, columns, rows):
-            _bulk_insert_typed_rows(con, table, columns, rows)
-            return
-        if _native_numeric_union_arrow_safe(table, columns, rows):
-            _bulk_insert_typed_rows(con, table, columns, rows)
+        route = _arrow_route(table, columns, rows, allow_numeric_union=True)
+        if route is not None:
+            _bulk_insert_typed_rows(
+                con, table, columns, rows, values_are_encoded=values_are_encoded
+            )
             return
         insert_typed_rows(
             con,
@@ -486,6 +509,7 @@ def insert_rows(
             columns,
             rows,
             [table.native_types.get(column) for column in columns],
+            values_are_encoded=values_are_encoded,
         )
         return
     bulk_insert(
@@ -497,72 +521,34 @@ def insert_rows(
     )
 
 
-def _arrow_native_supported(native: Any, physical: str) -> bool:
-    kind = getattr(native, "kind", None)
-    source = getattr(native, "source", None)
-    seen: set[int] = set()
-    while source is not None and getattr(source, "domain_base", None) is not None and id(source) not in seen:
-        seen.add(id(source))
-        source = source.domain_base
-    # JSONB's PostgreSQL equality is semantic.  Arrow would bind the already
-    # encoded text directly and bypass the canonical JSONB text path below.
-    if source is not None and str(getattr(source, "kind", "")).lower() == "jsonb":
-        return False
-    if kind in {"UNION", "MAP", "STRUCT", "NUMERIC_VARIABLE", "INTERVAL", "TIMETZ"}:
-        return False
-    if kind == "LIST":
-        return bool(native.children) and _arrow_native_supported(
-            native.children[0], native.children[0].sql
-        )
-    if kind == "NUMERIC_UNION":
-        return False
-    normalized = _normalise_type(physical)
-    return normalized in {
-        "SMALLINT", "INTEGER", BIGINT, "FLOAT", DOUBLE, BOOLEAN, VARCHAR,
-        JSON_T, "UUID", "DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ", "BLOB",
-    }
-
-
-def _native_arrow_safe(table: TableSchema, columns: list[str], rows: list[list]) -> bool:
+def _arrow_route(
+    table: TableSchema,
+    columns: list[str],
+    rows: list[list],
+    *,
+    allow_numeric_union: bool = False,
+) -> bool | None:
+    """Combine resolved Arrow capability with the value-level UNION restriction."""
     from .typed_types import UnionValue
 
     for index, column in enumerate(columns):
         native = table.native_types.get(column)
         physical = table.raw_types.get(column, table.columns.get(column, VARCHAR))
         if native is not None and native.kind == "NUMERIC_UNION":
-            return False
-        if not _arrow_native_supported(native, physical):
-            return False
-        for row in rows:
-            if _contains_union(row[index], UnionValue):
-                return False
-    return True
-
-
-def _native_numeric_union_arrow_safe(
-    table: TableSchema, columns: list[str], rows: list[list]
-) -> bool:
-    from .typed_types import UnionValue
-
-    found_numeric_union = False
-    for index, column in enumerate(columns):
-        native = table.native_types.get(column)
-        physical = table.raw_types.get(column, table.columns.get(column, VARCHAR))
-        if native is not None and native.kind == "NUMERIC_UNION":
-            found_numeric_union = True
+            if not allow_numeric_union:
+                return None
             for row in rows:
                 value = row[index]
                 if not isinstance(value, UnionValue) or value.member not in {"finite", "special"}:
-                    return False
+                    return None
                 if value.value is None:
-                    return False
+                    return None
             continue
-        if not _arrow_native_supported(native, physical):
-            return False
-        for row in rows:
-            if _contains_union(row[index], UnionValue):
-                return False
-    return found_numeric_union
+        if not _arrow_target_supported(native if native is not None else physical):
+            return None
+        if any(_contains_union(row[index], UnionValue) for row in rows):
+            return None
+    return True
 
 
 def _contains_postgres_infinity(value: Any) -> bool:
@@ -581,7 +567,10 @@ def _contains_postgres_infinity(value: Any) -> bool:
     return False
 
 
-def _bulk_insert_typed_rows(con, table: TableSchema, columns: list[str], rows: list[list]) -> None:
+def _bulk_insert_typed_rows(
+    con, table: TableSchema, columns: list[str], rows: list[list], *,
+    values_are_encoded: bool = False,
+) -> None:
     """Bulk-load native rows, rebuilding bounded numeric UNIONs in SQL.
 
     A normal source table can combine JSON, UUID, timestamps, lists, and a bounded
@@ -596,7 +585,11 @@ def _bulk_insert_typed_rows(con, table: TableSchema, columns: list[str], rows: l
 
     prepared = [
         [
-            _prepare_typed_value(value, table.native_types.get(column))
+            _prepare_typed_value(
+                value,
+                table.native_types.get(column),
+                values_are_encoded=values_are_encoded,
+            )
             for column, value in zip(columns, row, strict=True)
         ]
         for row in rows
@@ -616,6 +609,8 @@ def _bulk_insert_typed_rows(con, table: TableSchema, columns: list[str], rows: l
             value_values: list[str | None] = []
             for row in prepared:
                 value = row[index]
+                if value is None:
+                    value = _tagged_union_null(native)
                 if not isinstance(value, UnionValue) or value.member.lower() not in members:
                     raise ValueError(f"invalid numeric UNION value for {column}: {value!r}")
                 member = value.member.lower()
@@ -624,8 +619,8 @@ def _bulk_insert_typed_rows(con, table: TableSchema, columns: list[str], rows: l
                 value_values.append(None if value.value is None else str(value.value))
                 if member_type is None:  # pragma: no cover - NativeType invariant
                     raise ValueError(f"numeric UNION member {member!r} has no type")
-            arrays[member_name] = pa.array(member_values, type=pa.string())
-            arrays[value_name] = pa.array(value_values, type=pa.string())
+            arrays[member_name] = _arrow_array(member_values, VARCHAR)
+            arrays[value_name] = _arrow_array(value_values, VARCHAR)
             arms = []
             for member, member_type in members.items():
                 arms.append(
@@ -636,8 +631,7 @@ def _bulk_insert_typed_rows(con, table: TableSchema, columns: list[str], rows: l
             select_expressions.append("CASE " + " ".join(arms) + " END")
             continue
         values = [row[index] for row in prepared]
-        arrow_type = _arrow_type(physical)
-        arrays[column] = pa.array(values, type=arrow_type)
+        arrays[column] = _arrow_array(values, native if native is not None else physical)
         select_expressions.append(f"v.{quote(column)}")
 
     view = "cdcf_typed_bulk_rows"
@@ -661,6 +655,7 @@ def insert_typed_rows(
     native_types: list[Any],
     *,
     target: str | None = None,
+    values_are_encoded: bool = False,
 ) -> None:
     """Insert rows whose values carry explicit native/UNION semantics.
 
@@ -696,7 +691,13 @@ def insert_typed_rows(
         row_params: list[Any] = []
         for value, native in zip(row, native_types, strict=True):
             native = native if isinstance(native, NativeType) else None
-            value = _prepare_typed_value(value, native)
+            value = _prepare_typed_value(
+                value, native, values_are_encoded=values_are_encoded
+            )
+            if value is None and native is not None and native.kind in {
+                "UNION", "NUMERIC_UNION"
+            }:
+                value = _tagged_union_null(native)
             expression, bound = _typed_parameter(value, native)
             expressions.append(expression)
             row_params.extend(bound)
@@ -860,11 +861,17 @@ def _contains_union(value: Any, union_class: type) -> bool:
     return False
 
 
-def _prepare_typed_value(value: Any, native: Any) -> Any:
-    """Materialize an implicit source value into its declared UNION member."""
+def _prepare_typed_value(value: Any, native: Any, *, values_are_encoded: bool = False) -> Any:
+    """Materialize an implicit source value into its declared UNION member.
+
+    Production rows have already crossed ``RowPatch.encoded_values``; direct
+    callers retain the historical raw-value boundary by leaving the flag false.
+    """
     from .typed_types import UnionValue, adapt_value
 
     if native is None or isinstance(value, UnionValue):
+        return value
+    if values_are_encoded:
         return value
     if native.source is not None:
         adapted = adapt_value(value, native)

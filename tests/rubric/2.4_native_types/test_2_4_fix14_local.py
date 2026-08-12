@@ -265,10 +265,10 @@ def test_synthetic_builtin_failure_is_contained_to_one_table(tmp_path, monkeypat
     """The generic boundary catches a failure that is not an AdmissionError."""
     original = typed_materialization._bulk_insert_typed_rows
 
-    def fail_only_bad(con, table, columns, rows):
+    def fail_only_bad(con, table, columns, rows, **kwargs):
         if table.name.endswith("contained_bad"):
             raise ValueError("synthetic third-party materializer failure")
-        return original(con, table, columns, rows)
+        return original(con, table, columns, rows, **kwargs)
 
     monkeypatch.setattr(typed_materialization, "_bulk_insert_typed_rows", fail_only_bad)
     box = Lab(tmp_path / "contained.duckdb")
@@ -354,10 +354,10 @@ def test_real_slot_advances_when_a_builtin_materializer_failure_is_injected(sand
     hook.write_text(
         "from cdc_flight import typed_materialization as _tm\n"
         "_real = _tm._bulk_insert_typed_rows\n"
-        "def _fail_one(con, table, columns, rows):\n"
+        "def _fail_one(con, table, columns, rows, **kwargs):\n"
         "    if 'fix14_any_exception_bad' in table.name:\n"
         "        raise ValueError('synthetic third-party materializer failure')\n"
-        "    return _real(con, table, columns, rows)\n"
+        "    return _real(con, table, columns, rows, **kwargs)\n"
         "_tm._bulk_insert_typed_rows = _fail_one\n",
         encoding="utf-8",
     )
