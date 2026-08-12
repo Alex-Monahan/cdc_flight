@@ -7,11 +7,13 @@ from BEGIN through the guarded COMMIT/ack boundary and post-commit bookkeeping.
 from __future__ import annotations
 
 from . import commit_metadata, destination, offsets, self_heal, table_work
-from .commit_group import CommitResult
+from .commit_group import CommitResult, OpenGroup
 from .errors import (
     AdmissionError,
     AmbiguousDelete,
+    DestinationExecutionFailure,
     DestinationIdentityCollision,
+    TableWriteFailure,
     as_schema_refusal,
 )
 from .faults import arm_group, maybe_crash
@@ -28,6 +30,7 @@ def commit_group(self, trigger: str) -> CommitResult:
     has no alternate connection/group context that could overtake it.
     """
     group = self.group.units
+    original_group = self.group
     if not group:
         # In particular, never acknowledge a discard-only re-snapshot tail here:
         # this method has not opened or committed a MotherDuck transaction.
@@ -193,6 +196,33 @@ def commit_group(self, trigger: str) -> CommitResult:
         self._rollback_quietly()
         self._record_schema_refusal(refused)
         raise
+    except (DestinationExecutionFailure, TableWriteFailure) as failure:
+        # A destination SQL error may have aborted the connection, and a Python
+        # materializer failure may have happened after this table's DELETE. In both
+        # cases the only safe table boundary is a full group rollback: the independent
+        # sink records the refusal, then the same source transaction is replayed with
+        # only the failed relation excluded. Commit/resume state is written only by
+        # the successful retry.
+        self._rollback_quietly()
+        qualified = self._contain_destination_failure(
+            failure.refused,
+            failure.original,
+            destination_execution=isinstance(failure, DestinationExecutionFailure),
+        )
+        self.group = OpenGroup(
+            opened_at=original_group.opened_at,
+            units=list(group),
+            events=original_group.events,
+            nbytes=original_group.nbytes,
+            is_snapshot=original_group.is_snapshot,
+            close_requested=original_group.close_requested,
+            spill_commit_id=original_group.spill_commit_id,
+        )
+        self._excluded_destination_tables = {qualified}
+        try:
+            return commit_group(self, trigger)
+        finally:
+            self._excluded_destination_tables.clear()
     except (AmbiguousDelete, DestinationIdentityCollision) as ambiguous:
         # Rubric 4.7. The group still rolls back - a fold that cannot be decided is
         # never committed - but a bare rollback here is a *permanent* failure: the

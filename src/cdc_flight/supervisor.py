@@ -12,6 +12,7 @@ below is the contract.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import threading
@@ -704,14 +705,16 @@ def _record_connector_failure(handler, failure: str, summary: dict) -> None:
     lsn = _CONNECTOR_OFFSET_RE.search(failure)
     txid = _CONNECTOR_TXID_RE.search(failure)
     marker = lsn.group(1) if lsn else "unknown"
+    failure_fingerprint = hashlib.sha256(failure[:2000].encode("utf-8")).hexdigest()
     summary["connector_failure_offset_lsn"] = marker
     context = {
         "connector_offset_lsn": marker,
         "connector_txid": txid.group(1) if txid else None,
+        "connector_failure_fingerprint": failure_fingerprint,
         "connector_error": failure[:2000],
         "relation_attributed": False,
     }
-    if _connector_alert_exists(handler, marker):
+    if _connector_alert_exists(handler, marker, failure_fingerprint):
         summary["connector_failure_alert"] = "already_recorded"
         return
     summary["connector_failure_alert"] = "recorded"
@@ -729,22 +732,34 @@ def _record_connector_failure(handler, failure: str, summary: dict) -> None:
     )
 
 
-def _connector_alert_exists(handler, marker: str) -> bool:
-    """True when this exact connector offset already has a durable alert."""
+def _connector_alert_exists(
+    handler, marker: str, failure_fingerprint: str | None = None
+) -> bool:
+    """True when this exact connector failure has a durable alert.
+
+    Stock Debezium sometimes reports no parseable offset.  The normalized failure
+    fingerprint is then the only honest standing-condition key; treating ``unknown``
+    as permanently unmatchable made one critical row appear on every run.
+    """
     con = getattr(handler, "con", None)
-    if con is None or marker == "unknown":
+    if con is None:
         return False
     try:
         table = control_table(
             resolve_control_schema(getattr(handler, "control_schema", None)), "alerts"
         )
+        marker_key = (
+            "connector_failure_fingerprint" if marker == "unknown"
+            else "connector_offset_lsn"
+        )
+        marker_value = failure_fingerprint if marker == "unknown" else marker
         row = con.execute(
             f"SELECT 1 FROM {table} WHERE pipeline = ? AND code = ? "
             "AND context LIKE ? LIMIT 1",
             [
                 handler.pipeline,
                 "connector_event_failure",
-                f'%"connector_offset_lsn": "{marker}"%',
+                f'%"{marker_key}": "{marker_value}"%',
             ],
         ).fetchone()
     except Exception:  # pragma: no cover - alerting must never mask the cause

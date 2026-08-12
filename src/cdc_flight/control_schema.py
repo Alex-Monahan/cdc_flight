@@ -168,6 +168,21 @@ CONTROL_DDL = [
             patch_digest    VARCHAR,
             PRIMARY KEY (target_dataset, target_table, event_id, column_name)
         )""",
+    # A keyless DELETE has no source key that can identify the row it removes.
+    # Its full before-image selects one physical row, while this ledger makes the
+    # selection idempotent across a replay: once the event has committed, replay is
+    # the declared `applied -> applied` no-op, even if an identical row was inserted
+    # afterwards.  It is part of the same destination transaction as the row change.
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.keyless_events (
+            pipeline        VARCHAR NOT NULL,
+            target_table    VARCHAR NOT NULL,
+            event_id        VARCHAR NOT NULL,
+            operation       VARCHAR NOT NULL,
+            state           VARCHAR NOT NULL,
+            image_digest    VARCHAR,
+            applied_at      TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (pipeline, target_table, event_id)
+        )""",
     # A schema fold can be safely refused but must not become an infinite invisible
     # retry.  This row is written after the failed data transaction rolls back and
     # remains the operator/resnapshot obligation until explicitly discharged.

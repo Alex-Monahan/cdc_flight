@@ -57,6 +57,7 @@ def record_schema_refusal(
     *,
     transaction_open: bool = False,
     deferred_alerts: list[dict] | None = None,
+    connection=None,
 ) -> None:
     if not refused.source_schema or not refused.source_table:
         applier.unscoped_refusals += 1
@@ -75,7 +76,7 @@ def record_schema_refusal(
 
     _capture_source_fingerprint(applier, refused)
     destination.record_schema_refusal(
-        applier.con,
+        applier.con if connection is None else connection,
         pipeline=applier.pipeline,
         source_schema=refused.source_schema,
         source_table=refused.source_table,

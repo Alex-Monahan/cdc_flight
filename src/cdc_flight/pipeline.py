@@ -43,7 +43,7 @@ from . import faults as faults_mod
 from . import reconcile as reconcile_mod
 from . import recovery as recovery_mod
 from . import resnapshot as resnapshot_mod
-from . import resnapshot_batches as resnapshot_batches_mod
+from . import resnapshot_batches as rbs
 from . import resnapshot_recovery as resnapshot_recovery_mod
 from .completion_stage import PostEngineCompletion
 from .config import (
@@ -615,7 +615,7 @@ def run(
         if owed and not will_snapshot_everything and acquisition.resnapshot_enabled():
             phases.to(PHASE_SNAPSHOTTING, detail=f"{len(owed)} table(s) owed")
             resnapshot_passes, latest_resnapshot, snapshot_epoch = (
-                resnapshot_batches_mod.run_owed(
+                rbs.run_owed(
                     con,
                     source=source,
                     replication=replication,
@@ -637,7 +637,7 @@ def run(
                 )
             )
             summary_extra.update(latest_resnapshot)
-            summary_extra["resnapshot_passes"] = resnapshot_passes
+            summary_extra.update(rbs.summarize_passes(resnapshot_passes))
             reconciliation.resume_point.snapshot_epoch = max(
                 reconciliation.resume_point.snapshot_epoch, snapshot_epoch
             )

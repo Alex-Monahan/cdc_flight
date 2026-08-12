@@ -140,11 +140,14 @@ def delete_keys(con, table: TableSchema, key_columns: tuple[str, ...], keys: lis
         if table.native_types and any(column in table.native_types for column in key_columns):
             key_rows = [list(k) for k in keys]
             native_types = [table.native_types.get(column) for column in key_columns]
-            from .typed_types import UnionValue
-
             arrow_safe = all(
-                _arrow_native_supported(native, native.sql if native is not None else types[index])
-                and all(not _contains_union(row[index], UnionValue) for row in key_rows)
+                _arrow_native_supported(
+                    native, native.sql if native is not None else types[index]
+                )
+                and all(
+                    _arrow_value_safe(row[index], native)
+                    for row in key_rows
+                )
                 for index, native in enumerate(native_types)
             )
             if arrow_safe:
@@ -183,6 +186,52 @@ def delete_keys(con, table: TableSchema, key_columns: tuple[str, ...], keys: lis
             f"(SELECT 1 FROM (VALUES {placeholders}) AS v({cols}) WHERE {predicate})",
             params,
         )
+
+
+def delete_matching_row(
+    con,
+    table: TableSchema,
+    columns: tuple[str, ...] | list[str],
+    values: dict[str, Any],
+) -> int:
+    """Delete exactly one physical row matching a complete keyless before-image.
+
+    A keyless table's source key is empty, so ``cdcf_event_id`` is only the identity
+    of the *event*, not the row a DELETE names.  The full before-image is bound to the
+    destination's declared types and compared with ``IS NOT DISTINCT FROM``; a
+    single event therefore removes one row even when N physical rows are identical.
+    The event ledger, owned by the planner, makes the operation idempotent on replay.
+    """
+    columns = tuple(columns)
+    if not columns:
+        raise ValueError("a keyless before-image must contain at least one source column")
+    if CDCF_EVENT_ID not in table.columns:
+        raise ValueError(
+            f"{table.name}: keyless physical-row delete requires "
+            f"{CDCF_EVENT_ID!r}"
+        )
+    predicates: list[str] = []
+    params: list[Any] = []
+    for column in columns:
+        if column not in table.columns:
+            raise ValueError(
+                f"{table.name}: before-image column {column!r} is not "
+                "present in the destination schema"
+            )
+        expression, bound = _typed_assignment(table, column, values.get(column))
+        predicates.append(
+            f"candidate.{quote(column)} IS NOT DISTINCT FROM {expression}"
+        )
+        params.extend(bound)
+    match = " AND ".join(predicates)
+    result = con.execute(
+        f"DELETE FROM {table.qualified} AS victim WHERE "
+        f"victim.{quote(CDCF_EVENT_ID)} = ("
+        f"SELECT candidate.{quote(CDCF_EVENT_ID)} FROM {table.qualified} AS candidate "
+        f"WHERE {match} LIMIT 1) RETURNING 1",
+        params,
+    )
+    return len(result.fetchall())
 
 
 def _key_parameter(value: Any, table: TableSchema, column: str) -> tuple[str, list[Any]]:
@@ -461,19 +510,6 @@ def insert_rows(
         # and arbitrary struct paths stay on the typed SQL encoder.  The bounded
         # numeric UNION used for ordinary PostgreSQL NUMERIC is represented by two
         # Arrow staging fields and reconstructed in one INSERT ... SELECT.
-        # PyArrow cannot represent PostgreSQL's explicit temporal infinity marker
-        # as a DATE/TIMESTAMP scalar.  Keep the value lossless and use the same
-        # parameterized CAST path as shadow copies and typed backfills; this is a
-        # narrow fallback for the special value, not a VARCHAR downgrade.
-        if _contains_postgres_infinity(rows):
-            insert_typed_rows(
-                con,
-                table,
-                columns,
-                rows,
-                [table.native_types.get(column) for column in columns],
-            )
-            return
         if _native_arrow_safe(table, columns, rows):
             _bulk_insert_typed_rows(con, table, columns, rows)
             return
@@ -524,8 +560,6 @@ def _arrow_native_supported(native: Any, physical: str) -> bool:
 
 
 def _native_arrow_safe(table: TableSchema, columns: list[str], rows: list[list]) -> bool:
-    from .typed_types import UnionValue
-
     for index, column in enumerate(columns):
         native = table.native_types.get(column)
         physical = table.raw_types.get(column, table.columns.get(column, VARCHAR))
@@ -534,7 +568,7 @@ def _native_arrow_safe(table: TableSchema, columns: list[str], rows: list[list])
         if not _arrow_native_supported(native, physical):
             return False
         for row in rows:
-            if _contains_union(row[index], UnionValue):
+            if not _arrow_value_safe(row[index], native):
                 return False
     return True
 
@@ -560,25 +594,39 @@ def _native_numeric_union_arrow_safe(
         if not _arrow_native_supported(native, physical):
             return False
         for row in rows:
-            if _contains_union(row[index], UnionValue):
+            if not _arrow_value_safe(row[index], native):
                 return False
     return found_numeric_union
 
 
-def _contains_postgres_infinity(value: Any) -> bool:
-    """Return whether a typed row contains the explicit temporal sentinel."""
-    from .typed_types import PostgresInfinity
+def _arrow_value_safe(value: Any, native: Any) -> bool:
+    """Check one value against the same native Arrow eligibility lattice.
 
+    This is deliberately called while each column is being classified.  It keeps
+    PostgreSQL infinity on the typed CAST path without a third whole-row traversal,
+    and recurses only through a native LIST whose child Arrow representation is
+    otherwise supported.
+    """
+    from .typed_types import PostgresInfinity, UnionValue
+
+    if isinstance(value, UnionValue):
+        return False
     if isinstance(value, PostgresInfinity):
+        # Arrow cannot represent PostgreSQL's unbounded temporal sentinel.  Keep
+        # the value on the typed CAST path, where the PostgreSQL spelling is
+        # deliberately bound as the destination's exact temporal type.
+        return False
+    if value is None:
         return True
+    if getattr(native, "kind", None) == "LIST" and native.children:
+        if not isinstance(value, (list, tuple)):
+            return False
+        return all(_arrow_value_safe(item, native.children[0]) for item in value)
     if isinstance(value, dict):
-        return any(
-            _contains_postgres_infinity(key) or _contains_postgres_infinity(item)
-            for key, item in value.items()
-        )
+        return not any(_contains_union(item, UnionValue) for item in value.values())
     if isinstance(value, (list, tuple)):
-        return any(_contains_postgres_infinity(item) for item in value)
-    return False
+        return not any(_contains_union(item, UnionValue) for item in value)
+    return True
 
 
 def _bulk_insert_typed_rows(con, table: TableSchema, columns: list[str], rows: list[list]) -> None:

@@ -123,6 +123,24 @@ class PostEngineCompletion:
                 self._summary(result, extra),
             )
 
+        quarantined = list(self.base_summary.get("resnapshot_quarantine_run_not_ok", []))
+        if quarantined:
+            # The re-snapshot already committed the quarantine and the main engine
+            # above has had the opportunity to apply healthy peers and advance the
+            # main slot.  Do not turn that bounded, table-scoped containment into a
+            # successful run merely because the final streaming engine was idle.
+            self.outcome.record("engine_error")
+            result["stop_reason"] = self.outcome.value
+            result["error_cause_type"] = "SchemaEvolutionRefused"
+            extra["resnapshot_quarantine_run_not_ok"] = quarantined
+            raise EngineFailure(
+                "automatic re-snapshot durably quarantined relation(s) "
+                + ", ".join(quarantined)
+                + "; healthy peers were allowed to proceed, but this run is NOT-OK "
+                "until a complete replacement image resolves the quarantine",
+                self._summary(result, extra),
+            )
+
         summary = self._summary(result, extra)
         return CompletionReport(summary=summary, run_ok=bool(result.get("ok")))
 

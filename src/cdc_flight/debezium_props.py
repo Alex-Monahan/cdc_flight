@@ -179,12 +179,36 @@ def build_properties(
     """
     replication.state_dir.mkdir(parents=True, exist_ok=True)
     snapshot = snapshot_mode or replication.snapshot_mode
+    protected = {
+        **INVARIANT_O_PINS,
+        # These are correctness/configuration pins too, even though only the first
+        # three participate directly in the offset proof.  In particular, changing
+        # the JDBC startup locale reopens the stock money failure, and changing the
+        # slot/plugin identity points the engine at a different source contract.
+        "driver.options": MONEY_LOCALE_NEUTRAL_OPTIONS,
+        "snapshot.mode": snapshot,
+        "slot.name": replication.slot_name,
+        "plugin.name": "pgoutput",
+    }
+    protected_reasons = {
+        **INVARIANT_O_REASONS,
+        "driver.options": (
+            "the connector session must keep lc_monetary=C so stock Debezium's money "
+            "parser cannot fail before Python receives an event"
+        ),
+        "snapshot.mode": (
+            "the caller-selected snapshot/recovery mode is part of the durable source "
+            "handoff and cannot be changed by an unrelated override"
+        ),
+        "slot.name": "the configured logical slot is the source of the resume proof",
+        "plugin.name": "the source contract is pinned to stock PostgreSQL pgoutput",
+    }
     for key, value in (overrides or {}).items():
-        pinned = INVARIANT_O_PINS.get(key)
+        pinned = protected.get(key)
         if pinned is not None and str(value) != pinned:
             raise UnsafeDebeziumProperty(
                 f"refusing to set {key}={value!r}: it is pinned to {pinned!r} because "
-                f"{INVARIANT_O_REASONS[key]}"
+                f"{protected_reasons[key]}"
             )
 
     props: dict[str, str] = {

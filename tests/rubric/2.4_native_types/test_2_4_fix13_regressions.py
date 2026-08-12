@@ -112,6 +112,16 @@ NON_ADMISSION_EXCEPTIONS: dict[str, str] = {
         "same rubric 4.7 route as `AmbiguousDelete`, and it is a DESTINATION "
         "condition rather than a source admission"
     ),
+    "DestinationExecutionFailure": (
+        "wrapper for a destination execution error after the destination connection "
+        "is invalidated; commit protocol rolls back and scopes a refusal without "
+        "treating it as a source admission class"
+    ),
+    "TableWriteFailure": (
+        "wrapper for a Python/materializer write failure after DML; commit protocol "
+        "rolls back the whole group and retries healthy peers, preserving origin "
+        "outside AdmissionError"
+    ),
     "NoDurableDestinationRow": (
         "a start-up safety refusal about the whole destination, before admission"
     ),
@@ -150,12 +160,7 @@ NON_ADMISSION_EXCEPTIONS: dict[str, str] = {
 }
 
 #: Every module under `src/cdc_flight/` that contains an `except` naming
-#: `AdmissionError`.  Checked in as a fixed inventory rather than derived from
-#: the files being asserted about, because round 12's version defined the
-#: boundary set as "files with an AdmissionError handler" and then asserted those
-#: files have an AdmissionError handler — a tautology that a boundary widened to
-#: `except Exception` passed.  Adding or removing a containment boundary must be
-#: a visible edit to this list.
+#: `AdmissionError`.  This remains a useful file-level inventory for review output.
 ADMISSION_BOUNDARY_MODULES = frozenset(
     {
         "applier.py",
@@ -173,6 +178,35 @@ ADMISSION_BOUNDARY_MODULES = frozenset(
         "spill_protocol.py",
         "table_work.py",
         "unit_admission.py",
+    }
+)
+
+#: File names are not enough: planner.py has two handlers, and a mutation of the
+#: `_collect` one used to pass because the other handler kept the file in this set.
+#: Owners are stable function names, so widening one handler removes exactly one
+#: declared boundary and fails the guard.
+ADMISSION_BOUNDARY_HANDLERS = frozenset(
+    {
+        ("applier.py", "_spill_events"),
+        ("catalog.py", "descriptors_for"),
+        ("catalog_apply.py", "apply"),
+        ("catalog_apply.py", "backfill_schema"),
+        ("catalog_descriptors.py", "from_tables"),
+        ("catalog_poll.py", "poll_quietly"),
+        ("catalog_poll.py", "poll"),
+        ("commit_protocol.py", "commit_group"),
+        ("physical_row_matrix.py", "_exercise_cell"),
+        ("planner.py", "_collect"),
+        ("planner.py", "_enrich_descriptors"),
+        ("planner.py", "_hydrate_omitted_xml_arrays"),
+        ("resnapshot_batches.py", "run_owed"),
+        ("schema_evolution.py", "apply_column_changes"),
+        ("schema_registry.py", "ensure_typed"),
+        ("schema_shadow.py", "convert_column_to_union"),
+        ("spill_protocol.py", "_enrich_descriptors"),
+        ("table_work.py", "_key_token"),
+        ("table_work.py", "write"),
+        ("unit_admission.py", "add_unit"),
     }
 )
 
@@ -346,6 +380,51 @@ def test_every_declared_containment_boundary_still_catches_the_common_base():
         "remove it in ADMISSION_BOUNDARY_MODULES deliberately. "
         f"symmetric difference: {sorted(with_handler ^ set(ADMISSION_BOUNDARY_MODULES))}"
     )
+
+
+def _admission_handler_owners(package: Path) -> set[tuple[str, str]]:
+    """Return ``(module, owning function)`` for every common-base handler."""
+    found: set[tuple[str, str]] = set()
+    for path in sorted(package.rglob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        aliases = _module_aliases(tree)
+
+        def visit(
+            node: ast.AST,
+            owner: str = "<module>",
+            *,
+            aliases=aliases,
+            module_name=path.name,
+        ) -> None:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                owner = node.name
+            if isinstance(node, ast.ExceptHandler) and "AdmissionError" in _names(
+                node.type, aliases
+            ):
+                found.add((module_name, owner))
+            for child in ast.iter_child_nodes(node):
+                visit(child, owner)
+
+        visit(tree)
+    return found
+
+
+def test_every_declared_boundary_is_checked_at_handler_granularity():
+    assert _admission_handler_owners(PACKAGE) == set(ADMISSION_BOUNDARY_HANDLERS)
+
+
+def test_widening_the_planner_collect_handler_is_detected(tmp_path):
+    """The exact R14-7 mutation must fail even though planner.py has another handler."""
+    scratch = tmp_path / "cdc_flight"
+    shutil.copytree(PACKAGE, scratch)
+    target = scratch / "planner.py"
+    original = target.read_text()
+    mutated = original.replace(
+        "except AdmissionError as exc:", "except Exception as exc:", 1
+    )
+    assert mutated != original
+    target.write_text(mutated)
+    assert _admission_handler_owners(scratch) != set(ADMISSION_BOUNDARY_HANDLERS)
 
 
 def test_no_handler_names_a_concrete_admission_sibling_without_the_base():
@@ -575,6 +654,47 @@ def test_a_connector_thrown_failure_is_recorded_once_at_critical():
 
     # The same deterministic failure, again: recorded once, not once per run.
     seen.add('%"connector_offset_lsn": "88724302688"%')
+    second: dict = {}
+    supervisor._record_connector_failure(handler, failure, second)
+    assert len(raised) == 1
+    assert second["connector_failure_alert"] == "already_recorded"
+
+
+def test_a_connector_failure_without_an_offset_is_fingerprinted_once():
+    """An unparseable stock-Debezium failure must not grow one alert per run."""
+    from types import SimpleNamespace
+
+    from cdc_flight import supervisor
+
+    failure = (
+        "org.apache.kafka.connect.errors.ConnectException: the change event producer "
+        "failed before an offset was reported: malformed source value"
+    )
+    raised: list[dict] = []
+    seen: set[str] = set()
+
+    class _Con:
+        def execute(self, _sql, params):
+            marker_value = params[2]
+            return SimpleNamespace(
+                fetchone=lambda: (1,) if marker_value in seen else None
+            )
+
+    handler = SimpleNamespace(
+        alerts=SimpleNamespace(raise_alert=lambda **kw: raised.append(kw)),
+        con=_Con(),
+        pipeline="p",
+        control_schema="_cdc_flight",
+    )
+    first: dict = {}
+    supervisor._record_connector_failure(handler, failure, first)
+    assert len(raised) == 1
+    assert raised[0]["context"]["connector_offset_lsn"] == "unknown"
+    fingerprint = raised[0]["context"]["connector_failure_fingerprint"]
+    assert fingerprint
+    assert first["connector_failure_alert"] == "recorded"
+
+    seen.add(f'%"connector_failure_fingerprint": "{fingerprint}"%')
     second: dict = {}
     supervisor._record_connector_failure(handler, failure, second)
     assert len(raised) == 1

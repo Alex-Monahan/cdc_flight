@@ -295,6 +295,12 @@ class CatalogWatcher:
         self._toast_admission_lock = threading.Lock()
         self._toast_admission_conn = None
         self._toast_admission_contexts: dict[str, _ToastAdmissionContext] = {}
+        #: Opaque-array recovery is on the callback path, not the poll thread. Keep
+        #: one bounded source connection for all events in this watcher lifetime;
+        #: opening one libpq session per xml[] event made an N-row recovery O(N)
+        #: handshakes.
+        self._event_read_lock = threading.Lock()
+        self._event_read_conn = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         #: Every change this run is still carrying, whatever state it is in. The
@@ -433,6 +439,11 @@ class CatalogWatcher:
                 context.conn.close()
             conn = self._toast_admission_conn
             self._toast_admission_conn = None
+            if conn is not None:
+                conn.close()
+        with self._event_read_lock:
+            conn = self._event_read_conn
+            self._event_read_conn = None
             if conn is not None:
                 conn.close()
 
@@ -889,7 +900,19 @@ class CatalogWatcher:
         """Recover source fields omitted by stock Debezium's opaque-array path."""
         from . import catalog_support
 
-        return catalog_support.read_event_columns(self, event, value_columns)
+        with self._event_read_lock:
+            if self._event_read_conn is None or self._event_read_conn.closed:
+                self._event_read_conn = catalog_poll.connect(self)
+            try:
+                return catalog_support.read_event_columns_from_connection(
+                    self._event_read_conn, event, value_columns
+                )
+            except Exception:
+                # A failed statement can leave the reusable session unusable. Close
+                # it before the planner's normal refusal/retry path asks again.
+                self._event_read_conn.close()
+                self._event_read_conn = None
+                raise
 
     def _compare(self, observed: dict[str, SourceRelation], lsn: int) -> list[CatalogChange]:
         added: list[CatalogChange] = []

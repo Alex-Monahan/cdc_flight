@@ -103,7 +103,7 @@ implementation.
 | **Codex B5** — the persisted timeline never participated in the decision | **fixed.** `source_timeline_changed`, ordered after identity and before LSN regression, with the catalog discarded (which also closes **Codex M1**) |
 | **Codex B6** — the four giant modules regrew | **fixed, and re-fixed at Codex r1 MINOR-5.** The 1.6-1.8 round split `applier_config.py`, `self_heal.py`, `supervisor.py` and `control_schema.py` out; the 1.9 rounds put the growth back, so `OpenGroup` is now `commit_group.py` and the four pre-engine decisions are `acquisition.py`. Measured after round 4: `applier.py` 928, `resnapshot.py` 926, `destination.py` 914, `catalog.py` 875, `pipeline.py` 806, `reconcile.py` 611, `recovery.py` 609. `destination.py` crossed 1,000 in round 4 and the source-relation registry became `source_relations.py`; `applier.py` and `resnapshot.py` are the ones to watch and are a **carry-forward** |
 | **Codex M2 / M3, Opus MAJOR-5 / MAJOR-6, MINOR-1** — the fault matrix proved declared labels, not outcomes; four tautologies; the hung-commit test accepted any death; `hang_seconds` was the exit code; the chaos harness did not compose | **fixed.** Every anchor writes a fsynced `fault_fired.json`; the outcome class is derived from the run; exact exit codes; `CDC_FAULT_HANG_SECONDS`; `destination_commit_late` for genuine ambiguity; chaos injects during recovery over a shuffled cover with a per-iteration fired assertion. ADR §19/A54 |
-| **Codex M5, Opus MAJOR-3** — the A51 counts were arithmetically false and the inventory incomplete | **fixed.** 67 rows, one failure and one class each, **43/15/9**, with `tests/rubric/4.7_self_healing/test_4_7_inventory.py` parsing the table so the headline cannot drift again. The missing modes (`CDC_RESNAPSHOT=0`, the unqueueable folds, drop-failure, `C` disagreement, the startup-dark fail-open, and more) are rows |
+| **Codex M5, Opus MAJOR-3** — the A51 counts were arithmetically false and the inventory incomplete | **fixed.** 68 rows, one failure and one class each, **44/15/9**, with `tests/rubric/4.7_self_healing/test_4_7_inventory.py` parsing the table so the headline cannot drift again. The missing modes (`CDC_RESNAPSHOT=0`, the unqueueable folds, drop-failure, `C` disagreement, the startup-dark fail-open, and more) are rows |
 | **Codex M6, Opus MINOR-7** — `write_slot_state` was a non-atomic DELETE+INSERT | **fixed.** One transaction. "Typed record" is a **carry-forward**: it is still a dict |
 | **Opus MAJOR-4** — `RUBRIC_STATUS` contradicted itself on 1.5 and 4.6 and had no 4.7 detail | **fixed.** Headings reconciled, 1.5's stale falsifier struck through with what replaced it, 4.6's "no test exists" replaced by what the test measures, 4.7 has a detail section |
 | **Opus Q5, Codex m3** — 57 of 91 new tests and 10 of 12 fault anchors were slow-only | **fixed.** Every anchor and every reconciliation cell now has a default-suite guard; see "Suite partition" below |
@@ -320,7 +320,11 @@ enters the real GroupPlan/TableWork/SchemaRegistry/SpillBuffer path using the re
 Applier SnapshotCoordinator; cells are uncovered only when the real owner raises,
 and results record durable row count, rollback state, owner outcome, and transition.
 The three prior false exclusions—keyless update/absent, keyless delete, and keyless
-key_move—now commit through the `cdcf_event_id` identity and are individually tested.
+key_move—now enter the real physical-row path and are individually tested.  For a
+`REPLICA IDENTITY FULL` keyless table, `cdcf_event_id` is only the event/replay
+identity: DELETE matches one complete before-image with NULL-safe predicates, and
+UPDATE folds as delete-before followed by insert-after.  The durable
+`_cdc_flight.keyless_events` machine makes a replay of the same event a no-op.
 The Applier spill-refusal seam still records durable `awaiting_snapshot` recovery.
 
 Unproven or intentionally deferred: stock Debezium's marker-preserving unchanged-
@@ -680,18 +684,18 @@ correct assumptions in the notes below:
 | # | Item | Score | One-line gap |
 |---|---|---|---|
 | 1.1 | Delivery guarantees, tables WITH a primary key | ~~3~~ → **5** | Exactly-once by construction (Invariant O), with the identity enforced by a destination `PRIMARY KEY`. Crash at six commit-group anchors incl. `spill` and a true between-table `mid_apply`, plus MotherDuck. |
-| 1.2 | Delivery guarantees, tables WITHOUT a primary key | ~~3~~ → **5** | Keyless rows are keyed on a connector-derived `cdcf_event_id` whose ordinal contract is enforced at the boundary, so two identical source rows survive and a replay does not. |
+| 1.2 | Delivery guarantees, tables WITHOUT a primary key | ~~3~~ → **5** | Exactly-once current-state semantics for `REPLICA IDENTITY FULL`: `cdcf_event_id` is replay bookkeeping, while DELETE/UPDATE use complete before-images and a durable event ledger. Duplicate rows, NULLs, identical delete/reinsert, replay, and crash anchors pass on PostgreSQL with both local DuckDB and MotherDuck destinations. |
 | 1.3 | CDC changes atomic in MotherDuck | ~~1~~ → **5** | A commit group is an integral number of whole multi-table Postgres transactions, proven whole in every storage mode; a concurrent MotherDuck observer never sees a partial one, including across an injected crash. |
 | 1.4 | Primary-key update handled correctly | ~~2~~ → **5** | The `d(old)`/`c(new)` pair is one transaction and a commit group holds whole transactions, so the move is atomic by construction. The fold models **physical rows** rather than keys, so a key worn by two rows inside a transaction (or freed and re-taken across two transactions of one group) is expressible; where the before-image cannot attribute a delete the group is refused rather than folded. Five reproduced silent-loss/duplication orderings are now equality tests. |
 | 1.5 | TRUNCATE / DROP propagate | ~~1~~ → **5** | `skipped.operations=none` brings truncates through; **one** dispatcher applies them in every storage mode and each truncate's audit records what *it* removed. `DROP TABLE` is not in the stream, so the source catalog is polled and the action passes six guards before any DDL. A dropped-and-recreated relation retains its old image, is marked `awaiting_snapshot`, and is **re-snapshotted automatically on the next run**; the replacement or final source-missing policy owns any destruction. Held at 4 through the 1.6-1.8 review because the rebuild machinery could delete a live destination table it had merely not reached; that is closed with positive-evidence emptiness and multi-table proof (ADR §19/A52). A mass drop still needs an operator, deliberately. |
 | 1.6 | Snapshot/backfill consistent with CDC | ~~3~~ → **5** | Postgres's **exported snapshot** makes the boundary an iff, and the fence is on the transaction's **commit** LSN, so a transaction straddling `C` is applied in full rather than lost. Proven with ~200 transactions committing throughout a snapshot — every row on exactly one side. A re-snapshot is complete only when **every requested table** reaches a terminal state: swapped, or verified empty on three independent facts (Debezium's own end-of-snapshot marker, zero records for that table, and a source count of zero). A disagreement between the two readings of `C` is fatal. Proven against a four-table re-snapshot with a keyless table, a genuinely empty table and a concurrent writer. |
 | 1.7 | Failures do not cause correctness issues | ~~1~~ ~~4~~ → **3** | **Twenty-one in-process anchors**: eight protocol, five destination (including the genuinely ambiguous `destination_commit_late`), seven recovery/catalog-baseline, and one source-catalog fault, plus a real network blackhole injected from outside the process. The matrix is enumerated from `faults.ALL_POINTS`, every anchor writes a machine-readable fired record, and the chaos harness asserts each workload affected source rows before arming. Round 7 still scores this 3/5: substantial evidence, but repeated adversarial compositions were found outside the suite, so the 5-band's “robust injection” is not yet the reviewer's verdict. |
 | 1.8 | Externally-advanced slot detected → backfill | ~~1~~ → **5** | Checked on every slot acquisition. Seven decisions trigger an **automatic** re-snapshot: slot ahead, slot missing, slot recreated, source identity changed, **source timeline forked**, source WAL rewound, and an empty destination with a positioned slot. The recovery is a **journalled state machine**: the intent is durable before any mutation, every step is idempotent and re-entrant after a crash at any phase, and a slot that will not drop fails the recovery rather than being logged and stepped over. A **populated** destination with no resume point refuses instead of being rebuilt. Proven by comparing the whole destination against the whole source after a real `pg_replication_slot_advance` and a real `pg_drop_replication_slot`, and by cutting the recovery at every phase boundary. |
-| 1.9 | Consistency-affecting state managed with state machines | **5** (new item) | Nine focused machines plus one precedence are declared together in `cdc_flight/machines.py`, including the closed `snapshot_completion` and durable `runtime_root_lifecycle` models. The inventories are generated from those declarations. Failed quiescence is published inside the supervisor's `finally`; marker preparation refuses `armed` and retires `consumed` only through its declared edge. This satisfies the literal 5 band (“an appropriate number of state machines, over 1”). |
+| 1.9 | Consistency-affecting state managed with state machines | **5** (new item) | Thirteen focused machines plus one precedence are declared together in `cdc_flight/machines.py`, including `keyless_event`, the closed `snapshot_completion`, and durable `runtime_root_lifecycle` models. The inventories are generated from those declarations. Failed quiescence is published inside the supervisor's `finally`; marker preparation refuses `armed` and retires `consumed` only through its declared edge. This satisfies the literal 5 band (“an appropriate number of state machines, over 1”). |
 | 2.1 | Added / dropped columns handled | **5** | Catalog-fenced attnum diffs add and backfill existing rows, physically drop destination columns, and continue through live CDC; the add/drop E2E compares source and destination before and after both DDLs. |
 | 2.2 | Renamed columns handled well | **5** | Same-attnum/type changes use a true destination rename, including a late-row merge/fence path; the E2E has one logical column, one rename audit event, and no data loss. |
 | 2.3 | New tables and schemas auto-discovered | **5** | A 10-second (configurable) all-schema watcher admits table-scoped publication members and performs an in-process targeted re-snapshot on the same main slot; new-table and new-schema existing rows arrive without config edit or restart. |
-| 2.4 | Postgres types → native MotherDuck types | ~~1~~ → **5** | No type is refused for a value reason. `xml`, `inet`, `cidr` and the other opaque text types land losslessly as `VARCHAR`, byte-exact against the PostgreSQL **output function** (`SELECT`/COPY/`format('%s', value)`, not the `::text` cast) — **80/80** on local DuckDB and on real MotherDuck. **The honest figure is 80, not 86** (review r12, R12-8): the 86-value corpus includes six `money` values, and `money` is compared against `::numeric::text` (`tests/support/fix9_opaque.py:231`), not against the output function, so it was never inside that claim. `money` is a plain `VARCHAR` transport boundary that **carries stock Debezium's delivered text unchanged**, and the connector's own session is pinned to a dot-decimal monetary locale (`driver.options=-c lc_monetary=C`, `debezium_props.MONEY_LOCALE_NEUTRAL_OPTIONS`) so that stock Debezium can always parse it. **THE DEVIATION, STATED EXACTLY AND ENUMERATED:** the destination VARCHAR holds the value's locale-independent numeric spelling — `1234567.89` — and NOT the source session's `money_out` rendering (`$1,234,567.89`, `₹1,234,567.89`, `1.234.567,89 €`, `1\u202f234\u202f567,89 €`, `R$ 1.234.567,89`, `1\u00a0234\u00a0567,89 ₽`). Those six renderings and the one stored value are asserted exactly, not fuzzily, in `tests/rubric/2.4_native_types/test_2_4_fix13_regressions.py::test_money_crosses_every_locale_family_and_never_blocks_anything`, live, over the full locale-family matrix (dot and comma decimal separators; `,` / `.` / U+202F / U+00A0 thousands separators; prefix and suffix symbols). Without the pin, three of those six families make **stock Debezium's own change-event producer throw** (`Failed to parse money value: 100,50 €` / `NumberFormatException`) before any value reaches Python — measured on this branch, four consecutive runs with both slot LSNs frozen. Scored **5/5** under the binding clarification, which makes money-as-text 5/5 and permits exactly one kind of value difference — "an explicitly enumerated, test-asserted, documented deviation" — which is what the paragraph above is; the r12 reviewer independently stated that money carrying the connector's numeric spelling "is what the binding directive requires, and I do not treat that as a defect". What cost the 5 in r12 was the OUTAGE, not the spelling, and the outage is gone. The only refusals left are the declared no-verified-codec types and stock Debezium's list-shaped `int2vector` Connect payload, both contained. |
+| 2.4 | Postgres types → native MotherDuck types | ~~1~~ → **4** | Money/inet-as-text remains **5/5** and no opaque type blocks a table. `xml`, `inet`, `cidr` and the other opaque text types land as `VARCHAR`, byte-exact against the PostgreSQL **output function** where stock Debezium delivers a value. The honest overall score is 4/5 because stock Debezium omits `xml[]` from the event payload; if the source row disappears before the fallback read, the destination can preserve the row with explicit `NULL` but cannot reconstruct the omitted array text. The omission is contained and never blocks the table, but it is not lossless type fidelity. `money` carries stock Debezium's delivered locale-neutral text unchanged through `VARCHAR`, with `driver.options=-c lc_monetary=C`; its six enumerated locale-family cases and the numeric spelling deviation remain asserted in `tests/rubric/2.4_native_types/test_2_4_fix13_regressions.py::test_money_crosses_every_locale_family_and_never_blocks_anything`. The remaining `int2vector` refusal is also contained and attributable. |
 | 2.5 | Data type changes supported | ~~3~~ → **5** | Unregressed in round 12 and re-verified. The typed shadow path, spill/replay path, and source-semantic multirange identity use the same `VARCHAR` resolver; real PostgreSQL equality classes and MotherDuck key-gain/shadow evidence pass. A full Debezium-driven MotherDuck multirange stream was not separately run, as recorded in the round-7 limits. |
 | 2.6 | TOAST columns handled well | **4** | Sparse physical-row folding, durable NULL-vs-JSONB-root-null ambiguity refusal, and a bounded relation-lock activation fence close the soundness defects. The real-owner matrix is non-circular. Stock Debezium still lacks a marker-preserving efficient channel, so the policy ceiling remains 4. |
 | 3.1 | Backfill scalable / parallelized | 3 | 120 k rows in ~28 s single-threaded (`snapshot.max.threads=1`); works but does not scale, untested past 120 k. |
@@ -708,7 +712,7 @@ correct assumptions in the notes below:
 | 4.4 | Idle-slot heartbeat | 1 | `heartbeat.interval.ms` unset, no `heartbeat.action.query`. |
 | 4.5 | Errors must not hang or lock | 2 | Bounded runner + JVM watchdog make hangs survivable (one observed in p09), but nothing systematic prevents them. |
 | 4.6 | Detect silently-dead Postgres connection | ~~1~~ → **3** | TODO 4.6(b) closed: a blackholed Postgres used to exit `ok: true` on a partial delivery, because `unknown` slot health licensed an idle declaration *and* reset the not-streaming clock. A source that was answering and goes dark now fails the run within `CDC_SOURCE_DARK_SECONDS` (45 s), proven against a real TCP blackhole. Not 5: there is still no heartbeat (4.4) and no bounded JDBC socket timeout (4.6(c)), so detection depends on our 0.5 s sampler rather than on the connection itself. |
-| 4.7 | Self-heal without human intervention | **1** (new item; claimed 3, rescored 1) | The rubric's 1-band is a **count**: "more than 2 cases that cause manual human intervention". The corrected inventory (ADR §19/A51, 67 rows, parsed by `tests/rubric/4.7_self_healing/test_4_7_inventory.py`) is **43 AUTO / 15 MANUAL / 9 UNDEFINED**. Fifteen is more than two, so it is a 1 under every defensible reading. The direction is right — automatic recovery now covers forty-three enumerated cases, including the Flight's own half-finished recovery — while the mechanical inventory keeps the remaining exceptions explicit. See the detail section. |
+| 4.7 | Self-heal without human intervention | **1** (new item; claimed 3, rescored 1) | The rubric's 1-band is a **count**: "more than 2 cases that cause manual human intervention". The corrected inventory (ADR §19/A51, 68 rows, parsed by `tests/rubric/4.7_self_healing/test_4_7_inventory.py`) is **44 AUTO / 15 MANUAL / 9 UNDEFINED**. Fifteen is more than two, so it is a 1 under every defensible reading. The direction is right — automatic recovery now covers forty-four enumerated cases, including the Flight's own half-finished recovery — while the mechanical inventory keeps the remaining exceptions explicit. See the detail section. |
 | 5.1 | CDC fast on large changes | 3 | 50 k-row transaction absorbed at ~3.5 k rows/s into local DuckDB; no failure, but a full `dlt.run()` per 2048-row batch is the ceiling. |
 | 5.2 | Low latency on small changes | 1 | Capture latency is 83 ms, but the deliverable is a bounded batch job with no defined cadence — end-to-end latency is the schedule interval. |
 | 5.3 | Keep up with high Postgres TPS | 2 | ~1 k events/s inside the engine, but ~17 s of per-run JVM/connect overhead drops the shipped bounded job to ~157 events/s to MotherDuck. |
@@ -777,7 +781,7 @@ setting the manual rows aside as "exceptions" is scoring a hand-selected subset.
 The acquisition-recovery anchors closed the earlier stated 4-band gap, but subsequent
 reviews still found compositions outside the suite; the round-7 published verdict is
 therefore 1.7 **3/5**, not the interim claim of 5. **1.9 is 5/5** on the rubric's own
-text (*an appropriate number of state machines, over 1*): seven machines plus one
+text (*an appropriate number of state machines, over 1*): thirteen machines plus one
 precedence, including the durable catalog-baseline machine. 4.6 is 3, not 5, because
 the detection that closed TODO 4.6(b) is ours (a 0.5 s slot sampler), not the
 connection's — 4.4's heartbeat and 4.6(c)'s socket timeouts are still absent.
@@ -790,7 +794,7 @@ connection's — 4.4's heartbeat and 4.6(c)'s socket timeouts are still absent.
 
 `at-most-once=1, at-least-once=3, exactly-once=5`
 
-#### Now (`feature/transactional-applier`, ADR 0001 rev 4)
+#### Now (`feature/2.4-2.6-type-handling`, ADR 0001 rev 5)
 
 **Exactly-once, by construction.** The mechanism is Invariant O (ADR §4.1): the
 resume point is written **inside** the same destination transaction as the rows,
@@ -878,26 +882,31 @@ on it, which is what `CDC_OFFSET_FILE_REPAIR=0` exists to demonstrate.
 
 ### 1.2 Delivery guarantees for tables WITHOUT a primary key — **5 / 5**
 
-#### Now (`feature/transactional-applier`, ADR 0001 rev 4)
+#### Now (`feature/2.4-2.6-type-handling`, ADR 0001 rev 5)
 
-Same delivery mechanism as 1.1, plus a **derived identity** for tables Debezium
-gives no message key: `cdcf_event_id = "<event lsn>:<source.txId>:<transaction.
-total_order>"` (ADR §6). It is the connector's own bookkeeping, so a replayed
-event recomputes the *same* id while two byte-identical source rows are two
-different events with two different ids. Nothing that deduplicates by row
-*content* can do both, and that is the point.
+Same delivery mechanism as 1.1, plus a **derived event identity** for tables
+Debezium gives no message key: `cdcf_event_id = "<event lsn>:<source.txId>:<transaction.
+total_order>"` (ADR §6). It is replay bookkeeping, not a physical-row key.  When
+PostgreSQL supplies `REPLICA IDENTITY FULL`, the destination is a current-state
+replica: INSERT appends the new physical row, DELETE matches the complete old row,
+and UPDATE performs those two operations in source order.  A durable
+`keyless_event` ledger records the event after the row mutation in the same
+MotherDuck transaction.
 
 **Evidence:**
 
 | claim | where |
 |---|---|
 | two byte-identical source rows both survive, and their replay copies do not | `tests/rubric/1.2_exactly_once_nopk/test_1_2_exactly_once_nopk.py::test_target_identical_source_rows_both_survive` |
+| one of N identical rows is deleted, including an explicit NULL and a large before-image | `test_1_2_keyless_delete_e2e.py::test_real_keyless_delete_duplicate_null_and_toast_image` (real PostgreSQL + local DuckDB) and `test_1_2_keyless_delete_motherduck.py` (real PostgreSQL + MotherDuck) |
+| identical delete/reinsert, update+delete in one source transaction, and replay after a post-commit crash | `test_1_2_keyless_delete_e2e.py`, `test_1_2_keyless_delete_crash_e2e.py` |
+| every requested crash anchor leaves source and destination equal, with no second physical delete on replay | `test_1_2_keyless_delete_crash_e2e.py` (12 anchors, real PostgreSQL + local DuckDB) |
 | the identity is a function of the envelope, asserted separately for streaming and snapshot rows | `test_1_2_exactly_once_nopk.py::test_target_event_identity_is_derived_not_random` |
 | a replay of the same transaction recomputes identical ids and cannot duplicate, with the fence disabled | `test_1_2_keyless_identity.py::test_a_replay_recomputes_the_same_identity_and_cannot_duplicate` |
 | several events sharing one LSN get distinct identities | `test_1_2_keyless_identity.py::test_identity_is_unique_for_distinct_events_sharing_one_lsn` |
 | a missing or duplicated `total_order` is refused at the boundary | `test_1_2_keyless_identity.py`, `tests/unit/test_assembler.py` |
-| every keyless change event is one destination row, and `GROUP BY cdcf_event_id HAVING count(*) > 1` is empty after a crash at every anchor | `test_1_1_fault_matrix.py::test_no_duplicates_at_anchor` |
-| duplicates are rejected by the destination, not just by us | `PRIMARY KEY (cdcf_event_id)`, verified on MotherDuck |
+| the event ledger is durable and replaying the same DELETE is a no-op | `_cdc_flight.keyless_events` with `unseen → applied` and `applied → applied`; `test_real_keyless_delete_replay_after_post_commit_crash_is_idempotent` |
+| duplicate physical rows are handled without content deduplication | `delete_matching_row()` selects one candidate with `IS NOT DISTINCT FROM` and deletes exactly one row; the duplicate/NULL E2E asserts the source row count |
 
 **The disagreement between the two reviews, and how it resolved.** Codex called
 this a blocker and reproduced two accepted events colliding on `cdcf_event_id`;
@@ -907,11 +916,11 @@ metadata, and the assembler *accepted metadata that was not valid*. The ordinal 
 now a contract enforced where units are proven whole. Full write-up in
 ADR §16/A18.
 
-**Honest limitation (unchanged, ADR §15/A12).** A keyless destination table is a
-**changelog**, not a current-state replica: an update or delete appends a change
-event rather than mutating a row. 1.2 is scored as exactly-once *change delivery*,
-which is what the rubric asks for; current state for keyless tables is 8.1/8.2's
-work.
+**Boundary, stated explicitly.** This current-state behavior is only claimed for a
+complete `REPLICA IDENTITY FULL` image.  A sparse UPDATE/DELETE or an unchanged
+TOAST field is refused and queued for the existing table-scoped resnapshot path;
+the implementation never guesses a base row.  A keyless relation without FULL
+identity cannot safely provide this semantics and remains outside the claim.
 
 #### Baseline (Phase 0) — historical
 
@@ -920,6 +929,11 @@ so Debezium *does* deliver complete before-images for updates and deletes
 (`tests/e2e/test_e2e_duckdb.py` asserts `{"r": 4, "c": 6, "u": 4, "d": 2}`), but
 there is no key to deduplicate on afterwards — a replayed batch is
 indistinguishable from six genuinely identical readings.
+
+The old baseline claim stopped at complete before-images and event identity: its
+1.2 tests contained no `DELETE FROM` at all, so it did **not** prove that a
+keyless DELETE removed a physical row. The Round-15 blocker was therefore a real
+gap in both the implementation and the claimed evidence, not a closed case.
 
 **Gap to 5.** Same transactional-offset fix as 1.1, plus a synthetic identity for
 keyless tables (`(dbz_lsn, dbz_tx_id, ordinal-within-transaction)` is unique and
@@ -931,7 +945,7 @@ decode UPDATE/DELETE without it — that case is untested.
 
 `no transactional boundaries=1, single-table transactional batches=3, multi-table=5`
 
-#### Now (`feature/transactional-applier`, ADR 0001 rev 4)
+#### Now (`feature/2.4-2.6-type-handling`, ADR 0001 rev 5)
 
 **Multi-table transactional batches.** One destination transaction per *commit
 group*, and a commit group holds an integral number of **whole** Postgres
@@ -1747,8 +1761,8 @@ compare" when the row is absent, so correctness never depends on it.
 #### Evidence
 
 Real operations on real slots, and each one is scored on a **whole-table content
-comparison against the source afterwards**, including a keyless changelog table where a
-duplicate cannot hide behind an upsert:
+comparison against the source afterwards**, including a keyless FULL-identity
+current-state table where a duplicate cannot hide behind an upsert:
 
 * `pg_replication_slot_advance(slot, pg_current_wal_lsn())` after 25 keyed + 25 keyless
   rows → detected, all six tables re-snapshotted, destination equals source, CDC works
@@ -1814,7 +1828,7 @@ ours, it runs before the engine starts, and it does not depend on Debezium notic
 
 ### 1.9 Consistency-affecting state managed with state machines — **5 / 5**
 
-> **Current inventory: nine focused machines plus one precedence; score 5/5.** Round 7 awarded
+> **Current inventory: thirteen focused machines plus one precedence; score 5/5.** Round 7 awarded
 > 5/5 on the then-current five-machine inventory. Later reviews correctly identified
 > callback ownership and filesystem interruption recovery as two more
 > consistency-affecting states; both are now declared and mechanically inventoried.
@@ -1840,7 +1854,7 @@ therefore mutated by a path the design did not enumerate.**
 Explicit machines do not make the system correct. They make the **unenumerated path** a
 run-time error instead of a review finding.
 
-#### What was built — twelve focused machines and one precedence
+#### What was built — thirteen focused machines and one precedence
 
 | machine | owns | states | edges | persistence |
 |---|---|---|---|---|
@@ -1854,6 +1868,7 @@ run-time error instead of a review finding.
 | `publication_admission` | has a discovered relation been admitted to the publication, and who owns that decision | 6 | 23 | `_cdc_flight.source_relations.admission_state` |
 | `catalog_schema_liveness` | is a watched schema visibly queryable before absence can mean a drop | 4 | 16 | **memory only** |
 | `schema_refusal` | has a refused schema transition acquired a durable remediation obligation | 4 | 9 | `_cdc_flight.schema_refusals.state` |
+| `keyless_event` | has one keyless event's physical operation committed, making replay a no-op | 2 | 2 | `_cdc_flight.keyless_events.state` |
 | `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
 | `snapshot_completion` | have all ordered snapshot callbacks arrived | 6 | 9 | **memory only** |
 | `runtime_root_lifecycle` | is the disposable root reusable or committed to cleanup | 6 | 10 | project-local root and parent markers |
@@ -1958,7 +1973,7 @@ slow-lane tests.
 #### Why 5 — the current inventory
 
 The current implementation applies the rubric's literal 5 band: “an appropriate number
-of state machines (over 1).” Seven focused machines own seven concepts, and
+of state machines (over 1).” Thirteen focused machines own thirteen concepts, and
 `run_outcome` is separately a precedence rather than being forced into a graph.
 `catalog_baseline` owns identity adoption, `interruption_marker` owns the durable
 cross-process recovery obligation, and `destination_ownership` owns the terminal
@@ -2093,7 +2108,15 @@ membership, both tables' pre-existing rows, post-snapshot CDC rows, and one appl
 `new` audit event per relation. No config edit or second process run is used for the
 discovery itself.
 
-### 2.4 Postgres types accurately converted to native MotherDuck types — **5 / 5**
+### 2.4 Postgres types accurately converted to native MotherDuck types — **4 / 5**
+
+**FIX ROUND 15 current disposition.** Money/inet-as-text remains 5/5 and no
+opaque type blocks a table. The overall score is honestly 4/5 because stock
+Debezium omits `xml[]` from the event payload: if the source row disappears
+before the narrow fallback read, the destination preserves the row with an
+explicit `NULL` but cannot reconstruct the omitted array text. The omission is
+contained and attributable, but it is not lossless type fidelity. The historical
+5/5 paragraphs below are retained as audit history only.
 
 **FIX ROUND 2 (2026-08-08).** The production typed path now takes a
 catalog-authoritative recursive `SourceTypeDescriptor` and has no implicit
@@ -2621,7 +2644,7 @@ literal count rather than a judgement. That is why it is scored the way it is.*
 #### The number, and where it comes from
 
 ADR §19/A51 enumerates every raise site, fatal log, refusal and `stop_reason` in the
-tree: **67 rows, 43 AUTO / 15 MANUAL / 9 UNDEFINED**. Fifteen manual cases is more than
+tree: **68 rows, 44 AUTO / 15 MANUAL / 9 UNDEFINED**. Fifteen manual cases is more than
 two, so the 1-band's test is met on our own evidence.
 
 The count is not recalled: `tests/rubric/4.7_self_healing/test_4_7_inventory.py` re-parses the
@@ -3955,7 +3978,9 @@ infinity failure was reproduced first on the real PostgreSQL 18 clone at
 `CDC_TEST_PGPORT=15434`; the fix was then attacked through local DuckDB, real
 MotherDuck, stock Debezium/PostgreSQL, and an injected builtin exception.
 
-**Current honest scores: 2.4 = 5/5, 2.5 = 5/5, 2.6 = 4/5, 4.0 = 5/5.**
+**At Round 14 (superseded by FIX ROUND 15), the recorded scores were: 2.4 =
+5/5, 2.5 = 5/5, 2.6 = 4/5, 4.0 = 5/5.** Round 15 re-scored 2.4 honestly after
+the stock-Debezium `xml[]` limitation was re-proven.
 The 2.6 marker-preserving stock-Debezium path remains deferred as directed.
 Money data-fidelity validation remains the last TODO item; money-as-text is not
 deducted. `money[]` remains under that deferral. The 4.0 score is for the literal
@@ -4060,9 +4085,9 @@ streaming values plus a healthy peer; exact source output is preserved.
 
 ### Round-14 lane and baseline evidence
 
-Collection on the final tree reported 1,708 default candidates, 152 slow
-candidates, and 33 MotherDuck candidates. Subtracting the live structure-guard
-module (10/1/1) gives `_BASELINE_SELECTED = {1698, 151, 32}`.
+Collection at the end of Round 14 reported 1,708 default candidates, 152 slow
+candidates, and 33 MotherDuck candidates. That historical count is superseded
+by the Round-15 measurement below.
 
 | command | observed result |
 |---|---|
@@ -4090,7 +4115,177 @@ Both LSNs strictly advanced across all four runs; retained WAL stayed bounded.
 The run summaries retained `builtins.ValueError` and the exact synthetic message,
 not a generic swallowed error. This is the direct 4.0 level-5 table scenario.
 
-### Cleanup and remaining limits
+## FIX ROUND 15 closure — keyless DELETE, containment, and honest re-score (2026-08-11)
+
+Round 15 was driven by R14-1, the silent keyless DELETE corruption. The required
+failing test was added and run before the fix. On the old path, real PostgreSQL 18
+with stock Debezium reported `ok=True`, no refusal and no alert while the source
+was `[('b', 'n-b')]` and the destination was
+`[('a', 'n-a'), ('a', 'n-a'), ('b', 'n-b')]`. The slot advanced, so this was a
+real exactly-once data-divergence failure rather than a missed assertion. The
+regression test is now
+`tests/rubric/1.2_exactly_once_nopk/test_1_2_exactly_once_nopk.py::test_keyless_delete_removes_the_full_before_image`.
+
+### Ownership
+
+The defect was **pre-existing on the supplied `origin/main` baseline
+`2d4276e`**, not introduced by this branch. At that commit, `apply_sql.py`'s
+keyless table contract explicitly named `cdcf_event_id` as the row identity and
+the implementation deleted that event id if present and then inserted the
+before-image. The baseline 1.2 tests contained no `DELETE FROM` operation. This
+branch owns the correction and the new evidence, but not the original defect.
+
+### Keyless current-state model
+
+For a `REPLICA IDENTITY FULL` relation, `cdcf_event_id` is now only replay
+bookkeeping. The declared `keyless_event` machine has `unseen → applied` and
+`applied → applied` edges, persisted in `_cdc_flight.keyless_events`. The physical
+operation is folded in source order and the row mutation plus ledger transition
+commit in the same destination transaction:
+
+* INSERT appends a physical row with its event id.
+* DELETE requires a complete catalog-authoritative before-image, binds every
+  source column using the existing typed path, and matches with
+  `IS NOT DISTINCT FROM`. It selects one candidate and deletes exactly one
+  physical row. Content is not deduplicated: when N rows are identical, any one
+  is semantically the source row removed, and N−1 remain.
+* UPDATE is a physical delete-before followed by insert-after in source order.
+  DELETE followed by an identical INSERT therefore leaves one newly inserted
+  physical row. A replayed event sees `applied` and performs no second delete,
+  insert, or resurrection.
+* An explicit PostgreSQL NULL is a `EXPLICIT_NULL` field, not a missing value.
+  `UNCHANGED_TOAST` and `ABSENT` fields are refused and routed to the existing
+  table-scoped re-snapshot path; a large *complete* TOAST value is matched and
+  carried without reconstructing text.
+
+| hard case | local DuckDB evidence | MotherDuck evidence |
+|---|---|---|
+| single FULL-image DELETE | real PostgreSQL probe in `test_1_2_exactly_once_nopk.py` | real PostgreSQL + MotherDuck matrix |
+| one of N identical rows | 3 duplicate rows; one `ctid` delete; 6 rows remain in the full matrix | 3 duplicate rows; one delete; source/destination equality |
+| NULL in the before-image | `note IS NULL` in `test_real_keyless_delete_duplicate_null_and_toast_image` | `null-delete` row in `test_real_postgres_keyless_delete_matrix_on_motherduck` |
+| large/TOASTed complete image | 12,000-character bodies and source equality | 12,000-character bodies and source equality |
+| delete then identical re-insert | same source transaction; one physical row after fold | same source transaction; equality after cloud apply |
+| update and delete in one transaction | full UPDATE plus NULL DELETE, source-order equality | full UPDATE plus NULL DELETE, source-order equality |
+| replay after destination commit, before acknowledgement | `post_commit_pre_ack` crash and ledger no-op | same real crash/restart proof |
+| all crash/restart anchors | 12 anchors in `test_1_2_keyless_delete_crash_e2e.py` | the same 12 anchors in `test_1_2_keyless_delete_motherduck.py` |
+| sparse/unchanged TOAST image | refusal is asserted in the 2.6 physical-row matrix | same policy is exercised by the MotherDuck disposition lane |
+
+The local and cloud matrices compare current destination rows with the real
+PostgreSQL source after every operation. They do not use a destination changelog
+or an upsert count as a proxy for current state.
+
+### Delete infinity and the hot-path scan
+
+The >2,000-key `delete_rows`/`delete_keys` Arrow staging path now uses the same
+per-value `_arrow_value_safe` decision for `PostgresInfinity`; temporal infinity
+keys therefore take the typed parameterized path instead of reaching Arrow's
+unsupported sentinel conversion. The unconditional whole-row
+`_contains_postgres_infinity(rows)` walk was removed from `insert_rows`. This
+removes the measured third scan that changed 100k×20 `insert_rows` from 10.52 s
+to 13.26 s (+26%); no conversion or identity-system restructuring was duplicated
+here. The sibling conversion-simplification branch may later canonicalize this
+policy further, but this branch makes the narrow correctness/performance fix.
+
+### Destination-raised containment
+
+Destination execution failures are classified narrowly (`ConversionException`,
+`ConstraintException`, `OutOfRangeException`, and `TransactionException`). A
+programming, binder/catalog, connection, or engine error is not silently
+converted into a table problem. For a contained destination error, the whole
+commit group rolls back, an independent sink records a durable refusal and
+attributable alert, and the healthy peer is replayed in a new group. The pipeline
+then remains NOT-OK while the slot advances only after the healthy durable work.
+
+The real PostgreSQL proof injected a DuckDB `ConversionException` into four
+successive bad tables, one bad table per run, alongside one healthy peer. Every
+run had `error_cause_type=SchemaEvolutionRefused`, four peer rows were delivered,
+the bad table was quarantined, and four `table_exception_contained` alerts were
+retained. The measured tuples are `(restart_lsn, confirmed_flush_lsn,
+retained_wal_bytes, restart_integer, confirmed_integer)`:
+
+```text
+('17/F7FEF8F8','17/F7FF00A0',2456,102944930040,102944932000)
+('17/F7FF01E0','17/F7FF0A80',2704,102944932320,102944934528)
+('17/F7FF0BC0','17/F800B068',108184,102944934848,102945042536)
+('17/F800B1A8','17/F800BA18',2656,102945042856,102945045016)
+```
+
+The existing four-run builtin-Python exception proof remains green as a second
+boundary: its tuples were
+
+```text
+('17/F7020610','17/F7020EE8',2816,102928352784,102928355048)
+('17/F7021060','17/F7021838',2504,102928355424,102928357432)
+('17/F7021978','17/F7022110',2440,102928357752,102928359696)
+('17/F7022250','17/F7022998',2360,102928360016,102928361880)
+```
+
+Both LSN sequences strictly advanced and retained WAL stayed bounded. The
+destination proof is `test_real_destination_error_is_contained_over_four_runs_with_wal_metrics`;
+the rollback proof is `test_materializer_failure_after_table_delete_rolls_back_the_whole_group`.
+
+### R14 major/minor/nit dispositions
+
+| finding | Round-15 disposition |
+|---|---|
+| R14-2 `xml[]` re-read could block | The narrow source fallback now reuses one bounded source connection and a transient missing row becomes explicit NULL while the peer proceeds; unexplained omissions still refuse. Stock Debezium still cannot reproduce an omitted array after the source row is gone, so this is the explicit reason current 2.4 remains 4/5. |
+| R14-3 destination error collapses containment | Fixed with narrow destination classification, independent refusal/alert sink, full rollback and healthy-peer replay; four real runs above. |
+| R14-4 torn table image | Fixed: materializer failures after DML raise `TableWriteFailure`; the whole commit group rolls back before the healthy-peer retry. |
+| R14-5 infinity in large `delete_rows` | Fixed through the per-cell Arrow safety path; the >2,000-key temporal-key regression is covered. |
+| R14-6 third whole-row infinity scan | Removed; the existing per-column eligibility path is authoritative. |
+| R14-7 widened admission boundary could evade tests | The guard now inventories stable `(module, owning_function)` handlers, resolves aliases, checks the runtime/static exception graph, and mutates the exact planner handler plus third-file siblings. |
+| R14-8 unknown connector offset alert growth | Unknown offsets now use a durable failure fingerprint; known offsets retain offset-based dedupe. Repeated no-durable markers include the confirmed LSN. |
+| R14-9 one source connection per `xml[]` event | `RelationDescriptorProvider` owns one bounded source connection per recovery pass and closes it at the owner boundary. |
+| R14-10 password stripped from recovery DSN | Recovery receives the explicit configured source DSN, preserving credentials rather than rebuilding from `con.info.dsn`. |
+| R14-11 permanent alert marker | Alert markers include an incident marker/time; a genuinely new recurrence after repair is observable while a standing incident remains deduplicated. |
+| R14-12 only three Debezium properties protected | `driver.options`, `snapshot.mode`, `slot.name`, and `plugin.name` are now protected; override merging remains tested. |
+| R14-13 refusal attribution overwritten | The first concrete refusal reason and incident marker are retained across pending/quarantined transitions. |
+| R14-14 no acknowledgement path | `CDC_ACKNOWLEDGE_QUARANTINES` is explicit and loud: it suppresses only the repeated run-level error, leaves the relation stale/blocked, and is unit-tested. |
+| deferred `money[]` | Deferred under the standing user directive; no money-fidelity work or score deduction was added. |
+
+### Final Round-15 measurement and score
+
+Collection on this tree reported 1,719 default candidates, 170 slow candidates,
+and 46 MotherDuck candidates. The live structure guard contributes 10/1/1, so
+`_BASELINE_SELECTED` is **{1709, 169, 45}** for default/slow/MotherDuck.
+No collected node was removed or weakened.
+
+| command | observed result |
+|---|---|
+| `CDC_TEST_PGPORT=15434 make test` | **1,719 passed** in 324.52 s |
+| `CDC_TEST_PGPORT=15434 make test-slow` (run 1) | **170 passed** in 2,472.84 s |
+| `CDC_TEST_PGPORT=15434 make test-slow` (run 2) | **170 passed** in 2,456.88 s |
+| `CDC_TEST_PGPORT=15434 make test-md` | **46 passed** in 1,038.62 s; real MotherDuck |
+| `CDC_TEST_PGPORT=15434 make lint` | **All checks passed** |
+
+Current honest scores are **1.2 = 5/5**, **2.4 = 4/5**, **2.5 = 5/5**,
+**2.6 = 4/5**, **4.0 = 5/5**, and **4.7 = 1/5**. The 2.4 deduction is
+specifically the stock-Debezium `xml[]` omission after a transient source row
+disappears; it is not money. The 2.6 score remains capped by stock Debezium's
+unchanged-TOAST marker limitation. The 4.0 score is for table-scoped failures;
+an engine/connector error with no relation identity remains fail-loud and
+offset-alerted rather than being falsely assigned to a table.
+
+After the lanes, PostgreSQL 18 on **15434** had zero replication slots. Its only
+repository test leftovers were the eight expected
+`cdc_flight_test_template_pg15434_gw*` worker template databases; no active
+slot or per-run scratch database remained. MotherDuck listed 21 account
+databases and **zero** repository-created `cdc_flight_md_*` scratch databases.
+All final test and source checks used 15434 and no Docker was used. One earlier
+post-lane helper typo invoked the script without `CDC_TEST_PGPORT`, which
+selected the absent default 15432 socket and failed before connecting; it was
+immediately corrected and is recorded here rather than misreported as a clean
+constraint audit.
+
+Anything still unproven is explicit: stock Debezium cannot recover an omitted
+`xml[]` spelling after the source row is gone; the marker-preserving TOAST 5/5
+upgrade is deferred; money fidelity is deferred; and a connector failure raised
+before Python has no honest relation attribution. The cloud anchor test observed
+one safe, loud `slot_acknowledgement_timeout` retry at `destination_write` and
+requires a bounded retry only for that exact condition; it does not weaken the
+durability or row-equality assertions.
+
+### Round-14 cleanup and remaining limits (historical)
 
 After the final lanes, PostgreSQL on port 15434 reported zero replication slots
 and zero role settings; only `cdc_source`, `postgres`, and the lane template

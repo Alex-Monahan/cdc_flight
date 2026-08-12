@@ -151,7 +151,7 @@ def test_schema_refusal_uses_the_real_applier_spill_refusal_seam():
 
 
 def test_keyless_event_identity_cells_reach_the_real_owner():
-    """A keyless changelog uses cdcf_event_id for every physical row operation."""
+    """Keyless FULL operations reach the physical-row owner or refuse safely."""
     cells = (
         type(declared_cells()[0])(
             "update", "absent", "in_group", "spill", "commit", "keyless", "post"
@@ -165,6 +165,18 @@ def test_keyless_event_identity_cells_reach_the_real_owner():
     )
     for cell in cells:
         result = exercise_cell(cell)
+        if cell.operation == "update" and cell.field_state == "absent":
+            # A sparse keyless update has no complete before-image.  Treating its
+            # synthetic event id as a row key would silently insert or update the
+            # wrong physical row, so the declared safe outcome is a toast/base
+            # refusal until a complete image is available.
+            assert result.kind == "refused", result
+            assert not result.covered, result
+            assert result.owner == "ToastBaseMissing"
+            assert result.actual_outcome == "toast_base_missing"
+            assert result.reason.startswith("owner_refusal:")
+            assert result.rollback_clean
+            continue
         assert result.kind == "exercised", result
         assert result.covered
         assert result.owner == "destination_commit"

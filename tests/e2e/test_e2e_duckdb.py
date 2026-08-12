@@ -12,7 +12,7 @@ asserted here rather than left implicit:
 
 | baseline (dlt, append) | applier |
 |---|---|
-| every table append-only, so a delete left the old row behind | keyed tables are **current state** (merge on the Debezium message key), keyless tables are append-keyed on `cdcf_event_id` |
+| every table append-only, so a delete left the old row behind | keyed tables are **current state** (merge on the Debezium message key), keyless `REPLICA IDENTITY FULL` tables fold physical rows by complete before-image |
 | `_dlt_load_id` / `_dlt_id` | `cdcf_commit_id` / `cdcf_event_id`, plus `_cdc_flight.commit_log` |
 | arrays exploded into `<table>__tags` child tables | arrays land as DuckDB `JSON` in the row |
 | deletes rewritten to a `deleted='true'` row by the SMT | hard delete (rubric 8.1 adds the soft option) |
@@ -20,6 +20,7 @@ asserted here rather than left implicit:
 
 from __future__ import annotations
 
+import psycopg
 import pytest
 
 pytestmark = pytest.mark.e2e
@@ -116,21 +117,25 @@ def test_baseline_end_to_end(fresh_seed, run_pipeline, generate_changes, duck, d
             == 0
         )
 
-        # A table with NO primary key is an append-only changelog keyed on the
-        # synthetic event identity, so every change event is a row - which is
-        # exactly what rubric 1.2 needs to be measurable at all.
-        sensor_ops = dict(
-            con.execute(
-                f'SELECT dbz_op, count(*) FROM "{dataset}"."cdcflight_app_sensor_readings" '
-                "GROUP BY 1"
+        # A keyless FULL-identity table is current state too.  The source query
+        # is the oracle here: a DELETE removes one physical row, and an UPDATE
+        # changes that row rather than appending a new event-image row.  The
+        # synthetic event id remains replay bookkeeping, not row identity.
+        with psycopg.connect(fresh_seed.dsn, autocommit=True) as source:
+            source_rows = source.execute(
+                "SELECT sensor_id, reading_at, value, unit FROM app.sensor_readings "
+                "ORDER BY sensor_id, reading_at NULLS FIRST, value, unit"
             ).fetchall()
-        )
-        assert sensor_ops == {"r": 4, "c": 6, "u": 4, "d": 2}, sensor_ops
+        landed_rows = con.execute(
+            f'SELECT sensor_id, reading_at, value, unit FROM "{dataset}"."cdcflight_app_sensor_readings" '
+            "ORDER BY sensor_id, reading_at NULLS FIRST, value, unit"
+        ).fetchall()
+        assert landed_rows == source_rows, (landed_rows, source_rows)
         rows, ids = con.execute(
             f'SELECT count(*), count(DISTINCT cdcf_event_id) '
             f'FROM "{dataset}"."cdcflight_app_sensor_readings"'
         ).fetchone()
-        assert rows == ids == 16, (rows, ids)
+        assert rows == ids == len(source_rows), (rows, ids, source_rows)
 
         # Partitioned table arrives as one logical table (publish_via_partition_root).
         audit_ops = dict(

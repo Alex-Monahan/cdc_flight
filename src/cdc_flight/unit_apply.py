@@ -20,6 +20,7 @@ def apply_units(
     has_data: bool,
     clear_spill: bool = True,
     created_in_txn: set[str] | None = None,
+    excluded_tables: set[str] | None = None,
 ) -> dict:
     """Apply a list of whole units without changing their source order."""
     created_in_txn = (
@@ -74,6 +75,7 @@ def apply_units(
         # Quarantined relations plus any relation whose stream this run holds out
         # of a retained image pending a replacement snapshot (round 13, R12-2).
         blocked_tables=applier.blocked_schema_tables | applier.group.held_tables,
+        excluded_tables=excluded_tables,
         contain_table_failure=applier._contain_table_failure,
     )
     for unit in group:

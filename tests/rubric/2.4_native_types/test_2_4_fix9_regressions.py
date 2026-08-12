@@ -264,7 +264,14 @@ def test_identical_refusal_quarantines_one_table_and_advances_a_healthy_peer(
             "SELECT refusal_fingerprint FROM _cdc_flight.schema_refusals "
             "WHERE source_table='bad_opaque'"
         )
+        refusal_reason = second.scalar(
+            "SELECT reason FROM _cdc_flight.schema_refusals "
+            "WHERE source_table='bad_opaque'"
+        )
         assert refusal_fingerprint
+        # The second observation is a generic blocked retry; it must not erase the
+        # concrete first refusal's attribution.
+        assert "int2vector" in refusal_reason
         assert second.scalar(
             "SELECT state FROM _cdc_flight.schema_refusals "
             "WHERE source_table='bad_opaque'"

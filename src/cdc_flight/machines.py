@@ -2,7 +2,7 @@
 
 Rubric 1.9 asks that *any state that can affect consistency is managed with a state
 machine approach*, and grades **an appropriate number of machines (more than one)** at
-5. This file is what "appropriate" means here: twelve focused machines, each owning one state,
+5. This file is what "appropriate" means here: thirteen focused machines, each owning one state,
 each with a declared edge set — plus the frozen decision domains, which are
 classifications rather than states and are deliberately **not** dressed up as machines.
 The count is not the claim; coverage is. See SM-G for `CatalogBaseline`, the fifth
@@ -22,6 +22,8 @@ RunPhase                (per process,   _cdc_flight.heartbeat.phase)
  ├── SchemaRefusal      (per relation, schema_refusals.state)                [N, spans runs]
  ├── DestinationOwnership(per connection, memory only)                       [1, per run]
  └── CommitGroup        (memory only, NO machine — see below)               [1 at a time]
+
+KeylessEvent             (per pipeline/table/event, _cdc_flight.keyless_events.state)
 ```
 
 **Why the commit group is not here, and must not be.** Its states are real
@@ -821,6 +823,32 @@ PHYSICAL_ROW_IDENTITIES = Domain(
 )
 PHYSICAL_ROW_SCHEMA_EPOCHS = Domain(
     "physical_row_schema_epochs", values=("pre", "post", "mixed")
+)
+
+
+# SM-D · KeylessEvent — durable per-event mutation idempotence
+# --------------------------------------------------------------------------- #
+# A keyless row has no source key. The full before-image selects the physical row
+# for DELETE/UPDATE, while this ledger records that the event's physical operation
+# already committed. The self-edge is deliberate: replay is a no-op, never a second
+# physical delete or a resurrecting insert.
+KEYLESS_EVENT_UNSEEN = "unseen"
+KEYLESS_EVENT_APPLIED = "applied"
+
+KEYLESS_EVENT = Machine(
+    "keyless_event",
+    states=(KEYLESS_EVENT_UNSEEN, KEYLESS_EVENT_APPLIED),
+    edges=(
+        (KEYLESS_EVENT_UNSEEN, KEYLESS_EVENT_APPLIED),
+        (KEYLESS_EVENT_APPLIED, KEYLESS_EVENT_APPLIED),
+    ),
+    terminal=(KEYLESS_EVENT_APPLIED,),
+    initial=KEYLESS_EVENT_UNSEEN,
+    durable="_cdc_flight.keyless_events.state",
+    purpose=(
+        "Whether one keyless source event's physical operation has committed; "
+        "replay must remain an applied no-op."
+    ),
 )
 
 

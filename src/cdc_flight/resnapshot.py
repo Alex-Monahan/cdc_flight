@@ -450,6 +450,7 @@ def run(
             control_schema=control_schema,
         )
     descriptor_connection = None
+    descriptor_provider = None
     try:
         # The throwaway applier deliberately has no live CatalogWatcher, but its
         # snapshot shadow must use the same catalog-authoritative descriptors as the
@@ -461,7 +462,7 @@ def run(
 
         descriptor_connection = psycopg.connect(source.dsn, autocommit=True)
         descriptor_provider = RelationDescriptorProvider.from_tables(
-            descriptor_connection, tables
+            descriptor_connection, tables, source_dsn=source.dsn
         ).descriptors_for
         applier = Applier(
             con,
@@ -671,6 +672,9 @@ def run(
             recovery.consume()
         raise
     finally:
+        provider_owner = getattr(descriptor_provider, "__self__", None)
+        if provider_owner is not None and hasattr(provider_owner, "close"):
+            provider_owner.close()
         if descriptor_connection is not None:
             descriptor_connection.close()
         if not source_stopped:

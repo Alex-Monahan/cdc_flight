@@ -11,6 +11,19 @@ from .resnapshot_source_policy import (
 )
 
 
+def summarize_passes(passes: list[dict]) -> dict:
+    """Expose re-snapshot results and preserve deterministic quarantine failures."""
+    summary = {"resnapshot_passes": passes}
+    quarantined = sorted({
+        qualified
+        for detail in passes
+        for qualified in detail.get("resnapshot_quarantined", [])
+    })
+    if quarantined:
+        summary["resnapshot_quarantine_run_not_ok"] = quarantined
+    return summary
+
+
 def run_owed(
     con,
     *,

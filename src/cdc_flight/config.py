@@ -220,6 +220,12 @@ def _flag(name: str, default: bool) -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
+def _qualified_csv(name: str) -> frozenset[str]:
+    """Parse an explicit comma-separated set of qualified source relations."""
+    raw = os.environ.get(name, "")
+    return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
+
 def applier_settings() -> dict:
     """Trigger policy and containment switches for the transactional applier.
 
@@ -271,6 +277,11 @@ def applier_settings() -> dict:
         #: the affected table is queued for an automatic re-snapshot, whose consistent
         #: point necessarily fences the transaction that cannot be folded.
         "resnapshot_on_ambiguity": _flag("CDC_AMBIGUOUS_RESNAPSHOT", True),
+        #: An operator may explicitly acknowledge that a named relation is stale
+        #: while its quarantine remains durable.  This never unblocks the relation
+        #: or resolves its snapshot obligation; it only lets a deliberately chosen
+        #: run report healthy peers without repeating the same run-level error.
+        "acknowledged_quarantines": _qualified_csv("CDC_ACKNOWLEDGE_QUARANTINES"),
     }
 
 
@@ -333,6 +344,10 @@ class ApplierConfig:
     #: re-snapshot of the affected table instead of failing identically for ever.
     #: `CDC_AMBIGUOUS_RESNAPSHOT=0` restores the permanent-failure behaviour.
     resnapshot_on_ambiguity: bool = True
+    #: Explicit operator acknowledgement of already-quarantined stale relations.
+    #: The table remains blocked and visibly stale; no acknowledgement can make its
+    #: destination image current without the declared full re-snapshot.
+    acknowledged_quarantines: frozenset[str] = frozenset()
     #: rubric 1.6: this applier is serving a **re-snapshot** engine, not the
     #: pipeline's own stream. It applies snapshot chunks and DISCARDS streaming
     #: units: the re-snapshot's slot is a throwaway whose offsets nobody reads,

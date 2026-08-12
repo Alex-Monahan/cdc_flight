@@ -320,6 +320,7 @@ def test_planner_contains_a_sibling_typed_value_error_at_the_common_boundary(mon
     """A sibling error must become a durable refusal, never escape the planner."""
     plan = object.__new__(planner.GroupPlan)
     plan.blocked_tables = set()
+    plan.excluded_tables = set()
     plan.snapshots = SimpleNamespace(target_table=lambda _schema, _table: "target")
     plan.commit_id = 1
     plan.work = {}

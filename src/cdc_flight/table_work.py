@@ -5,7 +5,7 @@ This is the layer where the two table shapes become one mechanism (ADR D6):
 | table | identity | effect of a group |
 |---|---|---|
 | keyed | the source key columns | delete every key the group touched, insert the final row per key |
-| keyless | `cdcf_event_id` | delete that event id if present, insert - so a replay cannot duplicate and two byte-identical source rows stay two rows |
+| keyless | full before-image | append INSERTs, replace UPDATEs, and remove exactly one matching physical row for DELETEs; the durable event ledger makes replay a no-op |
 
 **The fold models physical rows, not keys** (ADR §18/A35). That is the correction the
 1.4/1.5 review round forced, and it is the whole of the design:
@@ -120,6 +120,17 @@ class RowMove:
     patch: RowPatch
 
 
+@dataclass(frozen=True)
+class KeylessOperation:
+    """One source-order physical operation for a keyless table."""
+
+    event_id: str
+    operation: str
+    after: dict[str, Any] | None = None
+    before: dict[str, Any] | None = None
+    image_digest: str | None = None
+
+
 @dataclass
 class TableWork:
     """Everything one destination table needs from one commit group."""
@@ -180,6 +191,18 @@ class TableWork:
     #: transaction.  A following INSERT clears the tombstone and is a legal physical
     #: key reuse; an UPDATE must never silently reuse the destination's START row.
     deleted_keys: set[tuple] = field(default_factory=set)
+    #: Keyless tables have no source-key fold. Keep their physical operations in
+    #: source order so a DELETE can consume an INSERT/UPDATE from earlier in the
+    #: same transaction and a later identical INSERT cannot be mistaken for it.
+    keyless_operations: list[KeylessOperation] = field(default_factory=list)
+    #: Event ids admitted to this in-memory plan. The durable ledger is checked by
+    #: the planner before this list is built; this set also catches a duplicate inside
+    #: one group without allowing it to become a second physical operation.
+    keyless_event_ids: set[str] = field(default_factory=set)
+    #: Stream events are written to `_cdc_flight.keyless_events` with the data change
+    #: in the same transaction. Snapshot rows already have the cdcf identity merge;
+    #: their shadow is rebuilt atomically and does not need this stream ledger.
+    keyless_ledger: list[tuple[str, str, str | None]] = field(default_factory=list)
 
 
 def work_for(
@@ -334,6 +357,12 @@ def collect(
     """
     if event.kind == KIND_TRUNCATE:
         truncate(item)
+        # Keep the marker in the same source-order stream as keyless row changes.
+        # `work_for` cannot know the table identity from a truncate envelope because
+        # Debezium deliberately gives it no message key; keyed tables ignore this.
+        item.keyless_operations.append(
+            KeylessOperation(event_id=event_id, operation="t")
+        )
         return
     patch = patch or patch_for(event, 0, event_id, snapshot=item.snapshot)
     descriptors = event.before_descriptors if event.op == "d" else event.after_descriptors
@@ -370,14 +399,61 @@ def collect(
     if patch.has_marker() and event.op in {"c", "r"}:
         _missing_toast_base(item, event)
     if item.keyless:
-        # A keyless table is a changelog (ADR §15/A12): one row per event, identified
-        # by `cdcf_event_id`, and a delete is a row like any other. The identity is
-        # unique per event, so no attribution question can arise and no `START` is
-        # needed - the keyed DELETE of that one event id is what makes a replay
-        # idempotent.
-        if patch.has_marker():
-            _missing_toast_base(item, event, reason="keyless sparse change has no safe base")
-        item.live[(event_id,)] = [patch.encoded_values()]
+        # `cdcf_event_id` remains the destination primary key for INSERT/UPDATE
+        # replay, but it is not the identity of a source row.  A DELETE/UPDATE on a
+        # keyless FULL-identity table must consume the complete before-image instead.
+        # The planner has already checked the durable event ledger; an applied event
+        # is intentionally absent from this source-order operation stream.
+        if (
+            not item.snapshot
+            and probe is not None
+            and hasattr(probe, "keyless_event_applied")
+            and probe.keyless_event_applied(item, event_id)
+        ):
+            return
+        if event_id in item.keyless_event_ids:
+            raise AmbiguousDelete(
+                f"{item.target}: keyless event identity {event_id!r} appeared twice "
+                "in one commit group; refusing to apply an un-attributable physical "
+                "operation",
+                source_schema=item.source_schema,
+                source_table=item.source_table,
+                target=item.target,
+            )
+        if event.op in {"d", "u"}:
+            before = _keyless_complete_image(item, patch if event.op == "d" else _before_patch(event))
+            after = patch.encoded_values() if event.op == "u" else None
+            if event.op == "u":
+                # An UPDATE is a physical replacement, not a changelog INSERT.  A
+                # sparse/TOAST after-image cannot reconstruct the replacement row
+                # without first reading and composing the matched physical row; the
+                # safe outcome is the existing self-healing refusal path.
+                _keyless_complete_image(item, patch, after=True)
+            item.keyless_operations.append(
+                KeylessOperation(
+                    event_id=event_id,
+                    operation=event.op,
+                    before=before,
+                    after=after,
+                    image_digest=patch.digest,
+                )
+            )
+        else:
+            if patch.has_marker():
+                _missing_toast_base(
+                    item, event, reason="keyless sparse change has no safe base"
+                )
+            item.keyless_operations.append(
+                KeylessOperation(
+                    event_id=event_id,
+                    operation=event.op,
+                    after=patch.encoded_values(),
+                    image_digest=patch.digest,
+                )
+            )
+        item.keyless_event_ids.add(event_id)
+        if not item.snapshot:
+            item.keyless_ledger.append((event_id, event.op, patch.digest))
         return
 
     current_values = tuple(
@@ -457,6 +533,54 @@ def collect(
         )
         return
     _place(item, key, patch.encoded_values(), patch=patch)
+
+
+def _before_patch(event: PendingRecord) -> RowPatch:
+    """Decode an UPDATE's old image with the same field-state rules as DELETE."""
+    return RowPatch.from_image(
+        event.before,
+        event.before_descriptors,
+        typed=event.typed_before,
+        complete=True,
+    )
+
+
+def _keyless_complete_image(
+    item: TableWork, patch: RowPatch, *, after: bool = False
+) -> dict[str, Any]:
+    """Return a bindable, complete source image for a keyless physical match."""
+    encoded = patch.encoded_values()
+    source_columns = tuple(
+        column for column in item.native_columns if column not in APPLIER_COLUMN_TYPES
+    )
+    if not source_columns:
+        _missing_toast_base(
+            item,
+            None,
+            reason=(
+                "keyless physical operation has no catalog-authoritative source "
+                "columns"
+            ),
+        )
+    result: dict[str, Any] = {}
+    for column in source_columns:
+        field = patch.field(column)
+        if field.state in {FieldState.UNCHANGED_TOAST, FieldState.ABSENT}:
+            _missing_toast_base(
+                item,
+                None,
+                reason=(
+                    "keyless UPDATE after-image" if after else "keyless DELETE "
+                    "before-image"
+                )
+                + f" has no complete value for column {column!r}",
+            )
+        if field.state not in {FieldState.VALUE, FieldState.EXPLICIT_NULL}:
+            _missing_toast_base(item, None, reason="keyless image has no safe base")
+        # `None` here is an explicit PostgreSQL NULL, not a missing value; the field
+        # state above is what preserves that distinction for the matcher.
+        result[column] = encoded.get(column)
+    return result
 
 
 def truncate(item: TableWork) -> None:
@@ -786,7 +910,15 @@ def _track(item: TableWork, key: tuple, entries: list) -> None:
 # --------------------------------------------------------------------------- #
 # writing the plan
 # --------------------------------------------------------------------------- #
-def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
+def write(
+    con,
+    registry,
+    item: TableWork,
+    created_in_txn: set[str],
+    *,
+    pipeline: str | None = None,
+    control_schema: str | None = None,
+) -> None:
     """Apply one table's plan: `ensure` the shape, delete the touched keys, insert.
 
     Runs on the caller's connection and never opens or closes a transaction: the
@@ -850,6 +982,26 @@ def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
         c for c in columns if c not in table.columns
     ]
     column_order = list(dict.fromkeys(column_order))
+
+    if item.keyless:
+        _write_keyless_operations(
+            con,
+            table,
+            item,
+            column_order,
+            fresh=fresh,
+            pipeline=pipeline,
+            control_schema=control_schema,
+        )
+        _finish_truncate_audit(item)
+        try:
+            apply_sql.assert_identity_is_unique(con, table)
+        except DestinationIdentityCollision as collision:
+            collision.source_schema = item.source_schema
+            collision.source_table = item.source_table
+            collision.target = item.target
+            raise
+        return
 
     delete_keys, rows, partial_updates, moves = _plan(item)
 
@@ -934,6 +1086,124 @@ def write(con, registry, item: TableWork, created_in_txn: set[str]) -> None:
         collision.source_table = item.source_table
         collision.target = item.target
         raise
+
+
+def _write_keyless_operations(
+    con,
+    table,
+    item: TableWork,
+    column_order: list[str],
+    *,
+    fresh: bool,
+    pipeline: str | None,
+    control_schema: str | None,
+) -> None:
+    """Execute keyless physical operations in source order.
+
+    Consecutive INSERTs stay on the bulk materializer.  DELETE and UPDATE are the
+    boundaries where order matters: each full before-image removes one physical row,
+    then UPDATE inserts its full after-image with the new event identity.  The ledger
+    is written only after all data operations have succeeded, still inside the caller's
+    single transaction.
+    """
+    pending: list[dict[str, Any]] = []
+    table_fresh = fresh
+
+    def flush_inserts() -> None:
+        nonlocal table_fresh
+        if not pending:
+            return
+        apply_sql.insert_rows(
+            con,
+            table,
+            column_order,
+            [
+                [
+                    (
+                        _typed_value(table, column, row.get(column))
+                        if table.native_types and column in table.native_types
+                        else apply_sql.bind(
+                            row.get(column), table.columns.get(column, apply_sql.VARCHAR)
+                        )
+                    )
+                    for column in column_order
+            ]
+            for row in pending
+        ],
+        )
+        pending.clear()
+        # A streaming INSERT may be the first operation against a table created in
+        # this same group.  A later TRUNCATE must still remove that newly inserted
+        # row; after the first successful flush the table is no longer empty merely
+        # because it was created during this transaction.
+        table_fresh = False
+
+    for operation in item.keyless_operations:
+        if operation.operation in {"c", "r"}:
+            if operation.after is not None:
+                pending.append(operation.after)
+            continue
+        flush_inserts()
+        if operation.operation == "t":
+            item.rows_removed = 0 if table_fresh else _delete_all(con, table)
+            table_fresh = False
+            continue
+        if operation.operation not in {"d", "u"}:
+            raise SchemaEvolutionRefused(
+                f"{item.target}: unsupported keyless operation {operation.operation!r}",
+                source_schema=item.source_schema,
+                source_table=item.source_table,
+                target=item.target,
+                refusal_origin="table_work",
+            )
+        if operation.before is None:
+            _missing_toast_base(
+                item,
+                None,
+                reason=f"keyless {operation.operation} has no complete before-image",
+            )
+        affected = apply_sql.delete_matching_row(
+            con,
+            table,
+            tuple(operation.before),
+            operation.before,
+        )
+        if affected != 1:
+            _missing_toast_base(
+                item,
+                None,
+                reason=(
+                    f"keyless {operation.operation} before-image matched "
+                    f"{affected} destination row(s), expected exactly one"
+                ),
+            )
+        if operation.operation == "u":
+            if operation.after is None:
+                _missing_toast_base(
+                    item, None, reason="keyless UPDATE has no complete after-image"
+                )
+            pending.append(operation.after)
+            flush_inserts()
+
+    flush_inserts()
+    if item.keyless_ledger and not item.snapshot and pipeline:
+        from . import destination
+
+        destination_rows = [
+            (
+                item.target,
+                event_id,
+                operation,
+                digest,
+            )
+            for event_id, operation, digest in item.keyless_ledger
+        ]
+        destination.write_keyless_events(
+            con,
+            destination_rows,
+            pipeline=pipeline,
+            control_schema=control_schema,
+        )
 
 
 def _typed_value(table, column: str, value):

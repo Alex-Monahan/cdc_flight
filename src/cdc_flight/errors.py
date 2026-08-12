@@ -198,6 +198,40 @@ class DestinationIdentityCollision(RuntimeError):
         self.target = target
 
 
+class DestinationExecutionFailure(RuntimeError):
+    """A destination SQL operation invalidated the current table transaction.
+
+    This is intentionally separate from ``DestinationFault`` (the test injector's
+    protocol failure) and from engine-level commit/connection failures.  The planner
+    raises it only for a concrete destination execution error while writing one table;
+    the commit owner can then roll back, durably quarantine that table independently,
+    and replay the same source transaction with healthy tables still eligible.
+    """
+
+    def __init__(self, refused: SchemaEvolutionRefused, original: Exception):
+        super().__init__(str(original))
+        self.refused = refused
+        self.original = original
+
+
+class TableWriteFailure(RuntimeError):
+    """A table write failed after the fold reached the destination.
+
+    DuckDB does not expose the savepoint syntax this applier would need to roll back
+    one table while retaining the source transaction's healthy peers.  The commit
+    owner therefore rolls the whole group back, records this table's refusal through
+    the independent sink, and replays the source transaction with that table held
+    out.  Keeping this distinct from a destination SQL error preserves attribution:
+    a Python/materializer failure is contained, while an engine/programming error
+    remains loud.
+    """
+
+    def __init__(self, refused: SchemaEvolutionRefused, original: Exception):
+        super().__init__(str(original))
+        self.refused = refused
+        self.original = original
+
+
 class SchemaEvolutionRefused(AdmissionError):
     """A catalog schema transition cannot be applied without guessing.
 

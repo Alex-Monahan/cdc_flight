@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 
@@ -170,10 +171,23 @@ class RelationDescriptorProvider:
 
     relations: dict[str, dict[str, SourceTypeDescriptor]]
     source_dsn: str | None = None
+    _event_read_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
+    _event_read_conn: object | None = field(default=None, init=False, repr=False)
 
     @classmethod
-    def from_tables(cls, con, tables: Iterable[tuple[str, str, str]]) -> RelationDescriptorProvider:
-        source_dsn = getattr(getattr(con, "info", None), "dsn", None)
+    def from_tables(
+        cls,
+        con,
+        tables: Iterable[tuple[str, str, str]],
+        *,
+        source_dsn: str | None = None,
+    ) -> RelationDescriptorProvider:
+        # psycopg intentionally removes the password from ``ConnectionInfo.dsn``.
+        # Callers that already own the configured source DSN must pass it through so
+        # a later opaque-array recovery connection does not silently lose credentials.
+        source_dsn = source_dsn or getattr(getattr(con, "info", None), "dsn", None)
         requested = sorted(
             {(str(schema), str(table), str(target)) for schema, table, target in tables}
         )
@@ -252,7 +266,7 @@ class RelationDescriptorProvider:
         return dict(self.relations.get(str(qualified), {}))
 
     def read_event_columns(self, event, value_columns):
-        """Recover omitted opaque-array fields through a short source read."""
+        """Recover omitted opaque-array fields through one bounded source session."""
         if not self.source_dsn:
             raise SchemaEvolutionRefused(
                 "the bounded descriptor provider has no source connection for "
@@ -266,10 +280,27 @@ class RelationDescriptorProvider:
 
         from . import catalog_support
 
-        with psycopg.connect(self.source_dsn, autocommit=True) as con:
-            return catalog_support.read_event_columns_from_connection(
-                con, event, value_columns
-            )
+        with self._event_read_lock:
+            con = self._event_read_conn
+            if con is None or con.closed:
+                con = psycopg.connect(self.source_dsn, autocommit=True)
+                self._event_read_conn = con
+            try:
+                return catalog_support.read_event_columns_from_connection(
+                    con, event, value_columns
+                )
+            except Exception:
+                con.close()
+                self._event_read_conn = None
+                raise
+
+    def close(self) -> None:
+        """Release the bounded opaque-array recovery connection."""
+        with self._event_read_lock:
+            con = self._event_read_conn
+            self._event_read_conn = None
+            if con is not None:
+                con.close()
 
 
 def relation_descriptor_fingerprint(
@@ -363,7 +394,7 @@ def provider_for_source(source) -> object:
 
     with psycopg.connect(source.dsn, autocommit=True) as descriptor_con:
         return RelationDescriptorProvider.from_tables(
-            descriptor_con, requested
+            descriptor_con, requested, source_dsn=source.dsn
         ).descriptors_for
 
 

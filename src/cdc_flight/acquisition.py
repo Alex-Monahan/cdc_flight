@@ -168,7 +168,13 @@ def check_the_slot(
         log.error(
             "%s: %s", verdict.decision, verdict.message,
         )
-        marker_value = f"{replication.slot_name}:{verdict.decision}"
+        # Include the observed slot position so a later repaired/recreated slot is a
+        # new alert incident, while repeated starts against the same standing cell
+        # remain deduplicated (R14-11).
+        marker_value = (
+            f"{replication.slot_name}:{verdict.decision}:"
+            f"{observation.confirmed_flush_lsn}"
+        )
         if not dest_mod.alert_marker_exists(
             con,
             pipeline=dest.pipeline_name,

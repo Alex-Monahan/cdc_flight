@@ -157,6 +157,98 @@ def test_two_byte_identical_source_rows_are_two_rows(lab):
     assert box.scalar(f'SELECT count(*) FROM "{DATASET}"."{READINGS}"') == 2
 
 
+def test_keyless_delete_consumes_one_full_duplicate_and_replay_is_a_noop(lab):
+    """A FULL before-image names one physical row, never an event-id row."""
+    box = lab()
+    seed = [
+        data("seed", 1, 100, table="keyless_delete", after={"id": 7, "value": "same", "note": None}),
+        data("seed", 2, 101, table="keyless_delete", after={"id": 7, "value": "same", "note": None}),
+        data("seed", 3, 102, table="keyless_delete", after={"id": 7, "value": "same", "note": None}),
+        end("seed", 3, 110, {"app.keyless_delete": 3}),
+    ]
+    box.run(seed)
+    before = {"id": 7, "value": "same", "note": None}
+    delete = data(
+        "delete",
+        1,
+        200,
+        table="keyless_delete",
+        op="d",
+        before=before,
+    )
+    box.run([delete, end("delete", 1, 210, {"app.keyless_delete": 1})])
+    assert box.scalar(
+        'SELECT count(*) FROM "cdc_raw"."cdcflight_app_keyless_delete"'
+    ) == 2
+
+    # Re-admit the exact source coordinates, bypassing only the lab's resume fence.
+    # The durable keyless event state, not a process-local set, must make this a no-op.
+    box.applier.resume_point = ResumePoint(last_lsn=0)
+    box.run([delete, end("delete", 1, 210, {"app.keyless_delete": 1})])
+    assert box.scalar(
+        'SELECT count(*) FROM "cdc_raw"."cdcflight_app_keyless_delete"'
+    ) == 2
+    assert box.scalar(
+        'SELECT count(*) FROM "cdc_raw"."cdcflight_app_keyless_delete" '
+        "WHERE id = 7 AND value = 'same' AND note IS NULL"
+    ) == 2
+
+
+def test_keyless_delete_reinsert_and_update_fold_in_source_order(lab):
+    """Delete/reinsert and a full-image UPDATE preserve physical-row semantics."""
+    box = lab()
+    original = {"id": 8, "value": "before", "note": "nullable"}
+    box.run(
+        [
+            data("seed", 1, 300, table="keyless_order", after=original),
+            end("seed", 1, 310, {"app.keyless_order": 1}),
+        ]
+    )
+    old_id = box.scalar(
+        'SELECT cdcf_event_id FROM "cdc_raw"."cdcflight_app_keyless_order"'
+    )
+    replacement = data(
+        "reuse",
+        2,
+        401,
+        table="keyless_order",
+        op="c",
+        after=original,
+    )
+    box.run(
+        [
+            data("reuse", 1, 400, table="keyless_order", op="d", before=original),
+            replacement,
+            end("reuse", 2, 410, {"app.keyless_order": 2}),
+        ]
+    )
+    assert box.q(
+        'SELECT cdcf_event_id, id, value, note FROM '
+        '"cdc_raw"."cdcflight_app_keyless_order"'
+    ) == [("401:reuse:2", 8, "before", "nullable")]
+    assert old_id != "401:reuse:2"
+
+    updated = {"id": 8, "value": "after", "note": None}
+    box.run(
+        [
+            data(
+                "update",
+                1,
+                500,
+                table="keyless_order",
+                op="u",
+                before=original,
+                after=updated,
+            ),
+            end("update", 1, 510, {"app.keyless_order": 1}),
+        ]
+    )
+    assert box.q(
+        'SELECT id, value, note, cdcf_event_id FROM '
+        '"cdc_raw"."cdcflight_app_keyless_order"'
+    ) == [(8, "after", None, "500:update:1")]
+
+
 def test_the_ordinal_contract_is_enforced_before_the_identity_is_built():
     """A unit-level restatement: nothing that reaches the applier can collide.
 

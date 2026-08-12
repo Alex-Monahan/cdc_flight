@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import shutil
+from datetime import date, timedelta
 
 import pytest
 from support.applier_lab import Lab, data, end, snap
@@ -28,6 +30,13 @@ NUMRANGE = SourceTypeDescriptor(
 NUMMULTIRANGE = SourceTypeDescriptor(
     4532, "pg_catalog.nummultirange", "multirange", range_subtype=NUMRANGE
 )
+
+
+def _fresh_real_sandbox(sandbox) -> None:
+    """Separate module-scoped real-source scenarios by deleting only their temp sink."""
+    sandbox.drop_slot()
+    shutil.rmtree(sandbox.state_dir, ignore_errors=True)
+    sandbox.duckdb_path.unlink(missing_ok=True)
 
 
 def _temporal_descriptors():
@@ -166,6 +175,37 @@ def test_temporal_infinity_is_a_real_key_and_delete_reuses_the_same_identity():
         assert con.execute(
             'SELECT CAST("key" AS VARCHAR), payload FROM typed.temporal_keys'
         ).fetchall() == [("-infinity", "negative")]
+    finally:
+        con.close()
+
+
+def test_large_delete_key_staging_keeps_temporal_infinity_on_typed_path():
+    """The >2,000-key DELETE path must not send PostgreSQL infinity through Arrow."""
+    import duckdb
+
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("CREATE SCHEMA typed")
+        registry = SchemaRegistry(con, "typed")
+        registry.ensure_typed(
+            "large_temporal_keys",
+            columns={"key": DATE, "payload": TEXT},
+            key_columns=("key",),
+        )
+        table = registry.get("large_temporal_keys")
+        finite = [date(2000, 1, 1) + timedelta(days=index) for index in range(2001)]
+        keys = [(PostgresInfinity(True),), *[(value,) for value in finite]]
+        insert_rows(
+            con,
+            table,
+            ["key", "payload"],
+            [[key[0], str(index)] for index, key in enumerate(keys)],
+        )
+        assert con.execute("SELECT count(*) FROM typed.large_temporal_keys").fetchone() == (
+            2002,
+        )
+        delete_keys(con, table, ("key",), keys)
+        assert con.execute("SELECT count(*) FROM typed.large_temporal_keys").fetchone() == (0,)
     finally:
         con.close()
 
@@ -324,6 +364,229 @@ def test_synthetic_builtin_failure_is_contained_to_one_table(tmp_path, monkeypat
         box.close()
 
 
+def test_materializer_failure_after_table_delete_rolls_back_the_whole_group(
+    tmp_path, monkeypatch
+):
+    """A Python failure after DML cannot commit a torn table image."""
+    original = typed_materialization._bulk_insert_typed_rows
+    box = Lab(tmp_path / "torn-write.duckdb")
+    try:
+        box.run(
+            [
+                data(
+                    "torn-baseline",
+                    1,
+                    100,
+                    table="torn_bad",
+                    key={"id": 1},
+                    after={"id": 1, "name": "old"},
+                ),
+                data(
+                    "torn-baseline",
+                    2,
+                    101,
+                    table="torn_bad",
+                    key={"id": 2},
+                    after={"id": 2, "name": "keep"},
+                ),
+                end("torn-baseline", 2, 102, {"app.torn_bad": 2}),
+            ]
+        )
+
+        def delete_then_raise(con, table, columns, rows):
+            if rows and table.name.endswith("torn_bad"):
+                con.execute(
+                    f'DELETE FROM {table.qualified} WHERE "id" = 1'
+                )
+                raise ValueError("synthetic post-delete materializer failure")
+            return original(con, table, columns, rows)
+
+        monkeypatch.setattr(
+            typed_materialization, "_bulk_insert_typed_rows", delete_then_raise
+        )
+        box.run(
+            [
+                data(
+                    "torn-change",
+                    1,
+                    200,
+                    table="torn_bad",
+                    op="d",
+                    key={"id": 1},
+                    before={"id": 1, "name": "old"},
+                ),
+                data(
+                    "torn-change",
+                    2,
+                    201,
+                    table="torn_bad",
+                    key={"id": 1},
+                    after={"id": 1, "name": "new"},
+                ),
+                data(
+                    "torn-change",
+                    3,
+                    202,
+                    table="torn_peer",
+                    key={"id": 1},
+                    after={"id": 1, "name": "healthy"},
+                ),
+                end(
+                    "torn-change",
+                    3,
+                    203,
+                    {"app.torn_bad": 2, "app.torn_peer": 1},
+                ),
+            ]
+        )
+        # The first attempt deleted the old row before the injected failure.  The
+        # commit owner must roll that whole group back before replaying the healthy
+        # peer with torn_bad excluded.
+        assert box.rows(box.target("torn_bad"), "id, name", "id") == [
+            (1, "old"),
+            (2, "keep"),
+        ]
+        assert box.rows(box.target("torn_peer"), "id, name", "id") == [
+            (1, "healthy")
+        ]
+        assert box.q(
+            "SELECT state FROM _cdc_flight.schema_refusals "
+            "WHERE source_table = 'torn_bad'"
+        ) == [("pending",)]
+        assert box.applier.error is not None
+        assert "ValueError" in box.applier._contained_failures[0]["exception_type"]
+    finally:
+        box.close()
+
+
+def test_an_explicit_quarantine_ack_is_loudly_recorded_but_does_not_unblock(
+    tmp_path, monkeypatch
+):
+    """An operator acknowledgement suppresses only the repeated run failure."""
+    original = typed_materialization._bulk_insert_typed_rows
+
+    def fail_only_bad(con, table, columns, rows):
+        if rows and table.name.endswith("ack_bad"):
+            raise ValueError("synthetic acknowledged materializer failure")
+        return original(con, table, columns, rows)
+
+    monkeypatch.setattr(typed_materialization, "_bulk_insert_typed_rows", fail_only_bad)
+    path = tmp_path / "acknowledged-quarantine.duckdb"
+    first = Lab(path)
+    try:
+        for ident in (1, 2):
+            first.run(
+                [
+                    data(
+                        f"ack-{ident}",
+                        1,
+                        300 + ident,
+                        table="ack_bad",
+                        key={"id": ident},
+                        after={"id": ident, "name": f"bad-{ident}"},
+                    ),
+                    data(
+                        f"ack-{ident}",
+                        2,
+                        400 + ident,
+                        table="ack_peer",
+                        key={"id": ident},
+                        after={"id": ident, "name": f"peer-{ident}"},
+                    ),
+                    end(
+                        f"ack-{ident}",
+                        2,
+                        500 + ident,
+                        {"app.ack_bad": 1, "app.ack_peer": 1},
+                    ),
+                ]
+            )
+        assert first.q(
+            "SELECT state FROM _cdc_flight.schema_refusals "
+            "WHERE source_table = 'ack_bad'"
+        ) == [("quarantined",)]
+    finally:
+        first.lease.release(first.con)
+        first.close()
+
+    acknowledged = Lab(
+        path,
+        acknowledged_quarantines=frozenset({"app.ack_bad"}),
+    )
+    try:
+        acknowledged.run(
+            [
+                data(
+                    "ack-replay",
+                    1,
+                    600,
+                    table="ack_bad",
+                    key={"id": 3},
+                    after={"id": 3, "name": "still-blocked"},
+                ),
+                data(
+                    "ack-replay",
+                    2,
+                    601,
+                    table="ack_peer",
+                    key={"id": 3},
+                    after={"id": 3, "name": "peer-3"},
+                ),
+                end("ack-replay", 2, 602, {"app.ack_bad": 1, "app.ack_peer": 1}),
+            ]
+        )
+        assert acknowledged.applier.error is None
+        assert acknowledged.applier._acknowledged_quarantines == {"app.ack_bad"}
+        assert acknowledged.rows(acknowledged.target("ack_peer"), "id, name", "id") == [
+            (1, "peer-1"),
+            (2, "peer-2"),
+            (3, "peer-3"),
+        ]
+        assert acknowledged.q(
+            "SELECT state FROM _cdc_flight.schema_refusals "
+            "WHERE source_table = 'ack_bad'"
+        ) == [("quarantined",)]
+        assert not acknowledged.exists(acknowledged.target("ack_bad"))
+    finally:
+        acknowledged.close()
+
+
+def test_destination_programming_error_is_loud_not_a_table_quarantine(tmp_path, monkeypatch):
+    """A malformed destination statement stays an engine/programming failure."""
+    import duckdb
+
+    original = typed_materialization._bulk_insert_typed_rows
+
+    def fail_with_bad_sql(con, table, columns, rows):
+        if table.name.endswith("programming_bad"):
+            con.execute("SELECT definitely_missing_column FROM definitely_missing_table")
+        return original(con, table, columns, rows)
+
+    monkeypatch.setattr(typed_materialization, "_bulk_insert_typed_rows", fail_with_bad_sql)
+    box = Lab(tmp_path / "programming-error.duckdb")
+    try:
+        with pytest.raises(duckdb.CatalogException):
+            box.run(
+                [
+                    data(
+                        "programming",
+                        1,
+                        100,
+                        table="programming_bad",
+                        key={"id": 1},
+                        after={"id": 1, "name": "bad"},
+                    ),
+                    end("programming", 1, 101, {"app.programming_bad": 1}),
+                ]
+            )
+        assert box.q(
+            "SELECT count(*) FROM _cdc_flight.schema_refusals "
+            "WHERE source_table = 'programming_bad'"
+        ) == [(0,)]
+    finally:
+        box.close()
+
+
 @pytest.mark.slow
 @pytest.mark.e2e
 def test_real_slot_advances_when_a_builtin_materializer_failure_is_injected(sandbox, tmp_path):
@@ -339,11 +602,14 @@ def test_real_slot_advances_when_a_builtin_materializer_failure_is_injected(sand
         "CDC_AUTO_DISCOVERY": "0",
         "CDC_TABLES": "fix14_any_exception_bad,fix14_any_exception_peer",
     }
+    _fresh_real_sandbox(sandbox)
     sandbox.reseed()
     with psycopg.connect(sandbox.source.dsn, autocommit=True) as conn:
         conn.execute(f"DROP TABLE IF EXISTS {bad}")
         conn.execute(f"DROP TABLE IF EXISTS {peer}")
-        conn.execute(f"CREATE TABLE {bad} (id integer PRIMARY KEY, name text)")
+        conn.execute(
+            f"CREATE TABLE {bad} (id integer PRIMARY KEY, name text, payload jsonb)"
+        )
         conn.execute(f"CREATE TABLE {peer} (id integer PRIMARY KEY, name text)")
         conn.execute(f"ALTER PUBLICATION {publication} ADD TABLE {bad}, {peer}")
 
@@ -353,12 +619,20 @@ def test_real_slot_advances_when_a_builtin_materializer_failure_is_injected(sand
     hook = tmp_path / "sitecustomize.py"
     hook.write_text(
         "from cdc_flight import typed_materialization as _tm\n"
-        "_real = _tm._bulk_insert_typed_rows\n"
-        "def _fail_one(con, table, columns, rows):\n"
-        "    if 'fix14_any_exception_bad' in table.name:\n"
+        "_real_bulk = _tm.bulk_insert\n"
+        "_real_typed = _tm.insert_typed_rows\n"
+        "def _bad(target):\n"
+        "    return 'fix14_any_exception_bad' in str(target)\n"
+        "def _fail_bulk(con, target, columns, rows, types=None, **kwargs):\n"
+        "    if rows and _bad(target):\n"
         "        raise ValueError('synthetic third-party materializer failure')\n"
-        "    return _real(con, table, columns, rows)\n"
-        "_tm._bulk_insert_typed_rows = _fail_one\n",
+        "    return _real_bulk(con, target, columns, rows, types, **kwargs)\n"
+        "def _fail_typed(con, table, columns, rows, native_types, **kwargs):\n"
+        "    if rows and _bad(table.qualified):\n"
+        "        raise ValueError('synthetic third-party materializer failure')\n"
+        "    return _real_typed(con, table, columns, rows, native_types, **kwargs)\n"
+        "_tm.bulk_insert = _fail_bulk\n"
+        "_tm.insert_typed_rows = _fail_typed\n",
         encoding="utf-8",
     )
     pipeline_env = {
@@ -392,7 +666,7 @@ def test_real_slot_advances_when_a_builtin_materializer_failure_is_injected(sand
         for ident in range(1, 5):
             sandbox.sql(
                 [
-                    f"INSERT INTO {bad} VALUES ({ident}, 'bad-{ident}')",
+                    f"INSERT INTO {bad} VALUES ({ident}, 'bad-{ident}', '{{\"kind\": \"bad\"}}')",
                     f"INSERT INTO {peer} VALUES ({ident}, 'peer-{ident}')",
                 ],
                 one_transaction=True,
@@ -403,7 +677,7 @@ def test_real_slot_advances_when_a_builtin_materializer_failure_is_injected(sand
                 timeout=150,
                 expect_success=False,
             )
-            assert run["ok"] is False, run
+            assert run["ok"] is False, run.get("output", run)
             assert run["error_cause_type"] == "SchemaEvolutionRefused", run
             # The first run carries the raw builtin in the run cause.  Once the
             # durable table is quarantined, later runs fail closed on the retained
@@ -439,3 +713,130 @@ def test_real_slot_advances_when_a_builtin_materializer_failure_is_injected(sand
             conn.execute(f"ALTER PUBLICATION {publication} DROP TABLE {bad}, {peer}")
             conn.execute(f"DROP TABLE IF EXISTS {bad}")
             conn.execute(f"DROP TABLE IF EXISTS {peer}")
+
+
+@pytest.mark.slow
+@pytest.mark.e2e
+def test_real_destination_error_is_contained_over_four_runs_with_wal_metrics(
+    sandbox, tmp_path
+):
+    """A real DuckDB statement error is loud, table-scoped, and slot-safe."""
+    import os
+
+    import psycopg
+
+    publication = "cdc_flight_pub"
+    bad_tables = [f"app.r15_destination_error_bad_{index}" for index in range(1, 5)]
+    peer = "app.r15_destination_error_peer"
+    capture = {
+        "CDC_AUTO_DISCOVERY": "0",
+        "CDC_TABLES": ",".join(
+            [table.rsplit(".", 1)[1] for table in [*bad_tables, peer]]
+        ),
+    }
+    _fresh_real_sandbox(sandbox)
+    sandbox.reseed()
+    with psycopg.connect(sandbox.source.dsn, autocommit=True) as conn:
+        conn.execute("DROP TABLE IF EXISTS " + ", ".join([*bad_tables, peer]))
+        for table in bad_tables:
+            conn.execute(
+                f"CREATE TABLE {table} (id integer PRIMARY KEY, name text, payload jsonb)"
+            )
+        conn.execute(f"CREATE TABLE {peer} (id integer PRIMARY KEY, name text)")
+        conn.execute(
+            "ALTER PUBLICATION " + publication + " ADD TABLE "
+            + ", ".join([*bad_tables, peer])
+        )
+    hook = tmp_path / "sitecustomize.py"
+    hook.write_text(
+        "from cdc_flight import typed_materialization as _tm\n"
+        "_real_bulk = _tm.bulk_insert\n"
+        "_real_typed = _tm.insert_typed_rows\n"
+        "def _bad(target):\n"
+        "    return 'r15_destination_error_bad_' in str(target)\n"
+        "def _fail_bulk(con, target, columns, rows, types=None, **kwargs):\n"
+        "    if rows and _bad(target):\n"
+        "        con.execute(\"SELECT CAST('destination-r15-error' AS INTEGER)\")\n"
+        "    return _real_bulk(con, target, columns, rows, types, **kwargs)\n"
+        "def _fail_typed(con, table, columns, rows, native_types, **kwargs):\n"
+        "    if rows and _bad(table.qualified):\n"
+        "        con.execute(\"SELECT CAST('destination-r15-error' AS INTEGER)\")\n"
+        "    return _real_typed(con, table, columns, rows, native_types, **kwargs)\n"
+        "_tm.bulk_insert = _fail_bulk\n"
+        "_tm.insert_typed_rows = _fail_typed\n",
+        encoding="utf-8",
+    )
+    pipeline_env = {
+        **capture,
+        "PYTHONPATH": os.pathsep.join(
+            item for item in (str(tmp_path), os.environ.get("PYTHONPATH", "")) if item
+        ),
+    }
+
+    def slot_metrics():
+        sandbox.sql("CHECKPOINT")
+        return sandbox.pg_query(
+            "SELECT restart_lsn::text, confirmed_flush_lsn::text, "
+            "pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint, "
+            "(restart_lsn - '0/0')::bigint, "
+            "(confirmed_flush_lsn - '0/0')::bigint "
+            "FROM pg_replication_slots WHERE slot_name = %s",
+            (sandbox.slot,),
+        )[0]
+
+    try:
+        baseline = sandbox.run(
+            reset_state=True,
+            extra_env=pipeline_env,
+            max_seconds=150,
+            timeout=300,
+        )
+        assert baseline["ok"] is True, baseline
+        metrics = []
+        for index, bad in enumerate(bad_tables, start=1):
+            sandbox.sql(
+                [
+                    f"INSERT INTO {bad} VALUES ({index}, 'bad-{index}', '{{\"kind\": \"bad\"}}')",
+                    f"INSERT INTO {peer} VALUES ({index}, 'healthy-{index}')",
+                ],
+                one_transaction=True,
+            )
+            failed = sandbox.run(
+                extra_env=pipeline_env,
+                expect_success=False,
+                max_seconds=150,
+                timeout=300,
+            )
+            assert failed["ok"] is False, failed.get("output", failed)
+            assert failed["error_cause_type"] == "SchemaEvolutionRefused", failed
+            metrics.append(slot_metrics())
+            reason = sandbox.duck_query(
+                "SELECT reason FROM _cdc_flight.schema_refusals "
+                "WHERE source_table = ?",
+                [bad.rsplit(".", 1)[1]],
+            )[0][0]
+            assert "ConversionException" in reason, reason
+
+        restart = [int(row[3]) for row in metrics]
+        confirmed = [int(row[4]) for row in metrics]
+        retained = [int(row[2]) for row in metrics]
+        assert restart == sorted(restart) and len(set(restart)) == 4, metrics
+        assert confirmed == sorted(confirmed) and len(set(confirmed)) == 4, metrics
+        assert all(value >= 0 for value in retained), metrics
+        assert all(int(row[3]) <= int(row[4]) for row in metrics), metrics
+        assert sandbox.duck_query(
+            "SELECT id, name FROM cdc_raw.cdcflight_app_r15_destination_error_peer "
+            "ORDER BY id"
+        ) == [(index, f"healthy-{index}") for index in range(1, 5)]
+        assert sandbox.duck_query(
+            "SELECT count(*) FROM _cdc_flight.alerts "
+            "WHERE code = 'table_exception_contained'"
+        ) == [(4,)]
+        print("FIX15 destination-raised LSN/WAL metrics:", metrics)
+    finally:
+        with psycopg.connect(sandbox.source.dsn, autocommit=True) as conn:
+            conn.execute(
+                "ALTER PUBLICATION " + publication + " DROP TABLE "
+                + ", ".join([*bad_tables, peer])
+            )
+            conn.execute("DROP TABLE IF EXISTS " + ", ".join([*bad_tables, peer]))

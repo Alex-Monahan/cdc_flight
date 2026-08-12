@@ -15,6 +15,10 @@ them must not. Nothing that deduplicates by row content can satisfy both halves.
 
 from __future__ import annotations
 
+import psycopg
+
+from cdc_flight.config import ReplicationConfig
+
 READINGS = '"cdc_raw"."cdcflight_app_sensor_readings"'
 REPLAY_FILTER = "sensor_id = 'REPLAY'"
 
@@ -27,6 +31,44 @@ def _identical(crash_replay) -> str:
     insertion order.
     """
     return f"sensor_id = '{crash_replay['identical_sensor']}'"
+
+
+def test_keyless_delete_removes_the_full_before_image(sandbox):
+    """A real FULL-identity DELETE removes its source row exactly once."""
+    publication = ReplicationConfig().publication_name
+    table = "app.r15_keyless_delete_probe"
+    capture = {
+        "CDC_AUTO_DISCOVERY": "0",
+        "CDC_TABLES": "r15_keyless_delete_probe",
+    }
+    sandbox.reseed()
+    with psycopg.connect(sandbox.source.dsn, autocommit=True) as conn:
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+        conn.execute(f"CREATE TABLE {table} (id integer, value text, note text)")
+        conn.execute(f"ALTER TABLE {table} REPLICA IDENTITY FULL")
+        conn.execute(f"ALTER PUBLICATION {publication} ADD TABLE {table}")
+        conn.execute(
+            f"INSERT INTO {table} VALUES (1, 'gone', 'before'), (2, 'keep', 'after')"
+        )
+
+    try:
+        snapshot = sandbox.run(reset_state=True, extra_env=capture)
+        assert snapshot["ok"] is True, snapshot
+
+        sandbox.sql(f"DELETE FROM {table} WHERE id = 1")
+        streamed = sandbox.run(extra_env=capture)
+        assert streamed["ok"] is True, streamed
+
+        source = sandbox.pg_query(f"SELECT id, value, note FROM {table} ORDER BY id")
+        landed = sandbox.duck_query(
+            'SELECT "id", "value", "note" FROM '
+            '"cdc_raw"."cdcflight_app_r15_keyless_delete_probe" ORDER BY "id"'
+        )
+        assert landed == source
+    finally:
+        with psycopg.connect(sandbox.source.dsn, autocommit=True) as conn:
+            conn.execute(f"ALTER PUBLICATION {publication} DROP TABLE {table}")
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
 
 
 

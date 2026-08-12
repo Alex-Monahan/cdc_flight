@@ -16,7 +16,10 @@ The plan is also where rubric 1.4's attribution question is *answered* rather th
 asked: `table_work` folds physical rows and asks this module two things about the
 destination (`start_exists`, `start_matches`), both only where two rows compete for
 one key. They run during the fold, before the group has issued any DELETE or INSERT
-for the table, so what they read is genuinely the pre-group state.
+for the table, so what they read is genuinely the pre-group state.  If a later
+materializer step fails after table DML, the commit owner rolls back the complete
+source transaction and replays healthy tables with the failed relation excluded;
+there is no attempt to commit a torn in-place table.
 """
 
 from __future__ import annotations
@@ -32,8 +35,10 @@ from .envelope import KIND_TRUNCATE, PendingRecord
 from .errors import (
     AdmissionError,
     AmbiguousDelete,
+    DestinationExecutionFailure,
     DestinationIdentityCollision,
     SchemaEvolutionRefused,
+    TableWriteFailure,
     ToastBaseMissing,
 )
 from .faults import DestinationFault
@@ -69,6 +74,50 @@ def input_fingerprint(event: PendingRecord) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _is_destination_execution_error(error: Exception) -> bool:
+    """Recognize the destination driver's execution errors, and only those.
+
+    Only errors that describe a rejected destination value/constraint are table data
+    failures. Binder, catalog, parser, connection, internal, and resource errors are
+    programming/engine failures and must remain loud. The distinction prevents a
+    malformed statement in our own code from becoming a data quarantine.
+    """
+    try:
+        import duckdb
+
+        classes = tuple(
+            getattr(duckdb, name)
+            for name in (
+                "ConversionException",
+                "ConstraintException",
+                "OutOfRangeException",
+                "TransactionException",
+            )
+            if hasattr(duckdb, name)
+        )
+        return bool(classes) and isinstance(error, classes)
+    except ImportError:  # pragma: no cover - DuckDB is a production dependency
+        return type(error).__name__ in {
+            "ConversionException",
+            "ConstraintException",
+            "OutOfRangeException",
+            "TransactionException",
+        }
+
+
+def _is_uncontainable_destination_error(error: Exception) -> bool:
+    """Keep destination programming/engine failures outside table quarantine."""
+    try:
+        import duckdb
+
+        return isinstance(error, duckdb.Error) and not _is_destination_execution_error(error)
+    except ImportError:  # pragma: no cover - DuckDB is a production dependency
+        return (
+            type(error).__module__.split(".", 1)[0] == "duckdb"
+            and not _is_destination_execution_error(error)
+        )
+
+
 class GroupPlan:
     """Everything one commit group does to the data tables.
 
@@ -97,6 +146,7 @@ class GroupPlan:
         pipeline: str | None = None,
         control_schema: str | None = None,
         blocked_tables: set[str] | None = None,
+        excluded_tables: set[str] | None = None,
         contain_table_failure=None,
     ):
         self.con = con
@@ -127,6 +177,11 @@ class GroupPlan:
         # group therefore share one refusal decision and healthy co-published tables
         # remain eligible.
         self.blocked_tables = set(blocked_tables or ())
+        #: A destination execution failure is quarantined after rollback, then the
+        #: original whole source transaction is replayed with only this table held
+        #: out. This is distinct from ordinary durable blocked-table admission: it is
+        #: a one-retry exclusion owned by the commit protocol.
+        self.excluded_tables = set(excluded_tables or ())
         self.quarantined_tables = self.blocked_tables  # compatibility for summaries
         self.watermark_fenced_events = 0
         self._catalog_descriptor_cache: dict[str, dict] = {}
@@ -136,6 +191,7 @@ class GroupPlan:
         self._contained_tables: set[str] = set()
         self._failed_snapshot_targets: set[str] = set()
         self._failure_fingerprints: dict[str, str] = {}
+        self._keyless_event_states: dict[tuple[str, str], str | None] = {}
 
         self.work: dict[str, TableWork] = {}
         self.stats: dict = {
@@ -285,6 +341,10 @@ class GroupPlan:
         if not event.schema or not event.table:
             return
         if event.qualified_table in getattr(self, "_contained_tables", ()):
+            self._count_event(event)
+            self.stats["quarantined_events"] += 1
+            return
+        if event.qualified_table in self.excluded_tables:
             self._count_event(event)
             self.stats["quarantined_events"] += 1
             return
@@ -509,6 +569,19 @@ class GroupPlan:
             input_fingerprint=fingerprint,
         )
         self._mark_contained(qualified, item.target, refused, error)
+
+    def _item_fingerprint(self, item: TableWork) -> str:
+        payload = {
+            "table": (
+                f"{item.source_schema}.{item.source_table}"
+                if item.source_schema and item.source_table
+                else item.target
+            ),
+            "target": item.target,
+            "columns": sorted(item.columns),
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _as_contained_refusal(
@@ -758,24 +831,22 @@ class GroupPlan:
                 detected_lsn=event.lsn,
                 refusal_origin="typed_planner",
             ) from exc
-        # A DELETE quite correctly has no current source row.  Its key is enough
-        # to remove the destination row; fill only the omitted before-image fields
-        # with SQL NULL so the completeness contract remains explicit.  Every
-        # insert/update/snapshot must have a current row to preserve its values.
+        # The stock connector omits opaque xml[] fields from the event itself.  A
+        # short-lived INSERT can therefore be gone before this planner sees it.  Do
+        # not turn that timing race into a table-wide refusal: an explicit SQL NULL
+        # is the only non-synthetic value available, and a same-transaction
+        # INSERT/DELETE is folded away before a destination row is written.  Stable
+        # rows still use the source output value when the reader can observe them;
+        # the limitation is recorded loudly in the run log rather than hidden as a
+        # fabricated XML string.
         if values is None:
-            if event.op == "d":
-                values = {name: None for name in columns}
-            else:
-                raise SchemaEvolutionRefused(
-                    f"source row for {event.qualified_table} disappeared while "
-                    f"recovering omitted field(s) {list(columns)!r}; refusing to "
-                    "fabricate a partial image",
-                    source_schema=event.schema,
-                    source_table=event.table,
-                    target=event.qualified_table,
-                    detected_lsn=event.lsn,
-                    refusal_origin="typed_planner",
-                )
+            log.warning(
+                "stock Debezium omitted xml[] field(s) %s for %s and the source "
+                "row is no longer visible; carrying explicit SQL NULL to keep the "
+                "table non-blocking",
+                list(columns), event.qualified_table,
+            )
+            values = {name: None for name in columns}
         image_name = "before" if event.op == "d" else "after"
         image = getattr(event, image_name)
         if image is None:
@@ -855,6 +926,27 @@ class GroupPlan:
     # ------------------------------------------------------------------ #
     # the destination probe (rubric 1.4)
     # ------------------------------------------------------------------ #
+    def keyless_event_applied(self, item: TableWork, event_id: str) -> bool:
+        """Return whether a keyless physical event already committed.
+
+        The state is cached per group because a replayed transaction can carry many
+        events, but the read remains inside the same destination transaction as the
+        fold.  Absence is the machine's `unseen` state; a durable row is parsed by
+        `destination` and means the event is an applied no-op.
+        """
+        if item.snapshot or not self.pipeline:
+            return False
+        cache_key = (item.target, event_id)
+        if cache_key not in self._keyless_event_states:
+            self._keyless_event_states[cache_key] = destination.read_keyless_event_state(
+                self.con,
+                pipeline=self.pipeline,
+                target_table=item.target,
+                event_id=event_id,
+                control_schema=self._control_schema,
+            )
+        return self._keyless_event_states[cache_key] is not None
+
     def start_exists(self, item: TableWork, key: tuple) -> bool:
         """Does the destination hold a row under `key`, from before this group?"""
         table = self._probe_table(item)
@@ -943,7 +1035,14 @@ class GroupPlan:
         """
         for index, item in enumerate(list(self.work.values())):
             try:
-                table_work.write(self.con, self.registry, item, self.created_in_txn)
+                table_work.write(
+                    self.con,
+                    self.registry,
+                    item,
+                    self.created_in_txn,
+                    pipeline=self.pipeline,
+                    control_schema=self._control_schema,
+                )
             except (AmbiguousDelete, DestinationIdentityCollision, ToastBaseMissing):
                 raise
             except Exception as exc:
@@ -954,12 +1053,42 @@ class GroupPlan:
                     # attempting table quarantine would replace the injected cause
                     # with a secondary "connection closed" error.
                     raise
-                self._contain_item_failure(item, exc)
-                # The failed table is never eligible for a snapshot swap.  A
-                # just-created destination table may be dropped safely; an existing
-                # table's data is protected by the materializer preflight below and
-                # remains untouched when the failure is raised before DML.
-                continue
+                if _is_uncontainable_destination_error(exc):
+                    # A malformed SQL statement, broken connection, or engine/resource
+                    # failure is ours/the engine's problem, not source data. Quarantine
+                    # would hide it behind a misleading table refusal.
+                    raise
+                if _is_destination_execution_error(exc):
+                    refused = self._as_contained_refusal(
+                        exc,
+                        source_schema=item.source_schema,
+                        source_table=item.source_table,
+                        target=item.target,
+                        detected_lsn=self.stats.get("last_lsn"),
+                        input_fingerprint=self._failure_fingerprints.get(
+                            f"{item.source_schema}.{item.source_table}"
+                        )
+                        or self._item_fingerprint(item),
+                    )
+                    raise DestinationExecutionFailure(refused, exc) from exc
+                # `table_work.write` may already have issued a DELETE before a
+                # Python/materializer failure reaches this boundary.  DuckDB has no
+                # savepoint support in the pinned runtime, so containing in-place
+                # would commit a torn table image.  Roll back the complete source
+                # transaction and let the commit owner replay healthy peers with
+                # this relation excluded.
+                refused = self._as_contained_refusal(
+                    exc,
+                    source_schema=item.source_schema,
+                    source_table=item.source_table,
+                    target=item.target,
+                    detected_lsn=self.stats.get("last_lsn"),
+                    input_fingerprint=self._failure_fingerprints.get(
+                        f"{item.source_schema}.{item.source_table}"
+                    )
+                    or self._item_fingerprint(item),
+                )
+                raise TableWriteFailure(refused, exc) from exc
             if (
                 not item.snapshot
                 and item.source_schema

@@ -26,6 +26,9 @@ from .config import resolve_control_schema
 from .control_schema import CONTROL_DDL, ensure_control_schema
 from .errors import CANONICAL_REFUSAL_CLASS, LeaseLost
 from .machines import (
+    KEYLESS_EVENT,
+    KEYLESS_EVENT_APPLIED,
+    KEYLESS_EVENT_UNSEEN,
     LIFECYCLE_DURABLE_VALUES,
     REFUSAL_ABSENT,
     REFUSAL_PENDING,
@@ -433,6 +436,63 @@ def write_column_presence_batch(
     )
 
 
+def read_keyless_event_state(
+    con,
+    *,
+    pipeline: str,
+    target_table: str,
+    event_id: str,
+    control_schema: str | None = None,
+) -> str | None:
+    """Read one keyless event's durable mutation state inside the group transaction."""
+    row = con.execute(
+        f"SELECT state FROM {_control_table(control_schema, 'keyless_events')} "
+        "WHERE pipeline = ? AND target_table = ? AND event_id = ?",
+        [pipeline, target_table, event_id],
+    ).fetchone()
+    if row is None:
+        return None
+    return KEYLESS_EVENT.parse(row[0])
+
+
+def write_keyless_events(
+    con,
+    rows: list[tuple],
+    *,
+    pipeline: str,
+    control_schema: str | None = None,
+) -> None:
+    """Persist keyless event transitions atomically with their physical rows."""
+    if not rows:
+        return
+    from .apply_sql import VARCHAR, bulk_insert
+
+    normalized: list[list[Any]] = []
+    for target_table, event_id, operation, image_digest in rows:
+        KEYLESS_EVENT.check(KEYLESS_EVENT_UNSEEN, KEYLESS_EVENT_APPLIED)
+        normalized.append(
+            [
+                pipeline,
+                target_table,
+                event_id,
+                operation,
+                KEYLESS_EVENT_APPLIED,
+                image_digest,
+                now(),
+            ]
+        )
+    bulk_insert(
+        con,
+        _control_table(control_schema, "keyless_events"),
+        [
+            "pipeline", "target_table", "event_id", "operation", "state",
+            "image_digest", "applied_at",
+        ],
+        normalized,
+        [VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, "TIMESTAMPTZ"],
+    )
+
+
 def _stable_refusal_fingerprint(
     *,
     source_schema: str,
@@ -533,7 +593,7 @@ def record_schema_refusal(
         con.execute("BEGIN TRANSACTION")
     try:
         previous = con.execute(
-            f"SELECT state, refusal_fingerprint, source_fingerprint "
+            f"SELECT state, refusal_fingerprint, source_fingerprint, reason "
             f"FROM {_control_table(control_schema, 'schema_refusals')} "
             "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
             [pipeline, source_schema, source_table],
@@ -566,6 +626,13 @@ def record_schema_refusal(
             recorded_source_fingerprint = (
                 source_fingerprint if source_fingerprint is not None else previous[2]
             )
+            # Keep the first concrete exception as the durable diagnosis.  A later
+            # blocked-table observation is a lifecycle fact, not new evidence, and
+            # must not replace `decimal.InvalidOperation`/`ValueError`/etc. with a
+            # generic retry explanation (R14-13).
+            recorded_reason = previous[3] or reason
+            incident_at = now()
+            incident_marker = f"{fingerprint}:{incident_at.isoformat()}"
             SCHEMA_REFUSAL.check(before, REFUSAL_QUARANTINED)
             con.execute(
                 f"UPDATE {_control_table(control_schema, 'schema_refusals')} SET "
@@ -574,9 +641,9 @@ def record_schema_refusal(
                 "state = ?, refused_at = ? "
                 "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
                 [
-                    target_table, detected_lsn, reason, fingerprint,
+                    target_table, detected_lsn, recorded_reason, fingerprint,
                     recorded_source_fingerprint,
-                    canonical_class, REFUSAL_QUARANTINED, now(), pipeline,
+                    canonical_class, REFUSAL_QUARANTINED, incident_at, pipeline,
                     source_schema, source_table,
                 ],
             )
@@ -619,8 +686,8 @@ def record_schema_refusal(
                 con,
                 pipeline=pipeline,
                 code="schema_table_quarantined",
-                marker_key="refusal_fingerprint",
-                marker_value=fingerprint,
+                marker_key="incident_marker",
+                marker_value=incident_marker,
                 control_schema=control_schema,
             ):
                 quarantine_alert = {
@@ -629,6 +696,7 @@ def record_schema_refusal(
                     "target_table": target_table,
                     "refusal_class": canonical_class,
                     "refusal_fingerprint": fingerprint,
+                    "incident_marker": incident_marker,
                     "resnapshot_required": True,
                 }
             result = REFUSAL_QUARANTINED
@@ -776,6 +844,23 @@ def blocked_schema_tables(
         ).fetchall()
     )
     return blocked
+
+
+def schema_refusal_state(
+    con,
+    *,
+    pipeline: str,
+    source_schema: str,
+    source_table: str,
+    control_schema: str | None = None,
+) -> str | None:
+    """Read one refusal state for an explicit operator acknowledgement decision."""
+    row = con.execute(
+        f"SELECT state FROM {_control_table(control_schema, 'schema_refusals')} "
+        "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+        [pipeline, source_schema, source_table],
+    ).fetchone()
+    return None if row is None else str(row[0])
 
 
 def quarantine_retry_allowed(

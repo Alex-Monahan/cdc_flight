@@ -976,14 +976,15 @@ Per-table identity comes from `table_state.key_strategy`:
 
 * `pk` — the Postgres primary key (or replica-identity index). Used for
   current-state merges, SCD2 keys, and hard deletes.
-* `synthetic` — no PK. `cdcf_event_id` is the row identity. The consequence is
-  explicit and must be documented for users: a keyless table can have a faithful
-  **changelog**, and a current-state table only if `REPLICA IDENTITY FULL` is
-  set, in which case the full before-image is the matching key. Postgres refuses
-  to decode UPDATE/DELETE on a keyless table without it, so the applier detects
-  that case at start-up (`pg_class.relreplident`) and forces
-  `history_mode='changelog'` for the table, raising a `warning` alert rather
-  than silently producing a wrong current-state table.
+* `synthetic` — no PK. `cdcf_event_id` is the **event/replay** identity, not the
+  physical-row identity for a FULL-identity DELETE.  With `REPLICA IDENTITY FULL`,
+  the complete before-image is matched with NULL-safe predicates; DELETE removes
+  exactly one candidate and UPDATE is delete-before followed by insert-after in
+  source order.  `_cdc_flight.keyless_events` records the event transition in the
+  same destination transaction, so replaying an applied event is a no-op.  A
+  sparse/unchanged-TOAST image is refused and queued for resnapshot.  PostgreSQL
+  refuses to decode UPDATE/DELETE on a keyless table without a usable replica
+  identity, so no current-state claim is made for that case.
 
 **The decisive keyless test** (Opus M6, Codex 8) is not "no duplicates": it is
 that two *genuinely identical* source rows both survive while a crash-replay copy
@@ -1619,14 +1620,17 @@ ordering argument again.
   the *same* `source.lsn`, so an LSN fence would drop the entire snapshot after
   the first chunk. Snapshot idempotence comes from D7, exactly as §3.5 says.
 
-### A12 — keyless tables are a changelog, not current state
+### A12 — keyless FULL-identity tables use physical-row matching
 
-§6 notes that a keyless table can have a current-state form under
-`REPLICA IDENTITY FULL`. This task implements the changelog form only: keyless
-tables are keyed on `cdcf_event_id`, so every change event is a row. That is
-what makes rubric 1.2 measurable at all (a merge can hide a double delivery; an
-append-keyed-on-event-identity table cannot). Keyless current state belongs to
-8.1/8.2.
+`cdcf_event_id` remains a stable event identity for INSERTs and replay accounting,
+but it cannot identify the row created by a later DELETE.  A FULL-identity DELETE
+therefore carries the complete old image through the fold and binds every source
+column with `IS NOT DISTINCT FROM`; `LIMIT 1` removes one physical row when N
+identical rows exist.  UPDATE is the ordered pair delete-before/insert-after, so a
+delete followed by an identical reinsert in one PostgreSQL transaction retains one
+row.  The durable `keyless_event` state machine makes a replay of the same event
+idempotent.  If the connector omits a value (including unchanged TOAST), the group
+refuses and queues the relation for resnapshot rather than inventing a predicate.
 
 ### A13 — fault anchors extended (Codex 9 carry-forward)
 
@@ -2018,7 +2022,7 @@ therefore false for the two states where the blockers lived. Coverage now:
 |---|---|
 | default matrix | `begin`, `mid_apply`, `spill`, `pre_commit`, `post_commit_pre_ack`, `post_ack`, each a hard exit plus a recovery run |
 | `test_1_1_fault_interleavings.py` (slow) | `decode`; the `raise` action before **and** after `COMMIT` (Debezium's L3 teardown, not process death); a between-table crash whose recovery replays a *spilled* transaction; a crash during the **snapshot** phase; a genuinely unwritable `offsets.dat` |
-| `test_1_3_motherduck_fault.py` (motherduck) | `mid_apply` and `post_commit_pre_ack` against real MotherDuck, with exactly-once measured on the keyless changelog |
+| `test_1_3_motherduck_fault.py` (motherduck) | `mid_apply` and `post_commit_pre_ack` against real MotherDuck, with exactly-once measured on the keyless FULL-identity current-state table |
 | `test_1_1_spill_and_snapshot.py`, `test_1_3_commit_protocol.py` (default) | the interleavings themselves, in process |
 
 The headline count is deliberately gone from the claims. What matters is which
@@ -2051,7 +2055,9 @@ whole design exists to make routine. The lease write retries a conflict for up t
 ### A28 — deferrals, stated explicitly
 
 These are the review findings **not** fixed here, with the rubric item that owns
-each. None of them is a loss or duplication path.
+each. None of them is a loss or duplication path. The former A12 keyless-delete
+limitation is not in this table: FIX ROUND 15 closes it with physical-row matching
+and a durable replay ledger; see A12 and rubric 1.2.
 
 | finding | owner | why deferred |
 |---|---|---|
@@ -2059,11 +2065,9 @@ each. None of them is a loss or duplication path.
 | Opus M-7 second half — actually supporting incremental snapshots | 3.3 | the guard is in (A20); the support is a design question about interleaved snapshot windows that 3.3 owns. |
 | Opus MINOR-11 — the resume point carries no source identity (`system_identifier`/timeline), so a source restored from a base backup or `pg_resetwal` can reuse LSNs below `last_lsn` and genuinely new events would be fenced | 1.8 | `check_invariant_o` detects the slot being *ahead*, not a backward jump. 1.8 owns slot/source divergence and the automatic re-snapshot it routes to. |
 | Opus MINOR-15 / the `timestamptz -> VARCHAR` regression | 2.4 / 2.5 | the honest consequence of dropping type inference (A2); `test_documented_type_gaps` pins it. `ensure()` now refuses to ALTER a column whose destination type is outside the widening lattice, so it can no longer narrow one by accident. |
-| Keyless tables are a changelog, not current state (A12) | 8.1 / 8.2 | unchanged, and it is what makes 1.2 measurable at all. |
 | Spill throughput against MotherDuck | 5.3 | correctness first; the local 200 000-event measurement stands (A16). |
 | Probes not migrated to the applier | — | they are baseline-era evidence and `RUBRIC_STATUS.md` now labels them as such where it cites them for §1. |
 | Codex's note that `naming.destination_table()` is not injective (two source tables can normalise to one destination name) | 2.3 | not reachable with the captured schema, and a collision registry belongs with automatic table discovery. The narrower case Codex asked to pin - a captured table whose topic collides with `<prefix>.transaction` - is a start-up assertion now (`assert_no_internal_topic_collision`), so the silent-loss shape is closed even though the general injectivity question is not. |
-| Keyless update/delete acceptance tests beyond op-mix coverage | 8.1 / 8.2 | `test_e2e_duckdb.py` pins the op mix (`{"r":4,"c":6,"u":4,"d":2}`) and A12 states plainly that the table is a changelog; what "correct update/delete" *means* for a keyless table is the current-state question 8.1/8.2 own. |
 
 ### A29 — module decomposition (Codex 8)
 
@@ -2948,6 +2952,15 @@ persistence: `_cdc_flight.schema_refusals.state` · initial: `absent` · termina
 | `quarantined` | `pending` | no |
 | `quarantined` | `resolved` | yes |
 
+**`keyless_event`** — Has one keyless source event's physical operation committed, so replay can be a no-op without treating the synthetic event id as a row key?
+
+persistence: `_cdc_flight.keyless_events.state` · initial: `unseen` · terminal: `applied`
+
+| from | to | terminal |
+|---|---|---|
+| `unseen` | `applied` | yes |
+| `applied` | `applied` | yes |
+
 **`catalog_baseline`** — Can the relation identities this run observes be related to the rows the destination already holds, or must they be reconciled before they are adopted?
 
 persistence: `_cdc_flight.catalog_baseline.state` · initial: `absent` · terminal: *none — a confirmed baseline becomes unconfirmed again the moment the next run starts, which is why `valid` is not terminal*
@@ -3088,12 +3101,14 @@ persistence: `.cdc_instances/{instance}` plus its parent completion record · in
 | 61 | destination_ownership: active -> callback_owned | callback leaves after failed quiescence, or a pending `BaseException` skips post-`finally` summary construction | the supervisor publishes a typed proof inside its `finally`; unretired active ownership also transfers fail-closed | terminal ownership preserves marker/slot/offset/alert/lease/heartbeat/parent state; outer teardown writes the failure summary and takes the hard-exit path | exact late-exit schedule plus a summaryless `KeyboardInterrupt` through the real supervisor boundary; marker remains `armed`, `reassert_owed` is skipped, resources survive, and the in-process outer teardown is process-terminal | AUTO (rev 20) |
 | 62 | runtime_root_lifecycle: active -> quarantining | persistent `prepare` or `run` observes a root already committed to destructive cleanup, including a partial sweep | the exhaustive parent/root marker classifier returns `quarantining`, `completion_recorded`, or `deleted_recorded` | persistent commands refuse with `clean` recovery guidance; only `clean` advances destructive states to `absent` | hard cuts after quarantine, after terminal-marker removal, after root removal, and before private publication; no child runs and the next clean/private reconciliation is deterministic | AUTO (rev 22) |
 
-**The counts, parsed from the rows above rather than recalled.** 67 rows, one
+| 62b | keyless_event: unseen -> applied | a keyless FULL-identity INSERT/UPDATE/DELETE physical operation commits, including its replay ledger entry | complete before-image matching for DELETE/UPDATE and one destination transaction for row plus ledger | replay sees `applied` and performs no second mutation; an incomplete image is refused | no loss, resurrection, or second delete | AUTO |
+
+**The counts, parsed from the rows above rather than recalled.** 68 rows, one
 failure and one terminal class each.
 
 | class | count | rows |
 |---|---:|---|
-| `AUTO` | **43** | 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 24b, 32, 35, 36, 40, 43, 44, 45, 46, 47, 53, 54, 55, 56, 57, 58, 60, 61, 62 |
+| `AUTO` | **44** | 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 24b, 32, 35, 36, 40, 43, 44, 45, 46, 47, 53, 54, 55, 56, 57, 58, 60, 61, 62, 62b |
 | `MANUAL` | **15** | 17b, 25, 26, 27, 28, 29, 33, 38, 41, 42, 44b, 49, 51, 51a, 52 |
 | `UNDEFINED` | **9** | 30, 31, 32b, 35b, 37, 39, 48, 50, 59 |
 
@@ -3365,7 +3380,7 @@ Three more corrections came with it:
 
 ## 20. Rubric 1.9 — explicit state machines
 
-### A55 — seven machines, one precedence, and the remaining candidates
+### A55 — thirteen machines, one precedence, and the remaining candidates
 
 Rubric 1.9 (added 2026-07-31) asks that *any state that can affect consistency is managed
 with a state machine approach*: **no state machines = 1, only one big state machine = 3,
@@ -3394,7 +3409,7 @@ machine is ceremony — worse than ceremony, because it advertises recoverable i
 states that do not exist. If yes, the state needs a name, a persisted value and a
 transition table.
 
-#### What was built (twelve focused machines + one precedence)
+#### What was built (thirteen focused machines + one precedence)
 
 | machine | owns | states | edges | persistence |
 |---|---|---|---|---|
@@ -3408,6 +3423,7 @@ transition table.
 | `publication_admission` | has a discovered relation been admitted to the publication, and who owns that decision | 6 | 23 | `_cdc_flight.source_relations.admission_state` |
 | `catalog_schema_liveness` | is a watched schema visibly queryable before absence can mean a drop | 4 | 16 | **memory only** |
 | `schema_refusal` | has a refused schema transition acquired a durable remediation obligation | 4 | 9 | `_cdc_flight.schema_refusals.state` |
+| `keyless_event` | has one keyless event's physical operation committed, making replay a no-op | 2 | 2 | `_cdc_flight.keyless_events.state` |
 | `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
 | `snapshot_completion` | have all ordered snapshot callbacks arrived | 6 | 9 | **memory only** |
 | `runtime_root_lifecycle` | is the disposable root reusable or committed to cleanup | 6 | 10 | project-local root and parent markers |
@@ -4454,8 +4470,8 @@ are copied before the commit is durable; a dropped source column is physically d
 from the destination. The add backfill uses destination primary-key values for keyed
 tables. Keyless tables have only connector event identity, so a non-uniform source
 value cannot be joined honestly to historical rows; the common uniform ADD default/NULL
-case is applied to all keyless changelog rows, and a non-uniform case fails the group
-rather than silently writing the wrong rows. Schema DDL runs before row DML in the
+case is applied to all keyless current-state physical rows, and a non-uniform case
+fails the group rather than silently writing the wrong rows. Schema DDL runs before row DML in the
 same transaction because DuckDB/MotherDuck can otherwise validate an old primary-key
 version at commit; table drops remain after row DML.
 

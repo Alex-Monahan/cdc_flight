@@ -591,7 +591,10 @@ def check_invariant_o(
             return result
         result["ok"] = False
         result["decision"] = "no_durable_destination_row"
-        marker_value = f"{slot_name}:no_durable_destination_row"
+        # The condition is standing while the slot remains at the same confirmed
+        # position, but a repaired/recreated slot (or a newly advanced position)
+        # is a new incident and must not be hidden by an old alert row (R14-11).
+        marker_value = f"{slot_name}:no_durable_destination_row:{confirmed}"
         if not dest_mod.alert_marker_exists(
             con,
             pipeline=pipeline,
