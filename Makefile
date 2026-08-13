@@ -48,11 +48,14 @@ export ARROW_DEFAULT_MEMORY_POOL ?= system
 PYTEST_WORKERS ?= 12
 PYTEST_XDIST_ARGS ?= -n $(PYTEST_WORKERS) --dist=loadscope --max-worker-restart=0
 # The slow lane contains real crash/snapshot timing proofs and heavy DuckDB/JPype
-# subprocesses. Two workers is the measured stable limit on this host: four concurrent
-# JVMs can make the bounded source-task and discovery processes abort or outlive their
-# outer fixture, even though each case converges serially.
+# subprocesses. Two workers is the conservative default on this host: three, four, and
+# six-worker controls were faster but failed real source/durability assertions. The
+# lock below is shared by clones, because separate PostgreSQL clusters do not separate
+# CPU and RAM pressure. This default is a scheduling guard, not a claim that every
+# host's slow lane is green.
 PYTEST_SLOW_WORKERS ?= 2
 PYTEST_SLOW_XDIST_ARGS ?= -n $(PYTEST_SLOW_WORKERS) --dist=loadscope --max-worker-restart=0
+SLOW_LANE_LOCK ?= /tmp/cdc_flight_slow_lane.lock
 # MotherDuck uses one database per worker and a unique control schema per test.
 PYTEST_MD_WORKERS ?= 8
 PYTEST_MD_XDIST_ARGS ?= -n $(PYTEST_MD_WORKERS) --dist=load --max-worker-restart=0
@@ -157,11 +160,12 @@ test-md: ## run only the MotherDuck tests
 
 .PHONY: test-slow
 test-slow: ## run only the slow fault-injection tests (real SIGKILL, big loads)
-	$(UV) run pytest $(PYTEST_SLOW_XDIST_ARGS) -m "slow and not motherduck" --durations=20
+	$(UV) run python scripts/slow_lane.py --lock-file "$(SLOW_LANE_LOCK)" -- \
+		$(UV) run pytest $(PYTEST_SLOW_XDIST_ARGS) -m "slow and not motherduck" --durations=20
 
 .PHONY: lint
 lint: ## ruff
-	$(UV) run ruff check src tests scripts/runtime_state*.py
+	$(UV) run ruff check src tests scripts/runtime_state*.py scripts/slow_lane.py
 
 ## ---------------------------------------------------------------------------
 ## housekeeping
