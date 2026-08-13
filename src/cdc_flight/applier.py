@@ -693,12 +693,14 @@ class Applier:
         refused: SchemaEvolutionRefused,
         original: Exception,
         *,
+        provenance,
         destination_execution: bool = True,
     ) -> str:
         return failure_containment.contain_destination_failure(
             self,
             refused,
             original,
+            provenance=provenance,
             destination_execution=destination_execution,
         )
 
@@ -897,6 +899,13 @@ class Applier:
         except AdmissionError as error:
             refused = as_schema_refusal(error, refusal_origin="spill_protocol")
             self._handle_spill_refusal(refused, events)
+            raise
+        except Exception:
+            # Descriptor enrichment is a source control read, not a table-DML
+            # boundary.  If the driver/session fails after stage_events opened
+            # the spill transaction, close that transaction here while preserving
+            # the original run-level error; never convert it into a table refusal.
+            self._rollback_quietly()
             raise
 
     # ------------------------------------------------------------------ #

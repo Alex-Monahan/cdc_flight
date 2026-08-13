@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import subprocess
 from pathlib import Path
 
@@ -94,27 +93,13 @@ def test_catalog_poll_default_is_short_and_configurable():
 
 
 def _is_ownership_source(source: str) -> bool:
-    """Discover an owner from its module contract or legacy plan/work shape."""
-    tree = ast.parse(source)
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Name) and target.id == "OWNER"
-            for target in node.targets
-        ):
-            return True
-        if isinstance(node, ast.AnnAssign) and (
-            isinstance(node.target, ast.Name) and node.target.id == "OWNER"
-        ):
-            return True
-        if isinstance(node, ast.ClassDef) and node.name.endswith(("Plan", "Work")):
-            # This recognizes the pre-marker owner shapes in the history. New
-            # owners use OWNER, so adding a module cannot silently evade the scan.
-            return True
-    return False
+    """Every production module is measured; markers are descriptive, not opt-in."""
+    del source
+    return True
 
 
 def _ownership_modules(package: Path) -> tuple[Path, ...]:
-    """Enumerate every maintainability owner from the source tree itself."""
+    """Enumerate every production Python module, failing closed by default."""
     return tuple(
         path
         for path in sorted(package.glob("*.py"))
@@ -122,13 +107,17 @@ def _ownership_modules(package: Path) -> tuple[Path, ...]:
     )
 
 
+def _assert_ownership_boundaries(package: Path) -> None:
+    for path in _ownership_modules(package):
+        assert len(path.read_text(encoding="utf-8").splitlines()) < 1000, path.name
+
+
 def test_discovery_ownership_modules_stay_below_the_maintainability_boundary():
     """Measure the ownership surface declared by production source code."""
     root = Path(__file__).resolve().parents[3]
     modules = _ownership_modules(root / "src" / "cdc_flight")
     assert modules
-    for path in modules:
-        assert len(path.read_text(encoding="utf-8").splitlines()) < 1000, path.name
+    _assert_ownership_boundaries(root / "src" / "cdc_flight")
 
 
 def test_r16_reproduction_measures_the_grown_table_owners():
@@ -149,13 +138,12 @@ def test_ownership_guard_would_reject_d291b62_shapes():
         )
         for name in ("planner.py", "table_work.py")
     }
-    old_owners = {
-        name for name, source in old_sources.items() if _is_ownership_source(source)
-    }
+    old_owners = {name for name, source in old_sources.items() if _is_ownership_source(source)}
     assert {"planner.py", "table_work.py"} <= old_owners
-    assert {
-        name for name, source in old_sources.items() if len(source.splitlines()) >= 1000
-    } == {"planner.py", "table_work.py"}
+    assert {name for name, source in old_sources.items() if len(source.splitlines()) >= 1000} == {
+        "planner.py",
+        "table_work.py",
+    }
 
 
 def test_liveness_is_per_schema_and_error_states_never_mean_mass_drop():
@@ -203,7 +191,8 @@ def test_catalog_query_error_enters_the_declared_liveness_error_state():
 
 
 @pytest.mark.parametrize(
-    "changed", [
+    "changed",
+    [
         {"type_name": "varchar(128)", "nullable": True},
         {"type_name": "varchar(32)", "nullable": False},
     ],
@@ -241,9 +230,10 @@ def test_confirmation_fingerprint_includes_full_column_identity(changed):
         )
 
     assert watcher._confirm("app.customers", observation("varchar(64)", True)) is None
-    assert watcher._confirm(
-        "app.customers", observation(changed["type_name"], changed["nullable"])
-    ) is None
+    assert (
+        watcher._confirm("app.customers", observation(changed["type_name"], changed["nullable"]))
+        is None
+    )
     assert watcher._unconfirmed["app.customers"].confirmations == 1
     confirmed = watcher._confirm(
         "app.customers", observation(changed["type_name"], changed["nullable"])
@@ -398,10 +388,13 @@ def test_failed_admission_is_durable_and_retried_after_watcher_restart(tmp_path)
         observed = {change.qualified: change.new_relation}
         watcher._ensure_published(FailingConnection(), observed, [change])
         destination.flush_learned_relations(con, pipeline="p", catalog=watcher)
-        assert con.execute(
-            "SELECT admission_state FROM _cdc_flight.source_relations "
-            "WHERE pipeline = 'p' AND source_table = 'arrival'"
-        ).fetchone()[0] == ADMISSION_ERROR
+        assert (
+            con.execute(
+                "SELECT admission_state FROM _cdc_flight.source_relations "
+                "WHERE pipeline = 'p' AND source_table = 'arrival'"
+            ).fetchone()[0]
+            == ADMISSION_ERROR
+        )
 
         restarted = CatalogWatcher(
             dsn="",

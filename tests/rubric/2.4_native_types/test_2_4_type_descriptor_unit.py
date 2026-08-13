@@ -48,10 +48,13 @@ def test_json_and_jsonb_have_distinct_native_targets():
 def test_jsonb_key_uses_json_while_non_key_jsonb_stays_variant():
     """JSONB is a VARIANT value, but JSON is the lossless key representation."""
 
-    con = duckdb.connect(":memory:", config={
-        "storage_compatibility_version": "v1.5.0",
-        "variant_minimum_shredding_size": "-1",
-    })
+    con = duckdb.connect(
+        ":memory:",
+        config={
+            "storage_compatibility_version": "v1.5.0",
+            "variant_minimum_shredding_size": "-1",
+        },
+    )
     try:
         con.execute("CREATE SCHEMA d")
         registry = SchemaRegistry(con, "d")
@@ -73,18 +76,22 @@ def test_jsonb_key_uses_json_while_non_key_jsonb_stays_variant():
             ["id", "tenant", "payload"],
             [['{"account": 7}', 1, '{"body": true}']],
         )
-        assert con.execute(
-            'SELECT "id", "payload" FROM d."jsonb_keys"'
-        ).fetchone() == ('{"account":7}', {"body": True})
+        assert con.execute('SELECT "id", "payload" FROM d."jsonb_keys"').fetchone() == (
+            '{"account":7}',
+            {"body": True},
+        )
     finally:
         con.close()
 
 
 def test_jsonb_key_gain_rebinds_a_composite_identity_without_variant_pk():
-    con = duckdb.connect(":memory:", config={
-        "storage_compatibility_version": "v1.5.0",
-        "variant_minimum_shredding_size": "-1",
-    })
+    con = duckdb.connect(
+        ":memory:",
+        config={
+            "storage_compatibility_version": "v1.5.0",
+            "variant_minimum_shredding_size": "-1",
+        },
+    )
     try:
         con.execute("CREATE SCHEMA d")
         registry = SchemaRegistry(con, "d")
@@ -110,10 +117,13 @@ def test_jsonb_key_gain_rebinds_a_composite_identity_without_variant_pk():
 
 def test_jsonb_primary_key_rebuild_self_heals_a_legacy_variant_identity():
     """A queued rebuild cannot repeat the old VARIANT-primary-key failure."""
-    con = duckdb.connect(":memory:", config={
-        "storage_compatibility_version": "v1.5.0",
-        "variant_minimum_shredding_size": "-1",
-    })
+    con = duckdb.connect(
+        ":memory:",
+        config={
+            "storage_compatibility_version": "v1.5.0",
+            "variant_minimum_shredding_size": "-1",
+        },
+    )
     try:
         con.execute("CREATE SCHEMA d")
         con.execute(
@@ -136,18 +146,22 @@ def test_jsonb_primary_key_rebuild_self_heals_a_legacy_variant_identity():
         assert table.raw_types["id"] == "JSON"
         assert table.primary_key_columns == ("id",)
         assert "cdcf_internal_id" not in table.columns
-        assert con.execute(
-            'SELECT "id", "payload" FROM d."legacy_variant_key"'
-        ).fetchone() == ('{"account":7}', {"body": True})
+        assert con.execute('SELECT "id", "payload" FROM d."legacy_variant_key"').fetchone() == (
+            '{"account":7}',
+            {"body": True},
+        )
     finally:
         con.close()
 
 
 def test_jsonb_key_loss_uses_a_typed_shadow_transition_to_variant():
-    con = duckdb.connect(":memory:", config={
-        "storage_compatibility_version": "v1.5.0",
-        "variant_minimum_shredding_size": "-1",
-    })
+    con = duckdb.connect(
+        ":memory:",
+        config={
+            "storage_compatibility_version": "v1.5.0",
+            "variant_minimum_shredding_size": "-1",
+        },
+    )
     try:
         con.execute("CREATE SCHEMA d")
         registry = SchemaRegistry(con, "d")
@@ -172,9 +186,7 @@ def test_jsonb_key_loss_uses_a_typed_shadow_transition_to_variant():
         table = registry.get("key_loss")
         assert table.raw_types["json_key"] == "VARIANT"
         assert table.primary_key_columns == ("id",)
-        assert con.execute('SELECT "payload" FROM d."key_loss"').fetchone() == (
-            {"body": True},
-        )
+        assert con.execute('SELECT "payload" FROM d."key_loss"').fetchone() == ({"body": True},)
     finally:
         con.close()
 
@@ -252,9 +264,7 @@ def test_bytea_key_changed_to_union_uses_the_same_identity_for_existing_rows():
 
 
 @pytest.mark.parametrize("shape", ["missing", "incomplete"], ids=["missing", "incomplete"])
-def test_relation_descriptor_provider_refuses_non_authoritative_catalog_shape(
-    monkeypatch, shape
-):
+def test_relation_descriptor_provider_refuses_non_authoritative_catalog_shape(monkeypatch, shape):
     """A strict one-shot provider cannot infer around a missing/incomplete tree."""
     oid = 9102 if shape == "incomplete" else 3802
 
@@ -268,9 +278,7 @@ def test_relation_descriptor_provider_refuses_non_authoritative_catalog_shape(
     if shape == "missing":
         resolved = {}
     else:
-        resolved = {
-            oid: SourceTypeDescriptor(oid, "app.payload", "composite", composite_fields=())
-        }
+        resolved = {oid: SourceTypeDescriptor(oid, "app.payload", "composite", composite_fields=())}
     monkeypatch.setattr(CatalogDescriptorReader, "resolve", lambda _reader, _oids: resolved)
     with pytest.raises(SchemaEvolutionRefused, match="descriptor"):
         RelationDescriptorProvider.from_tables(
@@ -278,25 +286,27 @@ def test_relation_descriptor_provider_refuses_non_authoritative_catalog_shape(
         )
 
 
-def test_spill_descriptor_failure_rolls_back_and_records_a_durable_refusal(tmp_path):
+def test_spill_descriptor_control_failure_is_run_level_and_not_a_refusal(tmp_path):
+    """A pre-DML source control failure cannot be blamed on the source table."""
     box = Lab(tmp_path / "spill-refusal.duckdb", unit_spill_events=1, unit_spill_bytes=1)
     try:
+
         def failing_provider(_qualified):
             raise OSError("catalog unavailable")
 
         box.applier.descriptor_provider = failing_provider
         event = data("spill-refusal", 1, 10, table="spill_rows", key={"id": 1}, after={"id": 1})
-        with pytest.raises(SchemaEvolutionRefused, match="descriptor"):
+        with pytest.raises(OSError, match="catalog unavailable"):
             box.applier._spill_events([event], unit_seq=1)
         assert box.applier.group.txn_open is False
-        assert pending_schema_refusals(box.con, "lab")
-        assert [
-            f"{schema}.{table}"
-            for schema, table, _target in tables_awaiting_snapshot(box.con, "lab")
-        ] == ["app.spill_rows"]
+        assert not pending_schema_refusals(box.con, "lab")
+        assert tables_awaiting_snapshot(box.con, "lab") == []
+        assert box.applier._contained_failures == []
         assert box.con.execute(
-            "SELECT count(*) FROM _cdc_flight.spill_events"
+            "SELECT count(*) FROM _cdc_flight.alerts "
+            "WHERE code = 'table_exception_contained'"
         ).fetchone()[0] == 0
+        assert box.con.execute("SELECT count(*) FROM _cdc_flight.spill_events").fetchone()[0] == 0
     finally:
         box.close()
 
@@ -319,7 +329,7 @@ def test_production_typed_path_fails_closed_when_catalog_descriptors_are_unavail
         OSError("catalog unavailable")
     )
     plan._catalog_descriptor_cache = {}
-    with pytest.raises(SchemaEvolutionRefused, match="catalog descriptor"):
+    with pytest.raises(OSError, match="catalog unavailable"):
         plan._enrich_descriptors(event)
 
 
@@ -331,10 +341,10 @@ def test_tablework_numeric_adapter_is_idempotent_for_all_bounded_specials():
     con.execute("CREATE SCHEMA d")
     registry = SchemaRegistry(con, "d")
     integer = SourceTypeDescriptor(23, "pg_catalog.int4", "int4")
-    numeric = SourceTypeDescriptor(
-        1700, "pg_catalog.numeric", "numeric", precision=12, scale=4
+    numeric = SourceTypeDescriptor(1700, "pg_catalog.numeric", "numeric", precision=12, scale=4)
+    registry.ensure_typed(
+        "adapter_numbers", columns={"id": integer, "value": numeric}, key_columns=("id",)
     )
-    registry.ensure_typed("adapter_numbers", columns={"id": integer, "value": numeric}, key_columns=("id",))
     table = registry.get("adapter_numbers")
     for raw in ("NaN", "Infinity", "-Infinity", "1.2500", None):
         encoded = encode_value(raw, numeric)
@@ -350,9 +360,7 @@ def test_numeric_specials_update_through_the_typed_assignment_seam(raw):
     try:
         con.execute("CREATE SCHEMA d")
         integer = SourceTypeDescriptor(23, "pg_catalog.int4", "int4")
-        numeric = SourceTypeDescriptor(
-            1700, "pg_catalog.numeric", "numeric", precision=12, scale=4
-        )
+        numeric = SourceTypeDescriptor(1700, "pg_catalog.numeric", "numeric", precision=12, scale=4)
         registry = SchemaRegistry(con, "d")
         registry.ensure_typed(
             "assignment_numbers", columns={"id": integer, "value": numeric}, key_columns=("id",)
@@ -365,7 +373,10 @@ def test_numeric_specials_update_through_the_typed_assignment_seam(raw):
             [((1,), {"value": encode_value(raw, numeric)})],
         )
         assert changed == 1
-        assert con.execute('SELECT union_tag("value") FROM d."assignment_numbers"').fetchone()[0] == "special"
+        assert (
+            con.execute('SELECT union_tag("value") FROM d."assignment_numbers"').fetchone()[0]
+            == "special"
+        )
     finally:
         con.close()
 
@@ -456,12 +467,15 @@ def test_scalar_and_nested_matrix_sql_is_pinned(source, expected_sql):
     assert native_type(source).sql == expected_sql
 
 
-@pytest.mark.parametrize("value, expected", [
-    ("NaN", "special"),
-    ("Infinity", "special"),
-    ("-Infinity", "special"),
-    ("12.3400", "finite"),
-])
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("NaN", "special"),
+        ("Infinity", "special"),
+        ("-Infinity", "special"),
+        ("12.3400", "finite"),
+    ],
+)
 def test_numeric_specials_use_the_declared_numeric_union(value, expected):
     source = SourceTypeDescriptor(
         oid=1700,
@@ -481,7 +495,9 @@ def test_numeric_specials_use_the_declared_numeric_union(value, expected):
 @pytest.mark.parametrize("value", [date(2026, 8, 7), time(1, 2, 3), datetime(2026, 8, 7, 1, 2, 3)])
 def test_temporal_values_remain_temporal(value):
     kind = {date: "date", time: "time", datetime: "timestamp"}[type(value)]
-    target = native_type(SourceTypeDescriptor(oid=1, qualified_name=f"pg_catalog.{kind}", kind=kind))
+    target = native_type(
+        SourceTypeDescriptor(oid=1, qualified_name=f"pg_catalog.{kind}", kind=kind)
+    )
     assert encode_value(value, target.source or target) == value
 
 
@@ -565,9 +581,7 @@ def test_recursive_struct_map_and_numeric_union_write_native_values():
         "composite",
         composite_fields=(("n", integer), ("amount", bounded_numeric)),
     )
-    attrs = SourceTypeDescriptor(
-        9001, "public.hstore", "map", map_key=text, map_value=text
-    )
+    attrs = SourceTypeDescriptor(9001, "public.hstore", "map", map_key=text, map_value=text)
     registry.ensure_typed(
         "native_rows",
         columns={"id": integer, "payload": row, "attrs": attrs},
@@ -613,9 +627,7 @@ def test_bounded_numeric_null_and_specials_are_explicitly_tagged():
     con.execute("CREATE SCHEMA d")
     registry = SchemaRegistry(con, "d")
     integer = SourceTypeDescriptor(23, "pg_catalog.int4", "int4")
-    numeric = SourceTypeDescriptor(
-        1700, "pg_catalog.numeric", "numeric", precision=12, scale=4
-    )
+    numeric = SourceTypeDescriptor(1700, "pg_catalog.numeric", "numeric", precision=12, scale=4)
     registry.ensure_typed("numbers", columns={"id": integer, "value": numeric}, key_columns=("id",))
     insert_rows(
         con,
@@ -623,9 +635,7 @@ def test_bounded_numeric_null_and_specials_are_explicitly_tagged():
         ["id", "value"],
         [[1, None], [2, "NaN"], [3, "Infinity"], [4, "-Infinity"], [5, "1.2500"]],
     )
-    rows = con.execute(
-        "SELECT id, union_tag(value), value FROM d.numbers ORDER BY id"
-    ).fetchall()
+    rows = con.execute("SELECT id, union_tag(value), value FROM d.numbers ORDER BY id").fetchall()
     assert [(row[0], row[1]) for row in rows] == [
         (1, "finite"),
         (2, "special"),

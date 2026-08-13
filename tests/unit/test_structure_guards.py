@@ -12,13 +12,12 @@ from pathlib import Path
 
 import pytest
 
-#: RE-MEASURED IN FIX ROUND 16 from real collection on this tree, not inherited:
-#:   `pytest -m "<expr>" --collect-only -q` reports 1723 / 171 / 46 items, of which
-#:   10 / 1 / 1 belong to this guard module, giving 1713 / 170 / 45 below. The
-#:   additions include the AST ownership guard, closed destination classifier, and
-#: real PostgreSQL transaction-control proof.
+#: RE-MEASURED IN FIX ROUND 17 from the real lane collections: the eight
+#: boundary tests in `test_fix17_boundaries.py` add eight items to the prior
+#: default baseline. The guard itself remains 10 / 1 / 1 items in the 1731 /
+#: 171 / 46 collections, giving 1721 / 170 / 45 below.
 _BASELINE_SELECTED = {
-    "not motherduck and not slow": 1713,
+    "not motherduck and not slow": 1721,
     "slow and not motherduck": 170,
     "motherduck": 45,
 }

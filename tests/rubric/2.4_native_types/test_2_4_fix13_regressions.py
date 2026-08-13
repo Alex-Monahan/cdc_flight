@@ -203,7 +203,6 @@ ADMISSION_BOUNDARY_HANDLERS = frozenset(
         ("physical_row_matrix.py", "_exercise_cell"),
         ("planner.py", "_collect"),
         ("planner.py", "_enrich_descriptors"),
-        ("planner.py", "_hydrate_omitted_xml_arrays"),
         ("resnapshot_batches.py", "run_owed"),
         ("schema_evolution.py", "apply_column_changes"),
         ("schema_registry.py", "ensure_typed"),

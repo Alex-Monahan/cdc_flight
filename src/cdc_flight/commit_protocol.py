@@ -207,6 +207,7 @@ def commit_group(self, trigger: str) -> CommitResult:
         qualified = self._contain_destination_failure(
             failure.refused,
             failure.original,
+            provenance=failure.provenance,
             destination_execution=isinstance(failure, DestinationExecutionFailure),
         )
         self.group = OpenGroup(

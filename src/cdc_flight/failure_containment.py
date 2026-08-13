@@ -61,15 +61,16 @@ def item_fingerprint(item) -> str:
 def as_contained_refusal(
     error: Exception,
     *,
-    source_schema: str | None,
-    source_table: str | None,
-    target: str | None,
+    provenance,
     detected_lsn: int | None,
     fingerprint: str,
 ):
-    """Attach one honest relation scope to a table-scoped materializer error."""
+    """Attach the scope carried by an unforgeable table-DML capability."""
     from .errors import SchemaEvolutionRefused
 
+    source_schema = provenance.source_schema
+    source_table = provenance.source_table
+    target = provenance.target
     if isinstance(error, SchemaEvolutionRefused):
         error.source_schema = error.source_schema or source_schema
         error.source_table = error.source_table or source_table
@@ -97,48 +98,8 @@ def as_contained_refusal(
     )
 
 
-def contain_event_failure(plan, event, target: str, error: Exception) -> None:
-    qualified = event.qualified_table
-    if qualified in plan._contained_tables:
-        return
-    fingerprint = plan._failure_fingerprints.setdefault(
-        qualified, event_fingerprint(event)
-    )
-    refused = as_contained_refusal(
-        error,
-        source_schema=event.schema,
-        source_table=event.table,
-        target=target,
-        detected_lsn=event.lsn,
-        fingerprint=fingerprint,
-    )
-    mark_contained(plan, qualified, target, refused, error)
-
-
-def contain_item_failure(plan, item, error: Exception) -> None:
-    qualified = (
-        f"{item.source_schema}.{item.source_table}"
-        if item.source_schema and item.source_table
-        else item.target
-    )
-    if qualified in plan._contained_tables:
-        return
-    fingerprint = plan._failure_fingerprints.setdefault(
-        qualified, item_fingerprint(item)
-    )
-    refused = as_contained_refusal(
-        error,
-        source_schema=item.source_schema,
-        source_table=item.source_table,
-        target=item.target,
-        detected_lsn=plan.stats.get("last_lsn"),
-        fingerprint=fingerprint,
-    )
-    mark_contained(plan, qualified, item.target, refused, error)
-
-
-def mark_contained(plan, qualified: str, target: str, refused, original: Exception) -> None:
-    """Remove one failed plan and call the independent durable owner once."""
+def mark_blocked_event(plan, qualified: str, target: str, refused, original: Exception) -> None:
+    """Remove an event already covered by a durable table refusal."""
     plan._contained_tables.add(qualified)
     plan.blocked_tables.add(qualified)
     plan.stats["contained_events"] += 1
@@ -260,9 +221,14 @@ def contain_destination_failure(
     refused,
     original: Exception,
     *,
+    provenance,
     destination_execution: bool = True,
 ) -> str:
     """Record a failure after destination rollback, using the independent sink."""
+    from .destination_failure import TableDataProvenance
+
+    if not isinstance(provenance, TableDataProvenance):
+        raise original
     if not refused.source_schema or not refused.source_table:
         raise original
     sink = applier.alerts._sink if applier.alerts.independent else None

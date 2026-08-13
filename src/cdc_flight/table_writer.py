@@ -10,7 +10,11 @@ from __future__ import annotations
 from typing import Any
 
 from . import apply_sql, destination, naming
-from .destination_failure import MaterializationConnection
+from .destination_failure import (
+    MaterializationConnection,
+    _mint_table_data_provenance,
+    execute_table_dml,
+)
 from .errors import (
     AdmissionError,
     AmbiguousDelete,
@@ -88,11 +92,9 @@ def write(
         c for c in columns if c not in table.columns
     ]
     column_order = list(dict.fromkeys(column_order))
-    data_con = MaterializationConnection(con)
-
     if item.keyless:
         _write_keyless_operations(
-            data_con,
+            con,
             table,
             item,
             column_order,
@@ -111,8 +113,20 @@ def write(
         return
 
     delete_keys, rows, partial_updates, moves = _plan(item)
+    data_con = None
+
+    def table_dml():
+        nonlocal data_con
+        if data_con is None:
+            data_con = MaterializationConnection(
+                con,
+                _mint_table_data_provenance(item.source_schema, item.source_table, item.target),
+            )
+            item._data_provenance = data_con.provenance
+        return data_con
+
     if item.truncated:
-        item.rows_removed = 0 if fresh else _delete_all(data_con, table)
+        item.rows_removed = 0 if fresh else _delete_all(table_dml(), table)
     elif not item.snapshot and not fresh and delete_keys:
         keys = [
             tuple(
@@ -121,7 +135,7 @@ def write(
             )
             for key in delete_keys
         ]
-        apply_sql.delete_keys(data_con, table, item.key_columns, keys)
+        apply_sql.delete_keys(table_dml(), table, item.key_columns, keys)
     _finish_truncate_audit(item)
 
     updates: list[tuple[tuple, dict[str, Any]]] = []
@@ -143,35 +157,35 @@ def write(
         )
         updates.append((source_key, assignments))
     if updates:
-        affected = 0 if fresh else apply_sql.update_rows(
-            data_con, table, item.key_columns, updates
+        affected = (
+            0 if fresh else apply_sql.update_rows(table_dml(), table, item.key_columns, updates)
         )
         if fresh or affected != len(updates):
             _missing_toast_base(
                 item,
                 None,
                 reason=(
-                    f"sparse update matched {affected} of {len(updates)} "
-                    "destination base row(s)"
+                    f"sparse update matched {affected} of {len(updates)} destination base row(s)"
                 ),
             )
 
-    apply_sql.insert_rows(
-        data_con,
-        table,
-        column_order,
-        [
+    if rows:
+        apply_sql.insert_rows(
+            table_dml(),
+            table,
+            column_order,
             [
-                (
-                    _typed_value(table, col, row.get(col))
-                    if table.native_types and col in table.native_types
-                    else apply_sql.bind(row.get(col), table.columns.get(col, apply_sql.VARCHAR))
-                )
-                for col in column_order
-            ]
-            for row in rows
-        ],
-    )
+                [
+                    (
+                        _typed_value(table, col, row.get(col))
+                        if table.native_types and col in table.native_types
+                        else apply_sql.bind(row.get(col), table.columns.get(col, apply_sql.VARCHAR))
+                    )
+                    for col in column_order
+                ]
+                for row in rows
+            ],
+        )
     try:
         apply_sql.assert_identity_is_unique(con, table)
     except DestinationIdentityCollision as collision:
@@ -194,13 +208,24 @@ def _write_keyless_operations(
     """Execute keyless physical operations in source order."""
     pending: list[dict[str, Any]] = []
     table_fresh = fresh
+    data_con = None
+
+    def table_dml():
+        nonlocal data_con
+        if data_con is None:
+            data_con = MaterializationConnection(
+                con,
+                _mint_table_data_provenance(item.source_schema, item.source_table, item.target),
+            )
+            item._data_provenance = data_con.provenance
+        return data_con
 
     def flush_inserts() -> None:
         nonlocal table_fresh
         if not pending:
             return
         apply_sql.insert_rows(
-            con,
+            table_dml(),
             table,
             column_order,
             [
@@ -227,7 +252,7 @@ def _write_keyless_operations(
             continue
         flush_inserts()
         if operation.operation == "t":
-            item.rows_removed = 0 if table_fresh else _delete_all(con, table)
+            item.rows_removed = 0 if table_fresh else _delete_all(table_dml(), table)
             table_fresh = False
             continue
         if operation.operation not in {"d", "u"}:
@@ -245,7 +270,7 @@ def _write_keyless_operations(
                 reason=f"keyless {operation.operation} has no complete before-image",
             )
         affected = apply_sql.delete_matching_row(
-            con,
+            table_dml(),
             table,
             tuple(operation.before),
             operation.before,
@@ -261,9 +286,7 @@ def _write_keyless_operations(
             )
         if operation.operation == "u":
             if operation.after is None:
-                _missing_toast_base(
-                    item, None, reason="keyless UPDATE has no complete after-image"
-                )
+                _missing_toast_base(item, None, reason="keyless UPDATE has no complete after-image")
             pending.append(operation.after)
             flush_inserts()
 
@@ -305,7 +328,9 @@ def _key_value(table, column: str, value):
     return adapt_value(value, native)
 
 
-def _plan(item: TableWork) -> tuple[
+def _plan(
+    item: TableWork,
+) -> tuple[
     list[tuple],
     list[dict],
     list[tuple[tuple, RowPatch]],
@@ -348,9 +373,7 @@ def _plan(item: TableWork) -> tuple[
                     moves.append(entry)
                 else:
                     delete_keys.append(key)
-                    rows.append(
-                        entry.encoded_values() if isinstance(entry, RowPatch) else entry
-                    )
+                    rows.append(entry.encoded_values() if isinstance(entry, RowPatch) else entry)
     move_sources = {move.source_key for move in moves}
     delete_keys = [key for key in delete_keys if key not in move_sources]
     return delete_keys, rows, partial_updates, moves
@@ -364,7 +387,7 @@ def _finish_truncate_audit(item: TableWork) -> None:
 
 
 def _delete_all(con, table) -> int | None:
-    result = con.execute(f"DELETE FROM {table.qualified}")
+    result = execute_table_dml(con, f"DELETE FROM {table.qualified}")
     try:
         row = result.fetchone()
     except Exception:  # pragma: no cover - a destination that returns no result set
@@ -380,6 +403,5 @@ def _delete_all(con, table) -> int | None:
 def live_names(tables: set[str]) -> set[str]:
     """Report the live table rather than a snapshot shadow."""
     return {
-        t[: -len(naming.SHADOW_SUFFIX)] if t.endswith(naming.SHADOW_SUFFIX) else t
-        for t in tables
+        t[: -len(naming.SHADOW_SUFFIX)] if t.endswith(naming.SHADOW_SUFFIX) else t for t in tables
     }

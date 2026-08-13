@@ -89,17 +89,11 @@ def _enrich_descriptors(applier, event: PendingRecord) -> None:
             target=event.qualified_table,
             refusal_origin="spill_protocol",
         )
-    try:
-        descriptors = provider(event.qualified_table)
-    except Exception as exc:
-        raise SchemaEvolutionRefused(
-            f"catalog descriptor authority failed for {event.qualified_table}; "
-            "the spilled source unit is held for automatic retry",
-            source_schema=event.schema,
-            source_table=event.table,
-            target=event.qualified_table,
-            refusal_origin="spill_protocol",
-        ) from exc
+    # This is a source catalog/control read, before any destination-table DML.
+    # Admission errors produced by the provider itself remain explicit schema
+    # refusals; driver/session/network failures must stay run-level and cannot be
+    # relabelled as a table problem here.
+    descriptors = provider(event.qualified_table)
     if not descriptors:
         raise SchemaEvolutionRefused(
             f"catalog descriptor authority is incomplete for {event.qualified_table}; "

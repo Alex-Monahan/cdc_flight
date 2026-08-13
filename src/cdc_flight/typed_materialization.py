@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from .destination_failure import execute_table_dml, executemany_table_dml
 from .identity_codec import (
     _identity_value,
     _stored_identity_source_value,
@@ -102,7 +103,8 @@ def _copy_rows_with_identity(
             else:
                 expressions.append(quote(column))
         params.append(rowid)
-        con.execute(
+        execute_table_dml(
+            con,
             f"INSERT INTO {quote(table.dataset)}.{quote(shadow)} "
             f"({', '.join(quote(column) for column in target_columns)}) "
             f"SELECT {', '.join(expressions)} FROM {table.qualified} WHERE rowid = ?",
@@ -119,7 +121,8 @@ def delete_keys(con, table: TableSchema, key_columns: tuple[str, ...], keys: lis
         ]
         identities = list(dict.fromkeys(identities))
         placeholders = ", ".join("?" for _ in identities)
-        con.execute(
+        execute_table_dml(
+            con,
             f"DELETE FROM {table.qualified} WHERE {quote('cdcf_internal_id')} "
             f"IN ({placeholders})",
             identities,
@@ -136,7 +139,7 @@ def delete_keys(con, table: TableSchema, key_columns: tuple[str, ...], keys: lis
         staging = "_cdcf_delete_keys"
         types = [table.raw_types.get(c, table.columns.get(c, VARCHAR)) for c in key_columns]
         defs = ", ".join(f"{quote(c)} {t}" for c, t in zip(key_columns, types, strict=True))
-        con.execute(f"CREATE OR REPLACE TEMP TABLE {staging} ({defs})")
+        execute_table_dml(con, f"CREATE OR REPLACE TEMP TABLE {staging} ({defs})")
         if table.native_types and any(column in table.native_types for column in key_columns):
             key_rows = [list(k) for k in keys]
             native_types = [table.native_types.get(column) for column in key_columns]
@@ -163,11 +166,12 @@ def delete_keys(con, table: TableSchema, key_columns: tuple[str, ...], keys: lis
                 )
         else:
             bulk_insert(con, staging, list(key_columns), [list(k) for k in keys], types)
-        con.execute(
+        execute_table_dml(
+            con,
             f"DELETE FROM {table.qualified} AS t WHERE EXISTS "
             f"(SELECT 1 FROM {staging} AS v WHERE {predicate})"
         )
-        con.execute(f"DROP TABLE IF EXISTS {staging}")
+        execute_table_dml(con, f"DROP TABLE IF EXISTS {staging}")
         return
     for start in range(0, len(keys), DELETE_CHUNK):
         chunk = keys[start : start + DELETE_CHUNK]
@@ -181,7 +185,8 @@ def delete_keys(con, table: TableSchema, key_columns: tuple[str, ...], keys: lis
                 params.extend(bound)
             value_sql.append("(" + ", ".join(expressions) + ")")
         placeholders = ", ".join(value_sql)
-        con.execute(
+        execute_table_dml(
+            con,
             f"DELETE FROM {table.qualified} AS t WHERE EXISTS "
             f"(SELECT 1 FROM (VALUES {placeholders}) AS v({cols}) WHERE {predicate})",
             params,
@@ -224,7 +229,8 @@ def delete_matching_row(
         )
         params.extend(bound)
     match = " AND ".join(predicates)
-    result = con.execute(
+    result = execute_table_dml(
+        con,
         f"DELETE FROM {table.qualified} AS victim WHERE "
         f"victim.{quote(CDCF_EVENT_ID)} = ("
         f"SELECT candidate.{quote(CDCF_EVENT_ID)} FROM {table.qualified} AS candidate "
@@ -302,7 +308,8 @@ def update_rows(
             nonlocal affected
             if not rows:
                 return
-            result = con.execute(
+            result = execute_table_dml(
+                con,
                 f"UPDATE {table.qualified} AS t SET {update_sql} FROM "
                 f"(VALUES {', '.join(rows)}) AS v({values_alias_sql}) "
                 f"WHERE {where_sql} RETURNING 1",
@@ -359,7 +366,8 @@ def _update_rows_by_internal_identity(
         if not set_parts:
             continue
         identity = _identity_value(table, source_key, key_columns=key_columns)
-        result = con.execute(
+        result = execute_table_dml(
+            con,
             f"UPDATE {table.qualified} SET {', '.join(set_parts)} WHERE "
             f"{quote('cdcf_internal_id')} = ? RETURNING 1",
             [*params, identity],
@@ -449,7 +457,8 @@ def bulk_insert(
     except ImportError:  # pragma: no cover - pyarrow is a declared dependency
         log.warning("pyarrow is unavailable; falling back to a slow row-at-a-time insert")
         placeholders = ", ".join("?" for _ in columns)
-        con.executemany(
+        executemany_table_dml(
+            con,
             f"{verb} INTO {target} ({collist}) VALUES ({placeholders})", rows
         )
         return
@@ -474,7 +483,7 @@ def bulk_insert(
         table = pa.table(arrays)
         con.register(view, table)
         try:
-            con.execute(f"{verb} INTO {target} ({collist}) SELECT * FROM {view}")
+            execute_table_dml(con, f"{verb} INTO {target} ({collist}) SELECT * FROM {view}")
         finally:
             con.unregister(view)
 
@@ -693,7 +702,8 @@ def _bulk_insert_typed_rows(con, table: TableSchema, columns: list[str], rows: l
     con.register(view, arrow_table)
     try:
         collist = ", ".join(quote(column) for column in columns)
-        con.execute(
+        execute_table_dml(
+            con,
             f"INSERT INTO {table.qualified} ({collist}) SELECT "
             f"{', '.join(select_expressions)} FROM {view} AS v"
         )
@@ -732,7 +742,8 @@ def insert_typed_rows(
     def flush() -> None:
         if not value_rows:
             return
-        con.execute(
+        execute_table_dml(
+            con,
             f"INSERT INTO {target} ({collist}) VALUES {', '.join(value_rows)}",
             batch_params,
         )

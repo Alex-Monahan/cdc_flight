@@ -4424,3 +4424,179 @@ correct boundary. 2.4 remains 4/5 for the stock-Debezium omitted `xml[]` value
 after the source row disappears, not for money. 2.6 remains 4/5 because the
 marker-preserving TOAST channel is still deferred. Money validation remains
 deferred. No keyless-delete behavior was changed or reopened.
+
+## FIX ROUND 17 closure — unforgeable provenance and fail-closed ownership (2026-08-12)
+
+FIX ROUND 17 started at `85f95f4919b84cefa4adeaec6176cf77407b7b34` on
+`feature/2.4-2.6-type-handling`. It closes both repeated R16 MAJORs and also
+closes the neighboring pre-DML control seams found during the final audit. The
+four mandated reproductions were run before implementation and all four failed:
+
+* Monkeypatching `destination.read_keyless_event_state` to raise a DuckDB
+  `TransactionException` still produced a durable `raw_control_bad` table
+  refusal and a critical `table_exception_contained` alert.
+* A duplicate `_cdc_flight.keyless_events` insert through the old facade was
+  wrapped as `DestinationDataRejection`.
+* Binding `10**100` to `INSERT INTO t_int VALUES (?)` raised DuckDB
+  `InvalidInputException`, which escaped the old three-class data tuple.
+* A 1,001-line unmarked `r16_unmarked_owner_probe.py` was absent from the old
+  ownership set and therefore did not fail the threshold guard.
+
+### R16-1: provenance is now a system boundary
+
+`destination_failure.py` creates `TableDataProvenance` and its mint inside a
+closure containing a private sentinel. The constructor accepts only that closed
+sentinel, stores the source schema, source table, and target in private slots,
+and exposes read-only properties. A caller cannot manufacture an accepted token
+from strings, a connection object, or a guessed constructor argument. The only
+production mint call is the lazy `table_dml()` factory in `table_writer.py`; it
+is reached immediately before that relation's first physical table DML. Empty
+keyed inserts do not mint a capability. `MaterializationConnection` requires the
+token, exposes only explicit table-DML routing plus Arrow register/unregister,
+and has no generic `execute` or `executemany` forwarding surface.
+
+All physical table DML in `table_writer.py` and `typed_materialization.py` routes
+through the explicit DML helpers. Control-state reads and writes receive the raw
+DuckDB connection structurally: keyless event-state reads, the keyless event
+ledger insert, column-presence writes, descriptor reads, spill catalog reads, and
+the XML recovery source read are not passed through the DML facade. The former
+SQL-prefix classifier was removed entirely. `failure_containment` derives scope
+only from a `TableDataProvenance` instance, and `_collect_contained` no longer
+catches and quarantines arbitrary exceptions.
+
+The two required control seams now fail the run without table attribution:
+
+* The unit and real-Lab raw-control-read tests raise the original
+  `TransactionException`; schema refusals are zero, the
+  `table_exception_contained` alert is zero, and `_contained_failures` is empty.
+  No fabricated `source_relation` is emitted and the healthy peer is not turned
+  into a replay-based justification for the control failure.
+* The real-Lab control-ledger test removes the physical row first so the duplicate
+  reaches the `_cdc_flight.keyless_events` primary key. With the durable read
+  monkeypatched absent, the original `ConstraintException` escapes; schema
+  refusals, containment alerts, and `_contained_failures` remain zero. The direct
+  facade test also proves that the control insert is raw.
+
+The additional seam audit found and fixed two more pre-DML routes. A descriptor
+provider `TransactionException` now stays raw in `GroupPlan._enrich_descriptors`,
+and spill-time descriptor/provider failures stay raw; `_spill_events` rolls back
+an open staging transaction and re-raises without recording a refusal. The
+omitted-`xml[]` source reader likewise re-raises driver/session failures while
+retaining deliberate `AdmissionError` schema decisions. Focused tests cover all
+three neighboring paths.
+
+### InvalidInputException and taxonomy completeness
+
+The table-DML data-rejection tuple is now
+`ConversionException`, `ConstraintException`, `InvalidInputException`,
+`NotImplementedException`, `OutOfRangeException`, and `TypeMismatchException`.
+The real `10**100` binding test crosses the actual table DML facade and is
+contained as `DestinationDataRejection`, so a row/value binding rejection cannot
+fail the whole run merely because DuckDB chose `InvalidInputException`.
+
+The remaining DuckDB 1.5.4 `Error` subclasses are explicitly listed as non-data
+operation/catalog/connection/parser/transaction classes. The boundary test
+introspects every exported `duckdb.Error` subclass and asserts that the union of
+the data and non-data lists is exact. A future driver class, or a class silently
+added to the data tuple, fails the test rather than widening the containment
+boundary invisibly. This is the completeness proof used for the reachable stock
+DuckDB table-binding surface.
+
+### R16-2: ownership measurement now fails closed
+
+`_ownership_modules` enumerates every `src/cdc_flight/*.py` module. The predicate
+is no longer an opt-in marker or legacy-class test: every source file is measured,
+including an empty or unmarked module. There are no exclusions. The threshold is
+still the original strict `<1000` lines; it was not raised or relaxed. The
+round-17 regression creates both an empty unmarked module and a 1,001-line
+unmarked probe, proves both are in the measurement set, and proves the threshold
+guard raises on the large probe. The temporary probe is removed by the test's
+temporary-directory cleanup.
+
+The old guard measured 16 modules. The new guard newly surfaces these 71 modules;
+each is retained in the measurement set and each is below the threshold in the
+final tree:
+
+```text
+__init__.py, acquisition.py, apply_sql.py, assembler.py, catalog.py,
+catalog_admission.py, catalog_baseline.py, catalog_change_queue.py,
+catalog_commit.py, catalog_descriptors.py, catalog_generation.py,
+catalog_lifecycle.py, catalog_poll.py, catalog_state.py, catalog_support.py,
+commit_group.py, commit_metadata.py, completion_stage.py, config.py,
+consumer.py, control_schema.py, datagen.py, debezium_props.py, destination.py,
+destination_alerts.py, destination_lease.py, destination_refusals.py,
+discovery_coordinator.py, engine.py, envelope.py, errors.py, faults.py,
+identity_codec.py, inspect.py, machines.py, naming.py, offsets.py, ownership.py,
+physical_row_matrix.py, reconcile.py, recovery.py, resnapshot_batches.py,
+resnapshot_recovery.py, resnapshot_refusal.py, resnapshot_source_policy.py,
+retirement.py, row_patch.py, run_state.py, schema_epoch.py, schema_evolution.py,
+schema_registry.py, self_heal.py, snapshot.py, snapshot_completion.py,
+source_health.py, source_marker.py, source_relations.py, spill.py,
+spill_protocol.py, spill_refusal.py, state_matrix.py, states.py, supervisor.py,
+table_lifecycle.py, toast.py, typed_materialization.py, typed_types.py,
+typed_value_codec.py, typed_value_transport.py, unit_admission.py,
+unit_apply.py
+```
+
+Three newly measured oversized ownership surfaces were honestly decomposed:
+
+* `catalog.py` was split with `catalog_lifecycle.py`; the final sizes are 853 and
+  594 lines.
+* `destination.py` was split with `destination_alerts.py`, `destination_lease.py`,
+  and `destination_refusals.py`; the final sizes are 543, 536, 241, and 601
+  lines.
+* `typed_types.py` was split with `typed_value_codec.py` and
+  `typed_value_transport.py`; the final sizes are 800, 975, and 94 lines.
+
+The historical starting sizes were 1,406 (`catalog.py`), 1,784
+(`destination.py`), and 1,683 (`typed_types.py`). No module was hidden, excluded,
+or split merely to evade measurement. The largest remaining modules are still
+under the unchanged boundary (`resnapshot.py` and `pipeline.py` are 999 lines).
+
+### Round-17 measurement, lanes, and score
+
+Final collection on the committed tree's pre-commit working tree was 1,731
+default candidates, 171 slow candidates, and 46 MotherDuck candidates. The
+structure guard contributes 10/1/1 items, so `_BASELINE_SELECTED` is
+**{1721, 170, 45}** for default/slow/MotherDuck respectively.
+
+| command | observed result | workers |
+|---|---|---:|
+| `CDC_TEST_PGPORT=15434 make test` | **1,731 passed** in 275.49s; wall 276.04s | 12 |
+| `CDC_TEST_PGPORT=15434 make test-slow` (run 1) | **171 passed** in 2,212.58s; wall 2,213.82s | 2 |
+| `CDC_TEST_PGPORT=15434 make test-slow` (run 2) | **171 passed** in 2,304.22s; wall 2,305.26s | 2 |
+| `CDC_TEST_PGPORT=15434 make test-md` | **46 passed** in 1,057.80s; wall 1,058.90s | 8 |
+| `CDC_TEST_PGPORT=15434 make lint` | **All checks passed** | n/a |
+
+The final honest scores remain **1.2 = 5/5**, **2.4 = 4/5**, **2.5 = 5/5**,
+**2.6 = 4/5**, **4.0 = 5/5**, and **4.7 = 1/5**. The 2.4 deduction is the
+non-money stock-Debezium limitation: an opaque `xml[]` field can be absent after
+the source row is gone, so no lossless source spelling can be recovered without
+synthesizing a value. The implementation keeps money and XML VARCHAR/non-blocking
+policy intact, but money fidelity remains deferred. The 2.6 score remains capped
+by stock Debezium's unchanged-TOAST marker limitation. The 4.0 score is now 5/5
+because table DML has a provenance boundary and control/driver failures stay
+fail-loud and unscoped.
+
+Cleanup after the final lanes: PostgreSQL 18 on the project-local **15434**
+cluster is running with **zero replication slots**; the only database names left
+are the eight expected `cdc_flight_test_template_pg15434_gw0` through `gw7`
+worker templates. MotherDuck listed 21 databases and zero repository-created
+`cdc_flight_md_*`, `cdc_p2b_*`, or `cdc_flight_test_*` databases. No Docker or
+prohibited PostgreSQL port was used by a test lane.
+
+One final default-lane attempt, before updating two stale tests to the new
+fail-loud spill contract and removing the no-longer-existing XML admission catch
+from the handler inventory, reported 1,729 passed and those two expected contract
+failures. It was corrected and rerun to the green result above. A mistyped
+workdir launch for one slow-pass attempt created no process; the required pass
+was immediately launched from this workspace. A diagnostic MotherDuck cleanup
+probe initially used a nonexistent helper import, connected nowhere, and was
+rerun through the repository's `motherduck_probe._database_names` helper.
+
+Anything still unproven is explicit: stock Debezium cannot losslessly recover an
+omitted `xml[]` value after the source row disappears; the marker-preserving TOAST
+5/5 upgrade is deferred; money fidelity is deferred; and a connector/engine
+failure raised before Python has any honest relation identity remains fail-loud
+and offset-alerted rather than being assigned to a table. No state from a prior
+build was migrated, and no keyless-delete work was reopened.

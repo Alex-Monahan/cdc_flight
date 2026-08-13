@@ -209,10 +209,11 @@ class DestinationExecutionFailure(RuntimeError):
     and replay the same source transaction with healthy tables still eligible.
     """
 
-    def __init__(self, refused: SchemaEvolutionRefused, original: Exception):
+    def __init__(self, refused: SchemaEvolutionRefused, original: Exception, provenance):
         super().__init__(str(original))
         self.refused = refused
         self.original = original
+        self.provenance = provenance
 
 
 class TableWriteFailure(RuntimeError):
@@ -227,10 +228,11 @@ class TableWriteFailure(RuntimeError):
     remains loud.
     """
 
-    def __init__(self, refused: SchemaEvolutionRefused, original: Exception):
+    def __init__(self, refused: SchemaEvolutionRefused, original: Exception, provenance):
         super().__init__(str(original))
         self.refused = refused
         self.original = original
+        self.provenance = provenance
 
 
 class SchemaEvolutionRefused(AdmissionError):

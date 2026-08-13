@@ -21,12 +21,8 @@ TIMESTAMP = SourceTypeDescriptor(1114, "pg_catalog.timestamp", "timestamp")
 TIMESTAMPTZ = SourceTypeDescriptor(1184, "pg_catalog.timestamptz", "timestamptz")
 FLOAT4 = SourceTypeDescriptor(700, "pg_catalog.float4", "float4")
 FLOAT8 = SourceTypeDescriptor(701, "pg_catalog.float8", "float8")
-NUMERIC = SourceTypeDescriptor(
-    1700, "pg_catalog.numeric", "numeric", precision=30, scale=10
-)
-NUMRANGE = SourceTypeDescriptor(
-    3906, "pg_catalog.numrange", "range", range_subtype=NUMERIC
-)
+NUMERIC = SourceTypeDescriptor(1700, "pg_catalog.numeric", "numeric", precision=30, scale=10)
+NUMRANGE = SourceTypeDescriptor(3906, "pg_catalog.numrange", "range", range_subtype=NUMERIC)
 NUMMULTIRANGE = SourceTypeDescriptor(
     4532, "pg_catalog.nummultirange", "multirange", range_subtype=NUMRANGE
 )
@@ -86,8 +82,8 @@ def test_scalar_temporal_infinities_round_trip_through_local_native_materializer
             ],
         )
         assert con.execute(
-            'SELECT id, CAST(tsz AS VARCHAR), CAST(ts AS VARCHAR), CAST(d AS VARCHAR) '
-            'FROM typed.temporal_specials ORDER BY id'
+            "SELECT id, CAST(tsz AS VARCHAR), CAST(ts AS VARCHAR), CAST(d AS VARCHAR) "
+            "FROM typed.temporal_specials ORDER BY id"
         ).fetchall() == [
             (1, "infinity", "infinity", "infinity"),
             (2, "-infinity", "-infinity", "-infinity"),
@@ -128,8 +124,24 @@ def test_scalar_special_value_five_band_is_native_for_every_supported_type():
             ["id", "real_value", "double_value", "numeric_value", "tsz", "ts", "d"],
             [
                 [1, float("nan"), float("nan"), "NaN", None, None, None],
-                [2, float("inf"), float("inf"), "Infinity", PostgresInfinity(True), PostgresInfinity(True), PostgresInfinity(True)],
-                [3, float("-inf"), float("-inf"), "-Infinity", PostgresInfinity(False), PostgresInfinity(False), PostgresInfinity(False)],
+                [
+                    2,
+                    float("inf"),
+                    float("inf"),
+                    "Infinity",
+                    PostgresInfinity(True),
+                    PostgresInfinity(True),
+                    PostgresInfinity(True),
+                ],
+                [
+                    3,
+                    float("-inf"),
+                    float("-inf"),
+                    "-Infinity",
+                    PostgresInfinity(False),
+                    PostgresInfinity(False),
+                    PostgresInfinity(False),
+                ],
             ],
         )
         rows = con.execute(
@@ -141,12 +153,30 @@ def test_scalar_special_value_five_band_is_native_for_every_supported_type():
         assert rows[0][:7] == (1, True, False, False, True, False, False)
         assert math.isnan(rows[0][7]) and rows[0][8:] == (None, None, None)
         assert rows[1] == (
-            2, False, True, False, False, True, False,
-            float("inf"), "infinity", "infinity", "infinity",
+            2,
+            False,
+            True,
+            False,
+            False,
+            True,
+            False,
+            float("inf"),
+            "infinity",
+            "infinity",
+            "infinity",
         )
         assert rows[2] == (
-            3, False, True, True, False, True, True,
-            float("-inf"), "-infinity", "-infinity", "-infinity",
+            3,
+            False,
+            True,
+            True,
+            False,
+            True,
+            True,
+            float("-inf"),
+            "-infinity",
+            "-infinity",
+            "-infinity",
         )
     finally:
         con.close()
@@ -201,9 +231,7 @@ def test_large_delete_key_staging_keeps_temporal_infinity_on_typed_path():
             ["key", "payload"],
             [[key[0], str(index)] for index, key in enumerate(keys)],
         )
-        assert con.execute("SELECT count(*) FROM typed.large_temporal_keys").fetchone() == (
-            2002,
-        )
+        assert con.execute("SELECT count(*) FROM typed.large_temporal_keys").fetchone() == (2002,)
         delete_keys(con, table, ("key",), keys)
         assert con.execute("SELECT count(*) FROM typed.large_temporal_keys").fetchone() == (0,)
     finally:
@@ -281,8 +309,7 @@ def test_temporal_infinity_survives_snapshot_spill_and_replay(tmp_path):
         box.run([first, second, end("stream-1", 2, 102, {"app.customers": 2})])
         assert box.rows(
             box.target("customers"),
-            'id, CAST("tsz" AS VARCHAR), CAST("ts" AS VARCHAR), '
-            'CAST("d" AS VARCHAR)',
+            'id, CAST("tsz" AS VARCHAR), CAST("ts" AS VARCHAR), CAST("d" AS VARCHAR)',
             "id",
         ) == [
             (1, "infinity", "infinity", "infinity"),
@@ -293,9 +320,7 @@ def test_temporal_infinity_survives_snapshot_spill_and_replay(tmp_path):
         # A second arrival of the exact source transaction is the replay path.  The
         # keyed fold/delete identity must leave one row per source key.
         box.run([first, second, end("stream-1", 2, 102, {"app.customers": 2})])
-        assert box.scalar(
-            f'SELECT count(*) FROM "cdc_raw"."{box.target("customers")}"'
-        ) == 2
+        assert box.scalar(f'SELECT count(*) FROM "cdc_raw"."{box.target("customers")}"') == 2
     finally:
         for box in boxes:
             box.close()
@@ -350,23 +375,26 @@ def test_synthetic_builtin_failure_is_contained_to_one_table(tmp_path, monkeypat
             (4, "peer-4"),
         ]
         assert not box.exists(box.target("contained_bad"))
-        assert box.q(
-            "SELECT state, reason FROM _cdc_flight.schema_refusals "
-            "WHERE source_table = 'contained_bad'"
-        )[0][0] == "quarantined"
-        assert box.scalar(
-            "SELECT count(*) FROM _cdc_flight.alerts "
-            "WHERE code = 'table_exception_contained'"
-        ) == 1
+        assert (
+            box.q(
+                "SELECT state, reason FROM _cdc_flight.schema_refusals "
+                "WHERE source_table = 'contained_bad'"
+            )[0][0]
+            == "quarantined"
+        )
+        assert (
+            box.scalar(
+                "SELECT count(*) FROM _cdc_flight.alerts WHERE code = 'table_exception_contained'"
+            )
+            == 1
+        )
         assert box.applier._contained_failures
         assert "ValueError" in box.applier._contained_failures[0]["exception_type"]
     finally:
         box.close()
 
 
-def test_materializer_failure_after_table_delete_rolls_back_the_whole_group(
-    tmp_path, monkeypatch
-):
+def test_materializer_failure_after_table_delete_rolls_back_the_whole_group(tmp_path, monkeypatch):
     """A Python failure after DML cannot commit a torn table image."""
     original = typed_materialization._bulk_insert_typed_rows
     box = Lab(tmp_path / "torn-write.duckdb")
@@ -395,15 +423,11 @@ def test_materializer_failure_after_table_delete_rolls_back_the_whole_group(
 
         def delete_then_raise(con, table, columns, rows):
             if rows and table.name.endswith("torn_bad"):
-                con.execute(
-                    f'DELETE FROM {table.qualified} WHERE "id" = 1'
-                )
+                con._connection.execute(f'DELETE FROM {table.qualified} WHERE "id" = 1')
                 raise ValueError("synthetic post-delete materializer failure")
             return original(con, table, columns, rows)
 
-        monkeypatch.setattr(
-            typed_materialization, "_bulk_insert_typed_rows", delete_then_raise
-        )
+        monkeypatch.setattr(typed_materialization, "_bulk_insert_typed_rows", delete_then_raise)
         box.run(
             [
                 data(
@@ -446,12 +470,9 @@ def test_materializer_failure_after_table_delete_rolls_back_the_whole_group(
             (1, "old"),
             (2, "keep"),
         ]
-        assert box.rows(box.target("torn_peer"), "id, name", "id") == [
-            (1, "healthy")
-        ]
+        assert box.rows(box.target("torn_peer"), "id, name", "id") == [(1, "healthy")]
         assert box.q(
-            "SELECT state FROM _cdc_flight.schema_refusals "
-            "WHERE source_table = 'torn_bad'"
+            "SELECT state FROM _cdc_flight.schema_refusals WHERE source_table = 'torn_bad'"
         ) == [("pending",)]
         assert box.applier.error is not None
         assert "ValueError" in box.applier._contained_failures[0]["exception_type"]
@@ -459,9 +480,7 @@ def test_materializer_failure_after_table_delete_rolls_back_the_whole_group(
         box.close()
 
 
-def test_an_explicit_quarantine_ack_is_loudly_recorded_but_does_not_unblock(
-    tmp_path, monkeypatch
-):
+def test_an_explicit_quarantine_ack_is_loudly_recorded_but_does_not_unblock(tmp_path, monkeypatch):
     """An operator acknowledgement suppresses only the repeated run failure."""
     original = typed_materialization._bulk_insert_typed_rows
 
@@ -502,8 +521,7 @@ def test_an_explicit_quarantine_ack_is_loudly_recorded_but_does_not_unblock(
                 ]
             )
         assert first.q(
-            "SELECT state FROM _cdc_flight.schema_refusals "
-            "WHERE source_table = 'ack_bad'"
+            "SELECT state FROM _cdc_flight.schema_refusals WHERE source_table = 'ack_bad'"
         ) == [("quarantined",)]
     finally:
         first.lease.release(first.con)
@@ -543,8 +561,7 @@ def test_an_explicit_quarantine_ack_is_loudly_recorded_but_does_not_unblock(
             (3, "peer-3"),
         ]
         assert acknowledged.q(
-            "SELECT state FROM _cdc_flight.schema_refusals "
-            "WHERE source_table = 'ack_bad'"
+            "SELECT state FROM _cdc_flight.schema_refusals WHERE source_table = 'ack_bad'"
         ) == [("quarantined",)]
         assert not acknowledged.exists(acknowledged.target("ack_bad"))
     finally:
@@ -559,7 +576,9 @@ def test_destination_programming_error_is_loud_not_a_table_quarantine(tmp_path, 
 
     def fail_with_bad_sql(con, table, columns, rows):
         if table.name.endswith("programming_bad"):
-            con.execute("SELECT definitely_missing_column FROM definitely_missing_table")
+            con._connection.execute(
+                "SELECT definitely_missing_column FROM definitely_missing_table"
+            )
         return original(con, table, columns, rows)
 
     monkeypatch.setattr(typed_materialization, "_bulk_insert_typed_rows", fail_with_bad_sql)
@@ -597,7 +616,7 @@ def test_transaction_control_exception_is_not_a_table_quarantine(tmp_path, monke
         if table.name.endswith("txn_exception_bad"):
             # This is the reviewer's probe: it is a transaction-control operation,
             # not a rejection of a source value or row.
-            con.execute("BEGIN TRANSACTION")
+            con._connection.execute("BEGIN TRANSACTION")
         return original(con, table, columns, rows)
 
     monkeypatch.setattr(
@@ -639,15 +658,16 @@ def test_transaction_control_exception_is_not_a_table_quarantine(tmp_path, monke
             "WHERE source_table = 'txn_exception_bad'"
         ) == [(0,)]
         assert box.q(
-            "SELECT count(*) FROM _cdc_flight.alerts "
-            "WHERE code = 'table_exception_contained'"
+            "SELECT count(*) FROM _cdc_flight.alerts WHERE code = 'table_exception_contained'"
         ) == [(0,)]
     finally:
         box.close()
 
 
 def test_destination_classifier_is_a_closed_data_boundary():
-    """Only explicit value/row rejections cross the table-containment boundary."""
+    """Only explicit value/row rejections cross the table-DML capability boundary."""
+    import inspect
+
     import duckdb
 
     from cdc_flight import destination_failure
@@ -655,20 +675,43 @@ def test_destination_classifier_is_a_closed_data_boundary():
     assert destination_failure.DATA_REJECTION_EXCEPTION_NAMES == (
         "ConversionException",
         "ConstraintException",
+        "InvalidInputException",
+        "NotImplementedException",
         "OutOfRangeException",
+        "TypeMismatchException",
     )
     assert "TransactionException" not in destination_failure.DATA_REJECTION_EXCEPTION_NAMES
+    driver_errors = {
+        name
+        for name in dir(duckdb)
+        if inspect.isclass(getattr(duckdb, name))
+        and issubclass(getattr(duckdb, name), duckdb.Error)
+        and name != "Error"
+    }
+    assert driver_errors == {
+        *destination_failure.DATA_REJECTION_EXCEPTION_NAMES,
+        *destination_failure.NON_DATA_EXCEPTION_NAMES,
+    }
 
     con = duckdb.connect(":memory:")
-    facade = destination_failure.MaterializationConnection(con)
+    con.execute("CREATE TABLE t_int (value INTEGER)")
+    facade = destination_failure.MaterializationConnection(
+        con,
+        destination_failure._mint_table_data_provenance("app", "typed", "t_int"),
+    )
     try:
+        with pytest.raises(duckdb.ConversionException):
+            con.execute("SELECT CAST('not-an-integer' AS INTEGER)")
         with pytest.raises(destination_failure.DestinationDataRejection) as rejected:
-            facade.execute("SELECT CAST('not-an-integer' AS INTEGER)")
+            destination_failure.execute_table_dml(
+                facade, "INSERT INTO t_int VALUES (?)", ["not-an-integer"]
+            )
         assert isinstance(rejected.value.original, duckdb.ConversionException)
+        assert rejected.value.provenance.qualified_source == "app.typed"
 
         con.execute("BEGIN TRANSACTION")
         with pytest.raises(duckdb.TransactionException):
-            facade.execute("BEGIN TRANSACTION")
+            con.execute("BEGIN TRANSACTION")
         con.execute("ROLLBACK")
     finally:
         con.close()
@@ -694,9 +737,7 @@ def test_real_slot_advances_when_a_builtin_materializer_failure_is_injected(sand
     with psycopg.connect(sandbox.source.dsn, autocommit=True) as conn:
         conn.execute(f"DROP TABLE IF EXISTS {bad}")
         conn.execute(f"DROP TABLE IF EXISTS {peer}")
-        conn.execute(
-            f"CREATE TABLE {bad} (id integer PRIMARY KEY, name text, payload jsonb)"
-        )
+        conn.execute(f"CREATE TABLE {bad} (id integer PRIMARY KEY, name text, payload jsonb)")
         conn.execute(f"CREATE TABLE {peer} (id integer PRIMARY KEY, name text)")
         conn.execute(f"ALTER PUBLICATION {publication} ADD TABLE {bad}, {peer}")
 
@@ -706,6 +747,7 @@ def test_real_slot_advances_when_a_builtin_materializer_failure_is_injected(sand
     hook = tmp_path / "sitecustomize.py"
     hook.write_text(
         "from cdc_flight import typed_materialization as _tm\n"
+        "from cdc_flight.destination_failure import execute_table_dml\n"
         "_real_bulk = _tm.bulk_insert\n"
         "_real_typed = _tm.insert_typed_rows\n"
         "def _bad(target):\n"
@@ -770,10 +812,13 @@ def test_real_slot_advances_when_a_builtin_materializer_failure_is_injected(sand
             # durable table is quarantined, later runs fail closed on the retained
             # refusal before re-entering the materializer; the original third-party
             # type/message must remain durable and attributable there.
-            assert "ValueError" in sandbox.duck_query(
-                "SELECT reason FROM _cdc_flight.schema_refusals "
-                "WHERE source_table = 'fix14_any_exception_bad'"
-            )[0][0], run
+            assert (
+                "ValueError"
+                in sandbox.duck_query(
+                    "SELECT reason FROM _cdc_flight.schema_refusals "
+                    "WHERE source_table = 'fix14_any_exception_bad'"
+                )[0][0]
+            ), run
             runs.append(run)
             metrics.append(slot_metrics())
 
@@ -782,16 +827,14 @@ def test_real_slot_advances_when_a_builtin_materializer_failure_is_injected(sand
         assert restarts == sorted(restarts) and len(set(restarts)) == 4, metrics
         assert confirms == sorted(confirms) and len(set(confirms)) == 4, metrics
         assert sandbox.duck_query(
-            "SELECT id, name FROM cdc_raw.cdcflight_app_fix14_any_exception_peer "
-            "ORDER BY id"
+            "SELECT id, name FROM cdc_raw.cdcflight_app_fix14_any_exception_peer ORDER BY id"
         ) == [(ident, f"peer-{ident}") for ident in range(1, 5)]
         assert sandbox.duck_query(
             "SELECT state FROM _cdc_flight.schema_refusals "
             "WHERE source_table = 'fix14_any_exception_bad'"
         ) == [("quarantined",)]
         assert sandbox.duck_query(
-            "SELECT count(*) FROM _cdc_flight.alerts "
-            "WHERE code = 'table_exception_contained'"
+            "SELECT count(*) FROM _cdc_flight.alerts WHERE code = 'table_exception_contained'"
         ) == [(1,)]
         print("FIX14 generic any-exception runs:", runs)
         print("FIX14 generic any-exception slot metrics:", metrics)
@@ -804,9 +847,7 @@ def test_real_slot_advances_when_a_builtin_materializer_failure_is_injected(sand
 
 @pytest.mark.slow
 @pytest.mark.e2e
-def test_real_destination_error_is_contained_over_four_runs_with_wal_metrics(
-    sandbox, tmp_path
-):
+def test_real_destination_error_is_contained_over_four_runs_with_wal_metrics(sandbox, tmp_path):
     """A real DuckDB statement error is loud, table-scoped, and slot-safe."""
     import os
 
@@ -817,37 +858,33 @@ def test_real_destination_error_is_contained_over_four_runs_with_wal_metrics(
     peer = "app.r15_destination_error_peer"
     capture = {
         "CDC_AUTO_DISCOVERY": "0",
-        "CDC_TABLES": ",".join(
-            [table.rsplit(".", 1)[1] for table in [*bad_tables, peer]]
-        ),
+        "CDC_TABLES": ",".join([table.rsplit(".", 1)[1] for table in [*bad_tables, peer]]),
     }
     _fresh_real_sandbox(sandbox)
     sandbox.reseed()
     with psycopg.connect(sandbox.source.dsn, autocommit=True) as conn:
         conn.execute("DROP TABLE IF EXISTS " + ", ".join([*bad_tables, peer]))
         for table in bad_tables:
-            conn.execute(
-                f"CREATE TABLE {table} (id integer PRIMARY KEY, name text, payload jsonb)"
-            )
+            conn.execute(f"CREATE TABLE {table} (id integer PRIMARY KEY, name text, payload jsonb)")
         conn.execute(f"CREATE TABLE {peer} (id integer PRIMARY KEY, name text)")
         conn.execute(
-            "ALTER PUBLICATION " + publication + " ADD TABLE "
-            + ", ".join([*bad_tables, peer])
+            "ALTER PUBLICATION " + publication + " ADD TABLE " + ", ".join([*bad_tables, peer])
         )
     hook = tmp_path / "sitecustomize.py"
     hook.write_text(
         "from cdc_flight import typed_materialization as _tm\n"
+        "from cdc_flight.destination_failure import execute_table_dml\n"
         "_real_bulk = _tm.bulk_insert\n"
         "_real_typed = _tm.insert_typed_rows\n"
         "def _bad(target):\n"
         "    return 'r15_destination_error_bad_' in str(target)\n"
         "def _fail_bulk(con, target, columns, rows, types=None, **kwargs):\n"
         "    if rows and _bad(target):\n"
-        "        con.execute(\"SELECT CAST('destination-r15-error' AS INTEGER)\")\n"
+        "        execute_table_dml(con, f'INSERT INTO {target} (\"id\") VALUES (?)', ['bad-int'])\n"
         "    return _real_bulk(con, target, columns, rows, types, **kwargs)\n"
         "def _fail_typed(con, table, columns, rows, native_types, **kwargs):\n"
         "    if rows and _bad(table.qualified):\n"
-        "        con.execute(\"SELECT CAST('destination-r15-error' AS INTEGER)\")\n"
+        "        execute_table_dml(con, f'INSERT INTO {table.qualified} (\"id\") VALUES (?)', ['bad-int'])\n"
         "    return _real_typed(con, table, columns, rows, native_types, **kwargs)\n"
         "_tm.bulk_insert = _fail_bulk\n"
         "_tm.insert_typed_rows = _fail_typed\n",
@@ -898,8 +935,7 @@ def test_real_destination_error_is_contained_over_four_runs_with_wal_metrics(
             assert failed["error_cause_type"] == "SchemaEvolutionRefused", failed
             metrics.append(slot_metrics())
             reason = sandbox.duck_query(
-                "SELECT reason FROM _cdc_flight.schema_refusals "
-                "WHERE source_table = ?",
+                "SELECT reason FROM _cdc_flight.schema_refusals WHERE source_table = ?",
                 [bad.rsplit(".", 1)[1]],
             )[0][0]
             assert "ConversionException" in reason, reason
@@ -912,28 +948,23 @@ def test_real_destination_error_is_contained_over_four_runs_with_wal_metrics(
         assert all(value >= 0 for value in retained), metrics
         assert all(int(row[3]) <= int(row[4]) for row in metrics), metrics
         assert sandbox.duck_query(
-            "SELECT id, name FROM cdc_raw.cdcflight_app_r15_destination_error_peer "
-            "ORDER BY id"
+            "SELECT id, name FROM cdc_raw.cdcflight_app_r15_destination_error_peer ORDER BY id"
         ) == [(index, f"healthy-{index}") for index in range(1, 5)]
         assert sandbox.duck_query(
-            "SELECT count(*) FROM _cdc_flight.alerts "
-            "WHERE code = 'table_exception_contained'"
+            "SELECT count(*) FROM _cdc_flight.alerts WHERE code = 'table_exception_contained'"
         ) == [(4,)]
         print("FIX15 destination-raised LSN/WAL metrics:", metrics)
     finally:
         with psycopg.connect(sandbox.source.dsn, autocommit=True) as conn:
             conn.execute(
-                "ALTER PUBLICATION " + publication + " DROP TABLE "
-                + ", ".join([*bad_tables, peer])
+                "ALTER PUBLICATION " + publication + " DROP TABLE " + ", ".join([*bad_tables, peer])
             )
             conn.execute("DROP TABLE IF EXISTS " + ", ".join([*bad_tables, peer]))
 
 
 @pytest.mark.slow
 @pytest.mark.e2e
-def test_real_transaction_control_failure_fails_run_without_table_attribution(
-    sandbox, tmp_path
-):
+def test_real_transaction_control_failure_fails_run_without_table_attribution(sandbox, tmp_path):
     """A real PostgreSQL run keeps DuckDB transaction-control errors run-scoped."""
     import os
 
@@ -960,7 +991,7 @@ def test_real_transaction_control_failure_fails_run_without_table_attribution(
         "_real = _tm._bulk_insert_typed_rows\n"
         "def _control(con, table, columns, rows):\n"
         "    if rows and str(table.name).endswith('r16_txn_control_bad'):\n"
-        "        con.execute('BEGIN TRANSACTION')\n"
+        "        con._connection.execute('BEGIN TRANSACTION')\n"
         "    return _real(con, table, columns, rows)\n"
         "_tm._bulk_insert_typed_rows = _control\n",
         encoding="utf-8",
@@ -999,9 +1030,7 @@ def test_real_transaction_control_failure_fails_run_without_table_attribution(
             ],
             one_transaction=True,
         )
-        source_lsn = sandbox.pg_query(
-            "SELECT (pg_current_wal_lsn() - '0/0')::bigint"
-        )[0][0]
+        source_lsn = sandbox.pg_query("SELECT (pg_current_wal_lsn() - '0/0')::bigint")[0][0]
         failed = sandbox.run(
             extra_env=pipeline_env,
             expect_success=False,
@@ -1011,17 +1040,13 @@ def test_real_transaction_control_failure_fails_run_without_table_attribution(
         after = slot_metrics()
         assert failed["ok"] is False, failed
         assert failed["error_cause_type"] == "TransactionException", failed
-        assert "cannot start a transaction within a transaction" in failed[
-            "error"
-        ].lower(), failed
+        assert "cannot start a transaction within a transaction" in failed["error"].lower(), failed
         assert sandbox.duck_query(
-            "SELECT count(*) FROM _cdc_flight.schema_refusals "
-            "WHERE source_table IN (?, ?)",
+            "SELECT count(*) FROM _cdc_flight.schema_refusals WHERE source_table IN (?, ?)",
             [bad.rsplit(".", 1)[1], peer.rsplit(".", 1)[1]],
         ) == [(0,)]
         assert sandbox.duck_query(
-            "SELECT count(*) FROM _cdc_flight.alerts "
-            "WHERE code = 'table_exception_contained'"
+            "SELECT count(*) FROM _cdc_flight.alerts WHERE code = 'table_exception_contained'"
         ) == [(0,)]
         assert int(after[4]) == int(before[4]), (before, after)
         assert int(after[4]) < int(source_lsn), (after, source_lsn)

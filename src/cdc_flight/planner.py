@@ -229,24 +229,14 @@ class GroupPlan:
             # transaction), and that assertion is what makes the fold
             # source-transaction-preserving rather than merely group-wide (Codex 1).
             for item in list(self.work.values()):
-                try:
-                    table_work.end_transaction(item)
-                except (AmbiguousDelete, DestinationIdentityCollision, ToastBaseMissing):
-                    raise
-                except Exception as exc:
-                    failure_containment.contain_item_failure(self, item, exc)
+                table_work.end_transaction(item)
             if unit.txn_id:
                 self.stats["first_txn_id"] = self.stats["first_txn_id"] or unit.txn_id
                 self.stats["last_txn_id"] = unit.txn_id
             unit_succeeded = True
         finally:
-            if (
-                unit.txn_id
-                and self.toast_admission_end_provider is not None
-            ):
-                self.toast_admission_end_provider(
-                    unit.txn_id, commit=unit_succeeded
-                )
+            if unit.txn_id and self.toast_admission_end_provider is not None:
+                self.toast_admission_end_provider(unit.txn_id, commit=unit_succeeded)
             self._active_txn_id = None
 
     def _below_watermark(
@@ -306,7 +296,7 @@ class GroupPlan:
                     input_fingerprint=failure_containment.event_fingerprint(event),
                     refusal_origin="typed_planner",
                 )
-                failure_containment.mark_contained(
+                failure_containment.mark_blocked_event(
                     self, event.qualified_table, target, refused, refused
                 )
             self._count_event(event)
@@ -324,14 +314,11 @@ class GroupPlan:
             return
         if event_id is None:
             event_id = (
-                self.snapshots.event_id(event)
-                if snapshot is not None
-                else stream_event_id(event)
+                self.snapshots.event_id(event) if snapshot is not None else stream_event_id(event)
             )
         self._enrich_descriptors(event)
         if snapshot is None and (
-            self.toast_admission_provider is not None
-            or self.toast_policy_provider is not None
+            self.toast_admission_provider is not None or self.toast_policy_provider is not None
         ):
             try:
                 if self.toast_admission_provider is not None:
@@ -341,9 +328,7 @@ class GroupPlan:
                         txn_id=self._active_txn_id or event.txn_id,
                     )
                 else:
-                    policy = self.toast_policy_provider(
-                        event.qualified_table, event_lsn=event.lsn
-                    )
+                    policy = self.toast_policy_provider(event.qualified_table, event_lsn=event.lsn)
                     admitted = policy is None or policy.accepts_event(event.lsn)
             except TypeError as exc:
                 # Keep the narrow compatibility seam for embedders that supplied a
@@ -351,10 +336,7 @@ class GroupPlan:
                 # the event-LSN close operation above.
                 if "event_lsn" not in str(exc) and "txn_id" not in str(exc):
                     raise
-                provider = (
-                    self.toast_admission_provider
-                    or self.toast_policy_provider
-                )
+                provider = self.toast_admission_provider or self.toast_policy_provider
                 try:
                     result = provider(event.qualified_table, event_lsn=event.lsn)
                 except TypeError as retry_exc:
@@ -401,7 +383,7 @@ class GroupPlan:
                 source_table=event.table,
                 target=target,
                 detected_lsn=event.lsn,
-                    input_fingerprint=failure_containment.input_fingerprint(event),
+                input_fingerprint=failure_containment.input_fingerprint(event),
                 refusal_origin="typed_planner",
             ) from exc
         table_work.collect(item, event, row, event_id, probe=self, patch=patch)
@@ -429,40 +411,17 @@ class GroupPlan:
         target: str | None = None,
         event_id: str | None = None,
     ) -> None:
-        """Run one event through the table boundary without swallowing failures.
-
-        ``Exception`` is intentional here: the materializer calls pyarrow, DuckDB,
-        datetime and third-party adapters, so a package-local admission-class list is
-        not a containment boundary.  Protocol-control exceptions retain their
-        dedicated whole-transaction/self-healing routes; every other exception is
-        converted into the same durable table-scoped refusal.
-        """
+        """Run one event through the fold without changing failure scope."""
         if event.schema and event.table:
             self._failure_fingerprints.setdefault(
                 event.qualified_table, failure_containment.event_fingerprint(event)
             )
-        try:
-            self._collect(
-                event,
-                snapshot=snapshot,
-                target=target,
-                event_id=event_id,
-            )
-        except (AmbiguousDelete, DestinationIdentityCollision, ToastBaseMissing):
-            raise
-        except Exception as exc:
-            if isinstance(exc, SchemaEvolutionRefused):
-                # A recognized refusal retains the established whole-transaction
-                # rollback/retry path in commit_protocol.  This broad handler is
-                # specifically the missing architectural containment boundary for
-                # an otherwise-unrecognized third-party or builtin exception.
-                raise
-            resolved_target = target or (
-                snapshot.shadow
-                if snapshot is not None
-                else self.snapshots.target_table(event.schema, event.table)
-            )
-            failure_containment.contain_event_failure(self, event, resolved_target, exc)
+        self._collect(
+            event,
+            snapshot=snapshot,
+            target=target,
+            event_id=event_id,
+        )
 
     def _enrich_descriptors(self, event: PendingRecord) -> None:
         """Merge one memoized catalog descriptor map into a row envelope."""
@@ -479,17 +438,13 @@ class GroupPlan:
             )
         qualified = event.qualified_table
         if qualified not in self._catalog_descriptor_cache:
-            try:
-                catalog_descriptors = self.descriptor_provider(qualified)
-            except Exception as exc:
-                raise SchemaEvolutionRefused(
-                    f"catalog descriptor authority failed for {qualified}: {exc}; "
-                    "the source unit is held for automatic catalog retry",
-                    source_schema=event.schema,
-                    source_table=event.table,
-                    target=qualified,
-                    refusal_origin="typed_planner",
-                ) from exc
+            # The provider reads source control/catalog state, before any
+            # destination-table DML capability exists.  Its driver/session/network
+            # failures therefore remain run-level; only the provider itself may
+            # raise an already-classified AdmissionError for a verified descriptor
+            # problem.  A broad catch here would recreate the old false table
+            # attribution at a neighboring control seam.
+            catalog_descriptors = self.descriptor_provider(qualified)
             self._catalog_descriptor_cache[qualified] = dict(catalog_descriptors or {})
         catalog_descriptors = self._catalog_descriptor_cache[qualified]
         if not catalog_descriptors:
@@ -521,10 +476,7 @@ class GroupPlan:
             missing = ()
         else:
             missing = tuple(
-                sorted(
-                    set(catalog_descriptors)
-                    - catalog_support.delivered_event_fields(event)
-                )
+                sorted(set(catalog_descriptors) - catalog_support.delivered_event_fields(event))
             )
         if missing:
             raise SchemaEvolutionRefused(
@@ -543,14 +495,11 @@ class GroupPlan:
             catalog_descriptors,
         )
         if recoverable:
-            self._hydrate_omitted_xml_arrays(
-                event, recoverable, catalog_descriptors, watcher
-            )
+            self._hydrate_omitted_xml_arrays(event, recoverable, catalog_descriptors, watcher)
         for attribute in ("key_descriptors", "before_descriptors", "after_descriptors"):
             descriptors = getattr(event, attribute)
             if len(descriptors) >= len(catalog_descriptors) and all(
-                name in descriptors
-                and descriptors[name].fingerprint == descriptor.fingerprint
+                name in descriptors and descriptors[name].fingerprint == descriptor.fingerprint
                 for name, descriptor in catalog_descriptors.items()
             ):
                 continue
@@ -606,21 +555,10 @@ class GroupPlan:
                 detected_lsn=event.lsn,
                 refusal_origin="typed_planner",
             )
-        try:
-            values = reader(event, columns)
-        except AdmissionError:
-            raise
-        except Exception as exc:
-            raise SchemaEvolutionRefused(
-                f"source read for omitted opaque array field(s) {list(columns)!r} "
-                f"failed for {event.qualified_table}: {exc}; refusing to invent "
-                "or drop those values",
-                source_schema=event.schema,
-                source_table=event.table,
-                target=event.qualified_table,
-                detected_lsn=event.lsn,
-                refusal_origin="typed_planner",
-            ) from exc
+        # The reader is a source session/control read.  Its own AdmissionError
+        # remains a deliberate schema/value refusal, while driver/session/network
+        # failures must fail the run without assigning a false table quarantine.
+        values = reader(event, columns)
         # The stock connector omits opaque xml[] fields from the event itself.  A
         # short-lived INSERT can therefore be gone before this planner sees it.  Do
         # not turn that timing race into a table-wide refusal: an explicit SQL NULL
@@ -634,7 +572,8 @@ class GroupPlan:
                 "stock Debezium omitted xml[] field(s) %s for %s and the source "
                 "row is no longer visible; carrying explicit SQL NULL to keep the "
                 "table non-blocking",
-                list(columns), event.qualified_table,
+                list(columns),
+                event.qualified_table,
             )
             values = {name: None for name in columns}
         image_name = "before" if event.op == "d" else "after"
@@ -660,9 +599,7 @@ class GroupPlan:
             self.stats["first_lsn"] = self.stats["first_lsn"] or event.lsn
             self.stats["last_lsn"] = event.lsn
         if event.source_ts_ms:
-            self.stats["max_source_ts"] = max(
-                self.stats["max_source_ts"] or 0, event.source_ts_ms
-            )
+            self.stats["max_source_ts"] = max(self.stats["max_source_ts"] or 0, event.source_ts_ms)
 
     def _truncate(
         self, event: PendingRecord, target: str, *, snapshot: SnapshotTable | None
@@ -768,9 +705,7 @@ class GroupPlan:
                 continue
             comparable += 1
             expression, bound = apply_sql._typed_assignment(table, column, value)
-            predicate += (
-                f" AND {naming.quote(column)} IS NOT DISTINCT FROM {expression}"
-            )
+            predicate += f" AND {naming.quote(column)} IS NOT DISTINCT FROM {expression}"
             params.extend(bound)
         if not comparable:
             return None
@@ -800,7 +735,7 @@ class GroupPlan:
                 descriptors=key_descriptors,
                 key_columns=item.key_columns,
             )
-            return f'{naming.quote("cdcf_internal_id")} = ?', [identity]
+            return f"{naming.quote('cdcf_internal_id')} = ?", [identity]
         expressions: list[str] = []
         params: list = []
         for column, value in zip(item.key_columns, raw_key, strict=False):
@@ -825,7 +760,7 @@ class GroupPlan:
         """
         for index, item in enumerate(list(self.work.values())):
             try:
-                    table_writer.write(
+                table_writer.write(
                     self.con,
                     self.registry,
                     item,
@@ -846,16 +781,16 @@ class GroupPlan:
                 if isinstance(exc, DestinationDataRejection):
                     refused = failure_containment.as_contained_refusal(
                         exc.original,
-                        source_schema=item.source_schema,
-                        source_table=item.source_table,
-                        target=item.target,
+                        provenance=exc.provenance,
                         detected_lsn=self.stats.get("last_lsn"),
                         fingerprint=self._failure_fingerprints.get(
                             f"{item.source_schema}.{item.source_table}"
                         )
                         or failure_containment.item_fingerprint(item),
                     )
-                    raise DestinationExecutionFailure(refused, exc.original) from exc
+                    raise DestinationExecutionFailure(
+                        refused, exc.original, exc.provenance
+                    ) from exc
                 if destination_failure.is_driver_error(exc):
                     # A raw driver error did not cross the materializer's DML
                     # provenance boundary.  It can therefore be transaction
@@ -868,23 +803,20 @@ class GroupPlan:
                 # would commit a torn table image.  Roll back the complete source
                 # transaction and let the commit owner replay healthy peers with
                 # this relation excluded.
+                provenance = getattr(item, "_data_provenance", None)
+                if provenance is None:
+                    raise
                 refused = failure_containment.as_contained_refusal(
                     exc,
-                    source_schema=item.source_schema,
-                    source_table=item.source_table,
-                    target=item.target,
+                    provenance=provenance,
                     detected_lsn=self.stats.get("last_lsn"),
                     fingerprint=self._failure_fingerprints.get(
                         f"{item.source_schema}.{item.source_table}"
                     )
                     or failure_containment.item_fingerprint(item),
                 )
-                raise TableWriteFailure(refused, exc) from exc
-            if (
-                not item.snapshot
-                and item.source_schema
-                and item.target in self.created_in_txn
-            ):
+                raise TableWriteFailure(refused, exc, provenance) from exc
+            if not item.snapshot and item.source_schema and item.target in self.created_in_txn:
                 # Codex 5: destination ownership has to be persisted by whoever first
                 # materialises the table, snapshot or streaming, or a table that only
                 # ever existed through streaming DML has no durable `table_state` row
@@ -894,9 +826,7 @@ class GroupPlan:
                 after_first_table()
             if item.events:
                 self.stats["tables"].add(item.target)
-                self.table_counts[item.target] = (
-                    self.table_counts.get(item.target, 0) + item.events
-                )
+                self.table_counts[item.target] = self.table_counts.get(item.target, 0) + item.events
 
         presence_rows = [
             (self.registry.dataset, target, event_id, column, True, digest)
