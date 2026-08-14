@@ -177,9 +177,35 @@ class RunConfig:
     MotherDuck Flight needs) rather than an unbounded daemon.
     """
 
+    #: The SAFETY CEILING, not a normal exit path (rubric 4.5: errors must not
+    #: hang or lock). A run that reaches it has not proved a complete delivery and
+    #: is judged accordingly below.
     max_seconds: float = field(default_factory=lambda: float(_env("CDC_MAX_SECONDS", "90")))
+    #: The DECLARED FALLBACK for a run whose source cannot be marked. A run that
+    #: can establish a completion watermark never waits for this: see
+    #: `cdc_flight.completion_watermark`, and the 1,640 s that used to be spent
+    #: here (`codex_logs/slowlane_rootcause.md`).
     idle_seconds: float = field(default_factory=lambda: float(_env("CDC_IDLE_SECONDS", "8")))
     min_records: int = field(default_factory=lambda: int(_env("CDC_MIN_RECORDS", "0")))
+    #: Write one transactional marker to the source and end the run on the LSN
+    #: PostgreSQL assigns it. `0` keeps a run read-only against its source and
+    #: falls back to `idle_seconds`.
+    watermark_enabled: bool = field(
+        default_factory=lambda: _flag("CDC_COMPLETION_WATERMARK", True)
+    )
+    #: How long the stream must be quiet before the run asks for a position. Not a
+    #: completion timer - a watermark the source overtakes is simply retaken - so
+    #: this only stops a marker being written between two batches of a burst.
+    watermark_quiet_seconds: float = field(
+        default_factory=lambda: float(_env("CDC_WATERMARK_QUIET_SECONDS", "0.5"))
+    )
+    #: How many positions one run may take before it gives up and falls back to
+    #: the quiet window. Only a source that keeps committing while we watch it can
+    #: consume these; the budget is separate from the catalog fence's so a busy
+    #: source can never starve a `DROP TABLE`.
+    watermark_max_writes: int = field(
+        default_factory=lambda: int(_env("CDC_WATERMARK_MAX_WRITES", "60"))
+    )
     #: How far the slot's `confirmed_flush_lsn` may trail `pg_current_wal_lsn()`
     #: and still allow the supervisor to call a quiet stream "idle". A quiet
     #: stream with a large backlog means the connector is not streaming - most

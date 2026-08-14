@@ -305,6 +305,14 @@ def test_a_relation_with_an_unapplied_change_is_excluded_from_persistence():
     assert w.dirty(exclude={"app.customers"}) == []
 
 
+class _MarkerCursor:
+    def __init__(self, lsn):
+        self._lsn = lsn
+
+    def fetchone(self):
+        return (self._lsn,)
+
+
 def test_marker_failure_leaves_the_change_unfenced_rather_than_applied():
     """A source that cannot be written to (a replica, no permission) means the fence
     may never open. That is reported, not worked around: `fenced` stays False and the
@@ -326,11 +334,14 @@ def test_a_successful_marker_fences_every_pending_change():
     WAL-position search after a restart, so every record - including the marker
     itself - is skipped (measured; see `catalog._emit_marker`)."""
     class Fine:
+        """As psycopg behaves: `execute` returns a cursor carrying the LSN."""
+
         def __init__(self):
             self.calls = []
 
         def execute(self, sql, params=None):
             self.calls.append((sql, params))
+            return _MarkerCursor(4242)
 
     w = watcher()
     change = _pending(w, 1000)
@@ -338,6 +349,7 @@ def test_a_successful_marker_fences_every_pending_change():
     w._emit_marker(conn, [change])
     assert change.fenced is True
     assert w.markers_emitted == 1
+    assert w.marker.last_lsn == 4242
     sql, params = conn.calls[0]
     assert "pg_logical_emit_message(true" in sql
     assert params[0] == "cdcf_catalog_fence", "the reason is in the prefix (Opus Q3)"

@@ -5,6 +5,9 @@ machine approach*, and grades **an appropriate number of machines (more than one
 5. This file is what "appropriate" means here: thirteen focused machines, each owning one state,
 each with a declared edge set — plus the frozen decision domains, which are
 classifications rather than states and are deliberately **not** dressed up as machines.
+The count moved to fourteen when the run's *completion* decision stopped being a timer
+and became `CompletionWatermark`: "may this run stop?" is a state a run moves through,
+with one terminal verdict, not a comparison scattered over the supervision loop.
 The count is not the claim; coverage is. See SM-G for `CatalogBaseline`, the fifth
 consistency-affecting state that rev 14 made explicit.
 
@@ -297,6 +300,40 @@ SNAPSHOT_COMPLETION = Machine(
         "Has Debezium's ordered callback queue delivered every per-table terminal "
         "mark and the initial-snapshot COMPLETED notification, with every declared "
         "row callback committed?"
+    ),
+)
+
+# --------------------------------------------------------------------------- #
+# SM-B(iv) · CompletionWatermark — memory only, per engine invocation
+# --------------------------------------------------------------------------- #
+WATERMARK_UNARMED = "unarmed"        # no position taken for this quiet episode
+WATERMARK_ARMED = "armed"            # a marker is in the WAL; reach its LSN
+WATERMARK_REACHED = "reached"        # the destination is durably past it
+WATERMARK_UNAVAILABLE = "unavailable"  # the source cannot be marked at all
+
+COMPLETION_WATERMARK = Machine(
+    "completion_watermark",
+    states=(
+        WATERMARK_UNARMED, WATERMARK_ARMED, WATERMARK_REACHED, WATERMARK_UNAVAILABLE,
+    ),
+    edges=(
+        (WATERMARK_UNARMED, WATERMARK_ARMED),
+        # `armed -> unarmed`: a whole transaction committed PAST the watermark, so
+        # it no longer describes a finished delivery; take a new one when the
+        # stream is quiet again. There is deliberately no `unarmed -> reached`
+        # edge - the only route to a verdict runs through the marker that makes
+        # the position real - and both verdicts are terminal, because ending a run
+        # is a durability decision and not a fact that can be withdrawn.
+        (WATERMARK_ARMED, WATERMARK_UNARMED),
+        (WATERMARK_ARMED, WATERMARK_REACHED),
+        (WATERMARK_UNARMED, WATERMARK_UNAVAILABLE),
+    ),
+    terminal=(WATERMARK_REACHED, WATERMARK_UNAVAILABLE),
+    initial=WATERMARK_UNARMED,
+    durable=None,
+    purpose=(
+        "Has this run reached a source position it can PROVE the destination is "
+        "durably past, so it may stop now rather than waiting out a timer?"
     ),
 )
 

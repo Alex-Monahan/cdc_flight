@@ -350,10 +350,14 @@ def postgres_bad_healthy_containment(sandbox):
         )
         runs = []
         run_diagnostics = []
-        for _ in range(4):
+        for iteration in range(4):
+            # One transaction was written above, so only the first run can see a
+            # record. `min_records=1` on the other three was a wait for something
+            # that could never happen, and its cost was the whole `--max-seconds`
+            # of each (`codex_logs/slowlane_rootcause.md` §3.2 A2).
             run = box.run(
                 max_seconds=20,
-                min_records=1,
+                min_records=1 if iteration == 0 else 0,
                 expect_success=False,
             )
             runs.append(run)
@@ -392,11 +396,12 @@ def postgres_bad_healthy_containment(sandbox):
         box.sql("ALTER TABLE app.bad_box DROP COLUMN value")
         box.sql("INSERT INTO app.bad_box VALUES (2)")
         repair_runs = []
-        for _ in range(2):
+        for iteration in range(2):
+            # Same shape: one INSERT, two runs. The second cannot see a record.
             repair_runs.append(
                 box.run(
                     max_seconds=30,
-                    min_records=1,
+                    min_records=1 if iteration == 0 else 0,
                     expect_success=False,
                 )
             )
@@ -420,6 +425,13 @@ def test_bad_box_is_quarantined_without_stopping_a_healthy_peer(
 ):
     scenario = postgres_bad_healthy_containment
     assert all(run["ok"] is False for run in scenario["runs"]), scenario["runs"]
+    # Each run must fail for the reason this test is about, and must reach that
+    # verdict by finishing rather than by running out of clock. A `max_seconds`
+    # stop is a run whose delivery was never shown to be complete, so it can
+    # neither prove nor disprove containment.
+    assert all(
+        run["stop_reason"] != "max_seconds" for run in scenario["runs"]
+    ), scenario["run_diagnostics"]
     state = scenario["quarantine_state"]
     assert state["refusal"][0][0] == "quarantined"
     assert state["refusal"][0][1]

@@ -12,12 +12,15 @@ from pathlib import Path
 
 import pytest
 
-#: RE-MEASURED IN FIX ROUND 17 from the real lane collections: the eight
-#: boundary tests in `test_fix17_boundaries.py` add eight items to the prior
-#: default baseline. The guard itself remains 10 / 1 / 1 items in the 1731 /
-#: 171 / 46 collections, giving 1721 / 170 / 45 below.
+#: RE-MEASURED FROM THE REAL LANE COLLECTIONS when the run's completion
+#: condition became a watermark: the fourteen unit tests in
+#: `1.9_state_machines/test_1_9_completion_watermark.py` and the six end-to-end
+#: ones beside it add twenty items to the default lane and none to the other two.
+#: The guard itself remains 10 / 1 / 1 items in the 1751 / 171 / 46 collections,
+#: giving 1741 / 170 / 45 below. (Round 17's baseline was 1721 / 170 / 45; no
+#: node id was removed to get here.)
 _BASELINE_SELECTED = {
-    "not motherduck and not slow": 1721,
+    "not motherduck and not slow": 1741,
     "slow and not motherduck": 170,
     "motherduck": 45,
 }

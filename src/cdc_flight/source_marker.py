@@ -7,6 +7,7 @@ the *same* write (Opus Q3, ADR D9 / §18/A36):
 |---|---|---|
 | `catalog_fence` | rubric 1.5, `cdc_flight.catalog` | a `DROP TABLE` is detected out of band, and the action may only be applied once the destination has consumed everything before it. On a quiet source nothing would ever advance the durable LSN past the detection point. |
 | `idle_heartbeat` | rubric 4.4 / 7.2, ADR D9 | a slot that only publishes a subset of tables never advances while other tables are busy, so the WAL it pins grows without bound. |
+| `completion_watermark` | `cdc_flight.completion_watermark` | a run must END on a POSITION rather than on a timer. Nothing in the source's own WAL is guaranteed to be delivered to *this* slot, so the run writes the position it wants to reach. |
 
 This is deliberately a small, complete component rather than one call inlined into
 the catalog poller: 4.4 extends it (one more reason, its own cadence, a rate limit
@@ -55,7 +56,10 @@ log = logging.getLogger("cdc_flight.source_marker")
 #: apart without parsing the payload.
 CATALOG_FENCE = "catalog_fence"
 IDLE_HEARTBEAT = "idle_heartbeat"
-REASONS = (CATALOG_FENCE, IDLE_HEARTBEAT)
+#: `cdc_flight.completion_watermark`: the position a run must reach before it may
+#: say it is finished. The LSN PostgreSQL assigns this record IS the watermark.
+COMPLETION_WATERMARK = "completion_watermark"
+REASONS = (CATALOG_FENCE, IDLE_HEARTBEAT, COMPLETION_WATERMARK)
 
 
 class SourceMarker:
@@ -63,6 +67,7 @@ class SourceMarker:
 
     CATALOG_FENCE = CATALOG_FENCE
     IDLE_HEARTBEAT = IDLE_HEARTBEAT
+    COMPLETION_WATERMARK = COMPLETION_WATERMARK
 
     def __init__(
         self,
@@ -80,6 +85,11 @@ class SourceMarker:
         self.suppressed = 0
         self.capable: bool | None = None
         self.last_error: str | None = None
+        #: The LSN PostgreSQL assigned the most recent successful write, as a
+        #: plain integer offset from `0/0`. `pg_logical_emit_message` returns it,
+        #: so the caller does not have to guess a position from a second query
+        #: whose answer a co-tenant database could have moved (review r12 R12-3).
+        self.last_lsn: int | None = None
         self._lock = threading.Lock()
 
     def prefix_for(self, reason: str) -> str:
@@ -113,10 +123,10 @@ class SourceMarker:
                 return False
         body = json.dumps(payload or {}, separators=(",", ":"), default=str)
         try:
-            conn.execute(
-                "SELECT pg_logical_emit_message(true, %s, %s)",
+            row = conn.execute(
+                "SELECT (pg_logical_emit_message(true, %s, %s) - '0/0')::BIGINT",
                 (self.prefix_for(reason), body),
-            )
+            ).fetchone()
         except Exception as exc:
             self.capable = False
             self.last_error = f"{type(exc).__name__}: {exc}"
@@ -128,6 +138,7 @@ class SourceMarker:
             return False
         with self._lock:
             self.writes += 1
+            self.last_lsn = int(row[0]) if row and row[0] is not None else None
         self.capable = True
         self.last_error = None
         return True

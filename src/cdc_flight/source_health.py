@@ -380,10 +380,26 @@ class SourceHealth:
         its own destination control-unit commit is what makes acknowledging the
         marker (and everything before it) safe under Invariant O.
         """
-        marker = self.source_marker
+        return self.emit_marker(
+            self.source_marker,
+            IDLE_HEARTBEAT,
+            {"slot": self.slot_name, "durable_lsn": int(target)},
+        ) is not None
+
+    def emit_marker(self, marker, reason: str, payload: dict) -> int | None:
+        """Write one whole, transactional marker on the primary route.
+
+        Returns **the LSN PostgreSQL assigned it**, or ``None`` when the source
+        could not be written to at all (a read-only replica, a missing privilege,
+        an exhausted budget, an operator who disabled markers).  This is the one
+        place in the Flight that writes to the source, and both callers need the
+        same three things from it: the separate primary connection, the same
+        bounded timeouts the sampler uses, and an error that is an operational
+        condition rather than a crash.
+        """
         dsn = self.primary_dsn
         if marker is None or not dsn:
-            return False
+            return None
         try:
             import psycopg
 
@@ -398,18 +414,16 @@ class SourceHealth:
                 keepalives_count=2,
                 tcp_user_timeout=self.query_timeout_ms,
             ) as conn:
-                return marker.emit(
-                    conn,
-                    IDLE_HEARTBEAT,
-                    {"slot": self.slot_name, "durable_lsn": int(target)},
-                )
+                if not marker.emit(conn, reason, payload):
+                    return None
+                return marker.last_lsn
         except Exception as exc:
             marker.last_error = f"{type(exc).__name__}: {exc}"
             log.error(
-                "could not emit the transactional idle marker on the primary: %s",
-                marker.last_error,
+                "could not emit the transactional %s marker on the primary: %s",
+                reason, marker.last_error,
             )
-            return False
+            return None
 
     def state(self, *, dark_after: float = 0.0) -> str:
         """The fold's classification, as ONE declared value (rubric 1.9).

@@ -96,11 +96,20 @@ class EmptySnapshotHealth:
     """Source-side positive evidence that an empty snapshot reached streaming."""
 
     ever_sampled = True
+    ever_streamed = True
     unknown_for = 0.0
     not_streaming_for = 0.0
 
     def may_declare_idle(self, *, min_seconds, received_high_water=None):
         return True
+
+    #: Every source in this module is deliberately UNMARKABLE, so each test below
+    #: exercises the completion route it was written for: the source-corroborated
+    #: `--idle-seconds` quiet window (`completion_watermark`'s declared fallback).
+    #: The watermark route has its own proofs in
+    #: `tests/rubric/1.9_state_machines/test_1_9_completion_watermark.py`.
+    def emit_marker(self, marker, reason, payload):
+        return None
 
     def summary(self):
         return {"slot_health": "streaming"}
@@ -220,6 +229,14 @@ class SettlingSourceHealth:
     ever_streamed = True
     unknown_for = 0.0
     not_streaming_for = 0.0
+
+    #: Every source in this module is deliberately UNMARKABLE, so each test below
+    #: exercises the completion route it was written for: the source-corroborated
+    #: `--idle-seconds` quiet window (`completion_watermark`'s declared fallback).
+    #: The watermark route has its own proofs in
+    #: `tests/rubric/1.9_state_machines/test_1_9_completion_watermark.py`.
+    def emit_marker(self, marker, reason, payload):
+        return None
 
     def __init__(self, *, settles_after: float | None):
         self._settles_at = (

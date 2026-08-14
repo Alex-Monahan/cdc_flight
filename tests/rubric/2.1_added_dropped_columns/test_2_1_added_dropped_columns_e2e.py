@@ -140,10 +140,19 @@ def inet_add_column_containment(sandbox):
 
         runs = []
         metrics = [before]
-        for _ in range(3):
+        for iteration in range(3):
+            # `min_records` is a WAIT, and a wait must be for a condition that can
+            # become true. Exactly one INSERT was made above, so only the first
+            # run can ever see a record; asking the second and third for one made
+            # each of them sit out its whole `--max-seconds` and pass anyway.
+            # Measured: 298.3 s on this node, the single largest cost in the slow
+            # lane (`codex_logs/slowlane_rootcause.md` §3.2 A2). The proof this
+            # fixture exists for — containment, a healthy peer, a slot that keeps
+            # advancing — never needed the wait; it needs the run to END, which
+            # the assertions below now check explicitly.
             result = box.run(
-                max_seconds=150,
-                min_records=1,
+                max_seconds=60,
+                min_records=1 if iteration == 0 else 0,
                 expect_success=False,
             )
             runs.append(result)
@@ -165,6 +174,15 @@ def test_add_column_inet_keeps_the_healthy_peer_and_advances_the_slot(
 ):
     scenario = inet_add_column_containment
     assert all(run["ok"] is True for run in scenario["runs"]), scenario["runs"]
+    # The wait that WAS satisfiable really was satisfied, and every run ended
+    # because it had finished rather than because its deadline expired. Both were
+    # previously invisible: a run that delivered nothing and timed out looked
+    # exactly like a run that delivered everything.
+    assert scenario["runs"][0]["records"] >= 1, scenario["runs"][0]
+    assert [run["stop_reason"] for run in scenario["runs"]] == ["idle"] * 3, (
+        "a run that reaches --max-seconds has not proved a complete delivery; "
+        f"{[run['stop_reason'] for run in scenario['runs']]}"
+    )
     assert scenario["target"] == scenario["source"]
     assert scenario["box"].duck_query(
         "SELECT count(*) FROM _cdc_flight.schema_refusals "

@@ -13,6 +13,7 @@ import uuid
 
 import duckdb
 import pytest
+from support.fixtures import source_records
 
 from cdc_flight.config import motherduck_token
 
@@ -105,7 +106,7 @@ def test_snapshot_loads_into_motherduck(fresh_seed, run_pipeline, md_token, md_c
     )
     assert result["destination"] == "motherduck"
     assert result["motherduck_database"] == database
-    assert result["records"] == 20, result
+    assert source_records(result) == 20, result
 
     con = md_connect(md_token, database)
     try:

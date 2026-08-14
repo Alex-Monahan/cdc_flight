@@ -22,9 +22,10 @@ from typing import TYPE_CHECKING
 
 from . import table_lifecycle
 from .applier import Applier
+from .completion_watermark import CompletionWatermark
 from .config import RunConfig, resolve_control_schema
 from .errors import EngineFailure
-from .machines import PHASE_DRAINING
+from .machines import PHASE_DRAINING, WATERMARK_ARMED
 from .naming import control_table
 from .run_state import RunOutcome
 from .snapshot_completion import SnapshotCompletion
@@ -63,8 +64,19 @@ def run_engine_bounded(
     outcome: RunOutcome | None = None,
     quiescence_observer=None,
     keep_catalog: bool = False,
+    watermark: CompletionWatermark | None = None,
 ) -> dict:
-    """Run the Debezium engine until the *source* agrees it is idle, or the deadline hits.
+    """Run the Debezium engine until the destination has REACHED a source position.
+
+    **How a run decides it is finished** is `cdc_flight.completion_watermark`, and
+    the whole of it: the run writes one transactional marker to the source, takes
+    the LSN PostgreSQL assigned it, and stops the instant the applier's durable
+    resume point is at or past that LSN — which proves every source transaction
+    that committed before the marker is durable in the destination. `--max-seconds`
+    is the safety ceiling, not an exit path; `--idle-seconds` survives only as the
+    declared fallback for a source that cannot be written to. Waiting out the timer
+    was measured at **1,640.1 s, 37.8 % of one slow lane**, on runs that had
+    nothing left to deliver (`codex_logs/slowlane_rootcause.md`).
 
     Four independent things can go wrong, and all four must reach the caller:
 
@@ -75,7 +87,9 @@ def run_engine_bounded(
       normally, so it is only visible via `SupervisedDebeziumEngine.failure`;
     * the connector stops streaming *without failing* - a retriable exception
       puts it into a restart backoff that is longer than our idle window, so an
-      idle timer alone reports success on a partial delivery (Opus B5). `health`
+      idle timer alone reports success on a partial delivery (Opus B5). A
+      watermark cannot be reached by a connector that is not delivering, so that
+      shape now fails on arithmetic; on the fallback path `health` still
       corroborates "quiet" against `pg_replication_slots`.
 
     Before a quiet run is allowed to shut down there is one more barrier (Codex 6):
@@ -153,8 +167,14 @@ def run_engine_bounded(
     # has been given, so no later assignment can overwrite an earlier diagnosis. ONE
     # per run, shared with the phase writer that publishes it (Codex r1 MAJOR-2).
     outcome = outcome if outcome is not None else RunOutcome("max_seconds")
+    # ONE concept owns "may this run stop?" (rubric 1.9). See
+    # `completion_watermark`: the run ends on a source POSITION it has reached,
+    # and the `--idle-seconds` quiet window survives only as the declared fallback
+    # for a source that cannot be marked.
+    watermark = watermark if watermark is not None else CompletionWatermark.for_run(
+        health, run, completion=completion
+    )
     idle_blocked_by_source = 0
-    idle_candidate_since: float | None = None
     source_dark_after: float | None = None
     close_hung = False
     try:
@@ -189,114 +209,50 @@ def run_engine_bounded(
                 outcome.record("work_done")
                 intermediate_handoff = bool(keep_catalog)
                 break
-            enough = handler.record_count >= run.min_records
-            quiet = handler.seconds_since_last_batch >= run.idle_seconds
-            # Never stop before the connector has had a chance to start, and
-            # never stop while a commit group is being applied.
-            warmed_up = elapsed >= min(run.idle_seconds, 5.0)
-            if enough and quiet and warmed_up and not handler.busy:
-                source_idle = (
-                    health is None
-                    or health.may_declare_idle(
-                        min_seconds=run.idle_seconds,
-                        # The per-slot backlog reference (round 13, review r12
-                        # R12-3): what the connector delivered to THIS run, not
-                        # what the whole cluster wrote.
-                        received_high_water=getattr(
-                            handler, "highest_source_lsn", None
-                        ),
-                    )
+            # THE completion decision. A run ends because it reached a position,
+            # not because a clock ran out; `CompletionWatermark` owns the whole
+            # question, including the `--idle-seconds` fallback for a source that
+            # cannot be marked and the B5 corroboration that fallback needs.
+            #
+            # A quiet stream the source refuses to call idle is NOT a verdict.  A
+            # walsender that has detached is exactly the state Debezium's
+            # retriable-restart backoff exists to repair, and that backoff is
+            # measured in tens of seconds.  Such a run cannot report success: it
+            # burns its own `--max-seconds` budget instead, and the end-of-run
+            # verdict below turns the unrepaired case into a loud failure.
+            if watermark.reached(handler, elapsed):
+                if catalog is not None and not intermediate_handoff and not final_poll_done:
+                    # The synchronous final poll. A DROP that happened after the
+                    # last scheduled poll is seen by THIS run, and it is also the
+                    # poll that completes `CDC_DROP_CONFIRM_POLLS` on a short run.
+                    final_poll_done = True
+                    catalog.poll_quietly()
+                    drain_until = time.monotonic() + catalog_drain_seconds
+                unresolved = (
+                    [c.qualified for c in pending_fenced()]
+                    if catalog is not None
+                    else []
                 )
-                if source_idle and completion.phase_ended:
-                    # The asynchronous slot sampler's last active observation can
-                    # race a walsender termination at the exact idle boundary. Keep
-                    # an idle candidate open for at least two sampler intervals and
-                    # require a fresh observation taken after the candidate began.
-                    # This is a state proof, not another arbitrary workload sleep.
-                    health_interval = getattr(health, "interval", None)
-                    if health is not None and health_interval is not None:
-                        if idle_candidate_since is None:
-                            idle_candidate_since = time.monotonic()
-                            time.sleep(0.05)
-                            continue
-                        candidate_age = time.monotonic() - idle_candidate_since
-                        latest = getattr(health, "last", None)
-                        latest_at = getattr(latest, "at", None)
-                        required_confirmation = max(float(health_interval) * 2.0, 1.0)
-                        if (
-                            candidate_age < required_confirmation
-                            or latest_at is None
-                            or latest_at < idle_candidate_since
-                        ):
-                            time.sleep(0.05)
-                            continue
-                        # The source may have changed state after the first
-                        # ``source_idle`` calculation. Re-run the actual proof at
-                        # the end of the candidate window; freshness alone cannot
-                        # turn a walsender kill that happened during this window
-                        # into an idle verdict.
-                        if not health.may_declare_idle(
-                            min_seconds=run.idle_seconds,
-                            received_high_water=getattr(
-                                handler, "highest_source_lsn", None
-                            ),
-                        ):
-                            idle_candidate_since = None
-                            time.sleep(0.05)
-                            continue
-                    idle_candidate_since = None
-                    if catalog is not None and not intermediate_handoff and not final_poll_done:
-                        # The synchronous final poll. A DROP that happened after the
-                        # last scheduled poll is seen by THIS run, and it is also the
-                        # poll that completes `CDC_DROP_CONFIRM_POLLS` on a short run.
-                        final_poll_done = True
-                        catalog.poll_quietly()
-                        drain_until = time.monotonic() + catalog_drain_seconds
-                    unresolved = (
-                        [c.qualified for c in pending_fenced()]
-                        if catalog is not None
-                        else []
-                    )
-                    if unresolved and time.monotonic() < drain_until:
-                        # The drain barrier: the fence marker has been emitted, so a
-                        # WAL record past the detection point is on its way and the
-                        # applier will apply the change on the group that carries it.
-                        if idle_blocked_by_source % 40 == 0:
-                            log.info(
-                                "holding the engine open for %s unresolved destructive "
-                                "catalog change(s): %s",
-                                len(unresolved), ", ".join(sorted(unresolved)),
-                            )
-                        idle_blocked_by_source += 1
-                        time.sleep(0.25)
-                        continue
-                    catalog_unresolved = unresolved
-                    outcome.record("idle")
-                    break
-                idle_candidate_since = None
-                # A quiet stream that the source refuses to call idle is NOT a
-                # verdict yet.  A walsender that has detached — including one that
-                # detached and has not re-confirmed a position — is exactly the
-                # state Debezium's own retriable-restart backoff exists to repair,
-                # and that backoff is measured in tens of seconds.  Ending the run
-                # here would abandon a connector that is about to reattach, deliver
-                # nothing, advance neither LSN, and leave the WAL to grow: a
-                # transient source blip would become a permanently failing run.
-                # The safety property r11 asked for does not need an early exit —
-                # `may_declare_idle` already refuses to call this state idle, so a
-                # run in it CANNOT report success. It burns its own `--max-seconds`
-                # budget instead, and the end-of-run verdict below turns the
-                # unrepaired case into a loud failure with the delivery named.
-                idle_blocked_by_source += 1
-                if not source_idle and idle_blocked_by_source % 20 == 1:
-                    log.warning(
-                        "stream quiet for %.1fs but the source disagrees it is idle: %s",
-                        handler.seconds_since_last_batch,
-                        health.summary(),
-                    )
-            else:
-                idle_candidate_since = None
-            time.sleep(0.25)
+                if unresolved and time.monotonic() < drain_until:
+                    # The drain barrier: the fence marker has been emitted, so a
+                    # WAL record past the detection point is on its way and the
+                    # applier will apply the change on the group that carries it.
+                    if idle_blocked_by_source % 40 == 0:
+                        log.info(
+                            "holding the engine open for %s unresolved destructive "
+                            "catalog change(s): %s",
+                            len(unresolved), ", ".join(sorted(unresolved)),
+                        )
+                    idle_blocked_by_source += 1
+                    time.sleep(0.25)
+                    continue
+                catalog_unresolved = unresolved
+                outcome.record("idle")
+                break
+            # A run with a position to reach is one destination COMMIT away from
+            # being finished, so it is watched closely; one with nothing pending
+            # is polled at the ordinary granularity.
+            time.sleep(0.05 if watermark.state == WATERMARK_ARMED else 0.25)
         else:
             outcome.record("engine_finished")
     finally:
@@ -319,14 +275,28 @@ def run_engine_bounded(
         ):
             wait_seconds = min(run.close_timeout, 10.0)
             marker_emitted = False
-            if not health.confirmed_at_least(durable_lsn):
-                # A quiet source does not necessarily deliver another poll after
-                # markBatchFinished().  Give the live connector one whole,
+            # ASK BEFORE WRITING.  A run that ends on a completion watermark stops
+            # within milliseconds of the commit that made the watermark durable, so
+            # the connector has almost always simply not published its next status
+            # update yet; `status.update.interval.ms=1000` means one second settles
+            # it.  Writing a marker first was harmless when a run had already been
+            # silent for `--idle-seconds`, but on this path it puts NEW WAL into the
+            # stream during shutdown, and the callback that carries it back can then
+            # be interrupted mid-`markBatchFinished()` by `engine.close()` below —
+            # measured against MotherDuck at 8 workers, where a destination commit
+            # is slow enough for that window to be wide.
+            prompt_seconds = min(2.0, wait_seconds)
+            confirmed = health.wait_for_confirmed(durable_lsn, timeout=prompt_seconds)
+            if not confirmed:
+                # A genuinely quiet source does not necessarily deliver another poll
+                # after markBatchFinished().  Give the live connector one whole,
                 # offset-only PostgreSQL transaction to carry the already durable
                 # destination position to the slot.  The write is on the explicit
                 # primary route, never Debezium's replication connection.
                 marker_emitted = health.emit_idle_marker(durable_lsn)
-            if not health.wait_for_confirmed(durable_lsn, timeout=wait_seconds):
+            if not confirmed and not health.wait_for_confirmed(
+                durable_lsn, timeout=wait_seconds - prompt_seconds
+            ):
                 sample = health.last
                 acknowledgement_timeout = {
                     "durable_lsn": durable_lsn,
@@ -431,6 +401,7 @@ def run_engine_bounded(
         **handler.stats(),
     }
     summary.update(completion.as_dict())
+    summary.update(watermark.as_dict())
     if close_hung:
         # Recorded even when it is not the reported reason, because "we could not shut
         # the engine down" is operationally interesting whatever caused it.

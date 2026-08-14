@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import psycopg
 import pytest
+from support.fixtures import source_records
 
 pytestmark = pytest.mark.e2e
 
@@ -37,6 +38,7 @@ TABLES = [
 TOAST_PLACEHOLDER = "__debezium_unavailable_value"
 
 
+
 def _rows(con, dataset, table, cols="*", where="", order=""):
     sql = f'SELECT {cols} FROM "{dataset}"."{table}"'
     if where:
@@ -50,7 +52,8 @@ def test_baseline_end_to_end(fresh_seed, run_pipeline, generate_changes, duck, d
     # ---------------------------------------------------------------- snapshot
     snap = run_pipeline(reset_state=True, max_seconds=120, idle_seconds=6)
     assert snap["stop_reason"] in {"idle", "engine_finished"}, snap
-    assert snap["records"] == 20, snap  # 5+5+4+2+1+3 seeded rows
+    assert source_records(snap) == 20, snap  # 5+5+4+2+1+3 seeded rows
+    assert snap["completion_watermark_arms"] == 1, snap  # and exactly one of ours
     assert snap["applied_events"] == 20, snap
     # ADR 0001 §3.5 / D7: the snapshot lands in `<table>__cdcf_tmp` and becomes
     # visible through one swap, which is what makes a crash mid-snapshot safe.
@@ -255,7 +258,8 @@ def test_second_run_is_incremental(fresh_seed, run_pipeline, duck, dataset):
     from support.fixtures import source_fingerprint
 
     first = run_pipeline(reset_state=True, max_seconds=120, idle_seconds=6)
-    assert first["records"] == 20
+    assert source_records(first) == 20, first
+    assert first["completion_watermark_arms"] == 1, first
 
     before = source_fingerprint(fresh_seed)
     second = run_pipeline(max_seconds=40, idle_seconds=6)

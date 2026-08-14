@@ -36,6 +36,22 @@ PROJECT_DIR = Path(__file__).resolve().parents[2]
 VENV_BIN = PROJECT_DIR / ".venv" / "bin"
 SANDBOX_IDLE_SECONDS = 6
 
+#: Debezium delivers a transactional logical message exactly like any other source
+#: transaction: BEGIN, the message, END. `cdc_flight` writes two kinds, and they
+#: are the only writes it ever makes to a source: the run's own completion
+#: watermark (`cdc_flight.completion_watermark`) and the catalog fence / idle
+#: slot hand-off (`cdc_flight.source_marker`).
+MARKER_RECORDS = 3
+
+
+def source_records(summary: dict) -> int:
+    """Records a run received that the SOURCE, not the Flight itself, produced."""
+    written = summary.get("completion_watermark_arms", 0) + summary.get(
+        "source_marker", {}
+    ).get("source_markers", 0)
+    return summary["records"] - MARKER_RECORDS * written
+
+
 #: Tables the pipeline replicates. Used to fingerprint the shared source so a
 #: concurrent writer produces a diagnostic instead of a mystery assertion.
 CAPTURED_TABLES = (
