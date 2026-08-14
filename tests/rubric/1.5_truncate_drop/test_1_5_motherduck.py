@@ -24,7 +24,11 @@ import pytest
 
 from cdc_flight.config import motherduck_token
 
-pytestmark = [pytest.mark.motherduck, pytest.mark.e2e]
+pytestmark = [
+    pytest.mark.motherduck,
+    pytest.mark.e2e,
+    pytest.mark.xdist_group("md_1_5"),
+]
 
 #: MotherDuck's catalog snapshot is cached per DSN in this process, so a reader here
 #: can go stale against writes made by the pipeline subprocess (ADR §15/A15).
@@ -43,12 +47,12 @@ def md_token() -> str:
     return token
 
 
-@pytest.fixture
-def md_database(motherduck_case):
-    return motherduck_case
+@pytest.fixture(scope="module")
+def md_database(motherduck_module_case):
+    return motherduck_module_case
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def md_truncate_drop(sandbox, md_token, md_database) -> dict:
     suffix = uuid.uuid4().hex[:8]
     dataset = f"cdc_15_{suffix}"
@@ -195,7 +199,7 @@ def test_the_source_relation_ownership_survived(md_truncate_drop):
 # --------------------------------------------------------------------------- #
 # a fault around a truncate, at MotherDuck (Codex 9-point item 9)
 # --------------------------------------------------------------------------- #
-@pytest.fixture
+@pytest.fixture(scope="module")
 def md_truncate_rollback(sandbox, md_token, md_database) -> dict:
     """A truncate whose commit group fails at `pre_commit`, then the replay.
 

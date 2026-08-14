@@ -10,6 +10,7 @@ names databases, slots, and other non-authority resources.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -161,7 +162,8 @@ def fresh_seed(postgres_cluster: SourceConfig) -> SourceConfig:
 @pytest.fixture
 def cdc_env(tmp_path: Path, postgres_cluster: SourceConfig) -> Iterator[dict[str, str]]:
     """Per-test Debezium offsets, dlt state, replication slot and DuckDB file."""
-    suffix = f"{os.getpid()}_{abs(hash(tmp_path)) % 100000}"
+    path_digest = hashlib.sha256(str(tmp_path).encode()).hexdigest()[:10]
+    suffix = f"{os.getpid()}_{path_digest}"
     slot = f"{TEST_SLOT_PREFIX[: 63 - len(suffix)]}{suffix}"
     env = {
         **_source_environment(postgres_cluster),
@@ -355,27 +357,50 @@ def motherduck_worker() -> Iterator[MotherDuckWorker]:
         _drop_database(token, database)
 
 
+def _motherduck_case(worker: MotherDuckWorker) -> dict[str, str]:
+    """Allocate a unique schema and dataset inside one worker database."""
+    suffix = uuid.uuid4().hex[:10]
+    control_schema = f"_cdc_flight_{worker.worker_id}_{suffix}"
+    dataset = f"cdc_md_{worker.worker_id}_{suffix}"
+    return {
+        "token": worker.token,
+        "database": worker.database,
+        "worker_id": worker.worker_id,
+        "control_schema": control_schema,
+        "dataset": dataset,
+    }
+
+
+def _motherduck_case_cleanup(worker: MotherDuckWorker, case: dict[str, str]) -> None:
+    _drop_schema(worker.token, worker.database, case["control_schema"])
+
+
+@pytest.fixture(scope="module")
+def motherduck_module_case(
+    motherduck_worker: MotherDuckWorker,
+) -> Iterator[dict[str, str]]:
+    """Give a module one unique schema, cleaned up after all its assertions.
+
+    This is intentionally separate from ``motherduck_case``.  A module fixture may
+    share the destination state only when the module's tests are all read-only
+    assertions over one setup scenario; ordinary tests keep the per-test fixture.
+    """
+    case = _motherduck_case(motherduck_worker)
+    try:
+        yield case
+    finally:
+        _motherduck_case_cleanup(motherduck_worker, case)
+
+
 @pytest.fixture
 def motherduck_case(motherduck_worker: MotherDuckWorker) -> Iterator[dict[str, str]]:
     """Give one test a unique schema inside its worker-owned database."""
 
-    suffix = uuid.uuid4().hex[:10]
-    control_schema = f"_cdc_flight_{motherduck_worker.worker_id}_{suffix}"
-    dataset = f"cdc_md_{motherduck_worker.worker_id}_{suffix}"
+    case = _motherduck_case(motherduck_worker)
     try:
-        yield {
-            "token": motherduck_worker.token,
-            "database": motherduck_worker.database,
-            "worker_id": motherduck_worker.worker_id,
-            "control_schema": control_schema,
-            "dataset": dataset,
-        }
+        yield case
     finally:
-        _drop_schema(
-            motherduck_worker.token,
-            motherduck_worker.database,
-            control_schema,
-        )
+        _motherduck_case_cleanup(motherduck_worker, case)
 
 
 # --------------------------------------------------------------------------- #
@@ -398,9 +423,15 @@ class Sandbox:
         self.dir = base
         self.dir.mkdir(parents=True, exist_ok=True)
         self.source = source
-        self.slot = re.sub(
+        raw_slot = re.sub(
             r"[^a-z0-9_]", "_", f"{TEST_SLOT_PREFIX}t_{name}_{os.getpid()}".lower()
-        )[:60]
+        )
+        # PostgreSQL limits slot names to 63 bytes.  Leave three bytes for the
+        # live-discovery fixture's ``_rs`` suffix, and keep a digest in the
+        # truncated portion: names such as ``destination_commit`` and
+        # ``destination_commit_late`` must never alias on one xdist worker.
+        slot_digest = hashlib.sha256(raw_slot.encode()).hexdigest()[:10]
+        self.slot = f"{raw_slot[:49]}_{slot_digest}"
         self.duckdb_path = self.dir / "cdc_flight.duckdb"
         self.state_dir = self.dir / "cdc_state"
         self.env = {

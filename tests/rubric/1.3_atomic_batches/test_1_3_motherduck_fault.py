@@ -31,7 +31,11 @@ import pytest
 
 from cdc_flight.config import motherduck_token
 
-pytestmark = [pytest.mark.motherduck, pytest.mark.e2e]
+pytestmark = [
+    pytest.mark.motherduck,
+    pytest.mark.e2e,
+    pytest.mark.xdist_group("md_1_3_fault"),
+]
 
 REFRESH = "FORCE CHECKPOINT"
 N = 20
@@ -48,11 +52,11 @@ def md_token() -> str:
     return token
 
 
-@pytest.fixture
-def md_crashed(sandbox, md_token, motherduck_case) -> dict:
-    database = motherduck_case["database"]
+@pytest.fixture(scope="module")
+def md_crashed(sandbox, md_token, motherduck_module_case) -> dict:
+    database = motherduck_module_case["database"]
     dataset = f"cdc_fault_{uuid.uuid4().hex[:8]}"
-    control_schema = motherduck_case["control_schema"]
+    control_schema = motherduck_module_case["control_schema"]
     dsn = f"md:{database}?motherduck_token={md_token}"
     env = {
         "CDC_DATASET": dataset,

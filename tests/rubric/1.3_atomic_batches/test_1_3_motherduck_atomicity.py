@@ -46,7 +46,11 @@ from cdc_flight.destination import Lease, ResumePoint
 from cdc_flight.envelope import KIND_SNAPSHOT_BOUNDARY, PendingRecord
 from cdc_flight.snapshot_completion import SnapshotCompletion
 
-pytestmark = [pytest.mark.motherduck, pytest.mark.e2e]
+pytestmark = [
+    pytest.mark.motherduck,
+    pytest.mark.e2e,
+    pytest.mark.xdist_group("md_1_3_atomicity"),
+]
 
 #: MEASURED, 2026-07-30: `duckdb.connect()` caches the database instance per DSN
 #: within a process and MotherDuck's catalog snapshot rides on it, so a reader in
@@ -69,17 +73,17 @@ def md_token() -> str:
     return token
 
 
-@pytest.fixture
-def md_observed_txn(sandbox, md_token, motherduck_case) -> dict:
+@pytest.fixture(scope="module")
+def md_observed_txn(sandbox, md_token, motherduck_module_case) -> dict:
     """Stream one multi-table PG transaction into MotherDuck, watching from outside.
 
     The observer polls both tables from a *separate* MotherDuck connection while
     the pipeline writes, and records every `(customers, orders)` pair it sees.
     An atomic implementation can only ever be observed at `(0, 0)` or `(N, N)`.
     """
-    database = motherduck_case["database"]
+    database = motherduck_module_case["database"]
     dataset = f"cdc_atomic_{uuid.uuid4().hex[:8]}"
-    control_schema = motherduck_case["control_schema"]
+    control_schema = motherduck_module_case["control_schema"]
     dsn = f"md:{database}?motherduck_token={md_token}"
     env = {
         "CDC_DATASET": dataset,
@@ -138,7 +142,9 @@ def md_observed_txn(sandbox, md_token, motherduck_case) -> dict:
             timeout=700, extra_env=env,
         )
     finally:
-        time.sleep(1.0)
+        deadline = time.monotonic() + 15.0
+        while (N, N) not in observations and time.monotonic() < deadline:
+            stop.wait(0.05)
         stop.set()
         watcher.join(timeout=15)
 

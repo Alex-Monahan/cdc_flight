@@ -49,6 +49,7 @@ def wait_for_tables(con, dataset: str, timeout: float = 90.0) -> set[str]:
     """
     deadline = time.monotonic() + timeout
     tables: set[str] = set()
+    poll_delay = 0.1
     while True:
         tables = {
             t
@@ -59,7 +60,11 @@ def wait_for_tables(con, dataset: str, timeout: float = 90.0) -> set[str]:
         }
         if tables or time.monotonic() >= deadline:
             return tables
-        time.sleep(2.0)
+        # Catalog visibility is the condition, not elapsed time.  Keep polling
+        # cheaply while the server catches up, with the same 90-second proof
+        # deadline and a bounded backoff for a genuinely delayed catalog.
+        time.sleep(poll_delay)
+        poll_delay = min(poll_delay * 2, 2.0)
         with contextlib.suppress(duckdb.Error):
             con.execute("FORCE CHECKPOINT")
 

@@ -56,9 +56,12 @@ PYTEST_XDIST_ARGS ?= -n $(PYTEST_WORKERS) --dist=loadscope --max-worker-restart=
 PYTEST_SLOW_WORKERS ?= 2
 PYTEST_SLOW_XDIST_ARGS ?= -n $(PYTEST_SLOW_WORKERS) --dist=loadscope --max-worker-restart=0
 SLOW_LANE_LOCK ?= /tmp/cdc_flight_slow_lane.lock
+SLOW_LANE_WAIT_TIMEOUT ?= 300
 # MotherDuck uses one database per worker and a unique control schema per test.
+# The few modules that intentionally batch one expensive scenario use xdist groups
+# so --dist=loadgroup keeps their read-only assertions with that scenario fixture.
 PYTEST_MD_WORKERS ?= 8
-PYTEST_MD_XDIST_ARGS ?= -n $(PYTEST_MD_WORKERS) --dist=load --max-worker-restart=0
+PYTEST_MD_XDIST_ARGS ?= -n $(PYTEST_MD_WORKERS) --dist=loadgroup --max-worker-restart=0
 
 .DEFAULT_GOAL := help
 
@@ -160,7 +163,8 @@ test-md: ## run only the MotherDuck tests
 
 .PHONY: test-slow
 test-slow: ## run only the slow fault-injection tests (real SIGKILL, big loads)
-	$(UV) run python scripts/slow_lane.py --lock-file "$(SLOW_LANE_LOCK)" -- \
+	$(UV) run python scripts/slow_lane.py --lock-file "$(SLOW_LANE_LOCK)" \
+		--wait-timeout "$(SLOW_LANE_WAIT_TIMEOUT)" -- \
 		$(UV) run pytest $(PYTEST_SLOW_XDIST_ARGS) -m "slow and not motherduck" --durations=20
 
 .PHONY: lint
