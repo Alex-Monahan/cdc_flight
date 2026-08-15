@@ -177,7 +177,7 @@ def write(
             [
                 [
                     (
-                        _typed_value(table, col, row.get(col))
+                        row.get(col)
                         if table.native_types and col in table.native_types
                         else apply_sql.bind(row.get(col), table.columns.get(col, apply_sql.VARCHAR))
                     )
@@ -185,6 +185,7 @@ def write(
                 ]
                 for row in rows
             ],
+            values_are_encoded=True,
         )
     try:
         apply_sql.assert_identity_is_unique(con, table)
@@ -231,7 +232,7 @@ def _write_keyless_operations(
             [
                 [
                     (
-                        _typed_value(table, column, row.get(column))
+                        row.get(column)
                         if table.native_types and column in table.native_types
                         else apply_sql.bind(
                             row.get(column), table.columns.get(column, apply_sql.VARCHAR)
@@ -241,6 +242,7 @@ def _write_keyless_operations(
                 ]
                 for row in pending
             ],
+            values_are_encoded=True,
         )
         pending.clear()
         table_fresh = False
@@ -302,18 +304,6 @@ def _write_keyless_operations(
             pipeline=pipeline,
             control_schema=control_schema,
         )
-
-
-def _typed_value(table, column: str, value):
-    """Bind a source value to the current physical native declaration."""
-    from .typed_types import adapt_value
-
-    native = table.native_types.get(column)
-    source = table.source_descriptors.get(column)
-    if native is None or source is None:
-        return value
-    return adapt_value(value, native)
-
 
 def _key_value(table, column: str, value):
     """Encode a key using the same source descriptor as the row path."""

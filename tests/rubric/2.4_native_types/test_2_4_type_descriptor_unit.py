@@ -334,7 +334,7 @@ def test_production_typed_path_fails_closed_when_catalog_descriptors_are_unavail
 
 
 def test_tablework_numeric_adapter_is_idempotent_for_all_bounded_specials():
-    from cdc_flight.table_writer import _typed_value
+    from cdc_flight.typed_materialization import _prepare_typed_value
     from cdc_flight.typed_types import UnionValue
 
     con = duckdb.connect()
@@ -348,10 +348,14 @@ def test_tablework_numeric_adapter_is_idempotent_for_all_bounded_specials():
     table = registry.get("adapter_numbers")
     for raw in ("NaN", "Infinity", "-Infinity", "1.2500", None):
         encoded = encode_value(raw, numeric)
-        adapted = _typed_value(table, "value", encoded)
-        assert adapted == encoded
+        carried = _prepare_typed_value(
+            encoded,
+            table.native_types["value"],
+            values_are_encoded=True,
+        )
+        assert carried == encoded
         if encoded is not None:
-            assert isinstance(adapted, UnionValue)
+            assert isinstance(carried, UnionValue)
 
 
 @pytest.mark.parametrize("raw", ["NaN", "Infinity", "-Infinity"])

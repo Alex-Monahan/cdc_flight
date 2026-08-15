@@ -330,10 +330,10 @@ def test_synthetic_builtin_failure_is_contained_to_one_table(tmp_path, monkeypat
     """The generic boundary catches a failure that is not an AdmissionError."""
     original = typed_materialization._bulk_insert_typed_rows
 
-    def fail_only_bad(con, table, columns, rows):
+    def fail_only_bad(con, table, columns, rows, **kwargs):
         if table.name.endswith("contained_bad"):
             raise ValueError("synthetic third-party materializer failure")
-        return original(con, table, columns, rows)
+        return original(con, table, columns, rows, **kwargs)
 
     monkeypatch.setattr(typed_materialization, "_bulk_insert_typed_rows", fail_only_bad)
     box = Lab(tmp_path / "contained.duckdb")
@@ -421,11 +421,11 @@ def test_materializer_failure_after_table_delete_rolls_back_the_whole_group(tmp_
             ]
         )
 
-        def delete_then_raise(con, table, columns, rows):
+        def delete_then_raise(con, table, columns, rows, **kwargs):
             if rows and table.name.endswith("torn_bad"):
                 con._connection.execute(f'DELETE FROM {table.qualified} WHERE "id" = 1')
                 raise ValueError("synthetic post-delete materializer failure")
-            return original(con, table, columns, rows)
+            return original(con, table, columns, rows, **kwargs)
 
         monkeypatch.setattr(typed_materialization, "_bulk_insert_typed_rows", delete_then_raise)
         box.run(
@@ -484,10 +484,10 @@ def test_an_explicit_quarantine_ack_is_loudly_recorded_but_does_not_unblock(tmp_
     """An operator acknowledgement suppresses only the repeated run failure."""
     original = typed_materialization._bulk_insert_typed_rows
 
-    def fail_only_bad(con, table, columns, rows):
+    def fail_only_bad(con, table, columns, rows, **kwargs):
         if rows and table.name.endswith("ack_bad"):
             raise ValueError("synthetic acknowledged materializer failure")
-        return original(con, table, columns, rows)
+        return original(con, table, columns, rows, **kwargs)
 
     monkeypatch.setattr(typed_materialization, "_bulk_insert_typed_rows", fail_only_bad)
     path = tmp_path / "acknowledged-quarantine.duckdb"
@@ -574,12 +574,12 @@ def test_destination_programming_error_is_loud_not_a_table_quarantine(tmp_path, 
 
     original = typed_materialization._bulk_insert_typed_rows
 
-    def fail_with_bad_sql(con, table, columns, rows):
+    def fail_with_bad_sql(con, table, columns, rows, **kwargs):
         if table.name.endswith("programming_bad"):
             con._connection.execute(
                 "SELECT definitely_missing_column FROM definitely_missing_table"
             )
-        return original(con, table, columns, rows)
+        return original(con, table, columns, rows, **kwargs)
 
     monkeypatch.setattr(typed_materialization, "_bulk_insert_typed_rows", fail_with_bad_sql)
     box = Lab(tmp_path / "programming-error.duckdb")
@@ -612,12 +612,12 @@ def test_transaction_control_exception_is_not_a_table_quarantine(tmp_path, monke
 
     original = typed_materialization._bulk_insert_typed_rows
 
-    def begin_inside_destination_transaction(con, table, columns, rows):
+    def begin_inside_destination_transaction(con, table, columns, rows, **kwargs):
         if table.name.endswith("txn_exception_bad"):
             # This is the reviewer's probe: it is a transaction-control operation,
             # not a rejection of a source value or row.
             con._connection.execute("BEGIN TRANSACTION")
-        return original(con, table, columns, rows)
+        return original(con, table, columns, rows, **kwargs)
 
     monkeypatch.setattr(
         typed_materialization,
@@ -750,6 +750,7 @@ def test_real_slot_advances_when_a_builtin_materializer_failure_is_injected(sand
         "from cdc_flight.destination_failure import execute_table_dml\n"
         "_real_bulk = _tm.bulk_insert\n"
         "_real_typed = _tm.insert_typed_rows\n"
+        "_real_bulk_typed = _tm._bulk_insert_typed_rows\n"
         "def _bad(target):\n"
         "    return 'fix14_any_exception_bad' in str(target)\n"
         "def _fail_bulk(con, target, columns, rows, types=None, **kwargs):\n"
@@ -760,8 +761,13 @@ def test_real_slot_advances_when_a_builtin_materializer_failure_is_injected(sand
         "    if rows and _bad(table.qualified):\n"
         "        raise ValueError('synthetic third-party materializer failure')\n"
         "    return _real_typed(con, table, columns, rows, native_types, **kwargs)\n"
+        "def _fail_bulk_typed(con, table, columns, rows, **kwargs):\n"
+        "    if rows and _bad(table.qualified):\n"
+        "        raise ValueError('synthetic third-party materializer failure')\n"
+        "    return _real_bulk_typed(con, table, columns, rows, **kwargs)\n"
         "_tm.bulk_insert = _fail_bulk\n"
-        "_tm.insert_typed_rows = _fail_typed\n",
+        "_tm.insert_typed_rows = _fail_typed\n"
+        "_tm._bulk_insert_typed_rows = _fail_bulk_typed\n",
         encoding="utf-8",
     )
     pipeline_env = {
@@ -989,10 +995,10 @@ def test_real_transaction_control_failure_fails_run_without_table_attribution(sa
     hook.write_text(
         "from cdc_flight import typed_materialization as _tm\n"
         "_real = _tm._bulk_insert_typed_rows\n"
-        "def _control(con, table, columns, rows):\n"
+        "def _control(con, table, columns, rows, **kwargs):\n"
         "    if rows and str(table.name).endswith('r16_txn_control_bad'):\n"
         "        con._connection.execute('BEGIN TRANSACTION')\n"
-        "    return _real(con, table, columns, rows)\n"
+        "    return _real(con, table, columns, rows, **kwargs)\n"
         "_tm._bulk_insert_typed_rows = _control\n",
         encoding="utf-8",
     )
