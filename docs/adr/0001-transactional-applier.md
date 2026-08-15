@@ -3019,7 +3019,6 @@ persistence: **memory only** · initial: `unarmed` · terminal: `reached`,
 | from | to | terminal |
 |---|---|---|
 | `armed` | `reached` | yes |
-| `armed` | `unarmed` | no |
 | `unarmed` | `armed` | no |
 | `unarmed` | `unavailable` | yes |
 
@@ -3439,7 +3438,7 @@ transition table.
 | `keyless_event` | has one keyless event's physical operation committed, making replay a no-op | 2 | 2 | `_cdc_flight.keyless_events.state` |
 | `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
 | `snapshot_completion` | have all ordered snapshot callbacks arrived | 6 | 9 | **memory only** |
-| `completion_watermark` | has this run reached a source position it can prove the destination is durably past | 4 | 4 | **memory only** |
+| `completion_watermark` | has this run reached a source position it can prove the destination is durably past | 4 | 3 | **memory only** |
 | `runtime_root_lifecycle` | is the disposable root reusable or committed to cleanup | 6 | 10 | project-local root and parent markers |
 
 Generated transition tables: §A51.1. Declarations: `cdc_flight/machines.py`, which is one

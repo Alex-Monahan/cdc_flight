@@ -318,13 +318,12 @@ COMPLETION_WATERMARK = Machine(
     ),
     edges=(
         (WATERMARK_UNARMED, WATERMARK_ARMED),
-        # `armed -> unarmed`: a whole transaction committed PAST the watermark, so
-        # it no longer describes a finished delivery; take a new one when the
-        # stream is quiet again. There is deliberately no `unarmed -> reached`
-        # edge - the only route to a verdict runs through the marker that makes
-        # the position real - and both verdicts are terminal, because ending a run
-        # is a durability decision and not a fact that can be withdrawn.
-        (WATERMARK_ARMED, WATERMARK_UNARMED),
+        # There is deliberately no `unarmed -> reached` edge - the only route to a
+        # verdict runs through the marker that makes the position real - and no
+        # `armed -> unarmed` edge either: a position, once PostgreSQL has assigned
+        # it, is a fact about this run's WAL and is never withdrawn. Both verdicts
+        # are terminal, because ending a run is a durability decision and not a
+        # fact that can be taken back.
         (WATERMARK_ARMED, WATERMARK_REACHED),
         (WATERMARK_UNARMED, WATERMARK_UNAVAILABLE),
     ),

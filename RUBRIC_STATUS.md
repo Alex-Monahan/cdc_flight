@@ -1871,7 +1871,7 @@ run-time error instead of a review finding.
 | `keyless_event` | has one keyless event's physical operation committed, making replay a no-op | 2 | 2 | `_cdc_flight.keyless_events.state` |
 | `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
 | `snapshot_completion` | have all ordered snapshot callbacks arrived | 6 | 9 | **memory only** |
-| `completion_watermark` | has this run reached a source position it can prove the destination is durably past | 4 | 4 | **memory only** |
+| `completion_watermark` | has this run reached a source position it can prove the destination is durably past | 4 | 3 | **memory only** |
 | `runtime_root_lifecycle` | is the disposable root reusable or committed to cleanup | 6 | 10 | project-local root and parent markers |
 
 Style, deliberately minimal: `cdc_flight/states.py` is 293 lines with **no dependencies**

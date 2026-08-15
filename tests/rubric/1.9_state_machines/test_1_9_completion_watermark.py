@@ -222,11 +222,23 @@ def test_the_run_is_complete_only_when_the_destination_is_DURABLY_past_the_water
     assert gate.state == WATERMARK_REACHED
 
 
-def test_a_source_that_commits_more_work_after_the_watermark_invalidates_it():
-    """Whole transactions only. A transaction that commits AFTER the watermark is
-    OUTSIDE it, so a watermark taken before it no longer describes a finished
-    delivery: it is discarded and a new one is taken once the source is quiet
-    again. Nothing is ever half-applied either way — the tail replays."""
+def test_a_source_that_commits_more_work_after_the_watermark_does_not_withdraw_it():
+    """Whole transactions only, and a position once taken is never withdrawn.
+
+    A transaction that commits AFTER the watermark has a commit LSN > L, so it is
+    decoded after the marker and belongs to the next run; the slot never advances
+    past what the destination made durable, so nothing is lost either way. The
+    run's claim is bounded and exact: *complete as of L*, not "the source has
+    stopped".
+
+    This used to be an `armed -> unarmed` invalidation edge with a re-arm budget
+    behind it (`CDC_WATERMARK_MAX_WRITES`). Both reviewers asked for it to go:
+    Opus measured that it did not deliver the quiescence property it was credited
+    with (a writer at 1.5 s intervals still armed, still stopped in 5.5 s, still
+    mid-write), and it is unnecessary because a position is only ever taken from
+    a quiet stream in the first place. Deleting it makes `arms` deterministically
+    0 or 1 per run.
+    """
     source = MarkableSource(lsn=5000)
     gate = _watermark(source)
     handler = FakeHandler(durable_lsn=10, quiet_for=99.0)
@@ -235,13 +247,40 @@ def test_a_source_that_commits_more_work_after_the_watermark_invalidates_it():
     assert gate.state == WATERMARK_ARMED
     handler.data_batch_count += 1          # a transaction past the watermark arrived
     handler.resume_point.last_lsn = 9999   # and it is already durable
-    assert gate.reached(handler, elapsed=2.0) is False
-    assert gate.state == WATERMARK_UNARMED
-    assert gate.invalidations == 1
+    assert gate.reached(handler, elapsed=2.0) is True
+    assert gate.state == WATERMARK_REACHED
+    assert gate.arms == 1, "one run takes at most one position"
+    assert len(source.emitted) == 1
 
-    source.lsn = 12000                     # the second watermark is taken later
-    assert gate.reached(handler, elapsed=3.0) is False
-    assert gate.target_lsn == 12000
+    # And the edge itself is gone from the declared machine, so no future caller
+    # can reintroduce the withdrawal by hand.
+    with pytest.raises(IllegalTransition):
+        m.COMPLETION_WATERMARK.check(WATERMARK_ARMED, WATERMARK_UNARMED)
+
+
+def test_a_position_is_only_ever_taken_from_a_quiet_stream():
+    """Why the withdrawal edge above is not needed: the marker is not written
+    while the connector is still handing batches over.
+
+    Without this, a run would take a position in the middle of a backlog, reach
+    it a few milliseconds later, and stop with the rest of the backlog still
+    undelivered — safe under Invariant O, but it would turn one run into two for
+    no reason. `CDC_WATERMARK_QUIET_SECONDS` is therefore load-bearing, and it is
+    NOT a completion timer: it is capped by `--idle-seconds` and it is the only
+    wait on the watermark path.
+    """
+    source = MarkableSource(lsn=5000)
+    gate = _watermark(source, run=_run_cfg(idle_seconds=30))
+    handler = FakeHandler(durable_lsn=10, quiet_for=0.1)
+
+    assert gate.reached(handler, elapsed=1.0) is False
+    assert gate.state == WATERMARK_UNARMED, "a stream mid-delivery is not a position"
+    assert source.emitted == []
+
+    handler.seconds_since_last_batch = 0.5
+    assert gate.reached(handler, elapsed=1.5) is False
+    assert gate.state == WATERMARK_ARMED
+    assert gate.quiet_seconds == 0.5
 
 
 def test_no_watermark_is_taken_before_the_connector_has_streamed():
@@ -277,10 +316,15 @@ def test_min_records_still_gates_completion():
 
 
 def test_a_source_that_cannot_be_marked_falls_back_to_the_idle_window():
-    """The declared fallback. A read-only replica, a missing privilege, an
-    exhausted marker budget or `CDC_CATALOG_MARKER=0` leaves the run with no way
-    to establish a position, so it keeps the source-corroborated quiet window it
-    always had — and says so in the summary."""
+    """The declared fallback. A read-only replica, a missing privilege or
+    `CDC_COMPLETION_WATERMARK=0` leaves the run with no way to establish a
+    position, so it keeps the source-corroborated quiet window it always had —
+    and says so in the summary.
+
+    `CDC_CATALOG_MARKER=0` is deliberately NOT on that list: it governs the DDL
+    fence, not the completion decision (Opus MINOR-5 — the module used to claim
+    the opposite, which would have told an operator that a knob kept the Flight
+    off their primary when it did not)."""
     source = MarkableSource(writable=False)
     gate = _watermark(source, run=_run_cfg(idle_seconds=1.0))
     handler = FakeHandler(durable_lsn=10, quiet_for=0.6)
@@ -342,11 +386,19 @@ def test_a_run_stops_on_the_watermark_and_not_on_the_clock():
 def test_a_run_whose_destination_never_reaches_the_watermark_does_not_report_ok():
     """Stopping early on a delivery that is not durable is the one thing this
     change must never do. The destination stays behind the watermark, so the run
-    burns its safety ceiling and fails loudly rather than reporting success."""
+    burns its safety ceiling and fails loudly rather than reporting success.
+
+    The source here is PERFECTLY HEALTHY: `not_streaming_for = 0` and it agrees
+    the stream is idle, so the pre-existing "reached --max-seconds while the
+    connector was not streaming" rule cannot fire. The only thing wrong with this
+    run is that it took a position and never reached it, and that alone must be
+    the failure — Opus MINOR-1 measured that removing one line
+    (`source.not_streaming_for = 99.0`) from the old version of this test flipped
+    it from `EngineFailure` to `ok: True`, which is test-audit F6's shape.
+    """
     source = MarkableSource(lsn=5000)
     handler = FakeHandler(durable_lsn=10, quiet_for=99.0)
-    source.may_declare_idle = lambda **kwargs: False
-    source.not_streaming_for = 99.0
+    assert source.not_streaming_for == 0.0 and source.unknown_for == 0.0
     with pytest.raises(EngineFailure) as raised:
         run_engine_bounded(
             FakeEngine(run_seconds=30.0),
@@ -356,3 +408,60 @@ def test_a_run_whose_destination_never_reaches_the_watermark_does_not_report_ok(
         )
     assert raised.value.summary["stop_reason"] == "max_seconds"
     assert raised.value.summary["completion_watermark"] == WATERMARK_ARMED
+    assert "ok" not in raised.value.summary
+    assert "5000" in str(raised.value), str(raised.value)
+
+
+def test_a_streaming_source_that_never_went_quiet_does_not_report_ok_either():
+    """Luna BLOCKER W-01, reproduced over the fakes.
+
+    A source committing continuously never produces a quiet tick, so no position
+    is ever taken and the completion machine is still `unarmed` when the run hits
+    its `--max-seconds` safety ceiling. Luna measured the consequence against a
+    real cluster: `returncode=0, ok=true, stop_reason=max_seconds,
+    completion_watermark=unarmed` with **28 committed source rows missing from
+    the destination** (customer ids 1180..1207). A run that reports success while
+    committed rows are absent is data loss reported as success.
+
+    `--max-seconds` is a SAFETY CEILING, not an exit path: a run that ends on it
+    has not shown its delivery to be complete, whatever the connector's health.
+    """
+    source = MarkableSource(lsn=5000)
+    source.not_streaming_for = 0.0     # the connector is healthy and streaming
+    # ... and the stream never goes quiet long enough to take a position.
+    handler = FakeHandler(durable_lsn=10, quiet_for=0.0)
+    with pytest.raises(EngineFailure) as raised:
+        run_engine_bounded(
+            FakeEngine(run_seconds=30.0),
+            handler,
+            _run_cfg(max_seconds=2, idle_seconds=1),
+            source,
+        )
+    assert raised.value.summary["stop_reason"] == "max_seconds"
+    assert raised.value.summary["completion_watermark"] == WATERMARK_UNARMED
+    assert raised.value.summary["completion_watermark_arms"] == 0
+    assert "ok" not in raised.value.summary
+    assert source.emitted == [], "a source that never went quiet was never marked"
+
+
+def test_the_safety_ceiling_is_still_a_verdict_when_the_source_cannot_be_marked():
+    """The declared fallback keeps its own pre-existing rules, unchanged.
+
+    A run with no way to take a position is judged exactly as it was before the
+    watermark existed: the `--idle-seconds` quiet window decides, and reaching
+    `--max-seconds` is judged by whether the connector was streaming. This is the
+    one path on which the ceiling is not, by itself, a failure — because there
+    was never a position to reach.
+    """
+    source = MarkableSource(writable=False)
+    source.may_declare_idle = lambda **kwargs: False
+    handler = FakeHandler(durable_lsn=10, quiet_for=1.0)
+    summary = run_engine_bounded(
+        FakeEngine(run_seconds=30.0),
+        handler,
+        _run_cfg(max_seconds=1, idle_seconds=5),
+        source,
+    )
+    assert summary["ok"] is True
+    assert summary["stop_reason"] == "max_seconds"
+    assert summary["completion_watermark"] == WATERMARK_UNAVAILABLE
