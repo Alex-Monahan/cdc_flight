@@ -4,16 +4,13 @@ Why this exists (measured, `codex_logs/slowlane_rootcause.md`, 2026-08-13)
 --------------------------------------------------------------------------
 `run_engine_bounded` used to end a *successful* run on a **timer**: `--idle-seconds`
 of silence, corroborated against `pg_replication_slots`. Silence is not a fact about
-delivery, so the window had to be long enough to out-wait Debezium's 10 s
-retriable-restart backoff (`source_health` explains why), and **every** run paid it
-whether or not anything was still owed. One instrumented slow lane measured
-
-    1,640.1 s — 37.8 % of the whole lane — inside that quiet window,
-    across 218 runs that had nothing left to deliver
-
+delivery, so the window had to out-wait Debezium's 10 s retriable-restart backoff
+(`source_health` explains why), and **every** run paid it whether or not anything was
+still owed. One instrumented slow lane measured **1,640.1 s — 37.8 % of the whole
+lane — inside that quiet window across 218 runs that had nothing left to deliver**,
 plus 572.7 s of runs that could never satisfy the predicate and burned their whole
-`--max-seconds`. The measured floor of one pipeline run was `3.90 s + idle_seconds`,
-so roughly four fifths of a typical run was waiting.
+`--max-seconds`. The floor of one pipeline run was `3.90 s + idle_seconds`, so
+roughly four fifths of a typical run was waiting.
 
 What replaces it
 ----------------
@@ -38,27 +35,34 @@ Why that is a proof and not an optimisation, in four steps:
    record at or past L is durable, which means every transaction before it is
    durable too. That is Invariant O read forwards.
 4. **L is reachable.** This is the reason for the marker, and the reason a bare
-   `pg_current_wal_lsn()` will not do: nothing guarantees that an arbitrary WAL
-   position is ever *delivered* to this slot — a publication that captures a subset
-   of tables never sees most of it — and `pg_current_wal_lsn()` is cluster-wide, so
-   an unrelated co-tenant database moves it (review r12 R12-3 measured that exact
-   mistake costing every bounded run its entire `--max-seconds`: 60.44 s against
-   10.55 s). The marker is OUR record on OUR slot, so it is guaranteed to arrive
-   and no neighbour can move it.
+   `pg_current_wal_lsn()` will not do: nothing guarantees an arbitrary WAL position
+   is ever *delivered* to this slot — a publication capturing a subset of tables
+   never sees most of it — and `pg_current_wal_lsn()` is cluster-wide, so a
+   co-tenant database moves it (review r12 R12-3 measured that mistake costing every
+   bounded run its entire `--max-seconds`: 60.44 s against 10.55 s). The marker is
+   OUR record on OUR slot: guaranteed to arrive, and no neighbour can move it.
 
-Straddling transactions
------------------------
+Straddling transactions, and what `stop_reason: "idle"` now means
+-----------------------------------------------------------------
 **Whole transactions only, and the boundary is the COMMIT.** A transaction that began
 before the watermark and commits after it has a commit LSN > L, so it is decoded
 after the marker: it is entirely *outside* this run's watermark and is delivered by
 the next run. It is never half-applied — the assembler only ever emits complete units
 and the un-ENDed tail is discarded at shutdown under Invariant O.
 
-If such a transaction is delivered anyway (it committed while we were waiting), the
-watermark is **invalidated** rather than honoured: a run whose source is still
-producing has not reached a quiescent point, so it takes a new position once the
-stream is quiet again. That is what keeps this identical to the old timer for a live
-writer while removing the wait for everyone else.
+A position, once PostgreSQL has assigned it, is never withdrawn. An earlier version
+invalidated an armed watermark when a data batch landed after it, claiming that kept a
+live writer behaving exactly as it did under the timer. **Measured, that claim is
+false** (review MINOR-3): a source writing every 1.5 s still produces quiet ticks,
+still arms, and still ends in ~5.5 s mid-write. All the edge did was take a second
+position when a batch landed in the ~100 ms between arming and durability. It is gone,
+with its re-arm budget; `arms` is now 0 or 1 per run.
+
+So state the claim honestly instead: a reached watermark says **"the destination is
+complete as of position L"**, NOT "the source has stopped writing". `stop_reason:
+"idle"` keeps its old spelling; the field carrying the real claim is
+`completion_watermark` — `reached` on the position path, `unavailable` on the
+quiet-window path. A caller needing "the source was quiescent" must read that one.
 
 What still falls back to `--idle-seconds`
 -----------------------------------------
@@ -68,8 +72,9 @@ had — `may_declare_idle` and its freshness confirmation, unchanged — and say
 `completion_watermark: "unavailable"` in its summary. The cases are:
 
 * the source cannot be written to: a hot standby, a role without permission on
-  `pg_logical_emit_message`, or `CDC_COMPLETION_WATERMARK=0` / `CDC_CATALOG_MARKER=0`;
-* the marker budget for this run is exhausted (`CDC_WATERMARK_MAX_WRITES`);
+  `pg_logical_emit_message`, or `CDC_COMPLETION_WATERMARK=0` — which is the ONLY
+  knob that keeps a run read-only against its source. `CDC_CATALOG_MARKER=0` is
+  **not** one: it governs the DDL fence, not the completion decision.
 * there is no `SourceHealth` at all — the re-snapshot engine and the streaming-only
   fakes. A re-snapshot stops on `stop_when` (its last shadow is swapped in) and its
   slot is a throwaway whose offsets nobody reads, so a watermark there would be a
@@ -78,13 +83,19 @@ had — `may_declare_idle` and its freshness confirmation, unchanged — and say
 What it is NOT
 --------------
 It is not a shortcut past any durability rule. The run still may not stop while the
-applier is busy, before `min_records`, or before the snapshot phase has ended; the
-slot-acknowledgement hand-off in the supervisor's `finally` still has to prove
-`confirmed_flush_lsn` reached the durable position; and `--max-seconds` is still the
-safety ceiling that stops this from ever becoming an unbounded wait (rubric 4.5).
-A run that arms a watermark and never reaches it does **not** report success: it
-fails loudly, which is the same B5 shape the timer's corroboration existed for, now
-proved by arithmetic on a position instead of by a continuity window.
+applier is busy, before `min_records`, or before the snapshot phase has ended, and
+the slot-acknowledgement hand-off in the supervisor's `finally` still has to prove
+`confirmed_flush_lsn` reached the durable position.
+
+`--max-seconds` remains the bound that stops this becoming an unbounded wait
+(rubric 4.5) — and it is a CEILING, NOT AN EXIT PATH. On any run that could take a
+position (`armed` and unreached, or `unarmed` because the source never stopped
+committing) reaching the ceiling raises `EngineFailure` in
+`supervisor.run_engine_bounded`. That closes the defect a review measured directly:
+against a continuously-writing source the run returned `ok: true, stop_reason:
+max_seconds, completion_watermark: unarmed` with 28 committed source rows absent
+from the destination. Only `unavailable` keeps the older, weaker connector-health
+rule, because a run that never had a position cannot be judged against one.
 """
 
 from __future__ import annotations
@@ -104,20 +115,18 @@ from .source_marker import SourceMarker
 
 log = logging.getLogger("cdc_flight.completion_watermark")
 
-#: How long the stream must have been quiet before the run asks the source for a
-#: position. It is NOT a completion timer: arming early is free, because a
-#: watermark the source overtakes is discarded and retaken. It only stops a run
-#: from writing a marker between two batches of a burst.
+#: How long the stream must have been quiet before the run asks for a position.
+#: Not a completion timer (it is capped by `--idle-seconds`) but load-bearing —
+#: see `CompletionWatermark._ready_to_arm`.
 DEFAULT_QUIET_SECONDS = 0.5
 
 
 class CompletionWatermark:
     """May this run stop yet? One object, one declared state, one answer.
 
-    The supervision loop asks `reached(handler, elapsed)` once per tick and does
-    nothing else with the question. Everything that used to be spread across the
-    loop — the quiet timer, the source corroboration, the sampler-freshness
-    confirmation window and their three `continue`s — lives here, behind
+    The supervision loop asks `reached(handler, elapsed)` once per tick. Everything
+    that used to be spread across it — the quiet timer, the source corroboration,
+    the sampler-freshness window and their three `continue`s — lives here, behind
     `machines.COMPLETION_WATERMARK`.
     """
 
@@ -139,29 +148,24 @@ class CompletionWatermark:
         self.quiet_seconds = max(0.0, min(quiet_seconds, run.idle_seconds))
         self.target_lsn: int | None = None
         self.arms = 0
-        self.invalidations = 0
         self._state = COMPLETION_WATERMARK.initial
-        self._armed_data_batches = 0
         self._idle_candidate_since: float | None = None
         self._blocked = 0
 
     @classmethod
     def for_run(cls, health, run, *, completion=None, prefix: str = "cdcf"):
-        """The production constructor: one marker budget of this run's own.
+        """The production constructor: a marker of this run's own.
 
-        Deliberately NOT the catalog watcher's marker. A source that keeps
-        committing while we watch it can consume watermark writes, and a fence
-        that cannot be written is a `DROP TABLE` the destination never applies.
+        Deliberately NOT the catalog watcher's marker: a fence that cannot be
+        written is a `DROP TABLE` the destination never applies, and the two
+        must not share a failure. No write budget, because a run takes at most
+        ONE position — `armed` is only ever left for `reached`.
         """
         return cls(
             health,
             run,
             completion=completion,
-            marker=SourceMarker(
-                prefix=prefix,
-                enabled=run.watermark_enabled,
-                max_writes=run.watermark_max_writes or None,
-            ),
+            marker=SourceMarker(prefix=prefix, enabled=run.watermark_enabled),
             quiet_seconds=run.watermark_quiet_seconds,
         )
 
@@ -183,13 +187,6 @@ class CompletionWatermark:
             self._idle_candidate_since = None
             return False
         if self._state == WATERMARK_ARMED:
-            if handler.data_batch_count != self._armed_data_batches:
-                # A whole source transaction committed PAST this watermark, so
-                # the watermark no longer describes a finished delivery. Take a
-                # new one once the stream is quiet again.
-                self.invalidations += 1
-                self._to(WATERMARK_UNARMED)
-                return False
             if self._durable(handler) >= (self.target_lsn or 0):
                 self._to(WATERMARK_REACHED)
                 log.info(
@@ -210,7 +207,6 @@ class CompletionWatermark:
             else:
                 self.target_lsn = self._arm(handler)
                 if self.target_lsn is not None:
-                    self._armed_data_batches = handler.data_batch_count
                     self.arms += 1
                     self._to(WATERMARK_ARMED)
                     return False
@@ -240,13 +236,19 @@ class CompletionWatermark:
         )
 
     def _ready_to_arm(self, handler) -> bool:
-        """Is now the moment to ask? A transient one.
+        """Is now the moment to ask? A transient one, and the ONLY one.
 
         A marker written before the slot exists is WAL the slot never carries, so
         the run could never reach it. `ever_streamed` is the cheapest honest proof
         that our slot already exists: a walsender has been observed attached to
         it, and Debezium only attaches after creating it, so the record we are
         about to write is behind the slot's start position.
+
+        The quiet term is what makes the removed `armed -> unarmed` edge
+        unnecessary: a position is taken only from a stream that has stopped
+        handing batches over, so there is nothing to withdraw it for. A source
+        that never stops committing therefore never gets a position at all, and
+        such a run fails on its ceiling rather than reporting success.
         """
         return (
             handler.seconds_since_last_batch >= self.quiet_seconds
@@ -332,10 +334,10 @@ class CompletionWatermark:
     def as_dict(self) -> dict:
         """What this run did to its source, reported rather than inferred.
 
-        `arms` is always present because it is the *cost* of the mechanism: each
-        one is a whole transaction the Flight wrote to a source it otherwise only
-        reads, and Debezium delivers each of them back as three records
-        (BEGIN, the message, END) that appear in `records`.
+        `arms` is always present because it is the *cost* of the mechanism: it is
+        a whole transaction the Flight wrote to a source it otherwise only reads,
+        and Debezium delivers it back as three records (BEGIN, the message, END)
+        that appear in `records`. It is 0 or 1, never more.
         """
         summary = {
             "completion_watermark": self._state,
@@ -343,6 +345,4 @@ class CompletionWatermark:
         }
         if self.target_lsn is not None:
             summary["completion_watermark_lsn"] = self.target_lsn
-        if self.invalidations:
-            summary["completion_watermark_invalidations"] = self.invalidations
         return summary

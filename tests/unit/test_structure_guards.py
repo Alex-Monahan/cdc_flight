@@ -12,15 +12,20 @@ from pathlib import Path
 
 import pytest
 
-#: RE-MEASURED FROM THE REAL LANE COLLECTIONS when the run's completion
-#: condition became a watermark: the fourteen unit tests in
+#: RE-MEASURED FROM THE REAL LANE COLLECTIONS. The run's completion condition
+#: became a watermark: the unit tests in
 #: `1.9_state_machines/test_1_9_completion_watermark.py` and the six end-to-end
-#: ones beside it add twenty items to the default lane and none to the other two.
-#: The guard itself remains 10 / 1 / 1 items in the 1751 / 171 / 46 collections,
-#: giving 1741 / 170 / 45 below. (Round 17's baseline was 1721 / 170 / 45; no
-#: node id was removed to get here.)
+#: ones beside it add items to the default lane and none to the other two. The
+#: follow-up that made `--max-seconds` a ceiling and not an exit path added three
+#: more unit tests there (a streaming source that never went quiet, the fallback
+#: path that keeps the older rule, and the quiet window that makes the deleted
+#: invalidation edge unnecessary). The guard itself remains 10 / 1 / 1 items in
+#: the 1754 / 171 / 46 collections, giving 1744 / 170 / 45 below. (Round 17's
+#: baseline was 1721 / 170 / 45, then 1741 / 170 / 45; no node id was removed to
+#: get here — the invalidation test was REPLACED in place by the test of the
+#: contract that replaced it.)
 _BASELINE_SELECTED = {
-    "not motherduck and not slow": 1741,
+    "not motherduck and not slow": 1744,
     "slow and not motherduck": 170,
     "motherduck": 45,
 }

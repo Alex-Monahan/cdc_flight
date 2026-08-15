@@ -25,7 +25,7 @@ from .applier import Applier
 from .completion_watermark import CompletionWatermark
 from .config import RunConfig, resolve_control_schema
 from .errors import EngineFailure
-from .machines import PHASE_DRAINING, WATERMARK_ARMED
+from .machines import PHASE_DRAINING, WATERMARK_ARMED, WATERMARK_UNARMED
 from .naming import control_table
 from .run_state import RunOutcome
 from .snapshot_completion import SnapshotCompletion
@@ -275,28 +275,37 @@ def run_engine_bounded(
         ):
             wait_seconds = min(run.close_timeout, 10.0)
             marker_emitted = False
-            # ASK BEFORE WRITING.  A run that ends on a completion watermark stops
-            # within milliseconds of the commit that made the watermark durable, so
-            # the connector has almost always simply not published its next status
-            # update yet; `status.update.interval.ms=1000` means one second settles
-            # it.  Writing a marker first was harmless when a run had already been
-            # silent for `--idle-seconds`, but on this path it puts NEW WAL into the
-            # stream during shutdown, and the callback that carries it back can then
-            # be interrupted mid-`markBatchFinished()` by `engine.close()` below —
-            # measured against MotherDuck at 8 workers, where a destination commit
-            # is slow enough for that window to be wide.
-            prompt_seconds = min(2.0, wait_seconds)
-            confirmed = health.wait_for_confirmed(durable_lsn, timeout=prompt_seconds)
-            if not confirmed:
-                # A genuinely quiet source does not necessarily deliver another poll
-                # after markBatchFinished().  Give the live connector one whole,
+            # ONE unsplit bounded wait, and the marker written up front.  A
+            # previous attempt at the shutdown `InterruptedException` in
+            # `markBatchFinished()` waited 2 s for the connector's own status
+            # update before writing anything, on the theory that a run ending on a
+            # completion watermark only needs the next `status.update.interval.ms`
+            # publication.  BOTH HALVES OF THAT ARE WRONG, and both were measured:
+            #
+            #  * The theory is false.  Skipping the marker on the reached path and
+            #    waiting the whole ten seconds instead was tried here and the slot
+            #    NEVER confirmed: durable 130314884344 against a slot stuck at
+            #    130314884040 after 10.0 s, turning ordinary catalog-baseline runs
+            #    into `slot_acknowledgement_timeout` failures.  Debezium publishes
+            #    feedback when it has WAL to answer for; the marker is what gives it
+            #    something to answer with.  It is NOT optional on any path.
+            #  * The 2 s bought nothing.  A review reproduced the identical
+            #    `InterruptedException` at the PARENT commit `9765340`, in a single
+            #    unloaded process with no marker involved at all, so the hazard is
+            #    pre-existing: `engine.close()` can interrupt an already-admitted
+            #    callback.  A timer that narrows a window it does not own has no
+            #    place in the one change whose purpose was removing timers.
+            #
+            # So the 2 s is DELETED and this is the parent's shape again: ask once,
+            # write once, wait once, bounded by `close_timeout` (rubric 4.5).
+            if not health.confirmed_at_least(durable_lsn):
+                # A quiet source does not necessarily deliver another poll after
+                # markBatchFinished().  Give the live connector one whole,
                 # offset-only PostgreSQL transaction to carry the already durable
                 # destination position to the slot.  The write is on the explicit
                 # primary route, never Debezium's replication connection.
                 marker_emitted = health.emit_idle_marker(durable_lsn)
-            if not confirmed and not health.wait_for_confirmed(
-                durable_lsn, timeout=wait_seconds - prompt_seconds
-            ):
+            if not health.wait_for_confirmed(durable_lsn, timeout=wait_seconds):
                 sample = health.last
                 acknowledgement_timeout = {
                     "durable_lsn": durable_lsn,
@@ -498,6 +507,40 @@ def run_engine_bounded(
             "the Debezium engine terminated before the supervisor requested a stop "
             f"(completion success={engine.completed_success}); in streaming mode "
             "that is engine death, not a clean finish",
+            summary,
+        )
+
+    if outcome.value == "max_seconds" and watermark.state in (
+        WATERMARK_ARMED, WATERMARK_UNARMED,
+    ):
+        # `--max-seconds` IS A SAFETY CEILING, NOT AN EXIT PATH (rubric 4.5, and
+        # the defect this whole change exists to remove). A run that had a way to
+        # take a position and ends on its clock has not shown its delivery to be
+        # complete, whatever the connector's health says:
+        #
+        #   * `armed`   - the marker is in the source's WAL and the destination
+        #                 never got there. The delivery is demonstrably behind.
+        #   * `unarmed` - the source never stopped committing long enough for a
+        #                 position to be taken, so nothing was ever proved.
+        #
+        # Both used to report `ok: true`. A review measured the consequence
+        # directly: 208 committed writes, `returncode=0, ok=true,
+        # stop_reason=max_seconds, completion_watermark=unarmed`, and 28 committed
+        # source rows absent from the destination. Data loss reported as success is
+        # the worst thing this project can ship, so both are now loud, attributable
+        # failures. `unavailable` deliberately keeps the older, weaker rules below:
+        # a run that never had a position cannot be judged against one.
+        detail = (
+            f"the completion watermark at LSN {watermark.target_lsn} was never "
+            f"reached (durable={summary.get('durable_lsn')})"
+            if watermark.state == WATERMARK_ARMED
+            else "no completion watermark was ever taken, because the source never "
+            "stopped committing long enough to be marked"
+        )
+        raise EngineFailure(
+            f"reached --max-seconds with the completion watermark {watermark.state}: "
+            f"{detail}. The safety ceiling is not an exit path: this run never "
+            "demonstrated a complete delivery, so it is not a success",
             summary,
         )
 
