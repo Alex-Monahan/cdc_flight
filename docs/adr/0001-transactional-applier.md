@@ -3022,6 +3022,32 @@ persistence: **memory only** · initial: `unarmed` · terminal: `reached`,
 | `unarmed` | `armed` | no |
 | `unarmed` | `unavailable` | yes |
 
+**`shutdown_sequence`** — Which shutdown boundary has been proved: source feedback,
+callback admission, callback quiescence, own executor retirement, and stock engine stop?
+
+persistence: **memory only** · initial: `open` · terminal: `callback_owned`,
+`engine_thread_stopped`, `hung`
+
+| from | to | terminal |
+|---|---|---|
+| `ack_complete` | `admission_sealed` | no |
+| `ack_failed` | `admission_sealed` | no |
+| `ack_not_required` | `admission_sealed` | no |
+| `ack_pending` | `ack_complete` | no |
+| `ack_pending` | `ack_failed` | no |
+| `admission_sealed` | `callback_owned` | yes |
+| `admission_sealed` | `callbacks_quiescent` | no |
+| `callbacks_quiescent` | `hung` | yes |
+| `callbacks_quiescent` | `own_executors_stopped` | no |
+| `engine_closed` | `engine_thread_stopped` | yes |
+| `engine_closed` | `hung` | yes |
+| `engine_closing` | `engine_closed` | no |
+| `engine_closing` | `hung` | yes |
+| `open` | `ack_complete` | no |
+| `open` | `ack_not_required` | no |
+| `open` | `ack_pending` | no |
+| `own_executors_stopped` | `engine_closing` | no |
+
 **`runtime_root_lifecycle`** — Is the project-local disposable root healthy and
 reusable, privately provisioning, or irreversibly committed to cleanup?
 
@@ -3421,7 +3447,7 @@ machine is ceremony — worse than ceremony, because it advertises recoverable i
 states that do not exist. If yes, the state needs a name, a persisted value and a
 transition table.
 
-#### What was built (thirteen focused machines + one precedence)
+#### What was built (fifteen focused machines + one precedence)
 
 | machine | owns | states | edges | persistence |
 |---|---|---|---|---|
@@ -3439,6 +3465,7 @@ transition table.
 | `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
 | `snapshot_completion` | have all ordered snapshot callbacks arrived | 6 | 9 | **memory only** |
 | `completion_watermark` | has this run reached a source position it can prove the destination is durably past | 4 | 3 | **memory only** |
+| `shutdown_sequence` | has source feedback, callback quiescence, own teardown, and stock engine stop completed in order | 13 | 17 | **memory only** |
 | `runtime_root_lifecycle` | is the disposable root reusable or committed to cleanup | 6 | 10 | project-local root and parent markers |
 
 Generated transition tables: §A51.1. Declarations: `cdc_flight/machines.py`, which is one

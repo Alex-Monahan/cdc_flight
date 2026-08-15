@@ -15,6 +15,7 @@ import pytest
 
 from cdc_flight.envelope import (
     KIND_DATA,
+    KIND_MESSAGE,
     KIND_SNAPSHOT,
     KIND_TXN_BEGIN,
     KIND_TXN_END,
@@ -128,9 +129,29 @@ def test_a_data_event_prefers_the_stable_source_tx_id():
     )
     assert rec.kind == KIND_DATA
     assert rec.txn_id == "77"
+
     assert rec.total_order == 2
     assert rec.lsn == 900
     assert rec.key == {"id": 1}
+
+
+def test_a_logical_message_retains_the_nested_marker_prefix():
+    rec = _decode(
+        FakeEvent(
+            f"{TOPIC_PREFIX}.message",
+            {
+                "op": "m",
+                "source": {"schema": "", "table": "", "txId": 78, "lsn": 901},
+                "transaction": {"id": "78:901", "total_order": 1},
+                "message": {
+                    "prefix": "cdcf_completion_watermark",
+                    "content": "payload",
+                },
+            },
+        )
+    )
+    assert rec.kind == KIND_MESSAGE
+    assert rec.message_prefix == "cdcf_completion_watermark"
 
 
 def test_a_snapshot_record_never_carries_transaction_metadata():

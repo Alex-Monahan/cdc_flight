@@ -39,6 +39,7 @@ from cdc_flight.pipeline import run_engine_bounded
 from cdc_flight.snapshot_completion import SnapshotCompletion
 from cdc_flight.source_marker import COMPLETION_WATERMARK, REASONS, SourceMarker
 from cdc_flight.states import IllegalTransition
+from cdc_flight.supervisor import ShutdownSequence
 
 
 # --------------------------------------------------------------------------- #
@@ -193,6 +194,31 @@ def test_the_marker_reason_is_declared():
     assert SourceMarker(prefix="cdcf").prefix_for(COMPLETION_WATERMARK) == (
         "cdcf_completion_watermark"
     )
+
+
+def test_shutdown_cannot_close_stock_engine_before_callbacks_quiesce():
+    """The close/ack boundary is a second declared 1.9 machine."""
+    sequence = ShutdownSequence()
+    sequence.to(m.SHUTDOWN_ACK_NOT_REQUIRED)
+    sequence.to(m.SHUTDOWN_ADMISSION_SEALED)
+    with pytest.raises(IllegalTransition):
+        sequence.to(m.SHUTDOWN_ENGINE_CLOSING)
+
+    sequence.to(m.SHUTDOWN_CALLBACKS_QUIESCENT)
+    sequence.to(m.SHUTDOWN_OWN_EXECUTORS_STOPPED)
+    sequence.to(m.SHUTDOWN_ENGINE_CLOSING)
+    sequence.to(m.SHUTDOWN_ENGINE_CLOSED)
+    sequence.to(m.SHUTDOWN_ENGINE_THREAD_STOPPED)
+    assert sequence.summary()["shutdown_sequence_history"] == [
+        m.SHUTDOWN_OPEN,
+        m.SHUTDOWN_ACK_NOT_REQUIRED,
+        m.SHUTDOWN_ADMISSION_SEALED,
+        m.SHUTDOWN_CALLBACKS_QUIESCENT,
+        m.SHUTDOWN_OWN_EXECUTORS_STOPPED,
+        m.SHUTDOWN_ENGINE_CLOSING,
+        m.SHUTDOWN_ENGINE_CLOSED,
+        m.SHUTDOWN_ENGINE_THREAD_STOPPED,
+    ]
 
 
 # --------------------------------------------------------------------------- #

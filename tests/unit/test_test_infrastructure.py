@@ -219,3 +219,20 @@ def test_sandbox_keeps_the_historical_six_second_default(monkeypatch, tmp_path: 
     sandbox.run()
 
     assert observed == [6]
+
+
+def test_source_records_counts_marker_records_received_not_written():
+    """A source marker written after admission closes is not in ``records``."""
+    summary = {
+        "records": 23,
+        "completion_watermark_arms": 0,
+        "source_marker": {"source_markers": 1},
+        "source_marker_records_received": 0,
+    }
+    assert conftest.source_records(summary) == 23
+
+    summary["source_marker_records_received"] = 2
+    assert conftest.source_records(summary) == 21
+
+    summary["source_marker_records_received"] = 3
+    assert conftest.source_records(summary) == 20

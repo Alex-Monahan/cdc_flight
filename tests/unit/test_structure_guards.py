@@ -20,12 +20,12 @@ import pytest
 #: more unit tests there (a streaming source that never went quiet, the fallback
 #: path that keeps the older rule, and the quiet window that makes the deleted
 #: invalidation edge unnecessary). The guard itself remains 10 / 1 / 1 items in
-#: the 1754 / 171 / 46 collections, giving 1744 / 170 / 45 below. (Round 17's
+#: the 1760 / 171 / 46 collections, giving 1750 / 170 / 45 below. (Round 17's
 #: baseline was 1721 / 170 / 45, then 1741 / 170 / 45; no node id was removed to
 #: get here — the invalidation test was REPLACED in place by the test of the
 #: contract that replaced it.)
 _BASELINE_SELECTED = {
-    "not motherduck and not slow": 1744,
+    "not motherduck and not slow": 1750,
     "slow and not motherduck": 170,
     "motherduck": 45,
 }

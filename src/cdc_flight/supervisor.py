@@ -17,7 +17,7 @@ import logging
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from . import table_lifecycle
@@ -25,7 +25,25 @@ from .applier import Applier
 from .completion_watermark import CompletionWatermark
 from .config import RunConfig, resolve_control_schema
 from .errors import EngineFailure
-from .machines import PHASE_DRAINING, WATERMARK_ARMED, WATERMARK_UNARMED
+from .machines import (
+    PHASE_DRAINING,
+    SHUTDOWN_ACK_COMPLETE,
+    SHUTDOWN_ACK_FAILED,
+    SHUTDOWN_ACK_NOT_REQUIRED,
+    SHUTDOWN_ACK_PENDING,
+    SHUTDOWN_ADMISSION_SEALED,
+    SHUTDOWN_CALLBACK_OWNED,
+    SHUTDOWN_CALLBACKS_QUIESCENT,
+    SHUTDOWN_ENGINE_CLOSED,
+    SHUTDOWN_ENGINE_CLOSING,
+    SHUTDOWN_ENGINE_THREAD_STOPPED,
+    SHUTDOWN_HUNG,
+    SHUTDOWN_OPEN,
+    SHUTDOWN_OWN_EXECUTORS_STOPPED,
+    SHUTDOWN_SEQUENCE,
+    WATERMARK_ARMED,
+    WATERMARK_UNARMED,
+)
 from .naming import control_table
 from .run_state import RunOutcome
 from .snapshot_completion import SnapshotCompletion
@@ -47,6 +65,31 @@ class QuiescenceProof:
     """
 
     applier_quiesced: bool
+
+
+@dataclass
+class ShutdownSequence:
+    """The single owner of the close/ack/callback boundary.
+
+    A plain collection of booleans made it possible to close stock Debezium while an
+    admitted callback still owned ``RecordCommitter``.  Every lifecycle step now moves
+    through ``machines.SHUTDOWN_SEQUENCE``; an order not declared there raises instead
+    of becoming another timing-dependent branch.
+    """
+
+    state: str = SHUTDOWN_OPEN
+    history: list[str] = field(default_factory=lambda: [SHUTDOWN_OPEN])
+
+    def to(self, state: str) -> None:
+        SHUTDOWN_SEQUENCE.check(self.state, state)
+        self.state = state
+        self.history.append(state)
+
+    def summary(self) -> dict[str, object]:
+        return {
+            "shutdown_sequence": self.state,
+            "shutdown_sequence_history": list(self.history),
+        }
 
 
 def run_engine_bounded(
@@ -177,6 +220,7 @@ def run_engine_bounded(
     idle_blocked_by_source = 0
     source_dark_after: float | None = None
     close_hung = False
+    shutdown_sequence = ShutdownSequence()
     try:
         while thread.is_alive():
             elapsed = time.monotonic() - started
@@ -256,56 +300,41 @@ def run_engine_bounded(
         else:
             outcome.record("engine_finished")
     finally:
-        # The destination commit and Debezium acknowledgement are deliberately
-        # separate.  PostgreSQL receives the slot feedback on the connector's next
-        # poll, so closing the engine at the first quiet instant can leave
-        # confirmed_flush_lsn behind a durable MotherDuck commit.  Keep the live
-        # connector open for one bounded feedback hand-off before sealing callback
-        # admission.  A timeout is a failed proof, not a successful run with a
-        # merely lagging slot.
+        # The shutdown state machine is deliberately linear.  The source feedback
+        # hand-off happens while callbacks are still admitted; then admission is
+        # sealed, admitted callbacks are drained, our own timer is retired, and only
+        # then is stock Debezium closed.  In particular, ``engine.close()`` is never
+        # used as the mechanism that makes an admitted callback quiescent: stock
+        # Debezium is allowed to interrupt its poll thread during close, and that
+        # interrupt must not be able to reach ``markBatchFinished()``.
         durable_lsn = int(
             getattr(getattr(handler, "resume_point", None), "last_lsn", 0) or 0
         )
-        if (
+        final_ack_required = (
             health is not None
             and durable_lsn > initial_durable_lsn
             and health.ever_sampled
             and not getattr(getattr(handler, "cfg", None), "resnapshot", False)
             and outcome.value not in {"source_dark", "hung"}
-        ):
+        )
+        if not final_ack_required:
+            shutdown_sequence.to(SHUTDOWN_ACK_NOT_REQUIRED)
+        elif health.confirmed_at_least(durable_lsn):
+            shutdown_sequence.to(SHUTDOWN_ACK_COMPLETE)
+        else:
+            shutdown_sequence.to(SHUTDOWN_ACK_PENDING)
             wait_seconds = min(run.close_timeout, 10.0)
             marker_emitted = False
-            # ONE unsplit bounded wait, and the marker written up front.  A
-            # previous attempt at the shutdown `InterruptedException` in
-            # `markBatchFinished()` waited 2 s for the connector's own status
-            # update before writing anything, on the theory that a run ending on a
-            # completion watermark only needs the next `status.update.interval.ms`
-            # publication.  BOTH HALVES OF THAT ARE WRONG, and both were measured:
-            #
-            #  * The theory is false.  Skipping the marker on the reached path and
-            #    waiting the whole ten seconds instead was tried here and the slot
-            #    NEVER confirmed: durable 130314884344 against a slot stuck at
-            #    130314884040 after 10.0 s, turning ordinary catalog-baseline runs
-            #    into `slot_acknowledgement_timeout` failures.  Debezium publishes
-            #    feedback when it has WAL to answer for; the marker is what gives it
-            #    something to answer with.  It is NOT optional on any path.
-            #  * The 2 s bought nothing.  A review reproduced the identical
-            #    `InterruptedException` at the PARENT commit `9765340`, in a single
-            #    unloaded process with no marker involved at all, so the hazard is
-            #    pre-existing: `engine.close()` can interrupt an already-admitted
-            #    callback.  A timer that narrows a window it does not own has no
-            #    place in the one change whose purpose was removing timers.
-            #
-            # So the 2 s is DELETED and this is the parent's shape again: ask once,
-            # write once, wait once, bounded by `close_timeout` (rubric 4.5).
-            if not health.confirmed_at_least(durable_lsn):
-                # A quiet source does not necessarily deliver another poll after
-                # markBatchFinished().  Give the live connector one whole,
-                # offset-only PostgreSQL transaction to carry the already durable
-                # destination position to the slot.  The write is on the explicit
-                # primary route, never Debezium's replication connection.
-                marker_emitted = health.emit_idle_marker(durable_lsn)
+            # A quiet source does not necessarily deliver another poll after
+            # markBatchFinished().  Give the live connector one whole,
+            # offset-only PostgreSQL transaction to carry the already durable
+            # destination position to the slot.  The write is on the explicit
+            # primary route, never Debezium's replication connection.  This marker
+            # remains load-bearing: ordinary catalog-baseline runs fail closed if it
+            # is removed because the slot has no WAL answer to publish.
+            marker_emitted = health.emit_idle_marker(durable_lsn)
             if not health.wait_for_confirmed(durable_lsn, timeout=wait_seconds):
+                shutdown_sequence.to(SHUTDOWN_ACK_FAILED)
                 sample = health.last
                 acknowledgement_timeout = {
                     "durable_lsn": durable_lsn,
@@ -325,47 +354,97 @@ def run_engine_bounded(
                     wait_seconds,
                     acknowledgement_timeout["confirmed_pos"],
                 )
-        # Seal admission BEFORE shutdown does anything that can touch the destination.
-        # New callbacks are now recorded no-ops. An already-admitted callback still owns
-        # the connection until `wait_for_quiescence()` proves it has left.
+            else:
+                shutdown_sequence.to(SHUTDOWN_ACK_COMPLETE)
+
+        # Seal before waiting: an open admission boundary can always admit another
+        # callback after a successful zero-in-flight observation.  Once this returns,
+        # a late Debezium callback is a recorded no-op and cannot call the committer.
         handler.shutdown(reason="supervisor_shutdown")
-        intentional = (
-            outcome.value != "engine_error"
-            and getattr(handler, "error", None) is None
-            and not error_box
-        )
-        log.info(
-            "closing debezium engine (reason=%s, intentional=%s)", outcome.value, intentional
-        )
-        closer = threading.Thread(
-            target=engine.close,
-            kwargs={"intentional": intentional},
-            name="debezium-close",
-            daemon=True,
-        )
-        closer.start()
-        closer.join(timeout=run.close_timeout)
-        if closer.is_alive():
-            log.error("engine.close() did not return within %ss", run.close_timeout)
-            close_hung = True
-            # The CAUSE, not the symptom. A source that has gone dark makes
-            # `engine.close()` hang almost by definition - the connector is waiting on a
-            # socket that will never answer - and overwriting `source_dark` with `hung`
-            # reported the consequence and lost the diagnosis. The same principle the
-            # error path already applies to `EngineFailure`'s cause ordering.
-            outcome.record("hung")
-        thread.join(timeout=60)
-        if thread.is_alive():
-            log.error("debezium engine thread did not stop within 60s")
-            close_hung = True
-            outcome.record("hung")
+        shutdown_sequence.to(SHUTDOWN_ADMISSION_SEALED)
+
+        # This is the critical repair.  The old path called engine.close() first and
+        # proved quiescence afterwards; stock close can interrupt the exact callback
+        # that is in markBatchFinished().  A failed bounded proof is terminal: do not
+        # close the engine or tear down destination ownership around a live callback.
         applier_quiesced = handler.wait_for_quiescence(timeout=run.close_timeout)
+        shutdown_sequence.to(
+            SHUTDOWN_CALLBACKS_QUIESCENT if applier_quiesced else SHUTDOWN_CALLBACK_OWNED
+        )
         proof = QuiescenceProof(applier_quiesced=applier_quiesced)
         if quiescence_observer is not None:
             # Publish immediately after the bounded proof. In particular, keep this
             # inside the `finally`: KeyboardInterrupt/SystemExit pending from the main
             # body resume unwinding as soon as this block ends and skip the summary.
             quiescence_observer(proof)
+
+        if not applier_quiesced:
+            # No close is permitted after a failed callback proof. A bounded join lets
+            # the engine thread finish any already-started lifecycle publication (for
+            # example, the re-snapshot offset file) without interrupting the live
+            # callback or reclaiming its destination owner.
+            thread.join(timeout=run.close_timeout)
+
+        if applier_quiesced:
+            # Applier's age thread is our own background executor.  It is stopped by
+            # ``shutdown()`` above, and joined here only after callbacks have released
+            # the mutable group.  Fakes and alternate handlers from the small unit
+            # surface predate this method, so the absence of it means there is no local
+            # executor to retire.
+            retire_background = getattr(handler, "wait_for_internal_teardown", None)
+            if retire_background is not None and not retire_background(
+                timeout=run.close_timeout
+            ):
+                shutdown_sequence.to(SHUTDOWN_HUNG)
+                close_hung = True
+                outcome.record("hung")
+            if shutdown_sequence.state != SHUTDOWN_HUNG:
+                shutdown_sequence.to(SHUTDOWN_OWN_EXECUTORS_STOPPED)
+
+        if applier_quiesced and shutdown_sequence.state != SHUTDOWN_HUNG:
+            shutdown_sequence.to(SHUTDOWN_ENGINE_CLOSING)
+            intentional = (
+                outcome.value != "engine_error"
+                and getattr(handler, "error", None) is None
+                and not error_box
+            )
+            log.info(
+                "closing debezium engine (reason=%s, intentional=%s)",
+                outcome.value,
+                intentional,
+            )
+            closer = threading.Thread(
+                target=engine.close,
+                kwargs={"intentional": intentional},
+                name="debezium-close",
+                daemon=True,
+            )
+            closer.start()
+            closer.join(timeout=run.close_timeout)
+            if closer.is_alive():
+                log.error("engine.close() did not return within %ss", run.close_timeout)
+                close_hung = True
+                shutdown_sequence.to(SHUTDOWN_HUNG)
+                # The CAUSE, not the symptom. A source that has gone dark makes
+                # `engine.close()` hang almost by definition - the connector is
+                # waiting on a socket that will never answer - and overwriting
+                # `source_dark` with `hung` reported the consequence and lost the
+                # diagnosis. The same principle the error path already applies to
+                # the error ordering.
+                outcome.record("hung")
+            else:
+                shutdown_sequence.to(SHUTDOWN_ENGINE_CLOSED)
+
+            if shutdown_sequence.state != SHUTDOWN_HUNG:
+                thread.join(timeout=60)
+                if thread.is_alive():
+                    log.error("debezium engine thread did not stop within 60s")
+                    close_hung = True
+                    shutdown_sequence.to(SHUTDOWN_HUNG)
+                    outcome.record("hung")
+                else:
+                    shutdown_sequence.to(SHUTDOWN_ENGINE_THREAD_STOPPED)
+
         if not applier_quiesced:
             log.error(
                 "an admitted Debezium callback did not leave within %ss; retaining the "
@@ -407,6 +486,7 @@ def run_engine_bounded(
         "skipped": handler.skipped_count,
         "tables": handler.snapshot_counts(),
         "offset_flushes_verified": engine.offset_flushes_verified,
+        **shutdown_sequence.summary(),
         **handler.stats(),
     }
     summary.update(completion.as_dict())

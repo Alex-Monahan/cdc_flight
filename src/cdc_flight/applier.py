@@ -63,7 +63,11 @@ from .catalog_apply import CatalogCoordinator, CatalogPlan
 from .commit_group import CommitResult, OpenGroup
 from .config import ApplierConfig, resolve_control_schema
 from .destination import AlertSink, Lease, ResumePoint
-from .envelope import KIND_SNAPSHOT_BOUNDARY, PendingRecord, decode
+from .envelope import (
+    KIND_SNAPSHOT_BOUNDARY,
+    PendingRecord,
+    decode,
+)
 from .errors import (
     AdmissionError,
     AmbiguousDelete,
@@ -72,6 +76,7 @@ from .errors import (
     as_schema_refusal,
 )
 from .faults import maybe_crash
+from .marker_accounting import SourceMarkerReceiptCounter
 from .snapshot import SnapshotCoordinator
 from .snapshot_completion import (
     SnapshotCompletion,
@@ -95,6 +100,7 @@ class Applier:
         namespace: str,
         dataset: str,
         topic_prefix: str,
+        marker_prefixes: tuple[str, ...] | None = None,
         offset_path,
         resume_point: ResumePoint,
         config: ApplierConfig,
@@ -236,6 +242,12 @@ class Applier:
         self._callback_seal_reason: str | None = None
         self._callback_batches_rejected = 0
         self._callback_records_rejected = 0
+        #: Raw records belonging to Flight-owned source marker transactions that
+        #: crossed this callback boundary.  This is deliberately based on receipt,
+        #: not on SourceMarker.writes: a shutdown marker can be written and then be
+        #: rejected after admission is sealed.
+        self.source_marker_records_received = 0
+        self._source_marker_receipts = SourceMarkerReceiptCounter(marker_prefixes)
         self.last_batch_at = time.monotonic()
 
         # -- counters surfaced in the run summary (rubric 6.1) --------------- #
@@ -382,6 +394,7 @@ class Applier:
             "callback_batches_rejected": self._callback_batches_rejected,
             "callback_records_rejected": self._callback_records_rejected,
             "callback_quiesced": self.callback_quiesced,
+            "source_marker_records_received": self.source_marker_records_received,
             **self.catalog_coordinator.summary(),
             **(self.catalog.summary() if self.catalog is not None else {}),
         }
@@ -429,6 +442,20 @@ class Applier:
                     return False
                 self._quiescence.wait(remaining)
             return True
+
+    def wait_for_internal_teardown(self, timeout: float) -> bool:
+        """Join the applier's age thread after callback quiescence is proved.
+
+        The age thread can request a group close, but it never owns the Debezium
+        committer.  Stopping and joining it after callback quiescence makes the
+        supervisor's own runtime teardown explicit without using stock Debezium's
+        ``close()`` as a callback barrier.
+        """
+        self._timer_stop.set()
+        if threading.current_thread() is self._timer:
+            return True
+        self._timer.join(timeout=max(0.0, timeout))
+        return not self._timer.is_alive()
 
     # ------------------------------------------------------------------ #
     # the Debezium callback
@@ -507,6 +534,7 @@ class Applier:
 
             source_records += 1
             rec = decode(raw, topic_prefix=self.topic_prefix)
+            self.source_marker_records_received += self._source_marker_receipts.observe(rec)
             if rec.lsn is not None:
                 self.highest_source_lsn = max(self.highest_source_lsn, int(rec.lsn))
             if rec.is_data:

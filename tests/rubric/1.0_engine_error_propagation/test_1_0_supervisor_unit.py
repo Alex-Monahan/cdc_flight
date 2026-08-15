@@ -205,6 +205,36 @@ def test_close_is_marked_intentional_on_a_clean_stop():
     assert engine.closed_intentional is True
 
 
+def test_callback_quiescence_is_proved_before_engine_close():
+    """Stock close must never interrupt an admitted Python callback."""
+    lifecycle: list[str] = []
+
+    class OrderingEngine(FakeEngine):
+        def close(self, *, intentional: bool = True):
+            lifecycle.append("engine.close")
+            super().close(intentional=intentional)
+
+    class OrderingHandler(FakeHandler):
+        def shutdown(self, *, reason="supervisor_shutdown"):
+            lifecycle.append("admission.sealed")
+            super().shutdown(reason=reason)
+
+        def wait_for_quiescence(self, timeout):
+            lifecycle.append("callbacks.quiescent")
+            return super().wait_for_quiescence(timeout)
+
+    handler = OrderingHandler()
+    handler.seconds_since_last_batch = 99
+    summary = run_engine_bounded(OrderingEngine(run_seconds=3), handler, _run_cfg())
+
+    assert summary["ok"] is True
+    assert lifecycle == [
+        "admission.sealed",
+        "callbacks.quiescent",
+        "engine.close",
+    ]
+
+
 class SettlingSourceHealth:
     """A source that will not corroborate idle yet, and later does.
 

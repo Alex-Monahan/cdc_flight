@@ -45,7 +45,17 @@ MARKER_RECORDS = 3
 
 
 def source_records(summary: dict) -> int:
-    """Records a run received that the SOURCE, not the Flight itself, produced."""
+    """Records a run received that the SOURCE, not the Flight itself, produced.
+
+    ``SourceMarker.writes`` is a source-side fact, not a delivery fact: the shutdown
+    marker can be written after the last admitted callback and never reach this run.
+    Production summaries therefore report the exact raw marker records that crossed
+    callback admission.  Keep the old arithmetic only for summaries from older
+    builds that do not carry that receipt counter.
+    """
+    received = summary.get("source_marker_records_received")
+    if received is not None:
+        return summary["records"] - int(received)
     written = summary.get("completion_watermark_arms", 0) + summary.get(
         "source_marker", {}
     ).get("source_markers", 0)

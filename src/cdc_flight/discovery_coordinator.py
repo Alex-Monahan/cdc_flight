@@ -410,6 +410,7 @@ class LiveDiscoveryCoordinator:
             namespace=self.namespace,
             dataset=self.destination.dataset_name,
             topic_prefix=self.replication.topic_prefix,
+            marker_prefixes=("cdcf", self.catalog_cfg.marker_prefix),
             offset_path=self.replication.offset_file,
             resume_point=self.main_resume,
             config=self.applier_cfg,

@@ -101,6 +101,10 @@ class PendingRecord:
     topic: str
     nbytes: int
     op: str | None = None
+    #: Logical-decoding message prefix. Flight-owned source markers use the
+    #: configured ``<marker-prefix>_<reason>`` namespace; retaining it lets the
+    #: applier report exactly which marker records crossed callback admission.
+    message_prefix: str | None = None
     schema: str | None = None
     table: str | None = None
     lsn: int | None = None
@@ -325,6 +329,10 @@ def decode(raw: Any, *, topic_prefix: str, want_offsets: bool = False) -> Pendin
 
     source = payload.get("source") or {}
     rec.op = payload.get("op")
+    message = payload.get("message")
+    rec.message_prefix = _as_str(
+        message.get("prefix") if isinstance(message, dict) else payload.get("prefix")
+    )
     rec.schema = source.get("schema")
     rec.table = source.get("table")
     rec.lsn = source.get("lsn") or _offset_lsn(rec.source_offset)
