@@ -118,15 +118,21 @@ from dataclasses import dataclass, field
 from . import destination as dest_mod
 from . import reconcile as reconcile_mod
 from . import resnapshot_projection as projection
-from . import table_lifecycle
+from . import resnapshot_refusal, table_lifecycle
 from .applier import Applier
-from .config import DROP_LOG, ApplierConfig, ReplicationConfig, RunConfig, SourceConfig
+from .config import (
+    DROP_LOG,
+    ApplierConfig,
+    ReplicationConfig,
+    RunConfig,
+    SourceConfig,
+    resolve_control_schema,
+)
 from .debezium_props import build_properties
-from .destination import CONTROL_SCHEMA, ResumePoint
+from .destination import ResumePoint
 from .errors import EngineFailure
-from .naming import quote
+from .naming import control_table, quote
 from .ownership import DestinationOwnership
-from .resnapshot_compat import completed_tables as _completed_tables
 from .resnapshot_projection import ProjectionEvent
 from .resnapshot_recovery import InterruptionRecovery
 from .resnapshot_source_policy import (
@@ -138,6 +144,7 @@ from .snapshot_completion import SnapshotCompletion
 from .source_health import SourceHealth
 
 log = logging.getLogger("cdc_flight.resnapshot")
+OWNER = "resnapshot-protocol"
 
 #: Suffix for the throwaway slot. Kept short: Postgres slot names are limited to 63
 #: characters and the base name is already operator-chosen.
@@ -153,6 +160,7 @@ class ResnapshotOutcome:
     emptied: list[str] = field(default_factory=list)
     logged_drops: list[str] = field(default_factory=list)
     dropped: list[str] = field(default_factory=list)
+    quarantined: list[str] = field(default_factory=list)
     consistent_lsn: int | None = None
     slot_consistent_lsn: int | None = None
     snapshot_record_lsn: int | None = None
@@ -171,6 +179,7 @@ class ResnapshotOutcome:
             "resnapshot_emptied": self.emptied,
             "resnapshot_logged_drops": self.logged_drops,
             "resnapshot_dropped": self.dropped,
+            "resnapshot_quarantined": self.quarantined,
             "resnapshot_consistent_lsn": self.consistent_lsn,
             "resnapshot_slot_consistent_lsn": self.slot_consistent_lsn,
             "resnapshot_snapshot_record_lsn": self.snapshot_record_lsn,
@@ -192,8 +201,8 @@ class ResnapshotOutcome:
             - set(self.emptied)
             - set(self.logged_drops)
             - set(self.dropped)
+            - set(self.quarantined)
         )
-
 
 def _record_snapshot_swap_audit(
     con,
@@ -206,12 +215,12 @@ def _record_snapshot_swap_audit(
     new_relations: set[str],
     namespace: str | None = None,
     snapshot_epoch: int | None = None,
+    control_schema: str | None = None,
 ) -> None:
     """Project a swapped image's audit and refusal discharge inside its COMMIT.
 
     ``SnapshotCoordinator.swap`` invokes this callback while the image transaction is
-    still open.  The post-swap completion projection remains as a read-only compatibility
-    check; it is no longer the transaction that makes a discovery look complete.
+    still open, so the image and its lifecycle/audit projection commit together.
     """
     qualified = f"{state.schema}.{state.table}"
     detail = (
@@ -243,19 +252,28 @@ def _record_snapshot_swap_audit(
         events=tuple(events),
         namespace=namespace,
         snapshot_epoch=snapshot_epoch,
+        control_schema=control_schema,
     )
 
 
-def _advance_snapshot_epoch(
-    con, *, pipeline: str, namespace: str | None, snapshot_epoch: int | None
-) -> None:
-    """Compatibility wrapper for callers that only need the epoch projection."""
-    projection.advance_snapshot_epoch(
-        con,
-        pipeline=pipeline,
-        namespace=namespace,
-        snapshot_epoch=snapshot_epoch,
-    )
+def _completed_tables(
+    con, pipeline: str, tables: list[tuple[str, str, str]]
+) -> list[str]:
+    """Return requested tables whose current lifecycle is complete.
+
+    The bounded snapshot engine uses this read-only view after its coordinator has
+    committed the canonical swap projection.  It deliberately performs no second
+    projection or control-plane write: current-run recovery reads the durable lifecycle
+    and audit state directly.
+    """
+    return [
+        f"{schema}.{table}"
+        for schema, table, _target in tables
+        if table_lifecycle.read(
+            con, pipeline=pipeline, source_schema=schema, source_table=table
+        )
+        == table_lifecycle.COMPLETE
+    ]
 
 
 class _SlotWatcher:
@@ -361,6 +379,7 @@ def run(
     ownership: DestinationOwnership,
     new_relations: set[str] | None = None,
     drop_mode: str = DROP_LOG,
+    control_schema: str | None = None,
 ) -> ResnapshotOutcome:
     """Re-snapshot `tables` into shadow tables and swap them in, then return.
 
@@ -429,8 +448,23 @@ def run(
             new_relations=new_relations or set(),
             namespace=namespace,
             snapshot_epoch=epoch_base + len(tables) + 1,
+            control_schema=control_schema,
         )
+    descriptor_connection = None
+    descriptor_provider = None
     try:
+        # The throwaway applier deliberately has no live CatalogWatcher, but its
+        # snapshot shadow must use the same catalog-authoritative descriptors as the
+        # main stream.  Read only the requested relation/type facts once; no source
+        # row values are fetched and no TOAST behavior is involved here.
+        import psycopg
+
+        from .catalog_descriptors import RelationDescriptorProvider
+
+        descriptor_connection = psycopg.connect(source.dsn, autocommit=True)
+        descriptor_provider = RelationDescriptorProvider.from_tables(
+            descriptor_connection, tables, source_dsn=source.dsn
+        ).descriptors_for
         applier = Applier(
             con,
             pipeline=pipeline,
@@ -446,6 +480,10 @@ def run(
             catalog=None,
             completion=completion,
             snapshot_audit=snapshot_audit,
+            descriptor_provider=descriptor_provider,
+            binary_handling_mode=props.get("binary.handling.mode", "base64"),
+            hstore_handling_mode=props.get("hstore.handling.mode", "map"),
+            control_schema=control_schema,
         )
         ownership.attach(applier)
         # Keep the historical pipeline seam: tests and embedding callers replace
@@ -506,10 +544,6 @@ def run(
                 con,
                 pipeline,
                 tables,
-                outcome.consistent_lsn,
-                reason=reason,
-                new_relations=new_relations or set(),
-                write_audit=False,
             )
         pending = [t for t in tables if f"{t[0]}.{t[1]}" not in set(outcome.swapped)]
         evidence = _gather_emptiness_evidence(
@@ -597,10 +631,53 @@ def run(
                 recovery.marker,
             )
         else:
-            reassert_owed(con, pipeline=pipeline, tables=tables, terminal=outcome)
+            refused = resnapshot_refusal.cause(exc)
+            if refused is not None:
+                resnapshot_refusal.persist(
+                    con,
+                    refused=refused,
+                    pipeline=pipeline,
+                    tables=tables,
+                    source_dsn=source.dsn,
+                    control_schema=control_schema,
+                )
+            reassert_owed(
+                con,
+                pipeline=pipeline,
+                tables=tables,
+                terminal=outcome,
+                control_schema=control_schema,
+            )
+            durable_quarantine = dest_mod.quarantined_tables(
+                con, pipeline, control_schema=control_schema
+            )
+            quarantined_requested = sorted(
+                qualified
+                for qualified in outcome.requested
+                if qualified in durable_quarantine
+            )
+            if refused is not None and quarantined_requested:
+                outcome.quarantined = quarantined_requested
+                outcome.engine_stop_reason = "schema_refusal_quarantined"
+                outcome.reason = (
+                    "identical durable input refused again; the table is durably "
+                    "quarantined and healthy co-published tables may proceed"
+                )
+                assert_every_requested_table_completed(outcome)
+                recovery.consume()
+                log.error(
+                    "RE-SNAPSHOT quarantined %s after deterministic schema refusal",
+                    ", ".join(quarantined_requested),
+                )
+                return outcome
             recovery.consume()
         raise
     finally:
+        provider_owner = getattr(descriptor_provider, "__self__", None)
+        if provider_owner is not None and hasattr(provider_owner, "close"):
+            provider_owner.close()
+        if descriptor_connection is not None:
+            descriptor_connection.close()
         if not source_stopped:
             if health is not None:
                 health.stop()
@@ -617,32 +694,30 @@ def run(
             recovery.retire_terminal_resources(dsn=source.dsn, slot=slot)
 
 
-def snapshot_phase_ended(completion: SnapshotCompletion) -> bool:
-    """Compatibility projection of the canonical completion policy."""
-    return completion.phase_ended
-
-
 def reassert_owed(
     con,
     *,
     pipeline: str,
     tables: list[tuple[str, str, str]],
     terminal: ResnapshotOutcome,
+    control_schema: str | None = None,
 ) -> list[str]:
-    """Put every non-terminal requested table back on the durable to-do list.
-
-    The two terminal states are `swapped` (a complete image with a published
-    watermark) and `emptied` (verified empty at the source). Everything else has to be
-    `awaiting_snapshot` when this function returns, whatever intermediate state the
-    engine left it in, or the next run cannot know it is owed.
-    """
+    """Reassert non-terminal requested tables, excluding terminal/quarantined ones."""
     finished = (
         set(terminal.swapped)
         | set(terminal.emptied)
         | set(terminal.logged_drops)
         | set(terminal.dropped)
+        | set(terminal.quarantined)
     )
-    owed = [t for t in tables if f"{t[0]}.{t[1]}" not in finished]
+    durable_quarantine = dest_mod.quarantined_tables(
+        con, pipeline, control_schema=control_schema
+    )
+    owed = [
+        t for t in tables
+        if f"{t[0]}.{t[1]}" not in finished
+        and f"{t[0]}.{t[1]}" not in durable_quarantine
+    ]
     if not owed:
         return []
     dest_mod.request_snapshot(
@@ -650,6 +725,7 @@ def reassert_owed(
         pipeline=pipeline,
         tables=owed,
         detail="the re-snapshot did not complete for these tables (rubric 1.6)",
+        control_schema=control_schema,
     )
     return [f"{s}.{t}" for s, t, _ in owed]
 
@@ -715,6 +791,7 @@ def finish_verified_empty_tables(
     new_relations: set[str] | None = None,
     namespace: str | None = None,
     snapshot_epoch: int | None = None,
+    control_schema: str | None = None,
 ) -> list[str]:
     """Empty the destination for the tables PROVEN empty at the source. Nothing else.
 
@@ -778,6 +855,7 @@ def finish_verified_empty_tables(
                 to=table_lifecycle.COMPLETE,
                 reason="verified empty at the source; the destination table was emptied",
                 snapshot_lsn=consistent_lsn,
+                control_schema=control_schema,
             )
             audit_detail = (
                 f"re-snapshot verified the source relation empty at consistent point "
@@ -823,6 +901,7 @@ def finish_verified_empty_tables(
                 commit_id=0,
                 events=tuple(audit_events),
                 snapshot_epoch=snapshot_epoch,
+                control_schema=control_schema,
             )
             emptied.append(f"{schema}.{table}")
         con.execute("COMMIT")
@@ -832,7 +911,9 @@ def finish_verified_empty_tables(
     return emptied
 
 
-def read_watermarks(con, pipeline: str) -> dict[str, int]:
+def read_watermarks(
+    con, pipeline: str, *, control_schema: str | None = None
+) -> dict[str, int]:
     """`"<schema>.<table>" -> snapshot_lsn` for every table with a complete image.
 
     The main applier's per-table fence (see `planner.GroupPlan`). Reading it for *every*
@@ -841,7 +922,8 @@ def read_watermarks(con, pipeline: str) -> dict[str, int]:
     only armed on some paths is a fence nobody can reason about.
     """
     rows = con.execute(
-        f"SELECT source_schema, source_table, snapshot_lsn FROM {CONTROL_SCHEMA}.table_state "
+        f"SELECT source_schema, source_table, snapshot_lsn FROM "
+        f"{control_table(resolve_control_schema(control_schema), 'table_state')} "
         "WHERE pipeline = ? AND snapshot_state = 'complete' AND snapshot_lsn IS NOT NULL",
         [pipeline],
     ).fetchall()
@@ -857,6 +939,7 @@ def finish_empty_tables_after_main_snapshot(
     owed: list[tuple[str, str, str]],
     completion: SnapshotCompletion,
     drop_mode: str = DROP_LOG,
+    control_schema: str | None = None,
 ) -> tuple[list[str], int | None]:
     """Close out the tables a MAIN-engine snapshot left owed because they are empty.
 
@@ -901,6 +984,8 @@ def finish_empty_tables_after_main_snapshot(
         done=set(),
         evidence=evidence,
         drop_mode=drop_mode,
+        namespace=None,
+        control_schema=control_schema,
     )
     emptied = finish_verified_empty_tables(
         con,
@@ -909,5 +994,6 @@ def finish_empty_tables_after_main_snapshot(
         tables=owed,
         done=set(logged) | set(dropped),
         evidence=evidence,
+        control_schema=control_schema,
     )
     return emptied + logged + dropped, evidence.wal_lsn

@@ -12,11 +12,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
+DEFAULT_CONTROL_SCHEMA = "_cdc_flight"
 
 
 def _env(name: str, default: str) -> str:
     value = os.environ.get(name)
     return default if value is None or value == "" else value
+
+
+def resolve_control_schema(value: str | None = None) -> str:
+    """Resolve the destination control schema from the one destination config surface."""
+    if value is not None and value != "":
+        return value
+    return _env("CDC_CONTROL_SCHEMA", DEFAULT_CONTROL_SCHEMA)
 
 
 def _instance_id() -> str:
@@ -150,6 +158,7 @@ class DestinationConfig:
     motherduck_database: str = field(
         default_factory=lambda: _env("CDC_MD_DATABASE", "cdc_flight_dev")
     )
+    control_schema: str = field(default_factory=resolve_control_schema)
     pipelines_dir: Path = field(
         default_factory=lambda: Path(
             _env(
@@ -168,9 +177,31 @@ class RunConfig:
     MotherDuck Flight needs) rather than an unbounded daemon.
     """
 
+    #: The SAFETY CEILING, not a normal exit path (rubric 4.5: errors must not
+    #: hang or lock). A run that reaches it has not proved a complete delivery and
+    #: is judged accordingly below.
     max_seconds: float = field(default_factory=lambda: float(_env("CDC_MAX_SECONDS", "90")))
+    #: The DECLARED FALLBACK for a run whose source cannot be marked. A run that
+    #: can establish a completion watermark never waits for this: see
+    #: `cdc_flight.completion_watermark`, and the 1,640 s that used to be spent
+    #: here (`codex_logs/slowlane_rootcause.md`).
     idle_seconds: float = field(default_factory=lambda: float(_env("CDC_IDLE_SECONDS", "8")))
     min_records: int = field(default_factory=lambda: int(_env("CDC_MIN_RECORDS", "0")))
+    #: Write one transactional marker to the source and end the run on the LSN
+    #: PostgreSQL assigns it. `0` keeps a run read-only against its source and
+    #: falls back to `idle_seconds`. It is the ONLY knob that does so:
+    #: `CDC_CATALOG_MARKER` governs the DDL fence, not the completion decision.
+    watermark_enabled: bool = field(
+        default_factory=lambda: _flag("CDC_COMPLETION_WATERMARK", True)
+    )
+    #: How long the stream must be quiet before the run asks for a position. Not a
+    #: completion timer (it is capped by `idle_seconds`), but load-bearing: a
+    #: position taken mid-backlog would be reached at once and end the run with
+    #: the rest of the backlog undelivered. A run takes at most ONE position, so
+    #: there is no write budget to bound.
+    watermark_quiet_seconds: float = field(
+        default_factory=lambda: float(_env("CDC_WATERMARK_QUIET_SECONDS", "0.5"))
+    )
     #: How far the slot's `confirmed_flush_lsn` may trail `pg_current_wal_lsn()`
     #: and still allow the supervisor to call a quiet stream "idle". A quiet
     #: stream with a large backlog means the connector is not streaming - most
@@ -209,6 +240,12 @@ def _flag(name: str, default: bool) -> bool:
     if raw is None or raw == "":
         return default
     return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _qualified_csv(name: str) -> frozenset[str]:
+    """Parse an explicit comma-separated set of qualified source relations."""
+    raw = os.environ.get(name, "")
+    return frozenset(item.strip() for item in raw.split(",") if item.strip())
 
 
 def applier_settings() -> dict:
@@ -262,6 +299,11 @@ def applier_settings() -> dict:
         #: the affected table is queued for an automatic re-snapshot, whose consistent
         #: point necessarily fences the transaction that cannot be folded.
         "resnapshot_on_ambiguity": _flag("CDC_AMBIGUOUS_RESNAPSHOT", True),
+        #: An operator may explicitly acknowledge that a named relation is stale
+        #: while its quarantine remains durable.  This never unblocks the relation
+        #: or resolves its snapshot obligation; it only lets a deliberately chosen
+        #: run report healthy peers without repeating the same run-level error.
+        "acknowledged_quarantines": _qualified_csv("CDC_ACKNOWLEDGE_QUARANTINES"),
     }
 
 
@@ -324,6 +366,10 @@ class ApplierConfig:
     #: re-snapshot of the affected table instead of failing identically for ever.
     #: `CDC_AMBIGUOUS_RESNAPSHOT=0` restores the permanent-failure behaviour.
     resnapshot_on_ambiguity: bool = True
+    #: Explicit operator acknowledgement of already-quarantined stale relations.
+    #: The table remains blocked and visibly stale; no acknowledgement can make its
+    #: destination image current without the declared full re-snapshot.
+    acknowledged_quarantines: frozenset[str] = frozenset()
     #: rubric 1.6: this applier is serving a **re-snapshot** engine, not the
     #: pipeline's own stream. It applies snapshot chunks and DISCARDS streaming
     #: units: the re-snapshot's slot is a throwaway whose offsets nobody reads,

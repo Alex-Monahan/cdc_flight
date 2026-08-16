@@ -29,7 +29,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from . import naming
-from .apply_sql import BIGINT, BOOLEAN, DOUBLE, JSON_T, VARCHAR
+from .errors import AdmissionError, SchemaEvolutionRefused
+from .typed_types import SourceTypeDescriptor, native_type
 
 COLUMN_ADDED = "added"
 COLUMN_DROPPED = "dropped"
@@ -50,14 +51,34 @@ class SourceColumn:
     #: It lets a keyless empty source prove the value without inventing a row join.
     has_missing_default: bool = False
     missing_value: object | None = None
+    #: Full recursive source descriptor.  It is persisted in source_relations and
+    #: supersedes the legacy OID/name pair for type identity.
+    descriptor: SourceTypeDescriptor | None = None
+    typmod: int | None = None
+    #: PostgreSQL ``pg_attribute.attstorage``.  ``p`` is the only column-level
+    #: exclusion from the TOAST classification; table ``reltoastrelid`` is not.
+    attstorage: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.descriptor is None:
+            object.__setattr__(
+                self,
+                "descriptor",
+                descriptor_from_type_name(
+                    self.type_name,
+                    oid=self.type_oid,
+                    typmod=self.typmod,
+                    nullable=self.nullable,
+                ),
+            )
 
     @property
     def destination_name(self) -> str:
         return naming.normalize(self.name)
 
     @property
-    def type_identity(self) -> tuple[int, str]:
-        return self.type_oid, self.type_name.lower()
+    def type_identity(self) -> str:
+        return self.descriptor.fingerprint if self.descriptor is not None else f"{self.type_oid}:{self.type_name.lower()}"
 
 
 @dataclass(frozen=True)
@@ -75,6 +96,10 @@ class ColumnChange:
     #: retained on the rename event so the destination can require a strict, explicit
     #: ALTER rather than silently treating the new baseline as adopted.
     type_changed: bool = False
+    old_type_oid: int | None = None
+    old_type_name: str | None = None
+    old_descriptor: SourceTypeDescriptor | None = None
+    new_descriptor: SourceTypeDescriptor | None = None
 
     @property
     def destination_old_name(self) -> str | None:
@@ -110,6 +135,7 @@ def diff_columns(
                     type_oid=current.type_oid,
                     type_name=current.type_name,
                     nullable=current.nullable,
+                    new_descriptor=current.descriptor,
                 )
             )
             continue
@@ -122,6 +148,7 @@ def diff_columns(
                     type_oid=previous.type_oid,
                     type_name=previous.type_name,
                     nullable=previous.nullable,
+                    old_descriptor=previous.descriptor,
                 )
             )
             continue
@@ -140,6 +167,10 @@ def diff_columns(
                     type_name=current.type_name,
                     nullable=current.nullable,
                     type_changed=previous.type_identity != current.type_identity,
+                    old_type_oid=previous.type_oid,
+                    old_type_name=previous.type_name,
+                    old_descriptor=previous.descriptor,
+                    new_descriptor=current.descriptor,
                 )
             )
         elif previous.type_identity != current.type_identity:
@@ -152,6 +183,10 @@ def diff_columns(
                     type_oid=current.type_oid,
                     type_name=current.type_name,
                     nullable=current.nullable,
+                    old_type_oid=previous.type_oid,
+                    old_type_name=previous.type_name,
+                    old_descriptor=previous.descriptor,
+                    new_descriptor=current.descriptor,
                 )
             )
     return tuple(changes)
@@ -199,21 +234,8 @@ def dlt_table_columns(columns: Iterable[SourceColumn]) -> dict:
 
 
 def destination_type(type_name: str | None) -> str:
-    """Best-effort DuckDB type for a source column seen before its first row."""
-
-    lowered = (type_name or "text").lower().strip()
-    if lowered in {"bool", "boolean"}:
-        return BOOLEAN
-    if lowered in {
-        "smallint", "int2", "integer", "int", "int4", "bigint", "int8",
-        "serial", "bigserial",
-    }:
-        return BIGINT
-    if lowered in {"real", "float4", "double precision", "float8", "numeric", "decimal"}:
-        return DOUBLE
-    if lowered in {"json", "jsonb"}:
-        return JSON_T
-    return VARCHAR
+    """Strict destination SQL for a source catalog type."""
+    return native_type(descriptor_from_type_name(type_name or "text")).sql
 
 
 def apply_column_changes(registry, table_name: str, changes: Iterable[ColumnChange]) -> None:
@@ -239,29 +261,120 @@ def apply_column_changes(registry, table_name: str, changes: Iterable[ColumnChan
                 change.destination_new_name,
             )
             if change.type_name and change.type_changed:
-                registry.ensure(
-                    table_name,
-                    columns={
-                        change.destination_new_name: destination_type(change.type_name)
-                    },
-                    key_columns=registry.get(table_name).key_columns,
-                    strict=True,
+                if change.old_descriptor is None or change.new_descriptor is None:
+                    raise SchemaEvolutionRefused(
+                        f"cannot apply rename/type change to {table_name}: source "
+                        "descriptor is missing, so the safe widening lattice cannot "
+                        "prove a native UNION member",
+                        target=table_name,
+                        refusal_origin="schema_evolution",
+                    )
+                old_descriptor = change.old_descriptor or descriptor_from_type_name(
+                    change.old_type_name or "text", oid=change.old_type_oid
                 )
+                new_descriptor = change.new_descriptor or descriptor_from_type_name(
+                    change.type_name or "text", oid=change.type_oid
+                )
+                try:
+                    registry.convert_column_to_union(
+                        table_name,
+                        change.destination_new_name,
+                        old_descriptor,
+                        new_descriptor,
+                    )
+                except (AdmissionError, ValueError) as exc:
+                    raise SchemaEvolutionRefused(
+                        f"cannot change source column {table_name}.{change.destination_new_name}: "
+                        f"the source descriptor is not deliverable: {exc}",
+                        target=table_name,
+                        refusal_origin="schema_evolution",
+                    ) from exc
         elif change.kind == COLUMN_DROPPED and change.destination_old_name:
             registry.drop_column(table_name, change.destination_old_name)
     for change in changes:
         if (
-            change.kind in (COLUMN_ADDED, COLUMN_TYPE_CHANGED)
+            change.kind == COLUMN_ADDED
             and change.destination_new_name
         ):
-            registry.ensure(
-                table_name,
-                columns={
-                    change.destination_new_name: destination_type(change.type_name)
-                },
-                key_columns=registry.get(table_name).key_columns,
-                strict=True,
+            descriptor = change.new_descriptor or descriptor_from_type_name(
+                change.type_name or "text", oid=change.type_oid
             )
+            try:
+                registry.ensure_typed(
+                    table_name,
+                    columns={change.destination_new_name: descriptor},
+                    key_columns=registry.get(table_name).key_columns,
+                )
+            except (AdmissionError, ValueError) as exc:
+                raise SchemaEvolutionRefused(
+                    f"cannot add source column {table_name}.{change.destination_new_name}: "
+                    f"the source descriptor is not deliverable: {exc}",
+                    target=table_name,
+                    refusal_origin="schema_evolution",
+                ) from exc
+        elif change.kind == COLUMN_TYPE_CHANGED and change.destination_new_name:
+            old_descriptor = change.old_descriptor or descriptor_from_type_name(
+                change.old_type_name or "text", oid=change.old_type_oid
+            )
+            new_descriptor = change.new_descriptor or descriptor_from_type_name(
+                change.type_name or "text", oid=change.type_oid
+            )
+            try:
+                registry.convert_column_to_union(
+                    table_name,
+                    change.destination_new_name,
+                    old_descriptor,
+                    new_descriptor,
+                )
+            except (AdmissionError, ValueError) as exc:
+                raise SchemaEvolutionRefused(
+                    f"cannot change source column {table_name}.{change.destination_new_name}: "
+                    f"the source descriptor is not deliverable: {exc}",
+                    target=table_name,
+                    refusal_origin="schema_evolution",
+                ) from exc
+
+
+def descriptor_from_type_name(
+    type_name: str,
+    *,
+    oid: int | None = None,
+    typmod: int | None = None,
+    nullable: bool = True,
+) -> SourceTypeDescriptor:
+    """Construct a catalog descriptor when a targeted OID read is unavailable.
+
+    The catalog watcher normally supplies the richer recursive descriptor.  This
+    conservative parser covers the stable formatted names used by unit callers and
+    never turns an unknown name into a native type: ``native_type`` will refuse it.
+    """
+    text = str(type_name or "text").strip()
+    if text.endswith("[]"):
+        element = descriptor_from_type_name(text[:-2], oid=None, nullable=nullable)
+        return SourceTypeDescriptor(oid, text, "array", typmod=typmod, array_element=element, nullable=nullable)
+    lowered = text.lower()
+    kind = lowered
+    precision = scale = None
+    if lowered.startswith(("numeric(", "decimal(")):
+        base, _, args = lowered.partition("(")
+        values = args.rstrip(")").split(",")
+        kind = base
+        precision = int(values[0]) if values and values[0].strip().isdigit() else None
+        scale = int(values[1]) if len(values) > 1 and values[1].strip().lstrip("-").isdigit() else None
+    aliases = {
+        "smallint": "int2", "integer": "int4", "int": "int4", "bigint": "int8",
+        "real": "float4", "double precision": "float8", "boolean": "bool",
+        "character varying": "varchar", "character": "char",
+    }
+    return SourceTypeDescriptor(
+        oid=oid,
+        qualified_name=text,
+        kind=aliases.get(kind, kind),
+        typmod=typmod,
+        precision=precision,
+        scale=scale,
+        nullable=nullable,
+    )
 
 
 __all__ = [
@@ -272,6 +385,7 @@ __all__ = [
     "ColumnChange",
     "SourceColumn",
     "apply_column_changes",
+    "descriptor_from_type_name",
     "destination_type",
     "diff_columns",
     "dlt_table_columns",

@@ -20,7 +20,17 @@ from __future__ import annotations
 import json
 
 import pytest
-from support.applier_lab import DATASET, Lab, begin, data, end, heartbeat, keyed, snap
+from support.applier_lab import (
+    DATASET,
+    Lab,
+    begin,
+    data,
+    end,
+    fixture_descriptors,
+    heartbeat,
+    keyed,
+    snap,
+)
 
 from cdc_flight.envelope import KIND_SNAPSHOT_BOUNDARY, PendingRecord
 from cdc_flight.errors import OffsetFlushFailed
@@ -1001,6 +1011,7 @@ def test_two_pipelines_on_one_destination_do_not_contend_for_commit_ids(tmp_path
             lease=lease,
             runner_id=f"{name}-runner",
             completion=SnapshotCompletion.streaming_only(),
+            descriptor_provider=fixture_descriptors,
         )
         applier._committer = type(
             "C", (), {"markProcessed": lambda s, r: None, "markBatchFinished": lambda s: None}

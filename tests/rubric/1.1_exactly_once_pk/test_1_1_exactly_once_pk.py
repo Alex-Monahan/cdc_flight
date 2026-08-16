@@ -18,6 +18,7 @@ changelog, these tests point at the changelog and keep meaning the same thing.
 from __future__ import annotations
 
 import signal
+import threading
 import time
 
 import pytest
@@ -161,16 +162,16 @@ def test_slow_real_sigkill_is_exactly_once(sandbox):
     assertion for an un-simulated kill, and it is the strongest statement this test
     can make.
 
-    **2. The workload is many transactions, not one.** 200 000 rows in a single
+    **2. The workload is many transactions, not one.** 80 000 rows in a single
     Postgres transaction is a single commit group, so *any* kill before the end
     replays everything and the interesting case - a kill after some groups have
     committed and before others - never occurs. 40 transactions of 5 000 rows
     produce many commit groups, so the kill genuinely lands between them.
 
-    The kill is timed off the replication slot becoming active rather than a fixed
-    sleep: the applier now streams 200 000 rows in ~30 s, and the old 35 s sleep
-    let the run finish before the signal arrived (which is how this rewrite
-    started).
+    The kill is timed off a durable source position rather than a fixed sleep.  The
+    applier's throughput is host-dependent; waiting for the slot's confirmed LSN to
+    enter the workload's strict interior is the invariant this test needs and is
+    independent of that throughput.
 
     **3. It can now actually see a duplicate.** `app.customers` is keyed, so it is
     under merge semantics: a re-delivered event is `delete_keys` + insert and
@@ -184,11 +185,26 @@ def test_slow_real_sigkill_is_exactly_once(sandbox):
     sandbox.reseed()
     sandbox.run(reset_state=True, max_seconds=200, idle_seconds=8, timeout=400)
 
-    txns, per_txn = 40, 5_000
+    txns, per_txn = 40, 2_000
     rows = txns * per_txn
     readings_per_txn = 25
     readings = txns * readings_per_txn
-    for t in range(txns):
+
+    # Start the stream before producing the workload.  A durable prefix is the
+    # synchronization barrier; the tail is written concurrently and remains
+    # demonstrably ahead of the confirmed source point when SIGKILL is sent.
+    proc = sandbox.spawn(max_seconds=400, idle_seconds=10)
+    sandbox.wait_for_slot_active(process=proc, timeout=120, poll_seconds=0.1)
+    before_lsn = int(
+        sandbox.pg_query(
+            "SELECT COALESCE(confirmed_flush_lsn - '0/0', 0) "
+            "FROM pg_replication_slots WHERE slot_name = %s",
+            (sandbox.slot,),
+        )[0][0]
+    )
+
+    prefix_txns = 4
+    for t in range(prefix_txns):
         sandbox.sql(
             [
                 "INSERT INTO app.customers (name, email) SELECT "
@@ -202,25 +218,111 @@ def test_slow_real_sigkill_is_exactly_once(sandbox):
             one_transaction=True,
         )
 
-    proc = sandbox.spawn(max_seconds=400, idle_seconds=10)
-    deadline = time.monotonic() + 120
-    while time.monotonic() < deadline:
-        time.sleep(1)
-        if sandbox.pg_query(
-            "SELECT active FROM pg_replication_slots WHERE slot_name = %s AND active",
+    progress_deadline = time.monotonic() + 180
+    prefix_durable = None
+    while time.monotonic() < progress_deadline:
+        if proc.poll() is not None:
+            raise AssertionError(
+                "the pipeline exited before the durable prefix barrier "
+                f"(returncode={proc.returncode})"
+            )
+        position = sandbox.pg_query(
+            "SELECT COALESCE(confirmed_flush_lsn - '0/0', 0) "
+            "FROM pg_replication_slots WHERE slot_name = %s AND active",
             (sandbox.slot,),
-        ):
+        )
+        if position and before_lsn < int(position[0][0]):
+            prefix_durable = int(position[0][0])
             break
-    time.sleep(8)  # long enough that several commit groups have gone through
-    assert proc.poll() is None, (
-        "the run finished before the SIGKILL could land, so the test would be "
-        "vacuous; raise the workload"
+        time.sleep(0.1)
+    assert prefix_durable is not None, (
+        "the durable slot position never crossed the source-produced prefix; "
+        f"before={before_lsn}"
     )
-    proc.send_signal(signal.SIGKILL)
-    proc.wait(timeout=60)
-    assert proc.returncode != 0, "process survived SIGKILL"
 
-    recovered = sandbox.run(max_seconds=400, idle_seconds=10, timeout=600)
+    tail_committed = 0
+    writer_errors: list[BaseException] = []
+    writer_done = threading.Event()
+
+    def write_tail() -> None:
+        nonlocal tail_committed
+        try:
+            for t in range(prefix_txns, txns):
+                sandbox.sql(
+                    [
+                        "INSERT INTO app.customers (name, email) SELECT "
+                        "'kill9-' || i, 'kill9-' || i || '@example.com' "
+                        f"FROM generate_series({t * per_txn + 1}, {(t + 1) * per_txn}) i",
+                        "INSERT INTO app.sensor_readings (sensor_id, value, unit) SELECT "
+                        f"'KILL9', {t} * 1000 + i, 'C' "
+                        f"FROM generate_series(1, {readings_per_txn}) i",
+                    ],
+                    one_transaction=True,
+                )
+                tail_committed = t - prefix_txns + 1
+        except BaseException as exc:  # report the source-writer cause below
+            writer_errors.append(exc)
+        finally:
+            writer_done.set()
+
+    writer = threading.Thread(target=write_tail, name="fix11-sigkill-writer")
+    writer.start()
+    try:
+        kill_confirmed = None
+        tail_wal = None
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise AssertionError(
+                    "the pipeline exited before SIGKILL could be coordinated "
+                    f"(returncode={proc.returncode})"
+                )
+            if writer_errors:
+                raise AssertionError("source workload writer failed") from writer_errors[0]
+            position = sandbox.pg_query(
+                "SELECT COALESCE(confirmed_flush_lsn - '0/0', 0) "
+                "FROM pg_replication_slots WHERE slot_name = %s AND active",
+                (sandbox.slot,),
+            )
+            current = int(
+                sandbox.pg_query("SELECT pg_current_wal_lsn() - '0/0'")[0][0]
+            )
+            if (
+                position
+                and int(position[0][0]) >= prefix_durable
+                and tail_committed > 0
+                and current > int(position[0][0])
+                and not writer_done.is_set()
+            ):
+                kill_confirmed = int(position[0][0])
+                tail_wal = current
+                break
+            if writer_done.is_set():
+                break
+            time.sleep(0.05)
+        assert kill_confirmed is not None, (
+            "could not coordinate SIGKILL after the prefix became durable and before "
+            "the concurrently written tail finished; "
+            f"before={before_lsn}, prefix={prefix_durable}, tail_committed={tail_committed}"
+        )
+        assert tail_wal > kill_confirmed, (
+            "the kill predicate did not observe future source WAL beyond the durable "
+            f"point: confirmed={kill_confirmed}, current={tail_wal}"
+        )
+        proc.send_signal(signal.SIGKILL)
+        proc.wait(timeout=60)
+        assert proc.returncode != 0, "process survived SIGKILL"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=60)
+        writer.join(timeout=180)
+        if writer.is_alive():
+            raise AssertionError("the source workload writer did not finish")
+        if writer_errors:
+            raise AssertionError("source workload writer failed") from writer_errors[0]
+
+    recovered = sandbox.run(max_seconds=450, idle_seconds=10, timeout=650)
     total, distinct = sandbox.duck_query(
         f"SELECT count(*), count(DISTINCT id) FROM {CUSTOMERS} WHERE name LIKE 'kill9-%'"
     )[0]

@@ -1,11 +1,11 @@
 """The one durable completion projection shared by every re-snapshot path.
 
-The image-producing path, the replayable compatibility path, and the verified-empty
-path have different transaction owners and different table-event shapes.  They do not
-have different meanings: each must publish the table watermark, snapshot audit,
-table-event history, refusal discharge, and main snapshot epoch as one destination
-projection.  This module owns that projection and deliberately assumes its caller has
-already opened the transaction that also owns the image or emptying operation.
+The image-producing path and the verified-empty path have different transaction owners
+and different table-event shapes. They do not have different meanings: each must
+publish the table watermark, snapshot audit, table-event history, refusal discharge,
+and main snapshot epoch as one destination projection. This module owns that projection
+and deliberately assumes its caller has already opened the transaction that also owns
+the image or emptying operation.
 """
 
 from __future__ import annotations
@@ -13,9 +13,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from . import destination as dest_mod
-from .destination import CONTROL_SCHEMA
+from .config import resolve_control_schema
 from .errors import EngineFailure
+from .naming import control_table
 
+OWNER = "resnapshot-projection"
 
 @dataclass(frozen=True)
 class ProjectionEvent:
@@ -42,6 +44,7 @@ def project_snapshot_completion(
     events: tuple[ProjectionEvent, ...],
     namespace: str | None = None,
     snapshot_epoch: int | None = None,
+    control_schema: str | None = None,
 ) -> None:
     """Publish one complete snapshot projection inside the caller's transaction.
 
@@ -58,7 +61,8 @@ def project_snapshot_completion(
         )
 
     con.execute(
-        f"UPDATE {CONTROL_SCHEMA}.table_state SET snapshot_lsn = ? "
+        f"UPDATE {control_table(resolve_control_schema(control_schema), 'table_state')} "
+        "SET snapshot_lsn = ? "
         "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
         [snapshot_lsn, pipeline, source_schema, source_table],
     )
@@ -71,6 +75,7 @@ def project_snapshot_completion(
             target_table=target_table,
             snapshot_lsn=snapshot_lsn,
             event=event,
+            control_schema=control_schema,
         )
         if event.table_event is not None:
             _write_table_event(
@@ -82,18 +87,21 @@ def project_snapshot_completion(
                 target_table=target_table,
                 snapshot_lsn=snapshot_lsn,
                 event=event,
+                control_schema=control_schema,
             )
     dest_mod.resolve_schema_refusal(
         con,
         pipeline=pipeline,
         source_schema=source_schema,
         source_table=source_table,
+        control_schema=control_schema,
     )
     advance_snapshot_epoch(
         con,
         pipeline=pipeline,
         namespace=namespace,
         snapshot_epoch=snapshot_epoch,
+        control_schema=control_schema,
     )
 
 
@@ -106,9 +114,10 @@ def _write_audit(
     target_table: str,
     snapshot_lsn: int,
     event: ProjectionEvent,
+    control_schema: str | None = None,
 ) -> None:
     exists = con.execute(
-        f"SELECT count(*) FROM {CONTROL_SCHEMA}.snapshot_audits "
+        f"SELECT count(*) FROM {control_table(resolve_control_schema(control_schema), 'snapshot_audits')} "
         "WHERE pipeline = ? AND source_schema = ? AND source_table = ? "
         "AND snapshot_lsn = ? AND event = ?",
         [pipeline, source_schema, source_table, snapshot_lsn, event.audit_event],
@@ -116,7 +125,7 @@ def _write_audit(
     if exists:
         return
     con.execute(
-        f"INSERT INTO {CONTROL_SCHEMA}.snapshot_audits "
+        f"INSERT INTO {control_table(resolve_control_schema(control_schema), 'snapshot_audits')} "
         "(pipeline, source_schema, source_table, snapshot_lsn, event, "
         "target_table, detail, recorded_at) VALUES (?,?,?,?,?,?,?,?)",
         [
@@ -142,11 +151,12 @@ def _write_table_event(
     target_table: str,
     snapshot_lsn: int,
     event: ProjectionEvent,
+    control_schema: str | None = None,
 ) -> None:
     table_event = event.table_event
     assert table_event is not None
     exists = con.execute(
-        f"SELECT count(*) FROM {CONTROL_SCHEMA}.table_events "
+        f"SELECT count(*) FROM {control_table(resolve_control_schema(control_schema), 'table_events')} "
         "WHERE pipeline = ? AND commit_id = ? AND seq = ? AND event = ? "
         "AND source_schema = ? AND source_table = ?",
         [
@@ -173,6 +183,7 @@ def _write_table_event(
         lsn=snapshot_lsn,
         rows_removed=event.rows_removed,
         detail=event.table_event_detail or event.audit_detail,
+        control_schema=control_schema,
     )
 
 
@@ -182,12 +193,14 @@ def advance_snapshot_epoch(
     pipeline: str,
     namespace: str | None,
     snapshot_epoch: int | None,
+    control_schema: str | None = None,
 ) -> None:
     """Advance the main image identity in the same transaction as its projection."""
     if namespace is None or snapshot_epoch is None:
         return
     con.execute(
-        f"UPDATE {CONTROL_SCHEMA}.debezium_offsets SET snapshot_epoch = "
+        f"UPDATE {control_table(resolve_control_schema(control_schema), 'debezium_offsets')} "
+        "SET snapshot_epoch = "
         "greatest(snapshot_epoch, ?) WHERE pipeline = ? AND namespace = ?",
         [snapshot_epoch, pipeline, namespace],
     )

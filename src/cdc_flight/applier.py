@@ -48,29 +48,35 @@ from typing import Any
 from . import (
     apply_sql,
     catalog_commit,
-    commit_metadata,
+    commit_protocol,
     destination,
-    offsets,
+    failure_containment,
     schema_epoch,
     self_heal,
     spill_protocol,
-    table_work,
+    spill_refusal,
     unit_admission,
     unit_apply,
 )
 from .assembler import CompleteUnit, TransactionAssembler
 from .catalog_apply import CatalogCoordinator, CatalogPlan
 from .commit_group import CommitResult, OpenGroup
-from .config import ApplierConfig
+from .config import ApplierConfig, resolve_control_schema
 from .destination import AlertSink, Lease, ResumePoint
-from .envelope import KIND_SNAPSHOT_BOUNDARY, PendingRecord, decode
+from .envelope import (
+    KIND_SNAPSHOT_BOUNDARY,
+    PendingRecord,
+    decode,
+)
 from .errors import (
+    AdmissionError,
     AmbiguousDelete,
     DestinationIdentityCollision,
     SchemaEvolutionRefused,
+    as_schema_refusal,
 )
-from .faults import arm_group, maybe_crash
-from .run_state import COMMIT_ACK
+from .faults import maybe_crash
+from .marker_accounting import SourceMarkerReceiptCounter
 from .snapshot import SnapshotCoordinator
 from .snapshot_completion import (
     SnapshotCompletion,
@@ -80,6 +86,7 @@ from .snapshot_completion import (
 from .spill import SpillBuffer
 
 log = logging.getLogger("cdc_flight.applier")
+OWNER = "applier-lifecycle"
 
 
 class Applier:
@@ -93,6 +100,7 @@ class Applier:
         namespace: str,
         dataset: str,
         topic_prefix: str,
+        marker_prefixes: tuple[str, ...] | None = None,
         offset_path,
         resume_point: ResumePoint,
         config: ApplierConfig,
@@ -103,7 +111,9 @@ class Applier:
         catalog=None,
         watermarks: dict[str, int] | None = None,
         completion: SnapshotCompletion | None = None,
-        snapshot_audit=None,
+        snapshot_audit=None, descriptor_provider=None,
+        binary_handling_mode: str = "base64", hstore_handling_mode: str = "map",
+        control_schema: str | None = None,
     ):
         self.con = con
         self.pipeline = pipeline
@@ -117,9 +127,12 @@ class Applier:
         self.runner_id = runner_id
         self.verifier = verifier
         self.transactional_ddl = transactional_ddl
+        self.control_schema = resolve_control_schema(control_schema)
         #: `catalog.CatalogWatcher` or None. The only source of DROP TABLE knowledge
         #: (rubric 1.5): logical decoding does not carry DDL at all.
         self.catalog = catalog
+        self.descriptor_provider = descriptor_provider
+        self.binary_handling_mode, self.hstore_handling_mode = str(binary_handling_mode), str(hstore_handling_mode)
         #: rubric 1.6: `"<schema>.<table>" -> snapshot_lsn`. A source transaction whose
         #: **commit** LSN is below a table's watermark is already inside that table's
         #: snapshot image, so its events for that table are dropped. Per table, because
@@ -127,12 +140,18 @@ class Applier:
         #: transaction that straddles the consistent point is in no image at all and
         #: must be applied in full (`cdc_flight.resnapshot`).
         self.watermarks: dict[str, int] = dict(watermarks or {})
-        #: The one owner of this invocation's snapshot completion state. The default
-        #: keeps the in-process laboratory's full-snapshot behaviour; production callers
-        #: pass the policy selected during acquisition.
+        #: The one owner of this invocation's snapshot completion state; production callers pass the acquisition policy.
         self.snapshot_completion = completion or SnapshotCompletion.full_snapshot()
         #: the consistent point of the snapshot this run applied, if any
         self.last_snapshot_lsn: int | None = None
+        #: The highest source LSN this run has RECEIVED from the connector, seeded
+        #: with the durable resume point.  This is the per-slot reference the idle
+        #: proof needs: `pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)`
+        #: is CLUSTER-wide, so any other database in the same PostgreSQL cluster
+        #: inflates it without a single byte of it being ours (review r12, R12-3:
+        #: a co-tenant made every bounded run burn its whole `--max-seconds`).
+        #: `highest_source_lsn - confirmed_flush_lsn` is ours and only ours.
+        self.highest_source_lsn: int = int(resume_point.last_lsn or 0)
 
         self.registry = apply_sql.SchemaRegistry(
             con, dataset, constraints=config.destination_constraints
@@ -154,9 +173,7 @@ class Applier:
         #: NEXT batch, so it outlives the group it belongs to (Codex 7).
         self._pending_verification: tuple | None = None
 
-        # ADR §3.5 / D7, §3.4, the fold and the catalog policy all live in their own
-        # modules (ADR §15/A29, §18/A37): every blocker of the last two review rounds
-        # was a consequence of two paths doing one job inside one file.
+        # ADR §3.5 / D7: the fold and catalog policy live in dedicated modules.
         self.snapshots = SnapshotCoordinator(
             con,
             dataset=dataset,
@@ -167,10 +184,32 @@ class Applier:
             get_registry=lambda: self.registry,
             epoch=resume_point.snapshot_epoch,
             transactional_ddl=transactional_ddl,
+            control_schema=self.control_schema,
             on_swap=snapshot_audit,
         )
-        self.spill = SpillBuffer(con)
-        self.alerts = AlertSink(con, pipeline=pipeline)
+        self.spill = SpillBuffer(
+            con,
+            binary_mode=self.binary_handling_mode,
+            hstore_mode=self.hstore_handling_mode,
+            control_schema=self.control_schema,
+        )
+        self.alerts = AlertSink(
+            con, pipeline=pipeline, control_schema=self.control_schema
+        )
+        # One durable admission snapshot per applier/run.  GroupPlan receives this
+        # set; it must not query control state once per table or schema epoch.
+        self.blocked_schema_tables = destination.blocked_schema_tables(
+            con, pipeline, control_schema=self.control_schema
+        )
+        #: Relations whose streaming rows this run holds out of a RETAINED
+        #: destination image because they owe a replacement snapshot under
+        #: `CDC_DROP_MODE=log` (see `unit_admission.hold_log_owed_tail`).  Kept
+        #: separate from `blocked_schema_tables` because the durable authority is
+        #: the table lifecycle, not a schema refusal.  DIAGNOSTICS AND ALERT
+        #: DEDUPLICATION ONLY: the set the planner actually reads is
+        #: `OpenGroup.held_tables`, which expires with the group that observed the
+        #: obligation, because that obligation can be discharged mid-run.
+        self.held_streaming_tables: set[str] = set()
         # rubric 1.9: an illegal table-lifecycle transition must reach an operator, and
         # the only connection that survives this group's rollback is the sink's.
         self.snapshots.alerts = self.alerts
@@ -181,6 +220,7 @@ class Applier:
             drop_mode=config.drop_mode,
             registry_of=lambda: self.registry,
             lifecycle_con=self.con,
+            control_schema=self.control_schema,
             max_destructive_per_group=config.drop_max_per_group,
             allow_mass_drop=config.drop_allow_mass,
         )
@@ -202,6 +242,12 @@ class Applier:
         self._callback_seal_reason: str | None = None
         self._callback_batches_rejected = 0
         self._callback_records_rejected = 0
+        #: Raw records belonging to Flight-owned source marker transactions that
+        #: crossed this callback boundary.  This is deliberately based on receipt,
+        #: not on SourceMarker.writes: a shutdown marker can be written and then be
+        #: rejected after admission is sealed.
+        self.source_marker_records_received = 0
+        self._source_marker_receipts = SourceMarkerReceiptCounter(marker_prefixes)
         self.last_batch_at = time.monotonic()
 
         # -- counters surfaced in the run summary (rubric 6.1) --------------- #
@@ -227,6 +273,18 @@ class Applier:
         self.truncates_applied = 0
         self.truncates_logged = 0
         self.resnapshot_discarded_events = 0
+        self.quarantined_events = 0
+        self.unscoped_refusals = 0
+        #: Unknown third-party/builtin failures contained at a source-table boundary.
+        #: The run still fails loudly after its healthy co-published work commits.
+        self._contained_failures: list[dict] = []
+        #: Explicit operator acknowledgements are diagnostic only: the relation stays
+        #: blocked and stale until its full resnapshot completes.
+        self._acknowledged_quarantines: set[str] = set()
+        #: One commit-protocol retry may exclude a table whose destination SQL error
+        #: invalidated the first transaction. It is cleared immediately after that
+        #: retry; durable quarantine is the control-plane authority thereafter.
+        self._excluded_destination_tables: set[str] = set()
         #: rubric 4.7: undecidable folds turned into automatic table rebuilds
         self.ambiguous_resnapshots_queued = 0
         #: events dropped because their transaction is already inside a table's image
@@ -234,7 +292,9 @@ class Applier:
         self.table_counts: dict[str, int] = {}
         self.last_commit_id = resume_point.commit_id
         self.error: BaseException | None = None
-        self._next_commit_id = destination.next_commit_id(con, pipeline)
+        self._next_commit_id = destination.next_commit_id(
+            con, pipeline, control_schema=self.control_schema
+        )
         self._pending_offset_blob: bytes | None = None
         self._pending_offset_key_blob: bytes | None = None
 
@@ -299,6 +359,12 @@ class Applier:
             "deferred_events": self.deferred_events,
             "snapshot_swaps": self.snapshots.swaps,
             "discarded_tail_events": self.assembler.discarded_tail_events,
+            "quarantined_events": self.quarantined_events,
+            "blocked_schema_tables": sorted(self.blocked_schema_tables),
+            "held_streaming_tables": sorted(self.held_streaming_tables),
+            "unscoped_refusals": self.unscoped_refusals,
+            "contained_failures": list(self._contained_failures),
+            "acknowledged_quarantines": sorted(self._acknowledged_quarantines),
             "orphan_end_markers": self.assembler.orphan_end_markers,
             "implicit_txn_opens": self.assembler.implicit_txn_opens,
             "last_commit_id": self.last_commit_id,
@@ -328,6 +394,7 @@ class Applier:
             "callback_batches_rejected": self._callback_batches_rejected,
             "callback_records_rejected": self._callback_records_rejected,
             "callback_quiesced": self.callback_quiesced,
+            "source_marker_records_received": self.source_marker_records_received,
             **self.catalog_coordinator.summary(),
             **(self.catalog.summary() if self.catalog is not None else {}),
         }
@@ -376,6 +443,20 @@ class Applier:
                 self._quiescence.wait(remaining)
             return True
 
+    def wait_for_internal_teardown(self, timeout: float) -> bool:
+        """Join the applier's age thread after callback quiescence is proved.
+
+        The age thread can request a group close, but it never owns the Debezium
+        committer.  Stopping and joining it after callback quiescence makes the
+        supervisor's own runtime teardown explicit without using stock Debezium's
+        ``close()`` as a callback barrier.
+        """
+        self._timer_stop.set()
+        if threading.current_thread() is self._timer:
+            return True
+        self._timer.join(timeout=max(0.0, timeout))
+        return not self._timer.is_alive()
+
     # ------------------------------------------------------------------ #
     # the Debezium callback
     # ------------------------------------------------------------------ #
@@ -402,10 +483,6 @@ class Applier:
                 self.last_batch_at = time.monotonic()
                 if self._in_flight == 0:
                     self._quiescence.notify_all()
-
-    # pydbzengine compatibility, used only if something calls the old shape.
-    def handleJsonBatch(self, records):  # pragma: no cover - not the live path
-        raise RuntimeError("the applier needs the RecordCommitter; use handle_batch()")
 
     def _handle(self, records, committer) -> None:
         self._committer = committer
@@ -457,6 +534,9 @@ class Applier:
 
             source_records += 1
             rec = decode(raw, topic_prefix=self.topic_prefix)
+            self.source_marker_records_received += self._source_marker_receipts.observe(rec)
+            if rec.lsn is not None:
+                self.highest_source_lsn = max(self.highest_source_lsn, int(rec.lsn))
             if rec.is_data:
                 data_in_batch += 1
             else:
@@ -546,229 +626,7 @@ class Applier:
     # the transaction
     # ------------------------------------------------------------------ #
     def commit_group(self, trigger: str) -> CommitResult:
-        """Commit the one destination-owned group.
-
-        Re-snapshot streaming units are discarded before this method is reached. A
-        single owner therefore publishes the only shared resume point, and this method
-        has no alternate connection/group context that could overtake it.
-        """
-        group = self.group.units
-        if not group:
-            # In particular, never acknowledge a discard-only re-snapshot tail here:
-            # this method has not opened or committed a MotherDuck transaction.
-            return CommitResult.EMPTY
-        # Snapshot rows are observations of the same closed protocol as the direct
-        # notifications. Validate their state and declared counts before BEGIN/COMMIT;
-        # a terminal boundary also waits here until its final buffered rows make the
-        # completion proof terminal. The post-commit observer only records evidence
-        # that has now become durable.
-        if not self.snapshot_completion.commit_ready(group):
-            return CommitResult.BLOCKED
-        acknowledge_snapshot_notifications = (
-            self.snapshot_completion.will_complete_after_commit(group)
-        )
-        commit_id = self.group.spill_commit_id or self._next_commit_id
-        opened_at = destination.now()
-        # Tell the destination-fault wrapper which data group this is, so a
-        # `destination_*` fault fires at the group the spec names rather than at one
-        # the wrapper inferred from the SQL it happened to see (rubric 1.7).
-        fault_group = self.data_commit_groups + 1
-        arm_group(fault_group)
-        if not self.group.txn_open:
-            self.con.execute("BEGIN TRANSACTION")
-            self.group.txn_open = True
-        try:
-            self.lease.renew(self.con)
-            new_point = offsets.point_for(
-                group,
-                previous=self.resume_point,
-                commit_id=commit_id,
-                snapshot_epoch=self.snapshots.epoch,
-            )
-            catalog_plan = self._plan_catalog_changes(new_point.last_lsn)
-            # NOT `or spill.rows > 0`: staged rows belonging only to *fenced*
-            # units are about to be discarded, and counting them made a group with no
-            # applicable content a "data group", which shifts every `<nth>`-indexed
-            # fault anchor by one (Codex 5). Compute this AFTER the plan fence so a
-            # same-group replacement unit cannot make a fenced-only group look like
-            # data merely because it arrived before catalog planning.
-            has_data = any(
-                not u.fenced and (u.events or u.spilled_events) for u in group
-            )
-            fault_enabled = has_data
-            if has_data:
-                maybe_crash("begin", fault_group)
-            catalog_stats = {"tables": set()}
-            stats = self._apply_units_by_schema_epoch(
-                group,
-                commit_id,
-                has_data=has_data,
-                catalog_plan=catalog_plan,
-                catalog_stats=catalog_stats,
-            )
-            stats["tables"].update(catalog_stats["tables"])
-            if catalog_plan is not None:
-                self._apply_catalog_phase(
-                    commit_id, catalog_plan, stats, schema_only=False
-                )
-                self.group.pending_alerts.extend(catalog_plan.alerts)
-            destination.write_commit_log(
-                self.con,
-                commit_id=commit_id,
-                pipeline=self.pipeline,
-                runner_id=self.runner_id,
-                opened_at=opened_at,
-                committed_at=destination.now(),
-                trigger=trigger,
-                unit_count=sum(1 for u in group if not u.fenced),
-                event_count=stats["events"],
-                fenced_units=sum(1 for u in group if u.fenced),
-                spilled=any(u.spilled for u in group),
-                first_txn_id=stats["first_txn_id"],
-                last_txn_id=stats["last_txn_id"],
-                first_lsn=stats["first_lsn"],
-                last_lsn=stats["last_lsn"],
-                max_source_ts=commit_metadata.epoch_ms(stats["max_source_ts"]),
-                tables_touched=sorted(table_work.live_names(stats["tables"])),
-            )
-            destination.write_resume_point(
-                self.con,
-                pipeline=self.pipeline,
-                namespace=self.namespace,
-                point=new_point,
-                commit_id=commit_id,
-                offset_blob=self._pending_offset_blob,
-                offset_key_blob=self._pending_offset_key_blob,
-            )
-            if fault_enabled:
-                maybe_crash("pre_commit", fault_group)
-            # Principle (3): the pre-flush fingerprint of `offsets.dat` is taken
-            # HERE, before the commit, because it is only a *forensic* baseline -
-            # it does not need to lengthen the commit->ack path (Codex 7).
-            offset_fingerprint = self.verifier.before() if self.verifier else None
-            # rubric 1.9 / ADR §20: the commit->ack exclusion, as a flag other threads
-            # can read. Entered BEFORE the COMMIT (so no observability write can be
-            # mid-statement when the window opens) and left after the acknowledgement.
-            # One attribute assignment, no lock, no allocation - see
-            # `run_state._CommitAckWindow` for why that is the only acceptable cost here.
-            stage = ["observability_gate"]
-            marked = 0
-            # A non-snapshot group can be durable without containing a replacement
-            # image. Keep discard-only handles pending across that boundary too; the
-            # only group that may discharge them is a snapshot/terminal group.
-            pending_discards = (
-                list(self._pending_discarded_records)
-                if self.group.is_snapshot
-                else []
-            )
-            with self_heal.commit_watchdog(
-                self.cfg.commit_timeout, commit_id, stage=lambda: stage[0]
-            ):
-                # INSIDE the watchdog (Codex r3 MAJOR-2). `enter()` waits, without a
-                # bound of its own, until no independent write is in flight — that is
-                # what makes the exclusion absolute rather than instrumented — and the
-                # watchdog bounds both COMMIT and every acknowledgement below.
-                COMMIT_ACK.enter()
-                try:
-                    stage[0] = "commit"
-                    self.con.execute("COMMIT")
-                    self.group.txn_open = False
-                    if fault_enabled:
-                        maybe_crash("post_commit_pre_ack", fault_group)
-
-                    # The only operations in the guarded post-COMMIT path are the
-                    # acknowledgement calls. Pending snapshot notifications join the
-                    # same plan only once the pure pre-commit completion check says this
-                    # group will make the callback proof terminal.
-                    stage[0] = "ack"
-                    pending = (
-                        list(self._pending_snapshot_notifications)
-                        if acknowledge_snapshot_notifications
-                        else []
-                    )
-                    for unit in group:
-                        for rec in unit.records:
-                            if rec.raw is None:  # released by `_add_unit`
-                                continue
-                            self._committer.markProcessed(rec.raw)
-                            marked += 1
-                    for raw in pending:
-                        self._committer.markProcessed(raw)
-                        marked += 1
-                    for record in pending_discards:
-                        if record.raw is None:
-                            continue
-                        self._committer.markProcessed(record.raw)
-                        marked += 1
-                    self._committer.markBatchFinished()
-                    if pending:
-                        # Do not discard the handles until markBatchFinished succeeds.
-                        del self._pending_snapshot_notifications[: len(pending)]
-                    if pending_discards:
-                        del self._pending_discarded_records[: len(pending_discards)]
-                finally:
-                    # A mark call can raise; a stuck window would silently drop every
-                    # later phase write, so the gate is closed in all cases.
-                    COMMIT_ACK.leave()
-        except SchemaEvolutionRefused as refused:
-            self._rollback_quietly()
-            self._record_schema_refusal(refused)
-            raise
-        except (AmbiguousDelete, DestinationIdentityCollision) as ambiguous:
-            # Rubric 4.7. The group still rolls back - a fold that cannot be decided is
-            # never committed - but a bare rollback here is a *permanent* failure: the
-            # transaction replays on the next run and hits the same ambiguity, for ever,
-            # which is a manual-intervention case. So the table is marked for a
-            # re-snapshot on the independent connection, where the request survives this
-            # rollback, and the next run rebuilds it. The re-snapshot's consistent point
-            # is necessarily after this transaction (we already received it, so it is
-            # already in WAL), so the per-table watermark fences the transaction that
-            # cannot be folded and the loop terminates after exactly one re-snapshot
-            # (ADR 0001 §19/A47).
-            COMMIT_ACK.leave()
-            self._request_resnapshot_for(ambiguous)
-            self._rollback_quietly()
-            raise
-        except BaseException:
-            self._rollback_quietly()
-            raise
-        if fault_enabled:
-            maybe_crash("post_ack", fault_group)
-        # next poll() -> performCommit() -> flushLsn(new)  ── nothing between ──
-        # No filesystem work, no hashing: the "did the flush happen" check is a
-        # liveness canary, not a prerequisite under Invariant O, so it runs on the
-        # next batch (or at shutdown) once the connector has had its poll/commit
-        # opportunity (Codex 7).
-        if self.verifier is not None and marked:
-            self._pending_verification = (offset_fingerprint, marked)
-
-        self._settle_catalog(self.group)
-        self._flush_alerts(self.group)
-        # Snapshot completion is one policy shared by the main and re-snapshot engines.
-        # Row evidence is recorded only after COMMIT; direct per-table/global callbacks
-        # and declared/committed counts take the terminal edge. Row markers are
-        # diagnostic only and never prove completion.
-        self.snapshot_completion.observe_committed_group(
-            group, snapshot_active=self.snapshots.active
-        )
-        self.commit_groups += 1
-        if has_data:
-            self.data_commit_groups += 1
-        self.applied_events += stats["events"]
-        self.last_commit_id = commit_id
-        self.resume_point = new_point
-        self._next_commit_id = max(self._next_commit_id, commit_id + 1)
-        # A throwaway re-snapshot has its own Debezium offset file, which may already
-        # include acknowledged duplicate streaming records that arrived after the
-        # snapshot image's point. It is disposable handoff evidence, not the main
-        # destination resume point; comparing that file with the snapshot group's
-        # temporary point would manufacture an Invariant-O drift (r15 acceptance).
-        if self.cfg.verify_offset_file and not self.cfg.resnapshot:
-            self._pending_offset_key_blob, self._pending_offset_blob = (
-                offsets.capture_offset_file(self.offset_path, new_point)
-            )
-        self._reset_group()
-        return CommitResult.COMMITTED
+        return commit_protocol.commit_group(self, trigger)
 
     def _request_resnapshot_for(
         self, ambiguous: AmbiguousDelete | DestinationIdentityCollision
@@ -785,18 +643,119 @@ class Applier:
             self.group.pending_alerts.append(alert)
         self.ambiguous_resnapshots_queued += int(recorded)
 
+    def hold_streaming_tail(self, tables) -> None:
+        """Hold these relations' ordinary stream rows out of a retained image.
+
+        See `unit_admission.hold_log_owed_tail`.  One deduplicated alert per
+        relation per run: the durable authority is `table_state.snapshot_state`,
+        which already records the replacement-snapshot obligation, so a second
+        durable row here would be a second writer of the same fact.
+        """
+        for qualified in tables:
+            # The GROUP decides what is skipped; the run-scoped set is diagnostics
+            # and alert deduplication only. See `OpenGroup.held_tables`.
+            self.group.held_tables.add(qualified)
+            if qualified in self.held_streaming_tables:
+                continue
+            self.held_streaming_tables.add(qualified)
+            # The obligation can survive a process restart.  The run-scoped set
+            # above handles duplicate observations in one run; the durable marker
+            # bounds the alert across runs for the same snapshot obligation.  A later
+            # snapshot epoch is a new incident and must be observable again.
+            con = getattr(self, "con", None)
+            state_row = None
+            if con is not None and hasattr(con, "execute"):
+                state_row = con.execute(
+                    f"SELECT snapshot_epoch FROM "
+                    f"{destination._control_table(self.control_schema, 'table_state')} "
+                    "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+                    [
+                        self.pipeline,
+                        qualified.split(".", 1)[0],
+                        qualified.split(".", 1)[1],
+                    ],
+                ).fetchone()
+            marker = f"{qualified}:{state_row[0] if state_row else 0}"
+            if (
+                con is not None
+                and destination.alert_marker_exists(
+                    con,
+                    pipeline=self.pipeline,
+                    code="streaming_tail_held_for_resnapshot",
+                    marker_key="snapshot_obligation",
+                    marker_value=marker,
+                    control_schema=self.control_schema,
+                )
+            ):
+                continue
+            self.alerts.raise_alert(
+                severity="warning",
+                code="streaming_tail_held_for_resnapshot",
+                message=(
+                    f"{qualified} owes a replacement snapshot under drop_mode=log; "
+                    "its streaming rows are held out of the retained destination "
+                    "image until that snapshot completes. Other relations in the "
+                    "same transaction are unaffected."
+                ),
+                context={
+                    "source_relation": qualified,
+                    "snapshot_obligation": marker,
+                    "resnapshot_required": True,
+                },
+            )
+
     def _record_schema_refusal(self, refused: SchemaEvolutionRefused) -> None:
-        if not refused.source_schema or not refused.source_table:
+        if refused.refusal_recorded:
             return
-        destination.record_schema_refusal(
-            self.con,
-            pipeline=self.pipeline,
-            source_schema=refused.source_schema,
-            source_table=refused.source_table,
-            target_table=refused.target,
-            detected_lsn=refused.detected_lsn,
-            reason=str(refused),
+        spill_refusal.record_schema_refusal(self, refused)
+        if refused.source_schema and refused.source_table:
+            self.blocked_schema_tables.add(
+                f"{refused.source_schema}.{refused.source_table}"
+            )
+
+    def _contain_table_failure(self, refused: SchemaEvolutionRefused, original) -> None:
+        failure_containment.contain_table_failure(self, refused, original)
+
+    def _contain_destination_failure(
+        self,
+        refused: SchemaEvolutionRefused,
+        original: Exception,
+        *,
+        destination_execution: bool = True,
+    ) -> str:
+        return failure_containment.contain_destination_failure(
+            self,
+            refused,
+            original,
+            destination_execution=destination_execution,
         )
+
+    def _contextualize_schema_refusal(self, refused: SchemaEvolutionRefused) -> None:
+        """Attach scope only when the failed group identifies exactly one relation."""
+        events = [event for unit in self.group.units for event in unit.events]
+        candidates = {
+            (item.schema, item.table, item.qualified_table)
+            for item in events
+            if item.schema and item.table
+        }
+        if not refused.source_schema and not refused.source_table:
+            if len(refused.source_tables) == 1:
+                refused.source_schema, refused.source_table, refused.target = (
+                    refused.source_tables[0]
+                )
+            elif len(candidates) == 1:
+                refused.source_schema, refused.source_table, refused.target = (
+                    next(iter(candidates))
+                )
+        if refused.detected_lsn is None:
+            lsns = [int(item.lsn) for item in events if item.lsn is not None]
+            if lsns:
+                refused.detected_lsn = max(lsns)
+
+    def _handle_spill_refusal(
+        self, refused: SchemaEvolutionRefused, events: list[PendingRecord]
+    ) -> None:
+        spill_refusal.handle(self, refused, events)
 
     def _rollback_quietly(self) -> None:
         if not self.group.txn_open:
@@ -896,6 +855,7 @@ class Applier:
         has_data: bool,
         clear_spill: bool = True,
         created_in_txn: set[str] | None = None,
+        excluded_tables: set[str] | None = None,
     ) -> dict:
         return unit_apply.apply_units(
             self,
@@ -904,6 +864,11 @@ class Applier:
             has_data=has_data,
             clear_spill=clear_spill,
             created_in_txn=created_in_txn,
+            excluded_tables=(
+                self._excluded_destination_tables
+                if excluded_tables is None
+                else excluded_tables
+            ),
         )
 
     # ------------------------------------------------------------------ #
@@ -953,9 +918,21 @@ class Applier:
         unit_seq: int,
         snapshot: tuple[str | None, str | None] | None = None,
     ) -> int:
-        return spill_protocol.stage_events(
-            self, events, unit_seq=unit_seq, snapshot=snapshot
-        )
+        try:
+            return spill_protocol.stage_events(
+                self, events, unit_seq=unit_seq, snapshot=snapshot
+            )
+        except AdmissionError as error:
+            refused = as_schema_refusal(error, refusal_origin="spill_protocol")
+            self._handle_spill_refusal(refused, events)
+            raise
+        except Exception:
+            # Descriptor enrichment is a source control read, not a table-DML
+            # boundary.  If the driver/session fails after stage_events opened
+            # the spill transaction, close that transaction here while preserving
+            # the original run-level error; never convert it into a table refusal.
+            self._rollback_quietly()
+            raise
 
     # ------------------------------------------------------------------ #
     # shutdown

@@ -8,12 +8,15 @@ in `research/NOTES.md`.
 
 from __future__ import annotations
 
+import os
+
 from .config import ReplicationConfig, SourceConfig
 from .errors import UnsafeDebeziumProperty
 from .snapshot_completion import notification_topic
+from .toast import UNAVAILABLE_VALUE_PLACEHOLDER
 
-# Debezium's marker for a TOASTed column whose value was not present in the WAL.
-UNAVAILABLE_VALUE_PLACEHOLDER = "__debezium_unavailable_value"
+# Re-exported for configuration callers.  The value is owned by ``toast.py`` so
+# the connector property and the decoder cannot drift apart.
 
 # Prefix applied to the CDC metadata fields injected by ExtractNewRecordState.
 METADATA_PREFIX = "dbz_"
@@ -120,6 +123,41 @@ SKIP_NOTHING = "none"
 SKIP_TRUNCATE = "t"
 
 
+#: DELIBERATE, NARROW, ENUMERATED DEVIATION (rubric 2.4, round 13).
+#:
+#: PostgreSQL renders `money` with the *session's* `lc_monetary`, and stock
+#: Debezium 3.6 parses that rendering with a locale-blind numeric parser
+#: (`PostgresValueConverter.convertMoney` -> `new BigDecimal(...)`).  Under any
+#: COMMA-DECIMAL `lc_monetary` — `de_DE.UTF-8`, `fr_FR.UTF-8`, `pt_BR.UTF-8`,
+#: `es_ES`, `it_IT`, `nl_NL`, `ru_RU`, `tr_TR`, `id_ID`, i.e. most of Europe and
+#: Latin America — the connector's own change-event producer throws
+#: `ConnectException: Failed to parse money value: 100,50 €` /
+#: `NumberFormatException`, MEASURED on this branch before this property existed.
+#: That failure happens inside the connector, before any value reaches Python, so
+#: no Python-side carry can help: nothing is delivered at all.
+#:
+#: `driver.options` is a stock Debezium pass-through (no fork, no converter, no
+#: SMT): `driver.*` properties are given to the JDBC driver, and pgjdbc forwards
+#: `options` verbatim as the PostgreSQL startup-packet `options` string.  Pinning
+#: `lc_monetary=C` on the connector's own sessions makes `money_out` emit a
+#: dot-decimal rendering that the stock converter always parses, for every source
+#: `lc_monetary`.
+#:
+#: THE DEVIATION, stated exactly: the destination VARCHAR then holds the value's
+#: locale-independent NUMERIC spelling (`100.50`, `1234.56`) — which is precisely
+#: what stock Debezium already delivered under every dot-decimal locale — and not
+#: the source session's decorated rendering (`100,50 €`, `₹1,234.56`).  Under the
+#: standing directive ("money should never be a blocker; just have it flow across
+#: into a VARCHAR column as simply as possible") this is the right trade: it is
+#: the SAME value on every locale rather than a whole-Flight outage on half of
+#: them.  It is asserted exactly (not fuzzily) by
+#: `tests/rubric/2.4_native_types/test_2_4_fix13_regressions.py` and recorded in
+#: `RUBRIC_STATUS.md`.  Nothing here synthesizes a value: PostgreSQL still writes
+#: the text and Debezium still delivers it; only the connector session's locale
+#: is pinned.
+MONEY_LOCALE_NEUTRAL_OPTIONS = "-c lc_monetary=C"
+
+
 def build_properties(
     source: SourceConfig,
     replication: ReplicationConfig,
@@ -141,12 +179,36 @@ def build_properties(
     """
     replication.state_dir.mkdir(parents=True, exist_ok=True)
     snapshot = snapshot_mode or replication.snapshot_mode
+    protected = {
+        **INVARIANT_O_PINS,
+        # These are correctness/configuration pins too, even though only the first
+        # three participate directly in the offset proof.  In particular, changing
+        # the JDBC startup locale reopens the stock money failure, and changing the
+        # slot/plugin identity points the engine at a different source contract.
+        "driver.options": MONEY_LOCALE_NEUTRAL_OPTIONS,
+        "snapshot.mode": snapshot,
+        "slot.name": replication.slot_name,
+        "plugin.name": "pgoutput",
+    }
+    protected_reasons = {
+        **INVARIANT_O_REASONS,
+        "driver.options": (
+            "the connector session must keep lc_monetary=C so stock Debezium's money "
+            "parser cannot fail before Python receives an event"
+        ),
+        "snapshot.mode": (
+            "the caller-selected snapshot/recovery mode is part of the durable source "
+            "handoff and cannot be changed by an unrelated override"
+        ),
+        "slot.name": "the configured logical slot is the source of the resume proof",
+        "plugin.name": "the source contract is pinned to stock PostgreSQL pgoutput",
+    }
     for key, value in (overrides or {}).items():
-        pinned = INVARIANT_O_PINS.get(key)
+        pinned = protected.get(key)
         if pinned is not None and str(value) != pinned:
             raise UnsafeDebeziumProperty(
                 f"refusing to set {key}={value!r}: it is pinned to {pinned!r} because "
-                f"{INVARIANT_O_REASONS[key]}"
+                f"{protected_reasons[key]}"
             )
 
     props: dict[str, str] = {
@@ -158,6 +220,13 @@ def build_properties(
         "database.user": source.user,
         "database.password": source.password,
         "database.dbname": source.dbname,
+        # --- connector session locale (see MONEY_LOCALE_NEUTRAL_OPTIONS) ------
+        # Stock Debezium pass-through: `driver.*` properties are handed to the
+        # JDBC driver (`CommonConnectorConfig.DRIVER_CONFIG_PREFIX = "driver."`),
+        # and pgjdbc's `options` parameter is forwarded verbatim in the startup
+        # packet, so it applies to BOTH the snapshot connection and the
+        # replication (walsender) connection that renders streamed `money`.
+        "driver.options": MONEY_LOCALE_NEUTRAL_OPTIONS,
         # --- logical decoding -------------------------------------------------
         # pgoutput is built into Postgres: no wal2json / decoderbufs extension.
         # (Rubric 7.1 wants exactly this.)
@@ -181,18 +250,27 @@ def build_properties(
         # `cdc_flight.consumer.OffsetFlushVerifier` cannot tell a policy no-op
         # from Debezium swallowing a flush failure (Opus B2).
         "offset.flush.interval.ms": OFFSET_FLUSH_INTERVAL_MS_ALWAYS,
+        # Keep PostgreSQL's connector-managed feedback cadence below the bounded
+        # commit -> slot-confirmation hand-off.  This is deliberately the status
+        # update interval, not `heartbeat.interval.ms`: heartbeat records would
+        # reset the ordinary source-idle detector and turn a quiet run into a
+        # max-seconds run.  With `lsn.flush.mode=connector`, the status update reads
+        # the connector's already-flushed offset; it cannot advance the slot past a
+        # destination commit that has not happened.
+        "status.update.interval.ms": "1000",
         # PINNED, not left to the default. See LSN_FLUSH_MODE_SAFE above: this is
         # the one path that can confirm WAL to Postgres without ever reading the
         # offset store, i.e. the one thing that could break Invariant O from
         # outside our code (Opus B-2).
         "lsn.flush.mode": LSN_FLUSH_MODE_SAFE,
-        # ADR 0001 §4.10 / Opus m10: `stopSourceTasks()` waits only
-        # `task.management.timeout.ms` before `taskService.shutdownNow()`
-        # (`AsyncEngineConfig.java:25,76-80`), so a flush timeout larger than it
-        # would be hard-killed mid-write during shutdown. Keep the pair aligned,
-        # with task management the larger of the two.
+        # ADR 0001 §4.10 / Opus m10: Debezium uses this bound for both source-task
+        # start and stop (`AsyncEngineConfig.startSourceTasks`,
+        # `AsyncEngineConfig.java:76-80`). Thirty seconds is too short for a
+        # stock JVM/pgoutput task to start when the six-worker slow lane is under
+        # load; 120 seconds remains finite and leaves the supervisor's own
+        # close/source-dark bounds responsible for declaring a wedged run.
         "offset.flush.timeout.ms": "5000",
-        "task.management.timeout.ms": "30000",
+        "task.management.timeout.ms": "120000",
         # --- batching / latency ----------------------------------------------
         "max.batch.size": str(max_batch_size),
         "max.queue.size": str(max_batch_size * 4),
@@ -203,12 +281,32 @@ def build_properties(
         # `before` image (1.2, 1.4, 2.6), the truncate/message operations (1.5,
         # 7.4) and, decisively, the `transaction` block that ADR 0001 §3.2 and §6
         # both depend on. Nothing downstream of here can recover those.
-        "key.converter.schemas.enable": "false",
-        # DEVIATION from ADR 0001 §5, recorded in the ADR amendment: the Connect
-        # *schema* stays off for now. The applier needs the *envelope*; the schema
-        # is what rubric 2.4/2.6 need, and turning it on inflates every payload
-        # 3-5x, which §5.1 flags as an unmeasured throughput risk owned by 5.3.
-        "value.converter.schemas.enable": "false",
+        # 2.4/2.5 consume the schema-bearing wrapper.  The envelope decoder accepts
+        # the old schema-disabled shape for replay fixtures, but production records
+        # must retain Connect logical names/parameters so a NULL-only or empty nested
+        # value cannot be inferred as VARCHAR/JSON.
+        "key.converter.schemas.enable": "true",
+        "value.converter.schemas.enable": "true",
+        "decimal.handling.mode": "string",
+        "time.precision.mode": "microseconds",
+        "interval.handling.mode": "string",
+        "binary.handling.mode": "base64",
+        # Stock PostgreSQL 3.6 otherwise drops JDBC-1111 columns before the
+        # envelope reaches Python.  Unknown values are opaque bytes at the
+        # connector boundary; the strict catalog descriptor and the one native
+        # resolver decide whether/how they can be stored.
+        # The production default is TRUE.  A false value is retained as a safe
+        # diagnostic mode: the completeness gate must refuse an omitted source
+        # column rather than allowing Debezium's historical silent-drop behavior.
+        "include.unknown.datatypes": os.environ.get(
+            "CDC_INCLUDE_UNKNOWN_DATATYPES", "true"
+        ).lower(),
+        "hstore.handling.mode": "map",
+        # Gate2 Option N: Debezium accepts the documented hex form and emits a
+        # U+0000 marker.  PostgreSQL text-like domains cannot contain that code
+        # point, so the Python decoder may recognize it only with a matching
+        # source descriptor.
+        "unavailable.value.placeholder": UNAVAILABLE_VALUE_PLACEHOLDER,
         "topic.naming.strategy": "io.debezium.schema.DefaultTopicNamingStrategy",
         # ADR 0001 §3.2: MANDATORY, not optional. Without it there is no `END`
         # marker and therefore no way to prove a Postgres transaction whole, so
@@ -254,4 +352,8 @@ def build_properties(
     if not source.auto_discovery:
         props["schema.include.list"] = source.schema
         props["table.include.list"] = ",".join(source.tables)
+    # Overrides are an actual configuration seam, not merely a validation probe.
+    # Apply them after the invariant-owned defaults so a non-pinned operator
+    # property reaches Debezium, while the pinned keys remain immutable.
+    props.update({str(key): str(value) for key, value in (overrides or {}).items()})
     return props

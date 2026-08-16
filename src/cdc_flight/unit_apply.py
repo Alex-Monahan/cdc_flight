@@ -20,6 +20,7 @@ def apply_units(
     has_data: bool,
     clear_spill: bool = True,
     created_in_txn: set[str] | None = None,
+    excluded_tables: set[str] | None = None,
 ) -> dict:
     """Apply a list of whole units without changing their source order."""
     created_in_txn = (
@@ -36,6 +37,46 @@ def apply_units(
         truncate_mode=applier.cfg.truncate_mode,
         created_in_txn=created_in_txn,
         watermarks=applier.watermarks,
+        descriptor_provider=(
+            applier.descriptor_provider
+            or (
+                getattr(applier.catalog, "descriptors_for", None)
+                if applier.catalog is not None
+                else None
+            )
+        ),
+        toast_policy_provider=(
+            getattr(applier.catalog, "toast_policy_for", None)
+            if applier.catalog is not None
+            else None
+        ),
+        toast_admission_provider=(
+            getattr(applier.catalog, "admit_toast_event", None)
+            if applier.catalog is not None
+            else None
+        ),
+        toast_admission_end_provider=(
+            getattr(applier.catalog, "end_toast_admission", None)
+            if applier.catalog is not None
+            else None
+        ),
+        binary_handling_mode=(
+            getattr(applier.catalog, "binary_handling_mode", applier.binary_handling_mode)
+            if applier.catalog is not None
+            else applier.binary_handling_mode
+        ),
+        hstore_handling_mode=(
+            getattr(applier.catalog, "hstore_handling_mode", applier.hstore_handling_mode)
+            if applier.catalog is not None
+            else applier.hstore_handling_mode
+        ),
+        pipeline=applier.pipeline,
+        control_schema=applier.control_schema,
+        # Quarantined relations plus any relation whose stream this run holds out
+        # of a retained image pending a replacement snapshot (round 13, R12-2).
+        blocked_tables=applier.blocked_schema_tables | applier.group.held_tables,
+        excluded_tables=excluded_tables,
+        contain_table_failure=applier._contain_table_failure,
     )
     for unit in group:
         if unit.fenced:
@@ -61,6 +102,7 @@ def apply_units(
             source_schema=schema,
             source_table=table,
             target_table=target,
+            control_schema=applier.control_schema,
         )
     with applier._lock:
         for target, count in plan.table_counts.items():
@@ -68,6 +110,7 @@ def apply_units(
     applier.truncates_applied += plan.truncates_applied
     applier.truncates_logged += plan.truncates_logged
     applier.watermark_fenced_events += plan.watermark_fenced_events
+    applier.quarantined_events += stats.get("quarantined_events", 0)
     if applier.group.is_snapshot and stats.get("last_lsn"):
         applier.last_snapshot_lsn = stats["last_lsn"]
     applier.group.source_tables |= plan.source_tables

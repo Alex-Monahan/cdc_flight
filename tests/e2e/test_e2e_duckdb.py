@@ -12,7 +12,7 @@ asserted here rather than left implicit:
 
 | baseline (dlt, append) | applier |
 |---|---|
-| every table append-only, so a delete left the old row behind | keyed tables are **current state** (merge on the Debezium message key), keyless tables are append-keyed on `cdcf_event_id` |
+| every table append-only, so a delete left the old row behind | keyed tables are **current state** (merge on the Debezium message key), keyless `REPLICA IDENTITY FULL` tables fold physical rows by complete before-image |
 | `_dlt_load_id` / `_dlt_id` | `cdcf_commit_id` / `cdcf_event_id`, plus `_cdc_flight.commit_log` |
 | arrays exploded into `<table>__tags` child tables | arrays land as DuckDB `JSON` in the row |
 | deletes rewritten to a `deleted='true'` row by the SMT | hard delete (rubric 8.1 adds the soft option) |
@@ -20,7 +20,9 @@ asserted here rather than left implicit:
 
 from __future__ import annotations
 
+import psycopg
 import pytest
+from support.fixtures import source_records
 
 pytestmark = pytest.mark.e2e
 
@@ -36,6 +38,7 @@ TABLES = [
 TOAST_PLACEHOLDER = "__debezium_unavailable_value"
 
 
+
 def _rows(con, dataset, table, cols="*", where="", order=""):
     sql = f'SELECT {cols} FROM "{dataset}"."{table}"'
     if where:
@@ -49,7 +52,8 @@ def test_baseline_end_to_end(fresh_seed, run_pipeline, generate_changes, duck, d
     # ---------------------------------------------------------------- snapshot
     snap = run_pipeline(reset_state=True, max_seconds=120, idle_seconds=6)
     assert snap["stop_reason"] in {"idle", "engine_finished"}, snap
-    assert snap["records"] == 20, snap  # 5+5+4+2+1+3 seeded rows
+    assert source_records(snap) == 20, snap  # 5+5+4+2+1+3 seeded rows
+    assert snap["completion_watermark_arms"] == 1, snap  # and exactly one of ours
     assert snap["applied_events"] == 20, snap
     # ADR 0001 §3.5 / D7: the snapshot lands in `<table>__cdcf_tmp` and becomes
     # visible through one swap, which is what makes a crash mid-snapshot safe.
@@ -74,14 +78,15 @@ def test_baseline_end_to_end(fresh_seed, run_pipeline, generate_changes, duck, d
         names = {r[0] for r in _rows(con, dataset, "cdcflight_app_customers", "name")}
         assert "Ada Lovelace" in names
 
-        # Arrays are a JSON column now, not a dlt child table.
+        # Arrays are native DuckDB LIST columns, not JSON or child tables.
         assert "cdcflight_app_customers__tags" not in landed
         tags_type = con.execute(
             "SELECT data_type FROM information_schema.columns WHERE table_schema = ? "
             "AND table_name = 'cdcflight_app_customers' AND column_name = 'tags'",
             [dataset],
         ).fetchone()[0]
-        assert tags_type == "JSON", tags_type
+        assert tags_type.endswith("[]"), tags_type
+        assert tags_type != "JSON", tags_type
     finally:
         con.close()
 
@@ -115,21 +120,25 @@ def test_baseline_end_to_end(fresh_seed, run_pipeline, generate_changes, duck, d
             == 0
         )
 
-        # A table with NO primary key is an append-only changelog keyed on the
-        # synthetic event identity, so every change event is a row - which is
-        # exactly what rubric 1.2 needs to be measurable at all.
-        sensor_ops = dict(
-            con.execute(
-                f'SELECT dbz_op, count(*) FROM "{dataset}"."cdcflight_app_sensor_readings" '
-                "GROUP BY 1"
+        # A keyless FULL-identity table is current state too.  The source query
+        # is the oracle here: a DELETE removes one physical row, and an UPDATE
+        # changes that row rather than appending a new event-image row.  The
+        # synthetic event id remains replay bookkeeping, not row identity.
+        with psycopg.connect(fresh_seed.dsn, autocommit=True) as source:
+            source_rows = source.execute(
+                "SELECT sensor_id, reading_at, value, unit FROM app.sensor_readings "
+                "ORDER BY sensor_id, reading_at NULLS FIRST, value, unit"
             ).fetchall()
-        )
-        assert sensor_ops == {"r": 4, "c": 6, "u": 4, "d": 2}, sensor_ops
+        landed_rows = con.execute(
+            f'SELECT sensor_id, reading_at, value, unit FROM "{dataset}"."cdcflight_app_sensor_readings" '
+            "ORDER BY sensor_id, reading_at NULLS FIRST, value, unit"
+        ).fetchall()
+        assert landed_rows == source_rows, (landed_rows, source_rows)
         rows, ids = con.execute(
             f'SELECT count(*), count(DISTINCT cdcf_event_id) '
             f'FROM "{dataset}"."cdcflight_app_sensor_readings"'
         ).fetchone()
-        assert rows == ids == 16, (rows, ids)
+        assert rows == ids == len(source_rows), (rows, ids, source_rows)
 
         # Partitioned table arrives as one logical table (publish_via_partition_root).
         audit_ops = dict(
@@ -183,28 +192,26 @@ def test_commit_log_accounts_for_the_whole_run(fresh_seed, run_pipeline, generat
         con.close()
 
 
-def test_documented_type_gaps(fresh_seed, run_pipeline, generate_changes, duck, dataset):
-    """Pin the *known* type-mapping weaknesses so rubric 2.4 can prove it closed them.
-
-    These are deliberately still open: ADR 0001 D5 lands the full envelope here,
-    but keeps `value.converter.schemas.enable=false`, so the Connect schema that
-    carries the semantic type (`io.debezium.time.Date`,
-    `org.apache.kafka.connect.data.Decimal`) is still not available. Turning it on
-    inflates every payload 3-5x, which ADR §5.1 flags as an unmeasured throughput
-    risk owned by rubric 5.3. If one of these starts failing, something improved.
-    """
+def test_native_types_round_trip(fresh_seed, run_pipeline, generate_changes, duck, dataset):
+    """The source catalog drives native destination types and special values."""
     run_pipeline(reset_state=True, max_seconds=120, idle_seconds=6)
     generate_changes(scale=1, seed=7)
     run_pipeline(max_seconds=120, idle_seconds=6)
 
     con = duck()
     try:
-        # GAP (rubric 2.6): unchanged TOAST columns arrive as a placeholder string.
+        # Gate2 structural-marker handling keeps the real TOAST body in place; the
+        # legacy printable token must never be materialised as the destination value.
         toast = con.execute(
             f'SELECT count(*) FROM "{dataset}"."cdcflight_app_documents" '
             f"WHERE body = '{TOAST_PLACEHOLDER}'"
         ).fetchone()[0]
-        assert toast >= 1, "expected at least one unchanged-TOAST placeholder"
+        assert toast == 0, "the legacy printable token is not a TOAST disposition"
+        body = con.execute(
+            f'SELECT body FROM "{dataset}"."cdcflight_app_documents" '
+            "WHERE title = 'gen-doc-7-0'"
+        ).fetchone()
+        assert body is not None and body[0] is not None and len(body[0]) > 10_000
 
         types = dict(
             con.execute(
@@ -213,19 +220,28 @@ def test_documented_type_gaps(fresh_seed, run_pipeline, generate_changes, duck, 
                 [dataset],
             ).fetchall()
         )
-        # GAP (rubric 2.4): numeric arrives base64-encoded, dates as raw integers.
-        assert types["col_numeric"] == "VARCHAR", types["col_numeric"]
-        assert types["col_date"] == "BIGINT"
-        assert types["col_interval"] == "BIGINT"
-        # GAP (rubric 2.4): timestamptz arrives as an ISO string. The baseline
-        # mapped it natively only because dlt *inferred* from the value; the
-        # applier deliberately does not infer, so this is a knowing regression
-        # that 2.4 fixes properly from the Connect schema.
-        assert types["col_timestamptz"] == "VARCHAR"
-        # IMPROVEMENT over the baseline: the all-NaN numeric column no longer
-        # disappears (dlt dropped it), and arrays are native JSON.
+        assert types["col_numeric"].startswith("UNION("), types["col_numeric"]
+        assert "DECIMAL(30,10)" in types["col_numeric"], types["col_numeric"]
+        assert types["col_numeric_nan"].startswith("STRUCT("), types["col_numeric_nan"]
+        assert types["col_date"] == "DATE"
+        assert types["col_interval"] == "INTERVAL"
+        assert "TIMESTAMP" in types["col_timestamptz"]
         assert "col_numeric_nan" in types
-        assert types["col_int_array"] == "JSON"
+        assert types["col_int_array"] == "INTEGER[]"
+        assert types["col_numeric_array"].endswith("[]")
+        assert types["col_numeric_array"].startswith("UNION(")
+        assert types["col_enum"].startswith("ENUM(")
+        assert types["col_point"].startswith("STRUCT(")
+        assert types["col_int4range"].startswith("STRUCT(")
+        values = con.execute(
+            f'SELECT col_numeric_nan, col_double_inf, col_double_nan '
+            f'FROM "{dataset}"."cdcflight_app_wide_types"'
+        ).fetchone()
+        assert values[0]["special"] != 0 or values[0]["coefficient"] is None
+        assert con.execute(
+            f'SELECT isinf(col_double_inf), isnan(col_double_nan) '
+            f'FROM "{dataset}"."cdcflight_app_wide_types"'
+        ).fetchone() == (True, True)
     finally:
         con.close()
 
@@ -242,7 +258,8 @@ def test_second_run_is_incremental(fresh_seed, run_pipeline, duck, dataset):
     from support.fixtures import source_fingerprint
 
     first = run_pipeline(reset_state=True, max_seconds=120, idle_seconds=6)
-    assert first["records"] == 20
+    assert source_records(first) == 20, first
+    assert first["completion_watermark_arms"] == 1, first
 
     before = source_fingerprint(fresh_seed)
     second = run_pipeline(max_seconds=40, idle_seconds=6)

@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 from .assembler import UNIT_SNAPSHOT_CHUNK
 from .envelope import KIND_SNAPSHOT_BOUNDARY
+from .errors import AdmissionError
 from .machines import (
     SNAPSHOT_AWAITING_CALLBACKS,
     SNAPSHOT_CALLBACK_OBSERVATIONS,
@@ -31,7 +32,31 @@ from .states import IllegalTransition, UnknownState
 
 
 class SnapshotObservationError(RuntimeError):
-    """A callback or non-callback observation outside the closed protocol."""
+    """A callback or non-callback observation outside the closed protocol.
+
+    NOT an :class:`~cdc_flight.errors.AdmissionError`, deliberately and
+    explicitly: these are protocol-integrity observations about the snapshot
+    callback model itself (a notification that does not decode, a declared count
+    that disagrees with what committed).  They are not scoped to one source
+    relation, so quarantining a relation would be a fiction.  The one shape that
+    *is* an admission refusal — the phase edge into streaming — is
+    :class:`StreamingAdmissionRefused` below.  This split is enforced by the
+    package-wide closure test's allow-list, so a future sibling cannot be
+    declared here without classifying it.
+    """
+
+
+class StreamingAdmissionRefused(AdmissionError, SnapshotObservationError):
+    """A streaming unit cannot be admitted while the snapshot model forbids it.
+
+    Round 13 (review r12, BLOCKER R12-2).  This is literally "streaming
+    admission refused", so it belongs to the one admission hierarchy every
+    containment boundary already catches; before this, it was a bare
+    ``RuntimeError`` that ``grep -rn "except SnapshotObservationError" src/``
+    proved nothing caught, and it killed every run.  It keeps
+    ``SnapshotObservationError`` as a second base so the snapshot protocol's own
+    callers and tests continue to see one observation type.
+    """
 
 
 NOTIFICATION_SUFFIX = "cdc_flight_snapshot_notifications"
@@ -65,6 +90,16 @@ def decode_notification(raw, *, topic_prefix: str) -> SnapshotNotification | Non
         raise SnapshotObservationError(
             f"snapshot notification on {topic} is not an object"
         )
+    # JsonConverter with schemas.enable=true wraps the sink notification in the
+    # same ``{"schema": ..., "payload": ...}`` envelope as row records.  The
+    # notification schema is transport metadata; the payload remains the closed
+    # callback protocol validated below.
+    if (
+        isinstance(payload.get("schema"), dict)
+        and "payload" in payload
+        and isinstance(payload.get("payload"), dict)
+    ):
+        payload = payload["payload"]
     aggregate = payload.get("aggregate_type")
     if aggregate != INITIAL_SNAPSHOT:
         raise SnapshotObservationError(
@@ -204,7 +239,7 @@ class SnapshotCompletion:
         try:
             SNAPSHOT_COMPLETION.check(self._state, SNAPSHOT_STREAMING)
         except (IllegalTransition, UnknownState) as exc:
-            raise SnapshotObservationError(
+            raise StreamingAdmissionRefused(
                 f"snapshot phase transition to streaming refused from {self._state}: "
                 f"{exc}"
             ) from exc

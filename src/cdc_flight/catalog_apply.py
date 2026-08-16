@@ -14,6 +14,7 @@ commit-time proof which could turn a source error into an acknowledged, lost uni
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass, field
 
@@ -28,14 +29,40 @@ from .catalog import (
     CatalogChange,
 )
 from .config import DROP_IGNORE, DROP_REPLICATE
-from .errors import SchemaEvolutionRefused
-from .machines import CHANGE_DEFERRED, CHANGE_REFUSED, require_admission_state
+from .errors import AdmissionError, as_schema_refusal
+from .machines import (
+    CHANGE_DEFERRED,
+    CHANGE_REFUSED,
+    CHANGE_SUPERSEDED,
+    require_admission_state,
+)
 from .schema_evolution import apply_column_changes
 
 log = logging.getLogger("cdc_flight.catalog_apply")
+OWNER = "catalog-application"
 
 # Canonical definition lives in destination; re-export the name for local callers.
 AWAITING_SNAPSHOT = destination.AWAITING_SNAPSHOT
+
+
+def _deferral_fingerprint(change: CatalogChange, lifecycle: str | None) -> str:
+    """Identify one (relation, blocking condition) pair for alert deduplication.
+
+    The relation generation tokens are part of the identity on purpose: a *later,
+    different* change on the same quarantined relation is a new condition and
+    deserves its own single alert, while the same change re-observed on every poll
+    is the same standing condition and deserves no second one.
+    """
+    material = "|".join(
+        (
+            change.qualified,
+            change.kind,
+            repr(change.old_identity),
+            repr(change.new_identity),
+            str(lifecycle),
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
 
 @dataclass(frozen=True)
@@ -78,6 +105,7 @@ class CatalogCoordinator:
         drop_mode: str,
         registry_of,
         lifecycle_con=None,
+        control_schema: str | None = None,
         max_destructive_per_group: int = 1,
         allow_mass_drop: bool = False,
     ):
@@ -87,6 +115,7 @@ class CatalogCoordinator:
         self.drop_mode = drop_mode
         self._registry_of = registry_of
         self._lifecycle_con = lifecycle_con
+        self.control_schema = control_schema
         self.max_destructive_per_group = max_destructive_per_group
         self.allow_mass_drop = allow_mass_drop
         self.tables_dropped = 0
@@ -103,6 +132,28 @@ class CatalogCoordinator:
     def enabled(self) -> bool:
         return self.catalog is not None and self.drop_mode != DROP_IGNORE
 
+    def _deferral_alert_is_new(self, fingerprint: str) -> bool:
+        """Whether this blocked change has never been alerted about.
+
+        The durable `alerts` table is deliberately the ONLY memory here.  An
+        in-process "already emitted" set would be wrong in both directions: it
+        forgets across restarts, and — because a deferral alert carries
+        ``on_rollback: False`` and is therefore *discarded* with a rolled-back
+        group — it would permanently suppress an alert that was never written.
+        Probing the table means a lost alert is re-emitted next poll and a
+        written one is never duplicated.
+        """
+        if self._lifecycle_con is None:
+            return True
+        return not destination.alert_marker_exists(
+            self._lifecycle_con,
+            pipeline=self.pipeline,
+            code="schema_change_deferred_for_refusal",
+            marker_key="deferral_fingerprint",
+            marker_value=fingerprint,
+            control_schema=self.control_schema,
+        )
+
     # ------------------------------------------------------------------ #
     # planning
     # ------------------------------------------------------------------ #
@@ -118,11 +169,85 @@ class CatalogCoordinator:
             return CatalogPlan()
 
         due = self.catalog.due(durable_lsn)
+        #: (change, blocking lifecycle) pairs; the lifecycle is part of the alert
+        #: dedup identity, so a table blocked for a *different* reason later still
+        #: gets its own single alert.
+        blocked_changes: list[tuple[CatalogChange, str | None]] = []
         if self._lifecycle_con is not None:
-            owing = set(table_lifecycle.owing_work(self._lifecycle_con, self.pipeline))
+            owing = set(
+                table_lifecycle.owing_work(
+                    self._lifecycle_con,
+                    self.pipeline,
+                    control_schema=self.control_schema,
+                )
+            )
+            blocked_refusals = destination.blocked_schema_tables(
+                self._lifecycle_con,
+                self.pipeline,
+                control_schema=self.control_schema,
+            )
             eligible: list[CatalogChange] = []
             for change in due:
-                if change.kind == CHANGE_DROPPED and change.qualified in owing:
+                lifecycle = table_lifecycle.read(
+                    self._lifecycle_con,
+                    pipeline=self.pipeline,
+                    source_schema=change.schema,
+                    source_table=change.table,
+                    control_schema=self.control_schema,
+                )
+                if change.kind == CHANGE_DROPPED and lifecycle == table_lifecycle.GONE:
+                    # A quarantined source drop was already discharged by the
+                    # current-source absence proof. Do not run ordinary DROP policy
+                    # afterward and delete the durable `gone` disposition.
+                    change.to(CHANGE_SUPERSEDED)
+                    log.info(
+                        "suppressing catalog drop for %s: its quarantine was already "
+                        "discharged as gone",
+                        change.qualified,
+                    )
+                elif (
+                    change.kind == CHANGE_RECREATED
+                    and lifecycle == table_lifecycle.COMPLETE
+                    and destination.replacement_snapshot_is_current(
+                        self._lifecycle_con,
+                        pipeline=self.pipeline,
+                        source_schema=change.schema,
+                        source_table=change.table,
+                        relation=change.new_relation,
+                        control_schema=self.control_schema,
+                    )
+                ):
+                    # An owed/repaired table may have completed its replacement
+                    # snapshot before this already-fenced catalog observation reaches
+                    # the main stream.  Reopening a current image here would create a
+                    # second obligation; the non-NULL snapshot LSN and matching
+                    # relation generation prove that this generation crossed the
+                    # snapshot boundary. A merely marked COMPLETE state does not.
+                    change.to(CHANGE_SUPERSEDED)
+                    log.info(
+                        "suppressing duplicate recreate for %s after its replacement "
+                        "snapshot completed",
+                        change.qualified,
+                    )
+                # ``gone`` blocks ordinary streaming, but a present relation is a
+                # new generation and must be allowed to take GONE -> AWAITING so a
+                # complete replacement snapshot can establish current data.
+                elif (
+                    change.qualified in blocked_refusals
+                    and not (
+                        change.kind == CHANGE_RECREATED
+                        and lifecycle == table_lifecycle.GONE
+                    )
+                ):
+                    change.to(CHANGE_DEFERRED)
+                    blocked_changes.append((change, lifecycle))
+                    log.warning(
+                        "deferring %s for %s while its schema/value refusal is "
+                        "pending or quarantined; the full resnapshot owns convergence",
+                        change.kind,
+                        change.qualified,
+                    )
+                elif change.kind == CHANGE_DROPPED and change.qualified in owing:
                     # A source-side drop observed while the retained image is still
                     # awaiting its replacement snapshot is not a final drop policy
                     # decision. Keep the catalog fact live, but do not let a stale
@@ -141,6 +266,31 @@ class CatalogCoordinator:
         actions: list[CatalogAction] = []
         refused: list[tuple[CatalogChange, str]] = []
         alerts: list[dict] = []
+        for change, lifecycle in blocked_changes:
+            fingerprint = _deferral_fingerprint(change, lifecycle)
+            if not self._deferral_alert_is_new(fingerprint):
+                # A permanently quarantined table re-observes the same blocked
+                # change on every poll; alerting once per poll grew `alerts`
+                # without bound (39 -> 78 -> 117 rows over three runs of ONE
+                # table) and buried the signal.  The condition is standing, so
+                # the alert is raised once per (relation, blocking condition).
+                continue
+            alerts.append(
+                {
+                    "severity": "critical",
+                    "code": "schema_change_deferred_for_refusal",
+                    "on_rollback": False,
+                    "message": (
+                        f"{change.kind} for {change.qualified} was deferred because "
+                        "the table is stale/unavailable pending a full resnapshot"
+                    ),
+                    "context": {
+                        **change.context(),
+                        "resnapshot_required": True,
+                        "deferral_fingerprint": fingerprint,
+                    },
+                }
+            )
 
         new_changes = [change for change in due if change.kind == CHANGE_NEW]
         if len(new_changes) > 1:
@@ -330,7 +480,8 @@ class CatalogCoordinator:
                     apply_column_changes(
                         self.registry, action.target, change.column_changes
                     )
-                except SchemaEvolutionRefused as refused:
+                except AdmissionError as error:
+                    refused = as_schema_refusal(error, refusal_origin="schema_evolution")
                     refused.source_schema = refused.source_schema or change.schema
                     refused.source_table = refused.source_table or change.table
                     refused.target = refused.target or action.target
@@ -345,6 +496,7 @@ class CatalogCoordinator:
                     pipeline=self.pipeline,
                     source_schema=change.schema,
                     source_table=change.table,
+                    control_schema=self.control_schema,
                 )
                 stats["tables"].add(action.target)
                 self.tables_dropped += 1
@@ -362,6 +514,7 @@ class CatalogCoordinator:
                     source_table=change.table,
                     target_table=action.target,
                     state=AWAITING_SNAPSHOT,
+                    control_schema=self.control_schema,
                 )
                 self.awaiting_snapshot.add(change.qualified)
             if change.kind == CHANGE_DROPPED and action.destructive:
@@ -370,6 +523,7 @@ class CatalogCoordinator:
                     pipeline=self.pipeline,
                     source_schema=change.schema,
                     source_table=change.table,
+                    control_schema=self.control_schema,
                 )
             if change.kind == CHANGE_SCHEMA and change.column_changes:
                 event_details = [
@@ -417,7 +571,10 @@ class CatalogCoordinator:
                 published=relation.published,
                 admission_state=require_admission_state(relation.admission_state),
                 replica_identity=relation.replica_identity,
+                full_activation_lsn=relation.full_activation_lsn,
+                full_invalidation_lsn=relation.full_invalidation_lsn,
                 columns=relation.columns,
+                control_schema=self.control_schema,
             )
         self.destructive_refused += len(plan.refused)
         return markers
@@ -485,7 +642,8 @@ class CatalogCoordinator:
                     value_columns=value_columns,
                     rows=rows,
                 )
-            except SchemaEvolutionRefused as refused:
+            except AdmissionError as error:
+                refused = as_schema_refusal(error, refusal_origin="schema_backfill")
                 refused.source_schema = refused.source_schema or change.schema
                 refused.source_table = refused.source_table or change.table
                 refused.target = refused.target or action.target

@@ -96,11 +96,20 @@ class EmptySnapshotHealth:
     """Source-side positive evidence that an empty snapshot reached streaming."""
 
     ever_sampled = True
+    ever_streamed = True
     unknown_for = 0.0
     not_streaming_for = 0.0
 
-    def may_declare_idle(self, *, min_seconds):
+    def may_declare_idle(self, *, min_seconds, received_high_water=None):
         return True
+
+    #: Every source in this module is deliberately UNMARKABLE, so each test below
+    #: exercises the completion route it was written for: the source-corroborated
+    #: `--idle-seconds` quiet window (`completion_watermark`'s declared fallback).
+    #: The watermark route has its own proofs in
+    #: `tests/rubric/1.9_state_machines/test_1_9_completion_watermark.py`.
+    def emit_marker(self, marker, reason, payload):
+        return None
 
     def summary(self):
         return {"slot_health": "streaming"}
@@ -194,6 +203,135 @@ def test_close_is_marked_intentional_on_a_clean_stop():
     summary = run_engine_bounded(engine, handler, _run_cfg())
     assert summary["stop_reason"] == "idle"
     assert engine.closed_intentional is True
+
+
+def test_callback_quiescence_is_proved_before_engine_close():
+    """Stock close must never interrupt an admitted Python callback."""
+    lifecycle: list[str] = []
+
+    class OrderingEngine(FakeEngine):
+        def close(self, *, intentional: bool = True):
+            lifecycle.append("engine.close")
+            super().close(intentional=intentional)
+
+    class OrderingHandler(FakeHandler):
+        def shutdown(self, *, reason="supervisor_shutdown"):
+            lifecycle.append("admission.sealed")
+            super().shutdown(reason=reason)
+
+        def wait_for_quiescence(self, timeout):
+            lifecycle.append("callbacks.quiescent")
+            return super().wait_for_quiescence(timeout)
+
+    handler = OrderingHandler()
+    handler.seconds_since_last_batch = 99
+    summary = run_engine_bounded(OrderingEngine(run_seconds=3), handler, _run_cfg())
+
+    assert summary["ok"] is True
+    assert lifecycle == [
+        "admission.sealed",
+        "callbacks.quiescent",
+        "engine.close",
+    ]
+
+
+class SettlingSourceHealth:
+    """A source that will not corroborate idle yet, and later does.
+
+    ROUND 12 REGRESSION, MEASURED. The supervisor used to `break` out of the loop —
+    with `outcome.record("engine_error")` — the first time a quiet stream met a
+    source that would not call itself idle. That is precisely the state Debezium's
+    own retriable-restart backoff produces, and that backoff is longer than one
+    idle window, so the run ended after ~`idle_seconds` having applied nothing,
+    advanced neither LSN, and left the WAL to grow. On a loaded host it pre-empted
+    the armed fault anchors in `tests/rubric/1.1_exactly_once_pk` and
+    `tests/rubric/1.7_fault_injection`; f8aeb33 (the commit before) ran the same
+    lane green. The connector owns a retry budget and the supervisor must let it
+    run: a source that is merely not-yet-idle is not a verdict.
+
+    The safety half is unchanged and asserted separately below — a run in this
+    state can never report success, because `may_declare_idle` is the only door to
+    the `idle` outcome.
+    """
+
+    interval = 0.5
+    ever_sampled = True
+    ever_streamed = True
+    unknown_for = 0.0
+    not_streaming_for = 0.0
+
+    #: Every source in this module is deliberately UNMARKABLE, so each test below
+    #: exercises the completion route it was written for: the source-corroborated
+    #: `--idle-seconds` quiet window (`completion_watermark`'s declared fallback).
+    #: The watermark route has its own proofs in
+    #: `tests/rubric/1.9_state_machines/test_1_9_completion_watermark.py`.
+    def emit_marker(self, marker, reason, payload):
+        return None
+
+    def __init__(self, *, settles_after: float | None):
+        self._settles_at = (
+            None if settles_after is None else time.monotonic() + settles_after
+        )
+        self.idle_questions = 0
+
+    @property
+    def last(self):
+        # A fresh observation every time it is asked for: this fake is about the
+        # supervisor's reaction, not about sampler staleness.
+        return type("Sample", (), {"at": time.monotonic()})()
+
+    @property
+    def _settled(self) -> bool:
+        return self._settles_at is not None and time.monotonic() >= self._settles_at
+
+    def may_declare_idle(self, *, min_seconds, received_high_water=None):
+        self.idle_questions += 1
+        return self._settled
+
+    def summary(self):
+        return {"slot_health": "streaming" if self._settled else "not_streaming"}
+
+
+def test_a_source_that_is_not_idle_yet_is_not_a_failed_run():
+    """The connector's own retry gets its budget; a blip is not a failed run."""
+    health = SettlingSourceHealth(settles_after=1.5)
+    handler = FakeHandler()
+    handler.seconds_since_last_batch = 99
+    summary = run_engine_bounded(
+        FakeEngine(run_seconds=6),
+        handler,
+        _run_cfg(max_seconds=9, idle_seconds=1, close_timeout=2),
+        health=health,
+    )
+    assert summary["stop_reason"] == "idle", summary
+    assert summary["ok"] is True, summary
+    # It really did sit in the unsettled state rather than skipping past it.
+    assert health.idle_questions > 1
+    assert summary["elapsed_sec"] >= 1.5
+
+
+class DetachedSourceHealth(SettlingSourceHealth):
+    """The walsender is gone and stays gone for longer than the idle window."""
+
+    not_streaming_for = 30.0
+
+
+def test_a_source_that_never_becomes_idle_still_fails_loudly():
+    """...and the B5 safety property survives: no false green, ever."""
+    health = DetachedSourceHealth(settles_after=None)
+    handler = FakeHandler()
+    handler.seconds_since_last_batch = 99
+    with pytest.raises(EngineFailure) as excinfo:
+        run_engine_bounded(
+            FakeEngine(run_seconds=4),
+            handler,
+            _run_cfg(max_seconds=2, idle_seconds=0.5, close_timeout=2),
+            health=health,
+        )
+    assert excinfo.value.summary["stop_reason"] == "max_seconds"
+    assert "the connector was not streaming" in str(excinfo.value)
+    # The raise is the verdict: no summary this run can produce says `ok`.
+    assert excinfo.value.summary.get("ok") is not True
 
 
 def test_initial_snapshot_cannot_declare_idle_with_zero_records():
@@ -339,9 +477,6 @@ def test_close_on_an_engine_that_was_never_built_does_not_build_one():
         ("pre_commit:1", ("pre_commit", 1, 137)),
         ("post_commit_pre_ack:3:9", ("post_commit_pre_ack", 3, 9)),
         ("post_ack:2:raise", ("post_ack", 2, "raise")),
-        # legacy names keep working
-        ("before_load:1", ("pre_commit", 1, 137)),
-        ("after_load:1", ("post_commit_pre_ack", 1, 137)),
     ],
 )
 def test_fault_spec_parses(raw, expected):

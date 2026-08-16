@@ -44,6 +44,11 @@ def main() -> None:
     )
     p.findings["slot_before_advance"] = before
 
+    # `pg_current_wal_lsn()` is the WRITE position, and this cluster runs with
+    # `synchronous_commit=off`, so freshly committed rows can still sit beyond it
+    # and the advance would strand nothing. Force a flush first, or the probe
+    # measures an advance that discarded no change events at all.
+    p.findings["wal_switched_to"] = query("SELECT pg_switch_wal()::text")
     advanced = query(
         "SELECT end_lsn::text FROM pg_replication_slot_advance(%s, pg_current_wal_lsn())",
         (p.slot,),

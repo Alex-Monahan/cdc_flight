@@ -29,9 +29,6 @@ today keeps working after D5/D9/D1 land:
   but the replication slot has not been confirmed yet (that happens on the next
   `poll()`). Under Invariant O a crash here loses nothing and duplicates nothing.
 
-Legacy aliases `before_load` / `after_load` map onto `pre_commit` /
-`post_commit_pre_ack` so existing scenarios keep working.
-
 `<nth>` is 1-based over the **data-carrying commit groups** this process
 performs (for `decode`, over data-carrying Debezium batches). Batches that
 contain only internal/skipped records (Debezium heartbeats, transaction-metadata
@@ -94,6 +91,9 @@ import logging
 import os
 import sys
 import time
+
+from .config import resolve_control_schema
+from .naming import quote
 
 log = logging.getLogger("cdc_flight.faults")
 
@@ -213,9 +213,6 @@ SOURCE_POINTS = ("catalog_poll",)
 
 ALL_POINTS = POINTS + DESTINATION_POINTS + RECOVERY_POINTS + SOURCE_POINTS
 
-#: Names kept working from the first fault-injection cut.
-ALIASES = {"before_load": "pre_commit", "after_load": "post_commit_pre_ack"}
-
 DEFAULT_EXIT_CODE = 137
 RAISE = "raise"
 
@@ -247,11 +244,11 @@ def parse_spec(raw: str | None) -> tuple[str, int, int | str] | None:
     if not raw:
         return None
     parts = raw.split(":")
-    point = ALIASES.get(parts[0].strip(), parts[0].strip())
+    point = parts[0].strip()
     if point not in ALL_POINTS:
         raise FaultSpecError(
             f"{ENV_VAR}: unknown point {parts[0]!r}; expected one of "
-            f"{ALL_POINTS} (or aliases {tuple(ALIASES)})"
+            f"{ALL_POINTS}"
         )
     try:
         nth = int(parts[1]) if len(parts) > 1 and parts[1] else 1
@@ -351,10 +348,15 @@ def current_group() -> int:
 _DATA_STATEMENTS = ("insert into", "update ", "delete from", "create table", "create or replace")
 
 
-def _is_data_statement(sql: str) -> bool:
+def _is_data_statement(sql: str, control_schema: str | None = None) -> bool:
     lowered = sql.lstrip().lower()
-    if lowered.startswith(("insert into _cdc_flight", "delete from _cdc_flight",
-                           "update _cdc_flight", "insert or replace into _cdc_flight")):
+    configured = resolve_control_schema(control_schema)
+    control_prefixes = (configured.lower(), quote(configured).lower())
+    if any(
+        lowered.startswith(f"{verb} {prefix}.")
+        for verb in ("insert into", "delete from", "update", "insert or replace into")
+        for prefix in control_prefixes
+    ):
         return False
     return lowered.startswith(_DATA_STATEMENTS)
 
@@ -370,11 +372,20 @@ class FaultyConnection:
     conflating them would hide which one the test proved).
     """
 
-    def __init__(self, con, point: str, nth: int, *, hang_seconds: float = 3600.0):
+    def __init__(
+        self,
+        con,
+        point: str,
+        nth: int,
+        *,
+        hang_seconds: float = 3600.0,
+        control_schema: str | None = None,
+    ):
         self._con = con
         self._point = point
         self._nth = nth
         self._hang_seconds = hang_seconds
+        self._control_schema = resolve_control_schema(control_schema)
         self.fired = False
 
     # -- the injected surface ---------------------------------------------- #
@@ -400,7 +411,9 @@ class FaultyConnection:
 
     def _maybe_fire(self, statement: str) -> None:
         lowered = statement.lstrip().lower()
-        if self._point == "destination_write" and _is_data_statement(statement):
+        if self._point == "destination_write" and _is_data_statement(
+            statement, self._control_schema
+        ):
             self.fired = True
             record_fired(self._point, self._nth, "raise")
             log.error("FAULT INJECTION: destination rejects %r (group %s)",
@@ -429,7 +442,9 @@ class FaultyConnection:
                 )
                 sys.stdout.flush()
                 time.sleep(self._hang_seconds)
-        if self._point == "destination_close" and _is_data_statement(statement):
+        if self._point == "destination_close" and _is_data_statement(
+            statement, self._control_schema
+        ):
             self.fired = True
             record_fired(self._point, self._nth, "close")
             log.error("FAULT INJECTION: severing the destination connection (group %s)",
@@ -466,7 +481,12 @@ def hang_seconds() -> float:
         ) from exc
 
 
-def wrap_destination(con, *, hang_seconds: float | None = None):
+def wrap_destination(
+    con,
+    *,
+    hang_seconds: float | None = None,
+    control_schema: str | None = None,
+):
     """Return `con`, or a `FaultyConnection` when a `destination_*` fault is armed."""
     spec = _spec()
     if spec is None:
@@ -479,7 +499,13 @@ def wrap_destination(con, *, hang_seconds: float | None = None):
         "destination fault armed: %s at data group %s%s",
         point, nth, f" (hang {hang}s)" if point == "destination_hang" else "",
     )
-    return FaultyConnection(con, point, nth, hang_seconds=hang)
+    return FaultyConnection(
+        con,
+        point,
+        nth,
+        hang_seconds=hang,
+        control_schema=control_schema,
+    )
 
 
 #: Where a fired anchor records itself. Inside `CDC_STATE_DIR` so a test that owns a
@@ -568,7 +594,7 @@ def maybe_crash(point: str, nth: int) -> None:
     if spec is None:
         return
     want_point, want_nth, action = spec
-    if ALIASES.get(point, point) != want_point or nth != want_nth:
+    if point != want_point or nth != want_nth:
         return
     log.error("FAULT INJECTION: firing at %s (data batch %s) action=%s", point, nth, action)
     # BEFORE the exit, and fsynced: `os._exit` runs no atexit hook, so this is the only

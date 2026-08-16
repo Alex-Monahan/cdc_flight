@@ -284,8 +284,15 @@ def test_the_marker_write_budget_is_bounded():
     from cdc_flight.source_marker import CATALOG_FENCE, SourceMarker
 
     class Fine:
+        """`psycopg.Connection.execute` returns a cursor, and the marker reads the
+        LSN PostgreSQL assigned the record off it (`completion_watermark`)."""
+
+        def __init__(self):
+            self.lsn = 0
+
         def execute(self, *_args):
-            return None
+            self.lsn += 100
+            return _Cursor(self.lsn)
 
     marker = SourceMarker(prefix="cdcf", max_writes=3)
     conn = Fine()
@@ -294,7 +301,16 @@ def test_the_marker_write_budget_is_bounded():
     ]
     assert marker.writes == 3
     assert marker.suppressed == 2
+    assert marker.last_lsn == 300, "the position of the last accepted write is kept"
     assert "budget exhausted" in marker.last_error
+
+
+class _Cursor:
+    def __init__(self, lsn):
+        self._lsn = lsn
+
+    def fetchone(self):
+        return (self._lsn,)
 
 
 def test_a_poll_that_finishes_at_shutdown_still_fails_the_run():

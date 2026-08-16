@@ -47,6 +47,21 @@ export PGDATABASE = $(CDC_TEST_PGDATABASE)
 export ARROW_DEFAULT_MEMORY_POOL ?= system
 PYTEST_WORKERS ?= 12
 PYTEST_XDIST_ARGS ?= -n $(PYTEST_WORKERS) --dist=loadscope --max-worker-restart=0
+# The slow lane contains real crash/snapshot timing proofs and heavy DuckDB/JPype
+# subprocesses. Two workers is the conservative default on this host: three, four, and
+# six-worker controls were faster but failed real source/durability assertions. The
+# lock below is shared by clones, because separate PostgreSQL clusters do not separate
+# CPU and RAM pressure. This default is a scheduling guard, not a claim that every
+# host's slow lane is green.
+PYTEST_SLOW_WORKERS ?= 2
+PYTEST_SLOW_XDIST_ARGS ?= -n $(PYTEST_SLOW_WORKERS) --dist=loadscope --max-worker-restart=0
+SLOW_LANE_LOCK ?= /tmp/cdc_flight_slow_lane.lock
+SLOW_LANE_WAIT_TIMEOUT ?= 300
+# MotherDuck uses one database per worker and a unique control schema per test.
+# The few modules that intentionally batch one expensive scenario use xdist groups
+# so --dist=loadgroup keeps their read-only assertions with that scenario fixture.
+PYTEST_MD_WORKERS ?= 8
+PYTEST_MD_XDIST_ARGS ?= -n $(PYTEST_MD_WORKERS) --dist=loadgroup --max-worker-restart=0
 
 .DEFAULT_GOAL := help
 
@@ -140,15 +155,21 @@ test-all: ## run everything: MotherDuck smoke test + slow fault injection
 
 .PHONY: test-md
 test-md: ## run only the MotherDuck tests
-	$(UV) run pytest -m motherduck --durations=20
+	@test -n "$${motherduck_token:-$${MOTHERDUCK_TOKEN:-}}" || { \
+		echo "ERROR: make test-md requires motherduck_token or MOTHERDUCK_TOKEN" >&2; \
+		exit 2; \
+	}
+	$(UV) run pytest $(PYTEST_MD_XDIST_ARGS) -m motherduck --durations=20
 
 .PHONY: test-slow
 test-slow: ## run only the slow fault-injection tests (real SIGKILL, big loads)
-	$(UV) run pytest -m "slow and not motherduck" --durations=20
+	$(UV) run python scripts/slow_lane.py --lock-file "$(SLOW_LANE_LOCK)" \
+		--wait-timeout "$(SLOW_LANE_WAIT_TIMEOUT)" -- \
+		$(UV) run pytest $(PYTEST_SLOW_XDIST_ARGS) -m "slow and not motherduck" --durations=20
 
 .PHONY: lint
 lint: ## ruff
-	$(UV) run ruff check src tests scripts/runtime_state*.py
+	$(UV) run ruff check src tests scripts/runtime_state*.py scripts/slow_lane.py
 
 ## ---------------------------------------------------------------------------
 ## housekeeping

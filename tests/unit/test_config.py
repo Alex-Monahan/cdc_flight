@@ -140,6 +140,44 @@ def test_snapshot_mode_override(tmp_path):
     assert props["snapshot.mode"] == "never"
 
 
+def test_non_pinned_property_overrides_are_applied(tmp_path):
+    props = build_properties(
+        SourceConfig(),
+        ReplicationConfig(state_dir=tmp_path),
+        overrides={"max.batch.size": "17"},
+    )
+    assert props["max.batch.size"] == "17"
+
+
+def test_source_and_money_contract_pins_cannot_be_clobbered_by_overrides(tmp_path):
+    replication = ReplicationConfig(state_dir=tmp_path, slot_name="r15_slot")
+    source = SourceConfig()
+    protected = {
+        "driver.options": "different",
+        "snapshot.mode": "never",
+        "slot.name": "other_slot",
+        "plugin.name": "wal2json",
+    }
+    for key, value in protected.items():
+        with pytest.raises(UnsafeDebeziumProperty, match=key.replace(".", r"\.")):
+            build_properties(source, replication, overrides={key: value})
+
+    # Matching the effective caller-selected snapshot mode remains a harmless
+    # no-op; this keeps recovery's explicit snapshot-mode argument usable.
+    props = build_properties(
+        source,
+        replication,
+        snapshot_mode="never",
+        overrides={
+            "driver.options": "-c lc_monetary=C",
+            "snapshot.mode": "never",
+            "slot.name": "r15_slot",
+            "plugin.name": "pgoutput",
+        },
+    )
+    assert props["snapshot.mode"] == "never"
+
+
 def test_destination_table_name_includes_the_source_schema():
     # Two same-named tables in different schemas must not collide.
     assert destination_table("cdcflight", "app", "customers") == "cdcflight_app_customers"

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from . import catalog_generation
-from .catalog_state import CHANGE_RECREATED, CatalogChange
+from .catalog_state import CHANGE_RECREATED, CHANGE_SCHEMA, CatalogChange
 from .machines import (
     CHANGE_APPLIED,
     CHANGE_DUE,
@@ -78,6 +78,16 @@ def settle(
                 planned_epoch,
                 watcher._epoch,
             )
+        if not advanced:
+            # A hand-built/frozen watcher may not have a later polling observation to
+            # project the relation carried by a committed schema action. Once the
+            # destination DDL is durable, the watcher must advance its in-memory
+            # descriptor epoch too; otherwise the next event is compared with the
+            # pre-DDL catalog shape and the completeness gate mistakes a valid new
+            # column for an omitted one. An observed newer epoch wins above.
+            for change in changes:
+                if change.kind == CHANGE_SCHEMA and change.new_relation is not None:
+                    watcher.known[change.qualified] = change.new_relation
         done = {
             id(change)
             for change in changes

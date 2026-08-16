@@ -624,9 +624,12 @@ def test_a_recovery_that_forgets_the_catalog_forgets_the_baseline_with_it():
 
     source = inspect.getsource(recovery)
     forget_block = source[source.index("if forget_catalog:"):]
-    forget_block = forget_block[: forget_block.index("con.execute(\n            f\"DELETE FROM {CONTROL_SCHEMA}.recovery_state")]
-    assert "DELETE FROM {CONTROL_SCHEMA}.source_relations" in forget_block
-    assert "catalog_baseline.forget(con, pipeline)" in forget_block
+    forget_block = forget_block[: forget_block.index(
+        "DELETE FROM {control_table(resolve_control_schema(control_schema), 'recovery_state')}"
+    )]
+    assert "DELETE FROM {control_table(resolve_control_schema(control_schema), 'source_relations')}" in forget_block
+    assert "catalog_baseline.forget(" in forget_block
+    assert "control_schema=control_schema" in forget_block
 
 
 # --------------------------------------------------------------------------- #

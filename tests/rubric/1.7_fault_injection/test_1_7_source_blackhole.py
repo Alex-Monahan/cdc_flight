@@ -169,7 +169,7 @@ def test_unknown_after_a_working_sampler_forbids_idle():
     now = time.monotonic()
     # It worked: streaming, caught up, for longer than the idle window.
     health._ingest(SlotSample(at=now - 30, exists=True, active=True, lag_bytes=0))
-    health._ingest(SlotSample(at=now - 20, exists=True, active=True, lag_bytes=0))
+    health._ingest(SlotSample(at=now - 0.1, exists=True, active=True, lag_bytes=0))
     assert health.may_declare_idle(min_seconds=5) is True
 
     # Then the source goes dark.
@@ -182,6 +182,98 @@ def test_unknown_after_a_working_sampler_forbids_idle():
     # never-sampled case below — which is the whole point of the declared domain.
     assert health.summary()["slot_health"] == "unknown"
     assert health.state() == "unknown"
+
+
+def test_stale_active_sample_cannot_prove_idle():
+    from cdc_flight.source_health import SlotSample, SourceHealth
+
+    health = SourceHealth(dsn="postgresql://nope", slot_name="x")
+    health._ingest(
+        SlotSample(
+            at=time.monotonic() - 30,
+            exists=True,
+            active=True,
+            lag_bytes=0,
+        )
+    )
+    assert health.may_declare_idle(min_seconds=5) is False
+
+
+def test_reconnected_stream_must_advance_confirmed_wal_before_large_lag_is_idle():
+    """A retry reattachment is not proof that the interrupted delivery recovered."""
+    from cdc_flight.source_health import SlotSample, SourceHealth
+
+    health = SourceHealth(dsn="postgresql://nope", slot_name="x")
+    now = time.monotonic()
+    health._ingest(
+        SlotSample(
+            at=now - 20,
+            exists=True,
+            active=True,
+            confirmed_pos=100,
+            lag_bytes=0,
+        )
+    )
+    health._ingest(
+        SlotSample(
+            at=now - 10,
+            exists=True,
+            active=False,
+            confirmed_pos=100,
+            lag_bytes=2_000_000,
+        )
+    )
+    health._ingest(
+        SlotSample(
+            at=now,
+            exists=True,
+            active=True,
+            confirmed_pos=100,
+            lag_bytes=2_000_000,
+        )
+    )
+    assert health.stream_interruptions == 1
+    assert health.recovered_after_interruption is False
+    assert health.may_declare_idle(min_seconds=5) is False
+
+    health._ingest(
+        SlotSample(
+            at=now + 0.1,
+            exists=True,
+            active=True,
+            confirmed_pos=101,
+            lag_bytes=2_000_000,
+        )
+    )
+    assert health.recovered_after_interruption is True
+
+
+def test_growing_backlog_is_not_a_stable_idle_backlog():
+    """Lag that increases while the source is active cannot satisfy the flat-lag proof."""
+    from cdc_flight.source_health import SlotSample, SourceHealth
+
+    health = SourceHealth(dsn="postgresql://nope", slot_name="x")
+    now = time.monotonic()
+    health._ingest(
+        SlotSample(
+            at=now - 20,
+            exists=True,
+            active=True,
+            confirmed_pos=100,
+            lag_bytes=100_000,
+        )
+    )
+    health._ingest(
+        SlotSample(
+            at=now - 1,
+            exists=True,
+            active=True,
+            confirmed_pos=100,
+            lag_bytes=2_000_000,
+        )
+    )
+    assert health.lag_steady_for < 5
+    assert health.may_declare_idle(min_seconds=5) is False
 
 
 def test_a_sampler_that_never_worked_stays_fail_soft():

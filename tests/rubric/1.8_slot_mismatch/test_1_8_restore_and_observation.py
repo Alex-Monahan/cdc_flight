@@ -137,9 +137,18 @@ def test_a_rewound_source_is_detected(tmp_path_factory, postgres_cluster):
         box.reseed()
         box.run(reset_state=True, max_seconds=150)
         current = box.pg_query("SELECT (pg_current_wal_lsn() - '0/0')::bigint")[0][0]
-        # A destination that has seen further than the source can possibly have written.
+        # Use a bounded but deliberately large synthetic lead. A one-byte lead can be
+        # consumed by another xdist worker during the recovery subprocess, turning a
+        # correct source into a false test pass; 1 GiB is far below the LSN range and
+        # comfortably exceeds the disposable lane's concurrent WAL budget.
+        durable_lsn = int(current) + 1_000_000_000
         box.duck_write(
-            "UPDATE _cdc_flight.debezium_offsets SET last_lsn = ?", [int(current) + 10_000_000]
+            "UPDATE _cdc_flight.debezium_offsets SET last_lsn = ?", [durable_lsn]
+        )
+        observed = box.pg_query("SELECT (pg_current_wal_lsn() - '0/0')::bigint")[0][0]
+        assert int(observed) < durable_lsn, (
+            "the rewound-source precondition was consumed before the supervisor ran: "
+            f"current={observed}, durable={durable_lsn}"
         )
         recovered = box.run(max_seconds=240)
         assert recovered["slot_check"]["decision"] == "source_lsn_regressed", (
@@ -168,9 +177,40 @@ def test_resnapshot_can_be_turned_off_for_the_rubrics_four(tmp_path_factory, pos
     try:
         box.reseed()
         box.run(reset_state=True, max_seconds=150)
-        box.sql("INSERT INTO app.customers (name, email) VALUES ('doomed', 'd@x.com')")
+        # `synchronous_commit` is off in this cluster, so an ordinary INSERT is
+        # committed but NOT yet written: `pg_current_wal_lsn()` can still point
+        # before it, and advancing the slot to that position would skip nothing.
+        # The test then measured an incidental byte or two of trailing WAL instead
+        # of the row it means to strand — and a pipeline that leaves its slot fully
+        # caught up (as one that ends on a completion watermark does) leaves no
+        # such bytes at all. Flush this one transaction so the precondition is
+        # REAL: the row is in written WAL, and advancing past it truly strands it.
+        box.sql(
+            [
+                "SET synchronous_commit = on",
+                "INSERT INTO app.customers (name, email) VALUES ('doomed', 'd@x.com')",
+            ]
+        )
+        durable_before = int(
+            box.duck_query("SELECT last_lsn FROM _cdc_flight.debezium_offsets")[0][0]
+        )
         box.pg_query(
             "SELECT pg_replication_slot_advance(%s, pg_current_wal_lsn())", (box.slot,)
+        )
+        confirmed = int(
+            box.pg_query(
+                "SELECT (confirmed_flush_lsn - '0/0')::bigint "
+                "FROM pg_replication_slots WHERE slot_name = %s",
+                (box.slot,),
+            )[0][0]
+        )
+        # Assert the precondition rather than assume it. Without this the whole
+        # test can pass — or fail — for reasons that have nothing to do with the
+        # behaviour under examination (test-audit finding F6, same shape).
+        assert confirmed > durable_before, (
+            "the slot was not left ahead of the destination, so there is no "
+            "stranded WAL for the run to detect: "
+            f"confirmed_flush={confirmed}, durable={durable_before}"
         )
         failed = box.run(
             max_seconds=120, expect_success=False, extra_env={"CDC_RESNAPSHOT": "0"}

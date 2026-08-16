@@ -25,6 +25,7 @@ import pytest
 from support.applier_lab import DATASET, Lab, data, end
 
 from cdc_flight.assembler import TransactionAssembler
+from cdc_flight.destination import ResumePoint
 from cdc_flight.envelope import PendingRecord
 from cdc_flight.errors import TransactionAssemblyError
 
@@ -101,8 +102,9 @@ def test_a_replay_recomputes_the_same_identity_and_cannot_duplicate(lab):
     A resume point can only ever sit on a transaction boundary (the assembler
     never emits a partial unit and a control record inside a transaction is
     carried by it), so a replayed transaction renumbers from 1 and recomputes
-    *identical* identities. The fence is turned off here — `resume_lsn` stays 0 —
-    so the merge on `cdcf_event_id` is what has to hold.
+    *identical* identities. The second delivery is deliberately admitted with a
+    fresh test applier whose explicit resume point is zero, so the merge on
+    `cdcf_event_id` is what this test proves.
     """
     box = lab()
     records = [
@@ -114,7 +116,11 @@ def test_a_replay_recomputes_the_same_identity_and_cannot_duplicate(lab):
     first = box.q(f'SELECT cdcf_event_id FROM "{DATASET}"."{READINGS}" ORDER BY 1')
 
     # The same WAL, delivered again, with a *fresh* record stream (the identity
-    # must be derived, not remembered).
+    # must be derived, not remembered). Reset only this test's in-memory admission
+    # point so the replay is above the fence rather than silently discarded by it.
+    # This is an explicit test seam: production startup obtains this point from the
+    # durable destination and never carries state between tests.
+    box.applier.resume_point = ResumePoint(last_lsn=0)
     box.run(
         [
             _reading("7", 1, 100, 1.0),
@@ -122,7 +128,15 @@ def test_a_replay_recomputes_the_same_identity_and_cannot_duplicate(lab):
             end("7", 2, 102, {"app.sensor_readings": 2}),
         ]
     )
-    second = box.q(f'SELECT cdcf_event_id FROM "{DATASET}"."{READINGS}" ORDER BY 1')
+    assert box.applier.fenced_units == 0
+    assert box.applier.applied_events == 4
+    assert box.q(
+        "SELECT event_count, fenced_units FROM _cdc_flight.commit_log "
+        "WHERE pipeline = 'lab' ORDER BY commit_id DESC LIMIT 1"
+    ) == [(2, 0)]
+    second = box.q(
+        f'SELECT cdcf_event_id FROM "{DATASET}"."{READINGS}" ORDER BY 1'
+    )
 
     assert first == second == [("100:7:1",), ("101:7:2",)]
     assert box.scalar(f'SELECT count(*) FROM "{DATASET}"."{READINGS}"') == 2, (
@@ -141,6 +155,98 @@ def test_two_byte_identical_source_rows_are_two_rows(lab):
         ]
     )
     assert box.scalar(f'SELECT count(*) FROM "{DATASET}"."{READINGS}"') == 2
+
+
+def test_keyless_delete_consumes_one_full_duplicate_and_replay_is_a_noop(lab):
+    """A FULL before-image names one physical row, never an event-id row."""
+    box = lab()
+    seed = [
+        data("seed", 1, 100, table="keyless_delete", after={"id": 7, "value": "same", "note": None}),
+        data("seed", 2, 101, table="keyless_delete", after={"id": 7, "value": "same", "note": None}),
+        data("seed", 3, 102, table="keyless_delete", after={"id": 7, "value": "same", "note": None}),
+        end("seed", 3, 110, {"app.keyless_delete": 3}),
+    ]
+    box.run(seed)
+    before = {"id": 7, "value": "same", "note": None}
+    delete = data(
+        "delete",
+        1,
+        200,
+        table="keyless_delete",
+        op="d",
+        before=before,
+    )
+    box.run([delete, end("delete", 1, 210, {"app.keyless_delete": 1})])
+    assert box.scalar(
+        'SELECT count(*) FROM "cdc_raw"."cdcflight_app_keyless_delete"'
+    ) == 2
+
+    # Re-admit the exact source coordinates, bypassing only the lab's resume fence.
+    # The durable keyless event state, not a process-local set, must make this a no-op.
+    box.applier.resume_point = ResumePoint(last_lsn=0)
+    box.run([delete, end("delete", 1, 210, {"app.keyless_delete": 1})])
+    assert box.scalar(
+        'SELECT count(*) FROM "cdc_raw"."cdcflight_app_keyless_delete"'
+    ) == 2
+    assert box.scalar(
+        'SELECT count(*) FROM "cdc_raw"."cdcflight_app_keyless_delete" '
+        "WHERE id = 7 AND value = 'same' AND note IS NULL"
+    ) == 2
+
+
+def test_keyless_delete_reinsert_and_update_fold_in_source_order(lab):
+    """Delete/reinsert and a full-image UPDATE preserve physical-row semantics."""
+    box = lab()
+    original = {"id": 8, "value": "before", "note": "nullable"}
+    box.run(
+        [
+            data("seed", 1, 300, table="keyless_order", after=original),
+            end("seed", 1, 310, {"app.keyless_order": 1}),
+        ]
+    )
+    old_id = box.scalar(
+        'SELECT cdcf_event_id FROM "cdc_raw"."cdcflight_app_keyless_order"'
+    )
+    replacement = data(
+        "reuse",
+        2,
+        401,
+        table="keyless_order",
+        op="c",
+        after=original,
+    )
+    box.run(
+        [
+            data("reuse", 1, 400, table="keyless_order", op="d", before=original),
+            replacement,
+            end("reuse", 2, 410, {"app.keyless_order": 2}),
+        ]
+    )
+    assert box.q(
+        'SELECT cdcf_event_id, id, value, note FROM '
+        '"cdc_raw"."cdcflight_app_keyless_order"'
+    ) == [("401:reuse:2", 8, "before", "nullable")]
+    assert old_id != "401:reuse:2"
+
+    updated = {"id": 8, "value": "after", "note": None}
+    box.run(
+        [
+            data(
+                "update",
+                1,
+                500,
+                table="keyless_order",
+                op="u",
+                before=original,
+                after=updated,
+            ),
+            end("update", 1, 510, {"app.keyless_order": 1}),
+        ]
+    )
+    assert box.q(
+        'SELECT id, value, note, cdcf_event_id FROM '
+        '"cdc_raw"."cdcflight_app_keyless_order"'
+    ) == [(8, "after", None, "500:update:1")]
 
 
 def test_the_ordinal_contract_is_enforced_before_the_identity_is_built():

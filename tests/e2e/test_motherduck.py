@@ -1,7 +1,7 @@
 """MotherDuck smoke test.
 
 Deselected by `make test`; run with `make test-md` or `pytest -m motherduck`.
-Kept deliberately light - one snapshot load into `cdc_flight_dev`.
+The snapshot runs in the current xdist worker's database.
 """
 
 from __future__ import annotations
@@ -13,18 +13,13 @@ import uuid
 
 import duckdb
 import pytest
+from support.fixtures import source_records
 
-from cdc_flight.catalog_state import read_known_relations
 from cdc_flight.config import motherduck_token
-from cdc_flight.control_schema import ensure_control_schema
-from cdc_flight.states import UnknownState
 
 pytestmark = [pytest.mark.motherduck, pytest.mark.e2e]
 
-MD_DATABASE = "cdc_flight_dev"
-
-
-def md_connect(token: str, database: str = MD_DATABASE):
+def md_connect(token: str, database: str):
     """Connect to MotherDuck with a **fresh** view of the catalog.
 
     MEASURED, 2026-07-30: `duckdb.connect()` caches the database instance per DSN
@@ -55,6 +50,7 @@ def wait_for_tables(con, dataset: str, timeout: float = 90.0) -> set[str]:
     """
     deadline = time.monotonic() + timeout
     tables: set[str] = set()
+    poll_delay = 0.1
     while True:
         tables = {
             t
@@ -65,7 +61,11 @@ def wait_for_tables(con, dataset: str, timeout: float = 90.0) -> set[str]:
         }
         if tables or time.monotonic() >= deadline:
             return tables
-        time.sleep(2.0)
+        # Catalog visibility is the condition, not elapsed time.  Keep polling
+        # cheaply while the server catches up, with the same 90-second proof
+        # deadline and a bounded backoff for a genuinely delayed catalog.
+        time.sleep(poll_delay)
+        poll_delay = min(poll_delay * 2, 2.0)
         with contextlib.suppress(duckdb.Error):
             con.execute("FORCE CHECKPOINT")
 
@@ -79,21 +79,17 @@ def md_token() -> str:
 
 
 @pytest.fixture
-def md_dataset(md_token: str):
-    """A throwaway dataset per run, dropped afterwards."""
-    name = f"cdc_smoke_{uuid.uuid4().hex[:8]}"
-    con = duckdb.connect(f"md:?motherduck_token={md_token}")
-    con.execute(f'CREATE DATABASE IF NOT EXISTS "{MD_DATABASE}"')
-    con.close()
-    yield name
-    con = duckdb.connect(f"md:{MD_DATABASE}?motherduck_token={md_token}")
-    try:
-        con.execute(f'DROP SCHEMA IF EXISTS "{MD_DATABASE}"."{name}" CASCADE')
-    finally:
-        con.close()
+def md_case(motherduck_case):
+    """A complete per-test case in the current worker database."""
+    return {
+        **motherduck_case,
+        "dataset": f"cdc_smoke_{uuid.uuid4().hex[:8]}",
+    }
 
 
-def test_snapshot_loads_into_motherduck(fresh_seed, run_pipeline, md_token, md_dataset):
+def test_snapshot_loads_into_motherduck(fresh_seed, run_pipeline, md_token, md_case):
+    database = md_case["database"]
+    dataset = md_case["dataset"]
     result = run_pipeline(
         destination="motherduck",
         reset_state=True,
@@ -101,26 +97,27 @@ def test_snapshot_loads_into_motherduck(fresh_seed, run_pipeline, md_token, md_d
         idle_seconds=10,
         timeout=420,
         extra_env={
-            "CDC_DATASET": md_dataset,
-            "CDC_MD_DATABASE": MD_DATABASE,
+            "CDC_DATASET": dataset,
+            "CDC_MD_DATABASE": database,
+            "CDC_CONTROL_SCHEMA": md_case["control_schema"],
             "MOTHERDUCK_TOKEN": md_token,
             "motherduck_token": md_token,
         },
     )
     assert result["destination"] == "motherduck"
-    assert result["motherduck_database"] == MD_DATABASE
-    assert result["records"] == 20, result
+    assert result["motherduck_database"] == database
+    assert source_records(result) == 20, result
 
-    con = md_connect(md_token)
+    con = md_connect(md_token, database)
     try:
-        tables = wait_for_tables(con, md_dataset)
+        tables = wait_for_tables(con, dataset)
         assert "cdcflight_app_customers" in tables, (
-            f"dataset {md_dataset!r} holds {sorted(tables)}; run summary="
+            f"dataset {dataset!r} holds {sorted(tables)}; run summary="
             f"{ {k: v for k, v in result.items() if k != 'output'} }"
         )
 
         n, ops = con.execute(
-            f'SELECT count(*), count(DISTINCT dbz_op) FROM "{MD_DATABASE}"."{md_dataset}".'
+            f'SELECT count(*), count(DISTINCT dbz_op) FROM "{database}"."{dataset}".'
             '"cdcflight_app_customers"'
         ).fetchone()
         assert n == 5
@@ -129,7 +126,7 @@ def test_snapshot_loads_into_motherduck(fresh_seed, run_pipeline, md_token, md_d
         names = {
             r[0]
             for r in con.execute(
-                f'SELECT name FROM "{MD_DATABASE}"."{md_dataset}"."cdcflight_app_customers"'
+                f'SELECT name FROM "{database}"."{dataset}"."cdcflight_app_customers"'
             ).fetchall()
         }
         assert "Ada Lovelace" in names
@@ -140,54 +137,3 @@ def test_snapshot_loads_into_motherduck(fresh_seed, run_pipeline, md_token, md_d
 def test_motherduck_token_is_available_to_the_suite(md_token):
     assert len(md_token) > 20
     assert os.environ.get("motherduck_token") or os.environ.get("MOTHERDUCK_TOKEN")
-
-
-def test_legacy_control_schema_migration_is_motherduck_compatible(md_token):
-    """The real cloud destination accepts the additive migration and its backfill."""
-    database = f"cdc_control_schema_{uuid.uuid4().hex[:8]}"
-    bootstrap = duckdb.connect(f"md:?motherduck_token={md_token}")
-    bootstrap.execute(f'CREATE DATABASE "{database}"')
-    bootstrap.close()
-
-    con = duckdb.connect(f"md:{database}?motherduck_token={md_token}")
-    try:
-        con.execute("CREATE SCHEMA _cdc_flight")
-        con.execute(
-            """
-            CREATE TABLE _cdc_flight.source_relations (
-                pipeline        VARCHAR NOT NULL,
-                source_schema   VARCHAR NOT NULL,
-                source_table    VARCHAR NOT NULL,
-                relation_oid    BIGINT NOT NULL,
-                published       BOOLEAN NOT NULL,
-                replica_identity VARCHAR,
-                first_seen_at   TIMESTAMPTZ NOT NULL,
-                last_seen_at    TIMESTAMPTZ NOT NULL,
-                PRIMARY KEY (pipeline, source_schema, source_table)
-            )
-            """
-        )
-        con.execute(
-            """
-            INSERT INTO _cdc_flight.source_relations
-            VALUES ('p', 'app', 'customers', 42, true, 'd', now(), now())
-            """
-        )
-
-        ensure_control_schema(con)
-        assert con.execute(
-            "SELECT admission_state FROM _cdc_flight.source_relations"
-        ).fetchall() == [("external",)]
-
-        # Idempotence and the state-machine refusal both run against the cloud table.
-        ensure_control_schema(con)
-        con.execute("UPDATE _cdc_flight.source_relations SET admission_state = NULL")
-        with pytest.raises(UnknownState, match="NULL"):
-            read_known_relations(con, "p")
-    finally:
-        con.close()
-        cleanup = duckdb.connect(f"md:?motherduck_token={md_token}")
-        try:
-            cleanup.execute(f'DROP DATABASE "{database}"')
-        finally:
-            cleanup.close()

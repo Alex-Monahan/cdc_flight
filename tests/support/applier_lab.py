@@ -43,6 +43,7 @@ from cdc_flight.envelope import (
     PendingRecord,
 )
 from cdc_flight.snapshot_completion import SnapshotCompletion
+from cdc_flight.typed_types import SourceTypeDescriptor
 
 TOPIC_PREFIX = "cdcflight"
 DATASET = "cdc_raw"
@@ -57,6 +58,59 @@ SNAPSHOT_TABLES = frozenset(
         "app.audit_log",
     }
 )
+
+FIXTURE_INT4 = SourceTypeDescriptor(23, "pg_catalog.int4", "int4")
+FIXTURE_FLOAT8 = SourceTypeDescriptor(701, "pg_catalog.float8", "float8")
+FIXTURE_TEXT = SourceTypeDescriptor(25, "pg_catalog.text", "text")
+FIXTURE_JSONB = SourceTypeDescriptor(3802, "pg_catalog.jsonb", "jsonb")
+FIXTURE_BYTEA = SourceTypeDescriptor(17, "pg_catalog.bytea", "bytea")
+
+
+def _fixture_descriptor(name: str, value: Any) -> SourceTypeDescriptor:
+    """Return the declared type for a synthetic lab column.
+
+    These records bypass Debezium, so the test factory supplies the schema facts that
+    ``envelope.decode`` would normally read from the Connect envelope. The production
+    applier never derives a destination type from a Python value.
+    """
+    if name in {"id", "total", "touch"}:
+        return FIXTURE_INT4
+    if isinstance(value, bool):
+        return FIXTURE_INT4
+    if isinstance(value, int):
+        return FIXTURE_INT4
+    if isinstance(value, float):
+        return FIXTURE_FLOAT8
+    if isinstance(value, (bytes, bytearray)):
+        return FIXTURE_BYTEA
+    if isinstance(value, (dict, list, tuple)):
+        return FIXTURE_JSONB
+    return FIXTURE_TEXT
+
+
+def _fixture_descriptors(image: dict | None) -> dict[str, SourceTypeDescriptor]:
+    return {
+        str(name): _fixture_descriptor(str(name), value)
+        for name, value in (image or {}).items()
+    }
+
+
+def fixture_descriptors(qualified: str) -> dict[str, SourceTypeDescriptor]:
+    """A small explicit schema authority for tests that construct Applier directly."""
+    table = str(qualified).rsplit(".", 1)[-1]
+    fields = {
+        "id": FIXTURE_INT4,
+        "name": FIXTURE_TEXT,
+        "note": FIXTURE_TEXT,
+        "full_name": FIXTURE_TEXT,
+        "nickname": FIXTURE_TEXT,
+        "body": FIXTURE_TEXT,
+        "payload": FIXTURE_TEXT,
+        "total": FIXTURE_INT4,
+        "touch": FIXTURE_INT4,
+        "value": FIXTURE_FLOAT8 if table == "sensor_readings" else FIXTURE_TEXT,
+    }
+    return fields
 
 
 class _Raw:
@@ -140,7 +194,7 @@ def data(
     before: dict | None = None,
     nbytes: int = 100,
 ) -> PendingRecord:
-    return PendingRecord(
+    record = PendingRecord(
         raw=_Raw(f"{TOPIC_PREFIX}.app.{table}"),
         kind=KIND_DATA,
         topic=f"{TOPIC_PREFIX}.app.{table}",
@@ -158,6 +212,10 @@ def data(
         source_partition=dict(PARTITION),
         source_offset=_offset(lsn, txn),
     )
+    record.key_descriptors = _fixture_descriptors(key)
+    record.before_descriptors = _fixture_descriptors(before)
+    record.after_descriptors = _fixture_descriptors(after)
+    return record
 
 
 def truncate(txn: str, order: int, lsn: int, *, table: str = "customers") -> PendingRecord:
@@ -207,7 +265,7 @@ def snap(
     nbytes: int = 100,
 ) -> PendingRecord:
     after = {"id": ident, "name": value} if ident is not None else {"name": value}
-    return PendingRecord(
+    record = PendingRecord(
         raw=_Raw(f"{TOPIC_PREFIX}.app.{table}"),
         kind=KIND_SNAPSHOT,
         topic=f"{TOPIC_PREFIX}.app.{table}",
@@ -222,6 +280,9 @@ def snap(
         source_partition=dict(PARTITION),
         source_offset=_offset(lsn),
     )
+    record.key_descriptors = _fixture_descriptors(record.key)
+    record.after_descriptors = _fixture_descriptors(after)
+    return record
 
 
 def heartbeat(lsn: int) -> PendingRecord:
@@ -249,12 +310,29 @@ class Lab:
         resume_lsn: int = 0,
         catalog=None,
         full_snapshot: bool = False,
+        connection=None,
+        dataset: str = DATASET,
+        pipeline: str = "lab",
+        namespace: str = "lab-namespace",
+        topic_prefix: str = TOPIC_PREFIX,
+        control_schema: str | None = None,
         **cfg: Any,
     ) -> None:
         self.path = Path(path)
-        self.con = duckdb.connect(str(self.path))
-        dest_mod.ensure_control_schema(self.con)
-        dest_mod.ensure_dataset(self.con, DATASET)
+        self.dataset = dataset
+        self.pipeline = pipeline
+        self.namespace = namespace
+        self.topic_prefix = topic_prefix
+        self.control_schema = control_schema
+        # Native VARIANT tables require the same storage compatibility and
+        # shredding settings as the production destination connection.  The lab
+        # drives the real applier, so opening a different DuckDB runtime contract
+        # would make native merge coverage fail before RowPatch reaches SQL.
+        self.con = connection or duckdb.connect(
+            str(self.path), config=dest_mod.DUCKDB_CONNECT_CONFIG
+        )
+        dest_mod.ensure_control_schema(self.con, control_schema)
+        dest_mod.ensure_dataset(self.con, dataset)
         self.committer = FakeCommitter()
         cfg.setdefault("verify_offset_file", False)
         self.config = ApplierConfig(**cfg)
@@ -266,14 +344,30 @@ class Lab:
             completion.observe_notification("STARTED", {})
         else:
             completion = SnapshotCompletion.streaming_only()
-        self.lease = Lease("lab", ttl_seconds=600)
+        self.lease = Lease(pipeline, ttl_seconds=600, control_schema=control_schema)
         self.lease.acquire(self.con)
+        self._fixture_descriptor_map: dict[str, dict[str, SourceTypeDescriptor]] = {}
+
+        def descriptor_provider(qualified: str):
+            if catalog is not None:
+                authority = getattr(catalog, "descriptors_for", None)
+                if authority is not None:
+                    catalog_descriptors = authority(qualified)
+                    if catalog_descriptors:
+                        merged = dict(catalog_descriptors)
+                        merged.update(self._fixture_descriptor_map.get(qualified, {}))
+                        return merged
+            return dict(
+                self._fixture_descriptor_map.get(qualified)
+                or fixture_descriptors(qualified)
+            )
+
         self.applier = Applier(
             self.con,
-            pipeline="lab",
-            namespace="lab-namespace",
-            dataset=DATASET,
-            topic_prefix=TOPIC_PREFIX,
+            pipeline=pipeline,
+            namespace=namespace,
+            dataset=dataset,
+            topic_prefix=topic_prefix,
             offset_path=self.path.parent / "offsets.dat",
             resume_point=ResumePoint(last_lsn=resume_lsn),
             config=self.config,
@@ -281,6 +375,8 @@ class Lab:
             runner_id="lab-runner",
             catalog=catalog,
             completion=completion,
+            descriptor_provider=descriptor_provider,
+            control_schema=control_schema,
         )
         self.applier._committer = self.committer
 
@@ -288,6 +384,12 @@ class Lab:
     def feed(self, records: list[PendingRecord]) -> None:
         """Assemble records into units and buffer them, exactly as `_handle` does."""
         for rec in records:
+            if rec.qualified_table:
+                descriptors = self._fixture_descriptor_map.setdefault(
+                    rec.qualified_table, {}
+                )
+                for attribute in ("key_descriptors", "before_descriptors", "after_descriptors"):
+                    descriptors.update(getattr(rec, attribute))
             for unit in self.applier.assembler.feed(rec):
                 self.applier._add_unit(unit)
 
@@ -307,19 +409,19 @@ class Lab:
         return self.q(sql, params)[0][0]
 
     def rows(self, table: str, columns: str = "*", order: str = "1") -> list[tuple]:
-        return self.q(f'SELECT {columns} FROM "{DATASET}"."{table}" ORDER BY {order}')
+        return self.q(f'SELECT {columns} FROM "{self.dataset}"."{table}" ORDER BY {order}')
 
     def exists(self, table: str) -> bool:
         return bool(
             self.scalar(
                 "SELECT count(*) FROM information_schema.tables "
                 "WHERE table_schema = ? AND table_name = ?",
-                [DATASET, table],
+                [self.dataset, table],
             )
         )
 
     def target(self, table: str) -> str:
-        return f"{TOPIC_PREFIX}_app_{table}"
+        return f"{self.topic_prefix}_app_{table}"
 
     def shadow(self, table: str) -> str:
         return f"{self.target(table)}__cdcf_tmp"

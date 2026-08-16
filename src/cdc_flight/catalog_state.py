@@ -11,7 +11,8 @@ import json
 import time
 from dataclasses import dataclass, field
 
-from .destination import CONTROL_SCHEMA
+from .config import resolve_control_schema
+from .errors import SchemaEvolutionRefused
 from .machines import (
     ADMISSION_EXTERNAL,
     ADMISSION_PENDING,
@@ -19,9 +20,12 @@ from .machines import (
     CHANGE_MARKED,
     CHANGE_OBSERVED,
     CHANGE_PENDING,
+    LIFECYCLE_GONE,
     require_admission_state,
 )
+from .naming import control_table
 from .schema_evolution import ColumnChange, SourceColumn
+from .typed_types import SourceTypeDescriptor
 
 CHANGE_DROPPED = "dropped"
 CHANGE_RECREATED = "recreated"
@@ -57,6 +61,8 @@ class SourceRelation:
     publication_all_tables: bool = False
     is_partition: bool = False
     admission_state: str | _AdmissionStateUnset | None = _ADMISSION_STATE_UNSET
+    full_activation_lsn: int | None = None
+    full_invalidation_lsn: int | None = None
 
     def __post_init__(self) -> None:
         state = self.admission_state
@@ -64,10 +70,52 @@ class SourceRelation:
             state = ADMISSION_EXTERNAL if self.published else ADMISSION_PENDING
         state = require_admission_state(state)
         object.__setattr__(self, "admission_state", state)
+        try:
+            boundary = (
+                int(self.full_activation_lsn)
+                if self.full_activation_lsn is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            boundary = None
+        object.__setattr__(
+            self,
+            "full_activation_lsn",
+            boundary if boundary is not None and boundary > 0 else None,
+        )
+        try:
+            invalidation = (
+                int(self.full_invalidation_lsn)
+                if self.full_invalidation_lsn is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            invalidation = None
+        if (
+            invalidation is None
+            or invalidation <= 0
+            or boundary is None
+            or invalidation <= boundary
+        ):
+            invalidation = None
+        object.__setattr__(self, "full_invalidation_lsn", invalidation)
 
     @property
     def qualified(self) -> str:
         return f"{self.schema}.{self.table}"
+
+    @property
+    def toast_policy(self):
+        """Current-runtime TOAST route for this catalog epoch."""
+        from .toast import classify_relation
+
+        return classify_relation(
+            self.qualified,
+            self.columns,
+            replica_identity=self.replica_identity,
+            full_activation_lsn=self.full_activation_lsn,
+            full_invalidation_lsn=self.full_invalidation_lsn,
+        )
 
 
 @dataclass
@@ -169,26 +217,51 @@ def _missing_value(raw: str | None, type_name: str) -> object | None:
     return text.replace('\\"', '"').replace('\\\\', '\\')
 
 
-def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
+def read_known_relations(
+    con, pipeline: str, *, control_schema: str | None = None
+) -> dict[str, SourceRelation]:
     rows = con.execute(
         f"SELECT source_schema, source_table, relation_oid, relation_filenode, "
         "relation_type_oid, "
-        "published, replica_identity, columns_json, admission_state "
-        f"FROM {CONTROL_SCHEMA}.source_relations WHERE pipeline = ?",
+        "published, replica_identity, full_activation_lsn, full_invalidation_lsn, "
+        "columns_json, admission_state "
+        f"FROM {control_table(resolve_control_schema(control_schema), 'source_relations')} "
+        "WHERE pipeline = ?",
         [pipeline],
     ).fetchall()
     known: dict[str, SourceRelation] = {}
-    for (
-        schema,
-        table,
-        oid,
-        relfilenode,
-        relation_type_oid,
-        published,
-        identity,
-        columns_json,
-        admission_state,
-    ) in rows:
+    for row in rows:
+        # Keep the reader tolerant of the pre-interval shape used by old embedded
+        # callers while the durable control-schema migration is rolling forward.
+        # This is state-column compatibility only; it never invents a descriptor or
+        # an identity candidate.
+        if len(row) == 9:
+            (
+                schema, table, oid, relfilenode, relation_type_oid, published,
+                identity, columns_json, admission_state,
+            ) = row
+            full_activation_lsn = None
+            full_invalidation_lsn = None
+        elif len(row) == 10:
+            (
+                schema, table, oid, relfilenode, relation_type_oid, published,
+                identity, full_activation_lsn, columns_json, admission_state,
+            ) = row
+            full_invalidation_lsn = None
+        else:
+            (
+                schema,
+                table,
+                oid,
+                relfilenode,
+                relation_type_oid,
+                published,
+                identity,
+                full_activation_lsn,
+                full_invalidation_lsn,
+                columns_json,
+                admission_state,
+            ) = row
         try:
             raw_columns = json.loads(columns_json or "[]")
         except (TypeError, ValueError):
@@ -199,11 +272,14 @@ def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
                 name=str(raw["name"]),
                 type_oid=int(raw["type_oid"]),
                 type_name=str(raw["type_name"]),
+                typmod=(int(raw["typmod"]) if raw.get("typmod") is not None else None),
                 nullable=bool(raw.get("nullable", True)),
                 has_missing_default=bool(raw.get("has_missing_default", False)),
                 missing_value=_missing_value(
                     raw.get("missing_value_text"), str(raw["type_name"])
                 ),
+                attstorage=(str(raw["attstorage"]) if raw.get("attstorage") else None),
+                descriptor=_durable_descriptor(raw, schema=schema, table=table),
             )
             for raw in raw_columns
         )
@@ -218,6 +294,16 @@ def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
             published=bool(published),
             replica_identity=identity or "d",
             columns=columns,
+            full_activation_lsn=(
+                int(full_activation_lsn)
+                if full_activation_lsn is not None and int(full_activation_lsn) > 0
+                else None
+            ),
+            full_invalidation_lsn=(
+                int(full_invalidation_lsn)
+                if full_invalidation_lsn is not None and int(full_invalidation_lsn) > 0
+                else None
+            ),
             # This is a durable read, so NULL must reach the machine boundary and be
             # refused; it is not an observation that may derive a default from `published`.
             admission_state=admission_state,
@@ -225,10 +311,54 @@ def read_known_relations(con, pipeline: str) -> dict[str, SourceRelation]:
     return known
 
 
-def seed_from_table_state(con, pipeline: str) -> set[str]:
+def _durable_descriptor(
+    raw: dict, *, schema: str, table: str
+) -> SourceTypeDescriptor:
+    """Load only catalog-authoritative descriptors from durable state."""
+    serialized = raw.get("descriptor")
+    if not serialized:
+        raise SchemaEvolutionRefused(
+            f"catalog descriptor authority is incomplete for {schema}.{table}."
+            f"{raw.get('name', '<unknown>')}: refusing to infer type "
+            f"OID {raw.get('type_oid')} from {raw.get('type_name')!r}",
+            source_schema=str(schema),
+            source_table=str(table),
+            target=f"{schema}.{table}",
+            refusal_origin="catalog_state",
+        )
+    try:
+        return SourceTypeDescriptor.from_dict(serialized)
+    except (TypeError, ValueError, KeyError) as exc:
+        raise SchemaEvolutionRefused(
+            f"catalog descriptor authority is corrupt for {schema}.{table}."
+            f"{raw.get('name', '<unknown>')}: refusing to infer type",
+            source_schema=str(schema),
+            source_table=str(table),
+            target=f"{schema}.{table}",
+            refusal_origin="catalog_state",
+        ) from exc
+
+
+def seed_from_table_state(
+    con, pipeline: str, *, control_schema: str | None = None
+) -> set[str]:
     rows = con.execute(
-        f"SELECT source_schema, source_table FROM {CONTROL_SCHEMA}.table_state "
-        "WHERE pipeline = ?",
-        [pipeline],
+        f"SELECT source_schema, source_table FROM "
+        f"{control_table(resolve_control_schema(control_schema), 'table_state')} "
+        "WHERE pipeline = ? AND snapshot_state <> ?",
+        [pipeline, LIFECYCLE_GONE],
+    ).fetchall()
+    return {f"{schema}.{table}" for schema, table in rows}
+
+
+def gone_from_table_state(
+    con, pipeline: str, *, control_schema: str | None = None
+) -> set[str]:
+    """Return terminal source names that may only re-enter via a new generation."""
+    rows = con.execute(
+        f"SELECT source_schema, source_table FROM "
+        f"{control_table(resolve_control_schema(control_schema), 'table_state')} "
+        "WHERE pipeline = ? AND snapshot_state = ?",
+        [pipeline, LIFECYCLE_GONE],
     ).fetchall()
     return {f"{schema}.{table}" for schema, table in rows}

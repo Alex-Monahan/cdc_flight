@@ -43,8 +43,13 @@ def crashed_recovery(tmp_path_factory, postgres_cluster):
         box.run(reset_state=True, max_seconds=150)
 
         # The data an advance discards: this is what a rubric-1 tool loses silently.
+        # `synchronous_commit` is off in this cluster, so the COMMIT alone does not
+        # put these rows inside `pg_current_wal_lsn()` and the advance below would
+        # strand nothing — leaving the whole scenario (the detection, the recovery,
+        # the anchor) unreachable for a reason that has nothing to do with it.
         box.sql(
             [
+                "SET synchronous_commit = on",
                 "INSERT INTO app.customers (name, email) SELECT 'rc-' || i, "
                 f"'rc-' || i || '@example.com' FROM generate_series(1, {ROWS}) i",
                 "INSERT INTO app.sensor_readings (sensor_id, value, unit) SELECT "
@@ -52,9 +57,24 @@ def crashed_recovery(tmp_path_factory, postgres_cluster):
             ],
             one_transaction=True,
         )
+        durable_before = int(
+            box.duck_query("SELECT last_lsn FROM _cdc_flight.debezium_offsets")[0][0]
+        )
         box.pg_query(
             "SELECT end_lsn::text FROM pg_replication_slot_advance(%s, pg_current_wal_lsn())",
             (box.slot,),
+        )
+        confirmed = int(
+            box.pg_query(
+                "SELECT (confirmed_flush_lsn - '0/0')::bigint "
+                "FROM pg_replication_slots WHERE slot_name = %s",
+                (box.slot,),
+            )[0][0]
+        )
+        # The precondition, asserted rather than assumed (test-audit finding F6).
+        assert confirmed > durable_before, (
+            "the advance did not strand anything, so no acquisition recovery can "
+            f"be armed: confirmed_flush={confirmed}, durable={durable_before}"
         )
 
         box.clear_fired_fault()

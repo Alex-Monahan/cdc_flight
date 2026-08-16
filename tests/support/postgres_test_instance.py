@@ -249,25 +249,49 @@ class PostgresTestInstance:
             (self.worker_database_prefix, self.template_database_prefix)
         )
 
-    def drop_database(self, admin: SourceConfig, dbname: str) -> None:
+    def drop_database(
+        self, admin: SourceConfig, dbname: str, *, attempts: int = 3, delay: float = 0.2
+    ) -> None:
         self.require_disposable_cluster(admin)
-        with psycopg.connect(admin.dsn, autocommit=True) as conn:
-            conn.execute(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                "WHERE datname = %s AND pid <> pg_backend_pid()",
-                (dbname,),
-            )
-            slots = conn.execute(
-                "SELECT r.slot_name FROM pg_replication_slots AS r "
-                "WHERE r.database = %s",
-                (dbname,),
-            ).fetchall()
-            for (slot,) in slots:
-                with contextlib.suppress(Exception):
-                    conn.execute("SELECT pg_drop_replication_slot(%s)", (slot,))
-            conn.execute(
-                sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(dbname))
-            )
+        if attempts < 1:
+            raise ValueError("attempts must be positive")
+        last_error: BaseException | None = None
+        for attempt in range(attempts):
+            try:
+                # A new admin connection for every attempt prevents a failed DROP
+                # from leaving this helper attached to the database it is removing.
+                with psycopg.connect(admin.dsn, autocommit=True) as conn:
+                    conn.execute(
+                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                        "WHERE datname = %s AND pid <> pg_backend_pid()",
+                        (dbname,),
+                    )
+                    slots = conn.execute(
+                        "SELECT r.slot_name FROM pg_replication_slots AS r "
+                        "WHERE r.database = %s",
+                        (dbname,),
+                    ).fetchall()
+                    for (slot,) in slots:
+                        conn.execute("SELECT pg_drop_replication_slot(%s)", (slot,))
+                    conn.execute(
+                        sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(dbname))
+                    )
+                with psycopg.connect(admin.dsn, autocommit=True) as verify:
+                    exists = verify.execute(
+                        "SELECT 1 FROM pg_database WHERE datname = %s", (dbname,)
+                    ).fetchone()
+                if exists is None:
+                    return
+                last_error = RuntimeError(
+                    f"Postgres still lists scratch database {dbname!r} after DROP"
+                )
+            except BaseException as exc:
+                last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(delay)
+        raise RuntimeError(
+            f"could not prove Postgres scratch database {dbname!r} was dropped"
+        ) from last_error
 
     def create_database(self, admin: SourceConfig, dbname: str, template: str) -> None:
         with psycopg.connect(admin.dsn, autocommit=True) as conn:
@@ -501,5 +525,4 @@ def postgres_cluster(exclusive_source: Path) -> Iterator[SourceConfig]:
     try:
         yield worker_source
     finally:
-        with contextlib.suppress(Exception):
-            INSTANCE.drop_database(admin, worker_source.dbname)
+        INSTANCE.drop_database(admin, worker_source.dbname)

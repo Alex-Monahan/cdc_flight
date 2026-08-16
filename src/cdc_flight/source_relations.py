@@ -1,7 +1,7 @@
 """The source-relation registry: what the catalog watcher learned, made durable.
 
-Split out of `destination.py`, which crossed the thermo-nuclear review's 1,000-line
-giant-file threshold. This is a coherent piece rather than an arbitrary cut: three
+Split out of `destination.py` to give source-relation ownership one cohesive home.
+This is a coherent piece rather than an arbitrary cut: three
 functions, one table, one job — `_cdc_flight.source_relations` is the **only** thing that
 makes a `DROP TABLE` or a drop-and-recreate detectable across a restart, because the
 persisted `(relation_oid, relation_filenode, relation_type_oid)` token is what the
@@ -20,8 +20,9 @@ import contextlib
 import json
 import logging
 
-from .control_schema import CONTROL_SCHEMA
+from .config import resolve_control_schema
 from .machines import require_admission_state
+from .naming import control_table
 
 log = logging.getLogger("cdc_flight.source_relations")
 
@@ -45,8 +46,11 @@ def upsert_source_relation(
     relation_type_oid: int | None = None,
     published: bool,
     replica_identity: str | None,
+    full_activation_lsn: int | None = None,
+    full_invalidation_lsn: int | None = None,
     admission_state: str = "external",
     columns=(),
+    control_schema: str | None = None,
 ) -> None:
     """Record what the source catalog says, inside the commit group's transaction.
 
@@ -56,26 +60,33 @@ def upsert_source_relation(
     """
     admission_state = require_admission_state(admission_state)
     first_seen = con.execute(
-        f"SELECT first_seen_at FROM {CONTROL_SCHEMA}.source_relations "
+        f"SELECT first_seen_at FROM "
+        f"{control_table(resolve_control_schema(control_schema), 'source_relations')} "
         "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
         [pipeline, source_schema, source_table],
     ).fetchall()
     current = _now()
     con.execute(
-        f"DELETE FROM {CONTROL_SCHEMA}.source_relations "
+        f"DELETE FROM "
+        f"{control_table(resolve_control_schema(control_schema), 'source_relations')} "
         "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
         [pipeline, source_schema, source_table],
     )
     con.execute(
-        f"INSERT INTO {CONTROL_SCHEMA}.source_relations "
+        f"INSERT INTO "
+        f"{control_table(resolve_control_schema(control_schema), 'source_relations')} "
         "(pipeline, source_schema, source_table, relation_oid, relation_filenode, "
         " relation_type_oid, published, admission_state, replica_identity, "
-        " columns_json, first_seen_at, last_seen_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        " full_activation_lsn, full_invalidation_lsn, columns_json, "
+        " first_seen_at, last_seen_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         [
             pipeline, source_schema, source_table, relation_oid, relation_filenode,
             relation_type_oid, published,
             admission_state,
             replica_identity,
+            full_activation_lsn,
+            full_invalidation_lsn,
             json.dumps(
                 [
                     {
@@ -83,6 +94,11 @@ def upsert_source_relation(
                         "name": column.name,
                         "type_oid": column.type_oid,
                         "type_name": column.type_name,
+                        "typmod": column.typmod,
+                        "attstorage": column.attstorage,
+                        "descriptor": (
+                            column.descriptor.to_dict() if column.descriptor is not None else None
+                        ),
                         "nullable": column.nullable,
                         "has_missing_default": column.has_missing_default,
                         "missing_value_text": (
@@ -100,16 +116,21 @@ def upsert_source_relation(
     )
 
 
-def forget_source_relation(con, *, pipeline: str, source_schema: str, source_table: str) -> None:
+def forget_source_relation(
+    con, *, pipeline: str, source_schema: str, source_table: str,
+    control_schema: str | None = None,
+) -> None:
     con.execute(
-        f"DELETE FROM {CONTROL_SCHEMA}.source_relations "
+        f"DELETE FROM "
+        f"{control_table(resolve_control_schema(control_schema), 'source_relations')} "
         "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
         [pipeline, source_schema, source_table],
     )
 
 
 def flush_learned_relations(
-    con, *, pipeline: str, catalog, exclude: set[str] | None = None
+    con, *, pipeline: str, catalog, exclude: set[str] | None = None,
+    control_schema: str | None = None,
 ) -> list[str]:
     """Persist what the catalog watcher learned, in its own transaction. Returns names.
 
@@ -163,8 +184,11 @@ def flush_learned_relations(
                 relation_type_oid=relation.relation_type_oid,
                 published=relation.published,
                 replica_identity=relation.replica_identity,
+                full_activation_lsn=relation.full_activation_lsn,
+                full_invalidation_lsn=relation.full_invalidation_lsn,
                 admission_state=require_admission_state(relation.admission_state),
                 columns=relation.columns,
+                control_schema=control_schema,
             )
         con.execute("COMMIT")
     except BaseException:

@@ -31,9 +31,12 @@ import pytest
 
 from cdc_flight.config import motherduck_token
 
-pytestmark = [pytest.mark.motherduck, pytest.mark.e2e]
+pytestmark = [
+    pytest.mark.motherduck,
+    pytest.mark.e2e,
+    pytest.mark.xdist_group("md_1_3_fault"),
+]
 
-MD_DATABASE = "cdc_flight_dev"
 REFRESH = "FORCE CHECKPOINT"
 N = 20
 #: (anchor, tag). Two anchors, not seven: each is a crash plus a recovery run
@@ -50,19 +53,18 @@ def md_token() -> str:
 
 
 @pytest.fixture(scope="module")
-def md_crashed(sandbox, md_token) -> dict:
+def md_crashed(sandbox, md_token, motherduck_module_case) -> dict:
+    database = motherduck_module_case["database"]
     dataset = f"cdc_fault_{uuid.uuid4().hex[:8]}"
-    dsn = f"md:{MD_DATABASE}?motherduck_token={md_token}"
+    control_schema = motherduck_module_case["control_schema"]
+    dsn = f"md:{database}?motherduck_token={md_token}"
     env = {
         "CDC_DATASET": dataset,
-        "CDC_MD_DATABASE": MD_DATABASE,
+        "CDC_MD_DATABASE": database,
+        "CDC_CONTROL_SCHEMA": control_schema,
         "MOTHERDUCK_TOKEN": md_token,
         "motherduck_token": md_token,
     }
-
-    bootstrap = duckdb.connect(f"md:?motherduck_token={md_token}")
-    bootstrap.execute(f'CREATE DATABASE IF NOT EXISTS "{MD_DATABASE}"')
-    bootstrap.close()
 
     sandbox.reseed()
     sandbox.run(
@@ -95,9 +97,15 @@ def md_crashed(sandbox, md_token) -> dict:
     con = duckdb.connect(dsn)
     con.execute(REFRESH)
     try:
-        yield {"con": con, "dataset": dataset, "results": results, "n": N}
+        yield {
+            "con": con,
+            "database": database,
+            "control_schema": control_schema,
+            "dataset": dataset,
+            "results": results,
+            "n": N,
+        }
     finally:
-        con.execute(f'DROP SCHEMA IF EXISTS "{MD_DATABASE}"."{dataset}" CASCADE')
         con.close()
 
 

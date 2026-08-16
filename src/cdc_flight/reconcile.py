@@ -23,13 +23,16 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import destination as dest_mod
 from . import recovery as recovery_mod
-from .destination import CONTROL_SCHEMA, raise_alert
+from .config import resolve_control_schema
+from .destination import raise_alert
 from .errors import (
     NoDurableDestinationRow,
     SlotAheadOfDestination,
 )
 from .machines import SLOT_VERDICTS
+from .naming import control_table
 from .offsets import Reconciliation, reconcile
 
 __all__ = ["Reconciliation", "reconcile"]
@@ -471,6 +474,7 @@ def recover_by_full_resnapshot(
     captured_tables: list[tuple[str, str, str]],
     forget_catalog: bool = False,
     on_phase=None,
+    control_schema: str | None = None,
 ) -> dict:
     """Rubric 1.8's automatic recovery: rebuild every captured table from the source.
 
@@ -504,6 +508,7 @@ def recover_by_full_resnapshot(
         captured_tables=captured_tables,
         forget_catalog=forget_catalog,
         context=verdict.as_dict(),
+        control_schema=control_schema,
     )
     return recovery_mod.resume(
         con,
@@ -512,6 +517,7 @@ def recover_by_full_resnapshot(
         record=record,
         dsn=dsn,
         on_phase=on_phase,
+        control_schema=control_schema,
     )
 
 
@@ -531,6 +537,7 @@ def check_invariant_o(
     slot_name: str,
     snapshot_mode: str | None = None,
     raise_on_violation: bool = True,
+    control_schema: str | None = None,
 ) -> dict:
     """`slot.confirmed_flush_lsn <= debezium_offsets.last_lsn`, plus the cell it lacked.
 
@@ -548,7 +555,8 @@ def check_invariant_o(
     captured table in full, and it is never "healthy".
     """
     rows = con.execute(
-        f"SELECT last_lsn FROM {CONTROL_SCHEMA}.debezium_offsets "
+        f"SELECT last_lsn FROM "
+        f"{control_table(resolve_control_schema(control_schema), 'debezium_offsets')} "
         "WHERE pipeline = ? AND namespace = ?",
         [pipeline, namespace],
     ).fetchall()
@@ -570,7 +578,8 @@ def check_invariant_o(
         backfills = (snapshot_mode or "") in SNAPSHOT_MODES_WITH_DATA
         message = (
             f"replication slot {slot_name!r} exists with confirmed_flush_lsn={confirmed} "
-            f"but {CONTROL_SCHEMA}.debezium_offsets has no row for pipeline={pipeline!r}: "
+            f"but {control_table(resolve_control_schema(control_schema), 'debezium_offsets')} "
+            f"has no row for pipeline={pipeline!r}: "
             "nothing before that position is durable here"
         )
         if backfills:
@@ -582,10 +591,24 @@ def check_invariant_o(
             return result
         result["ok"] = False
         result["decision"] = "no_durable_destination_row"
-        raise_alert(
-            con, pipeline=pipeline, severity="critical",
-            code="no_durable_destination_row", message=message, context=result,
-        )
+        # The condition is standing while the slot remains at the same confirmed
+        # position, but a repaired/recreated slot (or a newly advanced position)
+        # is a new incident and must not be hidden by an old alert row (R14-11).
+        marker_value = f"{slot_name}:no_durable_destination_row:{confirmed}"
+        if not dest_mod.alert_marker_exists(
+            con,
+            pipeline=pipeline,
+            code="no_durable_destination_row",
+            marker_key="condition_marker",
+            marker_value=marker_value,
+            control_schema=control_schema,
+        ):
+            raise_alert(
+                con, pipeline=pipeline, severity="critical",
+                code="no_durable_destination_row", message=message,
+                context=result | {"condition_marker": marker_value},
+                control_schema=control_schema,
+            )
         if raise_on_violation:
             raise NoDurableDestinationRow(
                 f"REFUSING TO START: {message}. snapshot.mode={snapshot_mode!r} does not "
@@ -605,6 +628,7 @@ def check_invariant_o(
         raise_alert(
             con, pipeline=pipeline, severity="critical",
             code="slot_ahead_of_destination", message=message, context=result,
+            control_schema=control_schema,
         )
         if raise_on_violation:
             raise SlotAheadOfDestination(message)

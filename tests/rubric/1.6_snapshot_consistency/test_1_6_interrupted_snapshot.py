@@ -21,6 +21,8 @@ dangerous instants, and both are tested here at an exact anchor rather than by r
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from support.fixtures import Sandbox
 
@@ -49,7 +51,27 @@ pytestmark = pytest.mark.slow
 #: Verified state at the crash: one shadow table, `table_state.snapshot_state='in_progress'`,
 #: no live table at all.
 PRELOAD = 3000
-CHUNKED = {"CDC_COMMIT_MAX_EVENTS": "1000", "CDC_SNAPSHOT_CHUNK_EVENTS": "500"}
+#: ROUND 12. `post_commit_pre_ack:1` fires on the FIRST commit group, and a group is
+#: closed once per Debezium batch — so which table that group contains is decided by
+#: Debezium's batching, not by us. With the whole default capture set, a *small* table
+#: (`app.audit_log` has three seeded rows) can be the entire first batch, in which case
+#: its snapshot COMPLETES and its shadow is swapped away inside that same group. The
+#: crash then lands after a finished table instead of inside an unfinished one, no
+#: shadow survives, and the scenario proves nothing — measured on this host as
+#: `commits=[(1,'snapshot_chunk',1,3,0,['cdcflight_app_audit_log'])], shadows=[]`.
+#: The reviewer named this same node as order-dependent at f8aeb33 (r11 R11-4).
+#:
+#: The precondition is now structural rather than lucky: this scenario captures ONLY
+#: `app.customers`, whose 3 000 preloaded rows exceed Debezium's 2 048-row default
+#: batch, so the first group necessarily holds a PARTIAL customers image. Nothing is
+#: relaxed — every assertion in this module is about `app.customers` and the shadow
+#: catalog, both of which are still compared in full against the source.
+ONLY_CUSTOMERS = {"CDC_TABLES": "customers", "CDC_AUTO_DISCOVERY": "0"}
+CHUNKED = {
+    "CDC_COMMIT_MAX_EVENTS": "1000",
+    "CDC_SNAPSHOT_CHUNK_EVENTS": "500",
+    **ONLY_CUSTOMERS,
+}
 
 
 def _source(box: Sandbox) -> set[str]:
@@ -63,14 +85,28 @@ def _dest(box: Sandbox) -> set[str]:
     }
 
 
-def _shadows(box: Sandbox) -> list[str]:
-    return [
-        str(r[0])
-        for r in box.duck_query(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_name LIKE '%__cdcf_tmp'"
-        )
-    ]
+def _shadows(box: Sandbox, *, wait_seconds: float = 0.0) -> list[str]:
+    """Read the committed shadow catalog, retrying a just-crashed DuckDB reader."""
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        shadows = [
+            str(r[0])
+            for r in box.duck_query(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_name LIKE '%__cdcf_tmp'"
+            )
+        ]
+        if shadows or time.monotonic() >= deadline:
+            return shadows
+        time.sleep(0.1)
+
+
+def _shadow_counts(box: Sandbox) -> dict[str, int]:
+    """Read durable row counts before recovery changes the interrupted state."""
+    return {
+        name: int(box.duck_query(f"SELECT count(*) FROM {box.table(name)}")[0][0])
+        for name in _shadows(box)
+    }
 
 
 @pytest.fixture(scope="module")
@@ -98,7 +134,17 @@ def interrupted(tmp_path_factory, postgres_cluster):
             extra_env={**CHUNKED, "CDC_FAULT_INJECT": "post_commit_pre_ack:1"},
         )
         mid_crash_tables = _dest(box) if _dest_exists(box) else set()
-        mid_crash_shadows = _shadows(box)
+        # The fault exits immediately after COMMIT. Under xdist load, a new DuckDB
+        # reader can briefly open before the committed catalog checkpoint is visible;
+        # retry the read itself, not the pipeline, and still fail if the durable shadow
+        # never appears.
+        mid_crash_shadows = _shadows(box, wait_seconds=10.0)
+        mid_crash_shadow_counts = _shadow_counts(box)
+        mid_crash_fault = box.fired_fault()
+        mid_crash_commit_log = box.duck_query(
+            "SELECT commit_id, trigger, unit_count, event_count, fenced_units, "
+            "tables_touched FROM _cdc_flight.commit_log ORDER BY commit_id"
+        )
         recovered = box.run(max_seconds=240, extra_env=CHUNKED)
         yield {
             "box": box,
@@ -106,6 +152,9 @@ def interrupted(tmp_path_factory, postgres_cluster):
             "recovered": recovered,
             "mid_crash_tables": mid_crash_tables,
             "mid_crash_shadows": mid_crash_shadows,
+            "mid_crash_shadow_counts": mid_crash_shadow_counts,
+            "mid_crash_fault": mid_crash_fault,
+            "mid_crash_commit_log": mid_crash_commit_log,
         }
     finally:
         box.cleanup()
@@ -133,10 +182,28 @@ def test_the_partial_snapshot_was_durable_and_invisible(interrupted):
     The first half is what makes the second one mean something: if nothing had been
     committed there would be no partial state to hide.
     """
+    fault = interrupted["mid_crash_fault"]
+    assert fault and fault["point"] == "post_commit_pre_ack" and fault["nth"] == 1, fault
+    commits = interrupted["mid_crash_commit_log"]
+    snapshot_commits = [row for row in commits if row[1] == "snapshot_chunk"]
+    assert snapshot_commits, commits
+    assert any(row[3] > 0 and row[4] == 0 for row in snapshot_commits), commits
+    shadow_targets = {
+        name.removesuffix("__cdcf_tmp")
+        for name in interrupted["mid_crash_shadows"]
+    }
+    assert any(
+        any(str(table) in shadow_targets for table in row[5])
+        for row in snapshot_commits
+    ), {
+        "commits": commits,
+        "shadows": interrupted["mid_crash_shadows"],
+    }
     assert interrupted["mid_crash_shadows"], (
         "no shadow table survived the crash, so no partial image was ever durable and "
         "this scenario proves nothing"
     )
+    assert all(count > 0 for count in interrupted["mid_crash_shadow_counts"].values())
     assert interrupted["mid_crash_tables"] == set(), interrupted["mid_crash_tables"]
 
 

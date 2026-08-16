@@ -24,6 +24,7 @@ from .ownership import DestinationOwnership
 from .run_state import RunOutcome, RunPhaseWriter
 from .snapshot_completion import SnapshotCompletion
 from .source_health import SourceHealth
+from .source_marker import SourceMarker
 from .supervisor import run_engine_bounded
 
 log = logging.getLogger("cdc_flight.discovery_coordinator")
@@ -59,6 +60,7 @@ class LiveDiscoveryCoordinator:
         outcome: RunOutcome,
         summary_extra: dict[str, Any],
         resnapshot_enabled: bool,
+        descriptor_provider=None,
         catalog_flush_exclude: set[str] | None = None,
     ) -> None:
         self.con = con
@@ -85,6 +87,11 @@ class LiveDiscoveryCoordinator:
         self.outcome = outcome
         self.summary_extra = summary_extra
         self._resnapshot_enabled = resnapshot_enabled
+        # In the normal path the live CatalogWatcher is the provider.  Explicit
+        # no-watcher modes (for example CDC_DROP_MODE=ignore) still need the
+        # source catalog's type authority for typed rows, supplied as a one-shot
+        # immutable provider by pipeline.py.
+        self.descriptor_provider = descriptor_provider
         self.catalog_flush_exclude = set(catalog_flush_exclude or ())
 
         self.applier = None
@@ -138,6 +145,15 @@ class LiveDiscoveryCoordinator:
                 self.health = SourceHealth(
                     dsn=self.source.dsn,
                     slot_name=self.replication.slot_name,
+                    primary_dsn=self.source.primary_dsn,
+                    source_marker=(
+                        getattr(self.watcher, "marker", None)
+                        or SourceMarker(
+                            prefix=self.catalog_cfg.marker_prefix,
+                            enabled=self.catalog_cfg.emit_marker,
+                            max_writes=self.catalog_cfg.marker_max_writes or None,
+                        )
+                    ),
                     max_lag_bytes=self.run_cfg.idle_max_lag_bytes,
                 ).start()
                 if self.phases.phase != PHASE_STREAMING:
@@ -177,6 +193,13 @@ class LiveDiscoveryCoordinator:
                     keep_catalog=discovery_handoff_enabled,
                     stop_when=discovery_ready if discovery_handoff_enabled else None,
                 )
+                # A background catalog poll can discover an incomplete strict
+                # descriptor after startup.  The watcher is quiesced by
+                # ``run_engine_bounded`` before this point, so persist that refusal
+                # before completion evaluates durable obligations.  Otherwise the
+                # refusal would exist only in process memory and a quiet run could
+                # publish a partial destination as successful.
+                self._persist_catalog_refusals()
                 self.health.stop()
                 self.health = None
 
@@ -207,7 +230,10 @@ class LiveDiscoveryCoordinator:
                         dict(self.result),
                     )
                 self.main_resume = dest_mod.read_resume_point(
-                    self.con, self.destination.pipeline_name, self.namespace
+                    self.con,
+                    self.destination.pipeline_name,
+                    self.namespace,
+                    control_schema=self.destination.control_schema,
                 ) or self.applier.resume_point
                 tables = [
                     (
@@ -227,6 +253,7 @@ class LiveDiscoveryCoordinator:
                         "a new source relation was discovered while the pipeline was "
                         "running; the main slot remains active during its re-snapshot"
                     ),
+                    control_schema=self.destination.control_schema,
                 )
                 self.phases.to(
                     PHASE_SNAPSHOTTING, detail="live catalog discovery hand-off"
@@ -249,6 +276,7 @@ class LiveDiscoveryCoordinator:
                     ownership=self.ownership,
                     new_relations={relation.qualified for relation in newly_discovered},
                     drop_mode=self.applier_cfg.drop_mode,
+                    control_schema=self.destination.control_schema,
                 )
                 self.watcher.complete_discoveries(
                     {relation.qualified for relation in newly_discovered}
@@ -270,7 +298,9 @@ class LiveDiscoveryCoordinator:
                     resnap.snapshot_epoch,
                 )
                 self.watermarks = resnapshot_mod.read_watermarks(
-                    self.con, self.destination.pipeline_name
+                    self.con,
+                    self.destination.pipeline_name,
+                    control_schema=self.destination.control_schema,
                 )
                 handled_discoveries.update(
                     relation.qualified for relation in newly_discovered
@@ -298,6 +328,21 @@ class LiveDiscoveryCoordinator:
             watcher_quiesced = True
             if self.watcher is not None:
                 watcher_quiesced = self.watcher.stop()
+            if watcher_quiesced:
+                try:
+                    self._persist_catalog_refusals()
+                except Exception:
+                    # Preserve the original exception/summary while making the
+                    # persistence failure visible in teardown diagnostics.  The
+                    # normal path above is the completion gate; this branch covers
+                    # supervisor failures that unwind before completion.
+                    self.summary_extra["catalog_schema_refusal_flush_error"] = (
+                        "could not persist catalog schema refusal during teardown"
+                    )
+                    log.error(
+                        "could not persist catalog schema refusals during teardown",
+                        exc_info=True,
+                    )
             if watcher_quiesced and self.ownership.retire_if_quiescent(
                 reason="discovery_coordinator_teardown"
             ):
@@ -311,6 +356,7 @@ class LiveDiscoveryCoordinator:
                         pipeline=self.destination.pipeline_name,
                         catalog=self.watcher,
                         exclude=self.catalog_flush_exclude,
+                        control_schema=self.destination.control_schema,
                     )
                     if learned:
                         self.summary_extra["source_relations_persisted"] = learned
@@ -322,6 +368,34 @@ class LiveDiscoveryCoordinator:
                         "could not persist source-catalog observations during teardown",
                         exc_info=True,
                     )
+
+    def _persist_catalog_refusals(self) -> None:
+        """Make watcher-side descriptor refusals durable before completion."""
+        if self.watcher is None:
+            return
+        refusals = self.watcher.schema_refusals()
+        for refused in refusals:
+            source_tables = refused.source_tables or (
+                ((refused.source_schema, refused.source_table, refused.target),)
+                if refused.source_schema and refused.source_table
+                else ()
+            )
+            for source_schema, source_table, target_table in source_tables:
+                dest_mod.record_schema_refusal(
+                    self.con,
+                    pipeline=self.destination.pipeline_name,
+                    source_schema=source_schema,
+                    source_table=source_table,
+                    target_table=target_table,
+                    detected_lsn=refused.detected_lsn,
+                    reason=str(refused),
+                    input_fingerprint=refused.input_fingerprint,
+                    source_fingerprint=refused.source_fingerprint,
+                )
+        if refusals:
+            self.summary_extra["catalog_schema_refusals"] = [
+                str(refused) for refused in refusals
+            ]
 
     def _resume_properties(self) -> dict:
         """Make the second engine an explicit stream resume."""
@@ -336,6 +410,7 @@ class LiveDiscoveryCoordinator:
             namespace=self.namespace,
             dataset=self.destination.dataset_name,
             topic_prefix=self.replication.topic_prefix,
+            marker_prefixes=("cdcf", self.catalog_cfg.marker_prefix),
             offset_path=self.replication.offset_file,
             resume_point=self.main_resume,
             config=self.applier_cfg,
@@ -343,8 +418,12 @@ class LiveDiscoveryCoordinator:
             runner_id=self.runner_id,
             transactional_ddl=self.transactional_ddl,
             catalog=self.watcher,
+            descriptor_provider=self.descriptor_provider,
             watermarks=self.watermarks,
             completion=completion,
+            binary_handling_mode=self.props.get("binary.handling.mode", "base64"),
+            hstore_handling_mode=self.props.get("hstore.handling.mode", "map"),
+            control_schema=self.destination.control_schema,
         )
         self.ownership.attach(applier)
         return applier

@@ -14,7 +14,41 @@ from collections.abc import Callable
 from .catalog import CHANGE_SCHEMA
 from .catalog_apply import CatalogPlan
 from .errors import SchemaEvolutionRefused
-from .schema_evolution import COLUMN_ADDED, COLUMN_DROPPED, COLUMN_RENAMED
+from .schema_evolution import COLUMN_ADDED, COLUMN_DROPPED, COLUMN_RENAMED, COLUMN_TYPE_CHANGED
+
+
+def _type_change_epoch(event, change, table: str) -> str | None:
+    """Classify a same-name type change from recursive source fingerprints."""
+    old = change.old_descriptor
+    new = change.new_descriptor
+    old_identity = old.fingerprint if old is not None else (
+        f"{change.old_type_oid}:{str(change.old_type_name or '').lower()}"
+    )
+    new_identity = new.fingerprint if new is not None else (
+        f"{change.type_oid}:{str(change.type_name or '').lower()}"
+    )
+    observed: set[str] = set()
+    for attribute in ("key_descriptors", "before_descriptors", "after_descriptors"):
+        for descriptor in getattr(event, attribute, {}).values():
+            fingerprint = descriptor.fingerprint
+            if fingerprint == old_identity:
+                observed.add("pre")
+            if fingerprint == new_identity:
+                observed.add("post")
+    if not observed:
+        raise SchemaEvolutionRefused(
+            f"type-change evidence for {table}.{change.destination_new_name or change.destination_old_name} "
+            "has no catalog descriptor fingerprint; the source unit is held rather "
+            "than inferred from a same-name field",
+            source_schema=event.schema,
+            source_table=event.table,
+            target=table,
+            detected_lsn=None,
+            refusal_origin="schema_epoch",
+        )
+    if len(observed) > 1:
+        return "mixed"
+    return next(iter(observed))
 
 
 def events_for_schema_check(spill, unit, commit_id: int) -> list:
@@ -52,6 +86,23 @@ def refuse_mixed_schema_epoch(events: list, actions: list) -> None:
             old = change.destination_old_name
             new = change.destination_new_name
             epoch = None
+            if change.kind == COLUMN_TYPE_CHANGED or (
+                change.kind == COLUMN_RENAMED and change.type_changed
+            ):
+                epoch = _type_change_epoch(event, change, table)
+                if epoch == "mixed":
+                    raise SchemaEvolutionRefused(
+                        f"row shape for {table} contains both old and new recursive "
+                        "type descriptors for the same schema fence",
+                        source_schema=event.schema,
+                        source_table=event.table,
+                        target=table,
+                        detected_lsn=min(action.change.detected_lsn for action in actions),
+                        refusal_origin="schema_epoch",
+                    )
+                if epoch is not None:
+                    epochs.setdefault(table, set()).add(epoch)
+                    continue
             if change.kind == COLUMN_ADDED and new:
                 epoch = "post" if new in fields else "pre"
             elif change.kind == COLUMN_DROPPED and old:
@@ -68,6 +119,7 @@ def refuse_mixed_schema_epoch(events: list, actions: list) -> None:
                         detected_lsn=min(
                             action.change.detected_lsn for action in actions
                         ),
+                        refusal_origin="schema_epoch",
                     )
                 if old in fields:
                     epoch = "pre"
@@ -88,6 +140,7 @@ def refuse_mixed_schema_epoch(events: list, actions: list) -> None:
         source_table=source_table,
         target=table,
         detected_lsn=min(action.change.detected_lsn for action in actions),
+        refusal_origin="schema_epoch",
     )
 
 
@@ -118,6 +171,12 @@ def unit_is_post_schema_epoch(spill, unit, actions: list, commit_id: int) -> boo
                 return True
             if change.kind == COLUMN_DROPPED and old and old not in fields:
                 return True
+            if change.kind == COLUMN_TYPE_CHANGED or (
+                change.kind == COLUMN_RENAMED and change.type_changed
+            ):
+                epoch = _type_change_epoch(event, change, f"{event.schema}.{event.table}")
+                if epoch == "post":
+                    return True
             if (
                 change.kind == COLUMN_RENAMED
                 and new

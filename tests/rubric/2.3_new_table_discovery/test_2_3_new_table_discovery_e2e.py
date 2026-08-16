@@ -8,6 +8,8 @@ import pytest
 
 pytestmark = [pytest.mark.slow, pytest.mark.e2e]
 
+LIVE_DISCOVERY_MAX_SECONDS = 300
+
 
 @pytest.fixture(scope="module")
 def discovery_scenario(sandbox):
@@ -23,8 +25,8 @@ def discovery_scenario(sandbox):
         # Keep one bounded pipeline process alive while the source DDL happens. The
         # watcher must hand the running engine through the existing re-snapshot path;
         # a second `box.run()` would only prove restart-time discovery.
-        proc = box.spawn(max_seconds=300, idle_seconds=60)
-        time.sleep(3)
+        proc = box.spawn(max_seconds=LIVE_DISCOVERY_MAX_SECONDS, idle_seconds=60)
+        box.wait_for_slot_active(process=proc)
         box.sql(
             [
                 "CREATE TABLE app.discovered_rows (id bigint PRIMARY KEY, value text)",
@@ -66,7 +68,11 @@ def discovery_scenario(sandbox):
             ],
             one_transaction=True,
         )
-        returncode = proc.wait(timeout=180)
+        # The child is explicitly allowed to run for LIVE_DISCOVERY_MAX_SECONDS. The
+        # old 180-second outer wait made this module fail only when another slow worker
+        # delayed the JVM/source handoff; use the child bound plus a small teardown
+        # margin instead of a second, shorter timing assumption.
+        returncode = proc.wait(timeout=LIVE_DISCOVERY_MAX_SECONDS + 120)
         streamed_after_discovery = (
             box.duck_query(
                 f"SELECT id, value FROM {box.table('cdcflight_app_discovered_rows')} "

@@ -1,50 +1,12 @@
-"""Every consistency-affecting state in the Flight, declared in one place (§20/A55).
+"""The production state machines for rubric 1.9.
 
-Rubric 1.9 asks that *any state that can affect consistency is managed with a state
-machine approach*, and grades **an appropriate number of machines (more than one)** at
-5. This file is what "appropriate" means here: twelve focused machines, each owning one state,
-each with a declared edge set — plus the frozen decision domains, which are
-classifications rather than states and are deliberately **not** dressed up as machines.
-The count is not the claim; coverage is. See SM-G for `CatalogBaseline`, the fifth
-consistency-affecting state that rev 14 made explicit.
+Each consistency-affecting state has one owner and one declared edge set. The commit
+group stays memory-only under Invariant O: a crash discards it and replays from the
+durable resume point. Domains below are classifications, not state machines.
 
-Reading order (the composition, not the file order):
-
-```
-RunPhase                (per process,   _cdc_flight.heartbeat.phase)
- ├── AcquisitionRecovery(per pipeline,  _cdc_flight.recovery_state.phase)   [0..1, spans runs]
- ├── CatalogBaseline    (per pipeline,  _cdc_flight.catalog_baseline.state) [1, spans runs]
- ├── TableLifecycle     (per table,     _cdc_flight.table_state.snapshot_state) [N, spans runs]
- ├── InterruptionMarker (per re-snapshot, interrupted.json)                    [0..1, spans runs]
- ├── CatalogChangeState (per relation,  memory only)                        [N, per run]
- ├── PublicationAdmission(per relation, source_relations.admission_state)    [N, spans runs]
- ├── CatalogSchemaLiveness(per schema, memory only)                          [N, per run]
- ├── SchemaRefusal      (per relation, schema_refusals.state)                [N, spans runs]
- ├── DestinationOwnership(per connection, memory only)                       [1, per run]
- └── CommitGroup        (memory only, NO machine — see below)               [1 at a time]
-```
-
-**Why the commit group is not here, and must not be.** Its states are real
-(`EMPTY → OPEN → TXN_OPEN → APPLIED → COMMITTED → ACKED`, plus `ROLLED_BACK`) but a
-crash never leaves durable state in an intermediate configuration: under Invariant O
-the entire group is uncommitted until one `COMMIT`, so "crash ⇒ discard and replay"
-is the whole correctness story. A durable machine there would *suggest* the group has
-recoverable intermediate states, which is the opposite of the claim the design rests
-on. The 16 hand-reset fields are collapsed into one `OpenGroup` object instead
-(`applier.py`), which makes the partial reset that caused Opus MAJOR-1's measured row
-loss unrepresentable without asserting anything false about durability.
-
-**Why the assembler is not here.** `assembler.py` already *is* a guarded state machine:
-`self._txn` / `self._chunk` are the state variable and every illegal transition raises
-`TransactionAssemblyError` naming the rule it violated. It is the one component that
-has not produced a correctness blocker in four review rounds. Do not touch it.
-
-The remaining candidates the architecture review considered and declined — the lease
-(already explicit and durable), the spill unit (crash ⇒ `ROLLBACK`), `SourceHealth`
-(a fold, not a machine), the slot check and the offset reconciliation (decision tables
-over external state) — appear below only as frozen **domains** where they have one.
+The commit group and assembler retain their existing guarded, memory-only designs; the
+remaining external decisions are represented below as frozen domains.
 """
-
 from __future__ import annotations
 
 from .states import Domain, Machine, UnknownState, ranked
@@ -65,6 +27,10 @@ LIFECYCLE_IN_PROGRESS = "in_progress"
 LIFECYCLE_COMPLETE = "complete"
 #: owed a full rebuild — the queue `cdc_flight.resnapshot` works from
 LIFECYCLE_AWAITING = "awaiting_snapshot"
+#: the source relation was positively observed gone while its rebuild obligation
+#: was outstanding. This is terminal, but deliberately not `absent`: retaining the
+#: durable disposition prevents a dropped quarantined table from looking current.
+LIFECYCLE_GONE = "gone"
 
 TABLE_LIFECYCLE = Machine(
     "table_lifecycle",
@@ -74,6 +40,7 @@ TABLE_LIFECYCLE = Machine(
         LIFECYCLE_IN_PROGRESS,
         LIFECYCLE_COMPLETE,
         LIFECYCLE_AWAITING,
+        LIFECYCLE_GONE,
     ),
     edges=(
         # -- row creation ------------------------------------------------- #
@@ -98,6 +65,12 @@ TABLE_LIFECYCLE = Machine(
         # a process killed inside a snapshot left a table owed work and invisible to
         # everything, including the recovery journal's "is the rebuild finished?" test.
         (LIFECYCLE_IN_PROGRESS, LIFECYCLE_AWAITING),
+        # A quarantined relation can be discharged by a fenced source-absence proof;
+        # it must never be promoted to `complete` because no current image exists.
+        (LIFECYCLE_AWAITING, LIFECYCLE_GONE),
+        # A same-name/new-generation relation is discovered after the old terminal
+        # disposition; it is owed a replacement image before any stream admission.
+        (LIFECYCLE_GONE, LIFECYCLE_AWAITING),
         # -- idempotent re-assertion -------------------------------------- #
         # `request_snapshot` is documented idempotent and `reassert_owed` re-marks a
         # table that is already owed; both are no-ops that must not raise.
@@ -113,8 +86,9 @@ TABLE_LIFECYCLE = Machine(
         (LIFECYCLE_IN_PROGRESS, LIFECYCLE_ABSENT),
         (LIFECYCLE_COMPLETE, LIFECYCLE_ABSENT),
         (LIFECYCLE_AWAITING, LIFECYCLE_ABSENT),
+        (LIFECYCLE_GONE, LIFECYCLE_ABSENT),
     ),
-    terminal=(LIFECYCLE_COMPLETE, LIFECYCLE_ABSENT),
+    terminal=(LIFECYCLE_COMPLETE, LIFECYCLE_GONE, LIFECYCLE_ABSENT),
     initial=LIFECYCLE_ABSENT,
     durable="_cdc_flight.table_state.snapshot_state",
     purpose=(
@@ -284,6 +258,88 @@ SNAPSHOT_COMPLETION = Machine(
         "mark and the initial-snapshot COMPLETED notification, with every declared "
         "row callback committed?"
     ),
+)
+
+# --------------------------------------------------------------------------- #
+# SM-B(iv) · CompletionWatermark — memory only, per engine invocation
+# --------------------------------------------------------------------------- #
+WATERMARK_UNARMED = "unarmed"        # no position taken for this quiet episode
+WATERMARK_ARMED = "armed"            # a marker is in the WAL; reach its LSN
+WATERMARK_REACHED = "reached"        # the destination is durably past it
+WATERMARK_UNAVAILABLE = "unavailable"  # the source cannot be marked at all
+
+COMPLETION_WATERMARK = Machine(
+    "completion_watermark",
+    states=(
+        WATERMARK_UNARMED, WATERMARK_ARMED, WATERMARK_REACHED, WATERMARK_UNAVAILABLE,
+    ),
+    edges=(
+        (WATERMARK_UNARMED, WATERMARK_ARMED),
+        # There is deliberately no `unarmed -> reached` edge - the only route to a
+        # verdict runs through the marker that makes the position real - and no
+        # `armed -> unarmed` edge either: a position, once PostgreSQL has assigned
+        # it, is a fact about this run's WAL and is never withdrawn. Both verdicts
+        # are terminal, because ending a run is a durability decision and not a
+        # fact that can be taken back.
+        (WATERMARK_ARMED, WATERMARK_REACHED),
+        (WATERMARK_UNARMED, WATERMARK_UNAVAILABLE),
+    ),
+    terminal=(WATERMARK_REACHED, WATERMARK_UNAVAILABLE),
+    initial=WATERMARK_UNARMED,
+    durable=None,
+    purpose=(
+        "Has this run reached a source position it can PROVE the destination is "
+        "durably past, so it may stop now rather than waiting out a timer?"
+    ),
+)
+
+# SM-B(v): feedback, callback admission, quiescence, own executor retirement, and
+# stock Debezium close are one declared boundary, never a close-time side effect.
+(
+    SHUTDOWN_OPEN, SHUTDOWN_ACK_PENDING, SHUTDOWN_ACK_COMPLETE,
+    SHUTDOWN_ACK_NOT_REQUIRED, SHUTDOWN_ACK_FAILED,
+    SHUTDOWN_ADMISSION_SEALED, SHUTDOWN_CALLBACKS_QUIESCENT,
+    SHUTDOWN_CALLBACK_OWNED, SHUTDOWN_OWN_EXECUTORS_STOPPED,
+    SHUTDOWN_ENGINE_CLOSING, SHUTDOWN_ENGINE_CLOSED,
+    SHUTDOWN_ENGINE_THREAD_STOPPED, SHUTDOWN_HUNG,
+) = (
+    "open", "ack_pending", "ack_complete", "ack_not_required",
+    "ack_failed", "admission_sealed", "callbacks_quiescent",
+    "callback_owned", "own_executors_stopped", "engine_closing",
+    "engine_closed", "engine_thread_stopped", "hung",
+)
+SHUTDOWN_SEQUENCE = Machine(
+    "shutdown_sequence",
+    states=(
+        SHUTDOWN_OPEN, SHUTDOWN_ACK_PENDING, SHUTDOWN_ACK_COMPLETE,
+        SHUTDOWN_ACK_NOT_REQUIRED, SHUTDOWN_ACK_FAILED, SHUTDOWN_ADMISSION_SEALED,
+        SHUTDOWN_CALLBACKS_QUIESCENT, SHUTDOWN_CALLBACK_OWNED,
+        SHUTDOWN_OWN_EXECUTORS_STOPPED, SHUTDOWN_ENGINE_CLOSING,
+        SHUTDOWN_ENGINE_CLOSED, SHUTDOWN_ENGINE_THREAD_STOPPED, SHUTDOWN_HUNG,
+    ),
+    edges=(
+        (SHUTDOWN_OPEN, SHUTDOWN_ACK_PENDING),
+        (SHUTDOWN_OPEN, SHUTDOWN_ACK_COMPLETE),
+        (SHUTDOWN_OPEN, SHUTDOWN_ACK_NOT_REQUIRED),
+        (SHUTDOWN_ACK_PENDING, SHUTDOWN_ACK_COMPLETE),
+        (SHUTDOWN_ACK_PENDING, SHUTDOWN_ACK_FAILED),
+        (SHUTDOWN_ACK_COMPLETE, SHUTDOWN_ADMISSION_SEALED),
+        (SHUTDOWN_ACK_NOT_REQUIRED, SHUTDOWN_ADMISSION_SEALED),
+        (SHUTDOWN_ACK_FAILED, SHUTDOWN_ADMISSION_SEALED),
+        (SHUTDOWN_ADMISSION_SEALED, SHUTDOWN_CALLBACKS_QUIESCENT),
+        (SHUTDOWN_ADMISSION_SEALED, SHUTDOWN_CALLBACK_OWNED),
+        (SHUTDOWN_CALLBACKS_QUIESCENT, SHUTDOWN_OWN_EXECUTORS_STOPPED),
+        (SHUTDOWN_CALLBACKS_QUIESCENT, SHUTDOWN_HUNG),
+        (SHUTDOWN_OWN_EXECUTORS_STOPPED, SHUTDOWN_ENGINE_CLOSING),
+        (SHUTDOWN_ENGINE_CLOSING, SHUTDOWN_ENGINE_CLOSED),
+        (SHUTDOWN_ENGINE_CLOSING, SHUTDOWN_HUNG),
+        (SHUTDOWN_ENGINE_CLOSED, SHUTDOWN_ENGINE_THREAD_STOPPED),
+        (SHUTDOWN_ENGINE_CLOSED, SHUTDOWN_HUNG),
+    ),
+    terminal=(SHUTDOWN_CALLBACK_OWNED, SHUTDOWN_ENGINE_THREAD_STOPPED, SHUTDOWN_HUNG),
+    initial=SHUTDOWN_OPEN,
+    durable=None,
+    purpose="Which shutdown boundary has been proved before stock engine close?",
 )
 
 SNAPSHOT_CALLBACK_OBSERVATIONS = Domain(
@@ -626,23 +682,37 @@ CATALOG_SCHEMA_LIVENESS = Machine(
 REFUSAL_ABSENT = "absent"
 REFUSAL_PENDING = "pending"
 REFUSAL_RESOLVED = "resolved"
+REFUSAL_QUARANTINED = "quarantined"
 
 SCHEMA_REFUSAL = Machine(
     "schema_refusal",
-    states=(REFUSAL_ABSENT, REFUSAL_PENDING, REFUSAL_RESOLVED),
+    states=(
+        REFUSAL_ABSENT,
+        REFUSAL_PENDING,
+        REFUSAL_RESOLVED,
+        REFUSAL_QUARANTINED,
+    ),
     edges=(
         (REFUSAL_ABSENT, REFUSAL_PENDING),
         (REFUSAL_PENDING, REFUSAL_PENDING),
         (REFUSAL_PENDING, REFUSAL_RESOLVED),
+        (REFUSAL_PENDING, REFUSAL_QUARANTINED),
         (REFUSAL_RESOLVED, REFUSAL_RESOLVED),
         (REFUSAL_RESOLVED, REFUSAL_PENDING),
+        (REFUSAL_QUARANTINED, REFUSAL_QUARANTINED),
+        # The blocking condition may clear.  Re-entry is not discharge: the table
+        # remains owed until a complete replacement snapshot takes it to current.
+        (REFUSAL_QUARANTINED, REFUSAL_PENDING),
+        # A fenced source DROP cancels the obligation because no replacement image
+        # can ever arrive; the table lifecycle records the paired terminal `gone`.
+        (REFUSAL_QUARANTINED, REFUSAL_RESOLVED),
     ),
     terminal=(REFUSAL_RESOLVED,),
     initial=REFUSAL_ABSENT,
     durable="_cdc_flight.schema_refusals.state",
     purpose=(
-        "Has a schema transition been refused with a durable remediation obligation, "
-        "and has that obligation been discharged?"
+        "Has a schema transition been refused, discharged by a complete snapshot, or "
+        "held in a quarantine that can be reactivated when the source is repaired?"
     ),
 )
 
@@ -761,6 +831,66 @@ INTERACTING_MACHINE_PAIRS = (
     ("schema_refusal", "table_lifecycle"),
     ("snapshot_completion", "table_lifecycle"),
     ("destination_ownership", "snapshot_completion"),
+)
+
+
+# Physical-row attribution is a declared product of the RowPatch, spill, toast,
+# recovery, identity, and schema-fence owners.  These are decision domains rather
+# than additional durable machines: a physical row does not persist an independent
+# seven-axis state record.  ``physical_row_matrix`` derives its cells from these
+# declarations and calls the owning gates for every feasible combination.
+PHYSICAL_ROW_OPERATIONS = Domain(
+    "physical_row_operations", values=("insert", "update", "delete", "key_move")
+)
+PHYSICAL_ROW_FIELD_STATES = Domain(
+    # Keep the declaration available to the standalone runtime-state helper,
+    # which intentionally copies only ``states.py`` and ``machines.py``.  The
+    # physical-row executor converts these names to the canonical FieldState
+    # enum when it exercises a cell.
+    "physical_row_field_states",
+    values=("value", "explicit_null", "unchanged_toast", "absent"),
+)
+PHYSICAL_ROW_BASE_STATES = Domain(
+    "physical_row_base_states", values=("start", "in_group", "missing")
+)
+PHYSICAL_ROW_STORAGE = Domain(
+    "physical_row_storage", values=("memory", "spill")
+)
+PHYSICAL_ROW_OUTCOMES = Domain(
+    "physical_row_outcomes",
+    values=("commit", "ambiguous_delete", "toast_base_missing", "schema_refusal", "swap_fault"),
+)
+PHYSICAL_ROW_IDENTITIES = Domain(
+    "physical_row_identities", values=("keyed", "keyless")
+)
+PHYSICAL_ROW_SCHEMA_EPOCHS = Domain(
+    "physical_row_schema_epochs", values=("pre", "post", "mixed")
+)
+
+
+# SM-D · KeylessEvent — durable per-event mutation idempotence
+# --------------------------------------------------------------------------- #
+# A keyless row has no source key. The full before-image selects the physical row
+# for DELETE/UPDATE, while this ledger records that the event's physical operation
+# already committed. The self-edge is deliberate: replay is a no-op, never a second
+# physical delete or a resurrecting insert.
+KEYLESS_EVENT_UNSEEN = "unseen"
+KEYLESS_EVENT_APPLIED = "applied"
+
+KEYLESS_EVENT = Machine(
+    "keyless_event",
+    states=(KEYLESS_EVENT_UNSEEN, KEYLESS_EVENT_APPLIED),
+    edges=(
+        (KEYLESS_EVENT_UNSEEN, KEYLESS_EVENT_APPLIED),
+        (KEYLESS_EVENT_APPLIED, KEYLESS_EVENT_APPLIED),
+    ),
+    terminal=(KEYLESS_EVENT_APPLIED,),
+    initial=KEYLESS_EVENT_UNSEEN,
+    durable="_cdc_flight.keyless_events.state",
+    purpose=(
+        "Whether one keyless source event's physical operation has committed; "
+        "replay must remain an applied no-op."
+    ),
 )
 
 

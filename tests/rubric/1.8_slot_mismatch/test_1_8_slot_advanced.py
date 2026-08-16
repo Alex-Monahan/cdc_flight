@@ -58,8 +58,13 @@ def advanced(tmp_path_factory, postgres_cluster):
 
         # Changes that will be DISCARDED by the advance: this is the data the rubric's 1
         # loses silently. A keyless table too - a changelog cannot absorb a duplicate.
+        # `synchronous_commit` is off in this cluster, so a plain COMMIT leaves the
+        # rows in WAL that `pg_current_wal_lsn()` does not yet cover, and the
+        # advance below would not actually strand them. Flush this transaction so
+        # the loss the whole module is about is REAL rather than incidental.
         box.sql(
             [
+                "SET synchronous_commit = on",
                 "INSERT INTO app.customers (name, email) SELECT 'lost-' || i, "
                 f"'lost-' || i || '@example.com' FROM generate_series(1, {ROWS}) i",
                 "INSERT INTO app.sensor_readings (sensor_id, value, unit) SELECT "
@@ -67,12 +72,29 @@ def advanced(tmp_path_factory, postgres_cluster):
             ],
             one_transaction=True,
         )
+        durable_before = int(
+            box.duck_query("SELECT last_lsn FROM _cdc_flight.debezium_offsets")[0][0]
+        )
         # Somebody else consumes the slot. `pg_replication_slot_advance` is exactly what
         # a stray `pg_recvlogical`, a second connector on the same slot, or a
         # well-meaning operator does.
         advance = box.pg_query(
             "SELECT end_lsn::text FROM pg_replication_slot_advance(%s, pg_current_wal_lsn())",
             (box.slot,),
+        )
+        confirmed = int(
+            box.pg_query(
+                "SELECT (confirmed_flush_lsn - '0/0')::bigint "
+                "FROM pg_replication_slots WHERE slot_name = %s",
+                (box.slot,),
+            )[0][0]
+        )
+        # Assert the precondition instead of assuming it (test-audit finding F6):
+        # if the advance did not leave the slot ahead of what the destination
+        # holds, nothing was stranded and every assertion below would be vacuous.
+        assert confirmed > durable_before, (
+            "the advance did not strand anything: "
+            f"confirmed_flush={confirmed}, durable={durable_before}"
         )
         recovered = box.run(max_seconds=240)
 

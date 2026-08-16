@@ -156,8 +156,18 @@ def test_a_slot_that_exists_with_no_durable_row_is_not_healthy(con, monkeypatch)
             slot_name="slot",
             snapshot_mode="never",
         )
+    assert reconcile.check_invariant_o(
+        con,
+        pipeline=PIPELINE,
+        namespace=NAMESPACE,
+        dsn="postgresql://ignored",
+        slot_name="slot",
+        snapshot_mode="never",
+        raise_on_violation=False,
+    )["ok"] is False
     codes = [r[0] for r in con.execute("SELECT code FROM _cdc_flight.alerts").fetchall()]
     assert "no_durable_destination_row" in codes
+    assert codes.count("no_durable_destination_row") == 1
 
 
 def test_a_slot_that_exists_with_no_durable_row_is_allowed_when_a_backfill_follows(con, monkeypatch):

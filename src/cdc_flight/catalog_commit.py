@@ -15,6 +15,7 @@ def flush_table_events(applier, commit_id: int) -> None:
             pipeline=applier.pipeline,
             commit_id=commit_id,
             seq=applier.group.next_table_event_seq(),
+            control_schema=applier.control_schema,
             **marker,
         )
     applier.group.table_events = []
@@ -67,15 +68,6 @@ def apply_catalog_phase(
     )
     if applier.group.table_events:
         flush_table_events(applier, commit_id)
-
-
-def apply_catalog_changes(applier, commit_id: int, durable_lsn: int, stats: dict) -> None:
-    """Compatibility wrapper for callers that apply a complete catalog plan."""
-    plan = plan_catalog_changes(applier, durable_lsn)
-    if plan is None:
-        return
-    apply_catalog_phase(applier, commit_id, plan, stats, schema_only=False)
-    applier.group.pending_alerts.extend(plan.alerts)
 
 
 def settle_catalog(applier, group_obj) -> None:

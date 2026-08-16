@@ -309,9 +309,8 @@ def test_nonuniform_keyless_backfill_records_a_durable_refusal_and_is_idempotent
             detected_lsn=100,
             reason=reason,
         )
-        assert destination.pending_schema_refusals(con, "p") == [
-            ("app", "readings", reason)
-        ]
+        assert destination.pending_schema_refusals(con, "p") == []
+        assert destination.quarantined_tables(con, "p") == {"app.readings"}
         assert con.execute(
             "SELECT snapshot_state FROM _cdc_flight.table_state "
             "WHERE pipeline = 'p' AND source_table = 'readings'"
@@ -320,6 +319,20 @@ def test_nonuniform_keyless_backfill_records_a_durable_refusal_and_is_idempotent
             "SELECT count(*) FROM _cdc_flight.table_events "
             "WHERE pipeline = 'p' AND event = 'schema_refusal'"
         ).fetchone()[0] == 1
+        assert con.execute(
+            "SELECT count(*) FROM _cdc_flight.table_events "
+            "WHERE pipeline = 'p' AND event = 'schema_quarantine'"
+        ).fetchone()[0] == 1
+        assert destination.reactivate_schema_refusal(
+            con,
+            pipeline="p",
+            source_schema="app",
+            source_table="readings",
+            target_table="cdcflight_app_readings",
+        ) is True
+        assert destination.pending_schema_refusals(con, "p") == [
+            ("app", "readings", reason)
+        ]
         con.execute("BEGIN")
         table_lifecycle.transition(
             con,
@@ -339,68 +352,6 @@ def test_nonuniform_keyless_backfill_records_a_durable_refusal_and_is_idempotent
             "SELECT state FROM _cdc_flight.schema_refusals "
             "WHERE pipeline = 'p' AND source_table = 'readings'"
         ).fetchone()[0] == "resolved"
-    finally:
-        con.close()
-
-
-def test_snapshot_audit_and_refusal_resolution_are_idempotent_after_swap(tmp_path):
-    """A replay after the shadow swap cannot duplicate audit or discharge state."""
-    con = duckdb.connect(str(tmp_path / "snapshot-audit-replay.duckdb"))
-    try:
-        destination.ensure_control_schema(con)
-        destination.record_schema_refusal(
-            con,
-            pipeline="p",
-            source_schema="app",
-            source_table="readings",
-            target_table="cdcflight_app_readings",
-            detected_lsn=100,
-            reason="schema fold refused",
-        )
-        table_lifecycle.transition(
-            con,
-            pipeline="p",
-            source_schema="app",
-            source_table="readings",
-            to=table_lifecycle.IN_PROGRESS,
-            reason="replacement shadow started",
-        )
-        table_lifecycle.transition(
-            con,
-            pipeline="p",
-            source_schema="app",
-            source_table="readings",
-            to=table_lifecycle.COMPLETE,
-            reason="replacement shadow swapped",
-            snapshot_lsn=123,
-        )
-        tables = [("app", "readings", "cdcflight_app_readings")]
-
-        assert resnapshot._completed_tables(
-            con,
-            "p",
-            tables,
-            123,
-            reason="replayable completion",
-            new_relations={"app.readings"},
-        ) == ["app.readings"]
-        assert resnapshot._completed_tables(
-            con,
-            "p",
-            tables,
-            123,
-            reason="replayable completion",
-            new_relations={"app.readings"},
-        ) == ["app.readings"]
-        assert con.execute(
-            "SELECT event, count(*) FROM _cdc_flight.snapshot_audits "
-            "WHERE pipeline = 'p' GROUP BY event ORDER BY event"
-        ).fetchall() == [("new", 1), ("resnapshot", 1)]
-        assert con.execute(
-            "SELECT event, count(*) FROM _cdc_flight.table_events "
-            "WHERE pipeline = 'p' GROUP BY event ORDER BY event"
-        ).fetchall() == [("new", 1), ("resnapshot", 1), ("schema_refusal", 1)]
-        assert destination.pending_schema_refusals(con, "p") == []
     finally:
         con.close()
 
@@ -507,31 +458,6 @@ def test_all_resnapshot_completion_paths_use_one_projection_component(monkeypatc
         )
         con.execute("COMMIT")
 
-        table_lifecycle.transition(
-            con,
-            pipeline="p",
-            source_schema="app",
-            source_table="compat",
-            to=table_lifecycle.IN_PROGRESS,
-            reason="compatibility projection",
-        )
-        table_lifecycle.transition(
-            con,
-            pipeline="p",
-            source_schema="app",
-            source_table="compat",
-            to=table_lifecycle.COMPLETE,
-            reason="compatibility projection",
-            snapshot_lsn=102,
-        )
-        assert resnapshot._completed_tables(
-            con,
-            "p",
-            [("app", "compat", "cdcflight_app_compat")],
-            102,
-            new_relations={"app.compat"},
-        ) == ["app.compat"]
-
         destination.request_snapshot(
             con,
             pipeline="p",
@@ -553,7 +479,7 @@ def test_all_resnapshot_completion_paths_use_one_projection_component(monkeypatc
             new_relations={"app.empty"},
         ) == ["app.empty"]
 
-        assert len(calls) == 3
+        assert len(calls) == 2
     finally:
         con.close()
 

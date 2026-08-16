@@ -36,6 +36,7 @@ from .machines import (
     OWNERSHIP_CALLBACK_OWNED,
     REFUSAL_ABSENT,
     REFUSAL_PENDING,
+    REFUSAL_QUARANTINED,
     REFUSAL_RESOLVED,
     SCHEMA_EMPTY,
     SCHEMA_ERROR,
@@ -46,6 +47,7 @@ from .machines import (
     SNAPSHOT_STREAMING,
 )
 
+OWNER = "state-interaction-gates"
 
 @dataclass(frozen=True)
 class InteractionDecision:
@@ -226,7 +228,10 @@ def _liveness_refusal(liveness, refusal, _liveness_owner, _refusal_owner):
     pair = ("catalog_schema_liveness", "schema_refusal")
     if liveness == SCHEMA_VISIBLE and refusal in {REFUSAL_ABSENT, REFUSAL_RESOLVED}:
         return _allow(pair, liveness, refusal, "visible catalog state has no open refusal")
-    if liveness in _LIVENESS_BLOCKED and refusal == REFUSAL_PENDING:
+    if liveness in _LIVENESS_BLOCKED and refusal in {
+        REFUSAL_PENDING,
+        REFUSAL_QUARANTINED,
+    }:
         return _allow(pair, liveness, refusal, "the blocked observation retains remediation")
     return _refuse(
         pair,
@@ -250,7 +255,10 @@ def _liveness_lifecycle(liveness, lifecycle, _liveness_owner, _lifecycle_owner):
 
 def _refusal_lifecycle(refusal, lifecycle, _refusal_owner, _lifecycle_owner):
     pair = ("schema_refusal", "table_lifecycle")
-    if refusal == REFUSAL_PENDING and lifecycle in {LIFECYCLE_AWAITING, LIFECYCLE_IN_PROGRESS}:
+    if refusal in {REFUSAL_PENDING, REFUSAL_QUARANTINED} and lifecycle in {
+        LIFECYCLE_AWAITING,
+        LIFECYCLE_IN_PROGRESS,
+    }:
         return _allow(pair, refusal, lifecycle, "remediation is durable while the image is owed or open")
     if refusal in {REFUSAL_ABSENT, REFUSAL_RESOLVED} and lifecycle in {
         LIFECYCLE_ABSENT,

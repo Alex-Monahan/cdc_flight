@@ -140,7 +140,13 @@ def _validated_record(
     return state, [(schema, table, target) for schema, table, target in tables]
 
 
-def requeue_interrupted(con, *, pipeline: str, state_dir) -> list[str]:
+def requeue_interrupted(
+    con,
+    *,
+    pipeline: str,
+    state_dir,
+    control_schema: str | None = None,
+) -> list[str]:
     """Consume a prior hard-exit marker and re-assert its snapshot obligation."""
     record = _validated_record(pipeline=pipeline, state_dir=state_dir)
     if record is None:
@@ -155,6 +161,7 @@ def requeue_interrupted(con, *, pipeline: str, state_dir) -> list[str]:
                 "a previous re-snapshot could not prove callback quiescence; its "
                 "durable image is requeued before this run starts"
             ),
+            control_schema=control_schema,
         )
         consume_interruption_marker(state_dir)
     discard_consumed_interruption_marker(state_dir)
