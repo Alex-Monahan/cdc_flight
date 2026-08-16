@@ -16,7 +16,7 @@ from .errors import (
     TableWriteFailure,
     as_schema_refusal,
 )
-from .faults import arm_group, maybe_crash
+from .faults import arm_group, maybe_crash, runtime_state
 from .run_state import COMMIT_ACK
 
 OWNER = "commit-durability"
@@ -154,6 +154,7 @@ def commit_group(self, trigger: str) -> CommitResult:
                 self.con.execute("COMMIT")
                 self.group.txn_open = False
                 if fault_enabled:
+                    runtime_state(commit_window="destination_committed_before_slot_advance")
                     maybe_crash("post_commit_pre_ack", fault_group)
 
                 # The only operations in the guarded post-COMMIT path are the

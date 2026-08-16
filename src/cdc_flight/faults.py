@@ -86,10 +86,13 @@ duplicate are all failures of the item.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import math
 import os
 import sys
+import threading
 import time
 
 from .config import resolve_control_schema
@@ -98,6 +101,13 @@ from .naming import quote
 log = logging.getLogger("cdc_flight.faults")
 
 ENV_VAR = "CDC_FAULT_INJECT"
+#: Test-only exact cuts for state cells that are not commit-group anchors.  Keeping
+#: these out of ``ALL_POINTS`` prevents the ordinary fault matrix from silently
+#: multiplying every time a lifecycle state gains a real-process proof.
+MATRIX_ENV_VAR = "CDC_CRASH_MATRIX_CUT"
+MATRIX_STATE_ENV_VAR = "CDC_CRASH_MATRIX_STATE"
+MATRIX_GATE_ENV_VAR = "CDC_CRASH_MATRIX_GATE"
+MATRIX_GATE_TIMEOUT_ENV_VAR = "CDC_CRASH_MATRIX_GATE_TIMEOUT"
 
 #: Protocol anchor points, in the order the applier reaches them.
 #:
@@ -213,6 +223,25 @@ SOURCE_POINTS = ("catalog_poll",)
 
 ALL_POINTS = POINTS + DESTINATION_POINTS + RECOVERY_POINTS + SOURCE_POINTS
 
+#: These cuts are reached only by the real state transitions below.  They are not
+#: state assignments made by a test: each one records the production object after its
+#: durable or lifecycle edge, then hard-exits the child.
+MATRIX_POINTS = (
+    "ownership_available",
+    "ownership_attached",
+    "ownership_active",
+    "ownership_callback_owned",
+    "recovery_requested_recorded",
+    "recovery_offsets_file_deleted_recorded",
+    "recovery_resume_point_deleted_recorded",
+    "recovery_armed_recorded",
+    "completion_marker_written",
+    "watermark_armed",
+    "watermark_reached",
+    "shutdown_idle_marker_written",
+    "shutdown_idle_marker_acknowledged",
+)
+
 DEFAULT_EXIT_CODE = 137
 RAISE = "raise"
 
@@ -276,6 +305,9 @@ def parse_spec(raw: str | None) -> tuple[str, int, int | str] | None:
 #: Sentinel distinguishing "not parsed yet" from "parsed, and there is no fault".
 _UNPARSED = object()
 _spec_cache: object = _UNPARSED
+_matrix_cache: object = _UNPARSED
+_runtime_context: dict[str, object] = {}
+_runtime_lock = threading.Lock()
 
 
 def validate_env() -> tuple[str, int, int | str] | None:
@@ -286,9 +318,121 @@ def validate_env() -> tuple[str, int, int | str] | None:
 def refresh() -> tuple[str, int, int | str] | None:
     """Re-read `CDC_FAULT_INJECT` and cache the result. Tests call this after
     changing the environment."""
-    global _spec_cache
+    global _matrix_cache, _spec_cache
     _spec_cache = parse_spec(os.environ.get(ENV_VAR))
+    _matrix_cache = parse_matrix_spec(os.environ.get(MATRIX_ENV_VAR))
     return _spec_cache  # type: ignore[return-value]
+
+
+def parse_matrix_spec(raw: str | None) -> tuple[str, int] | None:
+    """Parse the state-cut selector used by the real crash matrix.
+
+    It is intentionally a separate grammar from ``CDC_FAULT_INJECT``: a matrix cut
+    can be composed with a destination fault without changing the long-standing
+    single-anchor contract used by the default and slow fault lanes.
+    """
+    if not raw:
+        return None
+    parts = raw.split(":")
+    point = parts[0].strip()
+    if point not in MATRIX_POINTS:
+        raise FaultSpecError(
+            f"{MATRIX_ENV_VAR}: unknown point {parts[0]!r}; expected one of "
+            f"{MATRIX_POINTS}"
+        )
+    try:
+        nth = int(parts[1]) if len(parts) > 1 and parts[1] else 1
+    except ValueError as exc:
+        raise FaultSpecError(
+            f"{MATRIX_ENV_VAR}: <nth> must be an integer, got {parts[1]!r}"
+        ) from exc
+    if nth < 1:
+        raise FaultSpecError(f"{MATRIX_ENV_VAR}: <nth> is 1-based, got {nth}")
+    if len(parts) > 2:
+        raise FaultSpecError(f"{MATRIX_ENV_VAR}: too many fields in {raw!r}")
+    return point, nth
+
+
+def _matrix_spec() -> tuple[str, int] | None:
+    if _matrix_cache is _UNPARSED:
+        refresh()
+    return _matrix_cache  # type: ignore[return-value]
+
+
+def _matrix_state_path() -> str | None:
+    state_dir = os.environ.get("CDC_STATE_DIR")
+    filename = os.environ.get(MATRIX_STATE_ENV_VAR)
+    if not state_dir or not filename:
+        return None
+    if os.path.isabs(filename):
+        return filename
+    return os.path.join(state_dir, filename)
+
+
+def runtime_state(**fields: object) -> dict[str, object]:
+    """Persist the real runtime state used by a crash-matrix observer.
+
+    The write is completely inert unless ``CDC_CRASH_MATRIX_STATE`` is set.  When it
+    is set, the file is replaced and fsynced so a parent that sends ``SIGKILL`` can
+    distinguish the last completed production edge from a stale previous run.
+    """
+    path = _matrix_state_path()
+    if path is None:
+        return dict(_runtime_context)
+    with _runtime_lock:
+        _runtime_context.update(fields)
+        payload = {
+            "pid": os.getpid(),
+            "updated_at": time.time(),
+            "context": dict(_runtime_context),
+        }
+        temporary: str | None = None
+        try:
+            parent = os.path.dirname(path)
+            os.makedirs(parent, exist_ok=True)
+            temporary = f"{path}.{os.getpid()}.tmp"
+            with open(temporary, "w") as handle:
+                json.dump(payload, handle, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        except Exception:  # pragma: no cover - matrix evidence must not alter a run
+            log.debug("could not persist crash-matrix runtime state", exc_info=True)
+        finally:
+            if temporary is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(temporary)
+        return dict(_runtime_context)
+
+
+def matrix_crash(point: str, nth: int = 1) -> None:
+    """Hard-exit at a lifecycle edge selected by the real crash matrix."""
+    spec = _matrix_spec()
+    if spec is None or spec != (point, nth):
+        return
+    gate = os.environ.get(MATRIX_GATE_ENV_VAR)
+    if gate:
+        raw_timeout = os.environ.get(MATRIX_GATE_TIMEOUT_ENV_VAR, "30")
+        try:
+            gate_timeout = float(raw_timeout)
+        except ValueError as exc:
+            raise FaultSpecError(
+                f"{MATRIX_GATE_TIMEOUT_ENV_VAR}: expected seconds, got {raw_timeout!r}"
+            ) from exc
+        if not math.isfinite(gate_timeout) or gate_timeout < 0 or gate_timeout > 120:
+            raise FaultSpecError(
+                f"{MATRIX_GATE_TIMEOUT_ENV_VAR}: seconds must be finite and in "
+                "the bounded range 0..120, "
+                f"got {gate_timeout}"
+            )
+        deadline = time.monotonic() + gate_timeout
+        while not os.path.exists(gate) and time.monotonic() < deadline:
+            time.sleep(0.02)
+    log.error("CRASH MATRIX: firing at %s (arrival %s)", point, nth)
+    record_fired(point, nth, DEFAULT_EXIT_CODE)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(DEFAULT_EXIT_CODE)
 
 
 def _spec() -> tuple[str, int, int | str] | None:
@@ -534,9 +678,17 @@ def record_fired(point: str, nth: int, action) -> None:
         return
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        with _runtime_lock:
+            context = dict(_runtime_context)
         with open(path, "w") as handle:
             json.dump(
-                {"point": point, "nth": nth, "action": str(action), "pid": os.getpid()},
+                {
+                    "point": point,
+                    "nth": nth,
+                    "action": str(action),
+                    "pid": os.getpid(),
+                    "context": context,
+                },
                 handle,
             )
             handle.flush()

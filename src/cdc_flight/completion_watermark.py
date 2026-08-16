@@ -103,6 +103,7 @@ from __future__ import annotations
 import logging
 import time
 
+from . import faults
 from .machines import (
     COMPLETION_WATERMARK,
     WATERMARK_ARMED,
@@ -177,6 +178,11 @@ class CompletionWatermark:
     def _to(self, state: str) -> None:
         COMPLETION_WATERMARK.check(self._state, state)
         self._state = state
+        faults.runtime_state(watermark=state)
+        if state == WATERMARK_ARMED:
+            faults.matrix_crash("watermark_armed")
+        elif state == WATERMARK_REACHED:
+            faults.matrix_crash("watermark_reached")
 
     # -- the question ------------------------------------------------------- #
     def reached(self, handler, elapsed: float) -> bool:
@@ -269,7 +275,7 @@ class CompletionWatermark:
         )
 
     def _arm(self, handler) -> int | None:
-        return self.health.emit_marker(
+        target = self.health.emit_marker(
             self.marker,
             WATERMARK_REASON,
             {
@@ -277,6 +283,10 @@ class CompletionWatermark:
                 "delivered_lsn": getattr(handler, "highest_source_lsn", None),
             },
         )
+        if target is not None:
+            faults.runtime_state(marker_state="completion_written", marker_lsn=target)
+            faults.matrix_crash("completion_marker_written")
+        return target
 
     @staticmethod
     def _durable(handler) -> int:

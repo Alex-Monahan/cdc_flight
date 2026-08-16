@@ -37,6 +37,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+from . import faults
 from .machines import SOURCE_HEALTH_STATES
 from .source_marker import IDLE_HEARTBEAT, SourceMarker
 
@@ -352,14 +353,25 @@ class SourceHealth:
                 and sample.confirmed_pos is not None
                 and sample.confirmed_pos >= target
             ):
+                self._record_idle_ack(target)
                 return True
             time.sleep(min(self.interval, max(0.01, deadline - time.monotonic())))
         sample = self.last
-        return bool(
+        confirmed = bool(
             sample is not None
             and sample.confirmed_pos is not None
             and sample.confirmed_pos >= target
         )
+        if confirmed:
+            self._record_idle_ack(target)
+        return confirmed
+
+    @staticmethod
+    def _record_idle_ack(target: int) -> None:
+        faults.runtime_state(
+            marker_state="shutdown_idle_acknowledged", marker_ack_target=target
+        )
+        faults.matrix_crash("shutdown_idle_marker_acknowledged")
 
     def confirmed_at_least(self, target: int) -> bool:
         """Return the last sampled slot proof without waiting."""
@@ -380,11 +392,17 @@ class SourceHealth:
         its own destination control-unit commit is what makes acknowledging the
         marker (and everything before it) safe under Invariant O.
         """
-        return self.emit_marker(
+        marker_lsn = self.emit_marker(
             self.source_marker,
             IDLE_HEARTBEAT,
             {"slot": self.slot_name, "durable_lsn": int(target)},
-        ) is not None
+        )
+        if marker_lsn is not None:
+            faults.runtime_state(
+                marker_state="shutdown_idle_written", marker_lsn=marker_lsn
+            )
+            faults.matrix_crash("shutdown_idle_marker_written")
+        return marker_lsn is not None
 
     def emit_marker(self, marker, reason: str, payload: dict) -> int | None:
         """Write one whole, transactional marker on the primary route.

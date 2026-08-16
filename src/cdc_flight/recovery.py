@@ -76,7 +76,7 @@ from . import catalog_baseline, table_lifecycle
 from .config import resolve_control_schema
 from .destination import now, raise_alert, request_snapshot
 from .errors import RecoveryFailed
-from .faults import arrival, maybe_crash
+from .faults import arrival, matrix_crash, maybe_crash, runtime_state
 from .machines import (
     ACQUISITION_RECOVERY,
     RECOVERY_ABSENT,
@@ -294,6 +294,7 @@ def clear(
         "WHERE pipeline = ? AND namespace = ?",
         [pipeline, namespace],
     )
+    runtime_state(recovery_phase=PHASE_ABSENT)
 
 
 def begin(
@@ -425,6 +426,8 @@ def begin(
             ],
         )
         con.execute("COMMIT")
+        runtime_state(recovery_phase=PHASE_REQUESTED)
+        matrix_crash("recovery_requested_recorded")
         # rubric 1.7: the journal row and the to-do list are now durable and NOTHING
         # has been destroyed. A crash here must leave a resumable `requested` journal.
         maybe_crash("recovery_requested", _reached(PHASE_REQUESTED))
@@ -471,6 +474,7 @@ def resume(
         "tables_marked": record.tables_marked,
         "message": record.message,
     }
+    runtime_state(recovery_phase=record.phase)
     offset_path = Path(record.offset_path) if record.offset_path else None
 
     if record.phase == PHASE_REQUESTED:
@@ -507,6 +511,8 @@ def resume(
             control_schema=control_schema,
         )
         record.phase = PHASE_FILE_DELETED
+        runtime_state(recovery_phase=record.phase)
+        matrix_crash("recovery_offsets_file_deleted_recorded")
 
     if record.phase == PHASE_FILE_DELETED:
         con.execute(
@@ -526,6 +532,8 @@ def resume(
             control_schema=control_schema,
         )
         record.phase = PHASE_ROW_DELETED
+        runtime_state(recovery_phase=record.phase)
+        matrix_crash("recovery_resume_point_deleted_recorded")
 
     if record.phase == PHASE_ROW_DELETED:
         slot_action = _drop_the_slot_or_fail(
@@ -544,6 +552,8 @@ def resume(
             control_schema=control_schema,
         )
         record.phase = PHASE_ARMED
+        runtime_state(recovery_phase=record.phase)
+        matrix_crash("recovery_armed_recorded")
 
     if record.phase != PHASE_ARMED:  # pragma: no cover - the ladder above is total
         raise RecoveryFailed(

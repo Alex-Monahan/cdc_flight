@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from . import faults
 from .machines import (
     DESTINATION_OWNERSHIP,
     OWNERSHIP_ACTIVE,
@@ -28,6 +29,13 @@ class DestinationOwnership:
     def __init__(self) -> None:
         self._applier = None
         self._state = OWNERSHIP_AVAILABLE
+        faults.runtime_state(
+            recovery_phase="absent",
+            ownership=self._state,
+            marker_state="none",
+            watermark="unarmed",
+        )
+        faults.matrix_crash("ownership_available")
 
     def attach(self, applier) -> None:
         """Attach a constructed applier before consumer construction can fail."""
@@ -36,12 +44,16 @@ class DestinationOwnership:
         DESTINATION_OWNERSHIP.check(self._state, OWNERSHIP_ATTACHED)
         self._applier = applier
         self._state = OWNERSHIP_ATTACHED
+        faults.runtime_state(ownership=self._state)
+        faults.matrix_crash("ownership_attached")
 
     def activate(self, applier) -> None:
         """Publish that engine callbacks may now enter this applier."""
         self._assert_owner(applier)
         DESTINATION_OWNERSHIP.check(self._state, OWNERSHIP_ACTIVE)
         self._state = OWNERSHIP_ACTIVE
+        faults.runtime_state(ownership=self._state)
+        faults.matrix_crash("ownership_active")
 
     def transfer_to_callback(self, applier) -> None:
         """Record the supervisor's failed-quiescence verdict as a terminal handoff.
@@ -55,6 +67,8 @@ class DestinationOwnership:
             return
         DESTINATION_OWNERSHIP.check(self._state, OWNERSHIP_CALLBACK_OWNED)
         self._state = OWNERSHIP_CALLBACK_OWNED
+        faults.runtime_state(ownership=self._state)
+        faults.matrix_crash("ownership_callback_owned")
 
     def quiescence_observer(self, applier):
         """Bind this token to the supervisor's in-``finally`` proof publication."""
@@ -118,6 +132,7 @@ class DestinationOwnership:
         applier.alerts.close()
         self._applier = None
         self._state = OWNERSHIP_AVAILABLE
+        faults.runtime_state(ownership=self._state)
         return True
 
     def _assert_owner(self, applier) -> None:
