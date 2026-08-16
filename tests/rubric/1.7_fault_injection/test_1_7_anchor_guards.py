@@ -245,7 +245,10 @@ def test_production_entrypoint_cannot_be_armed_by_matrix_environment_alone(tmp_p
         "CDC_CRASH_MATRIX_GATE_TIMEOUT": "0",
         "CDC_CRASH_MATRIX_STATE": str(absolute_state),
     }
-    env.pop(faults.MATRIX_CAPABILITY_ENV_VAR, None)
+    # The old inherited-FD mechanism is intentionally ignored now.  Keep the
+    # legacy name in this probe to prove a stale descriptor value cannot arm a
+    # production child.
+    env["CDC_CRASH_MATRIX_CAPABILITY_FD"] = "999999"
     proc = subprocess.run(
         [
             sys.executable,
@@ -264,37 +267,117 @@ def test_production_entrypoint_cannot_be_armed_by_matrix_environment_alone(tmp_p
 
 
 def test_armed_runtime_state_failure_is_fail_closed(tmp_path):
-    """A capability-armed evidence write failure cannot silently continue."""
+    """A test-handler-armed evidence write failure cannot silently continue."""
     state_root = tmp_path / "state-root-file"
     state_root.write_text("not a directory")
-    read_fd, write_fd = os.pipe()
-    try:
-        os.write(write_fd, faults._MATRIX_CAPABILITY_TOKEN)
-    finally:
-        os.close(write_fd)
     project = Path(__file__).resolve().parents[3]
     env = {
         **os.environ,
-        "PYTHONPATH": str(project / "src"),
+        "PYTHONPATH": f"{project / 'src'}:{project / 'tests'}",
         "CDC_STATE_DIR": str(state_root),
         "CDC_CRASH_MATRIX_STATE": "state.json",
-        faults.MATRIX_CAPABILITY_ENV_VAR: str(read_fd),
     }
-    try:
-        proc = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                "from cdc_flight import faults; faults.runtime_state(edge='probe')",
-            ],
-            cwd=project,
-            env=env,
-            pass_fds=(read_fd,),
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    finally:
-        os.close(read_fd)
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from support.crash_matrix_runtime import install_matrix_crash_handler; "
+            "install_matrix_crash_handler(); "
+            "from cdc_flight import faults; faults.runtime_state(edge='probe')",
+        ],
+        cwd=project,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
     assert proc.returncode != 0
     assert "crash-matrix runtime state could not be persisted" in proc.stderr
+
+
+@pytest.mark.parametrize("inheritance", ["pass_fds", "close_fds_false"])
+def test_forged_matrix_fd_is_inert_and_nonblocking(tmp_path, inheritance):
+    """The removed pipe capability cannot arm or hang a shipped child."""
+    project = Path(__file__).resolve().parents[3]
+    state_dir = tmp_path / f"state-{inheritance}"
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, b"cdc-flight-crash-matrix-test-v1\n")
+    finally:
+        os.close(write_fd)
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(project / "src"),
+        "CDC_STATE_DIR": str(state_dir),
+        "CDC_CRASH_MATRIX_CUT": "ownership_available",
+        "CDC_CRASH_MATRIX_STATE": "state.json",
+        "CDC_CRASH_MATRIX_CAPABILITY_FD": str(read_fd),
+    }
+    try:
+        if inheritance == "pass_fds":
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "from cdc_flight.ownership import DestinationOwnership; "
+                    "DestinationOwnership()",
+                ],
+                cwd=project,
+                env=env,
+                pass_fds=(read_fd,),
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        else:
+            os.set_inheritable(read_fd, True)
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "from cdc_flight.ownership import DestinationOwnership; "
+                    "DestinationOwnership()",
+                ],
+                cwd=project,
+                env=env,
+                close_fds=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+    finally:
+        os.close(read_fd)
+    assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+    assert not (state_dir / "state.json").exists()
+    assert not (state_dir / "fault_fired.json").exists()
+
+
+def test_matrix_child_rejects_symlinked_state_root_before_production_starts(tmp_path):
+    """An armed matrix child never follows CDC_STATE_DIR to an outside target."""
+    project = Path(__file__).resolve().parents[3]
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    state_link = tmp_path / "state-link"
+    state_link.symlink_to(outside, target_is_directory=True)
+    env = {
+        **os.environ,
+        "PYTHONPATH": f"{project / 'src'}:{project / 'tests'}",
+        "CDC_STATE_DIR": str(state_link),
+        "CDC_CRASH_MATRIX_CUT": "ownership_available",
+        "CDC_CRASH_MATRIX_STATE": "state.json",
+    }
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(project / "tests" / "support" / "crash_matrix_child.py"),
+            "--destination",
+            "duckdb",
+        ],
+        cwd=project,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert proc.returncode == 2, (proc.returncode, proc.stdout, proc.stderr)
+    assert list(outside.iterdir()) == []

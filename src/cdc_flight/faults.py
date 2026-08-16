@@ -91,10 +91,10 @@ import json
 import logging
 import math
 import os
-import stat
 import sys
 import threading
 import time
+from collections.abc import Callable
 
 from .config import resolve_control_schema
 from .naming import quote
@@ -109,12 +109,10 @@ MATRIX_ENV_VAR = "CDC_CRASH_MATRIX_CUT"
 MATRIX_STATE_ENV_VAR = "CDC_CRASH_MATRIX_STATE"
 MATRIX_GATE_ENV_VAR = "CDC_CRASH_MATRIX_GATE"
 MATRIX_GATE_TIMEOUT_ENV_VAR = "CDC_CRASH_MATRIX_GATE_TIMEOUT"
-# A matrix cut is a test capability, not a deployment configuration.  The test
-# harness passes a one-shot pipe containing this token through ``pass_fds``.  An
-# inherited environment can name a selector, but it cannot create this capability
-# in an ordinary production process.
-MATRIX_CAPABILITY_ENV_VAR = "CDC_CRASH_MATRIX_CAPABILITY_FD"
-_MATRIX_CAPABILITY_TOKEN = b"cdc-flight-crash-matrix-test-v1\n"
+# Matrix cuts are an in-process test seam.  The production package contains only
+# the registration point; the handler that records a cut and hard-exits lives in
+# ``tests/support/crash_matrix_runtime.py``, which is not included in the wheel.
+# This makes ordinary environment inheritance unable to arm a production child.
 
 #: Protocol anchor points, in the order the applier reaches them.
 #:
@@ -313,9 +311,34 @@ def parse_spec(raw: str | None) -> tuple[str, int, int | str] | None:
 _UNPARSED = object()
 _spec_cache: object = _UNPARSED
 _matrix_cache: object = _UNPARSED
-_matrix_capability_cache: object = _UNPARSED
 _runtime_context: dict[str, object] = {}
 _runtime_lock = threading.Lock()
+MatrixCrashHandler = Callable[[str, int], None]
+_matrix_crash_handler: MatrixCrashHandler | None = None
+
+
+def register_matrix_crash_handler(handler: MatrixCrashHandler) -> None:
+    """Install the non-production handler used by real crash-matrix children.
+
+    The shipped package deliberately has no default handler.  A test-only child
+    imports this module and registers its own implementation before importing the
+    production CLI.  Refuse replacement so a later import cannot silently change
+    the meaning of a cut in a running process.
+    """
+    global _matrix_cache, _matrix_crash_handler
+    if not callable(handler):
+        raise TypeError("matrix crash handler must be callable")
+    if _matrix_crash_handler is not None and _matrix_crash_handler is not handler:
+        raise RuntimeError("a matrix crash handler is already registered")
+    _matrix_crash_handler = handler
+    # ``refresh`` may have run while this module was imported before the test
+    # harness registered its handler.  Reparse the selector now that the seam is live.
+    _matrix_cache = _UNPARSED
+
+
+def matrix_handler_registered() -> bool:
+    """Whether this process has the out-of-package matrix implementation installed."""
+    return _matrix_crash_handler is not None
 
 
 def validate_env() -> tuple[str, int, int | str] | None:
@@ -329,12 +352,11 @@ def refresh() -> tuple[str, int, int | str] | None:
     global _matrix_cache, _spec_cache
     _spec_cache = parse_spec(os.environ.get(ENV_VAR))
     # A deployment environment must not even parse or validate the matrix
-    # selector.  The private inherited capability is the first gate, not merely
-    # a condition around the eventual os._exit: without it the entire matrix
-    # configuration is inert, including malformed selectors and state paths.
+    # selector.  The handler is an in-process object supplied by the test tree,
+    # not an environment value that a first-party child can forge.
     _matrix_cache = (
         parse_matrix_spec(os.environ.get(MATRIX_ENV_VAR))
-        if _matrix_test_capability()
+        if _matrix_crash_handler is not None
         else None
     )
     return _spec_cache  # type: ignore[return-value]
@@ -375,35 +397,9 @@ def _matrix_spec() -> tuple[str, int] | None:
     return _matrix_cache  # type: ignore[return-value]
 
 
-def _matrix_test_capability() -> bool:
-    """Return whether this process was explicitly armed by the test harness.
-
-    The descriptor must be an inherited FIFO containing a private one-shot token.
-    This is intentionally an OS-level capability: setting any number of matrix
-    environment variables in a normal install is insufficient to reach a cut or
-    write matrix state.
-    """
-    global _matrix_capability_cache
-    if _matrix_capability_cache is not _UNPARSED:
-        return bool(_matrix_capability_cache)
-    raw_fd = os.environ.get(MATRIX_CAPABILITY_ENV_VAR)
-    enabled = False
-    if raw_fd:
-        try:
-            fd = int(raw_fd)
-            if stat.S_ISFIFO(os.fstat(fd).st_mode):
-                enabled = os.read(fd, len(_MATRIX_CAPABILITY_TOKEN)) == _MATRIX_CAPABILITY_TOKEN
-            if fd >= 3:
-                os.close(fd)
-        except (OSError, ValueError):
-            enabled = False
-    _matrix_capability_cache = enabled
-    return enabled
-
-
 def matrix_armed() -> bool:
-    """Whether the real crash-matrix capability and a selector are both present."""
-    return _matrix_test_capability() and _matrix_spec() is not None
+    """Whether a test-only handler and a matrix selector are both present."""
+    return _matrix_crash_handler is not None and _matrix_spec() is not None
 
 
 def matrix_selected(point: str, nth: int = 1) -> bool:
@@ -411,8 +407,60 @@ def matrix_selected(point: str, nth: int = 1) -> bool:
     return matrix_armed() and _matrix_spec() == (point, nth)
 
 
-def _matrix_state_path() -> str | None:
+def _safe_state_dir() -> str | None:
+    """Return a lexical state root without following a user-controlled symlink.
+
+    Matrix evidence must never follow a symlink supplied through ``CDC_STATE_DIR``.
+    The macOS host exposes the platform directories ``/var`` and ``/tmp`` through
+    stable ``/private`` aliases, so those two canonical aliases are allowed.  Any
+    other symlink in the root path is rejected, including a link in a parent
+    component.  This check is intentionally made before the test-only handler can
+    hard-exit.
+    """
     state_dir = os.environ.get("CDC_STATE_DIR")
+    if not state_dir:
+        return None
+    lexical = os.path.abspath(state_dir)
+    unsafe = _first_unsafe_state_symlink(lexical)
+    if unsafe is not None:
+        symlink, resolved = unsafe
+        raise FaultSpecError(
+            "CDC_STATE_DIR must not contain a symlink for crash-matrix evidence: "
+            f"{symlink!r} resolves to {resolved!r}"
+        )
+    return lexical
+
+
+def _first_unsafe_state_symlink(path: str) -> tuple[str, str] | None:
+    """Find the first non-platform symlink in an absolute state path."""
+    platform_aliases = {
+        ("/var", "/private/var"),
+        ("/tmp", "/private/tmp"),
+    }
+    current = os.path.sep
+    for component in os.path.abspath(path).split(os.path.sep):
+        if not component:
+            continue
+        current = os.path.join(current, component)
+        if os.path.islink(current):
+            resolved = os.path.realpath(current)
+            if (current, resolved) not in platform_aliases:
+                return current, resolved
+    return None
+
+
+def _realpath_is_contained(root: str, path: str) -> bool:
+    """Check containment after resolving both the root and candidate path."""
+    resolved_root = os.path.realpath(root)
+    resolved_path = os.path.realpath(path)
+    try:
+        return os.path.commonpath((resolved_root, resolved_path)) == resolved_root
+    except ValueError:
+        return False
+
+
+def _matrix_state_path() -> str | None:
+    state_dir = _safe_state_dir()
     filename = os.environ.get(MATRIX_STATE_ENV_VAR)
     if not state_dir or not filename:
         return None
@@ -421,18 +469,36 @@ def _matrix_state_path() -> str | None:
             f"{MATRIX_STATE_ENV_VAR}: filename must be a simple relative name under "
             f"CDC_STATE_DIR, got {filename!r}"
         )
-    return os.path.join(state_dir, filename)
+    path = os.path.abspath(os.path.join(state_dir, filename))
+    if (
+        _first_unsafe_state_symlink(path) is not None
+        or not _realpath_is_contained(state_dir, path)
+    ):
+        raise FaultSpecError(
+            f"{MATRIX_STATE_ENV_VAR}: state file must remain inside CDC_STATE_DIR: "
+            f"{path!r}"
+        )
+    return path
+
+
+def validate_matrix_state_directory() -> None:
+    """Validate matrix state containment before a test child enters production.
+
+    The test-only launcher calls this preflight so an invalid symlink or filename
+    cannot reach the production CLI's ordinary summary writer either.
+    """
+    _matrix_state_path()
 
 
 def runtime_state(**fields: object) -> dict[str, object]:
     """Persist the real runtime state used by a crash-matrix observer.
 
-    The write is completely inert unless the private test capability was inherited.
-    When that capability and a relative state filename are both present, the file is
-    replaced and fsynced so a parent that sends ``SIGKILL`` can distinguish the last
-    completed production edge from a stale previous run.
+    The write is completely inert unless the test-only handler was registered.  When
+    that handler and a relative state filename are both present, the file is replaced
+    and fsynced so a parent that sends ``SIGKILL`` can distinguish the last completed
+    production edge from a stale previous run.
     """
-    if not _matrix_test_capability():
+    if _matrix_crash_handler is None:
         return dict(_runtime_context)
     path = _matrix_state_path()
     with _runtime_lock:
@@ -449,6 +515,13 @@ def runtime_state(**fields: object) -> dict[str, object]:
             parent = os.path.dirname(path)
             os.makedirs(parent, exist_ok=True)
             temporary = f"{path}.{os.getpid()}.tmp"
+            if (
+                _first_unsafe_state_symlink(temporary) is not None
+                or not _realpath_is_contained(parent, temporary)
+            ):
+                raise RuntimeError(
+                    f"crash-matrix temporary state path escaped its directory: {temporary}"
+                )
             with open(temporary, "w") as handle:
                 json.dump(payload, handle, sort_keys=True)
                 handle.flush()
@@ -467,15 +540,18 @@ def runtime_state(**fields: object) -> dict[str, object]:
 
 
 def matrix_crash(point: str, nth: int = 1) -> None:
-    """Hard-exit at a lifecycle edge selected by the real crash matrix."""
-    # Check the OS capability before touching any matrix-controlled environment
-    # value.  Environment alone therefore cannot select, gate, persist, or fire
-    # a crash, even if a deployment inherited a stale or malformed selector.
-    if not _matrix_test_capability():
+    """Dispatch a selected lifecycle edge to the test-only hard-exit handler."""
+    # Production has no handler, so inherited selectors, gates, state paths and
+    # descriptors are all inert without parsing or waiting on any of them.
+    handler = _matrix_crash_handler
+    if handler is None:
         return
     spec = _matrix_spec()
     if spec is None or spec != (point, nth):
         return
+    # Validate containment before the handler records evidence or exits.  The
+    # test-only launcher performs the same preflight before production starts.
+    validate_matrix_state_directory()
     gate = os.environ.get(MATRIX_GATE_ENV_VAR)
     if gate:
         raw_timeout = os.environ.get(MATRIX_GATE_TIMEOUT_ENV_VAR, "30")
@@ -495,10 +571,7 @@ def matrix_crash(point: str, nth: int = 1) -> None:
         while not os.path.exists(gate) and time.monotonic() < deadline:
             time.sleep(0.02)
     log.error("CRASH MATRIX: firing at %s (arrival %s)", point, nth)
-    record_fired(point, nth, DEFAULT_EXIT_CODE)
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(DEFAULT_EXIT_CODE)
+    handler(point, nth)
 
 
 def _spec() -> tuple[str, int, int | str] | None:
@@ -724,10 +797,18 @@ FIRED_FILENAME = "fault_fired.json"
 
 
 def fired_record_path() -> str | None:
-    state_dir = os.environ.get("CDC_STATE_DIR")
+    try:
+        state_dir = _safe_state_dir()
+    except FaultSpecError:
+        # Fired evidence is best-effort for the long-standing generic fault
+        # injector; importantly, an unsafe matrix root is never followed.
+        return None
     if not state_dir:
         return None
-    return os.path.join(state_dir, FIRED_FILENAME)
+    path = os.path.abspath(os.path.join(state_dir, FIRED_FILENAME))
+    if _first_unsafe_state_symlink(path) is not None:
+        return None
+    return path if _realpath_is_contained(state_dir, path) else None
 
 
 def record_fired(point: str, nth: int, action) -> None:

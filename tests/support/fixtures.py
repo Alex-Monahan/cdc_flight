@@ -34,6 +34,7 @@ import pytest
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 VENV_BIN = PROJECT_DIR / ".venv" / "bin"
+MATRIX_CHILD = PROJECT_DIR / "tests" / "support" / "crash_matrix_child.py"
 SANDBOX_IDLE_SECONDS = 6
 
 #: Debezium delivers a transactional logical message exactly like any other source
@@ -124,18 +125,6 @@ def _executable(name: str) -> str:
     """Prefer the project venv's console scripts, fall back to PATH."""
     candidate = VENV_BIN / name
     return str(candidate) if candidate.exists() else name
-
-
-def _matrix_capability_fd() -> int:
-    """Create the OS capability required to arm a real crash-matrix child."""
-    from cdc_flight import faults
-
-    read_fd, write_fd = os.pipe()
-    try:
-        os.write(write_fd, faults._MATRIX_CAPABILITY_TOKEN)
-    finally:
-        os.close(write_fd)
-    return read_fd
 
 
 @pytest.fixture(autouse=True)
@@ -279,8 +268,13 @@ def _invoke_pipeline(
     clean - JPype allows exactly one JVM per process, and Debezium leaves
     non-daemon threads behind.
     """
+    executable = (
+        [sys.executable, str(MATRIX_CHILD)]
+        if matrix_arm
+        else [_executable("cdc-flight")]
+    )
     cmd = [
-        _executable("cdc-flight"),
+        *executable,
         "--destination",
         destination,
         "--max-seconds",
@@ -302,28 +296,14 @@ def _invoke_pipeline(
     summary_path = Path(env["CDC_STATE_DIR"]) / "last_run.json"
     summary_path.unlink(missing_ok=True)
 
-    capability_fd = None
-    pass_fds: tuple[int, ...] = ()
-    if matrix_arm:
-        capability_fd = _matrix_capability_fd()
-        env = {
-            **env,
-            "CDC_CRASH_MATRIX_CAPABILITY_FD": str(capability_fd),
-        }
-        pass_fds = (capability_fd,)
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            env=env,
-            cwd=PROJECT_DIR,
-            timeout=timeout,
-            pass_fds=pass_fds,
-        )
-    finally:
-        if capability_fd is not None:
-            os.close(capability_fd)
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=PROJECT_DIR,
+        timeout=timeout,
+    )
     if expect_success and proc.returncode != 0:
         raise AssertionError(
             f"pipeline exited {proc.returncode}\n--- stdout ---\n{proc.stdout[-4000:]}"
@@ -604,33 +584,27 @@ class Sandbox:
         """Start the pipeline as a killable child process (fault injection)."""
         sink = subprocess.PIPE if capture else subprocess.DEVNULL
         env = {**self.env, **(extra_env or {})}
-        capability_fd = None
-        pass_fds: tuple[int, ...] = ()
-        if matrix_arm:
-            capability_fd = _matrix_capability_fd()
-            env["CDC_CRASH_MATRIX_CAPABILITY_FD"] = str(capability_fd)
-            pass_fds = (capability_fd,)
-        try:
-            return subprocess.Popen(
-                [
-                    _executable("cdc-flight"),
-                    "--destination",
-                    destination,
-                    "--max-seconds",
-                    str(max_seconds),
-                    "--idle-seconds",
-                    str(idle_seconds),
-                ],
-                env=env,
-                cwd=PROJECT_DIR,
-                stdout=sink,
-                stderr=sink,
-                text=capture,
-                pass_fds=pass_fds,
-            )
-        finally:
-            if capability_fd is not None:
-                os.close(capability_fd)
+        executable = (
+            [sys.executable, str(MATRIX_CHILD)]
+            if matrix_arm
+            else [_executable("cdc-flight")]
+        )
+        return subprocess.Popen(
+            [
+                *executable,
+                "--destination",
+                destination,
+                "--max-seconds",
+                str(max_seconds),
+                "--idle-seconds",
+                str(idle_seconds),
+            ],
+            env=env,
+            cwd=PROJECT_DIR,
+            stdout=sink,
+            stderr=sink,
+            text=capture,
+        )
 
     def last_summary(self) -> dict:
         """The JSON summary the CLI wrote for its most recent run, if any."""
