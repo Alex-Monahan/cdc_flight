@@ -18,6 +18,7 @@ import json
 import os
 import signal
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from cdc_flight import faults
 
 ROWS = 8
 MATRIX_STATE = "crash_matrix_state.json"
+NAMESPACE = "cdc-flight-engine"
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,9 @@ class Cell:
     inject: str | None = None
     compose: dict[str, str] | None = None
     max_seconds: float = 120
+    prior_recovery: bool = False
+    expected_shutdown: str = "open"
+    expected_interruption_marker: str = "absent"
 
 
 @dataclass(frozen=True)
@@ -138,6 +143,7 @@ CELLS = (
         inject="destination_hang:1",
         compose={"CDC_COMMIT_TIMEOUT": "300", "CDC_FAULT_HANG_SECONDS": "600"},
         max_seconds=20,
+        expected_shutdown="callback_owned",
     ),
     Cell(
         "completion_marker_written",
@@ -145,7 +151,7 @@ CELLS = (
         "completion_marker_written",
         "absent",
         "active",
-        "completion_written",
+        "written",
         "unarmed",
     ),
     Cell(
@@ -154,7 +160,7 @@ CELLS = (
         "watermark_armed",
         "absent",
         "active",
-        "completion_written",
+        "written",
         "armed",
     ),
     Cell(
@@ -163,7 +169,7 @@ CELLS = (
         "watermark_reached",
         "absent",
         "active",
-        "completion_written",
+        "written",
         "reached",
     ),
     Cell(
@@ -174,6 +180,7 @@ CELLS = (
         "active",
         "shutdown_idle_written",
         "reached",
+        expected_shutdown="ack_pending",
     ),
     Cell(
         "shutdown_idle_marker_acknowledged",
@@ -183,6 +190,98 @@ CELLS = (
         "active",
         "shutdown_idle_acknowledged",
         "reached",
+        expected_shutdown="ack_pending",
+    ),
+)
+
+
+# The durable recovery journal is deliberately retained after a real child death.  These
+# cells start the next real child from that armed journal and then cut the later lifecycle
+# edges which the one-dimensional rows cannot reach.  They are local because the cloud
+# fixture already proves each destination edge independently; the cross-state reachability
+# proof is a PostgreSQL/source ordering property shared by both destinations.
+CROSS_STATE_CELLS = (
+    Cell(
+        "armed_recovery_ownership_available",
+        "an armed recovery journal survives a pre-engine ownership cut",
+        "ownership_available",
+        "armed",
+        "available",
+        "none",
+        "unarmed",
+        prior_recovery=True,
+    ),
+    Cell(
+        "armed_recovery_ownership_attached",
+        "an armed recovery journal survives applier attachment",
+        "ownership_attached",
+        "armed",
+        "attached",
+        "none",
+        "unarmed",
+        prior_recovery=True,
+    ),
+    Cell(
+        "armed_recovery_ownership_active",
+        "an armed recovery journal survives callback activation",
+        "ownership_active",
+        "armed",
+        "active",
+        "none",
+        "unarmed",
+        prior_recovery=True,
+    ),
+    Cell(
+        "armed_recovery_completion_marker_written",
+        "an armed recovery journal survives completion-marker publication",
+        "completion_marker_written",
+        "armed",
+        "active",
+        "written",
+        "unarmed",
+        prior_recovery=True,
+    ),
+    Cell(
+        "armed_recovery_watermark_armed",
+        "an armed recovery journal survives completion-watermark arming",
+        "watermark_armed",
+        "armed",
+        "active",
+        "written",
+        "armed",
+        prior_recovery=True,
+    ),
+    Cell(
+        "armed_recovery_watermark_reached",
+        "an armed recovery journal survives a reached completion watermark",
+        "watermark_reached",
+        "armed",
+        "active",
+        "written",
+        "reached",
+        prior_recovery=True,
+    ),
+    Cell(
+        "armed_recovery_shutdown_marker_written",
+        "an armed recovery journal survives a written shutdown idle marker",
+        "shutdown_idle_marker_written",
+        "armed",
+        "active",
+        "shutdown_idle_written",
+        "reached",
+        prior_recovery=True,
+        expected_shutdown="ack_pending",
+    ),
+    Cell(
+        "armed_recovery_shutdown_marker_acknowledged",
+        "an armed recovery journal survives acknowledgement of the shutdown marker",
+        "shutdown_idle_marker_acknowledged",
+        "armed",
+        "active",
+        "shutdown_idle_acknowledged",
+        "reached",
+        prior_recovery=True,
+        expected_shutdown="ack_pending",
     ),
 )
 
@@ -236,7 +335,9 @@ def _control_table(destination: Destination | None, name: str) -> str:
 def _advance_slot_past_new_rows(box: Sandbox, destination: Destination | None = None) -> None:
     durable_rows = _destination_query(
         box, destination,
-        f"SELECT last_lsn FROM {_control_table(destination, 'debezium_offsets')}"
+        f"SELECT last_lsn FROM {_control_table(destination, 'debezium_offsets')} "
+        "WHERE pipeline = ? AND namespace = ?",
+        [box.env["CDC_PIPELINE_NAME"], NAMESPACE],
     )
     durable = int(durable_rows[0][0])
     box.pg_query(
@@ -272,6 +373,7 @@ def _run_with_cut(
         timeout=190,
         expect_success=False,
         extra_env=env,
+        matrix_arm=True,
     )
 
 
@@ -285,22 +387,31 @@ def _probe_survivor(
     recovery = _destination_query(
         box, destination,
         f"SELECT phase FROM {_control_table(destination, 'recovery_state')} "
+        "WHERE pipeline = ? AND namespace = ? "
         "ORDER BY updated_at DESC LIMIT 1",
+        [box.env["CDC_PIPELINE_NAME"], NAMESPACE],
     )
     durable = _destination_query(
         box, destination,
         f"SELECT last_lsn FROM {_control_table(destination, 'debezium_offsets')} "
+        "WHERE pipeline = ? AND namespace = ? "
         "ORDER BY updated_at DESC LIMIT 1",
+        [box.env["CDC_PIPELINE_NAME"], NAMESPACE],
     )
     pipeline = box.env["CDC_PIPELINE_NAME"]
     control_rows = {}
     for table in ("recovery_state", "debezium_offsets", "lease"):
+        scope = "pipeline = ?"
+        params = [pipeline]
+        if table != "lease":
+            scope += " AND namespace = ?"
+            params.append(NAMESPACE)
         control_rows[table] = _destination_query(
             box,
             destination,
             f"SELECT count(*) FROM {_control_table(destination, table)} "
-            "WHERE pipeline = ?",
-            [pipeline],
+            f"WHERE {scope}",
+            params,
         )[0][0]
     slot = box.pg_query(
         "SELECT (restart_lsn - '0/0')::bigint, "
@@ -327,6 +438,32 @@ def _probe_survivor(
         "WHERE sensor_id = ?",
         [tag.upper()],
     )[0][0]
+    source_customer_values = box.pg_query(
+        "SELECT id, name, email FROM app.customers WHERE name LIKE %s ORDER BY id",
+        (f"{tag}-c-%",),
+    )
+    destination_customer_values = _destination_query(
+        box,
+        destination,
+        f"SELECT id, name, email FROM "
+        f"{_destination_table(box, destination, 'cdcflight_app_customers')} "
+        "WHERE name LIKE ? ORDER BY id",
+        [f"{tag}-c-%"],
+    )
+    source_reading_values = box.pg_query(
+        "SELECT sensor_id, value::double precision, unit "
+        "FROM app.sensor_readings WHERE sensor_id = %s "
+        "ORDER BY sensor_id, value, unit",
+        (tag.upper(),),
+    )
+    destination_reading_values = _destination_query(
+        box,
+        destination,
+        f"SELECT sensor_id, CAST(value AS DOUBLE), unit FROM "
+        f"{_destination_table(box, destination, 'cdcflight_app_sensor_readings')} "
+        "WHERE sensor_id = ? ORDER BY sensor_id, value, unit",
+        [tag.upper()],
+    )
     event_ids = _destination_query(
         box, destination,
         f"SELECT count(*), count(DISTINCT cdcf_event_id) FROM "
@@ -337,6 +474,7 @@ def _probe_survivor(
     return {
         "state": state,
         "recovery_phase": recovery[0][0] if recovery else "absent",
+        "durable_recovery_phase": recovery[0][0] if recovery else "absent",
         "offset_file": box.offset_file.exists(),
         "offset_file_bytes": box.offset_file.stat().st_size if box.offset_file.exists() else 0,
         "durable_lsn": durable[0][0] if durable else None,
@@ -347,6 +485,27 @@ def _probe_survivor(
         "source_readings": source_readings,
         "destination_readings": destination_readings,
         "destination_event_ids": event_ids,
+        "identities": {
+            "customers": {
+                "source": [row[0] for row in source_customer_values],
+                "destination": [row[0] for row in destination_customer_values],
+            },
+            # A keyless source has no primary-key identity. Its complete source row is
+            # the identity set; the destination additionally carries cdcf_event_id,
+            # checked separately below for replay uniqueness.
+            "sensor_readings": {
+                "source": [tuple(row) for row in source_reading_values],
+                "destination": [tuple(row) for row in destination_reading_values],
+            },
+        },
+        "values": {
+            "customers": [tuple(row) for row in source_customer_values],
+            "destination_customers": [tuple(row) for row in destination_customer_values],
+            "sensor_readings": [tuple(row) for row in source_reading_values],
+            "destination_sensor_readings": [
+                tuple(row) for row in destination_reading_values
+            ],
+        },
     }
 
 
@@ -396,10 +555,17 @@ def _run_commit_window(
             "CDC_CRASH_MATRIX_STATE": MATRIX_STATE,
             "CDC_FAULT_INJECT": "post_commit_pre_ack:1",
         },
+        matrix_arm=True,
     )
+    fired = box.fired_fault()
     survivor = _probe_survivor(box, tag, destination)
     resumed = _recover_and_probe(box, tag, destination)
-    return {"crashed": crashed, "survivor": survivor, "resumed": resumed}
+    return {
+        "crashed": crashed,
+        "fired": fired,
+        "survivor": survivor,
+        "resumed": resumed,
+    }
 
 
 def _run_compositions(tmp_path_factory, postgres_cluster) -> dict[str, dict]:
@@ -465,6 +631,7 @@ def _run_compositions(tmp_path_factory, postgres_cluster) -> dict[str, dict]:
                 **relay_env,
                 "CDC_CRASH_MATRIX_STATE": MATRIX_STATE,
             },
+            matrix_arm=True,
         )
         try:
             _wait_for_state(
@@ -563,6 +730,7 @@ def _run_contention_motherduck(
                 "CDC_CRASH_MATRIX_GATE": str(gate),
                 "CDC_CRASH_MATRIX_GATE_TIMEOUT": "60",
             },
+            matrix_arm=True,
         )
         _wait_for_state(
             box,
@@ -580,6 +748,7 @@ def _run_contention_motherduck(
                 "CDC_CRASH_MATRIX_CUT": CELLS[2].cut,
                 "CDC_CRASH_MATRIX_STATE": second_state.name,
             },
+            matrix_arm=True,
         )
         second_output, _ = second.communicate(timeout=40)
         gate.touch()
@@ -657,6 +826,98 @@ def _run_cells(
         box.reseed()
 
 
+def _seed_armed_recovery(
+    box: Sandbox, tag: str, destination: Destination | None = None
+) -> dict:
+    """Leave a real armed recovery journal for the following cross-state child."""
+    _add_rows(box, tag)
+    _advance_slot_past_new_rows(box, destination)
+    seed = _run_with_cut(box, CELLS[3], destination)
+    fired = box.fired_fault()
+    survivor = _probe_survivor(box, tag, destination)
+    assert seed["returncode"] == faults.DEFAULT_EXIT_CODE, seed
+    assert fired and fired["point"] == CELLS[3].cut, fired
+    assert survivor["durable_recovery_phase"] == "armed", survivor
+    assert survivor["control_rows"]["recovery_state"] == 1, survivor
+    box.clear_fired_fault()
+    return {"seed": seed, "fired": fired, "survivor": survivor}
+
+
+def _run_cross_state_cells(tmp_path_factory, postgres_cluster) -> dict[str, dict]:
+    """Run every declared armed-journal cross-state cell in real local children."""
+    box = Sandbox(
+        "real_cross_state_matrix",
+        tmp_path_factory.mktemp("sbx_real_cross_state_matrix"),
+        postgres_cluster,
+    )
+    results: dict[str, dict] = {}
+    try:
+        box.reseed()
+        results["baseline"] = box.run(reset_state=True, max_seconds=150)
+        for cell in CROSS_STATE_CELLS:
+            tag = f"r17_{cell.name}"
+            box.clear_fired_fault()
+            _state_path(box).unlink(missing_ok=True)
+            seed = _seed_armed_recovery(box, tag)
+            try:
+                killed = _run_with_cut(box, cell)
+                survivor = _probe_survivor(box, tag)
+                resumed = _recover_and_probe(box, tag)
+                results[cell.name] = {
+                    "cell": cell,
+                    "tag": tag,
+                    "seed": seed,
+                    "killed": killed,
+                    "survivor": survivor,
+                    "resumed": resumed,
+                    "fired": box.fired_fault(),
+                }
+            except Exception as exc:
+                results[cell.name] = {
+                    "cell": cell,
+                    "tag": tag,
+                    "seed": seed,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+        return results
+    finally:
+        box.cleanup()
+        box.reseed()
+
+
+def _assert_exact_identities_and_values(observation: dict, label: str) -> None:
+    """Require source/destination identity sets and row values to be identical."""
+    identities = observation["identities"]
+    values = observation["values"]
+    assert set(identities["customers"]["source"]) == set(
+        identities["customers"]["destination"]
+    ), f"{label} customer identity sets differ: {identities['customers']}"
+    assert Counter(values["customers"]) == Counter(
+        values["destination_customers"]
+    ), f"{label} customer values differ: {values}"
+    assert Counter(identities["sensor_readings"]["source"]) == Counter(
+        identities["sensor_readings"]["destination"]
+    ), f"{label} keyless source/destination identity rows differ: {identities}"
+    assert Counter(values["sensor_readings"]) == Counter(
+        values["destination_sensor_readings"]
+    ), f"{label} keyless values differ: {values}"
+
+
+def _assert_destination_is_a_source_subset(observation: dict, label: str) -> None:
+    """Before restart, a real cut may have applied a prefix but never foreign rows."""
+    identities = observation["identities"]
+    values = observation["values"]
+    assert set(identities["customers"]["destination"]) <= set(
+        identities["customers"]["source"]
+    ), f"{label} has a destination customer identity absent from source: {identities}"
+    assert Counter(values["destination_customers"]) <= Counter(values["customers"]), (
+        f"{label} has a destination customer value absent from source: {values}"
+    )
+    assert Counter(identities["sensor_readings"]["destination"]) <= Counter(
+        identities["sensor_readings"]["source"]
+    ), f"{label} has a foreign keyless row: {identities}"
+
+
 def _assert_matrix_cell(result: dict, cell: Cell) -> None:
     """Apply the same survivor proof to local DuckDB and MotherDuck results."""
     assert "error" not in result, f"{cell.name} did not reach its assertion: {result}"
@@ -674,8 +935,10 @@ def _assert_matrix_cell(result: dict, cell: Cell) -> None:
     context = survivor["state"].get("context", {})
     assert context.get("recovery_phase") == cell.expected_recovery, survivor
     assert context.get("ownership") == cell.expected_ownership, survivor
-    assert context.get("marker_state") == cell.expected_marker, survivor
+    assert context.get("completion_marker_state") == cell.expected_marker, survivor
     assert context.get("watermark") == cell.expected_watermark, survivor
+    assert context.get("interruption_marker") == cell.expected_interruption_marker, survivor
+    assert context.get("shutdown_sequence") == cell.expected_shutdown, survivor
     if cell.expected_marker == "shutdown_idle_written":
         assert context.get("marker_lsn") is not None, survivor
         assert survivor["durable_lsn"] is not None, survivor
@@ -687,20 +950,25 @@ def _assert_matrix_cell(result: dict, cell: Cell) -> None:
         )
     if cell.expected_marker == "shutdown_idle_acknowledged":
         assert context.get("marker_ack_target") is not None, survivor
+        assert context.get("marker_ack_lsn") == context.get("marker_lsn"), survivor
+        assert context.get("marker_ack_lsn") is not None, survivor
         assert survivor["slot"] is not None, survivor
-        assert survivor["slot"][1] >= context["marker_ack_target"], (
-            f"{cell.name} ({cell.proves}) lost the shutdown destination acknowledgement: "
+        assert survivor["slot"][1] >= context["marker_ack_lsn"], (
+            f"{cell.name} ({cell.proves}) lost the shutdown marker acknowledgement: "
             f"{survivor}"
         )
     assert survivor["source_customers"] == ROWS, survivor
     assert survivor["source_readings"] == ROWS, survivor
     assert 0 <= survivor["destination_customers"] <= ROWS, survivor
     assert 0 <= survivor["destination_readings"] <= ROWS, survivor
+    _assert_destination_is_a_source_subset(survivor, cell.name)
     assert survivor["destination_event_ids"][0] == survivor["destination_event_ids"][1], (
         f"{cell.name} ({cell.proves}) duplicated a keyless event before restart: "
         f"{survivor['destination_event_ids']}"
     )
-    assert survivor["control_rows"]["recovery_state"] == (1 if cell.recovery else 0), (
+    assert survivor["control_rows"]["recovery_state"] == (
+        1 if cell.recovery or cell.prior_recovery else 0
+    ), (
         f"{cell.name} ({cell.proves}) left an unexpected recovery control row: "
         f"{survivor}"
     )
@@ -712,6 +980,12 @@ def _assert_matrix_cell(result: dict, cell: Cell) -> None:
             f"{cell.name} ({cell.proves}) left the wrong durable resume-row count: "
             f"{survivor}"
         )
+    elif cell.prior_recovery:
+        assert survivor["durable_recovery_phase"] == "armed", survivor
+        # The recovery obligation remains authoritative while a later engine may
+        # recreate offsets.dat and/or a destination resume row for its snapshot.
+        if survivor["slot"] is not None and survivor["durable_lsn"] is not None:
+            assert survivor["slot"][1] <= survivor["durable_lsn"], survivor
     else:
         assert survivor["offset_file"], survivor
         assert survivor["control_rows"]["debezium_offsets"] == 1, survivor
@@ -721,7 +995,10 @@ def _assert_matrix_cell(result: dict, cell: Cell) -> None:
     # slot or resume row while its journal is still the obligation.
     if cell.expected_recovery == "requested":
         assert survivor["offset_file"], survivor
-    if cell.expected_recovery in {"offsets_file_deleted", "resume_point_deleted", "armed"}:
+    if (
+        cell.expected_recovery in {"offsets_file_deleted", "resume_point_deleted", "armed"}
+        and not cell.prior_recovery
+    ):
         assert not survivor["offset_file"], survivor
     if cell.recovery:
         if cell.expected_recovery == "armed":
@@ -743,6 +1020,11 @@ def _assert_matrix_cell(result: dict, cell: Cell) -> None:
                     f"{cell.name} ({cell.proves}) retained the resume point after "
                     f"deleting it: {survivor!r}"
                 )
+    elif cell.prior_recovery:
+        # The armed journal intentionally has no destination resume row.  A later
+        # engine may already have created a slot, but Invariant O has no pair to
+        # compare until the recovery obligation is discharged.
+        assert survivor["control_rows"]["recovery_state"] == 1, survivor
     elif survivor["slot"] is not None and survivor["durable_lsn"] is not None:
         assert survivor["slot"][1] <= survivor["durable_lsn"], (
             f"{cell.name} ({cell.proves}) let the slot outrun the durable destination: "
@@ -765,6 +1047,7 @@ def _assert_matrix_cell(result: dict, cell: Cell) -> None:
     assert after["slot"][1] <= after["durable_lsn"], (
         f"{cell.name} violated Invariant O after restart: {after}"
     )
+    _assert_exact_identities_and_values(after, f"{cell.name} after restart")
     assert after["destination_event_ids"][0] == after["destination_event_ids"][1], (
         f"{cell.name} ({cell.proves}) left duplicate keyless event identities: "
         f"{after['destination_event_ids']}"
@@ -799,6 +1082,20 @@ def test_every_real_matrix_cell_kills_and_recovers_on_motherduck(real_matrix_mot
 
 
 @pytest.fixture(scope="module")
+def armed_recovery_cross_state_matrix(tmp_path_factory, postgres_cluster):
+    return _run_cross_state_cells(tmp_path_factory, postgres_cluster)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("cell", CROSS_STATE_CELLS, ids=lambda cell: cell.name)
+def test_armed_recovery_cross_state_cells_kill_and_recover(
+    armed_recovery_cross_state_matrix, cell
+):
+    """A prior armed journal is a real survivor precondition for later cuts."""
+    _assert_matrix_cell(armed_recovery_cross_state_matrix[cell.name], cell)
+
+
+@pytest.fixture(scope="module")
 def composed_faults(tmp_path_factory, postgres_cluster):
     return _run_compositions(tmp_path_factory, postgres_cluster)
 
@@ -810,6 +1107,7 @@ def _assert_composed_recovery(result: dict) -> None:
     after = recovered["after"]
     assert after["destination_customers"] == after["source_customers"] == ROWS, after
     assert after["destination_readings"] == after["source_readings"] == ROWS, after
+    _assert_exact_identities_and_values(after, "composed recovery")
     assert after["destination_event_ids"][0] == after["destination_event_ids"][1], after
     assert after["recovery_phase"] == "absent", after
     assert after["control_rows"]["recovery_state"] == 0, after
@@ -834,13 +1132,12 @@ def test_real_composed_faults_are_lossless_and_single_writer(composed_faults):
 
     window = composed_faults["commit_before_slot_advance"]
     assert window["crashed"]["returncode"] == faults.DEFAULT_EXIT_CODE, window
-    assert window["survivor"]["state"]["context"]["commit_window"] == (
-        "destination_committed_before_slot_advance"
-    ), window
+    assert window["fired"]["point"] == "post_commit_pre_ack", window
     assert window["survivor"]["destination_customers"] == ROWS, window
     assert window["survivor"]["destination_readings"] == ROWS, window
     assert window["survivor"]["durable_lsn"] is not None, window
     assert window["survivor"]["slot"][1] <= window["survivor"]["durable_lsn"], window
+    _assert_destination_is_a_source_subset(window["survivor"], "commit-window survivor")
     _assert_composed_recovery(window)
 
     blackhole = composed_faults["blackhole_then_sigkill"]
@@ -866,13 +1163,12 @@ def test_real_recovery_paths_contend_for_one_motherduck_control_row(motherduck_c
     result = motherduck_contention
     window = result["commit_window"]
     assert window["crashed"]["returncode"] == faults.DEFAULT_EXIT_CODE, window
-    assert window["survivor"]["state"]["context"]["commit_window"] == (
-        "destination_committed_before_slot_advance"
-    ), window
+    assert window["fired"]["point"] == "post_commit_pre_ack", window
     assert window["survivor"]["destination_customers"] == ROWS, window
     assert window["survivor"]["destination_readings"] == ROWS, window
     assert window["survivor"]["durable_lsn"] is not None, window
     assert window["survivor"]["slot"][1] <= window["survivor"]["durable_lsn"], window
+    _assert_destination_is_a_source_subset(window["survivor"], "MotherDuck commit-window survivor")
     _assert_composed_recovery(window)
 
     assert result["first_returncode"] == faults.DEFAULT_EXIT_CODE, result
@@ -904,6 +1200,7 @@ def test_real_matrix_has_a_real_sigkill_cell(tmp_path_factory, postgres_cluster)
             extra_env={
                 "CDC_CRASH_MATRIX_STATE": MATRIX_STATE,
             },
+            matrix_arm=True,
         )
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline and process.poll() is None:
@@ -920,14 +1217,11 @@ def test_real_matrix_has_a_real_sigkill_cell(tmp_path_factory, postgres_cluster)
         assert state["context"]["watermark"] == "armed", state
         recovered = box.run(max_seconds=180, timeout=260)
         assert recovered["ok"] is True, recovered
-        assert box.scalar(
-            f"SELECT count(*) FROM {box.table('cdcflight_app_customers')} "
-            "WHERE name LIKE 'r17_sigkill-c-%'"
-        ) == ROWS
-        assert box.scalar(
-            f"SELECT count(*) FROM {box.table('cdcflight_app_sensor_readings')} "
-            "WHERE sensor_id = 'R17_SIGKILL'"
-        ) == ROWS
+        after = _probe_survivor(box, "r17_sigkill")
+        assert after["destination_customers"] == after["source_customers"] == ROWS, after
+        assert after["destination_readings"] == after["source_readings"] == ROWS, after
+        _assert_exact_identities_and_values(after, "SIGKILL after restart")
+        assert after["destination_event_ids"][0] == after["destination_event_ids"][1], after
     finally:
         if process is not None and process.poll() is None:
             process.kill()

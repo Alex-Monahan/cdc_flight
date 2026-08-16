@@ -19,9 +19,11 @@ costs six minutes is not one either.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 
 import pytest
 from support.applier_lab import DATASET, Lab, begin, end, keyed, snap
@@ -226,3 +228,73 @@ def test_a_fired_anchor_records_itself_where_a_test_can_read_it(tmp_path, monkey
 def test_the_record_is_a_no_op_without_a_state_directory(monkeypatch):
     monkeypatch.delenv("CDC_STATE_DIR", raising=False)
     faults.record_fired("post_ack", 1, 137)  # must not raise
+
+
+def test_production_entrypoint_cannot_be_armed_by_matrix_environment_alone(tmp_path):
+    """The reviewer-A direct probe must not hard-exit without the test capability."""
+    state_dir = tmp_path / "r17_matrix_arm_probe"
+    absolute_state = tmp_path / "absolute-state.json"
+    gate = tmp_path / "never-created-gate"
+    project = Path(__file__).resolve().parents[3]
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(project / "src"),
+        "CDC_STATE_DIR": str(state_dir),
+        "CDC_CRASH_MATRIX_CUT": "ownership_available",
+        "CDC_CRASH_MATRIX_GATE": str(gate),
+        "CDC_CRASH_MATRIX_GATE_TIMEOUT": "0",
+        "CDC_CRASH_MATRIX_STATE": str(absolute_state),
+    }
+    env.pop(faults.MATRIX_CAPABILITY_ENV_VAR, None)
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from cdc_flight.ownership import DestinationOwnership; DestinationOwnership()",
+        ],
+        cwd=project,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+    assert not absolute_state.exists()
+    assert not (state_dir / "fault_fired.json").exists()
+
+
+def test_armed_runtime_state_failure_is_fail_closed(tmp_path):
+    """A capability-armed evidence write failure cannot silently continue."""
+    state_root = tmp_path / "state-root-file"
+    state_root.write_text("not a directory")
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, faults._MATRIX_CAPABILITY_TOKEN)
+    finally:
+        os.close(write_fd)
+    project = Path(__file__).resolve().parents[3]
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(project / "src"),
+        "CDC_STATE_DIR": str(state_root),
+        "CDC_CRASH_MATRIX_STATE": "state.json",
+        faults.MATRIX_CAPABILITY_ENV_VAR: str(read_fd),
+    }
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from cdc_flight import faults; faults.runtime_state(edge='probe')",
+            ],
+            cwd=project,
+            env=env,
+            pass_fds=(read_fd,),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    finally:
+        os.close(read_fd)
+    assert proc.returncode != 0
+    assert "crash-matrix runtime state could not be persisted" in proc.stderr

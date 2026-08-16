@@ -13,10 +13,12 @@ from typing import TYPE_CHECKING
 from . import faults
 from .machines import (
     DESTINATION_OWNERSHIP,
+    MARKER_ABSENT,
     OWNERSHIP_ACTIVE,
     OWNERSHIP_ATTACHED,
     OWNERSHIP_AVAILABLE,
     OWNERSHIP_CALLBACK_OWNED,
+    SHUTDOWN_OPEN,
 )
 
 if TYPE_CHECKING:
@@ -26,14 +28,21 @@ if TYPE_CHECKING:
 class DestinationOwnership:
     """Track the applier which may own the destination and its child cursors."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        recovery_phase: str = "absent",
+        interruption_marker: str = MARKER_ABSENT,
+    ) -> None:
         self._applier = None
         self._state = OWNERSHIP_AVAILABLE
         faults.runtime_state(
-            recovery_phase="absent",
+            recovery_phase=recovery_phase,
             ownership=self._state,
-            marker_state="none",
+            interruption_marker=interruption_marker,
+            completion_marker_state="none",
             watermark="unarmed",
+            shutdown_sequence=SHUTDOWN_OPEN,
         )
         faults.matrix_crash("ownership_available")
 

@@ -91,6 +91,7 @@ import json
 import logging
 import math
 import os
+import stat
 import sys
 import threading
 import time
@@ -108,6 +109,12 @@ MATRIX_ENV_VAR = "CDC_CRASH_MATRIX_CUT"
 MATRIX_STATE_ENV_VAR = "CDC_CRASH_MATRIX_STATE"
 MATRIX_GATE_ENV_VAR = "CDC_CRASH_MATRIX_GATE"
 MATRIX_GATE_TIMEOUT_ENV_VAR = "CDC_CRASH_MATRIX_GATE_TIMEOUT"
+# A matrix cut is a test capability, not a deployment configuration.  The test
+# harness passes a one-shot pipe containing this token through ``pass_fds``.  An
+# inherited environment can name a selector, but it cannot create this capability
+# in an ordinary production process.
+MATRIX_CAPABILITY_ENV_VAR = "CDC_CRASH_MATRIX_CAPABILITY_FD"
+_MATRIX_CAPABILITY_TOKEN = b"cdc-flight-crash-matrix-test-v1\n"
 
 #: Protocol anchor points, in the order the applier reaches them.
 #:
@@ -306,6 +313,7 @@ def parse_spec(raw: str | None) -> tuple[str, int, int | str] | None:
 _UNPARSED = object()
 _spec_cache: object = _UNPARSED
 _matrix_cache: object = _UNPARSED
+_matrix_capability_cache: object = _UNPARSED
 _runtime_context: dict[str, object] = {}
 _runtime_lock = threading.Lock()
 
@@ -320,7 +328,15 @@ def refresh() -> tuple[str, int, int | str] | None:
     changing the environment."""
     global _matrix_cache, _spec_cache
     _spec_cache = parse_spec(os.environ.get(ENV_VAR))
-    _matrix_cache = parse_matrix_spec(os.environ.get(MATRIX_ENV_VAR))
+    # A deployment environment must not even parse or validate the matrix
+    # selector.  The private inherited capability is the first gate, not merely
+    # a condition around the eventual os._exit: without it the entire matrix
+    # configuration is inert, including malformed selectors and state paths.
+    _matrix_cache = (
+        parse_matrix_spec(os.environ.get(MATRIX_ENV_VAR))
+        if _matrix_test_capability()
+        else None
+    )
     return _spec_cache  # type: ignore[return-value]
 
 
@@ -359,28 +375,70 @@ def _matrix_spec() -> tuple[str, int] | None:
     return _matrix_cache  # type: ignore[return-value]
 
 
+def _matrix_test_capability() -> bool:
+    """Return whether this process was explicitly armed by the test harness.
+
+    The descriptor must be an inherited FIFO containing a private one-shot token.
+    This is intentionally an OS-level capability: setting any number of matrix
+    environment variables in a normal install is insufficient to reach a cut or
+    write matrix state.
+    """
+    global _matrix_capability_cache
+    if _matrix_capability_cache is not _UNPARSED:
+        return bool(_matrix_capability_cache)
+    raw_fd = os.environ.get(MATRIX_CAPABILITY_ENV_VAR)
+    enabled = False
+    if raw_fd:
+        try:
+            fd = int(raw_fd)
+            if stat.S_ISFIFO(os.fstat(fd).st_mode):
+                enabled = os.read(fd, len(_MATRIX_CAPABILITY_TOKEN)) == _MATRIX_CAPABILITY_TOKEN
+            if fd >= 3:
+                os.close(fd)
+        except (OSError, ValueError):
+            enabled = False
+    _matrix_capability_cache = enabled
+    return enabled
+
+
+def matrix_armed() -> bool:
+    """Whether the real crash-matrix capability and a selector are both present."""
+    return _matrix_test_capability() and _matrix_spec() is not None
+
+
+def matrix_selected(point: str, nth: int = 1) -> bool:
+    """Return whether an explicitly armed test selected this lifecycle point."""
+    return matrix_armed() and _matrix_spec() == (point, nth)
+
+
 def _matrix_state_path() -> str | None:
     state_dir = os.environ.get("CDC_STATE_DIR")
     filename = os.environ.get(MATRIX_STATE_ENV_VAR)
     if not state_dir or not filename:
         return None
-    if os.path.isabs(filename):
-        return filename
+    if os.path.isabs(filename) or os.path.basename(filename) != filename:
+        raise FaultSpecError(
+            f"{MATRIX_STATE_ENV_VAR}: filename must be a simple relative name under "
+            f"CDC_STATE_DIR, got {filename!r}"
+        )
     return os.path.join(state_dir, filename)
 
 
 def runtime_state(**fields: object) -> dict[str, object]:
     """Persist the real runtime state used by a crash-matrix observer.
 
-    The write is completely inert unless ``CDC_CRASH_MATRIX_STATE`` is set.  When it
-    is set, the file is replaced and fsynced so a parent that sends ``SIGKILL`` can
-    distinguish the last completed production edge from a stale previous run.
+    The write is completely inert unless the private test capability was inherited.
+    When that capability and a relative state filename are both present, the file is
+    replaced and fsynced so a parent that sends ``SIGKILL`` can distinguish the last
+    completed production edge from a stale previous run.
     """
-    path = _matrix_state_path()
-    if path is None:
+    if not _matrix_test_capability():
         return dict(_runtime_context)
+    path = _matrix_state_path()
     with _runtime_lock:
         _runtime_context.update(fields)
+        if path is None:
+            return dict(_runtime_context)
         payload = {
             "pid": os.getpid(),
             "updated_at": time.time(),
@@ -396,8 +454,11 @@ def runtime_state(**fields: object) -> dict[str, object]:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, path)
-        except Exception:  # pragma: no cover - matrix evidence must not alter a run
-            log.debug("could not persist crash-matrix runtime state", exc_info=True)
+        except Exception as exc:  # pragma: no cover - exercised by the evidence guard
+            log.error("could not persist crash-matrix runtime state", exc_info=True)
+            raise RuntimeError(
+                f"crash-matrix runtime state could not be persisted at {path}"
+            ) from exc
         finally:
             if temporary is not None:
                 with contextlib.suppress(OSError):
@@ -407,6 +468,11 @@ def runtime_state(**fields: object) -> dict[str, object]:
 
 def matrix_crash(point: str, nth: int = 1) -> None:
     """Hard-exit at a lifecycle edge selected by the real crash matrix."""
+    # Check the OS capability before touching any matrix-controlled environment
+    # value.  Environment alone therefore cannot select, gate, persist, or fire
+    # a crash, even if a deployment inherited a stale or malformed selector.
+    if not _matrix_test_capability():
+        return
     spec = _matrix_spec()
     if spec is None or spec != (point, nth):
         return

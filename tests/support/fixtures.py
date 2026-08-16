@@ -126,6 +126,18 @@ def _executable(name: str) -> str:
     return str(candidate) if candidate.exists() else name
 
 
+def _matrix_capability_fd() -> int:
+    """Create the OS capability required to arm a real crash-matrix child."""
+    from cdc_flight import faults
+
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, faults._MATRIX_CAPABILITY_TOKEN)
+    finally:
+        os.close(write_fd)
+    return read_fd
+
+
 @pytest.fixture(autouse=True)
 def _reset_fault_spec():
     """`faults` caches the parsed `CDC_FAULT_INJECT` (it is read from inside the
@@ -259,6 +271,7 @@ def _invoke_pipeline(
     timeout: float = 300,
     expect_success: bool = True,
     accept_orphan_offsets: bool = False,
+    matrix_arm: bool = False,
 ) -> dict:
     """Run the `cdc-flight` CLI once and return its summary plus process outcome.
 
@@ -289,9 +302,28 @@ def _invoke_pipeline(
     summary_path = Path(env["CDC_STATE_DIR"]) / "last_run.json"
     summary_path.unlink(missing_ok=True)
 
-    proc = subprocess.run(
-        cmd, capture_output=True, text=True, env=env, cwd=PROJECT_DIR, timeout=timeout
-    )
+    capability_fd = None
+    pass_fds: tuple[int, ...] = ()
+    if matrix_arm:
+        capability_fd = _matrix_capability_fd()
+        env = {
+            **env,
+            "CDC_CRASH_MATRIX_CAPABILITY_FD": str(capability_fd),
+        }
+        pass_fds = (capability_fd,)
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=PROJECT_DIR,
+            timeout=timeout,
+            pass_fds=pass_fds,
+        )
+    finally:
+        if capability_fd is not None:
+            os.close(capability_fd)
     if expect_success and proc.returncode != 0:
         raise AssertionError(
             f"pipeline exited {proc.returncode}\n--- stdout ---\n{proc.stdout[-4000:]}"
@@ -567,25 +599,38 @@ class Sandbox:
         destination: str = "duckdb",
         extra_env: dict[str, str] | None = None,
         capture: bool = False,
+        matrix_arm: bool = False,
     ) -> subprocess.Popen:
         """Start the pipeline as a killable child process (fault injection)."""
         sink = subprocess.PIPE if capture else subprocess.DEVNULL
-        return subprocess.Popen(
-            [
-                _executable("cdc-flight"),
-                "--destination",
-                destination,
-                "--max-seconds",
-                str(max_seconds),
-                "--idle-seconds",
-                str(idle_seconds),
-            ],
-            env={**self.env, **(extra_env or {})},
-            cwd=PROJECT_DIR,
-            stdout=sink,
-            stderr=sink,
-            text=capture,
-        )
+        env = {**self.env, **(extra_env or {})}
+        capability_fd = None
+        pass_fds: tuple[int, ...] = ()
+        if matrix_arm:
+            capability_fd = _matrix_capability_fd()
+            env["CDC_CRASH_MATRIX_CAPABILITY_FD"] = str(capability_fd)
+            pass_fds = (capability_fd,)
+        try:
+            return subprocess.Popen(
+                [
+                    _executable("cdc-flight"),
+                    "--destination",
+                    destination,
+                    "--max-seconds",
+                    str(max_seconds),
+                    "--idle-seconds",
+                    str(idle_seconds),
+                ],
+                env=env,
+                cwd=PROJECT_DIR,
+                stdout=sink,
+                stderr=sink,
+                text=capture,
+                pass_fds=pass_fds,
+            )
+        finally:
+            if capability_fd is not None:
+                os.close(capability_fd)
 
     def last_summary(self) -> dict:
         """The JSON summary the CLI wrote for its most recent run, if any."""

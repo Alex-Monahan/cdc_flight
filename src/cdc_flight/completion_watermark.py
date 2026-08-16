@@ -284,7 +284,9 @@ class CompletionWatermark:
             },
         )
         if target is not None:
-            faults.runtime_state(marker_state="completion_written", marker_lsn=target)
+            faults.runtime_state(
+                completion_marker_state="written", completion_marker_lsn=target
+            )
             faults.matrix_crash("completion_marker_written")
         return target
 

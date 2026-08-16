@@ -32,6 +32,7 @@ from support.applier_lab import (
     snap,
 )
 
+from cdc_flight import commit_protocol, faults
 from cdc_flight.envelope import KIND_SNAPSHOT_BOUNDARY, PendingRecord
 from cdc_flight.errors import OffsetFlushFailed
 from cdc_flight.run_state import COMMIT_ACK
@@ -792,6 +793,32 @@ def test_crash_between_snapshot_commit_and_discard_ack_keeps_handles_replayable(
     assert len(box.applier._pending_discarded_records) == 3
     box.applier.shutdown(reason="simulated_crash")
     assert len(box.applier._pending_discarded_records) == 3
+
+
+def test_pre_commit_cut_requires_resume_state_inside_the_data_transaction(
+    lab, monkeypatch
+):
+    """A mutation moving resume state after COMMIT must fail this guard."""
+    box = lab()
+    _patch_production_handle_for_pending_records(monkeypatch)
+    calls: list[tuple] = []
+    real_write_resume_point = commit_protocol.destination.write_resume_point
+
+    def observe_resume_write(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_write_resume_point(*args, **kwargs)
+
+    monkeypatch.setattr(
+        commit_protocol.destination, "write_resume_point", observe_resume_write
+    )
+    monkeypatch.setenv("CDC_FAULT_INJECT", "pre_commit:1:raise")
+    faults.refresh()
+    with pytest.raises(faults.InjectedFault):
+        box.applier._handle(_streaming_transaction(), box.committer)
+
+    assert calls, "resume state was not staged before the pre-COMMIT cut"
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.commit_log") == 0
+    assert box.scalar("SELECT count(*) FROM _cdc_flight.debezium_offsets") == 0
 
 
 def test_resnapshot_fences_streaming_unit_after_open_snapshot_group(lab):

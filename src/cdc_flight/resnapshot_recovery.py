@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import destination as dest_mod
+from . import faults
 from . import reconcile as reconcile_mod
 from .errors import EngineFailure
 from .machines import INTERRUPTION_MARKER as INTERRUPTION_MARKER_MACHINE
@@ -30,6 +31,11 @@ TableIdentity = tuple[str, str, str]
 
 def interruption_marker(state_dir) -> Path:
     return Path(state_dir) / INTERRUPTION_MARKER
+
+
+def interruption_marker_state(state_dir) -> str:
+    """Return the declared durable interruption-marker state for matrix observers."""
+    return _read_interruption_marker(state_dir)[0]
 
 
 def _write_interruption_marker(marker: Path, payload: dict) -> None:
@@ -81,6 +87,7 @@ def arm_interruption_marker(
         "tables": [list(table) for table in tables],
     }
     _write_interruption_marker(marker, payload)
+    faults.runtime_state(interruption_marker=MARKER_ARMED)
     return marker
 
 
@@ -92,6 +99,7 @@ def consume_interruption_marker(state_dir) -> Path:
     payload["state"] = MARKER_CONSUMED
     marker = interruption_marker(state_dir)
     _write_interruption_marker(marker, payload)
+    faults.runtime_state(interruption_marker=MARKER_CONSUMED)
     return marker
 
 
@@ -114,6 +122,7 @@ def discard_consumed_interruption_marker(state_dir) -> None:
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
+    faults.runtime_state(interruption_marker=MARKER_ABSENT)
 
 
 def _validated_record(
