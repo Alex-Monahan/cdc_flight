@@ -13,12 +13,14 @@ from pathlib import Path
 import pytest
 
 #: RE-MEASURED FROM THE REAL LANE COLLECTIONS. The current collections are
-#: 1760 / 171 / 46; this guard module contributes 10 / 1 / 1 items, giving the
-#: executable baselines below. The four removed ownership-size tests are the
+#: 1761 / 171 / 46; this guard module contributes 10 / 1 / 1 items, giving the
+#: executable baselines below. The source-corroboration regression is an ordinary
+#: default-lane test, so the default baseline grows by exactly one. The four removed
+#: ownership-size tests are the
 #: deliberate r17-MAJOR-3 deletion; the new containment proofs restore the
 #: selected surface without imposing a replacement size rule.
 _BASELINE_SELECTED = {
-    "not motherduck and not slow": 1750,
+    "not motherduck and not slow": 1751,
     "slow and not motherduck": 170,
     "motherduck": 45,
 }

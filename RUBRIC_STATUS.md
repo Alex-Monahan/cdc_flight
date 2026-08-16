@@ -4602,3 +4602,17 @@ omitted `xml[]` value after the source row disappears; the marker-preserving TOA
 failure raised before Python has any honest relation identity remains fail-loud
 and offset-alerted rather than being assigned to a table. No state from a prior
 build was migrated, and no keyless-delete work was reopened.
+
+### Merge-to-main verification — 2026-08-15
+
+The reviewed `fix/r17-containment` stack is now merged to `main`. During merged-tree
+verification, the completion watermark was tightened at the production boundary:
+callback quietness must also be corroborated by `SourceHealth.may_declare_idle`
+before a writable run takes its one completion position. A source that has suffered
+a walsender interruption and has not recovered therefore remains `unarmed` and
+fails on `--max-seconds`; a source with no primary write route retains the declared
+quiet-window fallback. The real walsender-kill test and a continuous-writer,
+row-by-row probe both pass this boundary: the ceiling run exits non-zero with rows
+missing at that instant, and the following run reconciles the complete source set.
+This strengthens the 1.9 / 4.5 claim without changing the honest carry-forwards
+above (stock Debezium `xml[]`, marker-preserving TOAST, and money fidelity).

@@ -116,10 +116,13 @@ class MarkableSource:
     """
 
     interval = 0.5
+    primary_dsn = "fake-primary"
 
     def __init__(self, *, lsn: int = 5000, writable: bool = True):
         self.lsn = lsn
         self.writable = writable
+        if not writable:
+            self.primary_dsn = None
         self.emitted: list[tuple[str, dict]] = []
         self.ever_streamed = True
         self.ever_sampled = True
@@ -307,6 +310,18 @@ def test_a_position_is_only_ever_taken_from_a_quiet_stream():
     assert gate.reached(handler, elapsed=1.5) is False
     assert gate.state == WATERMARK_ARMED
     assert gate.quiet_seconds == 0.5
+
+
+def test_a_source_that_does_not_corroborate_quiet_never_arms():
+    """A quiet callback is not proof while the source is reconnecting."""
+    source = MarkableSource()
+    source.may_declare_idle = lambda **_kwargs: False
+    gate = _watermark(source)
+    handler = FakeHandler(durable_lsn=10, quiet_for=99.0)
+
+    assert gate.reached(handler, elapsed=1.0) is False
+    assert gate.state == WATERMARK_UNARMED
+    assert source.emitted == []
 
 
 def test_no_watermark_is_taken_before_the_connector_has_streamed():

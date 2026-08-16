@@ -95,6 +95,7 @@ class FakeHandler:
 class EmptySnapshotHealth:
     """Source-side positive evidence that an empty snapshot reached streaming."""
 
+    primary_dsn = None
     ever_sampled = True
     ever_streamed = True
     unknown_for = 0.0
@@ -255,6 +256,7 @@ class SettlingSourceHealth:
     """
 
     interval = 0.5
+    primary_dsn = None
     ever_sampled = True
     ever_streamed = True
     unknown_for = 0.0

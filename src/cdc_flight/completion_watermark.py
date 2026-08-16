@@ -233,6 +233,12 @@ class CompletionWatermark:
             self.health is not None
             and self.marker is not None
             and self.marker.enabled
+            # A resnapshot and a read-only embedding caller deliberately have no
+            # primary write route.  Keep their documented quiet-window fallback
+            # even when the sampler cannot corroborate a watermark; a normal
+            # streaming run always supplies the configured primary DSN and must
+            # stay unarmed while the source is reconnecting.
+            and getattr(self.health, "primary_dsn", None) is not None
         )
 
     def _ready_to_arm(self, handler) -> bool:
@@ -246,13 +252,20 @@ class CompletionWatermark:
 
         The quiet term is what makes the removed `armed -> unarmed` edge
         unnecessary: a position is taken only from a stream that has stopped
-        handing batches over, so there is nothing to withdraw it for. A source
-        that never stops committing therefore never gets a position at all, and
-        such a run fails on its ceiling rather than reporting success.
+        handing batches over, so there is nothing to withdraw it for. Callback
+        silence alone is not enough, though: the source sampler must corroborate
+        the same quiet interval, so a walsender restart/backoff cannot arm a
+        position in front of an undelivered backlog. A source that never stops
+        committing therefore never gets a position at all, and such a run fails
+        on its ceiling rather than reporting success.
         """
         return (
             handler.seconds_since_last_batch >= self.quiet_seconds
             and self.health.ever_streamed
+            and self.health.may_declare_idle(
+                min_seconds=self.quiet_seconds,
+                received_high_water=getattr(handler, "highest_source_lsn", None),
+            )
         )
 
     def _arm(self, handler) -> int | None:
