@@ -30,7 +30,6 @@ from . import (
     apply_sql,
     catalog_support,
     destination,
-    destination_failure,
     failure_containment,
     naming,
     table_work,
@@ -42,14 +41,11 @@ from .destination_failure import DestinationDataRejection
 from .envelope import KIND_TRUNCATE, PendingRecord
 from .errors import (
     AdmissionError,
-    AmbiguousDelete,
     DestinationExecutionFailure,
-    DestinationIdentityCollision,
     SchemaEvolutionRefused,
     TableWriteFailure,
     ToastBaseMissing,
 )
-from .faults import DestinationFault
 from .snapshot import SnapshotTable
 from .table_work import TableWork
 from .typed_types import native_type
@@ -423,6 +419,21 @@ class GroupPlan:
             event_id=event_id,
         )
 
+    def _materialization_refusal(self, error: Exception, target: str, item):
+        if target != item.target:
+            raise error from None
+        return failure_containment.as_contained_refusal(
+            error,
+            source_schema=item.source_schema,
+            source_table=item.source_table,
+            target=item.target,
+            detected_lsn=self.stats.get("last_lsn"),
+            fingerprint=self._failure_fingerprints.get(
+                f"{item.source_schema}.{item.source_table}"
+            )
+            or failure_containment.item_fingerprint(item),
+        )
+
     def _enrich_descriptors(self, event: PendingRecord) -> None:
         """Merge one memoized catalog descriptor map into a row envelope."""
         if not event.qualified_table:
@@ -765,57 +776,29 @@ class GroupPlan:
                     self.registry,
                     item,
                     self.created_in_txn,
+                )
+            except DestinationDataRejection as rejection:
+                refused = self._materialization_refusal(
+                    rejection.original, rejection.target, item
+                )
+                raise DestinationExecutionFailure(
+                    refused, rejection.original, rejection.target
+                ) from rejection
+            except TableWriteFailure as failure:
+                failure.refused = self._materialization_refusal(
+                    failure.original, failure.target, item
+                )
+                raise
+            if item.keyless_ledger and not item.snapshot and self.pipeline:
+                destination.write_keyless_events(
+                    self.con,
+                    [
+                        (item.target, event_id, operation, digest)
+                        for event_id, operation, digest in item.keyless_ledger
+                    ],
                     pipeline=self.pipeline,
                     control_schema=self._control_schema,
                 )
-            except (AmbiguousDelete, DestinationIdentityCollision, ToastBaseMissing):
-                raise
-            except Exception as exc:
-                if isinstance(exc, (SchemaEvolutionRefused, DestinationFault)):
-                    # A recognized refusal follows the commit protocol's existing
-                    # rollback path.  A destination fault is likewise a whole-group
-                    # protocol failure: its connection may already be unusable, so
-                    # attempting table quarantine would replace the injected cause
-                    # with a secondary "connection closed" error.
-                    raise
-                if isinstance(exc, DestinationDataRejection):
-                    refused = failure_containment.as_contained_refusal(
-                        exc.original,
-                        provenance=exc.provenance,
-                        detected_lsn=self.stats.get("last_lsn"),
-                        fingerprint=self._failure_fingerprints.get(
-                            f"{item.source_schema}.{item.source_table}"
-                        )
-                        or failure_containment.item_fingerprint(item),
-                    )
-                    raise DestinationExecutionFailure(
-                        refused, exc.original, exc.provenance
-                    ) from exc
-                if destination_failure.is_driver_error(exc):
-                    # A raw driver error did not cross the materializer's DML
-                    # provenance boundary.  It can therefore be transaction
-                    # control, connection/session, parser/catalog, or engine
-                    # state, and must fail the run without a fabricated table.
-                    raise
-                # `table_writer.write` may already have issued a DELETE before a
-                # Python/materializer failure reaches this boundary.  DuckDB has no
-                # savepoint support in the pinned runtime, so containing in-place
-                # would commit a torn table image.  Roll back the complete source
-                # transaction and let the commit owner replay healthy peers with
-                # this relation excluded.
-                provenance = getattr(item, "_data_provenance", None)
-                if provenance is None:
-                    raise
-                refused = failure_containment.as_contained_refusal(
-                    exc,
-                    provenance=provenance,
-                    detected_lsn=self.stats.get("last_lsn"),
-                    fingerprint=self._failure_fingerprints.get(
-                        f"{item.source_schema}.{item.source_table}"
-                    )
-                    or failure_containment.item_fingerprint(item),
-                )
-                raise TableWriteFailure(refused, exc, provenance) from exc
             if not item.snapshot and item.source_schema and item.target in self.created_in_txn:
                 # Codex 5: destination ownership has to be persisted by whoever first
                 # materialises the table, snapshot or streaming, or a table that only

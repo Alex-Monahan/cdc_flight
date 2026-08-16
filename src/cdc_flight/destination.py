@@ -34,7 +34,7 @@ from .machines import (
 from .naming import control_table, quote
 
 # Re-exported: `source_relations.py` is a split of this module, not a new dependency
-# for its callers (Codex r3 MINOR / the 1,000-line threshold).
+# for its callers (Codex r3 MINOR / the destination ownership split).
 from .source_relations import (  # noqa: F401
     flush_learned_relations,
     forget_source_relation,

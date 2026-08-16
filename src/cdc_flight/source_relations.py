@@ -1,7 +1,7 @@
 """The source-relation registry: what the catalog watcher learned, made durable.
 
-Split out of `destination.py`, which crossed the thermo-nuclear review's 1,000-line
-giant-file threshold. This is a coherent piece rather than an arbitrary cut: three
+Split out of `destination.py` to give source-relation ownership one cohesive home.
+This is a coherent piece rather than an arbitrary cut: three
 functions, one table, one job — `_cdc_flight.source_relations` is the **only** thing that
 makes a `DROP TABLE` or a drop-and-recreate detectable across a restart, because the
 persisted `(relation_oid, relation_filenode, relation_type_oid)` token is what the

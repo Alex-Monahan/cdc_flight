@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -236,20 +238,16 @@ def test_huge_integer_table_binding_is_a_containable_data_rejection():
     """A table DML binding rejection must not escape the data boundary."""
     import duckdb
 
-    from cdc_flight import destination_failure
     from cdc_flight.destination_failure import (
         DestinationDataRejection,
-        MaterializationConnection,
         execute_table_dml,
     )
+    from cdc_flight.table_writer import _table_dml_connection
 
     con = duckdb.connect(":memory:")
     try:
         con.execute("CREATE TABLE t_int (value INTEGER)")
-        facade = MaterializationConnection(
-            con,
-            destination_failure._mint_table_data_provenance("app", "t_int", "t_int"),
-        )
+        facade = _table_dml_connection(con, "t_int")
         with pytest.raises(DestinationDataRejection) as rejected:
             execute_table_dml(facade, "INSERT INTO t_int VALUES (?)", [10**100])
         assert isinstance(rejected.value.original, duckdb.InvalidInputException)
@@ -257,31 +255,166 @@ def test_huge_integer_table_binding_is_a_containable_data_rejection():
         con.close()
 
 
-def test_unmarked_large_production_module_is_in_measurement_set(tmp_path):
-    """The ownership discovery probe must not disappear for lacking a marker."""
-    import importlib.util
-    from pathlib import Path
+def test_table_data_scope_rejects_a_statement_for_another_relation():
+    """A source-A DML scope must not execute or attribute target-B SQL."""
+    import duckdb
 
-    source_path = (
-        Path(__file__).resolve().parents[1]
-        / "rubric"
-        / "2.3_new_table_discovery"
-        / "test_2_3_new_table_discovery.py"
+    from cdc_flight.destination_failure import execute_table_dml, executemany_table_dml
+    from cdc_flight.table_writer import _table_dml_connection
+
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("CREATE TABLE target_a (value INTEGER)")
+        con.execute("CREATE TABLE target_b (value INTEGER)")
+        facade = _table_dml_connection(con, "target_a")
+
+        with pytest.raises(ValueError, match=r"target_a|target_b"):
+            execute_table_dml(facade, "INSERT INTO target_b VALUES (?)", [10**100])
+
+        with pytest.raises(ValueError, match=r"target_a|target_b"):
+            executemany_table_dml(facade, "INSERT INTO target_b VALUES (?)", [[10**100]])
+
+        assert con.execute("SELECT count(*) FROM target_b").fetchone() == (0,)
+    finally:
+        con.close()
+
+
+def test_table_data_scope_has_no_source_claim_to_forge():
+    """A DML scope guards its target; source attribution remains with the plan."""
+    import duckdb
+
+    from cdc_flight import destination_failure
+    from cdc_flight.destination_failure import (
+        DestinationDataRejection,
+        execute_table_dml,
     )
-    spec = importlib.util.spec_from_file_location("ownership_guard_probe", source_path)
-    assert spec is not None and spec.loader is not None
-    guard = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(guard)
+    from cdc_flight.table_writer import _table_dml_connection
 
-    package = tmp_path / "cdc_flight"
-    package.mkdir()
-    (package / "__init__.py").write_text("\n", encoding="utf-8")
-    empty = package / "empty_unmarked.py"
-    empty.write_text("", encoding="utf-8")
-    probe = package / "r16_unmarked_owner_probe.py"
-    probe.write_text("x = 0\n" * 1001, encoding="utf-8")
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("CREATE TABLE target_a (value INTEGER)")
+        con.execute("CREATE TABLE target_b (value INTEGER)")
+        facade = _table_dml_connection(con, "target_a")
+        assert not hasattr(destination_failure, "TableDataProvenance")
+        assert not hasattr(destination_failure, "_mint_table_data_provenance")
 
-    assert empty in guard._ownership_modules(package)
-    assert probe in guard._ownership_modules(package)
-    with pytest.raises(AssertionError, match=r"r16_unmarked_owner_probe\.py"):
-        guard._assert_ownership_boundaries(package)
+        with pytest.raises(ValueError, match=r"target_b"):
+            execute_table_dml(facade, "INSERT INTO target_b VALUES (?)", [10**100])
+        assert con.execute("SELECT count(*) FROM target_b").fetchone() == (0,)
+
+        with pytest.raises(DestinationDataRejection) as rejected:
+            execute_table_dml(
+                _table_dml_connection(con, "target_b"),
+                "INSERT INTO target_b VALUES (?)",
+                [10**100],
+            )
+        assert rejected.value.target == "target_b"
+    finally:
+        con.close()
+
+
+def test_control_helper_failure_after_table_dml_stays_run_level(tmp_path, monkeypatch):
+    """A control-plane helper must not inherit table-DML containment scope."""
+    from support.applier_lab import Lab, data, end
+
+    from cdc_flight import destination
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("synthetic control-ledger serializer failure")
+
+    monkeypatch.setattr(destination, "write_keyless_events", fail)
+    box = Lab(tmp_path / "control-helper-run.duckdb")
+    try:
+        with pytest.raises(RuntimeError, match="synthetic control-ledger serializer failure"):
+            box.run(
+                [
+                    data(
+                        "control-helper-run",
+                        1,
+                        100,
+                        table="control_helper_bad",
+                        after={"id": 1, "name": "bad"},
+                    ),
+                    end("control-helper-run", 1, 101, {"app.control_helper_bad": 1}),
+                ]
+            )
+        assert box.q("SELECT count(*) FROM _cdc_flight.schema_refusals") == [(0,)]
+        assert box.q(
+            "SELECT count(*) FROM _cdc_flight.alerts WHERE code = 'table_exception_contained'"
+        ) == [(0,)]
+        assert box.applier._contained_failures == []
+    finally:
+        box.close()
+
+
+def test_containment_entry_set_is_closed_by_package_ast():
+    """Every production route into containment is enumerated and named here."""
+    root = Path(__file__).resolve().parents[2] / "src" / "cdc_flight"
+    symbols = {
+        "contain_table_failure",
+        "contain_destination_failure",
+        "as_contained_refusal",
+        "mark_blocked_event",
+    }
+    found = []
+
+    class Calls(ast.NodeVisitor):
+        def __init__(self, path, module_aliases, function_aliases):
+            self.path = path
+            self.module_aliases = module_aliases
+            self.function_aliases = function_aliases
+            self.functions = []
+
+        def visit_FunctionDef(self, node):
+            self.functions.append(node.name)
+            self.generic_visit(node)
+            self.functions.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Call(self, node):
+            symbol = None
+            if isinstance(node.func, ast.Attribute):
+                if (
+                    isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in self.module_aliases
+                    and node.func.attr in symbols
+                ):
+                    symbol = node.func.attr
+            elif isinstance(node.func, ast.Name):
+                symbol = self.function_aliases.get(node.func.id)
+            if symbol is not None:
+                found.append((self.path.name, self.functions[-1], symbol, node.lineno))
+            self.generic_visit(node)
+
+    for path in sorted(root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        module_aliases = {"failure_containment"}
+        function_aliases = {}
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.endswith(".failure_containment"):
+                        module_aliases.add(alias.asname or alias.name.rsplit(".", 1)[-1])
+                continue
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            if node.module and node.module.endswith("failure_containment"):
+                for alias in node.names:
+                    if alias.name in symbols:
+                        function_aliases[alias.asname or alias.name] = alias.name
+            if node.module in {None, "cdc_flight"}:
+                for alias in node.names:
+                    if alias.name == "failure_containment":
+                        module_aliases.add(alias.asname or alias.name)
+        Calls(path, module_aliases, function_aliases).visit(tree)
+
+    assert sorted(row[:3] for row in found) == sorted(
+        [
+            ("applier.py", "_contain_destination_failure", "contain_destination_failure"),
+            ("applier.py", "_contain_table_failure", "contain_table_failure"),
+            ("planner.py", "_collect", "mark_blocked_event"),
+            ("planner.py", "_materialization_refusal", "as_contained_refusal"),
+        ],
+        key=lambda row: row[:3],
+    ), found

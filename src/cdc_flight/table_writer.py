@@ -9,10 +9,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import apply_sql, destination, naming
+from . import apply_sql, destination_failure, naming
 from .destination_failure import (
+    DestinationDataRejection,
     MaterializationConnection,
-    _mint_table_data_provenance,
     execute_table_dml,
 )
 from .errors import (
@@ -20,8 +20,10 @@ from .errors import (
     AmbiguousDelete,
     DestinationIdentityCollision,
     SchemaEvolutionRefused,
+    TableWriteFailure,
     as_schema_refusal,
 )
+from .faults import DestinationFault
 from .row_patch import RowPatch
 from .table_work import (
     APPLIER_COLUMN_TYPES,
@@ -35,14 +37,16 @@ from .table_work import (
 OWNER = "table-destination-materialization"
 
 
+def _table_dml_connection(con, target: str):
+    """Create the one DML facade owned by this table writer."""
+    return MaterializationConnection(con, target)
+
+
 def write(
     con,
     registry,
     item: TableWork,
     created_in_txn: set[str],
-    *,
-    pipeline: str | None = None,
-    control_schema: str | None = None,
 ) -> None:
     """Apply one prepared table plan without opening or closing a transaction."""
     if item.truncated and not item.live and not registry.get(item.target).exists:
@@ -92,15 +96,32 @@ def write(
         c for c in columns if c not in table.columns
     ]
     column_order = list(dict.fromkeys(column_order))
+    data_con = _table_dml_connection(con, item.target)
+    try:
+        _write_table(con, table, item, column_order, fresh=fresh, data_con=data_con)
+    except (
+        AdmissionError,
+        AmbiguousDelete,
+        DestinationDataRejection,
+        DestinationFault,
+        DestinationIdentityCollision,
+    ):
+        raise
+    except Exception as error:
+        if destination_failure.is_driver_error(error):
+            raise
+        raise TableWriteFailure(None, error, data_con.target) from error
+
+
+def _write_table(con, table, item: TableWork, column_order: list[str], *, fresh: bool, data_con):
+    """Apply one table's data-plane operations under one validated DML scope."""
     if item.keyless:
         _write_keyless_operations(
-            con,
+            data_con,
             table,
             item,
             column_order,
             fresh=fresh,
-            pipeline=pipeline,
-            control_schema=control_schema,
         )
         _finish_truncate_audit(item)
         try:
@@ -113,20 +134,9 @@ def write(
         return
 
     delete_keys, rows, partial_updates, moves = _plan(item)
-    data_con = None
-
-    def table_dml():
-        nonlocal data_con
-        if data_con is None:
-            data_con = MaterializationConnection(
-                con,
-                _mint_table_data_provenance(item.source_schema, item.source_table, item.target),
-            )
-            item._data_provenance = data_con.provenance
-        return data_con
 
     if item.truncated:
-        item.rows_removed = 0 if fresh else _delete_all(table_dml(), table)
+        item.rows_removed = 0 if fresh else _delete_all(data_con, table)
     elif not item.snapshot and not fresh and delete_keys:
         keys = [
             tuple(
@@ -135,7 +145,7 @@ def write(
             )
             for key in delete_keys
         ]
-        apply_sql.delete_keys(table_dml(), table, item.key_columns, keys)
+        apply_sql.delete_keys(data_con, table, item.key_columns, keys)
     _finish_truncate_audit(item)
 
     updates: list[tuple[tuple, dict[str, Any]]] = []
@@ -158,7 +168,7 @@ def write(
         updates.append((source_key, assignments))
     if updates:
         affected = (
-            0 if fresh else apply_sql.update_rows(table_dml(), table, item.key_columns, updates)
+            0 if fresh else apply_sql.update_rows(data_con, table, item.key_columns, updates)
         )
         if fresh or affected != len(updates):
             _missing_toast_base(
@@ -171,7 +181,7 @@ def write(
 
     if rows:
         apply_sql.insert_rows(
-            table_dml(),
+            data_con,
             table,
             column_order,
             [
@@ -197,36 +207,23 @@ def write(
 
 
 def _write_keyless_operations(
-    con,
+    data_con,
     table,
     item: TableWork,
     column_order: list[str],
     *,
     fresh: bool,
-    pipeline: str | None,
-    control_schema: str | None,
 ) -> None:
     """Execute keyless physical operations in source order."""
     pending: list[dict[str, Any]] = []
     table_fresh = fresh
-    data_con = None
-
-    def table_dml():
-        nonlocal data_con
-        if data_con is None:
-            data_con = MaterializationConnection(
-                con,
-                _mint_table_data_provenance(item.source_schema, item.source_table, item.target),
-            )
-            item._data_provenance = data_con.provenance
-        return data_con
 
     def flush_inserts() -> None:
         nonlocal table_fresh
         if not pending:
             return
         apply_sql.insert_rows(
-            table_dml(),
+            data_con,
             table,
             column_order,
             [
@@ -254,7 +251,7 @@ def _write_keyless_operations(
             continue
         flush_inserts()
         if operation.operation == "t":
-            item.rows_removed = 0 if table_fresh else _delete_all(table_dml(), table)
+            item.rows_removed = 0 if table_fresh else _delete_all(data_con, table)
             table_fresh = False
             continue
         if operation.operation not in {"d", "u"}:
@@ -272,7 +269,7 @@ def _write_keyless_operations(
                 reason=f"keyless {operation.operation} has no complete before-image",
             )
         affected = apply_sql.delete_matching_row(
-            table_dml(),
+            data_con,
             table,
             tuple(operation.before),
             operation.before,
@@ -293,17 +290,7 @@ def _write_keyless_operations(
             flush_inserts()
 
     flush_inserts()
-    if item.keyless_ledger and not item.snapshot and pipeline:
-        destination_rows = [
-            (item.target, event_id, operation, digest)
-            for event_id, operation, digest in item.keyless_ledger
-        ]
-        destination.write_keyless_events(
-            con,
-            destination_rows,
-            pipeline=pipeline,
-            control_schema=control_schema,
-        )
+
 
 def _key_value(table, column: str, value):
     """Encode a key using the same source descriptor as the row path."""

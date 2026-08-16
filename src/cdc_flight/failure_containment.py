@@ -61,16 +61,15 @@ def item_fingerprint(item) -> str:
 def as_contained_refusal(
     error: Exception,
     *,
-    provenance,
+    source_schema: str,
+    source_table: str,
+    target: str,
     detected_lsn: int | None,
     fingerprint: str,
 ):
-    """Attach the scope carried by an unforgeable table-DML capability."""
+    """Attach the current plan item's source relation to a DML failure."""
     from .errors import SchemaEvolutionRefused
 
-    source_schema = provenance.source_schema
-    source_table = provenance.source_table
-    target = provenance.target
     if isinstance(error, SchemaEvolutionRefused):
         error.source_schema = error.source_schema or source_schema
         error.source_table = error.source_table or source_table
@@ -221,14 +220,9 @@ def contain_destination_failure(
     refused,
     original: Exception,
     *,
-    provenance,
     destination_execution: bool = True,
 ) -> str:
     """Record a failure after destination rollback, using the independent sink."""
-    from .destination_failure import TableDataProvenance
-
-    if not isinstance(provenance, TableDataProvenance):
-        raise original
     if not refused.source_schema or not refused.source_table:
         raise original
     sink = applier.alerts._sink if applier.alerts.independent else None

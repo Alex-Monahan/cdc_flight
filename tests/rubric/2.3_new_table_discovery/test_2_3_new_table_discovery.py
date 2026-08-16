@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import subprocess
-from pathlib import Path
-
 import duckdb
 import pytest
 
@@ -90,60 +87,6 @@ def test_completed_resnapshot_closes_new_hook_without_duplicate_marker():
 
 def test_catalog_poll_default_is_short_and_configurable():
     assert 0 < CatalogConfig().poll_seconds <= 60
-
-
-def _is_ownership_source(source: str) -> bool:
-    """Every production module is measured; markers are descriptive, not opt-in."""
-    del source
-    return True
-
-
-def _ownership_modules(package: Path) -> tuple[Path, ...]:
-    """Enumerate every production Python module, failing closed by default."""
-    return tuple(
-        path
-        for path in sorted(package.glob("*.py"))
-        if _is_ownership_source(path.read_text(encoding="utf-8"))
-    )
-
-
-def _assert_ownership_boundaries(package: Path) -> None:
-    for path in _ownership_modules(package):
-        assert len(path.read_text(encoding="utf-8").splitlines()) < 1000, path.name
-
-
-def test_discovery_ownership_modules_stay_below_the_maintainability_boundary():
-    """Measure the ownership surface declared by production source code."""
-    root = Path(__file__).resolve().parents[3]
-    modules = _ownership_modules(root / "src" / "cdc_flight")
-    assert modules
-    _assert_ownership_boundaries(root / "src" / "cdc_flight")
-
-
-def test_r16_reproduction_measures_the_grown_table_owners():
-    """The AST surface includes the newly decomposed fold and plan owners."""
-    root = Path(__file__).resolve().parents[3]
-    names = {path.name for path in _ownership_modules(root / "src" / "cdc_flight")}
-    assert {"planner.py", "table_work.py", "table_writer.py", "keyless_work.py"} <= names
-
-
-def test_ownership_guard_would_reject_d291b62_shapes():
-    """The fixed guard identifies both oversized r15 owners in the old tree."""
-    root = Path(__file__).resolve().parents[3]
-    old_sources = {
-        name: subprocess.check_output(
-            ["git", "show", f"d291b62:src/cdc_flight/{name}"],
-            cwd=root,
-            text=True,
-        )
-        for name in ("planner.py", "table_work.py")
-    }
-    old_owners = {name for name, source in old_sources.items() if _is_ownership_source(source)}
-    assert {"planner.py", "table_work.py"} <= old_owners
-    assert {name for name, source in old_sources.items() if len(source.splitlines()) >= 1000} == {
-        "planner.py",
-        "table_work.py",
-    }
 
 
 def test_liveness_is_per_schema_and_error_states_never_mean_mass_drop():

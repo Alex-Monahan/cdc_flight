@@ -671,6 +671,7 @@ def test_destination_classifier_is_a_closed_data_boundary():
     import duckdb
 
     from cdc_flight import destination_failure
+    from cdc_flight.table_writer import _table_dml_connection
 
     assert destination_failure.DATA_REJECTION_EXCEPTION_NAMES == (
         "ConversionException",
@@ -695,10 +696,7 @@ def test_destination_classifier_is_a_closed_data_boundary():
 
     con = duckdb.connect(":memory:")
     con.execute("CREATE TABLE t_int (value INTEGER)")
-    facade = destination_failure.MaterializationConnection(
-        con,
-        destination_failure._mint_table_data_provenance("app", "typed", "t_int"),
-    )
+    facade = _table_dml_connection(con, "t_int")
     try:
         with pytest.raises(duckdb.ConversionException):
             con.execute("SELECT CAST('not-an-integer' AS INTEGER)")
@@ -707,7 +705,7 @@ def test_destination_classifier_is_a_closed_data_boundary():
                 facade, "INSERT INTO t_int VALUES (?)", ["not-an-integer"]
             )
         assert isinstance(rejected.value.original, duckdb.ConversionException)
-        assert rejected.value.provenance.qualified_source == "app.typed"
+        assert rejected.value.target == "t_int"
 
         con.execute("BEGIN TRANSACTION")
         with pytest.raises(duckdb.TransactionException):

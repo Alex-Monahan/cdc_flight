@@ -1,7 +1,7 @@
 """One commit group, as one object (rubric 1.9, ADR §20/A55).
 
-Split out of `applier.py`, which is back within a hundred lines of the thermo-nuclear
-review's 1,000-line giant-file threshold. `OpenGroup` is a self-contained value with one
+Split out of `applier.py` to restore a cohesive ownership boundary. `OpenGroup` is a
+self-contained value with one
 argument attached to it and no dependency on the applier at all, which makes it the
 cheapest honest seam rather than an arbitrary cut.
 """

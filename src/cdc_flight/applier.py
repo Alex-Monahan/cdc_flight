@@ -721,14 +721,12 @@ class Applier:
         refused: SchemaEvolutionRefused,
         original: Exception,
         *,
-        provenance,
         destination_execution: bool = True,
     ) -> str:
         return failure_containment.contain_destination_failure(
             self,
             refused,
             original,
-            provenance=provenance,
             destination_execution=destination_execution,
         )
 

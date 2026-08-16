@@ -123,8 +123,8 @@ NON_ADMISSION_EXCEPTIONS: dict[str, str] = {
         "outside AdmissionError"
     ),
     "DestinationDataRejection": (
-        "a narrow materializer value/row rejection carrying DML provenance; the "
-        "commit protocol unwraps it only after the whole group rolls back"
+        "a narrow materializer value/row rejection carrying its destination-DML "
+        "target; the current plan supplies the source relation after rollback"
     ),
     "NoDurableDestinationRow": (
         "a start-up safety refusal about the whole destination, before admission"

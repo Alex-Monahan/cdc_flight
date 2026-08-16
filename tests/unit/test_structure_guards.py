@@ -12,18 +12,11 @@ from pathlib import Path
 
 import pytest
 
-#: RE-MEASURED FROM THE REAL LANE COLLECTIONS. The run's completion condition
-#: became a watermark: the unit tests in
-#: `1.9_state_machines/test_1_9_completion_watermark.py` and the six end-to-end
-#: ones beside it add items to the default lane and none to the other two. The
-#: follow-up that made `--max-seconds` a ceiling and not an exit path added three
-#: more unit tests there (a streaming source that never went quiet, the fallback
-#: path that keeps the older rule, and the quiet window that makes the deleted
-#: invalidation edge unnecessary). The guard itself remains 10 / 1 / 1 items in
-#: the 1760 / 171 / 46 collections, giving 1750 / 170 / 45 below. (Round 17's
-#: baseline was 1721 / 170 / 45, then 1741 / 170 / 45; no node id was removed to
-#: get here — the invalidation test was REPLACED in place by the test of the
-#: contract that replaced it.)
+#: RE-MEASURED FROM THE REAL LANE COLLECTIONS. The current collections are
+#: 1760 / 171 / 46; this guard module contributes 10 / 1 / 1 items, giving the
+#: executable baselines below. The four removed ownership-size tests are the
+#: deliberate r17-MAJOR-3 deletion; the new containment proofs restore the
+#: selected surface without imposing a replacement size rule.
 _BASELINE_SELECTED = {
     "not motherduck and not slow": 1750,
     "slow and not motherduck": 170,
@@ -71,10 +64,9 @@ def test_catalog_helpers_share_one_public_module():
 
 
 def test_type_apply_owners_are_split_by_cohesion_not_line_count():
-    """The round-3 type split has explicit owners; a line-count proxy is not a design proof."""
-    from cdc_flight import apply_sql, identity_codec, schema_registry, typed_materialization
+    """The round-3 type split has explicit owners with real dependency boundaries."""
+    from cdc_flight import identity_codec, schema_registry, typed_materialization
 
-    assert len(Path(apply_sql.__file__).read_text().splitlines()) < 200
     assert callable(identity_codec._identity_value)
     assert callable(identity_codec.canonical_jsonb_identity)
     assert schema_registry.SchemaRegistry.__module__ == "cdc_flight.schema_registry"

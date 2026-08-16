@@ -1,7 +1,7 @@
 """Everything between taking the lease and opening the engine (rubric 1.8/1.9).
 
 Split out of `pipeline.py`, which the thermo-nuclear review has twice found back at the
-1,000-line giant-file threshold. `run()` is a sequence; this module is the four
+giant-file review. `run()` is a sequence; this module is the four
 *decisions* that sequence makes before an engine exists — which tables are captured,
 whether a journalled recovery is half-done, what the slot check concludes, and what
 `--reset-state` has to journal before it destroys anything. All four are testable

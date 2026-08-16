@@ -1,14 +1,15 @@
 """The capability boundary for table-data destination failures.
 
 DuckDB uses one exception hierarchy for row/value rejection and for control,
-catalog, connection, and transaction failures.  The only safe containment
-capability is therefore an opaque token minted by the table writer at the first
-destination-table DML operation.  Control-state code receives the raw
-connection and cannot acquire that capability from it.
+catalog, connection, and transaction failures.  The materializer therefore gets
+only a writer-owned destination-table scope.  It validates every DML statement
+against that scope, while source attribution stays with the current ``TableWork``;
+there is no source-claim object for a caller to forge or reuse.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 OWNER = "destination-failure-classification"
@@ -60,53 +61,35 @@ NON_DATA_EXCEPTION_NAMES = (
 )
 
 
-def _make_provenance_capability():
-    """Create the token type and its closed-over mint without exposing the mint."""
-    capability_token = object()
-
-    class TableDataProvenance:
-        """An opaque, relation-specific table-DML capability."""
-
-        __slots__ = ("__source_schema", "__source_table", "__target")
-
-        def __init__(self, capability, source_schema: str, source_table: str, target: str):
-            if capability is not capability_token:
-                raise TypeError("table-data provenance can only be minted by the table writer")
-            if not all(
-                isinstance(value, str) and value for value in (source_schema, source_table, target)
-            ):
-                raise ValueError(
-                    "table-data provenance requires a concrete source relation and target"
-                )
-            self.__source_schema = source_schema
-            self.__source_table = source_table
-            self.__target = target
-
-        @property
-        def source_schema(self) -> str:
-            return self.__source_schema
-
-        @property
-        def source_table(self) -> str:
-            return self.__source_table
-
-        @property
-        def target(self) -> str:
-            return self.__target
-
-        @property
-        def qualified_source(self) -> str:
-            return f"{self.__source_schema}.{self.__source_table}"
-
-    def mint(
-        source_schema: str | None, source_table: str | None, target: str | None
-    ) -> TableDataProvenance:
-        return TableDataProvenance(capability_token, source_schema, source_table, target)
-
-    return TableDataProvenance, mint
+_IDENTIFIER = r"(?:\"(?:[^\"]|\"\")*\"|[A-Za-z_][A-Za-z0-9_$]*)"
+_DML_TARGET = re.compile(
+    rf"\b(?:INSERT(?:\s+OR\s+[A-Z]+)?\s+INTO|UPDATE|DELETE\s+FROM)\s+"
+    rf"({_IDENTIFIER}(?:\s*\.\s*{_IDENTIFIER})*)",
+    re.IGNORECASE,
+)
+_INTERNAL_TARGETS = frozenset(
+    {"_cdcf_delete_keys", "cdcf_bulk_rows", "cdcf_typed_bulk_rows"}
+)
 
 
-TableDataProvenance, _mint_table_data_provenance = _make_provenance_capability()
+def _relation_name(identifier: str) -> str:
+    part = identifier.rsplit(".", 1)[-1].strip()
+    if part.startswith('"') and part.endswith('"'):
+        part = part[1:-1].replace('""', '"')
+    return part.lower()
+
+
+def _check_statement_binding(target: str, statement: str) -> None:
+    match = _DML_TARGET.search(statement)
+    if match is None:
+        return
+    actual = _relation_name(match.group(1))
+    expected = _relation_name(target)
+    if actual != expected and actual not in _INTERNAL_TARGETS:
+        raise ValueError(
+            f"table-DML scope for {expected!r} cannot execute a statement targeting "
+            f"{actual!r}"
+        )
 
 
 class DestinationDataRejection(RuntimeError):
@@ -118,13 +101,13 @@ class DestinationDataRejection(RuntimeError):
         *,
         operation: str,
         statement: str,
-        provenance: TableDataProvenance,
+        target: str,
     ):
         super().__init__(str(original))
         self.original = original
         self.operation = operation
         self.statement = statement
-        self.provenance = provenance
+        self.target = target
 
 
 def _data_rejection_types() -> tuple[type[Exception], ...]:
@@ -152,20 +135,20 @@ def _wrap_data_rejection(
     *,
     operation: str,
     statement: str,
-    provenance: TableDataProvenance,
+    target: str,
 ) -> None:
     if isinstance(error, _data_rejection_types()):
         raise DestinationDataRejection(
             error,
             operation=operation,
             statement=statement,
-            provenance=provenance,
+            target=target,
         ) from error
     raise error
 
 
 class MaterializationConnection:
-    """DML-only facade carrying an opaque table-data provenance capability.
+    """DML-only facade bound to one destination table.
 
     It deliberately has no generic ``execute``/``executemany`` forwarding API.
     Table materialization calls the explicit DML methods; control-state helpers
@@ -173,19 +156,20 @@ class MaterializationConnection:
     boundary, regardless of the SQL statement they execute.
     """
 
-    __slots__ = ("_connection", "_provenance")
+    __slots__ = ("_connection", "_target")
 
-    def __init__(self, connection: Any, provenance: TableDataProvenance):
-        if not isinstance(provenance, TableDataProvenance):
-            raise TypeError("a table-data provenance capability is required")
+    def __init__(self, connection: Any, target: str):
+        if not isinstance(target, str) or not target:
+            raise ValueError("a concrete destination table is required")
         self._connection = connection
-        self._provenance = provenance
+        self._target = target
 
     @property
-    def provenance(self) -> TableDataProvenance:
-        return self._provenance
+    def target(self) -> str:
+        return self._target
 
     def _execute_table_dml(self, statement: str, parameters=None):
+        _check_statement_binding(self._target, statement)
         try:
             if parameters is None:
                 return self._connection.execute(statement)
@@ -195,11 +179,12 @@ class MaterializationConnection:
                 error,
                 operation="table_dml",
                 statement=statement,
-                provenance=self._provenance,
+                target=self._target,
             )
             raise  # pragma: no cover - _wrap_data_rejection always raises
 
     def _executemany_table_dml(self, statement: str, parameters):
+        _check_statement_binding(self._target, statement)
         try:
             return self._connection.executemany(statement, parameters)
         except Exception as error:
@@ -207,7 +192,7 @@ class MaterializationConnection:
                 error,
                 operation="table_dml_many",
                 statement=statement,
-                provenance=self._provenance,
+                target=self._target,
             )
             raise  # pragma: no cover - _wrap_data_rejection always raises
 

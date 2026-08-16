@@ -209,30 +209,30 @@ class DestinationExecutionFailure(RuntimeError):
     and replay the same source transaction with healthy tables still eligible.
     """
 
-    def __init__(self, refused: SchemaEvolutionRefused, original: Exception, provenance):
+    def __init__(self, refused: SchemaEvolutionRefused, original: Exception, target: str):
         super().__init__(str(original))
         self.refused = refused
         self.original = original
-        self.provenance = provenance
+        self.target = target
 
 
 class TableWriteFailure(RuntimeError):
-    """A table write failed after the fold reached the destination.
+    """A table materializer failed after the fold reached the destination.
 
     DuckDB does not expose the savepoint syntax this applier would need to roll back
     one table while retaining the source transaction's healthy peers.  The commit
     owner therefore rolls the whole group back, records this table's refusal through
-    the independent sink, and replays the source transaction with that table held
-    out.  Keeping this distinct from a destination SQL error preserves attribution:
-    a Python/materializer failure is contained, while an engine/programming error
-    remains loud.
+    the independent sink, and replays the source transaction with that table held out.
+    ``table_writer`` creates this only for an exception raised inside the data
+    materializer. Control-plane helpers are outside that boundary and propagate
+    unchanged.
     """
 
-    def __init__(self, refused: SchemaEvolutionRefused, original: Exception, provenance):
+    def __init__(self, refused: SchemaEvolutionRefused | None, original: Exception, target: str):
         super().__init__(str(original))
         self.refused = refused
         self.original = original
-        self.provenance = provenance
+        self.target = target
 
 
 class SchemaEvolutionRefused(AdmissionError):
