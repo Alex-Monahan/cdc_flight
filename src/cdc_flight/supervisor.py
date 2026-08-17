@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from . import table_lifecycle
+from . import faults, table_lifecycle
 from .applier import Applier
 from .completion_watermark import CompletionWatermark
 from .config import RunConfig, resolve_control_schema
@@ -84,6 +84,7 @@ class ShutdownSequence:
         SHUTDOWN_SEQUENCE.check(self.state, state)
         self.state = state
         self.history.append(state)
+        faults.runtime_state(shutdown_sequence=state)
 
     def summary(self) -> dict[str, object]:
         return {
@@ -319,12 +320,16 @@ def run_engine_bounded(
         )
         if not final_ack_required:
             shutdown_sequence.to(SHUTDOWN_ACK_NOT_REQUIRED)
-        elif health.confirmed_at_least(durable_lsn):
+        elif (
+            health.confirmed_at_least(durable_lsn)
+            and not faults.matrix_selected("shutdown_idle_marker_written")
+            and not faults.matrix_selected("shutdown_idle_marker_acknowledged")
+        ):
             shutdown_sequence.to(SHUTDOWN_ACK_COMPLETE)
         else:
             shutdown_sequence.to(SHUTDOWN_ACK_PENDING)
             wait_seconds = min(run.close_timeout, 10.0)
-            marker_emitted = False
+            marker_lsn = None
             # A quiet source does not necessarily deliver another poll after
             # markBatchFinished().  Give the live connector one whole,
             # offset-only PostgreSQL transaction to carry the already durable
@@ -332,8 +337,14 @@ def run_engine_bounded(
             # primary route, never Debezium's replication connection.  This marker
             # remains load-bearing: ordinary catalog-baseline runs fail closed if it
             # is removed because the slot has no WAL answer to publish.
-            marker_emitted = health.emit_idle_marker(durable_lsn)
-            if not health.wait_for_confirmed(durable_lsn, timeout=wait_seconds):
+            marker_lsn = health.emit_idle_marker(durable_lsn)
+            marker_emitted = marker_lsn is not None
+            acknowledgement_target = marker_lsn or durable_lsn
+            if not health.wait_for_confirmed(
+                acknowledgement_target,
+                timeout=wait_seconds,
+                marker_lsn=marker_lsn,
+            ):
                 shutdown_sequence.to(SHUTDOWN_ACK_FAILED)
                 sample = health.last
                 acknowledgement_timeout = {

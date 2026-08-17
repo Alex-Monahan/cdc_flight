@@ -34,6 +34,7 @@ import pytest
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 VENV_BIN = PROJECT_DIR / ".venv" / "bin"
+MATRIX_CHILD = PROJECT_DIR / "tests" / "support" / "crash_matrix_child.py"
 SANDBOX_IDLE_SECONDS = 6
 
 #: Debezium delivers a transactional logical message exactly like any other source
@@ -259,6 +260,7 @@ def _invoke_pipeline(
     timeout: float = 300,
     expect_success: bool = True,
     accept_orphan_offsets: bool = False,
+    matrix_arm: bool = False,
 ) -> dict:
     """Run the `cdc-flight` CLI once and return its summary plus process outcome.
 
@@ -266,8 +268,13 @@ def _invoke_pipeline(
     clean - JPype allows exactly one JVM per process, and Debezium leaves
     non-daemon threads behind.
     """
+    executable = (
+        [sys.executable, str(MATRIX_CHILD)]
+        if matrix_arm
+        else [_executable("cdc-flight")]
+    )
     cmd = [
-        _executable("cdc-flight"),
+        *executable,
         "--destination",
         destination,
         "--max-seconds",
@@ -290,7 +297,12 @@ def _invoke_pipeline(
     summary_path.unlink(missing_ok=True)
 
     proc = subprocess.run(
-        cmd, capture_output=True, text=True, env=env, cwd=PROJECT_DIR, timeout=timeout
+        cmd,
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=PROJECT_DIR,
+        timeout=timeout,
     )
     if expect_success and proc.returncode != 0:
         raise AssertionError(
@@ -567,12 +579,19 @@ class Sandbox:
         destination: str = "duckdb",
         extra_env: dict[str, str] | None = None,
         capture: bool = False,
+        matrix_arm: bool = False,
     ) -> subprocess.Popen:
         """Start the pipeline as a killable child process (fault injection)."""
         sink = subprocess.PIPE if capture else subprocess.DEVNULL
+        env = {**self.env, **(extra_env or {})}
+        executable = (
+            [sys.executable, str(MATRIX_CHILD)]
+            if matrix_arm
+            else [_executable("cdc-flight")]
+        )
         return subprocess.Popen(
             [
-                _executable("cdc-flight"),
+                *executable,
                 "--destination",
                 destination,
                 "--max-seconds",
@@ -580,7 +599,7 @@ class Sandbox:
                 "--idle-seconds",
                 str(idle_seconds),
             ],
-            env={**self.env, **(extra_env or {})},
+            env=env,
             cwd=PROJECT_DIR,
             stdout=sink,
             stderr=sink,

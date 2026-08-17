@@ -13,16 +13,16 @@ from pathlib import Path
 import pytest
 
 #: RE-MEASURED FROM THE REAL LANE COLLECTIONS. The current collections are
-#: 1761 / 171 / 46; this guard module contributes 10 / 1 / 1 items, giving the
-#: executable baselines below. The source-corroboration regression is an ordinary
-#: default-lane test, so the default baseline grows by exactly one. The four removed
-#: ownership-size tests are the
-#: deliberate r17-MAJOR-3 deletion; the new containment proofs restore the
-#: selected surface without imposing a replacement size rule.
+#: 1768 / 194 / 48; this guard module contributes 11 / 1 / 1 items, giving the
+#: executable baselines below. These are collection counts, not a module-size rule.
+#: The slow lane adds the 23 local committed-crash/composition cells, and the
+#: MotherDuck lane adds the cloud matrix and cloud contention proof. The four removed
+#: ownership-size tests remain removed; these additions are behavior proofs, not a
+#: replacement size rule.
 _BASELINE_SELECTED = {
-    "not motherduck and not slow": 1751,
-    "slow and not motherduck": 170,
-    "motherduck": 45,
+    "not motherduck and not slow": 1757,
+    "slow and not motherduck": 193,
+    "motherduck": 47,
 }
 
 
@@ -115,6 +115,19 @@ def test_commit_protocol_owns_the_durability_boundary():
     assert 'self.con.execute("BEGIN TRANSACTION")' in protocol_source
     assert 'self.con.execute("COMMIT")' in protocol_source
     assert commit_protocol.OWNER == "commit-durability"
+
+
+def test_commit_ack_window_has_no_crash_matrix_persistence():
+    """The disarmed and armed paths share a post-COMMIT region containing only ack."""
+    from cdc_flight import commit_protocol
+
+    source = Path(commit_protocol.__file__).read_text()
+    commit = source.index('self.con.execute("COMMIT")')
+    window_end = source.index("COMMIT_ACK.leave()", commit)
+    boundary = source[commit:window_end]
+    assert "runtime_state" not in boundary
+    assert "os.replace" not in boundary
+    assert "fsync" not in boundary
 
 
 def test_snapshot_protocol_and_notifications_share_one_public_module():

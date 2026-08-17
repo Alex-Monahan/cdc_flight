@@ -37,6 +37,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+from . import faults
 from .machines import SOURCE_HEALTH_STATES
 from .source_marker import IDLE_HEARTBEAT, SourceMarker
 
@@ -133,6 +134,7 @@ class SourceHealth:
     _ever_sampled: bool = field(default=False, repr=False)
     _ever_streamed: bool = field(default=False, repr=False)
     _unknown_samples: int = field(default=0, repr=False)
+    _last_idle_marker_lsn: int | None = field(default=None, repr=False)
 
     # -- lifecycle ---------------------------------------------------------- #
     def start(self) -> SourceHealth:
@@ -333,7 +335,9 @@ class SourceHealth:
                 return 0.0
             return time.monotonic() - self._lag_stable_since
 
-    def wait_for_confirmed(self, target: int, *, timeout: float) -> bool:
+    def wait_for_confirmed(
+        self, target: int, *, timeout: float, marker_lsn: int | None = None
+    ) -> bool:
         """Wait while the live connector publishes a durable LSN to PostgreSQL.
 
         ``markBatchFinished()`` acknowledges records only after the destination
@@ -344,6 +348,7 @@ class SourceHealth:
         proof, never a reason to claim the slot advanced.
         """
         target = int(target)
+        marker_lsn = marker_lsn if marker_lsn is not None else self._last_idle_marker_lsn
         deadline = time.monotonic() + max(0.0, timeout)
         while time.monotonic() < deadline:
             sample = self.last
@@ -352,14 +357,27 @@ class SourceHealth:
                 and sample.confirmed_pos is not None
                 and sample.confirmed_pos >= target
             ):
+                self._record_idle_ack(target, marker_lsn=marker_lsn)
                 return True
             time.sleep(min(self.interval, max(0.01, deadline - time.monotonic())))
         sample = self.last
-        return bool(
+        confirmed = bool(
             sample is not None
             and sample.confirmed_pos is not None
             and sample.confirmed_pos >= target
         )
+        if confirmed:
+            self._record_idle_ack(target, marker_lsn=marker_lsn)
+        return confirmed
+
+    @staticmethod
+    def _record_idle_ack(target: int, *, marker_lsn: int | None = None) -> None:
+        faults.runtime_state(
+            completion_marker_state="shutdown_idle_acknowledged",
+            marker_ack_target=target,
+            marker_ack_lsn=marker_lsn,
+        )
+        faults.matrix_crash("shutdown_idle_marker_acknowledged")
 
     def confirmed_at_least(self, target: int) -> bool:
         """Return the last sampled slot proof without waiting."""
@@ -370,7 +388,7 @@ class SourceHealth:
             and sample.confirmed_pos >= int(target)
         )
 
-    def emit_idle_marker(self, target: int) -> bool:
+    def emit_idle_marker(self, target: int) -> int | None:
         """Emit one transactional source marker on the separate primary route.
 
         Debezium only sends slot feedback while its replication loop receives a
@@ -380,11 +398,18 @@ class SourceHealth:
         its own destination control-unit commit is what makes acknowledging the
         marker (and everything before it) safe under Invariant O.
         """
-        return self.emit_marker(
+        marker_lsn = self.emit_marker(
             self.source_marker,
             IDLE_HEARTBEAT,
             {"slot": self.slot_name, "durable_lsn": int(target)},
-        ) is not None
+        )
+        if marker_lsn is not None:
+            self._last_idle_marker_lsn = marker_lsn
+            faults.runtime_state(
+                completion_marker_state="shutdown_idle_written", marker_lsn=marker_lsn
+            )
+            faults.matrix_crash("shutdown_idle_marker_written")
+        return marker_lsn
 
     def emit_marker(self, marker, reason: str, payload: dict) -> int | None:
         """Write one whole, transactional marker on the primary route.

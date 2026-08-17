@@ -154,7 +154,28 @@ def run(
     lease: Lease | None = None
     lease_held = False
     phases: RunPhaseWriter | None = None
-    ownership = DestinationOwnership()
+    initial_recovery_phase = recovery_mod.PHASE_ABSENT
+    initial_interruption_marker = "absent"
+    if faults_mod.matrix_armed():
+        # The capability-armed matrix is allowed to inspect durable state before the
+        # first lifecycle cut.  Production runs do not execute these probes.
+        try:
+            row = con.execute(
+                f"SELECT phase FROM {control_table(control_schema, 'recovery_state')} "
+                "WHERE pipeline = ? AND namespace = ?",
+                [dest.pipeline_name, namespace],
+            ).fetchone()
+        except Exception:
+            row = None
+        if row:
+            initial_recovery_phase = str(row[0])
+        initial_interruption_marker = resnapshot_recovery_mod.interruption_marker_state(
+            replication.state_dir / "resnapshot"
+        )
+    ownership = DestinationOwnership(
+        recovery_phase=initial_recovery_phase,
+        interruption_marker=initial_interruption_marker,
+    )
     run_ok = False
     #: The run's ONE outcome, shared by the supervisor, the terminal `RUN_PHASE`
     #: transition and the returned summary (Codex r1 MAJOR-2). `RunOutcome` refuses a
@@ -248,6 +269,8 @@ def run(
         )
         if resumed is not None:
             summary_extra["recovery_resumed"] = resumed
+        if journal is not None:
+            faults_mod.runtime_state(recovery_phase=journal.phase)
 
         phases.ensure(PHASE_RECONCILING)
         verdict, recovery = acquisition.check_the_slot(
@@ -295,6 +318,7 @@ def run(
                     journal.snapshot_mode or recovery_mod.FORCED_SNAPSHOT_MODE
                 )
             summary_extra["recovery_journal"] = journal.as_dict()
+            faults_mod.runtime_state(recovery_phase=journal.phase)
 
         phases.ensure(PHASE_RECONCILING)
         reconciliation = reconcile_mod.reconcile(
@@ -372,6 +396,27 @@ def run(
             snapshot_mode=props["snapshot.mode"],
             control_schema=control_schema,
         )
+
+        # A hard exit can land after the final recovery snapshot commit but before
+        # PostEngineCompletion gets to clear the journal.  At that point the durable
+        # table lifecycle and resume row are already the positive terminal evidence
+        # that `complete_if_ready()` requires.  Discharge that evidence before
+        # constructing the main engine: Debezium quite correctly emits `SKIPPED` when
+        # its offsets file already names the committed hand-off, and a still-required
+        # snapshot callback machine would misclassify that valid restart as a protocol
+        # error.  This path is reachable only with a journal; ordinary runs do no extra
+        # recovery work.
+        if journal is not None:
+            completion = recovery_mod.complete_if_ready(
+                con,
+                pipeline=dest.pipeline_name,
+                namespace=namespace,
+                record=journal,
+                control_schema=control_schema,
+            )
+            if completion.cleared:
+                summary_extra["recovery_cleared_before_engine"] = completion.recovery_id
+                journal = None
 
         # ADR §14.1's open question, answered by measurement rather than by guess.
         # AFTER the lease: the probe DROPs and CREATEs shared

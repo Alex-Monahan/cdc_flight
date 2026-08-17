@@ -86,11 +86,15 @@ duplicate are all failures of the item.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import math
 import os
 import sys
+import threading
 import time
+from collections.abc import Callable
 
 from .config import resolve_control_schema
 from .naming import quote
@@ -98,6 +102,17 @@ from .naming import quote
 log = logging.getLogger("cdc_flight.faults")
 
 ENV_VAR = "CDC_FAULT_INJECT"
+#: Test-only exact cuts for state cells that are not commit-group anchors.  Keeping
+#: these out of ``ALL_POINTS`` prevents the ordinary fault matrix from silently
+#: multiplying every time a lifecycle state gains a real-process proof.
+MATRIX_ENV_VAR = "CDC_CRASH_MATRIX_CUT"
+MATRIX_STATE_ENV_VAR = "CDC_CRASH_MATRIX_STATE"
+MATRIX_GATE_ENV_VAR = "CDC_CRASH_MATRIX_GATE"
+MATRIX_GATE_TIMEOUT_ENV_VAR = "CDC_CRASH_MATRIX_GATE_TIMEOUT"
+# Matrix cuts are an in-process test seam.  The production package contains only
+# the registration point; the handler that records a cut and hard-exits lives in
+# ``tests/support/crash_matrix_runtime.py``, which is not included in the wheel.
+# This makes ordinary environment inheritance unable to arm a production child.
 
 #: Protocol anchor points, in the order the applier reaches them.
 #:
@@ -213,6 +228,25 @@ SOURCE_POINTS = ("catalog_poll",)
 
 ALL_POINTS = POINTS + DESTINATION_POINTS + RECOVERY_POINTS + SOURCE_POINTS
 
+#: These cuts are reached only by the real state transitions below.  They are not
+#: state assignments made by a test: each one records the production object after its
+#: durable or lifecycle edge, then hard-exits the child.
+MATRIX_POINTS = (
+    "ownership_available",
+    "ownership_attached",
+    "ownership_active",
+    "ownership_callback_owned",
+    "recovery_requested_recorded",
+    "recovery_offsets_file_deleted_recorded",
+    "recovery_resume_point_deleted_recorded",
+    "recovery_armed_recorded",
+    "completion_marker_written",
+    "watermark_armed",
+    "watermark_reached",
+    "shutdown_idle_marker_written",
+    "shutdown_idle_marker_acknowledged",
+)
+
 DEFAULT_EXIT_CODE = 137
 RAISE = "raise"
 
@@ -276,6 +310,35 @@ def parse_spec(raw: str | None) -> tuple[str, int, int | str] | None:
 #: Sentinel distinguishing "not parsed yet" from "parsed, and there is no fault".
 _UNPARSED = object()
 _spec_cache: object = _UNPARSED
+_matrix_cache: object = _UNPARSED
+_runtime_context: dict[str, object] = {}
+_runtime_lock = threading.Lock()
+MatrixCrashHandler = Callable[[str, int], None]
+_matrix_crash_handler: MatrixCrashHandler | None = None
+
+
+def _register_matrix_crash_handler(handler: MatrixCrashHandler) -> None:
+    """Install the non-production handler used by real crash-matrix children.
+
+    The shipped package deliberately has no default handler.  A test-only child
+    imports this module and registers its own implementation before importing the
+    production CLI.  Refuse replacement so a later import cannot silently change
+    the meaning of a cut in a running process.
+    """
+    global _matrix_cache, _matrix_crash_handler
+    if not callable(handler):
+        raise TypeError("matrix crash handler must be callable")
+    if _matrix_crash_handler is not None and _matrix_crash_handler is not handler:
+        raise RuntimeError("a matrix crash handler is already registered")
+    _matrix_crash_handler = handler
+    # ``refresh`` may have run while this module was imported before the test
+    # harness registered its handler.  Reparse the selector now that the seam is live.
+    _matrix_cache = _UNPARSED
+
+
+def matrix_handler_registered() -> bool:
+    """Whether this process has the out-of-package matrix implementation installed."""
+    return _matrix_crash_handler is not None
 
 
 def validate_env() -> tuple[str, int, int | str] | None:
@@ -286,9 +349,229 @@ def validate_env() -> tuple[str, int, int | str] | None:
 def refresh() -> tuple[str, int, int | str] | None:
     """Re-read `CDC_FAULT_INJECT` and cache the result. Tests call this after
     changing the environment."""
-    global _spec_cache
+    global _matrix_cache, _spec_cache
     _spec_cache = parse_spec(os.environ.get(ENV_VAR))
+    # A deployment environment must not even parse or validate the matrix
+    # selector.  The handler is an in-process object supplied by the test tree,
+    # not an environment value that a first-party child can forge.
+    _matrix_cache = (
+        parse_matrix_spec(os.environ.get(MATRIX_ENV_VAR))
+        if _matrix_crash_handler is not None
+        else None
+    )
     return _spec_cache  # type: ignore[return-value]
+
+
+def parse_matrix_spec(raw: str | None) -> tuple[str, int] | None:
+    """Parse the state-cut selector used by the real crash matrix.
+
+    It is intentionally a separate grammar from ``CDC_FAULT_INJECT``: a matrix cut
+    can be composed with a destination fault without changing the long-standing
+    single-anchor contract used by the default and slow fault lanes.
+    """
+    if not raw:
+        return None
+    parts = raw.split(":")
+    point = parts[0].strip()
+    if point not in MATRIX_POINTS:
+        raise FaultSpecError(
+            f"{MATRIX_ENV_VAR}: unknown point {parts[0]!r}; expected one of "
+            f"{MATRIX_POINTS}"
+        )
+    try:
+        nth = int(parts[1]) if len(parts) > 1 and parts[1] else 1
+    except ValueError as exc:
+        raise FaultSpecError(
+            f"{MATRIX_ENV_VAR}: <nth> must be an integer, got {parts[1]!r}"
+        ) from exc
+    if nth < 1:
+        raise FaultSpecError(f"{MATRIX_ENV_VAR}: <nth> is 1-based, got {nth}")
+    if len(parts) > 2:
+        raise FaultSpecError(f"{MATRIX_ENV_VAR}: too many fields in {raw!r}")
+    return point, nth
+
+
+def _matrix_spec() -> tuple[str, int] | None:
+    if _matrix_cache is _UNPARSED:
+        refresh()
+    return _matrix_cache  # type: ignore[return-value]
+
+
+def matrix_armed() -> bool:
+    """Whether a test-only handler and a matrix selector are both present."""
+    return _matrix_crash_handler is not None and _matrix_spec() is not None
+
+
+def matrix_selected(point: str, nth: int = 1) -> bool:
+    """Return whether an explicitly armed test selected this lifecycle point."""
+    return matrix_armed() and _matrix_spec() == (point, nth)
+
+
+def _safe_state_dir() -> str | None:
+    """Return a lexical state root without following a user-controlled symlink.
+
+    Matrix evidence must never follow a symlink supplied through ``CDC_STATE_DIR``.
+    The macOS host exposes the platform directories ``/var`` and ``/tmp`` through
+    stable ``/private`` aliases, so those two canonical aliases are allowed.  Any
+    other symlink in the root path is rejected, including a link in a parent
+    component.  This check is intentionally made before the test-only handler can
+    hard-exit.
+    """
+    state_dir = os.environ.get("CDC_STATE_DIR")
+    if not state_dir:
+        return None
+    lexical = os.path.abspath(state_dir)
+    unsafe = _first_unsafe_state_symlink(lexical)
+    if unsafe is not None:
+        symlink, resolved = unsafe
+        raise FaultSpecError(
+            "CDC_STATE_DIR must not contain a symlink for crash-matrix evidence: "
+            f"{symlink!r} resolves to {resolved!r}"
+        )
+    return lexical
+
+
+def _first_unsafe_state_symlink(path: str) -> tuple[str, str] | None:
+    """Find the first non-platform symlink in an absolute state path."""
+    platform_aliases = {
+        ("/var", "/private/var"),
+        ("/tmp", "/private/tmp"),
+    }
+    current = os.path.sep
+    for component in os.path.abspath(path).split(os.path.sep):
+        if not component:
+            continue
+        current = os.path.join(current, component)
+        if os.path.islink(current):
+            resolved = os.path.realpath(current)
+            if (current, resolved) not in platform_aliases:
+                return current, resolved
+    return None
+
+
+def _realpath_is_contained(root: str, path: str) -> bool:
+    """Check containment after resolving both the root and candidate path."""
+    resolved_root = os.path.realpath(root)
+    resolved_path = os.path.realpath(path)
+    try:
+        return os.path.commonpath((resolved_root, resolved_path)) == resolved_root
+    except ValueError:
+        return False
+
+
+def _matrix_state_path() -> str | None:
+    state_dir = _safe_state_dir()
+    filename = os.environ.get(MATRIX_STATE_ENV_VAR)
+    if not state_dir or not filename:
+        return None
+    if os.path.isabs(filename) or os.path.basename(filename) != filename:
+        raise FaultSpecError(
+            f"{MATRIX_STATE_ENV_VAR}: filename must be a simple relative name under "
+            f"CDC_STATE_DIR, got {filename!r}"
+        )
+    path = os.path.abspath(os.path.join(state_dir, filename))
+    if (
+        _first_unsafe_state_symlink(path) is not None
+        or not _realpath_is_contained(state_dir, path)
+    ):
+        raise FaultSpecError(
+            f"{MATRIX_STATE_ENV_VAR}: state file must remain inside CDC_STATE_DIR: "
+            f"{path!r}"
+        )
+    return path
+
+
+def validate_matrix_state_directory() -> None:
+    """Validate matrix state containment before a test child enters production.
+
+    The test-only launcher calls this preflight so an invalid symlink or filename
+    cannot reach the production CLI's ordinary summary writer either.
+    """
+    _matrix_state_path()
+
+
+def runtime_state(**fields: object) -> dict[str, object]:
+    """Persist the real runtime state used by a crash-matrix observer.
+
+    The write is completely inert unless the test-only handler was registered.  When
+    that handler and a relative state filename are both present, the file is replaced
+    and fsynced so a parent that sends ``SIGKILL`` can distinguish the last completed
+    production edge from a stale previous run.
+    """
+    if _matrix_crash_handler is None:
+        return dict(_runtime_context)
+    path = _matrix_state_path()
+    with _runtime_lock:
+        _runtime_context.update(fields)
+        if path is None:
+            return dict(_runtime_context)
+        payload = {
+            "pid": os.getpid(),
+            "updated_at": time.time(),
+            "context": dict(_runtime_context),
+        }
+        temporary: str | None = None
+        try:
+            parent = os.path.dirname(path)
+            os.makedirs(parent, exist_ok=True)
+            temporary = f"{path}.{os.getpid()}.tmp"
+            if (
+                _first_unsafe_state_symlink(temporary) is not None
+                or not _realpath_is_contained(parent, temporary)
+            ):
+                raise RuntimeError(
+                    f"crash-matrix temporary state path escaped its directory: {temporary}"
+                )
+            with open(temporary, "w") as handle:
+                json.dump(payload, handle, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        except Exception as exc:  # pragma: no cover - exercised by the evidence guard
+            log.error("could not persist crash-matrix runtime state", exc_info=True)
+            raise RuntimeError(
+                f"crash-matrix runtime state could not be persisted at {path}"
+            ) from exc
+        finally:
+            if temporary is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(temporary)
+        return dict(_runtime_context)
+
+
+def matrix_crash(point: str, nth: int = 1) -> None:
+    """Dispatch a selected lifecycle edge to the test-only hard-exit handler."""
+    # Production has no handler, so inherited selectors, gates, state paths and
+    # descriptors are all inert without parsing or waiting on any of them.
+    handler = _matrix_crash_handler
+    if handler is None:
+        return
+    spec = _matrix_spec()
+    if spec is None or spec != (point, nth):
+        return
+    # Validate containment before the handler records evidence or exits.  The
+    # test-only launcher performs the same preflight before production starts.
+    validate_matrix_state_directory()
+    gate = os.environ.get(MATRIX_GATE_ENV_VAR)
+    if gate:
+        raw_timeout = os.environ.get(MATRIX_GATE_TIMEOUT_ENV_VAR, "30")
+        try:
+            gate_timeout = float(raw_timeout)
+        except ValueError as exc:
+            raise FaultSpecError(
+                f"{MATRIX_GATE_TIMEOUT_ENV_VAR}: expected seconds, got {raw_timeout!r}"
+            ) from exc
+        if not math.isfinite(gate_timeout) or gate_timeout < 0 or gate_timeout > 120:
+            raise FaultSpecError(
+                f"{MATRIX_GATE_TIMEOUT_ENV_VAR}: seconds must be finite and in "
+                "the bounded range 0..120, "
+                f"got {gate_timeout}"
+            )
+        deadline = time.monotonic() + gate_timeout
+        while not os.path.exists(gate) and time.monotonic() < deadline:
+            time.sleep(0.02)
+    log.error("CRASH MATRIX: firing at %s (arrival %s)", point, nth)
+    handler(point, nth)
 
 
 def _spec() -> tuple[str, int, int | str] | None:
@@ -514,10 +797,18 @@ FIRED_FILENAME = "fault_fired.json"
 
 
 def fired_record_path() -> str | None:
-    state_dir = os.environ.get("CDC_STATE_DIR")
+    try:
+        state_dir = _safe_state_dir()
+    except FaultSpecError:
+        # Fired evidence is best-effort for the long-standing generic fault
+        # injector; importantly, an unsafe matrix root is never followed.
+        return None
     if not state_dir:
         return None
-    return os.path.join(state_dir, FIRED_FILENAME)
+    path = os.path.abspath(os.path.join(state_dir, FIRED_FILENAME))
+    if _first_unsafe_state_symlink(path) is not None:
+        return None
+    return path if _realpath_is_contained(state_dir, path) else None
 
 
 def record_fired(point: str, nth: int, action) -> None:
@@ -534,9 +825,17 @@ def record_fired(point: str, nth: int, action) -> None:
         return
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        with _runtime_lock:
+            context = dict(_runtime_context)
         with open(path, "w") as handle:
             json.dump(
-                {"point": point, "nth": nth, "action": str(action), "pid": os.getpid()},
+                {
+                    "point": point,
+                    "nth": nth,
+                    "action": str(action),
+                    "pid": os.getpid(),
+                    "context": context,
+                },
                 handle,
             )
             handle.flush()
