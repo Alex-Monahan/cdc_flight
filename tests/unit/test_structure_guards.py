@@ -18,7 +18,7 @@ import pytest
 #: 11 / 1 / 1 items. These are collection counts, not a module-size rule. The
 #: expected values below subtract only this guard module.
 _BASELINE_SELECTED = {
-    "not motherduck and not slow": 2168,
+    "not motherduck and not slow": 2169,
     "slow and not motherduck": 200,
     "motherduck": 48,
 }

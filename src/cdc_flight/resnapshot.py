@@ -149,6 +149,10 @@ OWNER = "resnapshot-protocol"
 #: Suffix for the throwaway slot. Kept short: Postgres slot names are limited to 63
 #: characters and the base name is already operator-chosen.
 SLOT_SUFFIX = "_rs"
+# A blocking re-snapshot's image and its source handoff watermark must describe one
+# source snapshot. Keep this path on one stock snapshot reader; ordinary §3 acquisition
+# retains the general `snapshot.max.threads=4` property.
+RESNAPSHOT_SNAPSHOT_MAX_THREADS = "1"
 
 
 @dataclass
@@ -360,6 +364,36 @@ def sweep_stale_slot(dsn: str, base_slot_name: str) -> str:
     return action
 
 
+def build_resnapshot_properties(
+    source: SourceConfig,
+    replication: ReplicationConfig,
+    *,
+    tables: list[tuple[str, str, str]],
+    truncate_mode: str,
+) -> dict[str, str]:
+    """Build the throwaway connector properties for one exact source image.
+
+    The normal connector property advertises stock source-side snapshot parallelism,
+    but the blocking handoff has a stricter contract: the rows in the shadow and the
+    consistent WAL point used to fence the main slot must be produced by one source
+    snapshot reader. Keyless rows have no primary-key identity with which a later
+    parallel reader/stream overlap could be reconciled.
+    """
+    include = sorted({f"{schema}.{table}" for schema, table, _ in tables})
+    props = build_properties(
+        source,
+        replication,
+        snapshot_mode="initial",
+        truncate_mode=truncate_mode,
+    )
+    props["name"] = f"{props['name']}-resnapshot"
+    props["table.include.list"] = ",".join(include)
+    # Debezium only snapshots what it captures, and capturing more would stream more.
+    props["snapshot.include.collection.list"] = ",".join(include)
+    props["snapshot.max.threads"] = RESNAPSHOT_SNAPSHOT_MAX_THREADS
+    return props
+
+
 def run(
     con,
     *,
@@ -394,7 +428,6 @@ def run(
     if not tables:
         return outcome
 
-    include = sorted({f"{schema}.{table}" for schema, table, _ in tables})
     slot = slot_name_for(replication.slot_name)
     state_dir = replication.state_dir / "resnapshot"
     recovery = InterruptionRecovery.prepare(
@@ -407,16 +440,13 @@ def run(
     resnap_replication = dataclasses.replace(
         replication, slot_name=slot, state_dir=state_dir
     )
-    props = build_properties(
+    props = build_resnapshot_properties(
         source,
         resnap_replication,
-        snapshot_mode="initial",
+        tables=tables,
         truncate_mode=settings["truncate_mode"],
     )
-    props["name"] = f"{props['name']}-resnapshot"
-    props["table.include.list"] = ",".join(include)
-    # Debezium only snapshots what it captures, and capturing more would stream more.
-    props["snapshot.include.collection.list"] = ",".join(include)
+    include = props["table.include.list"].split(",")
 
     resnap_settings = dict(settings)
     cfg = ApplierConfig(
