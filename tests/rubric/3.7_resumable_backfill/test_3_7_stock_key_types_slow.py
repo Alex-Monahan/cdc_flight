@@ -125,14 +125,14 @@ def test_stock_incremental_resume_handles_composite_and_uuid_keys(sandbox):
             "SELECT tenant_id, row_id, payload FROM app.p3_resume_composite ORDER BY tenant_id, row_id"
         ).fetchall()
         source_uuid = source.execute(
-            "SELECT id::text, payload FROM app.p3_resume_uuid ORDER BY id"
+            "SELECT id, payload FROM app.p3_resume_uuid ORDER BY id"
         ).fetchall()
     destination_composite = sandbox.duck_query(
         'SELECT tenant_id, row_id, payload FROM "cdc_raw"."cdcflight_app_p3_resume_composite" '
         "ORDER BY tenant_id, row_id"
     )
     destination_uuid = sandbox.duck_query(
-        'SELECT CAST(id AS VARCHAR), payload FROM "cdc_raw"."cdcflight_app_p3_resume_uuid" '
+        'SELECT id, payload FROM "cdc_raw"."cdcflight_app_p3_resume_uuid" '
         "ORDER BY id"
     )
     assert _identity(destination_composite) == _identity(source_composite)

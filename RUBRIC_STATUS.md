@@ -2397,6 +2397,12 @@ old-data/new-state pair. The commit trace also asserts that all data/progress/ru
 claim writes precede one commit and only the two existing acknowledgement calls
 follow it. The full MotherDuck lane passed 49/49.
 
+The production seam guard also mutates `SnapshotCoordinator.swap`, the
+backfill swap callback's transaction boundary, and the declared-row terminal
+fence in process-local runs. Each broken seam fails its production assertion;
+each restored method passes again. This is defense against regressions in the
+actual publication path, not only a protocol fixture.
+
 ### 3.3 Existing tables continue to receive CDC during a healthy snapshot — **4 / 5**
 
 Stock `signal.data.collection` and incremental notifications are decoded into
@@ -2408,9 +2414,10 @@ scan, kept unselected CDC live, and compared source/destination identity sets an
 value multisets; it passed in 13.92 s. A stale post-swap READ is fenced by retained
 terminal run evidence.
 
-The real integration workload does not yet include a DELETE during the scan, nor
-does it prove every stock notification interleaving or a cross-table source
-transaction during the scan. Those gaps keep the honest score below 5.
+The real integration workload does not synchronize a DML transaction with the
+stock table-scan interval. The 24 notification permutations are in-process
+ordering evidence rather than PostgreSQL/stock-Debezium runs, so they do not
+prove that race live. Those gaps keep the honest score at 4.
 
 ### 3.4 Snapshot an arbitrary set of tables while others keep streaming — **4 / 5**
 
@@ -2420,9 +2427,10 @@ true no-ops; per-table outcomes preserve a failed peer's shadow while successful
 peers complete; a second active signal is refused rather than ambiguously
 correlated. The real stock run exercised the two-table set and both final images.
 
-The live suite does not yet execute an empty/error table outcome through stock
-notifications, and additional requests are refused/coalesced for a later retry
-rather than proven in a full live queue scenario. Score: 4.
+The live suite executes the empty publication, but the decisive error-peer case
+does not assert that the healthy peer published in the same stock run. Additional
+requests are durably coalesced for a later retry rather than proven in a full
+live queue scenario. Score: 4.
 
 ### 3.5 Per-table CDC / scheduled full refresh / scheduled incremental refresh — **4 / 5**
 
@@ -2433,9 +2441,12 @@ without owning acknowledgements, and transactional mode changes preserve active
 run id, shadow, cursor, and rows. The keyless stock boundary selects full fallback
 without inventing an arrival-order cursor.
 
-The full live schedule/restart matrix is not executed, and one arbitrary stock
-signal is intentionally single-mode because stock notification correlation is
-ambiguous for concurrent mixed-mode requests. Score: 4.
+The live restart hand-off consumes durable full and incremental requests, but
+those requests are admitted by the test/driver before restart. There is no
+normal production due/poll caller that turns `interval_seconds`/`next_due_at`
+into work automatically. One arbitrary stock signal is also intentionally
+single-mode because stock notification correlation is ambiguous for concurrent
+mixed-mode requests. Score: 4.
 
 ### 3.6 Auto-backfill when CDC falls too far behind — **4 / 5**
 
@@ -2445,9 +2456,10 @@ repeated triggers with retry/backoff state, and never advances the source slot.
 The tests cover below/above thresholds, size-only, time-only, both, unknown age,
 coalescing, and durable admission.
 
-The executed evidence is coordinator/source-health-shaped and DuckDB durable; a
-full live PostgreSQL slot sampler feeding an automatic fall-behind run was not
-run. Score: 4.
+The live lane samples a real PostgreSQL slot and real WAL, but threshold
+admission and source-signal insertion are still invoked by the test/driver with
+those sampled values. `SourceHealth` has no normal production caller that
+automatically admits the run. Score: 4.
 
 ### 3.7 Failed backfill resumes midway — **4 / 5**
 
@@ -2458,7 +2470,9 @@ registered hard-exit handler at an incremental chunk boundary: the child is
 SIGKILLed, partial shadow and a positive durable cursor remain, and resume equals
 the clean run by identity set and value multiset with zero duplicate keys. The
 normal installed package cannot arm this handler. Keyless stock tables explicitly
-fall back to full, with the documented ceiling of 4.
+fall back to full, with the documented ceiling of 4. The durable cursor is now a
+type-aware monotonic high-water mark: an out-of-order `(10, 2)` unit and a later
+lower-key write both retain key `10`.
 
 Not every crash point, composite/UUID stock case, offset corruption case, or
 keyless incremental source run is proven. Score: 4.

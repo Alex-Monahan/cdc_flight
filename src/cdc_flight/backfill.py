@@ -15,6 +15,7 @@ value already delivered by Debezium, so ``7`` and ``"7"`` cannot collide.
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import hashlib
 import json
@@ -87,6 +88,8 @@ def _stable_json(value: Any) -> Any:
         return {"type": "boolean", "value": value}
     if isinstance(value, int) and not isinstance(value, bool):
         return {"type": "integer", "value": value}
+    if isinstance(value, str):
+        return {"type": "string", "value": value}
     if isinstance(value, Decimal):
         return {"type": "decimal", "value": format(value, "f")}
     if isinstance(value, float):
@@ -214,6 +217,104 @@ def _key_order_key(key: Mapping[str, Any] | Iterable[Any]) -> tuple:
             for name, value in sorted(key.items(), key=lambda pair: str(pair[0]))
         )
     return tuple(_stable_order_key(value) for value in key)
+
+
+def _decode_cursor_tree(tree: Any) -> Any:
+    """Decode a durable cursor tree for comparison only.
+
+    ``last_processed_key_json`` is an identity/high-water mark, not a PostgreSQL
+    value conversion.  Older local fixtures also contain plain JSON keys, so the
+    decoder accepts both those values and the type-tagged representation emitted by
+    :func:`canonical_key_json`.
+    """
+    if isinstance(tree, dict) and "type" in tree and "value" in tree:
+        kind = tree["type"]
+        value = tree["value"]
+        if kind == "null":
+            return None
+        if kind == "boolean":
+            return bool(value)
+        if kind == "integer":
+            return int(value)
+        if kind == "string":
+            return str(value)
+        if kind == "str":
+            # ``str`` was the pre-guard fallback tag for Python strings. Preserve
+            # its repr-based payload while new cursors use the explicit string tag.
+            try:
+                return ast.literal_eval(str(value))
+            except (SyntaxError, ValueError):
+                return str(value)
+        if kind == "decimal":
+            return Decimal(str(value))
+        if kind == "float":
+            return {
+                "NaN": float("nan"),
+                "Infinity": float("inf"),
+                "-Infinity": float("-inf"),
+            }.get(str(value), float(value))
+        if kind == "bytes":
+            return bytes.fromhex(str(value))
+        if kind == "datetime":
+            return datetime.fromisoformat(str(value))
+        if kind == "date":
+            return date.fromisoformat(str(value))
+        if kind == "time":
+            return datetime_time.fromisoformat(str(value))
+        if kind == "interval":
+            return timedelta(
+                days=int(value["days"]),
+                seconds=int(value["seconds"]),
+                microseconds=int(value["microseconds"]),
+            )
+        if kind == "uuid":
+            return uuid.UUID(str(value))
+        if kind == "mapping":
+            return {
+                str(name): _decode_cursor_tree(item)
+                for name, item in value
+            }
+        if kind == "tuple":
+            return tuple(_decode_cursor_tree(item) for item in value)
+        if kind == "list":
+            return [_decode_cursor_tree(item) for item in value]
+        raise BackfillInvariantError(
+            f"durable cursor contains unknown type tag {kind!r}"
+        )
+    if isinstance(tree, dict):
+        return {str(name): _decode_cursor_tree(value) for name, value in tree.items()}
+    if isinstance(tree, list):
+        return [_decode_cursor_tree(value) for value in tree]
+    return tree
+
+
+def _cursor_order(key_json: str) -> tuple:
+    """Return the type-aware order key for one durable cursor JSON value."""
+    try:
+        tree = json.loads(key_json)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise BackfillInvariantError(
+            f"durable cursor is not valid JSON: {key_json!r}"
+        ) from exc
+    if not isinstance(tree, (dict, list)):
+        raise BackfillInvariantError(
+            "durable cursor must encode a mapping or ordered key sequence"
+        )
+    return _key_order_key(_decode_cursor_tree(tree))
+
+
+def _max_cursor_json(*candidates: str | None) -> str | None:
+    """Choose the greatest cursor without comparing JSON text lexicographically."""
+    winner: str | None = None
+    winner_order: tuple | None = None
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        order = _cursor_order(candidate)
+        if winner_order is None or order > winner_order:
+            winner = candidate
+            winner_order = order
+    return winner
 
 
 def _coalesced_trigger_reason(previous: str, current: str) -> str:
@@ -878,6 +979,23 @@ class BackfillRepository:
             raise BackfillInvariantError(
                 f"progress for {current.run_id} entered terminal state {current.state}"
             )
+        # ``last_processed_key_json`` is a durable high-water mark.  A stock
+        # incremental chunk is allowed to arrive out of key order, and a retry may
+        # present an older key after a newer chunk has committed.  Absorb that
+        # delivery rather than moving the restart cursor backwards.  Include the
+        # previously recorded maximum when repairing a row written by an older
+        # build: that makes the invariant self-healing on the next progress write.
+        last_key_json = _max_cursor_json(
+            current.last_processed_key_json,
+            current.maximum_key_json,
+            last_key_json,
+        )
+        maximum_key_json = _max_cursor_json(
+            current.maximum_key_json,
+            current.last_processed_key_json,
+            maximum_key_json,
+            last_key_json,
+        )
         sets = [
             "last_processed_key_json = COALESCE(?, last_processed_key_json)",
             "maximum_key_json = COALESCE(?, maximum_key_json)",
@@ -1601,11 +1719,14 @@ class BackfillCoordinator:
                             "lsn": None,
                         },
                     )
-                    progress["last"] = key_json
                     order = _key_order_key(event.key)
                     if progress["maximum_order"] is None or order > progress["maximum_order"]:
                         progress["maximum_order"] = order
                         progress["maximum"] = key_json
+                        # The durable cursor is the greatest key observed in the
+                        # unit, not the last callback's arrival key.  The repository
+                        # applies the same monotonic guard across units/restarts.
+                        progress["last"] = key_json
                     progress["rows"] += 1
                     if event.lsn is not None:
                         progress["lsn"] = max(progress["lsn"] or int(event.lsn), int(event.lsn))

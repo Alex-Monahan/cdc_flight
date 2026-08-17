@@ -233,7 +233,7 @@ def test_live_restart_consumes_full_and_incremental_modes_independently(sandbox)
 
     with psycopg.connect(sandbox.source.dsn) as source:
         source_orders = source.execute(
-            "SELECT id, customer_id, status::text, total_amount, currency, note "
+            "SELECT id, customer_id, status, total_amount, currency, note "
             "FROM app.orders ORDER BY id"
         ).fetchall()
         source_customers = source.execute(

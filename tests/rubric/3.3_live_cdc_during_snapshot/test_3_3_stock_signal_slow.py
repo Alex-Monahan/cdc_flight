@@ -99,7 +99,7 @@ def test_stock_signal_runs_arbitrary_set_while_streaming(sandbox):
             "FROM app.customers ORDER BY id"
         ).fetchall()
         source_orders = source.execute(
-            "SELECT id, customer_id, status::text, total_amount, currency, note "
+            "SELECT id, customer_id, status, total_amount, currency, note "
             "FROM app.orders ORDER BY id"
         ).fetchall()
     destination_customers = sandbox.duck_query(

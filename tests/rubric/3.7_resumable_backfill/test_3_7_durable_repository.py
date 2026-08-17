@@ -95,6 +95,53 @@ def test_maximum_cursor_uses_typed_numeric_order_not_json_text_order():
         con.close()
 
 
+def test_out_of_order_delivery_is_absorbed_by_the_monotonic_durable_cursor():
+    """The restart cursor never regresses when a later key arrives first."""
+    from types import SimpleNamespace
+
+    from cdc_flight.envelope import PendingRecord
+
+    con, coordinator = _coordinator()
+    try:
+        run = coordinator.prepare(
+            coordinator.request("app", "customers", mode="incremental")
+        )
+
+        def event(key: int) -> PendingRecord:
+            return PendingRecord(
+                raw=object(),
+                kind="data",
+                topic="cdcflight.app.customers",
+                nbytes=1,
+                schema="app",
+                table="customers",
+                key={"id": key},
+                snapshot_identity=f"inc:s:app.customers:{key}",
+                incremental=True,
+            )
+
+        # The unit itself is out of order: 10 is delivered before 2.
+        coordinator.commit_progress(
+            [SimpleNamespace(incremental=True, events=[event(10), event(2)])]
+        )
+        persisted = coordinator.repository.get(run.run_id)
+        high_water = '{"id":{"type":"integer","value":10}}'
+        assert persisted.last_processed_key_json == high_water
+        assert persisted.maximum_key_json == high_water
+
+        # A later retry/progress write carrying a lower key is absorbed too.
+        coordinator.repository.update_progress(
+            run.run_id,
+            last_key_json='{"id":{"type":"integer","value":2}}',
+            maximum_key_json='{"id":{"type":"integer","value":2}}',
+        )
+        persisted = coordinator.repository.get(run.run_id)
+        assert persisted.last_processed_key_json == high_water
+        assert persisted.maximum_key_json == high_water
+    finally:
+        con.close()
+
+
 def test_completed_run_is_retained_as_the_replay_fence_until_reconciliation():
     """A post-swap stock READ has durable terminal evidence and no live route."""
     con, coordinator = _coordinator()

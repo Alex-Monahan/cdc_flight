@@ -7,18 +7,23 @@ leaves the patch context and runs the same assertion against the restored code.
 
 from __future__ import annotations
 
+import contextlib
+import threading
+import time
 from types import SimpleNamespace
 
 import duckdb
 import pytest
-from support.applier_lab import Lab, begin, data, end
+from support.applier_lab import Lab, begin, data, end, snap
 from support.backfill_lab import require_backfill
 
+from cdc_flight import destination
 from cdc_flight.assembler import TransactionAssembler
 from cdc_flight.control_schema import ensure_control_schema
-from cdc_flight.envelope import PendingRecord
+from cdc_flight.envelope import KIND_SNAPSHOT_BOUNDARY, PendingRecord
 from cdc_flight.errors import TransactionAssemblyError
 from cdc_flight.snapshot import SnapshotCoordinator
+from cdc_flight.snapshot_completion import SnapshotCompletion
 
 
 def _atomic_guard(backfill, tmp_path) -> None:
@@ -177,8 +182,192 @@ def _full_swap_state_guard(backfill) -> None:
         con.close()
 
 
+def _production_publication_guard(tmp_path) -> None:
+    """Exercise the shipped SnapshotCoordinator.swap callback boundary."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    lab = Lab(tmp_path / "production-publication.duckdb", pipeline="prod-publication")
+    try:
+        lab.run(
+            [
+                begin("old", 10),
+                data("old", 1, 11, key={"id": 1}, after={"id": 1, "name": "old"}),
+                end("old", 1, 12, {"app.customers": 1}),
+            ]
+        )
+        snapshots = lab.applier.snapshots
+        observed: list[tuple[list[tuple], list[tuple]]] = []
+
+        def on_swap(state, _snapshot_lsn, _commit_id):
+            image = lab.q(
+                f'SELECT id, name FROM "{lab.dataset}"."{state.target}" ORDER BY id'
+            )
+            lifecycle = lab.q(
+                "SELECT snapshot_state FROM \"_cdc_flight\".\"table_state\" "
+                "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+                ["prod-publication", "app", "customers"],
+            )
+            observed.append((image, lifecycle))
+            assert image == [(2, "new")]
+            assert lifecycle == [("complete",)]
+
+        snapshots._on_swap = on_swap
+        lab.con.execute("BEGIN TRANSACTION")
+        try:
+            state = snapshots.state_for("app", "customers")
+            lab.con.execute(
+                f'CREATE TABLE "{lab.dataset}"."{state.shadow}" AS '
+                f'SELECT * FROM "{lab.dataset}"."{state.target}" WHERE FALSE'
+            )
+            lab.con.execute(
+                f'INSERT INTO "{lab.dataset}"."{state.shadow}" (id, name) '
+                "VALUES (2, 'new')"
+            )
+            assert snapshots.swap(state, commit_id=1, snapshot_lsn=99) is True
+            lab.con.execute("COMMIT")
+        except BaseException:
+            with contextlib.suppress(Exception):
+                lab.con.execute("ROLLBACK")
+            raise
+        assert observed == [([(2, "new")], [("complete",)])]
+        assert lab.q(
+            f'SELECT id, name FROM "{lab.dataset}"."{state.target}" ORDER BY id'
+        ) == [(2, "new")]
+    finally:
+        lab.close()
+
+
+def _production_commit_boundary_guard(tmp_path) -> None:
+    """Readers must never see a production swap before its run state commits."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    lab = Lab(tmp_path / "production-commit.duckdb", pipeline="prod-commit")
+    reader = None
+    thread = None
+    stop = threading.Event()
+    observations: list[tuple[object, object]] = []
+    errors: list[str] = []
+    try:
+        lab.run(
+            [
+                begin("old", 10),
+                data("old", 1, 11, key={"id": 1}, after={"id": 1, "name": "old"}),
+                end("old", 1, 12, {"app.customers": 1}),
+            ]
+        )
+        backfill = lab.applier.backfill
+        run = backfill.prepare(
+            backfill.request("app", "customers", mode="incremental")
+        )
+        lab.applier._ensure_backfill_route("app", "customers", run)
+        state = lab.applier.snapshots.states()[0]
+        lab.con.execute(
+            f'INSERT INTO "{lab.dataset}"."{state.shadow}" (id, name) '
+            "VALUES (2, 'new')"
+        )
+
+        reader = duckdb.connect(
+            str(lab.path), config=destination.DUCKDB_CONNECT_CONFIG
+        )
+
+        def sample() -> None:
+            while not stop.is_set():
+                try:
+                    image = reader.execute(
+                        f'SELECT id, name FROM "{lab.dataset}"."{state.target}" ORDER BY id'
+                    ).fetchall()
+                    run_state = reader.execute(
+                        "SELECT state FROM \"_cdc_flight\".\"backfill_runs\" "
+                        "WHERE pipeline = ? AND run_id = ?",
+                        ["prod-commit", run.run_id],
+                    ).fetchone()[0]
+                    observations.append((image, run_state))
+                except Exception as exc:  # pragma: no cover - mutation diagnostics
+                    errors.append(f"{type(exc).__name__}: {exc}")
+                time.sleep(0.002)
+
+        thread = threading.Thread(target=sample, name="production-commit-reader")
+        thread.start()
+        commit_error: BaseException | None = None
+        try:
+            lab.con.execute("BEGIN TRANSACTION")
+            lab.applier.snapshots.swap(state, commit_id=1, snapshot_lsn=99)
+            lab.con.execute("COMMIT")
+        except BaseException as exc:
+            commit_error = exc
+        time.sleep(0.05)
+        stop.set()
+        thread.join(timeout=2)
+        if commit_error is not None:
+            raise AssertionError(
+                "production swap callback escaped the surrounding transaction: "
+                f"{type(commit_error).__name__}: {commit_error}; observations={observations}"
+            ) from commit_error
+        assert not errors, errors
+        invalid = [
+            observation
+            for observation in observations
+            if observation[0] == [(2, "new")] and observation[1] != "complete"
+        ]
+        assert not invalid, f"new image was visible before complete state: {invalid}"
+        assert lab.q(
+            f'SELECT id, name FROM "{lab.dataset}"."{state.target}" ORDER BY id'
+        ) == [(2, "new")]
+        assert lab.q(
+            "SELECT state FROM \"_cdc_flight\".\"backfill_runs\" "
+            "WHERE pipeline = ? AND run_id = ?",
+            ["prod-commit", run.run_id],
+        ) == [("complete",)]
+    finally:
+        stop.set()
+        if thread is not None:
+            thread.join(timeout=2)
+        if reader is not None:
+            reader.close()
+        lab.close()
+
+
+def _production_terminal_fence_guard(tmp_path) -> None:
+    """A declared two-row terminal callback cannot publish one buffered row."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    lab = Lab(
+        tmp_path / "production-terminal-fence.duckdb",
+        pipeline="prod-terminal-fence",
+        snapshot_chunk_events=1,
+    )
+    try:
+        completion = SnapshotCompletion.full_snapshot({"app.customers"})
+        completion.observe_notification("STARTED", {})
+        completion.observe_notification(
+            "TABLE_SCAN_COMPLETED",
+            {
+                "scanned_collection": "app.customers",
+                "status": "SUCCEEDED",
+                "total_rows_scanned": "2",
+            },
+        )
+        completion.observe_notification("COMPLETED", {})
+        lab.applier.snapshot_completion = completion
+        lab.feed([snap("customers", 100, ident=1, marker="last")])
+        boundary = PendingRecord(
+            raw=None,
+            kind=KIND_SNAPSHOT_BOUNDARY,
+            topic="cdcflight.cdc_flight_snapshot_notifications",
+            nbytes=0,
+            lsn=201,
+            source_partition={"server": "cdcflight"},
+            source_offset={"lsn": 201, "lsn_proc": 201, "ts_usec": 201000},
+        )
+        for unit in lab.applier.assembler.feed_snapshot_boundary(boundary):
+            lab.applier._add_unit(unit)
+        lab.commit("production_terminal_fence")
+        assert lab.applier.commit_groups == 0
+        assert lab.committer.marked == 0
+        assert not lab.exists(lab.target("customers"))
+    finally:
+        lab.close()
+
+
 def test_mutation_guards_fail_when_new_invariants_are_broken(tmp_path, monkeypatch):
-    """Ten real production mutations fail their corresponding invariant guard."""
+    """Thirteen production mutations fail their corresponding invariant guard."""
     backfill = require_backfill()
     proofs: list[str] = []
 
@@ -317,5 +506,65 @@ def test_mutation_guards_fail_when_new_invariants_are_broken(tmp_path, monkeypat
     assert backfill.BackfillCoordinator.complete_full_swap is original_full_swap
     proofs.append("full_swap_state_projection")
 
+    # F-05(i): mutate the actual publication seam so its callback runs before the
+    # shadow is live and the lifecycle is complete. The callback-boundary oracle must
+    # see the new image and complete state together.
+    original_swap = SnapshotCoordinator.swap
+
+    def callback_before_publication(self, state, *, commit_id, snapshot_lsn):
+        if self._on_swap is not None:
+            self._on_swap(state, snapshot_lsn, commit_id)
+        return original_swap(
+            self, state, commit_id=commit_id, snapshot_lsn=snapshot_lsn
+        )
+
+    with monkeypatch.context() as patch:
+        patch.setattr(SnapshotCoordinator, "swap", callback_before_publication)
+        with pytest.raises(AssertionError) as failure:
+            _production_publication_guard(tmp_path / "f05-swap-mutated")
+        print(f"F-05 swap-order mutation failed as expected: {failure.value}")
+    _production_publication_guard(tmp_path / "f05-swap-restored")
+    assert SnapshotCoordinator.swap is original_swap
+    proofs.append("production_swap_publication")
+
+    # F-05(ii): commit from the production backfill callback before it projects the
+    # run state. The independent reader and the surrounding COMMIT guard must reject
+    # the split publication.
+    original_complete_swap = backfill.BackfillCoordinator.complete_swap
+
+    def early_callback_commit(self, state, **kwargs):
+        self.con.execute("COMMIT")
+        time.sleep(0.1)
+        return original_complete_swap(self, state, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            backfill.BackfillCoordinator, "complete_swap", early_callback_commit
+        )
+        with pytest.raises(AssertionError) as failure:
+            _production_commit_boundary_guard(tmp_path / "f05-commit-mutated")
+        print(f"F-05 early-commit mutation failed as expected: {failure.value}")
+    _production_commit_boundary_guard(tmp_path / "f05-commit-restored")
+    assert backfill.BackfillCoordinator.complete_swap is original_complete_swap
+    proofs.append("production_one_transaction")
+
+    # F-05(iii): remove the declared-row terminal fence from the production
+    # completion object. One buffered row for a two-row declaration must not publish.
+    original_terminal_fence = SnapshotCompletion._will_complete_after
+
+    def permissive_terminal_fence(self, *_args, **_kwargs):
+        return True
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            SnapshotCompletion, "_will_complete_after", permissive_terminal_fence
+        )
+        with pytest.raises(AssertionError) as failure:
+            _production_terminal_fence_guard(tmp_path / "f05-terminal-mutated")
+        print(f"F-05 terminal-fence mutation failed as expected: {failure.value}")
+    _production_terminal_fence_guard(tmp_path / "f05-terminal-restored")
+    assert SnapshotCompletion._will_complete_after is original_terminal_fence
+    proofs.append("production_declared_row_fence")
+
     print(f"P3 mutation proofs: {proofs}")
-    assert len(proofs) == 10
+    assert len(proofs) == 13
