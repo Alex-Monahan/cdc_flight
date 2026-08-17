@@ -129,6 +129,9 @@ class ReplicationConfig:
         default_factory=lambda: _env("CDC_PUBLICATION", "cdc_flight_pub")
     )
     topic_prefix: str = field(default_factory=lambda: _env("CDC_TOPIC_PREFIX", "cdcflight"))
+    signal_data_collection: str | None = field(
+        default_factory=lambda: os.environ.get("CDC_SIGNAL_DATA_COLLECTION")
+    )
     snapshot_mode: str = field(default_factory=lambda: _env("CDC_SNAPSHOT_MODE", "initial"))
     state_dir: Path = field(
         default_factory=lambda: Path(

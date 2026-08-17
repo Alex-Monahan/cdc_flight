@@ -831,6 +831,14 @@ INTERACTING_MACHINE_PAIRS = (
     ("schema_refusal", "table_lifecycle"),
     ("snapshot_completion", "table_lifecycle"),
     ("destination_ownership", "snapshot_completion"),
+    ("backfill_run", "table_lifecycle"),
+    ("backfill_run", "shadow_claim"),
+    ("backfill_run", "run_phase"),
+    ("backfill_run", "snapshot_completion"),
+    ("backfill_run", "catalog_change"),
+    ("backfill_run", "destination_ownership"),
+    ("shadow_claim", "catalog_change"),
+    ("shadow_claim", "destination_ownership"),
 )
 
 
@@ -890,6 +898,97 @@ KEYLESS_EVENT = Machine(
     purpose=(
         "Whether one keyless source event's physical operation has committed; "
         "replay must remain an applied no-op."
+    ),
+)
+
+
+# --------------------------------------------------------------------------- #
+# SM-E · BackfillRun — durable, `_cdc_flight.backfill_runs.state`
+# --------------------------------------------------------------------------- #
+BACKFILL_RUN_REQUESTED = "requested"
+BACKFILL_RUN_PREPARING = "preparing"
+BACKFILL_RUN_LOADING = "loading"
+BACKFILL_RUN_READY_TO_SWAP = "ready_to_swap"
+BACKFILL_RUN_SWAPPING = "swapping"
+BACKFILL_RUN_COMPLETE = "complete"
+BACKFILL_RUN_RETRY_WAIT = "retry_wait"
+BACKFILL_RUN_BLOCKED = "blocked"
+BACKFILL_RUN_STATES = (
+    BACKFILL_RUN_REQUESTED,
+    BACKFILL_RUN_PREPARING,
+    BACKFILL_RUN_LOADING,
+    BACKFILL_RUN_READY_TO_SWAP,
+    BACKFILL_RUN_SWAPPING,
+    BACKFILL_RUN_COMPLETE,
+    BACKFILL_RUN_RETRY_WAIT,
+    BACKFILL_RUN_BLOCKED,
+)
+
+BACKFILL_RUN = Machine(
+    "backfill_run",
+    states=BACKFILL_RUN_STATES,
+    edges=(
+        (BACKFILL_RUN_REQUESTED, BACKFILL_RUN_PREPARING),
+        (BACKFILL_RUN_PREPARING, BACKFILL_RUN_LOADING),
+        (BACKFILL_RUN_PREPARING, BACKFILL_RUN_RETRY_WAIT),
+        (BACKFILL_RUN_PREPARING, BACKFILL_RUN_BLOCKED),
+        (BACKFILL_RUN_LOADING, BACKFILL_RUN_LOADING),
+        (BACKFILL_RUN_LOADING, BACKFILL_RUN_READY_TO_SWAP),
+        (BACKFILL_RUN_LOADING, BACKFILL_RUN_RETRY_WAIT),
+        (BACKFILL_RUN_LOADING, BACKFILL_RUN_BLOCKED),
+        (BACKFILL_RUN_READY_TO_SWAP, BACKFILL_RUN_SWAPPING),
+        (BACKFILL_RUN_READY_TO_SWAP, BACKFILL_RUN_RETRY_WAIT),
+        (BACKFILL_RUN_SWAPPING, BACKFILL_RUN_COMPLETE),
+        (BACKFILL_RUN_SWAPPING, BACKFILL_RUN_RETRY_WAIT),
+        (BACKFILL_RUN_RETRY_WAIT, BACKFILL_RUN_PREPARING),
+        (BACKFILL_RUN_RETRY_WAIT, BACKFILL_RUN_LOADING),
+        (BACKFILL_RUN_BLOCKED, BACKFILL_RUN_PREPARING),
+        (BACKFILL_RUN_BLOCKED, BACKFILL_RUN_RETRY_WAIT),
+        # A new request carries a new run_id; this edge describes that durable
+        # lifecycle without allowing a completed row to be mutated in place.
+        (BACKFILL_RUN_COMPLETE, BACKFILL_RUN_REQUESTED),
+    ),
+    terminal=(BACKFILL_RUN_COMPLETE,),
+    initial=BACKFILL_RUN_REQUESTED,
+    durable="_cdc_flight.backfill_runs.state",
+    purpose=(
+        "Which one-table stock acquisition and atomic shadow publication is active, "
+        "retryable, blocked, or complete?"
+    ),
+)
+
+
+# --------------------------------------------------------------------------- #
+# SM-F · ShadowClaim — durable, `_cdc_flight.shadow_claims.claim_state`
+# --------------------------------------------------------------------------- #
+SHADOW_CLAIM_FREE = "free"
+SHADOW_CLAIM_BACKFILL = "backfill"
+SHADOW_CLAIM_TYPED_CHANGE = "typed_change"
+SHADOW_CLAIM_SCHEMA_REBUILD = "schema_rebuild"
+SHADOW_CLAIM_STATES = (
+    SHADOW_CLAIM_FREE,
+    SHADOW_CLAIM_BACKFILL,
+    SHADOW_CLAIM_TYPED_CHANGE,
+    SHADOW_CLAIM_SCHEMA_REBUILD,
+)
+
+SHADOW_CLAIM = Machine(
+    "shadow_claim",
+    states=SHADOW_CLAIM_STATES,
+    edges=(
+        (SHADOW_CLAIM_FREE, SHADOW_CLAIM_BACKFILL),
+        (SHADOW_CLAIM_FREE, SHADOW_CLAIM_TYPED_CHANGE),
+        (SHADOW_CLAIM_FREE, SHADOW_CLAIM_SCHEMA_REBUILD),
+        (SHADOW_CLAIM_BACKFILL, SHADOW_CLAIM_FREE),
+        (SHADOW_CLAIM_TYPED_CHANGE, SHADOW_CLAIM_FREE),
+        (SHADOW_CLAIM_SCHEMA_REBUILD, SHADOW_CLAIM_FREE),
+    ),
+    terminal=(SHADOW_CLAIM_FREE,),
+    initial=SHADOW_CLAIM_FREE,
+    durable="_cdc_flight.shadow_claims.claim_state",
+    purpose=(
+        "Which table-replacement owner may drop, rename, or otherwise mutate the "
+        "shared shadow?"
     ),
 )
 

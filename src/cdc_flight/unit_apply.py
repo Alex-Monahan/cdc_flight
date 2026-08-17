@@ -75,6 +75,7 @@ def apply_units(
         # Quarantined relations plus any relation whose stream this run holds out
         # of a retained image pending a replacement snapshot (round 13, R12-2).
         blocked_tables=applier.blocked_schema_tables | applier.group.held_tables,
+        ignored_tables=applier.ignored_source_tables,
         excluded_tables=excluded_tables,
         contain_table_failure=applier._contain_table_failure,
     )
@@ -84,7 +85,7 @@ def apply_units(
                 applier.fenced_spilled_events += unit.spilled_events
                 plan.staged_units = True
             continue
-        if unit.kind == "snapshot_chunk":
+        if unit.kind == "snapshot_chunk" and not getattr(unit, "incremental", False):
             applier.group.is_snapshot = True
         plan.add_unit(unit)
 

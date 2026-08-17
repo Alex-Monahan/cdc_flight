@@ -471,6 +471,7 @@ def run(
             namespace=f"{namespace}::resnapshot",
             dataset=dataset,
             topic_prefix=replication.topic_prefix,
+            signal_data_collection=props.get("signal.data.collection"),
             offset_path=resnap_replication.offset_file,
             resume_point=ResumePoint(snapshot_epoch=epoch_base),
             config=cfg,

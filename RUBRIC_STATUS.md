@@ -698,13 +698,13 @@ correct assumptions in the notes below:
 | 2.4 | Postgres types → native MotherDuck types | ~~1~~ → **4** | Money/inet-as-text remains **5/5** and no opaque type blocks a table. `xml`, `inet`, `cidr` and the other opaque text types land as `VARCHAR`, byte-exact against the PostgreSQL **output function** where stock Debezium delivers a value. The honest overall score is 4/5 because stock Debezium omits `xml[]` from the event payload; if the source row disappears before the fallback read, the destination can preserve the row with explicit `NULL` but cannot reconstruct the omitted array text. The omission is contained and never blocks the table, but it is not lossless type fidelity. `money` carries stock Debezium's delivered locale-neutral text unchanged through `VARCHAR`, with `driver.options=-c lc_monetary=C`; its six enumerated locale-family cases and the numeric spelling deviation remain asserted in `tests/rubric/2.4_native_types/test_2_4_fix13_regressions.py::test_money_crosses_every_locale_family_and_never_blocks_anything`. The remaining `int2vector` refusal is also contained and attributable. |
 | 2.5 | Data type changes supported | ~~3~~ → **5** | Unregressed in round 12 and re-verified. The typed shadow path, spill/replay path, and source-semantic multirange identity use the same `VARCHAR` resolver; real PostgreSQL equality classes and MotherDuck key-gain/shadow evidence pass. A full Debezium-driven MotherDuck multirange stream was not separately run, as recorded in the round-7 limits. |
 | 2.6 | TOAST columns handled well | **4** | Sparse physical-row folding, durable NULL-vs-JSONB-root-null ambiguity refusal, and a bounded relation-lock activation fence close the soundness defects. The real-owner matrix is non-circular. Stock Debezium still lacks a marker-preserving efficient channel, so the policy ceiling remains 4. |
-| 3.1 | Backfill scalable / parallelized | 3 | 120 k rows in ~28 s single-threaded (`snapshot.max.threads=1`); works but does not scale, untested past 120 k. |
-| 3.2 | Backfills atomic | 1 | Snapshot rows are appended straight into the live table; no shadow table, no swap. |
-| 3.3 | Existing tables keep receiving CDC during snapshot | 1 | Debezium's initial snapshot blocks streaming entirely; everything goes stale for the snapshot's duration. |
-| 3.4 | Snapshot an arbitrary set of tables | 1 | Only the global `snapshot.mode`; no `signal.data.collection`, so no ad-hoc/incremental snapshots. |
-| 3.5 | Per-table CDC / full refresh / incremental refresh | 3 | CDC only. |
-| 3.6 | Backfill when CDC falls too far behind | 1 | Lag is never measured, so nothing can trigger on it. |
-| 3.7 | Failed backfill resumes midway | 1 | Debezium restarts the initial snapshot from scratch, and the partial snapshot is already appended. |
+| 3.1 | Backfill scalable / parallelized | **3** | Stock `snapshot.max.threads=4`, bounded incremental chunks, one destination writer, and a 10M-row bounded measurement are implemented. A material stock 1-vs-4 large-table speedup and MotherDuck server-memory result remain unproven. |
+| 3.2 | Backfills atomic | **5** | Existing shadow-table loading plus one transactional rename/state publication keeps a separate MotherDuck reader on old/old or new/new only; rollback and pre/post-rename faults preserve the old image. |
+| 3.3 | Existing tables keep receiving CDC during snapshot | **4** | Stock incremental signal records and ordinary CDC share one retained shadow; the real stock test compares source/destination identities and value multisets for selected tables. A real DELETE-during-scan and every notification interleaving remain unproven. |
+| 3.4 | Snapshot an arbitrary set of tables | **4** | One stock signal carries a non-contiguous set and creates independent per-table runs; failed peers do not overwrite completed outcomes. Live per-table failure/empty coverage and queued coalescing are not fully exercised end to end. |
+| 3.5 | Per-table CDC / full refresh / incremental refresh | **4** | Durable `cdc`, `full`, and `incremental` modes, policy changes, cursor preservation, and a scheduler are implemented. A full live schedule/restart matrix and mixed modes in one stock signal are not proven. |
+| 3.6 | Backfill when CDC falls too far behind | **4** | Size OR oldest-pending-age predicates, durable `bytes`/`time`/`both` reasons, unknown-age refusal, coalescing, and no slot ownership are tested. Wiring to a live slot/source-health sampling run is not end-to-end proven. |
+| 3.7 | Failed backfill resumes midway | **4** | A real source-tree crash child kills a keyed chunk load; durable cursor/shadow survives and resume matches clean identity/value sets with zero duplicates. Composite/UUID stock cases and every crash point remain unproven; keyless stock deliberately falls back to full. |
 | 4.0 | Blast-radius containment for permanently unprocessable rows/tables | ~~5~~ ~~4~~ → **5** | A bad table becomes durable, observable quarantine; every affected run is NOT-OK and alerted once, healthy tables continue, both slot positions advance, and `quarantined → pending → complete` automatically re-snapshots current source state. Round 14 closes the remaining table-scoped materializer gap: four consecutive real PostgreSQL runs inject a builtin `ValueError` from the typed materializer, retain the original class/message in the refusal and alert, keep the peer's four rows, advance both slot positions, and measure bounded retained WAL (552, 2,512, 2,400, 2,056 B). The connector's pre-Python, no-relation failure remains an explicit boundary limitation: it is durably alerted by offset but cannot honestly be assigned to a table. The 5/5 score is for the rubric's literal table-scoped failure scenario; no relation is fabricated for an unrelatable connector failure. |
 | 4.1 | Recover from failed / lost slot | 1 | **Proven**: slot dropped → engine fails to start, process exits **0** in 1 s, slot never recreated, permanent silent no-op. |
 | 4.2 | Concurrent Flight instances | 1 | Two simultaneous runs both exit 0; same-slot runs silently no-op, different-slot runs silently duplicate into the same tables. |
@@ -712,7 +712,7 @@ correct assumptions in the notes below:
 | 4.4 | Idle-slot heartbeat | 1 | `heartbeat.interval.ms` unset, no `heartbeat.action.query`. |
 | 4.5 | Errors must not hang or lock | 2 | Bounded runner + JVM watchdog make hangs survivable (one observed in p09), but nothing systematic prevents them. |
 | 4.6 | Detect silently-dead Postgres connection | ~~1~~ → **3** | TODO 4.6(b) closed: a blackholed Postgres used to exit `ok: true` on a partial delivery, because `unknown` slot health licensed an idle declaration *and* reset the not-streaming clock. A source that was answering and goes dark now fails the run within `CDC_SOURCE_DARK_SECONDS` (45 s), proven against a real TCP blackhole. Not 5: there is still no heartbeat (4.4) and no bounded JDBC socket timeout (4.6(c)), so detection depends on our 0.5 s sampler rather than on the connection itself. |
-| 4.7 | Self-heal without human intervention | **1** (new item; claimed 3, rescored 1) | The rubric's 1-band is a **count**: "more than 2 cases that cause manual human intervention". The corrected inventory (ADR §19/A51, 68 rows, parsed by `tests/rubric/4.7_self_healing/test_4_7_inventory.py`) is **44 AUTO / 15 MANUAL / 9 UNDEFINED**. Fifteen is more than two, so it is a 1 under every defensible reading. The direction is right — automatic recovery now covers forty-four enumerated cases, including the Flight's own half-finished recovery — while the mechanical inventory keeps the remaining exceptions explicit. See the detail section. |
+| 4.7 | Self-heal without human intervention | **1** (new item; claimed 3, rescored 1) | The rubric's 1-band is a **count**: "more than 2 cases that cause manual human intervention". The corrected inventory (ADR §19/A51, 70 rows, parsed by `tests/rubric/4.7_self_healing/test_4_7_inventory.py`) is **46 AUTO / 15 MANUAL / 9 UNDEFINED**. Fifteen is more than two, so it is a 1 under every defensible reading. The direction is right — automatic recovery now covers forty-six enumerated cases, including the Flight's own half-finished recovery — while the mechanical inventory keeps the remaining exceptions explicit. See the detail section. |
 | 5.1 | CDC fast on large changes | 3 | 50 k-row transaction absorbed at ~3.5 k rows/s into local DuckDB; no failure, but a full `dlt.run()` per 2048-row batch is the ceiling. |
 | 5.2 | Low latency on small changes | 1 | Capture latency is 83 ms, but the deliverable is a bounded batch job with no defined cadence — end-to-end latency is the schedule interval. |
 | 5.3 | Keep up with high Postgres TPS | 2 | ~1 k events/s inside the engine, but ~17 s of per-run JVM/connect overhead drops the shipped bounded job to ~157 events/s to MotherDuck. |
@@ -1854,7 +1854,7 @@ therefore mutated by a path the design did not enumerate.**
 Explicit machines do not make the system correct. They make the **unenumerated path** a
 run-time error instead of a review finding.
 
-#### What was built — fifteen focused machines and one precedence
+#### What was built — seventeen focused machines and one precedence
 
 | machine | owns | states | edges | persistence |
 |---|---|---|---|---|
@@ -1870,6 +1870,8 @@ run-time error instead of a review finding.
 | `schema_refusal` | has a refused schema transition acquired a durable remediation obligation | 4 | 9 | `_cdc_flight.schema_refusals.state` |
 | `keyless_event` | has one keyless event's physical operation committed, making replay a no-op | 2 | 2 | `_cdc_flight.keyless_events.state` |
 | `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
+| `backfill_run` | which per-table backfill request owns acquisition, progress, and publication | 8 | 17 | `_cdc_flight.backfill_runs.state` |
+| `shadow_claim` | which table-replacement owner may mutate the shared shadow | 4 | 6 | `_cdc_flight.shadow_claims.claim_state` |
 | `snapshot_completion` | have all ordered snapshot callbacks arrived | 6 | 9 | **memory only** |
 | `completion_watermark` | has this run reached a source position it can prove the destination is durably past | 4 | 3 | **memory only** |
 | `shutdown_sequence` | has source feedback, callback quiescence, own teardown, and stock engine stop completed in order | 13 | 17 | **memory only** |
@@ -2358,116 +2360,108 @@ is included in this implementation.
 
 ## 3. Backfill & Refresh Modes
 
-### 3.1 Backfill scalable and performant (parallelized) — **3 / 5** (provisional)
+Honest implementation score on this branch: **28 / 35**. The unproven claims are
+kept explicit below rather than inferred from configuration or unit-only probes.
 
-`fails on large tables=1, slow=3, fast=5`
+The implementation extends the existing `SnapshotCoordinator`, planner, commit
+protocol, and source marker paths. It does not add a second destination writer or
+replace the atomic publication route. Every mode keeps live data until the shadow
+swap; data, progress, run state, claim, audit, and resume evidence are written in
+the same MotherDuck transaction, and the existing `COMMIT_ACK` guard leaves only
+`markProcessed`/`markBatchFinished` after commit. PostgreSQL transactions remain
+whole. No Debezium artifact, SMT, Java, Maven, or Gradle change was made.
 
-**Evidence** (`p08`). 120 320 rows snapshotted in 40.5 s wall (59 batches),
-≈ 28 s excluding JVM start and the 12 s idle tail → **~4 300 rows/s**, entirely
-single-threaded: `snapshot.max.threads` defaults to 1
-(`repos/debezium/.../CommonConnectorConfig.java:936-944`) and we never set it.
-At that rate a 100 M-row table takes ~6.5 hours with no parallelism and no
-resumability (3.7).
+### 3.1 Backfill scalable and performant (parallelized) — **3 / 5**
 
-**Evidence that would raise or lower this.** A snapshot of ≥10 M rows,
-and the same against MotherDuck rather than a local DuckDB file. If it fails or
-OOMs at that size the score is 1.
+Stock `snapshot.max.threads=4` and bounded incremental chunk configuration are
+explicit, while the destination remains one writer per table/shadow. The isolated
+10,000,000-row bounded measurement processed all rows in 4.722 s with four
+configured workers, 77,365,248 bytes peak process RSS, zero spill, and no
+MotherDuck-memory measurement. The source/destination identity and value oracles
+also reject count-only success.
 
-**Gap to 5.** Parallel chunked backfill: split each table by primary-key range,
-run N readers concurrently, write into per-chunk shadow tables, and use
-MotherDuck's bulk path rather than `INSERT … VALUES` per 2048 rows.
-Debezium's incremental snapshot (with `signal.data.collection`) already chunks;
-`snapshot.max.threads > 1` parallelises across tables but not within one.
+This proves bounded consumption and resource measurement, not a material stock
+one-versus-four-thread speedup on the same large MotherDuck table. The plan's
+verified ceiling therefore remains 3; no server-side memory or one-table
+incremental parallelism claim is made.
 
-### 3.2 Backfills must be atomic — **1 / 5**
+### 3.2 Backfills must be atomic — **5 / 5**
 
-`clear and repopulate=1, alternate table + rename swap=4, fully atomic=5`
+The existing shadow route loads chunks incrementally and publishes by one
+transactional rename/state update; no CTAS complexity was added. The local fault
+matrix covers rollback, between-drop-and-rename, and after-rename faults. The
+MotherDuck test uses a separate connection and a real polling reader transaction
+during DROP/RENAME/state update. It observed both `old/old` and `new/new`, and
+asserted the complete observation set contained no cleared, partial, or
+old-data/new-state pair. The commit trace also asserts that all data/progress/run/
+claim writes precede one commit and only the two existing acknowledgement calls
+follow it. The full MotherDuck lane passed 49/49.
 
-**Evidence (baseline; `handler.py` was deleted by ADR 0001 D1).** `src/cdc_flight/handler.py:62` — every resource is
-`write_disposition="append"`, and the snapshot writes into the same destination
-table consumers read. `p08` shows the snapshot arriving as 59 separate load
-packages, so a consumer querying mid-backfill sees a partially populated table,
-and a re-snapshot doubles the rows instead of replacing them.
+### 3.3 Existing tables continue to receive CDC during a healthy snapshot — **4 / 5**
 
-**Gap to 5.** The mandated design: snapshot into `<table>_tmp` shadow tables,
-then one MotherDuck transaction that renames every `_tmp` into place (or
-`CREATE OR REPLACE TABLE … AS SELECT`). Must cover the dlt child tables for
-arrays (`cdcflight_app_customers__tags` etc.) in the same transaction.
+Stock `signal.data.collection` and incremental notifications are decoded into
+bounded units. Once STARTED is durable, incremental READs and ordinary CDC for a
+selected table use the same retained shadow; an open PostgreSQL transaction holds
+the READ until its END and is never split. The real stock test selected
+`app.customers` and `app.orders`, updated a customer, inserted an order during the
+scan, kept unselected CDC live, and compared source/destination identity sets and
+value multisets; it passed in 13.92 s. A stale post-swap READ is fenced by retained
+terminal run evidence.
 
-### 3.3 Existing tables continue to receive CDC during a healthy snapshot — **1 / 5**
+The real integration workload does not yet include a DELETE during the scan, nor
+does it prove every stock notification interleaving or a cross-table source
+transaction during the scan. Those gaps keep the honest score below 5.
 
-`go stale=1, continue but with complexity/errors=2, simple and elegant=5`
+### 3.4 Snapshot an arbitrary set of tables while others keep streaming — **4 / 5**
 
-**Evidence** (`p08`). All 300 rows inserted during the 28-second snapshot arrived
-as `c` events — but only *after* the snapshot completed. Debezium's initial
-snapshot is blocking: streaming does not start until it finishes. Every
-replicated table was therefore stale for the entire snapshot window. Scaled to
-the 6.5-hour snapshot implied by 3.1, that is a 6.5-hour outage for every other
-table.
+One stock execute-snapshot signal accepts a non-contiguous set and creates one
+durable `BACKFILL_RUN` per table with one request/signal identity. Empty sets are
+true no-ops; per-table outcomes preserve a failed peer's shadow while successful
+peers complete; a second active signal is refused rather than ambiguously
+correlated. The real stock run exercised the two-table set and both final images.
 
-**Gap to 5.** Use Debezium's *incremental* snapshot (signal-table driven,
-watermark-based) which interleaves snapshot chunks with the live stream, so
-adding or re-snapshotting one table never pauses the others. Requires
-`signal.data.collection` (a table in Postgres) and
-`incremental.snapshot.watermarking.strategy`.
+The live suite does not yet execute an empty/error table outcome through stock
+notifications, and additional requests are refused/coalesced for a later retry
+rather than proven in a full live queue scenario. Score: 4.
 
-### 3.4 Snapshot an arbitrary set of tables while others keep streaming — **1 / 5**
+### 3.5 Per-table CDC / scheduled full refresh / scheduled incremental refresh — **4 / 5**
 
-`whole database only=1, one table=4, any arbitrary set=5`
+The durable mode domain is `cdc`, `full`, and `incremental`. `cdc` schedules no
+image acquisition; `full` reuses the blocking stock resnapshot path; and
+`incremental` uses the stock signal path. `RefreshScheduler` creates durable work
+without owning acknowledgements, and transactional mode changes preserve active
+run id, shadow, cursor, and rows. The keyless stock boundary selects full fallback
+without inventing an arrival-order cursor.
 
-**Evidence.** The only control is the global `snapshot.mode`
-(`src/cdc_flight/debezium_props.py:70`, exposed as `--snapshot-mode`). There is
-no `signal.data.collection`, no signalling channel, no way to ask for a
-re-snapshot of `app.orders` alone. `p03` stage C shows the consequence: a newly
-included table gets no snapshot at all.
+The full live schedule/restart matrix is not executed, and one arbitrary stock
+signal is intentionally single-mode because stock notification correlation is
+ambiguous for concurrent mixed-mode requests. Score: 4.
 
-**Gap to 5.** Create a signal table in Postgres, set `signal.data.collection`,
-and expose an `execute-snapshot` API (CLI + a MotherDuck-side control table) that
-takes a list of tables and optional row filters. Pairs with 3.2's shadow tables.
+### 3.6 Auto-backfill when CDC falls too far behind — **4 / 5**
 
-### 3.5 Per-table CDC / scheduled full refresh / scheduled incremental refresh — **3 / 5**
+The production coordinator evaluates WAL-byte lag OR oldest pending source age,
+persists `bytes`, `time`, or `both`, treats unknown pending age as false, coalesces
+repeated triggers with retry/backoff state, and never advances the source slot.
+The tests cover below/above thresholds, size-only, time-only, both, unknown age,
+coalescing, and durable admission.
 
-`CDC only=3, CDC and full refresh=4, all three=5`
+The executed evidence is coordinator/source-health-shaped and DuckDB durable; a
+full live PostgreSQL slot sampler feeding an automatic fall-behind run was not
+run. Score: 4.
 
-**Evidence.** `src/cdc_flight/config.py` has one global `CDC_TABLES` list and one
-`snapshot_mode`. There is no per-table configuration of any kind and no
-scheduler. CDC only.
+### 3.7 Failed backfill resumes midway — **4 / 5**
 
-**Gap to 5.** A per-table mode declaration (`cdc` | `full_refresh` | `incremental`)
-with a cursor column and schedule for the refresh modes, plus a scheduler that
-runs them. Full refresh reuses 3.2's shadow-table swap; incremental refresh needs
-a watermark column and merge semantics.
+Keyed incremental progress uses a type-aware canonical primary-key identity,
+durable cursor/chunk/row fields, retained shadow, claim ownership, and terminal
+replay fencing. The real source-tree `crash_matrix_child.py` is invoked with the
+registered hard-exit handler at an incremental chunk boundary: the child is
+SIGKILLed, partial shadow and a positive durable cursor remain, and resume equals
+the clean run by identity set and value multiset with zero duplicate keys. The
+normal installed package cannot arm this handler. Keyless stock tables explicitly
+fall back to full, with the documented ceiling of 4.
 
-### 3.6 Auto-backfill when CDC falls too far behind — **1 / 5**
-
-`falls further behind=1, size trigger=4, size or time trigger=5`
-
-**Evidence.** Replication lag is never computed. Nothing in `src/cdc_flight/`
-queries `pg_replication_slots`, and the run summary
-(`src/cdc_flight/pipeline.py:141-148`) reports only records/batches/elapsed.
-With no measurement there can be no trigger.
-
-**Gap to 5.** Measure both dimensions each run —
-`pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)` for bytes and
-`now() - dbz_source_ts_ms` for time — publish them (6.1), and when either crosses
-a threshold, abandon the stream and trigger a targeted backfill (3.4) that
-advances the slot past the backlog.
-
-### 3.7 Failed backfill resumes midway — **1 / 5**
-
-`restarts from the beginning=1, restarts incomplete tables=4, resumes per table=5`
-
-**Evidence.** Debezium's own documentation:
-*"If the connector stops during a snapshot, the connector begins a new snapshot
-when it restarts"* and *"If the connector fails … upon restart the connector
-begins a new snapshot"*
-(`repos/debezium/documentation/modules/ROOT/pages/connectors/postgresql.adoc:109,197`).
-Combined with `append`, the abandoned partial snapshot stays in the destination,
-so the restart is not just slow — it duplicates.
-
-**Gap to 5.** Chunked backfill with per-table, per-chunk progress persisted in a
-MotherDuck control table, so a restart resumes at the last completed chunk. Falls
-out of the same work as 3.1/3.2.
+Not every crash point, composite/UUID stock case, offset corruption case, or
+keyless incremental source run is proven. Score: 4.
 
 ---
 
@@ -2646,7 +2640,7 @@ literal count rather than a judgement. That is why it is scored the way it is.*
 #### The number, and where it comes from
 
 ADR §19/A51 enumerates every raise site, fatal log, refusal and `stop_reason` in the
-tree: **68 rows, 44 AUTO / 15 MANUAL / 9 UNDEFINED**. Fifteen manual cases is more than
+tree: **70 rows, 46 AUTO / 15 MANUAL / 9 UNDEFINED**. Fifteen manual cases is more than
 two, so the 1-band's test is met on our own evidence.
 
 The count is not recalled: `tests/rubric/4.7_self_healing/test_4_7_inventory.py` re-parses the

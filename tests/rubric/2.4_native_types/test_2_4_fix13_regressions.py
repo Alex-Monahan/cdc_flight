@@ -142,6 +142,19 @@ NON_ADMISSION_EXCEPTIONS: dict[str, str] = {
     "DestinationFault": "injected destination fault (rubric 1.7 harness)",
     "InjectedFault": "injected fault signal (rubric 1.7 harness)",
     "FaultSpecError": "a malformed fault specification; configuration, not data",
+    # --- backfill.py: durable coordination protocol failures --------------- #
+    "BackfillError": (
+        "the base for a destination-side backfill coordination failure; it is not "
+        "a source value admission and must stop or retry the owning run"
+    ),
+    "ClaimConflict": (
+        "a competing replacement owner holds the table shadow; the safe response is "
+        "to refuse this run rather than mutate another owner's image"
+    ),
+    "BackfillInvariantError": (
+        "a destination backfill protocol or identity invariant failed; it is a "
+        "run-scoped consistency failure, not a relation value to contain"
+    ),
     # --- states.py / state_matrix.py: state-machine integrity ---------------- #
     "UnknownState": (
         "a durable value outside a frozen state domain; rubric 1.9 requires a loud "

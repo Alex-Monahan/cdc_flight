@@ -239,6 +239,21 @@ def build_properties(
         "publication.autocreate.mode": "disabled",
         "topic.prefix": replication.topic_prefix,
         "snapshot.mode": snapshot,
+        # Stock Debezium incremental snapshots are requested through this
+        # source-side signal table.  The signal row is a control request, not a
+        # destination data table; its topic is consumed by the incremental
+        # notification adapter and ignored by the ordinary row applier.
+        "signal.data.collection": replication.signal_data_collection or (
+            f"{source.schema}.cdc_flight_signal"
+        ),
+        "signal.enabled.channels": "source",
+        "incremental.snapshot.chunk.size": os.environ.get(
+            "CDC_INCREMENTAL_SNAPSHOT_CHUNK_SIZE", "1000"
+        ),
+        "incremental.snapshot.watermarking.strategy": "insert_insert",
+        # The source connector owns initial/full acquisition parallelism.  The
+        # destination remains one writer per table/shadow.
+        "snapshot.max.threads": os.environ.get("CDC_SNAPSHOT_MAX_THREADS", "4"),
         # --- offsets ----------------------------------------------------------
         # File-backed offsets: the simplest Kafka-less store. This is a known
         # baseline weakness (offsets live outside the destination transaction,
@@ -351,7 +366,11 @@ def build_properties(
     # retains the old bounded-capture behaviour for deployments that want it.
     if not source.auto_discovery:
         props["schema.include.list"] = source.schema
-        props["table.include.list"] = ",".join(source.tables)
+        captured = list(source.tables)
+        signal_collection = props["signal.data.collection"]
+        if signal_collection not in captured:
+            captured.append(signal_collection)
+        props["table.include.list"] = ",".join(captured)
     # Overrides are an actual configuration seam, not merely a validation probe.
     # Apply them after the invariant-owned defaults so a non-pinned operator
     # property reaches Debezium, while the pinned keys remain immutable.

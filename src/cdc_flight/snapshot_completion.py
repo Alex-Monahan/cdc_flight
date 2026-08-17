@@ -278,7 +278,10 @@ class SnapshotCompletion:
         return [
             unit
             for unit in units
-            if unit.kind == UNIT_SNAPSHOT_CHUNK and not unit.fenced
+            if unit.kind == UNIT_SNAPSHOT_CHUNK
+            and not getattr(unit, "incremental", False)
+            and not getattr(unit, "ignored", False)
+            and not unit.fenced
         ]
 
     @staticmethod

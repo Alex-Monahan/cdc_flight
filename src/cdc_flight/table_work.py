@@ -147,6 +147,15 @@ class TableWork:
     #: probed at most once per key and only where attribution needs it.
     start_present: dict[tuple, bool] = field(default_factory=dict)
     snapshot: bool = False
+    #: True when this is the retained shadow route for a stock incremental scan.
+    #: Incremental READs have lower precedence than ordinary CDC for one key, and
+    #: an ordinary UPDATE may legitimately arrive before its shadow base row exists.
+    incremental: bool = False
+    #: Keys already represented by an incremental READ in this commit-group fold.
+    incremental_keys: set[tuple] = field(default_factory=set)
+    #: Keys touched by ordinary CDC while the incremental shadow is loading.
+    #: These events win over a later stock READ for the same key.
+    cdc_keys: set[tuple] = field(default_factory=set)
     events: int = 0
     #: rubric 1.5: the group truncated this table, so every row that predates the
     #: truncate is gone - including the destination's own, which is why no `START`
@@ -192,6 +201,7 @@ class TableWork:
 
 def work_for(
     work: dict[str, TableWork], target: str, event: PendingRecord, snapshot: bool,
+    *, incremental: bool = False,
 ) -> TableWork:
     """The `TableWork` for `target`, created on first sight.
 
@@ -208,8 +218,15 @@ def work_for(
         item = TableWork(
             target=target,
             snapshot=snapshot,
+            incremental=incremental,
         )
         work[target] = item
+    elif incremental:
+        # A notification/control unit can establish the retained route after an
+        # ordinary CDC unit has already created the same table work in this commit
+        # group.  Upgrade the shared fold rather than leaving its first-event flag
+        # to decide whether the missing-base rule is available.
+        item.incremental = True
     if item.source_schema is None and event.schema:
         item.source_schema = event.schema
         item.source_table = event.table
@@ -394,6 +411,23 @@ def collect(
     current_descriptors = dict(event.after_descriptors or {})
     current_descriptors.update(event.key_descriptors or {})
     key = _key_token(item, current_values, current_descriptors)
+    if event.incremental:
+        # Stock watermarking deliberately allows a READ to race ordinary CDC.  A
+        # READ is a lower-precedence image: once a live event or delete has touched
+        # this key, replaying the old snapshot image must not resurrect or overwrite
+        # it.  A resumed shadow may already contain the key, which is equally safe
+        # to leave alone because its durable row is the prior committed image.
+        entries = _entries(item, key)
+        if entries == [START]:
+            _resolve_start(item, key, entries, probe)
+        if key in item.cdc_keys or key in item.deleted_keys or key in item.incremental_keys:
+            return
+        if entries:
+            return
+        item.incremental_keys.add(key)
+        _place(item, key, row, patch=patch)
+        return
+    item.cdc_keys.add(key)
     if event.op == "d":
         before_values = tuple(
             (event.before or {}).get(column) for column in item.key_columns
@@ -438,6 +472,7 @@ def collect(
                     descriptors=event.before_descriptors,
                     typed=event.typed_before,
                 )
+                item.cdc_keys.add(old)
                 if isinstance(removed, RowMove):
                     _place(
                         item,
@@ -562,6 +597,21 @@ def _update(
     if entries == [START]:
         _resolve_start(item, key, entries, probe)
     if not entries:
+        complete_after_image = bool(patch and patch.fields) and all(
+            field.state in {FieldState.VALUE, FieldState.EXPLICIT_NULL}
+            for field in patch.fields.values()
+        )
+        if item.incremental and patch is not None and (
+            patch.complete or complete_after_image
+        ):
+            # A live UPDATE can beat the first incremental READ for a key.  The
+            # shadow has no base row yet, but a complete after-image is itself a
+            # safe replacement.  A sparse or residual-TOAST update still fails
+            # closed and takes the existing table-scoped recovery route.
+            if complete_after_image and not patch.complete:
+                patch = RowPatch(dict(patch.fields), patch.absent, complete=True)
+            _place(item, key, row, patch=patch)
+            return
         _missing_toast_base(item, None, reason="UPDATE has no destination base row")
     index = _target_entry(
         item, key, entries, before, probe, "update", descriptors=descriptors, typed=typed

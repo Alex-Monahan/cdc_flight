@@ -134,6 +134,18 @@ CREATE TABLE app.audit_log_2026_08 PARTITION OF app.audit_log
     FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
 
 -- ---------------------------------------------------------------------------
+-- 7. Debezium's stock source signal collection for incremental snapshots.
+--    It is deliberately text-shaped: the connector owns interpretation of the
+--    `type`/`data` request and the Flight never fabricates a source row value.
+-- ---------------------------------------------------------------------------
+CREATE TABLE app.cdc_flight_signal (
+    id      text PRIMARY KEY,
+    type    text NOT NULL,
+    data    text
+);
+ALTER TABLE app.cdc_flight_signal REPLICA IDENTITY FULL;
+
+-- ---------------------------------------------------------------------------
 -- Replication plumbing.
 -- pgoutput is the built-in output plugin (no extension needed) and needs a
 -- PUBLICATION. We create it explicitly rather than letting Debezium autocreate
@@ -146,5 +158,6 @@ CREATE PUBLICATION cdc_flight_pub FOR TABLE
     app.sensor_readings,
     app.documents,
     app.wide_types,
-    app.audit_log
+    app.audit_log,
+    app.cdc_flight_signal
 WITH (publish = 'insert, update, delete, truncate', publish_via_partition_root = true);

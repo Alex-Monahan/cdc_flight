@@ -12,17 +12,16 @@ from pathlib import Path
 
 import pytest
 
-#: RE-MEASURED FROM THE REAL LANE COLLECTIONS. The current collections are
-#: 1768 / 194 / 48; this guard module contributes 11 / 1 / 1 items, giving the
-#: executable baselines below. These are collection counts, not a module-size rule.
-#: The slow lane adds the 23 local committed-crash/composition cells, and the
-#: MotherDuck lane adds the cloud matrix and cloud contention proof. The four removed
-#: ownership-size tests remain removed; these additions are behavior proofs, not a
-#: replacement size rule.
+#: RE-MEASURED FROM THE REAL LANE COLLECTIONS in the f43d783 checkout plus §3.
+#: The current collections are 2167 / 196 / 49; this guard module contributes
+#: 11 / 1 / 1 items, giving the executable baselines below. These are collection
+#: counts, not a module-size rule. The pre-§3 checkout collected 2124 default
+#: These are measured collection counts, with no collected node excluded by this
+#: accounting. The expected values below subtract only this guard module.
 _BASELINE_SELECTED = {
-    "not motherduck and not slow": 1757,
-    "slow and not motherduck": 193,
-    "motherduck": 47,
+    "not motherduck and not slow": 2156,
+    "slow and not motherduck": 195,
+    "motherduck": 48,
 }
 
 
