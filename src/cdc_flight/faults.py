@@ -317,7 +317,7 @@ MatrixCrashHandler = Callable[[str, int], None]
 _matrix_crash_handler: MatrixCrashHandler | None = None
 
 
-def register_matrix_crash_handler(handler: MatrixCrashHandler) -> None:
+def _register_matrix_crash_handler(handler: MatrixCrashHandler) -> None:
     """Install the non-production handler used by real crash-matrix children.
 
     The shipped package deliberately has no default handler.  A test-only child

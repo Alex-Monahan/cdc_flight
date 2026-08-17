@@ -24,4 +24,4 @@ def _hard_exit(point: str, nth: int) -> NoReturn:
 
 def install_matrix_crash_handler() -> None:
     """Register the test-tree hard-exit implementation in this process."""
-    faults.register_matrix_crash_handler(_hard_exit)
+    faults._register_matrix_crash_handler(_hard_exit)
