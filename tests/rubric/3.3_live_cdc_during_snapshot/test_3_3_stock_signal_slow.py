@@ -55,10 +55,16 @@ def test_stock_signal_runs_arbitrary_set_while_streaming(sandbox):
             "INSERT INTO app.cdc_flight_signal (id, type, data) VALUES (%s, %s, %s)",
             ("p3-stock-signal", "execute-snapshot", payload),
         )
+    # One whole PostgreSQL transaction deliberately contains UPDATE, DELETE (and
+    # its FK cascade), and INSERT while the stock scan is live.  The final identity
+    # and value oracles below catch a lost delete or a duplicate row that a count
+    # assertion would miss.
+    with psycopg.connect(sandbox.source.dsn) as source, source.transaction():
         source.execute(
             "UPDATE app.customers SET name = %s, updated_at = now() WHERE id = 1",
             ("p3-stock-live",),
         )
+        source.execute("DELETE FROM app.customers WHERE id = 2")
         source.execute(
             "INSERT INTO app.orders (customer_id, total_amount, currency) "
             "VALUES (1, 777.77, 'USD')"

@@ -214,7 +214,7 @@ class Applier:
             control_schema=self.control_schema,
             on_swap=_on_swap,
         )
-        # Reattach active durable runs before the next callback can route a row.
+        # Reattach active incremental runs before the next callback can route a row.
         # This path never drops or recreates a shadow; the legacy in-progress
         # snapshot recovery remains owned by destination/table_lifecycle.
         for run in self.backfill.active_runs():
@@ -225,9 +225,13 @@ class Applier:
             # lifecycle and leave it permanently in_progress.  Only a run that has
             # crossed into loading (or retained recovery work) may reattach a
             # destination shadow at process start.
-            if run.shadow_table and run.state in {
-                "loading", "ready_to_swap", "swapping", "retry_wait", "blocked",
-            }:
+            if (
+                run.effective_mode == "incremental"
+                and run.shadow_table
+                and run.state in {
+                    "loading", "ready_to_swap", "swapping", "retry_wait", "blocked",
+                }
+            ):
                 self.snapshots.reattach(
                     schema=run.source_schema,
                     table=run.source_table,

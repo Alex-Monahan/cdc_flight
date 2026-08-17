@@ -2,11 +2,23 @@
 
 from __future__ import annotations
 
+from itertools import permutations
+
+import duckdb
+import pytest
 from support.applier_lab import Lab, begin, data, end, heartbeat, snap
 from support.backfill_lab import incremental_record, notification, require_backfill
 
 from cdc_flight.assembler import UNIT_SNAPSHOT_CHUNK, CompleteUnit, TransactionAssembler
+from cdc_flight.control_schema import ensure_control_schema
 from cdc_flight.envelope import KIND_SNAPSHOT, PendingRecord
+
+_NOTIFICATION_PERMUTATIONS = tuple(
+    permutations(("STARTED", "IN_PROGRESS", "COMPLETED", "TABLE_SCAN_COMPLETED"))
+)
+_NOTIFICATION_GROUPS = tuple(
+    _NOTIFICATION_PERMUTATIONS[offset:offset + 6] for offset in range(0, 24, 6)
+)
 
 
 def test_incremental_snapshot_records_are_accepted_as_bounded_units():
@@ -47,6 +59,44 @@ def test_stock_incremental_notification_is_decoded_as_progress_not_initial_compl
     assert decoded.signal_id == "signal-1"
     assert decoded.chunk_id == "12"
     assert decoded.last_processed_key == "12"
+
+
+@pytest.mark.parametrize("orderings", _NOTIFICATION_GROUPS)
+def test_stock_notification_interleavings_keep_one_loading_state(orderings):
+    """All 24 notification permutations stay durable until the real swap."""
+    backfill = require_backfill()
+    for ordering in orderings:
+        con = duckdb.connect(":memory:")
+        try:
+            ensure_control_schema(con)
+            coordinator = backfill.BackfillCoordinator(
+                con, pipeline="notification-order"
+            )
+            coordinator.request_tables(
+                ("app.customers",), request_id="request-order", signal_id="signal-order"
+            )
+            for observation in ordering:
+                raw = notification(
+                    observation,
+                    table="app.customers",
+                    rows=0 if observation == "TABLE_SCAN_COMPLETED" else 1,
+                    status="EMPTY" if observation == "TABLE_SCAN_COMPLETED" else "SUCCEEDED",
+                    signal_id="signal-order",
+                )
+                decoded = backfill.decode_incremental_notification(raw)
+                coordinator.observe_notification(decoded)
+            run = coordinator.active("app", "customers")
+            assert run is not None
+            assert run.state == "ready_to_swap", ordering
+            assert coordinator.claims.state("app", "customers")[0] == "backfill"
+            coordinator.complete_swap(
+                type("State", (), {"schema": "app", "table": "customers"})(),
+                snapshot_lsn=99,
+                commit_id=1,
+            )
+            assert coordinator.repository.get(run.run_id).state == "complete", ordering
+        finally:
+            con.close()
 
 
 def test_incremental_chunk_boundary_never_splits_an_open_postgres_transaction():

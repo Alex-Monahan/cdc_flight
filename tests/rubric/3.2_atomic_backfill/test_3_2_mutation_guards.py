@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import duckdb
 import pytest
-from support.applier_lab import begin, data, end
+from support.applier_lab import Lab, begin, data, end
 from support.backfill_lab import require_backfill
 
 from cdc_flight.assembler import TransactionAssembler
@@ -123,8 +123,62 @@ def _claim_guard(backfill, con) -> None:
     raise AssertionError("the shadow claim guard allowed two owners")
 
 
-def test_mutation_guards_fail_when_seven_invariants_are_broken(tmp_path, monkeypatch):
-    """Seven real production mutations fail their corresponding invariant guard."""
+def _queued_signal_guard(backfill) -> None:
+    con = duckdb.connect(":memory:")
+    try:
+        ensure_control_schema(con)
+        coordinator = backfill.BackfillCoordinator(con, pipeline="queue-mutation")
+        coordinator.request_tables(("app.customers",), signal_id="active-signal")
+        queued, _runs = coordinator.request_tables(
+            ("app.orders",), signal_id="successor-signal", request_id="successor-request"
+        )
+        assert queued.queued is True
+        assert coordinator.signal_queue.queued(), "successor request was lost"
+    finally:
+        con.close()
+
+
+def _empty_shadow_guard(backfill, path) -> None:
+    lab = Lab(path)
+    try:
+        lab.run(
+            [
+                begin("old-empty", 10),
+                data("old-empty", 1, 11, key={"id": 1}, after={"id": 1, "value": "old"}),
+                end("old-empty", 1, 12, {"app.customers": 1}),
+            ]
+        )
+        run = lab.applier.backfill.prepare(
+            lab.applier.backfill.request("app", "customers", mode="incremental")
+        )
+        lab.applier._ensure_backfill_route("app", "customers", run)
+        assert lab.exists(lab.shadow("customers")), "empty incremental shadow is absent"
+    finally:
+        lab.close()
+
+
+def _full_swap_state_guard(backfill) -> None:
+    con = duckdb.connect(":memory:")
+    try:
+        ensure_control_schema(con)
+        coordinator = backfill.BackfillCoordinator(con, pipeline="full-swap")
+        run = coordinator.prepare(
+            coordinator.request("app", "orders", mode="full")
+        )
+        coordinator.complete_full_swap(
+            SimpleNamespace(schema="app", table="orders"),
+            snapshot_lsn=17,
+            commit_id=1,
+        )
+        persisted = coordinator.repository.get(run.run_id)
+        assert persisted.state == "complete"
+        assert coordinator.claims.state("app", "orders")[0] == "free"
+    finally:
+        con.close()
+
+
+def test_mutation_guards_fail_when_new_invariants_are_broken(tmp_path, monkeypatch):
+    """Ten real production mutations fail their corresponding invariant guard."""
     backfill = require_backfill()
     proofs: list[str] = []
 
@@ -223,5 +277,45 @@ def test_mutation_guards_fail_when_seven_invariants_are_broken(tmp_path, monkeyp
         con.close()
     proofs.append("claim_ownership")
 
+    original_enqueue = backfill.BackfillSignalQueueRepository.enqueue
+
+    def drop_queue(self, **_kwargs):
+        return None
+
+    with monkeypatch.context() as patch:
+        patch.setattr(backfill.BackfillSignalQueueRepository, "enqueue", drop_queue)
+        with pytest.raises(AssertionError):
+            _queued_signal_guard(backfill)
+    _queued_signal_guard(backfill)
+    assert backfill.BackfillSignalQueueRepository.enqueue is original_enqueue
+    proofs.append("queued_signal_durability")
+
+    original_state_for = SnapshotCoordinator.state_for
+
+    def drop_empty_shadow(self, *args, **kwargs):
+        state = original_state_for(self, *args, **kwargs)
+        if state is not None and kwargs.get("incremental") and kwargs.get("retain_existing"):
+            self.con.execute(
+                f'DROP TABLE IF EXISTS "{self.dataset}"."{state.shadow}"'
+            )
+        return state
+
+    with monkeypatch.context() as patch:
+        patch.setattr(SnapshotCoordinator, "state_for", drop_empty_shadow)
+        with pytest.raises(AssertionError):
+            _empty_shadow_guard(backfill, tmp_path / "empty-shadow-mutated.duckdb")
+    _empty_shadow_guard(backfill, tmp_path / "empty-shadow-restored.duckdb")
+    assert SnapshotCoordinator.state_for is original_state_for
+    proofs.append("empty_shadow_publication")
+
+    original_full_swap = backfill.BackfillCoordinator.complete_full_swap
+    with monkeypatch.context() as patch:
+        patch.setattr(backfill.BackfillCoordinator, "complete_full_swap", lambda *_args, **_kwargs: None)
+        with pytest.raises(AssertionError):
+            _full_swap_state_guard(backfill)
+    _full_swap_state_guard(backfill)
+    assert backfill.BackfillCoordinator.complete_full_swap is original_full_swap
+    proofs.append("full_swap_state_projection")
+
     print(f"P3 mutation proofs: {proofs}")
-    assert len(proofs) == 7
+    assert len(proofs) == 10

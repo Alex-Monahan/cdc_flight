@@ -45,6 +45,7 @@ from . import recovery as recovery_mod
 from . import resnapshot as resnapshot_mod
 from . import resnapshot_batches as rbs
 from . import resnapshot_recovery as resnapshot_recovery_mod
+from .backfill import BackfillCoordinator
 from .completion_stage import PostEngineCompletion
 from .config import (
     ApplierConfig,
@@ -760,6 +761,69 @@ def run(
                     "or rebuild those tables by hand",
                     dict(summary_extra),
                 )
+
+        # A RefreshScheduler full request is destination-durable work. Consume it
+        # on this normal pipeline start through the existing blocking stock
+        # resnapshot hand-off, before the main engine can stream onto the old image.
+        # The run is prepared before the throwaway engine and completed by its atomic
+        # swap callback, so a restart sees either the old active run or the fully
+        # published image. This is deliberately startup consumption: a live main-
+        # engine polling loop would create a second source owner.
+        backfill = BackfillCoordinator(
+            con,
+            pipeline=dest.pipeline_name,
+            control_schema=control_schema,
+            topic_prefix=replication.topic_prefix,
+        )
+        scheduled_full = [
+            run for run in backfill.active_runs()
+            if run.effective_mode == "full"
+            and run.state in {"requested", "preparing", "loading"}
+        ]
+        if scheduled_full and not will_snapshot_everything:
+            prepared: list = []
+
+            def prepare_full() -> None:
+                for run in scheduled_full:
+                    prepared.append(backfill.prepare(run, in_transaction=True))
+
+            backfill.repository.transaction(prepare_full)
+            full_tables = [
+                (run.source_schema, run.source_table, run.target_table)
+                for run in prepared
+            ]
+            phases.to(PHASE_SNAPSHOTTING, detail="scheduled full refresh")
+            scheduled_result = resnapshot_mod.run(
+                con,
+                source=source,
+                replication=replication,
+                pipeline=dest.pipeline_name,
+                dataset=dest.dataset_name,
+                tables=full_tables,
+                settings=settings,
+                run_cfg=run_cfg,
+                lease=lease,
+                runner_id=runner_id,
+                transactional_ddl=transactional_ddl,
+                epoch_base=reconciliation.resume_point.snapshot_epoch,
+                reason="scheduled full refresh",
+                namespace=namespace,
+                ownership=ownership,
+                new_relations=set(),
+                drop_mode=applier_cfg.drop_mode,
+                control_schema=control_schema,
+                on_swap=lambda state, snapshot_lsn, commit_id: backfill.complete_full_swap(
+                    state,
+                    snapshot_lsn=snapshot_lsn,
+                    commit_id=commit_id,
+                    in_transaction=True,
+                ),
+            )
+            summary_extra["scheduled_full_refresh"] = scheduled_result.as_dict()
+            reconciliation.resume_point.snapshot_epoch = max(
+                reconciliation.resume_point.snapshot_epoch,
+                scheduled_result.snapshot_epoch,
+            )
 
         # The refusal above is intentionally before the coordinator's
         # `phases.to(PHASE_STREAMING)` transition.

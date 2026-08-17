@@ -120,6 +120,22 @@ CONTROL_DDL = [
             updated_at            TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (pipeline, run_id)
         )""",
+    # A second stock signal is not safe to correlate while the first signal is
+    # active.  Keep the request, including its arbitrary table set, durably so a
+    # scheduler restart coalesces it into the next single stock signal instead of
+    # refusing it or silently dropping it.
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.backfill_signal_queue (
+            pipeline          VARCHAR NOT NULL,
+            request_id        VARCHAR NOT NULL,
+            signal_id         VARCHAR NOT NULL,
+            tables_json       VARCHAR NOT NULL,
+            trigger_reason    VARCHAR NOT NULL,
+            state             VARCHAR NOT NULL,
+            dispatch_signal_id VARCHAR,
+            created_at        TIMESTAMPTZ NOT NULL,
+            updated_at        TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (pipeline, request_id)
+        )""",
     # Exactly one replacement owner may mutate a table's shared shadow.
     f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.shadow_claims (
             pipeline        VARCHAR NOT NULL,

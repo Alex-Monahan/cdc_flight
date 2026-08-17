@@ -380,6 +380,7 @@ def run(
     new_relations: set[str] | None = None,
     drop_mode: str = DROP_LOG,
     control_schema: str | None = None,
+    on_swap=None,
 ) -> ResnapshotOutcome:
     """Re-snapshot `tables` into shadow tables and swap them in, then return.
 
@@ -450,6 +451,8 @@ def run(
             snapshot_epoch=epoch_base + len(tables) + 1,
             control_schema=control_schema,
         )
+        if on_swap is not None:
+            on_swap(state, snapshot_lsn, commit_id)
     descriptor_connection = None
     descriptor_provider = None
     try:

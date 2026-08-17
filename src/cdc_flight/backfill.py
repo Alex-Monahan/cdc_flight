@@ -116,6 +116,8 @@ def _stable_json(value: Any) -> Any:
                 "microseconds": value.microseconds,
             },
         }
+    if isinstance(value, uuid.UUID):
+        return {"type": "uuid", "value": str(value)}
     if isinstance(value, Mapping):
         items = [
             [str(key), _stable_json(item)]
@@ -185,6 +187,8 @@ def _stable_order_key(value: Any) -> tuple:
         return (4, value)
     if isinstance(value, bytes):
         return (5, value)
+    if isinstance(value, uuid.UUID):
+        return (5, value.bytes)
     if isinstance(value, datetime):
         return (6, value.isoformat())
     if isinstance(value, date):
@@ -321,6 +325,7 @@ class BenchmarkResult:
 class IncrementalSignal:
     signal_id: str
     tables: tuple[str, ...]
+    queued: bool = False
 
     def __post_init__(self) -> None:
         if not self.signal_id:
@@ -354,6 +359,13 @@ class StockSignalWriter:
 
     def insert(self, signal: IncrementalSignal) -> str:
         import psycopg
+
+        if signal.queued:
+            # A queued request is destination-durable but intentionally has no
+            # source row yet.  Inserting it now would make the second stock signal
+            # ambiguous with the active one; dispatch_queued() owns the later
+            # source INSERT after the active signal has completed.
+            return signal.signal_id
 
         payload = json.dumps(
             {"data-collections": list(signal.tables), "type": "incremental"},
@@ -922,6 +934,106 @@ class BackfillRepository:
             raise
 
 
+@dataclass(frozen=True)
+class QueuedSignalRequest:
+    request_id: str
+    signal_id: str
+    tables: tuple[str, ...]
+    trigger_reason: str
+    state: str
+    dispatch_signal_id: str | None = None
+
+
+class BackfillSignalQueueRepository:
+    """Durable successor requests for stock signal correlation."""
+
+    def __init__(self, con, *, pipeline: str, control_schema: str | None = None):
+        self.con = con
+        self.pipeline = pipeline
+        self.control_schema = resolve_control_schema(control_schema)
+        self.table = control_table(self.control_schema, "backfill_signal_queue")
+
+    @staticmethod
+    def _decode(row) -> QueuedSignalRequest:
+        return QueuedSignalRequest(
+            request_id=str(row[0]),
+            signal_id=str(row[1]),
+            tables=tuple(json.loads(str(row[2]))),
+            trigger_reason=str(row[3]),
+            state=str(row[4]),
+            dispatch_signal_id=None if row[5] is None else str(row[5]),
+        )
+
+    def get(self, request_id: str) -> QueuedSignalRequest | None:
+        row = self.con.execute(
+            f"SELECT request_id, signal_id, tables_json, trigger_reason, state, "
+            f"dispatch_signal_id FROM {self.table} WHERE pipeline = ? AND request_id = ?",
+            [self.pipeline, request_id],
+        ).fetchone()
+        return None if row is None else self._decode(row)
+
+    def queued(self) -> list[QueuedSignalRequest]:
+        rows = self.con.execute(
+            f"SELECT request_id, signal_id, tables_json, trigger_reason, state, "
+            f"dispatch_signal_id FROM {self.table} WHERE pipeline = ? AND state = 'queued' "
+            "ORDER BY created_at, request_id",
+            [self.pipeline],
+        ).fetchall()
+        return [self._decode(row) for row in rows]
+
+    def enqueue(
+        self,
+        *,
+        request_id: str,
+        signal_id: str,
+        tables: tuple[str, ...],
+        trigger_reason: str,
+    ) -> QueuedSignalRequest:
+        if not request_id or not signal_id or not tables:
+            raise ValueError("queued stock requests need an id, signal, and table set")
+        if trigger_reason not in TRIGGER_REASONS:
+            raise ValueError(trigger_reason)
+        existing = self.get(request_id)
+        now = datetime.now(UTC)
+        if existing is not None:
+            if existing.state != "queued":
+                return existing
+            merged = tuple(dict.fromkeys((*existing.tables, *tables)))
+            reason = _coalesced_trigger_reason(existing.trigger_reason, trigger_reason)
+            self.con.execute(
+                f"UPDATE {self.table} SET tables_json = ?, trigger_reason = ?, updated_at = ? "
+                "WHERE pipeline = ? AND request_id = ?",
+                [json.dumps(merged, separators=(",", ":")), reason, now, self.pipeline, request_id],
+            )
+            return self.get(request_id)
+        self.con.execute(
+            f"INSERT INTO {self.table} "
+            "(pipeline, request_id, signal_id, tables_json, trigger_reason, state, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)",
+            [
+                self.pipeline,
+                request_id,
+                signal_id,
+                json.dumps(tables, separators=(",", ":")),
+                trigger_reason,
+                now,
+                now,
+            ],
+        )
+        return self.get(request_id)
+
+    def mark_dispatched(self, request_ids: Iterable[str], signal_id: str) -> None:
+        ids = tuple(request_ids)
+        if not ids or not signal_id:
+            raise ValueError("dispatch needs queued request ids and a signal id")
+        self.con.execute(
+            f"UPDATE {self.table} SET state = 'dispatched', dispatch_signal_id = ?, "
+            "updated_at = ? WHERE pipeline = ? AND state = 'queued' "
+            f"AND request_id IN ({','.join('?' for _ in ids)})",
+            [signal_id, datetime.now(UTC), self.pipeline, *ids],
+        )
+
+
 class ShadowClaimRepository:
     """Transactional owner arbitration for a table's shared shadow."""
 
@@ -1071,6 +1183,9 @@ class BackfillCoordinator:
         self.repository = BackfillRepository(
             con, pipeline=pipeline, control_schema=self.control_schema
         )
+        self.signal_queue = BackfillSignalQueueRepository(
+            con, pipeline=pipeline, control_schema=self.control_schema
+        )
         self.claims = ShadowClaimRepository(
             con, pipeline=pipeline, control_schema=self.control_schema
         )
@@ -1161,26 +1276,19 @@ class BackfillCoordinator:
                 "only one active stock signal request may be admitted at a time"
             )
         active_signal_id = next(iter(active_signal_ids), None)
-        if active_signal_id is not None and signal_id not in (None, active_signal_id):
-            raise BackfillInvariantError(
-                "a second stock signal cannot overtake the active signal request"
-            )
         active_incremental_tables = {
             run.qualified_table
             for run in active_runs
             if run.signal_id == active_signal_id
         }
-        if active_signal_id is not None and not set(selected) <= active_incremental_tables:
-            raise BackfillInvariantError(
-                "additional tables are queued until the active stock signal completes"
-            )
+        active_non_incremental_tables = {
+            run.qualified_table
+            for run in active_runs
+            if run.effective_mode != "incremental"
+        }
         for qualified in selected:
             schema, table = qualified.split(".", 1)
             active = self.repository.active(schema, table)
-            if active is not None and active.effective_mode != "incremental":
-                raise BackfillInvariantError(
-                    f"{qualified} already has an active {active.effective_mode} run"
-                )
             if active is not None and active.signal_id:
                 active_signal_ids.add(active.signal_id)
         if len(active_signal_ids) > 1:
@@ -1192,6 +1300,40 @@ class BackfillCoordinator:
             selected,
         )
         request_id = request_id or uuid.uuid4().hex
+
+        # Stock's notification aggregate carries one signal correlation, so a
+        # second source row cannot safely be admitted while the first request is
+        # active.  Persist it instead.  The scheduler later combines all queued
+        # table sets into one successor signal, preserving the source boundary
+        # without inventing a second reader or dropping the request.
+        needs_queue = (
+            active_signal_id is not None
+            and (
+                signal.signal_id != active_signal_id
+                or not set(selected) <= active_incremental_tables
+            )
+        ) or bool(set(selected) & active_non_incremental_tables)
+        if needs_queue:
+            queued_signal_id = signal.signal_id
+            if queued_signal_id == active_signal_id:
+                queued_signal_id = uuid.uuid4().hex
+            queued_signal = IncrementalSignal(
+                queued_signal_id, selected, queued=True
+            )
+
+            def enqueue() -> tuple[IncrementalSignal, tuple[BackfillRun, ...]]:
+                self.signal_queue.enqueue(
+                    request_id=request_id,
+                    signal_id=queued_signal.signal_id,
+                    tables=selected,
+                    trigger_reason=reason,
+                )
+                faults.maybe_crash("before_request_md_commit", 1)
+                return queued_signal, ()
+
+            result = self.repository.transaction(enqueue)
+            faults.maybe_crash("after_request_commit_before_signal", 1)
+            return result
 
         def admit() -> tuple[IncrementalSignal, tuple[BackfillRun, ...]]:
             runs: list[BackfillRun] = []
@@ -1211,6 +1353,47 @@ class BackfillCoordinator:
                     )
                 run = self.repository.set_signal(run, signal.signal_id)
                 runs.append(run)
+            faults.maybe_crash("before_request_md_commit", 1)
+            return signal, tuple(runs)
+
+        result = self.repository.transaction(admit)
+        faults.maybe_crash("after_request_commit_before_signal", 1)
+        return result
+
+    def dispatch_queued(self) -> tuple[IncrementalSignal, tuple[BackfillRun, ...]] | None:
+        """Dispatch all successor requests as one stock signal when idle."""
+        if self.repository.active_all():
+            return None
+        queued = self.signal_queue.queued()
+        if not queued:
+            return None
+        selected = tuple(
+            dict.fromkeys(table for request in queued for table in request.tables)
+        )
+        request_id = f"queued-{uuid.uuid4().hex}"
+        signal_id = f"queued-{uuid.uuid4().hex}"
+        reason = queued[0].trigger_reason
+        for request in queued[1:]:
+            reason = _coalesced_trigger_reason(reason, request.trigger_reason)
+        signal = IncrementalSignal(signal_id, selected)
+
+        def admit() -> tuple[IncrementalSignal, tuple[BackfillRun, ...]]:
+            runs: list[BackfillRun] = []
+            for qualified in selected:
+                schema, table = qualified.split(".", 1)
+                run = self.repository.request(
+                    schema,
+                    table,
+                    mode="incremental",
+                    reason=reason,
+                    request_id=request_id,
+                    target_table=naming.destination_table(self.topic_prefix, schema, table),
+                )
+                run = self.repository.set_signal(run, signal.signal_id)
+                runs.append(run)
+            self.signal_queue.mark_dispatched(
+                (request.request_id for request in queued), signal.signal_id
+            )
             faults.maybe_crash("before_request_md_commit", 1)
             return signal, tuple(runs)
 
@@ -1251,6 +1434,49 @@ class BackfillCoordinator:
 
         return admit() if in_transaction else self.repository.transaction(admit)
 
+    def complete_full_swap(
+        self, state, *, snapshot_lsn: int | None, commit_id: int,
+        in_transaction: bool = False,
+    ) -> None:
+        """Close a scheduled full run inside the blocking resnapshot commit."""
+        def publish() -> None:
+            run = self.repository.active(state.schema, state.table)
+            if run is None or run.effective_mode != "full":
+                return
+            if run.state == "requested":
+                run = self.repository.transition(run, "preparing")
+                self.claims.acquire(
+                    state.schema, state.table,
+                    owner_kind="backfill", owner_id=run.run_id,
+                )
+                run = self.repository.transition(run, "loading")
+            elif run.state == "preparing":
+                self.claims.acquire(
+                    state.schema, state.table,
+                    owner_kind="backfill", owner_id=run.run_id,
+                )
+                run = self.repository.transition(run, "loading")
+            if run.state == "loading":
+                run = self.repository.transition(run, "ready_to_swap")
+            if run.state == "ready_to_swap":
+                run = self.repository.transition(run, "swapping")
+            if run.state == "swapping":
+                self.repository.transition(
+                    run,
+                    "complete",
+                    terminal_source_point=str(snapshot_lsn or ""),
+                    notification_status="COMPLETED",
+                )
+                self.claims.release(
+                    state.schema, state.table,
+                    owner_kind="backfill", owner_id=run.run_id,
+                )
+
+        if in_transaction:
+            publish()
+        else:
+            self.repository.transaction(publish)
+
     def observe_notification(
         self, notification: IncrementalNotification, *, in_transaction: bool = False
     ) -> BackfillRun | None:
@@ -1271,16 +1497,28 @@ class BackfillCoordinator:
                 "signal_id": notification.signal_id or run.signal_id,
                 "notification_status": notification.observation,
             }
-            if notification.observation in {"STARTED", "IN_PROGRESS"}:
-                if run.state == "requested":
-                    run = self.repository.transition(run, "preparing", **updates)
+
+            def ensure_loading(current: BackfillRun) -> BackfillRun:
+                """Bring any valid notification arrival back to the loading route."""
+                if current.state == "requested":
+                    current = self.repository.transition(current, "preparing", **updates)
                     self.claims.acquire(
-                        schema, table_name, owner_kind="backfill", owner_id=run.run_id
+                        schema, table_name, owner_kind="backfill", owner_id=current.run_id
                     )
-                    run = self.repository.transition(run, "loading")
-                elif run.state == "preparing":
-                    run = self.repository.transition(run, "loading", **updates)
-                else:
+                    current = self.repository.transition(current, "loading")
+                elif current.state == "preparing":
+                    current = self.repository.transition(current, "loading", **updates)
+                elif current.state in {"retry_wait", "blocked"}:
+                    current = self.repository.transition(current, "preparing", **updates)
+                    self.claims.acquire(
+                        schema, table_name, owner_kind="backfill", owner_id=current.run_id
+                    )
+                    current = self.repository.transition(current, "loading")
+                return current
+
+            if notification.observation in {"STARTED", "IN_PROGRESS"}:
+                if run.state not in {"ready_to_swap", "swapping", "complete"}:
+                    run = ensure_loading(run)
                     run = self.repository.update_progress(
                         run,
                         notification_status=notification.observation,
@@ -1289,17 +1527,38 @@ class BackfillCoordinator:
             elif notification.observation == "TABLE_SCAN_COMPLETED":
                 status = (notification.status or "").upper()
                 if status in {"SUCCEEDED", "EMPTY", "COMPLETED"}:
+                    run = ensure_loading(run)
                     if run.state == "loading":
                         faults.maybe_crash(
                             "after_TABLE_SCAN_COMPLETED", run.chunk_count + 1
                         )
                         run = self.repository.transition(run, "ready_to_swap", **updates)
                 else:
-                    run = self.repository.transition(
-                        run, "blocked", **updates, error_code=status or "UNKNOWN",
-                        error_detail="stock incremental scan did not complete successfully",
-                    ) if run.state == "loading" else run
-            elif notification.observation == "COMPLETED":
+                    run = ensure_loading(run)
+                    if run.state == "loading":
+                        decision = capability_decision(
+                            status or "UNKNOWN", requested_mode=run.effective_mode
+                        )
+                        run = self.repository.transition(
+                            run,
+                            "blocked",
+                            **updates,
+                            effective_mode=decision.effective_mode,
+                            error_code=status or "UNKNOWN",
+                            error_detail=(
+                                f"stock incremental scan failed; {decision.reason}; "
+                                "existing full-refresh handoff is required"
+                            ),
+                        )
+                        if self.claims.state(schema, table_name) is not None:
+                            self.claims.release(
+                                schema, table_name, owner_kind="backfill", owner_id=run.run_id
+                            )
+            elif (
+                notification.observation == "COMPLETED"
+                and run.state not in {"ready_to_swap", "swapping", "complete"}
+            ):
+                run = ensure_loading(run)
                 faults.maybe_crash(
                     "after_COMPLETED_before_ready_to_swap", run.chunk_count + 1
                 )
@@ -1494,7 +1753,7 @@ class RefreshScheduler:
                 request_id=request_id,
                 signal_id=signal_id,
             )
-            if self.signal_writer is not None and not signal.is_noop:
+            if self.signal_writer is not None and not signal.is_noop and not signal.queued:
                 # This is deliberately outside the MD transaction and outside the
                 # commit-to-ack window: a failed source insert leaves the durable
                 # request retryable instead of inventing a second run.
@@ -1518,6 +1777,17 @@ class RefreshScheduler:
             )
 
         return None, self.coordinator.repository.transaction(admit_full)
+
+    def dispatch_queued(
+        self,
+    ) -> tuple[IncrementalSignal, tuple[BackfillRun, ...]] | None:
+        """Publish one coalesced successor signal after the active run is done."""
+        result = self.coordinator.dispatch_queued()
+        if result is not None and self.signal_writer is not None:
+            signal, _runs = result
+            if not signal.is_noop:
+                self.signal_writer.insert(signal)
+        return result
 
 
 def fall_behind_reason(
@@ -1878,8 +2148,10 @@ class ResumableBackfillLab:
                 "CDC_BACKFILL_LAB_CHILD": "1",
                 "CDC_BACKFILL_DB": str(self.db),
                 "CDC_BACKFILL_STATE_DIR": str(self.state_dir),
+                "CDC_STATE_DIR": str(self.state_dir),
                 "CDC_BACKFILL_ROWS": str(self.rows),
                 "CDC_BACKFILL_CHUNKS": str(self.chunks),
+                "CDC_BACKFILL_FAULT_POINT": point,
                 "CDC_FAULT_INJECT": f"{point}:2",
             }
         )
@@ -1935,7 +2207,13 @@ def run_lab_child() -> int:
         chunks=int(os.environ.get("CDC_BACKFILL_CHUNKS", "20")),
         rows=int(os.environ.get("CDC_BACKFILL_ROWS", "2000")),
     )
-    lab._run(Path(os.environ["CDC_BACKFILL_DB"]), fault="incremental_chunk_after_shadow_write_before_progress")
+    lab._run(
+        Path(os.environ["CDC_BACKFILL_DB"]),
+        fault=os.environ.get(
+            "CDC_BACKFILL_FAULT_POINT",
+            "incremental_chunk_after_shadow_write_before_progress",
+        ),
+    )
     return 0
 
 
@@ -1955,6 +2233,7 @@ __all__ = [
     "BackfillError",
     "BackfillInvariantError",
     "BackfillRun",
+    "BackfillSignalQueueRepository",
     "BenchmarkResult",
     "CapabilityDecision",
     "ClaimConflict",
@@ -1964,6 +2243,7 @@ __all__ = [
     "IncrementalSignal",
     "LocalAtomicityLab",
     "MatrixReport",
+    "QueuedSignalRequest",
     "RefreshCoordinator",
     "RefreshPolicy",
     "RefreshScheduler",

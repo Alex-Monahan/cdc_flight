@@ -213,6 +213,22 @@ class SnapshotCoordinator:
             )
         elif retain_existing:
             self.created_in_txn.discard(state.shadow)
+        if incremental and retain_existing:
+            # A stock empty incremental scan has no READ from which the normal
+            # table materialiser could create the shadow.  Clone the already-live
+            # destination schema with a false predicate so an empty scan still
+            # publishes an actual empty image atomically.  The source type oracle
+            # remains the destination's existing schema; no type text is invented.
+            live_exists = self.con.execute(
+                "SELECT count(*) FROM information_schema.tables "
+                "WHERE table_schema = ? AND table_name = ?",
+                [self.dataset, state.target],
+            ).fetchone()[0]
+            if live_exists:
+                self.con.execute(
+                    f"CREATE TABLE IF NOT EXISTS {quote(self.dataset)}.{quote(state.shadow)} "
+                    f"AS SELECT * FROM {quote(self.dataset)}.{quote(state.target)} WHERE FALSE"
+                )
         self._tables[key] = state
         return state
 
