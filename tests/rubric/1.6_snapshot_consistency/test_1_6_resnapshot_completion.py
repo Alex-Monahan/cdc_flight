@@ -39,15 +39,10 @@ from cdc_flight.snapshot_completion import SnapshotCompletion
 PIPELINE = "test_resnap_completion"
 
 
-def test_blocking_resnapshot_serializes_the_source_image_and_handoff(tmp_path, monkeypatch):
-    """The image and its source watermark must come from one stock reader.
-
-    The normal §3 acquisition property remains parallelized. A blocking throwaway
-    re-snapshot is different: its image is published against one exact source
-    handoff point, and a keyless row cannot be reconciled later by primary-key
-    identity. The re-snapshot policy therefore has to override the general property
-    to one source snapshot reader.
-    """
+def test_blocking_resnapshot_reuses_the_serial_source_acquisition_contract(
+    tmp_path, monkeypatch
+):
+    """The throwaway connector inherits the one-reader production contract."""
     monkeypatch.setenv("CDC_SNAPSHOT_MAX_THREADS", "4")
     props = resnapshot_mod.build_resnapshot_properties(
         SourceConfig(),

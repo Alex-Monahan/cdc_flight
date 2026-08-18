@@ -149,10 +149,6 @@ OWNER = "resnapshot-protocol"
 #: Suffix for the throwaway slot. Kept short: Postgres slot names are limited to 63
 #: characters and the base name is already operator-chosen.
 SLOT_SUFFIX = "_rs"
-# A blocking re-snapshot's image and its source handoff watermark must describe one
-# source snapshot. Keep this path on one stock snapshot reader; ordinary §3 acquisition
-# retains the general `snapshot.max.threads=4` property.
-RESNAPSHOT_SNAPSHOT_MAX_THREADS = "1"
 
 
 @dataclass
@@ -373,11 +369,9 @@ def build_resnapshot_properties(
 ) -> dict[str, str]:
     """Build the throwaway connector properties for one exact source image.
 
-    The normal connector property advertises stock source-side snapshot parallelism,
-    but the blocking handoff has a stricter contract: the rows in the shadow and the
-    consistent WAL point used to fence the main slot must be produced by one source
-    snapshot reader. Keyless rows have no primary-key identity with which a later
-    parallel reader/stream overlap could be reconciled.
+    The shared connector property already pins every source acquisition to one reader.
+    This builder remains the owner of the throwaway connector's table scope and name;
+    it does not maintain a second snapshot-threading rule.
     """
     include = sorted({f"{schema}.{table}" for schema, table, _ in tables})
     props = build_properties(
@@ -390,7 +384,6 @@ def build_resnapshot_properties(
     props["table.include.list"] = ",".join(include)
     # Debezium only snapshots what it captures, and capturing more would stream more.
     props["snapshot.include.collection.list"] = ",".join(include)
-    props["snapshot.max.threads"] = RESNAPSHOT_SNAPSHOT_MAX_THREADS
     return props
 
 

@@ -157,6 +157,16 @@ SKIP_TRUNCATE = "t"
 #: is pinned.
 MONEY_LOCALE_NEUTRAL_OPTIONS = "-c lc_monetary=C"
 
+# One source snapshot reader is a correctness pin, not a tuning default. With more
+# than one reader, a keyless row written while the initial snapshot is being acquired
+# can appear in both the parallel snapshot image and the live stream; the destination
+# has no primary-key identity with which to reconcile those two copies. Reviewer A
+# measured only a 2.16% end-to-end difference for 250,000 rows (97.844 s at one reader
+# versus 95.731 s at four) while this production path still has one destination writer.
+# Revisit this only when genuinely parallel destination writers and keyless
+# reconciliation exist; until then, the correctness-preserving value is deliberately 1.
+PRODUCTION_SNAPSHOT_MAX_THREADS = "1"
+
 
 def build_properties(
     source: SourceConfig,
@@ -189,6 +199,7 @@ def build_properties(
         "snapshot.mode": snapshot,
         "slot.name": replication.slot_name,
         "plugin.name": "pgoutput",
+        "snapshot.max.threads": PRODUCTION_SNAPSHOT_MAX_THREADS,
     }
     protected_reasons = {
         **INVARIANT_O_REASONS,
@@ -202,6 +213,11 @@ def build_properties(
         ),
         "slot.name": "the configured logical slot is the source of the resume proof",
         "plugin.name": "the source contract is pinned to stock PostgreSQL pgoutput",
+        "snapshot.max.threads": (
+            "parallel source snapshot readers can publish a keyless row twice across "
+            "the snapshot/live boundary; the destination has one writer and no "
+            "primary-key identity with which to reconcile it"
+        ),
     }
     for key, value in (overrides or {}).items():
         pinned = protected.get(key)
@@ -251,9 +267,10 @@ def build_properties(
             "CDC_INCREMENTAL_SNAPSHOT_CHUNK_SIZE", "1000"
         ),
         "incremental.snapshot.watermarking.strategy": "insert_insert",
-        # The source connector owns initial/full acquisition parallelism.  The
-        # destination remains one writer per table/shadow.
-        "snapshot.max.threads": os.environ.get("CDC_SNAPSHOT_MAX_THREADS", "4"),
+        # The source connector uses one reader for every acquisition path. This is
+        # deliberately pinned above: the destination has one writer, and parallel
+        # source readers make keyless snapshot/live overlap physically ambiguous.
+        "snapshot.max.threads": PRODUCTION_SNAPSHOT_MAX_THREADS,
         # --- offsets ----------------------------------------------------------
         # File-backed offsets: the simplest Kafka-less store. This is a known
         # baseline weakness (offsets live outside the destination transaction,

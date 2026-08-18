@@ -8,13 +8,14 @@ from cdc_flight.config import ReplicationConfig, SourceConfig
 from cdc_flight.debezium_props import build_properties
 
 
-def test_stock_parallel_and_incremental_properties_are_explicit(tmp_path, monkeypatch):
-    """Proves the selected stock connector owns acquisition parallelism and chunks."""
+def test_stock_serial_and_incremental_properties_are_explicit(tmp_path, monkeypatch):
+    """Proves every stock acquisition uses the one-reader correctness pin."""
     monkeypatch.setenv("CDC_AUTO_DISCOVERY", "0")
+    monkeypatch.setenv("CDC_SNAPSHOT_MAX_THREADS", "4")
     props = build_properties(
         SourceConfig(), ReplicationConfig(state_dir=tmp_path)
     )
-    assert props["snapshot.max.threads"] == "4"
+    assert props["snapshot.max.threads"] == "1"
     assert props["incremental.snapshot.chunk.size"]
     assert props["incremental.snapshot.watermarking.strategy"] == "insert_insert"
     assert props["signal.enabled.channels"] == "source"

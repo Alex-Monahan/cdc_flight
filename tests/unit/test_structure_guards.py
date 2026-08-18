@@ -14,12 +14,12 @@ import pytest
 
 #: RE-MEASURED FROM THE REAL LANE COLLECTIONS after the §3 gap coverage.
 #: The pre-gap selected baselines were 2156 / 195 / 48. This round adds twelve
-#: default-lane nodes and five slow-lane nodes; the guard module still contributes
+#: default-lane nodes and six slow-lane nodes; the guard module still contributes
 #: 11 / 1 / 1 items. These are collection counts, not a module-size rule. The
 #: expected values below subtract only this guard module.
 _BASELINE_SELECTED = {
     "not motherduck and not slow": 2169,
-    "slow and not motherduck": 200,
+    "slow and not motherduck": 201,
     "motherduck": 48,
 }
 

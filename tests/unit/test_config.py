@@ -157,6 +157,7 @@ def test_source_and_money_contract_pins_cannot_be_clobbered_by_overrides(tmp_pat
         "snapshot.mode": "never",
         "slot.name": "other_slot",
         "plugin.name": "wal2json",
+        "snapshot.max.threads": "4",
     }
     for key, value in protected.items():
         with pytest.raises(UnsafeDebeziumProperty, match=key.replace(".", r"\.")):
