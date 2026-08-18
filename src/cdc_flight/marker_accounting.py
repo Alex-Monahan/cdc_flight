@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from .envelope import KIND_MESSAGE, KIND_TXN_BEGIN, KIND_TXN_END, PendingRecord
+from .envelope import (
+    KIND_HEARTBEAT,
+    KIND_MESSAGE,
+    KIND_TXN_BEGIN,
+    KIND_TXN_END,
+    PendingRecord,
+)
 
 
 class SourceMarkerReceiptCounter:
@@ -21,6 +27,12 @@ class SourceMarkerReceiptCounter:
 
     def observe(self, rec: PendingRecord) -> int:
         """Return how many records in ``rec``'s transaction are marker records."""
+        # Debezium's own ``__debezium-heartbeat`` topic is a data-free source
+        # control record without the BEGIN/MESSAGE/END envelope used by
+        # ``heartbeat.action.query``. It is still not application data and must not
+        # inflate the operator-facing source-record count.
+        if rec.kind == KIND_HEARTBEAT:
+            return 1
         if rec.kind not in (KIND_TXN_BEGIN, KIND_TXN_END, KIND_MESSAGE):
             return 0
         txn_id = rec.txn_id
@@ -47,4 +59,7 @@ class SourceMarkerReceiptCounter:
 
     def _is_marker(self, prefix: str | None) -> bool:
         value = str(prefix or "")
-        return any(value.startswith(f"{marker}_") for marker in self._prefixes)
+        return any(
+            value == marker or value.startswith(f"{marker}_")
+            for marker in self._prefixes
+        )

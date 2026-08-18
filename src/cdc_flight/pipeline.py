@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -59,7 +60,7 @@ from .config import (
 )
 from .debezium_props import assert_no_internal_topic_collision, build_properties
 from .destination import Lease
-from .errors import EngineFailure
+from .errors import EngineFailure, LeaseLost, OffsetUnusable, SlotAheadOfDestination
 from .faults import validate_env as validate_fault_env
 from .machines import (
     PHASE_RECONCILING,
@@ -128,6 +129,8 @@ def run(
         replication,
         snapshot_mode=snapshot_mode,
         truncate_mode=settings["truncate_mode"],
+        jdbc_socket_timeout_seconds=run_cfg.jdbc_socket_timeout_seconds,
+        jdbc_connect_timeout_seconds=run_cfg.jdbc_connect_timeout_seconds,
     )
     # A captured table whose topic collides with `<prefix>.transaction` would be
     # decoded as transaction metadata and never applied. Not reachable with the
@@ -155,6 +158,7 @@ def run(
     # the applier writes through, rather than by scattering anchors through the SQL
     # builders. `AlertSink`'s independent `cursor()` is delegated untouched on
     # purpose - see `faults.FaultyConnection`.
+    con = None
     con = faults_mod.wrap_destination(
         dest_mod.connect(dest), control_schema=control_schema
     )
@@ -208,19 +212,6 @@ def run(
             control_schema=control_schema,
         )
 
-        if reset_state:
-            # The one part of `--reset-state` that is NOT journalled, and the one part
-            # that does not need to be: a lease row destroys no data and records no
-            # obligation. It is cleared before the lease is acquired because an operator
-            # saying "start over" is also saying "break whatever claims to hold this
-            # pipeline"; `Lease.acquire` reclaims a dead owner on its own, so this only
-            # covers an owner whose host we cannot check.
-            con.execute(
-                f"DELETE FROM {control_table(control_schema, 'lease')} "
-                "WHERE pipeline = ?",
-                [dest.pipeline_name],
-            )
-
         applier_cfg = ApplierConfig(
             max_batch_size=int(props["max.batch.size"]),
             commit_timeout=run_cfg.commit_timeout,
@@ -236,10 +227,11 @@ def run(
         # deletes the resume point, drops the slot), and a second runner doing that
         # concurrently is exactly what rubric 4.2 exists to prevent.
         lease = Lease(
-            dest.pipeline_name,
+            dest.lease_key,
             owner_id=runner_id,
             ttl_seconds=lease_ttl_seconds(),
             control_schema=control_schema,
+            label=dest.pipeline_name,
         )
         lease.acquire(con)
         lease_held = True
@@ -923,6 +915,18 @@ def run(
         except EngineFailure as failure:
             outcome.record(failure.summary.get("stop_reason") or "engine_error")
             reported = failure.summary
+            # EngineFailure is the normal fail-closed boundary for supervisor-owned
+            # failures (source-dark, bounded timeout, incomplete watermark, and
+            # connector shutdown).  It must take the same durable alert path as an
+            # acquisition/lease exception; otherwise the process exits non-zero while
+            # the operator sees only the local summary.
+            _record_run_failure_alert(
+                con,
+                dest=dest,
+                runner_id=runner_id,
+                exc=failure,
+                summary=reported,
+            )
             raise
     except BaseException as exc:
         # Anything that unwound before (or around) the engine: a refusal, a lease loss,
@@ -944,6 +948,27 @@ def run(
         reported.update(dict(getattr(exc, "summary", {}) or {}))
         reported.update(summary_extra)
         reported.setdefault("stop_reason", outcome.value)
+        if phases is not None and hasattr(phases, "record_log"):
+            phases.record_log(
+                level="CRITICAL",
+                event="run_failure",
+                message=(
+                    f"run failed before success could be claimed: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                context={
+                    "error_type": type(exc).__name__,
+                    "stop_reason": reported.get("stop_reason"),
+                },
+                force=True,
+            )
+        _record_run_failure_alert(
+            con,
+            dest=dest,
+            runner_id=runner_id,
+            exc=exc,
+            summary=reported,
+        )
         with contextlib.suppress(Exception):  # a BaseException without a __dict__
             exc.summary = reported
         raise
@@ -958,6 +983,96 @@ def run(
             run_ok=run_ok,
             hard_exit_on_transfer=True,
         )
+
+
+def _record_run_failure_alert(
+    con,
+    *,
+    dest: DestinationConfig,
+    runner_id: str,
+    exc: BaseException,
+    summary: dict,
+) -> None:
+    """Project every pre-engine/run-boundary failure onto the durable alert surface.
+
+    The supervisor owns connector-time failures, while this outer boundary owns
+    acquisition, lease, offset, and teardown failures. Keeping this projection here
+    means a failure before an Applier/AlertSink exists cannot silently become only a
+    local summary record.
+    """
+    if con is None:
+        return
+    if summary.get("connector_failure_alert") in {"recorded", "already_recorded"}:
+        return
+    # Slot reconciliation raises after it has durably emitted the named verdict
+    # (`slot_missing`, `slot_ahead_of_destination`, or `slot_recreated`).  Projecting
+    # the same exception again as a generic run_failure creates two operator incidents
+    # for one loss of source position; the named verdict is the complete diagnosis.
+    if isinstance(exc, SlotAheadOfDestination):
+        return
+    if isinstance(exc, LeaseLost) or "lease" in str(exc).lower():
+        code = "concurrent_destination_run"
+        severity = "critical"
+        # The runner id identifies the attempt, not the occurrence.  Retrying the
+        # same contender while the same holder is alive must remain one operator
+        # incident; the holder/error text is the stable occurrence fingerprint.
+        marker = f"{code}:{hashlib.sha256(str(exc).encode()).hexdigest()}"
+    elif isinstance(exc, OffsetUnusable):
+        code = "offset_unusable"
+        severity = "critical"
+        marker = f"{code}:{hashlib.sha256(str(exc).encode()).hexdigest()}"
+    elif summary.get("slot_check"):
+        code = str(summary["slot_check"].get("decision") or "slot_check_failed")
+        severity = "critical"
+        marker = f"{code}:{summary['slot_check'].get('confirmed_flush_lsn')}"
+    elif summary.get("stop_reason") == "source_dark":
+        code = "source_dark"
+        severity = "critical"
+        marker = f"{code}:{dest.pipeline_name}"
+    elif summary.get("stop_reason") in {"max_seconds", "engine_error", "hung"}:
+        code = "run_incomplete"
+        severity = "critical"
+        marker = (
+            f"{code}:{hashlib.sha256(str(exc).encode()).hexdigest()}:"
+            f"{summary.get('stop_reason')}"
+        )
+    else:
+        code = "run_failure"
+        severity = "critical"
+        marker = f"{code}:{hashlib.sha256(str(exc).encode()).hexdigest()}"
+    message = (
+        f"cdc_flight run for pipeline {dest.pipeline_name!r} failed before it could "
+        f"claim success: {type(exc).__name__}: {exc}"
+    )
+    try:
+        # A failed lease acquisition can leave the destination connection inside the
+        # implicit transaction opened by its probe (MotherDuck reports this as a
+        # conflict/aborted transaction).  The alert is an operator-side fact, not part
+        # of that failed attempt; clear the probe transaction before writing it so the
+        # failure cannot be durable only in last_run.json.
+        with contextlib.suppress(Exception):
+            con.execute("ROLLBACK")
+        alert_sink = dest_mod.AlertSink(
+            con,
+            pipeline=dest.pipeline_name,
+            control_schema=dest.control_schema,
+        )
+        try:
+            alert_sink.raise_alert_once(
+                severity=severity,
+                code=code,
+                message=message,
+                marker_value=marker,
+                context={
+                    "runner_id": runner_id,
+                    "error_type": type(exc).__name__,
+                    "stop_reason": summary.get("stop_reason"),
+                },
+            )
+        finally:
+            alert_sink.close()
+    except Exception:
+        log.warning("could not persist run failure alert %s", code, exc_info=True)
 
 
 def _teardown_destination(

@@ -50,6 +50,14 @@ class Lease:
     owner_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     ttl_seconds: float = 60.0
     control_schema: str | None = None
+    #: Human-facing pipeline name when pipeline is the canonical physical
+    #: destination key. Existing unit callers leave this unset and retain the old
+    #: wording.
+    label: str | None = None
+
+    @property
+    def name(self) -> str:
+        return self.label or self.pipeline
 
     def acquire(self, con) -> None:
         rows = con.execute(
@@ -70,7 +78,7 @@ class Lease:
                 # this host is not a concurrent writer, so it is reclaimed and said so.
                 log.warning(
                     "reclaiming the lease for %r from dead runner %s (pid %s on %s)",
-                    self.pipeline,
+                    self.name,
                     owner,
                     pid,
                     host,
@@ -78,9 +86,10 @@ class Lease:
                 live = False
             if live:
                 raise LeaseLost(
-                    f"pipeline {self.pipeline!r} is already leased by runner {owner} "
+                    f"pipeline {self.name!r} is already leased by runner {owner} "
                     f"(pid {pid} on {host}) until {expires_at.isoformat()}; a second "
-                    "concurrent Flight would double-write (rubric 4.2)"
+                    "concurrent Flight would double-write the shared destination "
+                    f"(lease key {self.pipeline!r}, rubric 4.2)"
                 )
         self._upsert(con, current)
 
@@ -94,7 +103,7 @@ class Lease:
         ).fetchall()
         if rows and rows[0][0] != self.owner_id:
             raise LeaseLost(
-                f"lease for {self.pipeline!r} was taken by runner {rows[0][0]}; "
+                f"lease for {self.name!r} was taken by runner {rows[0][0]}; "
                 "this commit group must not be applied (rubric 4.2)"
             )
         self._upsert(con, now())
@@ -153,7 +162,7 @@ class Lease:
                 log.warning(
                     "lease row for %r is locked by an abandoned transaction (attempt %s): "
                     "%s; retrying",
-                    self.pipeline,
+                    self.name,
                     attempt,
                     exc,
                 )

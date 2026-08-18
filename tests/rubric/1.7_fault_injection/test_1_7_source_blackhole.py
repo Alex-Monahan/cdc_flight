@@ -28,6 +28,7 @@ import os
 import subprocess
 import time
 
+import duckdb
 import psycopg
 import pytest
 from support.fixtures import PROJECT_DIR, TEST_INSTANCE_ID, TEST_SLOT_PREFIX, _executable
@@ -105,6 +106,15 @@ def test_a_blackholed_source_never_reports_ok(tmp_path, postgres_cluster, relay)
 
     summary_path = state / "last_run.json"
     summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
+    control = duckdb.connect(str(tmp_path / "cdc_flight.duckdb"), read_only=True)
+    try:
+        alerts = control.execute(
+            "SELECT severity, code FROM _cdc_flight.alerts "
+            "WHERE pipeline = ? ORDER BY raised_at",
+            (env["CDC_PIPELINE_NAME"],),
+        ).fetchall()
+    finally:
+        control.close()
     assert returncode != 0, (
         f"a blackholed Postgres produced a SUCCESSFUL run: returncode={returncode} "
         f"summary={ {k: v for k, v in summary.items() if k != 'output'} }"
@@ -115,6 +125,15 @@ def test_a_blackholed_source_never_reports_ok(tmp_path, postgres_cluster, relay)
     # MINOR-5). The mechanism has a name and the summary carries it.
     assert summary.get("stop_reason") == "source_dark", summary
     assert "unreachable" in (summary.get("error") or "").lower(), summary.get("error")
+    source_dark_alerts = [
+        (severity, code) for severity, code in alerts
+        if severity == "critical" and code == "source_dark"
+    ]
+    assert len(source_dark_alerts) == 1, alerts
+    assert any(
+        severity == "critical" and code == "source_dark"
+        for severity, code in alerts
+    ), alerts
     # And the BOUND is measured, not asserted from the configuration. RUBRIC_STATUS
     # claims detection "within CDC_SOURCE_DARK_SECONDS (45 s)"; with `--max-seconds 70`
     # the run could equally have died of the not-streaming guard at 70 s, so the claim

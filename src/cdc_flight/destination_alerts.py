@@ -79,6 +79,36 @@ class AlertSink:
         log.warning("ALERT %s/%s: %s", severity, code, message)
         return self.independent
 
+    def raise_alert_once(
+        self, *, severity: str, code: str, message: str, marker_value: str,
+        context=None,
+    ) -> bool:
+        """Write one durable alert for one condition occurrence.
+
+        Use the sink's independent cursor for both the probe and the insert.  A
+        pre-engine failure can leave the applier connection in an aborted transaction;
+        routing the alert through that same handle would make the operator signal
+        disappear when the failed transaction is retired.
+        """
+        con = self._sink if self.independent else self._main
+        if alert_marker_exists(
+            con,
+            pipeline=self.pipeline,
+            code=code,
+            marker_key="condition_marker",
+            marker_value=marker_value,
+            control_schema=self.control_schema,
+        ):
+            return False
+        payload = dict(context or {})
+        payload["condition_marker"] = marker_value
+        return self.raise_alert(
+            severity=severity,
+            code=code,
+            message=message,
+            context=payload,
+        )
+
     def request_snapshot(
         self, *, pipeline: str, schema: str, table: str, target: str
     ) -> bool:
@@ -174,6 +204,48 @@ def raise_alert(
         )
     except Exception:  # pragma: no cover - alerting must never mask the cause
         log.warning("could not write alert %s", code, exc_info=True)
+
+
+def raise_alert_once(
+    con,
+    *,
+    pipeline: str,
+    severity: str,
+    code: str,
+    message: str,
+    marker_value: str,
+    context=None,
+    control_schema: str | None = None,
+) -> bool:
+    """Persist one alert for one durable occurrence.
+
+    Failure paths are often revisited on every bounded runner invocation.  The
+    condition marker makes that repetition a single operator incident while a
+    changed marker (for example a new slot LSN or a new failure fingerprint) is a
+    new occurrence.  A failed probe intentionally falls through to an insert:
+    losing the alert is worse than a duplicate.
+    """
+    if alert_marker_exists(
+        con,
+        pipeline=pipeline,
+        code=code,
+        marker_key="condition_marker",
+        marker_value=marker_value,
+        control_schema=control_schema,
+    ):
+        return False
+    payload = dict(context or {})
+    payload["condition_marker"] = marker_value
+    raise_alert(
+        con,
+        pipeline=pipeline,
+        severity=severity,
+        code=code,
+        message=message,
+        context=payload,
+        control_schema=control_schema,
+    )
+    return True
 
 
 def read_slot_state(

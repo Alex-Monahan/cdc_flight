@@ -131,6 +131,16 @@ class ReconciliationRefused(RuntimeError):
     """
 
 
+class OffsetUnusable(RuntimeError):
+    """The durable resume row is present but cannot be parsed safely.
+
+    A malformed resume point is not the same as a repairable offsets.dat scratch
+    file: the destination row is the source of truth, and there is no trustworthy
+    position from which Debezium may start.  The caller must alert and exit before
+    the engine is constructed.
+    """
+
+
 class AmbiguousDelete(RuntimeError):
     """The fold cannot say which physical row a delete removed (ADR 0001 §18/A35).
 

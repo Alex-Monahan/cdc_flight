@@ -138,6 +138,10 @@ NON_ADMISSION_EXCEPTIONS: dict[str, str] = {
         "run with the journal intact, which is the opposite of containment"
     ),
     "LeaseLost": "another runner owns the pipeline lease; this run must not write",
+    "OffsetUnusable": (
+        "a durable resume point is malformed or semantically unusable; the run must "
+        "refuse before streaming rather than inventing an offset or relation scope"
+    ),
     # --- faults.py: the test-only fault harness ----------------------------- #
     "DestinationFault": "injected destination fault (rubric 1.7 harness)",
     "InjectedFault": "injected fault signal (rubric 1.7 harness)",

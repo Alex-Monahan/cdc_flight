@@ -301,6 +301,11 @@ class Applier:
         self.source_marker_records_received = 0
         self._source_marker_receipts = SourceMarkerReceiptCounter(marker_prefixes)
         self.last_batch_at = time.monotonic()
+        # A stock Debezium heartbeat is a control-only callback. It must advance the
+        # slot, but it must not reset the completion watermark's data-quiet clock or a
+        # read-only fallback can wait forever on a quiet source that heartbeats every
+        # five seconds.
+        self._last_callback_had_data = False
 
         # -- counters surfaced in the run summary (rubric 6.1) --------------- #
         self.record_count = 0
@@ -534,12 +539,14 @@ class Applier:
         finally:
             with self._quiescence:
                 self._in_flight -= 1
-                self.last_batch_at = time.monotonic()
+                if self._last_callback_had_data:
+                    self.last_batch_at = time.monotonic()
                 if self._in_flight == 0:
                     self._quiescence.notify_all()
 
     def _handle(self, records, committer) -> None:
         self._committer = committer
+        self._last_callback_had_data = False
         # The previous group's offset flush is verified here, outside the
         # commit->ack window, now that Debezium has polled at least once since it
         # (Codex 7).
@@ -641,6 +648,7 @@ class Applier:
             self.record_count += source_records
             if data_in_batch:
                 self.data_batch_count += 1
+        self._last_callback_had_data = bool(data_in_batch)
 
         if data_in_batch:
             maybe_crash("decode", self.data_batch_count)
@@ -799,6 +807,26 @@ class Applier:
         if alert is not None:
             self.group.pending_alerts.append(alert)
         self.ambiguous_resnapshots_queued += int(recorded)
+
+    def _record_commit_timeout_alert(self, commit_id: int, stage: str) -> None:
+        """Persist the watchdog diagnosis before its hard, fail-closed exit."""
+        marker = f"commit:{commit_id}:{stage}"
+        self.alerts.raise_alert_once(
+            severity="critical",
+            code="commit_timeout",
+            message=(
+                f"commit group {commit_id} exceeded the bounded commit watchdog "
+                f"while waiting at {stage}; the process will exit without claiming "
+                "success and the next run must reconcile the destination"
+            ),
+            marker_value=marker,
+            context={
+                "commit_id": commit_id,
+                "stage": stage,
+                "timeout_seconds": self.cfg.commit_timeout,
+                "runner_id": self.runner_id,
+            },
+        )
 
     def hold_streaming_tail(self, tables) -> None:
         """Hold these relations' ordinary stream rows out of a retained image.

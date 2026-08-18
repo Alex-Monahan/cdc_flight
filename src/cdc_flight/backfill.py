@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from . import faults, naming
-from .config import resolve_control_schema
+from .config import resolve_control_schema, source_connection_kwargs
 from .envelope import PendingRecord, decode
 from .machines import (
     BACKFILL_RUN,
@@ -473,7 +473,11 @@ class StockSignalWriter:
             ensure_ascii=False,
             separators=(",", ":"),
         )
-        with psycopg.connect(self.dsn, autocommit=False, connect_timeout=10) as conn:
+        with psycopg.connect(
+            self.dsn,
+            autocommit=False,
+            **source_connection_kwargs(),
+        ) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"INSERT INTO {self._quoted_collection()} (id, type, data) "

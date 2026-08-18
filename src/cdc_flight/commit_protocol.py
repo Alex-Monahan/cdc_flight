@@ -157,7 +157,12 @@ def commit_group(self, trigger: str) -> CommitResult:
             else []
         )
         with self_heal.commit_watchdog(
-            self.cfg.commit_timeout, commit_id, stage=lambda: stage[0]
+            self.cfg.commit_timeout,
+            commit_id,
+            stage=lambda: stage[0],
+            on_timeout=lambda where: self._record_commit_timeout_alert(
+                commit_id, where
+            ),
         ):
             # INSIDE the watchdog (Codex r3 MAJOR-2). `enter()` waits, without a
             # bound of its own, until no independent write is in flight — that is

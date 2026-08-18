@@ -65,6 +65,8 @@ SELECT s.active,
        s.confirmed_flush_lsn IS NOT NULL AS has_confirmed,
        CASE WHEN s.confirmed_flush_lsn IS NULL THEN NULL
             ELSE (s.confirmed_flush_lsn - '0/0')::BIGINT END AS confirmed_pos,
+       CASE WHEN s.restart_lsn IS NULL THEN NULL
+            ELSE (s.restart_lsn - '0/0')::BIGINT END AS restart_pos,
        COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), s.confirmed_flush_lsn), 0)::BIGINT
 FROM pg_replication_slots s
 WHERE s.slot_name = %s
@@ -80,6 +82,7 @@ class SlotSample:
     active: bool = False
     lag_bytes: int | None = None
     confirmed_pos: int | None = None
+    restart_pos: int | None = None
     error: str | None = None
 
     @property
@@ -142,10 +145,24 @@ class SourceHealth:
         self._thread.start()
         return self
 
-    def stop(self) -> None:
+    def stop(self, *, timeout: float | None = None) -> bool:
+        """Stop the sampler under an explicit bound and report quiescence.
+
+        A join of interval*3 was shorter than the configured JDBC query budget, so a
+        sampler blocked in a source read could outlive the run with no durable verdict.
+        The default covers one bounded query plus the connection handshake; callers
+        with a run-level budget may provide a tighter/longer bound.
+        """
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=self.interval * 3)
+            wait = (
+                timeout
+                if timeout is not None
+                else self.connect_timeout + self.query_timeout_ms / 1000.0 + 1.0
+            )
+            self._thread.join(timeout=max(0.01, wait))
+            return not self._thread.is_alive()
+        return True
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -255,12 +272,13 @@ class SourceHealth:
             return SlotSample(at=now, error=f"{type(exc).__name__}: {exc}")
         if row is None:
             return SlotSample(at=now, exists=False)
-        active, has_confirmed, confirmed_pos, lag = row
+        active, has_confirmed, confirmed_pos, restart_pos, lag = row
         return SlotSample(
             at=now,
             exists=True,
             active=bool(active),
             confirmed_pos=(int(confirmed_pos) if has_confirmed else None),
+            restart_pos=(int(restart_pos) if restart_pos is not None else None),
             lag_bytes=int(lag) if has_confirmed else None,
         )
 
@@ -631,6 +649,7 @@ class SourceHealth:
             "slot_exists": sample.exists,
             "slot_active": sample.active,
             "slot_confirmed_pos": sample.confirmed_pos,
+            "slot_restart_pos": sample.restart_pos,
             "slot_lag_bytes": sample.lag_bytes,
             "slot_streaming_for_sec": round(self.streaming_for, 1),
             "slot_ever_streamed": self.ever_streamed,

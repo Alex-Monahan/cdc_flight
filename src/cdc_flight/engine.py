@@ -126,6 +126,7 @@ class SupervisedDebeziumEngine(DebeziumJsonEngine):
         self._offset_file = Path(offset_file) if offset_file else None
         self._always_commit_offsets = always_commit_offsets
         self._verifier: OffsetFlushVerifier | None = None
+        self._effective_configuration: dict[str, object] = {}
 
     # -- completion bookkeeping --------------------------------------------- #
     def _on_completion(self, success: bool, message, error) -> None:
@@ -183,6 +184,11 @@ class SupervisedDebeziumEngine(DebeziumJsonEngine):
     def offset_flushes_verified(self) -> int:
         return self._verifier.flushes_verified if self._verifier else 0
 
+    @property
+    def effective_configuration(self) -> dict[str, object]:
+        """The stock Debezium/pgjdbc values observed while building the engine."""
+        return dict(self._effective_configuration)
+
     # -- engine construction ------------------------------------------------ #
     @cached_property
     def consumer(self):
@@ -217,18 +223,69 @@ class SupervisedDebeziumEngine(DebeziumJsonEngine):
         else:
             java_props = self.properties
 
+        self._effective_configuration = self._probe_effective_configuration(java_props)
+
         callback = _completion_callback_class()(self._on_completion)
         # Keep a reference: JPype proxies are garbage-collected like any Python
         # object, and the JVM only holds a weak handle to them.
         self._completion_callback = callback
 
-        return (
+        built = (
             DebeziumEngine.create(EngineFormat.JSON)
             .using(java_props)
             .notifying(self.consumer)
             .using(callback)
             .build()
         )
+        self._effective_configuration["engine_built"] = True
+        return built
+
+    @staticmethod
+    def _probe_effective_configuration(java_props) -> dict[str, object]:
+        """Validate the exact stock runtime properties, including driver pass-through.
+
+        Checking the Python dict alone would repeat the dead-configuration failure this
+        project already had. Debezium's own PostgresConnectorConfig consumes the
+        heartbeat values, and pgjdbc's PGProperty consumes the driver subset; both
+        probes run before the engine is built and therefore fail startup if a property
+        is rejected or renamed.
+        """
+        import jpype
+
+        configuration_cls = jpype.JClass("io.debezium.config.Configuration")
+        postgres_config_cls = jpype.JClass(
+            "io.debezium.connector.postgresql.PostgresConnectorConfig"
+        )
+        pg_property = jpype.JClass("org.postgresql.PGProperty")
+        config = configuration_cls.from_(java_props)
+        connector_config = postgres_config_cls(config)
+        interval_ms = int(connector_config.getHeartbeatInterval().toMillis())
+        action_raw = config.getString("heartbeat.action.query")
+        action_query = str(action_raw) if action_raw is not None else ""
+        jdbc_props = jpype.JClass("java.util.Properties")()
+        for name in ("socketTimeout", "connectTimeout", "tcpKeepAlive"):
+            value = config.getString(f"driver.{name}")
+            if value is not None:
+                jdbc_props.setProperty(name, str(value))
+        effective = {
+            "validation": "io.debezium.connector.postgresql.PostgresConnectorConfig",
+            "heartbeat.interval.ms": interval_ms,
+            "heartbeat.action.query": action_query,
+            "driver.socketTimeout": str(
+                pg_property.forName("socketTimeout").get(jdbc_props)
+            ),
+            "driver.connectTimeout": str(
+                pg_property.forName("connectTimeout").get(jdbc_props)
+            ),
+            "driver.tcpKeepAlive": str(
+                pg_property.forName("tcpKeepAlive").get(jdbc_props)
+            ),
+        }
+        if interval_ms <= 0 or not action_query:
+            raise EngineFailure(
+                "stock Debezium accepted no effective idle heartbeat interval/action query"
+            )
+        return effective
 
     def close(self, *, intentional: bool = True) -> None:
         """Stop the engine.

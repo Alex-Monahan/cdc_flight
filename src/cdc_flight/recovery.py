@@ -74,7 +74,7 @@ from pathlib import Path
 
 from . import catalog_baseline, table_lifecycle
 from .config import resolve_control_schema
-from .destination import now, raise_alert, request_snapshot
+from .destination import now, raise_alert_once, request_snapshot
 from .errors import RecoveryFailed
 from .faults import arrival, matrix_crash, maybe_crash, runtime_state
 from .machines import (
@@ -345,14 +345,45 @@ def begin(
         captured=captured,
         state_dir=str(state_dir) if state_dir is not None else None,
     )
-    raise_alert(
-        con, pipeline=pipeline, severity=severity, code=decision,
-        message=(
-            f"{message}. Rebuilding every captured table from the source "
-            f"({len(captured_tables)} tables); the destination stays queryable until "
-            "each table's snapshot is complete and swapped in one transaction."
-        ),
-        context=(context or {}) | {"recovery_id": record.recovery_id},
+    alert_message = (
+        f"{message}. Rebuilding every captured table from the source "
+        f"({len(captured_tables)} tables); the destination stays queryable until "
+        "each table's snapshot is complete and swapped in one transaction."
+    )
+    context = dict(context or {})
+    # A retry of the same missing/advanced slot is one standing occurrence, even
+    # though a new recovery row gets a new UUID.  Explicit reset/orphan commands are
+    # separate operator actions, so their recovery id deliberately starts a new
+    # occurrence.
+    if decision in {
+        "slot_missing",
+        "slot_ahead_of_destination",
+        "slot_recreated",
+        "source_identity_changed",
+        "source_timeline_changed",
+        "source_lsn_regressed",
+        "no_durable_destination_row",
+    }:
+        marker_value = ":".join(
+            str(value)
+            for value in (
+                decision,
+                slot_name,
+                context.get("confirmed_flush_lsn"),
+                context.get("durable_lsn"),
+            )
+        )
+    else:
+        marker_value = f"{decision}:{record.recovery_id}"
+    context["recovery_id"] = record.recovery_id
+    raise_alert_once(
+        con,
+        pipeline=pipeline,
+        severity=severity,
+        code=decision,
+        message=alert_message,
+        marker_value=marker_value,
+        context=context,
         control_schema=control_schema,
     )
     con.execute("BEGIN TRANSACTION")

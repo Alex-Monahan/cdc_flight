@@ -334,6 +334,8 @@ class RunPhaseWriter:
         #: True once the writer has given the cursor up. The worker reads it to decide
         #: whether IT is now responsible for closing.
         self._released = False
+        self._log_seq = 0
+        self._last_log_at = 0.0
         #: Phase writes this run stopped waiting for, terminal or not.
         self.phase_writes_abandoned = 0
         #: A terminal write the run stopped waiting for. Distinct from
@@ -382,6 +384,48 @@ class RunPhaseWriter:
         recovery), where "already there" is not a transition at all."""
         if self.phase != phase:
             self.to(phase, detail=detail)
+
+    def record_log(
+        self,
+        *,
+        level: str = "INFO",
+        event: str,
+        message: str,
+        replication_lag_bytes: int | None = None,
+        slot_restart_lsn: int | None = None,
+        slot_confirmed_flush_lsn: int | None = None,
+        context=None,
+        force: bool = False,
+    ) -> None:
+        """Best-effort durable operator log with a bounded database wait.
+
+        The log sink shares the existing bounded writer and commit-to-ack exclusion.
+        The force flag is used only for the terminal sample; normal telemetry is
+        throttled so a 0.5 s source sampler does not turn an operator table into an
+        event flood. Any sink failure/drop is diagnostic and cannot fail a healthy
+        data commit.
+        """
+        if self._sink is None:
+            return
+        now_mono = time.monotonic()
+        if not force and now_mono - self._last_log_at < 1.0:
+            return
+        self._last_log_at = now_mono
+        self._execute_bounded(
+            "operator_log",
+            insert=False,
+            terminal=False,
+            timeout=self.PHASE_WRITE_TIMEOUT,
+            operation=lambda: self._execute_log(
+                level=level,
+                event=event,
+                message=message,
+                replication_lag_bytes=replication_lag_bytes,
+                slot_restart_lsn=slot_restart_lsn,
+                slot_confirmed_flush_lsn=slot_confirmed_flush_lsn,
+                context=context,
+            ),
+        )
 
     def finish(self, *, ok: bool, reason: str | None = None) -> None:
         """Terminal: `stopped` when the run succeeded, `failed` when it did not."""
@@ -446,7 +490,8 @@ class RunPhaseWriter:
         )
 
     def _execute_bounded(
-        self, phase: str, *, insert: bool, terminal: bool, timeout: float
+        self, phase: str, *, insert: bool, terminal: bool, timeout: float,
+        operation=None,
     ) -> None:
         """One phase write, with a bound on the DATABASE call, not just the gate.
 
@@ -482,7 +527,10 @@ class RunPhaseWriter:
                             "commit->ack window", phase,
                         )
                         return
-                    self._execute(phase, insert=insert)
+                    if operation is None:
+                        self._execute(phase, insert=insert)
+                    else:
+                        operation()
             finally:
                 # If the run has already retired the sink, this thread is now its only
                 # owner and closing it is this thread's job. Under the lock, so
@@ -529,7 +577,7 @@ class RunPhaseWriter:
             # commit->ack gate", and incrementing it here made one attempt look like two
             # separate ungated writes. This is a different fact and it gets its own name.
             self.phase_writes_abandoned += 1
-            if RUN_PHASE.is_terminal(phase):
+            if terminal:
                 self.terminal_write_abandoned = True
             log.error(
                 "the %r phase write did not complete within %.1fs; this run stops "
@@ -576,12 +624,50 @@ class RunPhaseWriter:
         except Exception:  # pragma: no cover - observability must never fail a run
             log.debug("could not write the run-phase heartbeat row", exc_info=True)
 
+    def _execute_log(
+        self,
+        *,
+        level: str,
+        event: str,
+        message: str,
+        replication_lag_bytes: int | None,
+        slot_restart_lsn: int | None,
+        slot_confirmed_flush_lsn: int | None,
+        context,
+    ) -> None:
+        try:
+            from .destination import now
+
+            self._log_seq += 1
+            self._sink.execute(
+                f"INSERT INTO {control_table(self.control_schema, 'run_logs')} "
+                "(pipeline, runner_id, log_seq, occurred_at, level, event, message, "
+                " replication_lag_bytes, slot_restart_lsn, slot_confirmed_flush_lsn, "
+                " context) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                [
+                    self.pipeline,
+                    self.runner_id,
+                    self._log_seq,
+                    now(),
+                    str(level).upper(),
+                    event,
+                    message,
+                    replication_lag_bytes,
+                    slot_restart_lsn,
+                    slot_confirmed_flush_lsn,
+                    json.dumps(context, default=str) if context else None,
+                ],
+            )
+        except Exception:
+            log.debug("could not write operator run log", exc_info=True)
+
     def summary(self) -> dict:
         out = {
             "run_phase": self.phase,
             "run_phases": list(self.transitions),
             "run_outcome": self.outcome.value,
             "heartbeat_independent": self.independent,
+            "operator_log_events_attempted": self._log_seq,
         }
         if COMMIT_ACK.dropped_writes:
             # Evidence, not decoration: it is the count of times the commit->ack

@@ -161,6 +161,14 @@ class LiveDiscoveryCoordinator:
                         )
                     ),
                     max_lag_bytes=self.run_cfg.idle_max_lag_bytes,
+                    connect_timeout=max(1, int(self.run_cfg.jdbc_connect_timeout_seconds)),
+                    query_timeout_ms=max(
+                        250,
+                        min(
+                            4000,
+                            int(self.run_cfg.jdbc_socket_timeout_seconds * 1000),
+                        ),
+                    ),
                 ).start()
                 if self.phases.phase != PHASE_STREAMING:
                     self.phases.to(PHASE_STREAMING)
@@ -206,7 +214,12 @@ class LiveDiscoveryCoordinator:
                 # refusal would exist only in process memory and a quiet run could
                 # publish a partial destination as successful.
                 self._persist_catalog_refusals()
-                self.health.stop()
+                if not self.health.stop(timeout=self.run_cfg.close_timeout):
+                    raise EngineFailure(
+                        "the source-health sampler did not quiesce within the run "
+                        f"close budget of {self.run_cfg.close_timeout:.1f}s",
+                        dict(self.result),
+                    )
                 self.health = None
 
                 newly_discovered = (
@@ -328,7 +341,17 @@ class LiveDiscoveryCoordinator:
             raise
         finally:
             if self.health is not None:
-                self.health.stop()
+                health_stopped = self.health.stop(timeout=self.run_cfg.close_timeout)
+                if not health_stopped:
+                    self.summary_extra["source_health_quiesced"] = False
+                    self.summary_extra["source_health_quiescence_error"] = (
+                        "the source-health sampler did not stop within the configured "
+                        f"close budget of {self.run_cfg.close_timeout:.1f}s"
+                    )
+                    self.outcome.record("hung")
+                    log.error(self.summary_extra["source_health_quiescence_error"])
+                else:
+                    self.summary_extra.setdefault("source_health_quiesced", True)
             if self.applier is not None:
                 self.applier.shutdown()
             watcher_quiesced = True
@@ -417,7 +440,11 @@ class LiveDiscoveryCoordinator:
             dataset=self.destination.dataset_name,
             topic_prefix=self.replication.topic_prefix,
             signal_data_collection=self.props.get("signal.data.collection"),
-            marker_prefixes=("cdcf", self.catalog_cfg.marker_prefix),
+            marker_prefixes=(
+                "cdcf",
+                self.catalog_cfg.marker_prefix,
+                "cdc_flight_heartbeat",
+            ),
             offset_path=self.replication.offset_file,
             resume_point=self.main_resume,
             config=self.applier_cfg,

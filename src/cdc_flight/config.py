@@ -14,6 +14,37 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_CONTROL_SCHEMA = "_cdc_flight"
 
+# One source-side wait policy shared by catalog, snapshot, backfill, and liveness
+# connections.  The embedded Debezium engine has its own pgjdbc properties; these
+# values cover the psycopg connections opened by the Flight itself.  Keeping the
+# server statement timeout and the client TCP timeout together matters: the former
+# cannot fire when the server is unreachable, while the latter cannot cancel a query
+# that the server is still executing.
+DEFAULT_SOURCE_CONNECT_TIMEOUT_SECONDS = 5
+DEFAULT_SOURCE_SOCKET_TIMEOUT_SECONDS = 60
+DEFAULT_SOURCE_STATEMENT_TIMEOUT_MS = 4000
+
+
+def source_connection_kwargs(
+    *,
+    connect_timeout: float = DEFAULT_SOURCE_CONNECT_TIMEOUT_SECONDS,
+    socket_timeout_seconds: float = DEFAULT_SOURCE_SOCKET_TIMEOUT_SECONDS,
+    statement_timeout_ms: int = DEFAULT_SOURCE_STATEMENT_TIMEOUT_MS,
+) -> dict[str, object]:
+    """Return bounded psycopg connection options for every Flight source wait."""
+    connect = max(1, int(connect_timeout))
+    socket_ms = max(250, int(float(socket_timeout_seconds) * 1000))
+    statement_ms = max(1, int(statement_timeout_ms))
+    return {
+        "connect_timeout": connect,
+        "options": f"-c statement_timeout={statement_ms}",
+        "keepalives": 1,
+        "keepalives_idle": 1,
+        "keepalives_interval": 1,
+        "keepalives_count": 2,
+        "tcp_user_timeout": socket_ms,
+    }
+
 
 def _env(name: str, default: str) -> str:
     value = os.environ.get(name)
@@ -171,6 +202,24 @@ class DestinationConfig:
         )
     )
 
+    @property
+    def lease_key(self) -> str:
+        """Stable single-writer key for this physical destination.
+
+        Pipeline names are not ownership boundaries: two slots/pipelines can point at
+        the same DuckDB file (or MotherDuck database/schema) and would otherwise both
+        pass the old per-pipeline lease.  Keep the durable lease table shape backward
+        compatible by using this canonical destination identity as its key.  The
+        pipeline name remains in the row only for diagnostics through ``lease_label``.
+        """
+        if self.kind == "duckdb":
+            location = str(self.duckdb_path.expanduser().resolve())
+        elif self.kind == "motherduck":
+            location = self.motherduck_database
+        else:
+            location = f"{self.kind}:{self.duckdb_path}"
+        return f"destination:{self.kind}:{location}:{self.dataset_name}:{self.control_schema}"
+
 
 @dataclass(frozen=True)
 class RunConfig:
@@ -235,6 +284,35 @@ class RunConfig:
     #: next run resumes at exactly what the destination holds.
     commit_timeout: float = field(
         default_factory=lambda: float(_env("CDC_COMMIT_TIMEOUT", "300"))
+    )
+    #: pgjdbc's bounded socket read timeout, in seconds.  This is distinct from the
+    #: Python sampler's statement timeout: Debezium itself must not remain blocked on a
+    #: source socket after the sampler has declared the source dark (rubric 4.6c).
+    jdbc_socket_timeout_seconds: float = field(
+        default_factory=lambda: float(_env("CDC_JDBC_SOCKET_TIMEOUT_SECONDS", "60"))
+    )
+    #: pgjdbc handshake bound, in seconds.  Kept explicit so every source wait has a
+    #: named budget and the connector properties cannot silently fall back to infinity.
+    jdbc_connect_timeout_seconds: float = field(
+        default_factory=lambda: float(_env("CDC_JDBC_CONNECT_TIMEOUT_SECONDS", "5"))
+    )
+    #: Startup grace for the independent source sampler.  A sampler that has never
+    #: returned a successful observation is not evidence of a healthy source; after
+    #: this bounded grace the run fails closed instead of taking the old timer-only
+    #: success path (A51 row 50).
+    source_probe_startup_seconds: float = field(
+        default_factory=lambda: float(_env("CDC_SOURCE_PROBE_STARTUP_SECONDS", "8"))
+    )
+    #: Bound for the final join of the Debezium engine thread after ``close``.  The old
+    #: hard-coded 60 s was a wait with no operator-configured budget.
+    engine_thread_timeout: float = field(
+        default_factory=lambda: float(_env("CDC_ENGINE_THREAD_TIMEOUT", "30"))
+    )
+    #: Maximum time the embedded engine may take to publish its first source-health
+    #: observation after the thread is started.  It is a separate startup bound so a
+    #: connector that never reaches a live slot cannot masquerade as an idle run.
+    engine_start_timeout: float = field(
+        default_factory=lambda: float(_env("CDC_ENGINE_START_TIMEOUT", "15"))
     )
 
 

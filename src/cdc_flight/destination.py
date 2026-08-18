@@ -18,7 +18,7 @@ from typing import Any
 from . import faults, table_lifecycle
 from .config import resolve_control_schema
 from .control_schema import CONTROL_DDL, ensure_control_schema
-from .errors import CANONICAL_REFUSAL_CLASS  # noqa: F401
+from .errors import CANONICAL_REFUSAL_CLASS, OffsetUnusable  # noqa: F401
 from .machines import (
     KEYLESS_EVENT,
     KEYLESS_EVENT_APPLIED,
@@ -151,15 +151,30 @@ class ResumePoint:
 
     @classmethod
     def from_json(cls, text: str, **extra) -> ResumePoint:
-        payload = json.loads(text)
-        return cls(
-            partition=payload.get("partition") or {},
-            offset=payload.get("offset") or {},
-            last_lsn=int(payload.get("last_lsn") or 0),
-            last_txn_id=payload.get("last_txn_id"),
-            last_total_order=payload.get("last_total_order"),
-            **extra,
-        )
+        try:
+            payload = json.loads(text)
+            if not isinstance(payload, dict):
+                raise ValueError("resume JSON must be an object")
+            partition = payload.get("partition") or {}
+            offset = payload.get("offset") or {}
+            if not isinstance(partition, dict) or not isinstance(offset, dict):
+                raise ValueError("resume partition and offset must be objects")
+            last_lsn = int(payload.get("last_lsn") or 0)
+            if last_lsn < 0:
+                raise ValueError("resume last_lsn must be non-negative")
+            total_order = payload.get("last_total_order")
+            if total_order is not None:
+                total_order = int(total_order)
+            return cls(
+                partition=partition,
+                offset=offset,
+                last_lsn=last_lsn,
+                last_txn_id=payload.get("last_txn_id"),
+                last_total_order=total_order,
+                **extra,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise OffsetUnusable(f"resume point is not usable JSON: {exc}") from exc
 
 
 # --------------------------------------------------------------------------- #
@@ -233,7 +248,13 @@ def read_resume_point(
         _blob,
         _key_blob,
     ) = rows[0]
-    point = ResumePoint.from_json(resume_json)
+    try:
+        point = ResumePoint.from_json(resume_json)
+    except OffsetUnusable as exc:
+        raise OffsetUnusable(
+            f"durable resume point for pipeline={pipeline!r}, namespace={namespace!r} "
+            f"is unusable: {exc}"
+        ) from exc
     point.commit_id = int(commit_id or 0)
     point.last_lsn = int(last_lsn or point.last_lsn or 0)
     point.last_txn_id = last_txn_id
@@ -513,6 +534,7 @@ from .destination_alerts import (  # noqa: E402, F401
     mark_awaiting_snapshot,
     promote_interrupted_snapshots,
     raise_alert,
+    raise_alert_once,
     read_slot_state,
     read_snapshot_states,
     register_table,

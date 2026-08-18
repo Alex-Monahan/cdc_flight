@@ -432,6 +432,26 @@ CONTROL_DDL = [
             message         VARCHAR     NOT NULL,
             context         VARCHAR
         )""",
+    # Rubric 6.1. The heartbeat table answers where a run is in its lifecycle;
+    # this is the durable operator event stream. The lag columns are first-class
+    # values rather than text in message so an operator can graph retained WAL and
+    # the confirmed hand-off in MotherDuck. Rows are written through the same bounded,
+    # independent observability sink as the phase writer, never from the commit->ack
+    # path and never as a prerequisite for a data commit.
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.run_logs (
+            pipeline                  VARCHAR     NOT NULL,
+            runner_id                 VARCHAR     NOT NULL,
+            log_seq                   BIGINT      NOT NULL,
+            occurred_at               TIMESTAMPTZ NOT NULL,
+            level                     VARCHAR     NOT NULL,
+            event                     VARCHAR     NOT NULL,
+            message                   VARCHAR     NOT NULL,
+            replication_lag_bytes     BIGINT,
+            slot_restart_lsn          BIGINT,
+            slot_confirmed_flush_lsn  BIGINT,
+            context                   VARCHAR,
+            PRIMARY KEY (pipeline, runner_id, log_seq)
+        )""",
 ]
 
 

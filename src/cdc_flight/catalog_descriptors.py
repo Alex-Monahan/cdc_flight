@@ -14,6 +14,7 @@ import threading
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 
+from .config import source_connection_kwargs
 from .errors import AdmissionError, SchemaEvolutionRefused
 from .naming import normalize
 from .schema_evolution import descriptor_from_type_name
@@ -283,7 +284,11 @@ class RelationDescriptorProvider:
         with self._event_read_lock:
             con = self._event_read_conn
             if con is None or con.closed:
-                con = psycopg.connect(self.source_dsn, autocommit=True)
+                con = psycopg.connect(
+                    self.source_dsn,
+                    autocommit=True,
+                    **source_connection_kwargs(),
+                )
                 self._event_read_conn = con
             try:
                 return catalog_support.read_event_columns_from_connection(
@@ -344,7 +349,11 @@ def source_relation_fingerprint(
     import psycopg
 
     try:
-        with psycopg.connect(dsn, autocommit=True) as con:
+        with psycopg.connect(
+            dsn,
+            autocommit=True,
+            **source_connection_kwargs(),
+        ) as con:
             rows = con.execute(
                 "SELECT c.oid::bigint, a.attname, a.attnum, a.atttypid::bigint, "
                 "a.atttypmod, format_type(a.atttypid, a.atttypmod) "
@@ -392,7 +401,11 @@ def provider_for_source(source) -> object:
         requested.append((schema, table, ""))
     import psycopg
 
-    with psycopg.connect(source.dsn, autocommit=True) as descriptor_con:
+    with psycopg.connect(
+        source.dsn,
+        autocommit=True,
+        **source_connection_kwargs(),
+    ) as descriptor_con:
         return RelationDescriptorProvider.from_tables(
             descriptor_con, requested, source_dsn=source.dsn
         ).descriptors_for

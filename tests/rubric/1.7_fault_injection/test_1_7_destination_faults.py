@@ -210,6 +210,15 @@ def test_a_hung_commit_is_bounded_and_never_reports_success(dest_fault_box):
     output = failed["output"].lower()
     assert "commit" in output and "did not return within" in output, output[-2000:]
     assert "ambiguous" in output, "the log must say the commit may already be durable"
+    timeout_alerts = box.duck_query(
+        "SELECT severity, code FROM _cdc_flight.alerts "
+        "WHERE code = 'commit_timeout'"
+    )
+    assert any(
+        severity == "critical" and code == "commit_timeout"
+        for severity, code in timeout_alerts
+    ), timeout_alerts
+    assert len(timeout_alerts) == 1, timeout_alerts
     _assert_exact_after_recovery(box, tag)
 
 

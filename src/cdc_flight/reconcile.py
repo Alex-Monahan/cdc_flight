@@ -47,7 +47,17 @@ def slot_position(dsn: str, slot_name: str) -> int | None:
     """`confirmed_flush_lsn` of the slot, as an integer, or None if it is gone."""
     import psycopg
 
-    with psycopg.connect(dsn, autocommit=True, connect_timeout=10) as conn:
+    with psycopg.connect(
+        dsn,
+        autocommit=True,
+        connect_timeout=5,
+        options="-c statement_timeout=4000",
+        keepalives=1,
+        keepalives_idle=1,
+        keepalives_interval=1,
+        keepalives_count=2,
+        tcp_user_timeout=4000,
+    ) as conn:
         rows = conn.execute(
             "SELECT confirmed_flush_lsn - '0/0' FROM pg_replication_slots "
             "WHERE slot_name = %s",
@@ -120,7 +130,17 @@ def observe_slot(dsn: str, slot_name: str, *, connect_timeout: int = 10) -> Slot
     try:
         import psycopg
 
-        with psycopg.connect(dsn, autocommit=True, connect_timeout=connect_timeout) as conn:
+        with psycopg.connect(
+            dsn,
+            autocommit=True,
+            connect_timeout=connect_timeout,
+            options="-c statement_timeout=4000",
+            keepalives=1,
+            keepalives_idle=1,
+            keepalives_interval=1,
+            keepalives_count=2,
+            tcp_user_timeout=4000,
+        ) as conn:
             row = conn.execute(_SLOT_OBSERVATION_SQL, (slot_name,)).fetchone()
     except Exception as exc:  # pragma: no cover - the source may be down
         return SlotObservation(error=f"{type(exc).__name__}: {exc}")
@@ -453,7 +473,17 @@ def drop_slot(dsn: str, slot_name: str) -> str:
     """
     import psycopg
 
-    with psycopg.connect(dsn, autocommit=True, connect_timeout=10) as conn:
+    with psycopg.connect(
+        dsn,
+        autocommit=True,
+        connect_timeout=5,
+        options="-c statement_timeout=4000",
+        keepalives=1,
+        keepalives_idle=1,
+        keepalives_interval=1,
+        keepalives_count=2,
+        tcp_user_timeout=4000,
+    ) as conn:
         rows = conn.execute(
             "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
             "WHERE slot_name = %s",

@@ -102,7 +102,7 @@ def request_resnapshot_for(
 
 
 @contextlib.contextmanager
-def commit_watchdog(timeout: float, commit_id: int, stage=None):
+def commit_watchdog(timeout: float, commit_id: int, stage=None, on_timeout=None):
     """Bound the post-COMMIT protocol. A hung commit or acknowledgement kills the process.
 
     Rubric 1.7 requires every injected fault to end in a clean recovery or a loud
@@ -130,6 +130,33 @@ def commit_watchdog(timeout: float, commit_id: int, stage=None):
         # NEVER STARTED — reporting that as an ambiguous commit sends an operator looking
         # for a half-applied transaction that does not exist.
         where = stage() if stage is not None else "commit"
+        if on_timeout is not None:
+            # The destination operation is the thing that is wedged, so the alert
+            # must use the already-open independent observability sink. Keep this
+            # attempt bounded as well: a broken destination must not turn the
+            # watchdog into another unbounded wait. The hard exit remains the
+            # authoritative failure outcome if the alert sink cannot answer.
+            finished = threading.Event()
+
+            def _write_timeout_alert() -> None:
+                try:
+                    on_timeout(where)
+                except Exception:
+                    log.warning("could not persist the commit-timeout alert", exc_info=True)
+                finally:
+                    finished.set()
+
+            alert_thread = threading.Thread(
+                target=_write_timeout_alert,
+                name="cdc-commit-timeout-alert",
+                daemon=True,
+            )
+            alert_thread.start()
+            if not finished.wait(1.0):
+                log.error(
+                    "the commit-timeout alert sink did not answer within 1.0s; "
+                    "exiting with the watchdog outcome"
+                )
         if where == "ack":
             log.critical(
                 "destination COMMIT for commit_id=%s completed, but Debezium's "
