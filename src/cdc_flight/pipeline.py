@@ -45,6 +45,7 @@ from . import recovery as recovery_mod
 from . import resnapshot as resnapshot_mod
 from . import resnapshot_batches as rbs
 from . import resnapshot_recovery as resnapshot_recovery_mod
+from .backfill import BackfillCoordinator
 from .completion_stage import PostEngineCompletion
 from .config import (
     ApplierConfig,
@@ -133,7 +134,14 @@ def run(
     # pinned topic-naming strategy, and asserted rather than reasoned about
     # (Opus MINOR-6).
     assert_no_internal_topic_collision(replication.topic_prefix, source.tables)
-    snapshot_capture_names = tuple(source.tables)
+    signal_data_collection = props.get("signal.data.collection")
+
+    def is_signal_relation(qualified: str) -> bool:
+        return bool(signal_data_collection and qualified == signal_data_collection)
+
+    snapshot_capture_names = tuple(
+        table for table in source.tables if not is_signal_relation(table)
+    )
     namespace = props["name"]
     runner_id = uuid.uuid4().hex
 
@@ -251,6 +259,10 @@ def run(
             replication,
             control_schema=control_schema,
         )
+        captured_tables = [
+            table for table in captured_tables
+            if not is_signal_relation(f"{table[0]}.{table[1]}")
+        ]
         if reset_state:
             # Journalled BEFORE the first destructive step, and before the generic
             # resume below picks it up (Codex r1 MAJOR-4).
@@ -472,7 +484,12 @@ def run(
             # keep the configured capture bounded instead of letting Debezium snapshot
             # every table in the publication while completion still expects CDC_TABLES.
             props["schema.include.list"] = source.schema
-            props["table.include.list"] = ",".join(source.tables)
+            configured_tables = [
+                table for table in source.tables if not is_signal_relation(table)
+            ]
+            if signal_data_collection and signal_data_collection not in configured_tables:
+                configured_tables.append(signal_data_collection)
+            props["table.include.list"] = ",".join(configured_tables)
         baseline = baseline_mod.mark_unconfirmed(
             con, pipeline=dest.pipeline_name, dataset=dest.dataset_name,
             runner_id=runner_id, reconcile=catalog_enabled,
@@ -535,7 +552,9 @@ def run(
                 summary_extra["catalog_schema_refusals"] = [
                     str(refused) for refused in catalog_refusals
                 ]
-            discovered = watcher.new_relations()
+            discovered = watcher.new_relations(
+                exclude={signal_data_collection} if signal_data_collection else None
+            )
             if discovered:
                 dest_mod.request_snapshot(
                     con,
@@ -556,18 +575,21 @@ def run(
                 summary_extra["discovered_relations"] = [
                     relation.qualified for relation in discovered
                 ]
-            observed = watcher.captured_relations()
+            observed = tuple(
+                relation
+                for relation in watcher.captured_relations()
+                if not is_signal_relation(relation.qualified)
+            )
             if observed and source.auto_discovery:
                 # Debezium is publication-driven in discovery mode. Snapshot completion
                 # therefore expects the relations observed at the run's start, including
                 # a relation that was not in CDC_TABLES.
-                props["table.include.list"] = ",".join(
-                    sorted(
-                        relation.qualified
-                        for relation in observed
-                        if not relation.is_partition
-                    )
+                observed_names = sorted(
+                    relation.qualified for relation in observed if not relation.is_partition
                 )
+                if signal_data_collection and signal_data_collection not in observed_names:
+                    observed_names.append(signal_data_collection)
+                props["table.include.list"] = ",".join(observed_names)
                 captured_tables = [
                     (
                         relation.schema,
@@ -579,7 +601,10 @@ def run(
                     for relation in observed
                     if not relation.is_partition
                 ]
-                snapshot_capture_names = watcher.snapshot_names()
+                snapshot_capture_names = tuple(
+                    name for name in watcher.snapshot_names()
+                    if not is_signal_relation(name)
+                )
             if catalog_cfg.grace_seconds:
                 log.warning(
                     "CDC_CATALOG_GRACE=%.0fs: a destructive catalog action will be "
@@ -737,6 +762,69 @@ def run(
                     dict(summary_extra),
                 )
 
+        # A RefreshScheduler full request is destination-durable work. Consume it
+        # on this normal pipeline start through the existing blocking stock
+        # resnapshot hand-off, before the main engine can stream onto the old image.
+        # The run is prepared before the throwaway engine and completed by its atomic
+        # swap callback, so a restart sees either the old active run or the fully
+        # published image. This is deliberately startup consumption: a live main-
+        # engine polling loop would create a second source owner.
+        backfill = BackfillCoordinator(
+            con,
+            pipeline=dest.pipeline_name,
+            control_schema=control_schema,
+            topic_prefix=replication.topic_prefix,
+        )
+        scheduled_full = [
+            run for run in backfill.active_runs()
+            if run.effective_mode == "full"
+            and run.state in {"requested", "preparing", "loading"}
+        ]
+        if scheduled_full and not will_snapshot_everything:
+            prepared: list = []
+
+            def prepare_full() -> None:
+                for run in scheduled_full:
+                    prepared.append(backfill.prepare(run, in_transaction=True))
+
+            backfill.repository.transaction(prepare_full)
+            full_tables = [
+                (run.source_schema, run.source_table, run.target_table)
+                for run in prepared
+            ]
+            phases.to(PHASE_SNAPSHOTTING, detail="scheduled full refresh")
+            scheduled_result = resnapshot_mod.run(
+                con,
+                source=source,
+                replication=replication,
+                pipeline=dest.pipeline_name,
+                dataset=dest.dataset_name,
+                tables=full_tables,
+                settings=settings,
+                run_cfg=run_cfg,
+                lease=lease,
+                runner_id=runner_id,
+                transactional_ddl=transactional_ddl,
+                epoch_base=reconciliation.resume_point.snapshot_epoch,
+                reason="scheduled full refresh",
+                namespace=namespace,
+                ownership=ownership,
+                new_relations=set(),
+                drop_mode=applier_cfg.drop_mode,
+                control_schema=control_schema,
+                on_swap=lambda state, snapshot_lsn, commit_id: backfill.complete_full_swap(
+                    state,
+                    snapshot_lsn=snapshot_lsn,
+                    commit_id=commit_id,
+                    in_transaction=True,
+                ),
+            )
+            summary_extra["scheduled_full_refresh"] = scheduled_result.as_dict()
+            reconciliation.resume_point.snapshot_epoch = max(
+                reconciliation.resume_point.snapshot_epoch,
+                scheduled_result.snapshot_epoch,
+            )
+
         # The refusal above is intentionally before the coordinator's
         # `phases.to(PHASE_STREAMING)` transition.
 
@@ -785,6 +873,21 @@ def run(
         # consumer-construction failure retires an idle owner rather than
         # exposing an unowned callback.
 
+        catalog_flush_exclude = set(
+            baseline_mod.unrebuilt_relations(
+                con,
+                pipeline=dest.pipeline_name,
+                dataset=dest.dataset_name,
+                control_schema=control_schema,
+            )
+        )
+        # The signal relation is a stock Debezium control channel, not a source
+        # data relation whose catalog identity belongs in destination history.
+        # It remains in the connector capture list so source signalling works, but
+        # its catalog observation must never create a destination ownership row.
+        if signal_data_collection:
+            catalog_flush_exclude.add(signal_data_collection)
+
         coordinator = LiveDiscoveryCoordinator(
             con=con,
             source=source,
@@ -811,14 +914,7 @@ def run(
             summary_extra=summary_extra,
             resnapshot_enabled=acquisition.resnapshot_enabled(),
             descriptor_provider=descriptor_provider,
-            catalog_flush_exclude=set(
-                baseline_mod.unrebuilt_relations(
-                    con,
-                    pipeline=dest.pipeline_name,
-                    dataset=dest.dataset_name,
-                    control_schema=control_schema,
-                )
-            ),
+            catalog_flush_exclude=catalog_flush_exclude,
         )
         try:
             reported = coordinator.run()

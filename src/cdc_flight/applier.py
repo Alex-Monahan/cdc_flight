@@ -58,12 +58,18 @@ from . import (
     unit_admission,
     unit_apply,
 )
-from .assembler import CompleteUnit, TransactionAssembler
+from .assembler import UNIT_CONTROL, UNIT_SNAPSHOT_CHUNK, CompleteUnit, TransactionAssembler
+from .backfill import (
+    BackfillCoordinator,
+    decode_incremental_notification,
+    decode_incremental_record,
+)
 from .catalog_apply import CatalogCoordinator, CatalogPlan
 from .commit_group import CommitResult, OpenGroup
 from .config import ApplierConfig, resolve_control_schema
 from .destination import AlertSink, Lease, ResumePoint
 from .envelope import (
+    KIND_HEARTBEAT,
     KIND_SNAPSHOT_BOUNDARY,
     PendingRecord,
     decode,
@@ -106,6 +112,7 @@ class Applier:
         config: ApplierConfig,
         lease: Lease,
         runner_id: str,
+        signal_data_collection: str | None = None,
         verifier=None,
         transactional_ddl: bool = True,
         catalog=None,
@@ -120,6 +127,10 @@ class Applier:
         self.namespace = namespace
         self.dataset = dataset
         self.topic_prefix = topic_prefix
+        self.signal_data_collection = signal_data_collection
+        self.ignored_source_tables = (
+            {signal_data_collection} if signal_data_collection else set()
+        )
         self.offset_path = offset_path
         self.resume_point = resume_point
         self.cfg = config
@@ -164,6 +175,7 @@ class Applier:
             on_spill=self._spill_events,
             keep_all_records=config.ack_every_record,
             discard_streaming=config.resnapshot,
+            incremental_enabled=True,
         )
 
         #: The open commit group, as ONE object. Replaced wholesale at COMMIT and at
@@ -173,7 +185,22 @@ class Applier:
         #: NEXT batch, so it outlives the group it belongs to (Codex 7).
         self._pending_verification: tuple | None = None
 
+        self.backfill = BackfillCoordinator(
+            con,
+            pipeline=pipeline,
+            control_schema=self.control_schema,
+            topic_prefix=topic_prefix,
+        )
+
         # ADR §3.5 / D7: the fold and catalog policy live in dedicated modules.
+        def _on_swap(state, snapshot_lsn, commit_id):
+            if snapshot_audit is not None:
+                snapshot_audit(state, snapshot_lsn, commit_id)
+            self.backfill.complete_swap(
+                state, snapshot_lsn=snapshot_lsn, commit_id=commit_id,
+                in_transaction=True,
+            )
+
         self.snapshots = SnapshotCoordinator(
             con,
             dataset=dataset,
@@ -185,8 +212,33 @@ class Applier:
             epoch=resume_point.snapshot_epoch,
             transactional_ddl=transactional_ddl,
             control_schema=self.control_schema,
-            on_swap=snapshot_audit,
+            on_swap=_on_swap,
         )
+        # Reattach active incremental runs before the next callback can route a row.
+        # This path never drops or recreates a shadow; the legacy in-progress
+        # snapshot recovery remains owned by destination/table_lifecycle.
+        for run in self.backfill.active_runs():
+            # A newly requested run already has its deterministic shadow name in
+            # durable state, but it does not own an image yet.  Reattaching that
+            # name before Debezium's STARTED notification lets a completion control
+            # unit swap an empty shadow, after which the real READ rows reopen the
+            # lifecycle and leave it permanently in_progress.  Only a run that has
+            # crossed into loading (or retained recovery work) may reattach a
+            # destination shadow at process start.
+            if (
+                run.effective_mode == "incremental"
+                and run.shadow_table
+                and run.state in {
+                    "loading", "ready_to_swap", "swapping", "retry_wait", "blocked",
+                }
+            ):
+                self.snapshots.reattach(
+                    schema=run.source_schema,
+                    table=run.source_table,
+                    shadow=run.shadow_table,
+                    run_id=run.run_id,
+                    incremental=run.effective_mode == "incremental",
+                )
         self.spill = SpillBuffer(
             con,
             binary_mode=self.binary_handling_mode,
@@ -257,6 +309,7 @@ class Applier:
         self.skipped_count = 0
         self.snapshot_notification_count = 0
         self._pending_snapshot_notifications: list[Any] = []
+        self._pending_backfill_notifications: list[Any] = []
         #: Re-snapshot streaming units are complete source observations but have no
         #: destination side. Keep only their acknowledgeable terminal handles until a
         #: preceding snapshot group is durable; they must never enter ``self.group``.
@@ -385,6 +438,7 @@ class Applier:
             "snapshot_notifications_pending": len(
                 self._pending_snapshot_notifications
             ),
+            "backfill_notifications_pending": len(self._pending_backfill_notifications),
             **self.snapshot_completion.as_dict(),
             # Round 8 MAJOR-1: this is the callback/connection ownership proof. A late
             # callback after the seal is a recorded no-op and can never decode, write,
@@ -493,6 +547,12 @@ class Applier:
         source_records = 0
         data_in_batch = 0
         for raw in records:
+            incremental_notification = decode_incremental_notification(
+                raw, topic_prefix=self.topic_prefix
+            )
+            if incremental_notification is not None:
+                self._handle_incremental_notification(raw, incremental_notification)
+                continue
             notification = decode_notification(raw, topic_prefix=self.topic_prefix)
             if notification is not None and self.assembler.open_transaction_id is not None:
                 raise SnapshotObservationError(
@@ -534,6 +594,38 @@ class Applier:
 
             source_records += 1
             rec = decode(raw, topic_prefix=self.topic_prefix)
+            if rec.qualified_table in self.ignored_source_tables:
+                # The source signal row is a control-plane request.  It still
+                # participates in the source transaction/offset proof as a
+                # counted data event, but GroupPlan ignores the relation before
+                # destination materialisation.  Relabelling it as a heartbeat
+                # here would make the transaction assembler count zero events
+                # against Debezium's END event_count=1.
+                pass
+            if rec.incremental:
+                run = self.backfill.incremental_owner(rec.schema or "", rec.table or "")
+                rec = decode_incremental_record(
+                    raw,
+                    topic_prefix=self.topic_prefix,
+                    signal_id=run.signal_id if run is not None else None,
+                )
+                if run is not None and run.state == "complete":
+                    # The terminal run is retained until source-offset
+                    # reconciliation. A replay in that interval is already
+                    # durable in the published shadow image; acknowledge it as a
+                    # control record rather than ever feeding a stale READ into
+                    # the new live table.
+                    rec.kind = KIND_HEARTBEAT
+                    rec.schema = None
+                    rec.table = None
+                    rec.op = None
+                else:
+                    # A row may be replayed before its STARTED notification's
+                    # commit is observed. Do not create lifecycle/shadow state
+                    # outside the commit protocol; GroupPlan will admit it after
+                    # BEGIN, while a committed STARTED notification has already
+                    # installed the route.
+                    self._ensure_backfill_route(rec.schema, rec.table, run, create=False)
             self.source_marker_records_received += self._source_marker_receipts.observe(rec)
             if rec.lsn is not None:
                 self.highest_source_lsn = max(self.highest_source_lsn, int(rec.lsn))
@@ -573,6 +665,71 @@ class Applier:
             return
         if self.group.close_requested or drained or self._soft_trigger_hit():
             self.commit_group(self._trigger_name(drained))
+
+    def _ensure_backfill_route(
+        self, schema: str | None, table: str | None, run=None, *, create: bool = True
+    ):
+        if not schema or not table:
+            return
+        run = run or self.backfill.active(schema, table)
+        if run is None or run.state not in {
+            "requested", "preparing", "loading", "ready_to_swap", "swapping",
+            "retry_wait", "blocked",
+        }:
+            return
+        if f"{schema}.{table}" not in {state.schema + "." + state.table for state in self.snapshots.states()}:
+            if not create:
+                return
+            self.snapshots.state_for(
+                schema,
+                table,
+                retain_existing=True,
+                incremental=run.effective_mode == "incremental",
+                run_id=run.run_id,
+            )
+
+    def _handle_incremental_notification(self, raw, notification) -> None:
+        # Queue state with the source notification. The commit protocol applies
+        # it after its one BEGIN and before row DML, so notification state,
+        # shadow rows, progress, and the resume point share one transaction.
+        self._pending_backfill_notifications.append(notification)
+        decoded = decode(raw, topic_prefix=self.topic_prefix, want_offsets=True)
+        decoded.kind = KIND_HEARTBEAT
+        decoded.schema = None
+        decoded.table = None
+        decoded.op = None
+        decoded.incremental_rows = notification.rows
+        if notification.observation == "TABLE_SCAN_COMPLETED" and notification.table:
+            schema, table = notification.table.split(".", 1)
+            unit = CompleteUnit(
+                kind=UNIT_SNAPSHOT_CHUNK,
+                records=[decoded],
+                schema=schema,
+                table=table,
+                nbytes=decoded.nbytes,
+                incremental=True,
+                snapshot_last_for_table=(
+                    (notification.status or "").upper()
+                    in {"SUCCEEDED", "EMPTY", "COMPLETED"}
+                ),
+            )
+        else:
+            unit = CompleteUnit(
+                kind=UNIT_CONTROL,
+                records=[decoded],
+                nbytes=decoded.nbytes,
+                last_lsn=decoded.lsn or 0,
+                commit_lsn=decoded.lsn,
+            )
+        self._add_unit(unit)
+
+    def _apply_backfill_notifications(self) -> None:
+        """Apply queued stock state after commit_protocol has opened its transaction."""
+        for notification in self._pending_backfill_notifications:
+            run = self.backfill.observe_notification(notification, in_transaction=True)
+            if notification.table and "." in notification.table:
+                schema, table = notification.table.split(".", 1)
+                self._ensure_backfill_route(schema, table, run)
 
     def _soft_trigger_hit(self) -> bool:
         return (

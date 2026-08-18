@@ -51,6 +51,7 @@ Debezium 3.6 rather than assumed:
 from __future__ import annotations
 
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -111,6 +112,13 @@ class CompleteUnit:
     #: events counted and validated for a discard-only re-snapshot stream unit.
     #: They are intentionally never retained or sent to the destination spill table.
     discarded_events: int = 0
+    #: True for stock incremental snapshot chunks.  These chunks are bounded
+    #: units but are not initial-snapshot terminal evidence.
+    incremental: bool = False
+    #: True for the Debezium signal relation's initial snapshot chunk.  The
+    #: relation must remain captured for control-plane writes, but it is not a
+    #: destination table and must not create a shadow or snapshot swap.
+    ignored: bool = False
 
     @property
     def terminal(self) -> PendingRecord | None:
@@ -168,11 +176,21 @@ class _OpenTxn:
 
 class _OpenChunk:
     __slots__ = (
-        "count", "events", "mem_bytes", "nbytes", "records", "saw_last", "schema",
-        "spill_unit_seq", "spilled", "table", "touched_tables",
+        "count",
+        "events",
+        "incremental",
+        "mem_bytes",
+        "nbytes",
+        "records",
+        "saw_last",
+        "schema",
+        "spill_unit_seq",
+        "spilled",
+        "table",
+        "touched_tables",
     )
 
-    def __init__(self, schema: str | None, table: str | None):
+    def __init__(self, schema: str | None, table: str | None, *, incremental: bool = False):
         self.schema = schema
         self.table = table
         self.events: list[PendingRecord] = []
@@ -186,6 +204,7 @@ class _OpenChunk:
         #: True once Debezium actually said `snapshot=last` for this chunk. Only
         #: then may the chunk claim the whole snapshot ended (Opus M-7).
         self.saw_last = False
+        self.incremental = incremental
 
 
 class TransactionAssembler:
@@ -201,6 +220,7 @@ class TransactionAssembler:
         spill_bytes: int = 64 * 1024 * 1024,
         keep_all_records: bool = False,
         discard_streaming: bool = False,
+        incremental_enabled: bool = False,
     ):
         self.snapshot_chunk_events = snapshot_chunk_events
         self.snapshot_chunk_bytes = snapshot_chunk_bytes
@@ -217,6 +237,9 @@ class TransactionAssembler:
         #: reach a verified END so their source boundary is proven, but their payload
         #: is never retained or handed to the destination spill callback.
         self.discard_streaming = discard_streaming
+        #: Existing callers retain the deliberate refusal until the stock
+        #: incremental coordinator has admitted this path explicitly.
+        self.incremental_enabled = incremental_enabled
         #: callback(unit_events) -> int, invoked while a unit is over the hard
         #: spill threshold. Returns how many events it took off our hands.
         self.on_spill = on_spill
@@ -225,6 +248,12 @@ class TransactionAssembler:
 
         self._txn: _OpenTxn | None = None
         self._chunk: _OpenChunk | None = None
+        #: Stock incremental READ records are not part of a PostgreSQL transaction,
+        #: but Debezium can deliver one between BEGIN and END of an unrelated
+        #: streaming transaction.  Hold it until that transaction is proven whole;
+        #: applying it earlier would either commit a partial PostgreSQL transaction
+        #: or let the READ overtake the CDC event that follows it.
+        self._deferred_snapshots: deque[PendingRecord] = deque()
         #: monotone identity for spilled units within this process
         self._spill_unit_seq = 0
         #: per-table arrival ordinal for the snapshot phase (ADR §6 / Codex 1)
@@ -259,6 +288,7 @@ class TransactionAssembler:
     def buffered_events(self) -> int:
         n = len(self._txn.events) if self._txn else 0
         n += len(self._chunk.events) if self._chunk else 0
+        n += len(self._deferred_snapshots)
         return n
 
     @property
@@ -271,7 +301,16 @@ class TransactionAssembler:
     def feed(self, rec: PendingRecord) -> list[CompleteUnit]:
         kind = rec.kind
         if kind == KIND_SNAPSHOT:
-            return self._feed_snapshot(rec)
+            if self._txn is not None:
+                if rec.snapshot != SNAPSHOT_INCREMENTAL or not self.incremental_enabled:
+                    raise TransactionAssemblyError(
+                        "snapshot record arrived while a streaming transaction is open"
+                    )
+                self._deferred_snapshots.append(rec)
+                return []
+            units = self._feed_snapshot(rec)
+            self.units_emitted += len(units)
+            return units
 
         units: list[CompleteUnit] = []
         # Any non-snapshot record ends the snapshot phase for the table whose chunk
@@ -293,7 +332,16 @@ class TransactionAssembler:
             units.extend(self._feed_control(rec))
         else:
             units.extend(self._feed_control(rec))
+        if self._txn is None and self._deferred_snapshots:
+            units.extend(self._flush_deferred_snapshots())
         self.units_emitted += len(units)
+        return units
+
+    def _flush_deferred_snapshots(self) -> list[CompleteUnit]:
+        """Release queued incremental READs after the enclosing PG transaction."""
+        units: list[CompleteUnit] = []
+        while self._deferred_snapshots and self._txn is None:
+            units.extend(self._feed_snapshot(self._deferred_snapshots.popleft()))
         return units
 
     def feed_snapshot_boundary(self, rec: PendingRecord) -> list[CompleteUnit]:
@@ -566,19 +614,13 @@ class TransactionAssembler:
             raise TransactionAssemblyError(
                 "snapshot record arrived while a streaming transaction is open"
             )
-        if rec.snapshot == SNAPSHOT_INCREMENTAL:
-            # VERIFIED against vendored Debezium 3.6: incremental chunk records are
-            # interleaved with streaming events on the same queue
-            # (`AbstractIncrementalSnapshotChangeEventSource.java:170-178`), never
-            # carry `last`/`last_in_data_collection` (`EventDispatcher.java:693-695`
-            # is empty) and carry no `txId`/`lsn` at all. The shadow-table phase
-            # machinery here cannot host that safely; rubric 3.3 owns it (Opus M-7).
+        if rec.snapshot == SNAPSHOT_INCREMENTAL and not self.incremental_enabled:
+            # Keep the baseline safety boundary for callers that have not admitted a
+            # stock incremental run.  The backfill coordinator opts in explicitly.
             raise TransactionAssemblyError(
                 "record carries source.snapshot='incremental'. Incremental snapshots "
-                "interleave with streaming events and never emit a `last` marker, so "
-                "the snapshot-phase shadow/swap machinery cannot host them; refusing "
-                "rather than swapping a partial shadow over a live table "
-                "(rubric 3.3, ADR 0001 §15/A20)."
+                "are admitted only through the stock incremental backfill route; "
+                "the ordinary initial-snapshot assembler refuses them."
             )
         units: list[CompleteUnit] = []
         if self._chunk is not None and (
@@ -586,7 +628,14 @@ class TransactionAssembler:
         ):
             units.extend(self._close_chunk(last_for_table=True))
         if self._chunk is None:
-            self._chunk = _OpenChunk(rec.schema, rec.table)
+            self._chunk = _OpenChunk(
+                rec.schema, rec.table, incremental=rec.snapshot == SNAPSHOT_INCREMENTAL
+            )
+        elif self._chunk.incremental != (rec.snapshot == SNAPSHOT_INCREMENTAL):
+            units.extend(self._close_chunk(last_for_table=False))
+            self._chunk = _OpenChunk(
+                rec.schema, rec.table, incremental=rec.snapshot == SNAPSHOT_INCREMENTAL
+            )
         if rec.qualified_table:
             self._chunk.touched_tables.add(rec.qualified_table)
         # Assigned HERE, on arrival, so the ordinal is arrival order whether the
@@ -629,7 +678,7 @@ class TransactionAssembler:
             touched_tables=set(chunk.touched_tables),
             last_lsn=max((e.lsn or 0 for e in chunk.events), default=0),
             nbytes=chunk.nbytes,
-            snapshot_last_for_table=last_for_table,
+            snapshot_last_for_table=last_for_table and not chunk.incremental,
             # ONLY when Debezium actually said so. Deriving "the whole snapshot
             # ended" from "a non-snapshot record arrived" swaps EVERY shadow over
             # its live table, which is live-table destruction the moment anything
@@ -638,6 +687,7 @@ class TransactionAssembler:
             spilled=bool(chunk.spilled),
             spilled_events=chunk.spilled,
             spill_unit_seq=chunk.spill_unit_seq,
+            incremental=chunk.incremental,
         )
         return [unit]
 
@@ -736,5 +786,7 @@ class TransactionAssembler:
         if self._chunk is not None:
             discarded += self._chunk.count
             self._chunk = None
+        discarded += len(self._deferred_snapshots)
+        self._deferred_snapshots.clear()
         self.discarded_tail_events += discarded
         return discarded

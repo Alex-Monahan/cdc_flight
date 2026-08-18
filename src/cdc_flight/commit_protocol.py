@@ -52,10 +52,13 @@ def commit_group(self, trigger: str) -> CommitResult:
     # the wrapper inferred from the SQL it happened to see (rubric 1.7).
     fault_group = self.data_commit_groups + 1
     arm_group(fault_group)
+    has_incremental = any(getattr(unit, "incremental", False) for unit in group)
+    has_snapshot_unit = any(unit.kind == "snapshot_chunk" for unit in group)
     if not self.group.txn_open:
         self.con.execute("BEGIN TRANSACTION")
         self.group.txn_open = True
     try:
+        self._apply_backfill_notifications()
         self.lease.renew(self.con)
         new_point = offsets.point_for(
             group,
@@ -76,6 +79,8 @@ def commit_group(self, trigger: str) -> CommitResult:
         fault_enabled = has_data
         if has_data:
             maybe_crash("begin", fault_group)
+        if has_incremental:
+            maybe_crash("incremental_chunk_before_shadow_write", fault_group)
         catalog_stats = {"tables": set()}
         stats = self._apply_units_by_schema_epoch(
             group,
@@ -84,6 +89,16 @@ def commit_group(self, trigger: str) -> CommitResult:
             catalog_plan=catalog_plan,
             catalog_stats=catalog_stats,
         )
+        # Incremental snapshot cursor/state is written only after its shadow rows
+        # have been folded and materialised, and before the single destination
+        # COMMIT.  It therefore cannot outrun MotherDuck durability (Invariant O).
+        if has_incremental:
+            maybe_crash("incremental_chunk_after_shadow_write_before_progress", fault_group)
+        self.backfill.commit_progress(group, in_transaction=True)
+        if has_incremental:
+            maybe_crash("incremental_chunk_after_progress_before_md_commit", fault_group)
+        if has_snapshot_unit:
+            maybe_crash("before_swap_commit", fault_group)
         stats["tables"].update(catalog_stats["tables"])
         if catalog_plan is not None:
             self._apply_catalog_phase(
@@ -153,6 +168,10 @@ def commit_group(self, trigger: str) -> CommitResult:
                 stage[0] = "commit"
                 self.con.execute("COMMIT")
                 self.group.txn_open = False
+                if has_incremental:
+                    maybe_crash("after_md_commit_before_markProcessed", fault_group)
+                if has_snapshot_unit:
+                    maybe_crash("after_swap_commit_before_ack", fault_group)
                 if fault_enabled:
                     maybe_crash("post_commit_pre_ack", fault_group)
 
@@ -180,16 +199,22 @@ def commit_group(self, trigger: str) -> CommitResult:
                         continue
                     self._committer.markProcessed(record.raw)
                     marked += 1
+                if has_incremental:
+                    maybe_crash("after_markProcessed_before_markBatchFinished", fault_group)
                 self._committer.markBatchFinished()
-                if pending:
-                    # Do not discard the handles until markBatchFinished succeeds.
-                    del self._pending_snapshot_notifications[: len(pending)]
-                if pending_discards:
-                    del self._pending_discarded_records[: len(pending_discards)]
             finally:
                 # A mark call can raise; a stuck window would silently drop every
-                # later phase write, so the gate is closed in all cases.
+                # later phase write, so the gate is closed immediately after the
+                # last acknowledgement in all cases.
                 COMMIT_ACK.leave()
+            if has_incremental:
+                maybe_crash("after_ack_before_next_poll", fault_group)
+            self._pending_backfill_notifications.clear()
+            if pending:
+                # Do not discard the handles until markBatchFinished succeeds.
+                del self._pending_snapshot_notifications[: len(pending)]
+            if pending_discards:
+                del self._pending_discarded_records[: len(pending_discards)]
     except AdmissionError as error:
         refused = as_schema_refusal(error, refusal_origin="typed_planner")
         self._contextualize_schema_refusal(refused)

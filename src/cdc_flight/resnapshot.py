@@ -360,6 +360,33 @@ def sweep_stale_slot(dsn: str, base_slot_name: str) -> str:
     return action
 
 
+def build_resnapshot_properties(
+    source: SourceConfig,
+    replication: ReplicationConfig,
+    *,
+    tables: list[tuple[str, str, str]],
+    truncate_mode: str,
+) -> dict[str, str]:
+    """Build the throwaway connector properties for one exact source image.
+
+    The shared connector property already pins every source acquisition to one reader.
+    This builder remains the owner of the throwaway connector's table scope and name;
+    it does not maintain a second snapshot-threading rule.
+    """
+    include = sorted({f"{schema}.{table}" for schema, table, _ in tables})
+    props = build_properties(
+        source,
+        replication,
+        snapshot_mode="initial",
+        truncate_mode=truncate_mode,
+    )
+    props["name"] = f"{props['name']}-resnapshot"
+    props["table.include.list"] = ",".join(include)
+    # Debezium only snapshots what it captures, and capturing more would stream more.
+    props["snapshot.include.collection.list"] = ",".join(include)
+    return props
+
+
 def run(
     con,
     *,
@@ -380,6 +407,7 @@ def run(
     new_relations: set[str] | None = None,
     drop_mode: str = DROP_LOG,
     control_schema: str | None = None,
+    on_swap=None,
 ) -> ResnapshotOutcome:
     """Re-snapshot `tables` into shadow tables and swap them in, then return.
 
@@ -393,7 +421,6 @@ def run(
     if not tables:
         return outcome
 
-    include = sorted({f"{schema}.{table}" for schema, table, _ in tables})
     slot = slot_name_for(replication.slot_name)
     state_dir = replication.state_dir / "resnapshot"
     recovery = InterruptionRecovery.prepare(
@@ -406,16 +433,13 @@ def run(
     resnap_replication = dataclasses.replace(
         replication, slot_name=slot, state_dir=state_dir
     )
-    props = build_properties(
+    props = build_resnapshot_properties(
         source,
         resnap_replication,
-        snapshot_mode="initial",
+        tables=tables,
         truncate_mode=settings["truncate_mode"],
     )
-    props["name"] = f"{props['name']}-resnapshot"
-    props["table.include.list"] = ",".join(include)
-    # Debezium only snapshots what it captures, and capturing more would stream more.
-    props["snapshot.include.collection.list"] = ",".join(include)
+    include = props["table.include.list"].split(",")
 
     resnap_settings = dict(settings)
     cfg = ApplierConfig(
@@ -450,6 +474,8 @@ def run(
             snapshot_epoch=epoch_base + len(tables) + 1,
             control_schema=control_schema,
         )
+        if on_swap is not None:
+            on_swap(state, snapshot_lsn, commit_id)
     descriptor_connection = None
     descriptor_provider = None
     try:
@@ -471,6 +497,7 @@ def run(
             namespace=f"{namespace}::resnapshot",
             dataset=dataset,
             topic_prefix=replication.topic_prefix,
+            signal_data_collection=props.get("signal.data.collection"),
             offset_path=resnap_replication.offset_file,
             resume_point=ResumePoint(snapshot_epoch=epoch_base),
             config=cfg,

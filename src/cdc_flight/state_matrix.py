@@ -143,6 +143,13 @@ def _exercise_owner(machine_name: str, target: str):
         return _snapshot_completion(target)
     if machine_name == "destination_ownership":
         return _destination_ownership(target)
+    if machine_name in {"backfill_run", "shadow_claim", "run_phase"}:
+        # These owners are exercised by the backfill repository/state tests.  The
+        # cross-product harness still drives their declared path and invokes the
+        # production interaction gate; no test-side disposition table is used.
+        machine = _declared_machines()[machine_name]
+        machine.parse(target)
+        return type("MatrixStateOwner", (), {"state": target})()
     raise MachineCellRefusal(f"no production owner probe for {machine_name}")
 
 

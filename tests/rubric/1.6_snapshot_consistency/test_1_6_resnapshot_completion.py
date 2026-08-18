@@ -32,11 +32,25 @@ from support.applier_lab import DATASET, Lab, snap
 from cdc_flight import destination as dest_mod
 from cdc_flight import resnapshot as resnapshot_mod
 from cdc_flight.assembler import UNIT_SNAPSHOT_CHUNK
-from cdc_flight.config import DROP_LOG, DROP_REPLICATE
+from cdc_flight.config import DROP_LOG, DROP_REPLICATE, ReplicationConfig, SourceConfig
 from cdc_flight.errors import EngineFailure
 from cdc_flight.snapshot_completion import SnapshotCompletion
 
 PIPELINE = "test_resnap_completion"
+
+
+def test_blocking_resnapshot_reuses_the_serial_source_acquisition_contract(
+    tmp_path, monkeypatch
+):
+    """The throwaway connector inherits the one-reader production contract."""
+    monkeypatch.setenv("CDC_SNAPSHOT_MAX_THREADS", "4")
+    props = resnapshot_mod.build_resnapshot_properties(
+        SourceConfig(),
+        ReplicationConfig(state_dir=tmp_path, slot_name="resnapshot-regression"),
+        tables=[("app", "sensor_readings", "cdcflight_app_sensor_readings")],
+        truncate_mode="replicate",
+    )
+    assert props["snapshot.max.threads"] == "1"
 
 
 # --------------------------------------------------------------------------- #

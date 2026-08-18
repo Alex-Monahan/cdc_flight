@@ -157,6 +157,22 @@ SKIP_TRUNCATE = "t"
 #: is pinned.
 MONEY_LOCALE_NEUTRAL_OPTIONS = "-c lc_monetary=C"
 
+# One source snapshot reader is a correctness pin, not a tuning default. With more
+# than one reader, a keyless row written while the initial snapshot is being acquired
+# can appear in both the parallel snapshot image and the live stream; the destination
+# has no primary-key identity with which to reconcile those two copies. Reviewer A
+# measured only a 2.16% end-to-end difference for 250,000 rows (97.844 s at one reader
+# versus 95.731 s at four) while this production path still has one destination writer.
+# Revisit this only when genuinely parallel destination writers and keyless
+# reconciliation exist; until then, the correctness-preserving value is deliberately 1.
+PRODUCTION_SNAPSHOT_MAX_THREADS = "1"
+
+# Debezium's AsyncEngineConfig declares this field internal, so its effective
+# property name is ``internal.task.management.timeout.ms``. Three two-worker
+# contended one-reader acquisitions measured 60.688 s, 61.604 s, and 61.206 s;
+# 74 s is the measured 61.604 s p99/max plus 20% headroom.
+SOURCE_TASK_MANAGEMENT_TIMEOUT_MS = "74000"
+
 
 def build_properties(
     source: SourceConfig,
@@ -189,6 +205,7 @@ def build_properties(
         "snapshot.mode": snapshot,
         "slot.name": replication.slot_name,
         "plugin.name": "pgoutput",
+        "snapshot.max.threads": PRODUCTION_SNAPSHOT_MAX_THREADS,
     }
     protected_reasons = {
         **INVARIANT_O_REASONS,
@@ -202,6 +219,11 @@ def build_properties(
         ),
         "slot.name": "the configured logical slot is the source of the resume proof",
         "plugin.name": "the source contract is pinned to stock PostgreSQL pgoutput",
+        "snapshot.max.threads": (
+            "parallel source snapshot readers can publish a keyless row twice across "
+            "the snapshot/live boundary; the destination has one writer and no "
+            "primary-key identity with which to reconcile it"
+        ),
     }
     for key, value in (overrides or {}).items():
         pinned = protected.get(key)
@@ -239,6 +261,22 @@ def build_properties(
         "publication.autocreate.mode": "disabled",
         "topic.prefix": replication.topic_prefix,
         "snapshot.mode": snapshot,
+        # Stock Debezium incremental snapshots are requested through this
+        # source-side signal table.  The signal row is a control request, not a
+        # destination data table; its topic is consumed by the incremental
+        # notification adapter and ignored by the ordinary row applier.
+        "signal.data.collection": replication.signal_data_collection or (
+            f"{source.schema}.cdc_flight_signal"
+        ),
+        "signal.enabled.channels": "source",
+        "incremental.snapshot.chunk.size": os.environ.get(
+            "CDC_INCREMENTAL_SNAPSHOT_CHUNK_SIZE", "1000"
+        ),
+        "incremental.snapshot.watermarking.strategy": "insert_insert",
+        # The source connector uses one reader for every acquisition path. This is
+        # deliberately pinned above: the destination has one writer, and parallel
+        # source readers make keyless snapshot/live overlap physically ambiguous.
+        "snapshot.max.threads": PRODUCTION_SNAPSHOT_MAX_THREADS,
         # --- offsets ----------------------------------------------------------
         # File-backed offsets: the simplest Kafka-less store. This is a known
         # baseline weakness (offsets live outside the destination transaction,
@@ -265,12 +303,12 @@ def build_properties(
         "lsn.flush.mode": LSN_FLUSH_MODE_SAFE,
         # ADR 0001 §4.10 / Opus m10: Debezium uses this bound for both source-task
         # start and stop (`AsyncEngineConfig.startSourceTasks`,
-        # `AsyncEngineConfig.java:76-80`). Thirty seconds is too short for a
-        # stock JVM/pgoutput task to start when the six-worker slow lane is under
-        # load; 120 seconds remains finite and leaves the supervisor's own
-        # close/source-dark bounds responsible for declaring a wedged run.
+        # `AsyncEngineConfig.java:76-80`). AsyncEngineConfig marks the field
+        # internal; the canonical key below is therefore what the engine reads.
+        # The value is measured from the contended one-reader acquisitions above,
+        # not selected as an unbounded retry or hang allowance.
         "offset.flush.timeout.ms": "5000",
-        "task.management.timeout.ms": "120000",
+        "internal.task.management.timeout.ms": SOURCE_TASK_MANAGEMENT_TIMEOUT_MS,
         # --- batching / latency ----------------------------------------------
         "max.batch.size": str(max_batch_size),
         "max.queue.size": str(max_batch_size * 4),
@@ -351,7 +389,11 @@ def build_properties(
     # retains the old bounded-capture behaviour for deployments that want it.
     if not source.auto_discovery:
         props["schema.include.list"] = source.schema
-        props["table.include.list"] = ",".join(source.tables)
+        captured = list(source.tables)
+        signal_collection = props["signal.data.collection"]
+        if signal_collection not in captured:
+            captured.append(signal_collection)
+        props["table.include.list"] = ",".join(captured)
     # Overrides are an actual configuration seam, not merely a validation probe.
     # Apply them after the invariant-owned defaults so a non-pinned operator
     # property reaches Debezium, while the pinned keys remain immutable.

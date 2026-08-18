@@ -141,6 +141,16 @@ class PendingRecord:
     typed_key: TypedImage | None = None
     typed_before: TypedImage | None = None
     typed_after: TypedImage | None = None
+    #: Stock incremental READ metadata.  These fields are deliberately separate
+    #: from snapshot_ordinal: an arrival ordinal is not a resumable cursor.
+    incremental: bool = False
+    incremental_signal_id: str | None = None
+    snapshot_identity: str | None = None
+    incremental_chunk_id: str | None = None
+    #: Stock's TABLE_SCAN_COMPLETED notification may overtake READ records on the
+    #: embedded-engine callback stream.  Preserve its declared row total so the
+    #: destination can defer the atomic swap until the shadow has received them.
+    incremental_rows: int | None = None
 
     @property
     def is_data(self) -> bool:
@@ -402,6 +412,7 @@ def decode(raw: Any, *, topic_prefix: str, want_offsets: bool = False) -> Pendin
         # assembler would try to close a transaction that has no END.
         rec.txn_id = None
         rec.total_order = None
+        rec.incremental = rec.snapshot == SNAPSHOT_INCREMENTAL
     else:
         rec.kind = KIND_DATA
     return rec

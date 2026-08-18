@@ -507,6 +507,33 @@ class SourceHealth:
             return sample.lag_bytes
         return max(0, int(received_high_water) - int(sample.confirmed_pos))
 
+    def fall_behind_reason(
+        self,
+        *,
+        current_wal_lsn: int | None,
+        oldest_pending_source_ts_ms: int | None,
+        now_ms: int,
+        size_threshold_bytes: int | None,
+        time_threshold_ms: int | None,
+    ) -> str | None:
+        """Use this fold's slot observation plus admitted-unit age for refresh.
+
+        The scheduler does not open another slot sampler.  An absent oldest pending
+        timestamp remains unknown/false; the timestamp of the last applied event is
+        never substituted as queue age.
+        """
+        from .backfill import fall_behind_reason
+
+        sample = self.last
+        return fall_behind_reason(
+            current_wal_lsn=current_wal_lsn,
+            confirmed_flush_lsn=(sample.confirmed_pos if sample else None),
+            oldest_pending_source_ts_ms=oldest_pending_source_ts_ms,
+            now_ms=now_ms,
+            size_threshold_bytes=size_threshold_bytes,
+            time_threshold_ms=time_threshold_ms,
+        )
+
     def may_declare_idle(
         self, *, min_seconds: float, received_high_water: int | None = None
     ) -> bool:

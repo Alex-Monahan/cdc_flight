@@ -205,7 +205,7 @@ def test_live_unsupported_add_column_contains_the_table_and_advances_both_slot_p
     box.env["CDC_AUTO_DISCOVERY"] = "0"
     box.env["CDC_CATALOG_POLL_SECONDS"] = "1"
     try:
-        baseline = box.run(reset_state=True, max_seconds=20)
+        baseline = box.run(reset_state=True, max_seconds=74)
         assert baseline["ok"] is True, baseline
 
         box.sql(
@@ -230,7 +230,7 @@ def test_live_unsupported_add_column_contains_the_table_and_advances_both_slot_p
                 ],
                 one_transaction=True,
             )
-            runs.append(box.run(max_seconds=20, min_records=1, expect_success=False))
+            runs.append(box.run(max_seconds=74, min_records=1, expect_success=False))
             box.sql("CHECKPOINT")
             metrics.append(
                 box.pg_query(

@@ -577,6 +577,7 @@ class Sandbox:
         max_seconds: float = 300,
         idle_seconds: float = 10,
         destination: str = "duckdb",
+        snapshot_mode: str | None = None,
         extra_env: dict[str, str] | None = None,
         capture: bool = False,
         matrix_arm: bool = False,
@@ -589,16 +590,19 @@ class Sandbox:
             if matrix_arm
             else [_executable("cdc-flight")]
         )
+        command = [
+            *executable,
+            "--destination",
+            destination,
+            "--max-seconds",
+            str(max_seconds),
+            "--idle-seconds",
+            str(idle_seconds),
+        ]
+        if snapshot_mode:
+            command += ["--snapshot-mode", snapshot_mode]
         return subprocess.Popen(
-            [
-                *executable,
-                "--destination",
-                destination,
-                "--max-seconds",
-                str(max_seconds),
-                "--idle-seconds",
-                str(idle_seconds),
-            ],
+            command,
             env=env,
             cwd=PROJECT_DIR,
             stdout=sink,

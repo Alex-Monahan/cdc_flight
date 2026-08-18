@@ -319,6 +319,30 @@ def test_an_incremental_snapshot_record_is_refused_until_rubric_3_3_owns_it():
         a.feed(snapshot("customers", marker="incremental"))
 
 
+def test_incremental_read_waits_for_an_open_streaming_transaction_to_close():
+    """Stock READs may arrive between BEGIN and END, but never split a PG txn."""
+    a = TransactionAssembler(incremental_enabled=True)
+    assert a.feed(begin("7")) == []
+    assert a.feed(data("7", 1, 101)) == []
+    assert a.feed(snapshot("customers", marker="incremental")) == []
+
+    txn_units = a.feed(end("7", 1, lsn=103, per_table={"app.customers": 1}))
+    assert [unit.kind for unit in txn_units] == [UNIT_TXN]
+    assert txn_units[0].txn_id == "7"
+
+    # The queued READ is released only after the whole transaction, and remains a
+    # bounded chunk until a later non-snapshot boundary closes that chunk.
+    released = a.feed(
+        PendingRecord(
+            raw=object(), kind=KIND_HEARTBEAT, topic="__debezium-heartbeat.p",
+            nbytes=1, lsn=104,
+        )
+    )
+    assert [unit.kind for unit in released] == [UNIT_SNAPSHOT_CHUNK, UNIT_CONTROL]
+    assert released[0].incremental is True
+    assert released[0].events[0].snapshot == "incremental"
+
+
 # --------------------------------------------------------------------------- #
 # spill (ADR §3.4)
 # --------------------------------------------------------------------------- #

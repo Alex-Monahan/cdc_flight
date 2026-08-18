@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -11,7 +12,6 @@ if str(TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(TESTS_DIR))
 
 from cdc_flight import faults
-from cdc_flight.pipeline import main
 from support.crash_matrix_runtime import install_matrix_crash_handler
 
 install_matrix_crash_handler()
@@ -24,4 +24,13 @@ except faults.FaultSpecError as exc:
     raise SystemExit(2) from exc
 
 if __name__ == "__main__":
+    if os.environ.get("CDC_BACKFILL_LAB_CHILD") == "1":
+        # The resumability proof reuses this source-tree child and its registered
+        # hard-exit handler.  The branch is intentionally unavailable from the
+        # installed production package because the handler lives under tests/.
+        from cdc_flight.backfill import run_lab_child
+
+        raise SystemExit(run_lab_child())
+    from cdc_flight.pipeline import main
+
     raise SystemExit(main())

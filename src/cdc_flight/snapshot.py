@@ -42,6 +42,13 @@ class SnapshotTable:
     target: str
     #: `<target>__cdcf_tmp`
     shadow: str
+    #: Stock incremental rows are bounded units but not initial-snapshot evidence.
+    incremental: bool = False
+    run_id: str | None = None
+    incremental_rows_seen: int = 0
+    incremental_terminal: bool = False
+    incremental_terminal_rows: int | None = None
+    incremental_swap_scheduled: bool = False
 
 
 class SnapshotCoordinator:
@@ -121,7 +128,15 @@ class SnapshotCoordinator:
             return state.shadow
         return naming.destination_table(self.topic_prefix, schema, table)
 
-    def state_for(self, schema: str | None, table: str | None) -> SnapshotTable | None:
+    def state_for(
+        self,
+        schema: str | None,
+        table: str | None,
+        *,
+        retain_existing: bool = False,
+        incremental: bool = False,
+        run_id: str | None = None,
+    ) -> SnapshotTable | None:
         """Enter (or continue) the snapshot phase for one table. Idempotent.
 
         Establishes the epoch, the shadow table and the `table_state` row. Every
@@ -141,7 +156,12 @@ class SnapshotCoordinator:
             log.info("snapshot session started, epoch=%s", self.epoch)
         target = naming.destination_table(self.topic_prefix, schema, table)
         state = SnapshotTable(
-            schema=schema, table=table, target=target, shadow=naming.shadow_table(target)
+            schema=schema,
+            table=table,
+            target=target,
+            shadow=naming.shadow_table(target),
+            incremental=incremental,
+            run_id=run_id,
         )
         # THE EDGE IS CHECKED BEFORE THE FIRST SIDE EFFECT (Codex r1 MINOR-3). The
         # three statements below drop the shadow, forget it in the registry and add it
@@ -150,7 +170,7 @@ class SnapshotCoordinator:
         # it means a durable half-snapshot from a previous process was never promoted to
         # owed work. Refusing after mutating left the coordinator's view of the shadow
         # and the transaction disagreeing with the destination.
-        table_lifecycle.check_transition(
+        current_lifecycle = table_lifecycle.check_transition(
             self.con,
             pipeline=self.pipeline,
             source_schema=schema,
@@ -160,35 +180,114 @@ class SnapshotCoordinator:
             control_schema=self.control_schema,
             alerts=self.alerts,
         )
-        # A crash mid-snapshot means Debezium re-snapshots from the beginning
-        # (`InitialSnapshotter.shouldSnapshotData` returns true while the offset
-        # says a snapshot was in progress). Dropping the shadow here is what makes
-        # that idempotent - not event identity (ADR §3.5).
-        self.con.execute(
-            f"DROP TABLE IF EXISTS {quote(self.dataset)}.{quote(state.shadow)}"
-        )
-        self.registry.forget(state.shadow)
-        self.created_in_txn.add(state.shadow)
+        if retain_existing and current_lifecycle == table_lifecycle.IN_PROGRESS:
+            # A durable BACKFILL_RUN owns this shadow after a crash. Reattaching
+            # must preserve both its rows and its stable cursor.
+            self.registry.forget(state.shadow)
+        else:
+            # Legacy initial/full snapshots retain their measured drop-and-rebuild
+            # behaviour. A new incremental run also starts with an empty shadow.
+            self.con.execute(
+                f"DROP TABLE IF EXISTS {quote(self.dataset)}.{quote(state.shadow)}"
+            )
+            self.registry.forget(state.shadow)
+            self.created_in_txn.add(state.shadow)
         # rubric 1.9: `-> in_progress` goes through `TableLifecycle`, which is the ONE
         # writer of this column. `in_progress -> in_progress` is deliberately NOT a
         # declared edge: reaching it means a durable half-snapshot from a previous
         # process was never promoted to owed work, and silently starting a second
         # snapshot over it is how that residue stayed invisible.
-        table_lifecycle.transition(
-            self.con,
-            pipeline=self.pipeline,
-            source_schema=schema,
-            source_table=table,
-            to=table_lifecycle.IN_PROGRESS,
-            reason=f"a snapshot shadow was opened for {key} (epoch {self.epoch})",
-            target_table=target,
-            epoch=self.epoch,
-            replace=True,
-            control_schema=self.control_schema,
-            alerts=self.alerts,
-        )
+        if current_lifecycle != table_lifecycle.IN_PROGRESS:
+            table_lifecycle.transition(
+                self.con,
+                pipeline=self.pipeline,
+                source_schema=schema,
+                source_table=table,
+                to=table_lifecycle.IN_PROGRESS,
+                reason=f"a snapshot shadow was opened for {key} (epoch {self.epoch})",
+                target_table=target,
+                epoch=self.epoch,
+                replace=True,
+                control_schema=self.control_schema,
+                alerts=self.alerts,
+            )
+        elif retain_existing:
+            self.created_in_txn.discard(state.shadow)
+        if incremental and retain_existing:
+            # A stock empty incremental scan has no READ from which the normal
+            # table materialiser could create the shadow.  Clone the already-live
+            # destination schema with a false predicate so an empty scan still
+            # publishes an actual empty image atomically.  The source type oracle
+            # remains the destination's existing schema; no type text is invented.
+            live_exists = self.con.execute(
+                "SELECT count(*) FROM information_schema.tables "
+                "WHERE table_schema = ? AND table_name = ?",
+                [self.dataset, state.target],
+            ).fetchone()[0]
+            if live_exists:
+                self.con.execute(
+                    f"CREATE TABLE IF NOT EXISTS {quote(self.dataset)}.{quote(state.shadow)} "
+                    f"AS SELECT * FROM {quote(self.dataset)}.{quote(state.target)} WHERE FALSE"
+                )
         self._tables[key] = state
         return state
+
+    def reattach(
+        self,
+        *,
+        schema: str,
+        table: str,
+        shadow: str,
+        run_id: str | None = None,
+        incremental: bool = True,
+    ) -> SnapshotTable:
+        """Rehydrate an active durable run without touching live or shadow data."""
+        state = SnapshotTable(
+            schema=schema,
+            table=table,
+            target=naming.destination_table(self.topic_prefix, schema, table),
+            shadow=shadow,
+            incremental=incremental,
+            run_id=run_id,
+        )
+        self._tables[f"{schema}.{table}"] = state
+        self._session = True
+        self.registry.forget(shadow)
+        return state
+
+    def note_incremental_rows(self, state: SnapshotTable, count: int) -> None:
+        """Record READs that arrived before or after stock's terminal notice."""
+        if state.incremental:
+            state.incremental_rows_seen += max(0, int(count))
+
+    def note_incremental_terminal(
+        self, state: SnapshotTable, *, rows: int | None
+    ) -> None:
+        """Remember a terminal notice without swapping an as-yet-empty shadow."""
+        if not state.incremental:
+            return
+        state.incremental_terminal = True
+        state.incremental_terminal_rows = rows
+
+    def incremental_swap_ready(self, state: SnapshotTable) -> bool:
+        """Whether a terminal notice and its declared READ set are both present."""
+        if not state.incremental or not state.incremental_terminal:
+            return False
+        if state.incremental_terminal_rows == 0:
+            return True
+        if state.incremental_rows_seen <= 0:
+            return False
+        return (
+            state.incremental_terminal_rows is None
+            or state.incremental_rows_seen >= state.incremental_terminal_rows
+        )
+
+    def schedule_incremental_swap(self, state: SnapshotTable) -> bool:
+        """Schedule one swap for a ready incremental table."""
+        if not self.incremental_swap_ready(state) or state.incremental_swap_scheduled:
+            return False
+        state.incremental_swap_scheduled = True
+        return True
 
     # -- identity ----------------------------------------------------------- #
     def event_id(self, event: PendingRecord) -> str:
@@ -204,6 +303,13 @@ class SnapshotCoordinator:
         disjoint from a previous run's ordinals; the `snap:` prefix keeps it
         disjoint from streaming identity.
         """
+        if event.incremental:
+            if not event.snapshot_identity:
+                raise ResumePointDrift(
+                    f"incremental record for {event.qualified_table} has no stable "
+                    "primary-key identity"
+                )
+            return event.snapshot_identity
         if event.snapshot_ordinal is None:  # pragma: no cover - assembler guarantees it
             raise ResumePointDrift(
                 f"snapshot record for {event.schema}.{event.table} has no arrival "
@@ -245,6 +351,7 @@ class SnapshotCoordinator:
         swapped = False
         if exists:
             if self.transactional_ddl:
+                maybe_crash("before_DROP_live", self.swaps + 1)
                 self.con.execute(f"DROP TABLE IF EXISTS {live}")
                 # rubric 1.7: the most dangerous instant of a backfill is between
                 # the DROP and the RENAME - the live table is gone and the shadow is
@@ -256,9 +363,11 @@ class SnapshotCoordinator:
                 # fault anchor whose index is a function of the workload is one that
                 # silently stops firing (Opus M7).
                 maybe_crash("swap", self.swaps + 1)
+                maybe_crash("between_DROP_live_and_RENAME_shadow", self.swaps + 1)
                 self.con.execute(
                     f"ALTER TABLE {shadow} RENAME TO {quote(state.target)}"
                 )
+                maybe_crash("after_RENAME_before_state_update", self.swaps + 1)
             else:
                 self.con.execute(
                     f"CREATE OR REPLACE TABLE {live} AS SELECT * FROM {shadow}"

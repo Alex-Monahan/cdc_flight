@@ -89,6 +89,83 @@ CONTROL_DDL = [
             last_commit_id  BIGINT,
             PRIMARY KEY (pipeline, source_schema, source_table)
         )""",
+    # One durable request per table.  This is the source of truth for resumable
+    # stock incremental/full work; it is not an offset store.
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.backfill_runs (
+            pipeline              VARCHAR NOT NULL,
+            run_id                VARCHAR NOT NULL,
+            request_id            VARCHAR NOT NULL,
+            source_schema         VARCHAR NOT NULL,
+            source_table          VARCHAR NOT NULL,
+            target_table          VARCHAR NOT NULL,
+            requested_mode        VARCHAR NOT NULL,
+            effective_mode        VARCHAR NOT NULL,
+            trigger_reason        VARCHAR NOT NULL,
+            state                 VARCHAR NOT NULL,
+            signal_id             VARCHAR,
+            notification_status   VARCHAR NOT NULL,
+            catalog_epoch         BIGINT NOT NULL DEFAULT 0,
+            shadow_table          VARCHAR,
+            last_processed_key_json VARCHAR,
+            maximum_key_json      VARCHAR,
+            chunk_count           BIGINT NOT NULL DEFAULT 0,
+            row_count             BIGINT NOT NULL DEFAULT 0,
+            last_source_lsn       BIGINT,
+            terminal_source_point VARCHAR,
+            ack_reconciled_at     TIMESTAMPTZ,
+            retry_at              TIMESTAMPTZ,
+            error_code            VARCHAR,
+            error_detail          VARCHAR,
+            created_at            TIMESTAMPTZ NOT NULL,
+            updated_at            TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (pipeline, run_id)
+        )""",
+    # A second stock signal is not safe to correlate while the first signal is
+    # active.  Keep the request, including its arbitrary table set, durably so a
+    # scheduler restart coalesces it into the next single stock signal instead of
+    # refusing it or silently dropping it.
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.backfill_signal_queue (
+            pipeline          VARCHAR NOT NULL,
+            request_id        VARCHAR NOT NULL,
+            signal_id         VARCHAR NOT NULL,
+            tables_json       VARCHAR NOT NULL,
+            trigger_reason    VARCHAR NOT NULL,
+            state             VARCHAR NOT NULL,
+            dispatch_signal_id VARCHAR,
+            created_at        TIMESTAMPTZ NOT NULL,
+            updated_at        TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (pipeline, request_id)
+        )""",
+    # Exactly one replacement owner may mutate a table's shared shadow.
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.shadow_claims (
+            pipeline        VARCHAR NOT NULL,
+            source_schema   VARCHAR NOT NULL,
+            source_table    VARCHAR NOT NULL,
+            claim_state     VARCHAR NOT NULL,
+            owner_kind      VARCHAR NOT NULL,
+            owner_id        VARCHAR NOT NULL,
+            lease_id        VARCHAR,
+            acquired_at     TIMESTAMPTZ,
+            renewed_at      TIMESTAMPTZ,
+            released_at     TIMESTAMPTZ,
+            updated_at      TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (pipeline, source_schema, source_table)
+        )""",
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.refresh_policy (
+            pipeline            VARCHAR NOT NULL,
+            source_schema       VARCHAR NOT NULL,
+            source_table        VARCHAR NOT NULL,
+            mode                VARCHAR NOT NULL DEFAULT 'cdc',
+            enabled             BOOLEAN NOT NULL DEFAULT true,
+            interval_seconds    DOUBLE,
+            next_due_at         TIMESTAMPTZ,
+            size_threshold_bytes BIGINT,
+            time_threshold_ms   BIGINT,
+            retry_initial_seconds DOUBLE NOT NULL DEFAULT 1,
+            retry_max_seconds   DOUBLE NOT NULL DEFAULT 300,
+            updated_at          TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (pipeline, source_schema, source_table)
+        )""",
     f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.spill_events (
             commit_id      BIGINT   NOT NULL,
             unit_seq       BIGINT   NOT NULL,

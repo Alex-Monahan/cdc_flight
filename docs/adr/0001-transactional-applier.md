@@ -2992,6 +2992,44 @@ predates this table reads `absent` and may already hold rows it has no identity 
 it reconciles like any other unconfirmed baseline rather than being trusted for having
 made no claim — see A63.4.
 
+**`backfill_run`** — Which one-table backfill acquisition and atomic publication is active,
+retryable, blocked, or complete?
+
+persistence: `_cdc_flight.backfill_runs.state` · initial: `requested` · terminal: `complete`
+
+| from | to | terminal |
+|---|---|---|
+| `blocked` | `preparing` | no |
+| `blocked` | `retry_wait` | no |
+| `complete` | `requested` | no |
+| `loading` | `blocked` | no |
+| `loading` | `loading` | no |
+| `loading` | `ready_to_swap` | no |
+| `loading` | `retry_wait` | no |
+| `preparing` | `blocked` | no |
+| `preparing` | `loading` | no |
+| `preparing` | `retry_wait` | no |
+| `ready_to_swap` | `retry_wait` | no |
+| `ready_to_swap` | `swapping` | no |
+| `requested` | `preparing` | no |
+| `retry_wait` | `loading` | no |
+| `retry_wait` | `preparing` | no |
+| `swapping` | `complete` | yes |
+| `swapping` | `retry_wait` | no |
+
+**`shadow_claim`** — Which replacement owner may mutate a table's shared shadow?
+
+persistence: `_cdc_flight.shadow_claims.claim_state` · initial: `free` · terminal: `free`
+
+| from | to | terminal |
+|---|---|---|
+| `backfill` | `free` | yes |
+| `free` | `backfill` | no |
+| `free` | `schema_rebuild` | no |
+| `free` | `typed_change` | no |
+| `schema_rebuild` | `free` | yes |
+| `typed_change` | `free` | yes |
+
 **`snapshot_completion`** — Has Debezium's ordered callback queue delivered every
 per-table snapshot terminal and then the global completion callback?
 
@@ -3140,13 +3178,15 @@ persistence: `.cdc_instances/{instance}` plus its parent completion record · in
 | 62 | runtime_root_lifecycle: active -> quarantining | persistent `prepare` or `run` observes a root already committed to destructive cleanup, including a partial sweep | the exhaustive parent/root marker classifier returns `quarantining`, `completion_recorded`, or `deleted_recorded` | persistent commands refuse with `clean` recovery guidance; only `clean` advances destructive states to `absent` | hard cuts after quarantine, after terminal-marker removal, after root removal, and before private publication; no child runs and the next clean/private reconciliation is deterministic | AUTO (rev 22) |
 
 | 62b | keyless_event: unseen -> applied | a keyless FULL-identity INSERT/UPDATE/DELETE physical operation commits, including its replay ledger entry | complete before-image matching for DELETE/UPDATE and one destination transaction for row plus ledger | replay sees `applied` and performs no second mutation; an incomplete image is refused | no loss, resurrection, or second delete | AUTO |
+| 63 | backfill_run: requested -> preparing | a durable per-table backfill is admitted before stock acquisition | `BackfillCoordinator` and the BACKFILL_RUN transition gate | the request remains durable and retryable; no source offset is advanced by admission | the request row is either committed or rolled back before signalling | AUTO |
+| 64 | shadow_claim: free -> backfill | a backfill attempts to acquire the table's shared replacement shadow | `ShadowClaimRepository` refuses a competing owner | retry after the incumbent releases the claim; the live table is untouched | the claim and run admission are transactional destination state | AUTO |
 
-**The counts, parsed from the rows above rather than recalled.** 68 rows, one
+**The counts, parsed from the rows above rather than recalled.** 70 rows, one
 failure and one terminal class each.
 
 | class | count | rows |
 |---|---:|---|
-| `AUTO` | **44** | 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 24b, 32, 35, 36, 40, 43, 44, 45, 46, 47, 53, 54, 55, 56, 57, 58, 60, 61, 62, 62b |
+| `AUTO` | **46** | 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 24b, 32, 35, 36, 40, 43, 44, 45, 46, 47, 53, 54, 55, 56, 57, 58, 60, 61, 62, 62b, 63, 64 |
 | `MANUAL` | **15** | 17b, 25, 26, 27, 28, 29, 33, 38, 41, 42, 44b, 49, 51, 51a, 52 |
 | `UNDEFINED` | **9** | 30, 31, 32b, 35b, 37, 39, 48, 50, 59 |
 
@@ -3447,7 +3487,7 @@ machine is ceremony — worse than ceremony, because it advertises recoverable i
 states that do not exist. If yes, the state needs a name, a persisted value and a
 transition table.
 
-#### What was built (fifteen focused machines + one precedence)
+#### What was built (seventeen focused machines + one precedence)
 
 | machine | owns | states | edges | persistence |
 |---|---|---|---|---|
@@ -3463,6 +3503,8 @@ transition table.
 | `schema_refusal` | has a refused schema transition acquired a durable remediation obligation | 4 | 9 | `_cdc_flight.schema_refusals.state` |
 | `keyless_event` | has one keyless event's physical operation committed, making replay a no-op | 2 | 2 | `_cdc_flight.keyless_events.state` |
 | `catalog_baseline` | may observed relation identities be adopted as history | 4 | 12 | `_cdc_flight.catalog_baseline.state` |
+| `backfill_run` | which per-table backfill request owns acquisition, progress, and publication | 8 | 17 | `_cdc_flight.backfill_runs.state` |
+| `shadow_claim` | which table-replacement owner may mutate the shared shadow | 4 | 6 | `_cdc_flight.shadow_claims.claim_state` |
 | `snapshot_completion` | have all ordered snapshot callbacks arrived | 6 | 9 | **memory only** |
 | `completion_watermark` | has this run reached a source position it can prove the destination is durably past | 4 | 3 | **memory only** |
 | `shutdown_sequence` | has source feedback, callback quiescence, own teardown, and stock engine stop completed in order | 13 | 17 | **memory only** |

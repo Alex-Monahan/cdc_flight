@@ -25,6 +25,7 @@ def add_unit(applier, unit) -> None:
     and catches the common ``AdmissionError`` base, so a future admission
     sibling is contained by construction rather than by having been listed.
     """
+    mark_ignored_snapshot(applier, unit)
     if discard_resnapshot_unit(applier, unit):
         return
     try:
@@ -154,6 +155,26 @@ def append_unit(applier, unit, *, is_snapshot: bool) -> None:
     applier.group.nbytes += unit.nbytes
 
 
+def mark_ignored_snapshot(applier, unit) -> None:
+    """Keep the signal relation in the initial phase without materialising it.
+
+    Debezium captures the signal table so a later signal is decoded by the
+    connector, and the stock connector may also emit an empty initial-snapshot
+    chunk for that table.  It is control-plane input, not a destination table:
+    admitting it as an ordinary snapshot chunk would create an unnecessary
+    shadow/swap.  It remains a snapshot unit for phase ordering, while the
+    planner and completion machine explicitly ignore it.
+    """
+    if (
+        unit.kind == UNIT_SNAPSHOT_CHUNK
+        and not getattr(unit, "incremental", False)
+        and unit.schema
+        and unit.table
+        and f"{unit.schema}.{unit.table}" in applier.ignored_source_tables
+    ):
+        unit.ignored = True
+
+
 def discard_resnapshot_unit(applier, unit) -> bool:
     """Discard throwaway-slot streaming after the assembler proved it whole."""
     if not applier.cfg.resnapshot or unit.kind != UNIT_TXN:
@@ -174,7 +195,11 @@ def discard_resnapshot_unit(applier, unit) -> bool:
 
 
 def is_snapshot_unit(unit) -> bool:
-    return unit.kind == UNIT_SNAPSHOT_CHUNK or any(
+    # Stock incremental chunks share the normal streaming phase.  Their
+    # ``CompleteUnit`` shape is still a bounded snapshot chunk for the planner,
+    # but routing them through the initial SnapshotCompletion machine would
+    # confuse the two Debezium notification vocabularies and globally pause CDC.
+    return (unit.kind == UNIT_SNAPSHOT_CHUNK and not getattr(unit, "incremental", False)) or any(
         record.kind == KIND_SNAPSHOT_BOUNDARY for record in unit.records
     )
 

@@ -82,6 +82,7 @@ class GroupPlan:
         pipeline: str | None = None,
         control_schema: str | None = None,
         blocked_tables: set[str] | None = None,
+        ignored_tables: set[str] | None = None,
         excluded_tables: set[str] | None = None,
         contain_table_failure=None,
     ):
@@ -113,6 +114,7 @@ class GroupPlan:
         # group therefore share one refusal decision and healthy co-published tables
         # remain eligible.
         self.blocked_tables = set(blocked_tables or ())
+        self.ignored_tables = set(ignored_tables or ())
         #: A destination execution failure is quarantined after rollback, then the
         #: original whole source transaction is replayed with only this table held
         #: out. This is distinct from ordinary durable blocked-table admission: it is
@@ -174,11 +176,24 @@ class GroupPlan:
         order interleaves the two representations (Opus B-1). One ordered pass is the
         only arrangement that is right in every case.
         """
-        if unit.kind == UNIT_CONTROL:
+        if unit.kind == UNIT_CONTROL or getattr(unit, "ignored", False):
             return
         snapshot_state = None
         if unit.kind == UNIT_SNAPSHOT_CHUNK:
-            snapshot_state = self.snapshots.state_for(unit.schema, unit.table)
+            snapshot_state = self.snapshots.state_for(
+                unit.schema,
+                unit.table,
+                retain_existing=bool(unit.incremental),
+                incremental=bool(unit.incremental),
+            )
+        # Incremental READs use the active shadow route but ordinary merge
+        # semantics. A CDC delete/update in the same destination commit must not
+        # be treated as an append-only initial image operation.
+        fold_snapshot = (
+            None
+            if snapshot_state is not None and snapshot_state.incremental
+            else snapshot_state
+        )
 
         # rubric 1.6, the snapshot/stream hand-over. A table whose image was taken at
         # consistent point C already contains every transaction that committed before C,
@@ -203,17 +218,40 @@ class GroupPlan:
                         continue
                     self._collect_contained(
                         staged.event,
-                        snapshot=snapshot_state,
+                        snapshot=fold_snapshot,
                         target=staged.target,
                         event_id=staged.event_id,
                     )
             for event in unit.events:
                 if self._below_watermark(event, commit_lsn, fence_below):
                     continue
-                self._collect_contained(event, snapshot=snapshot_state)
+                self._collect_contained(event, snapshot=fold_snapshot)
 
             if unit.kind == UNIT_SNAPSHOT_CHUNK:
-                if unit.snapshot_last_for_table and snapshot_state is not None:
+                if snapshot_state is not None and snapshot_state.incremental:
+                    # Stock can publish TABLE_SCAN_COMPLETED before the embedded
+                    # engine delivers the READ records.  A terminal notice is not
+                    # permission to swap an empty shadow when it declares rows;
+                    # retain the notice and schedule the swap once this table's
+                    # bounded READ set has arrived.
+                    self.snapshots.note_incremental_rows(
+                        snapshot_state, unit.event_count
+                    )
+                    if unit.snapshot_last_for_table:
+                        terminal_rows = next(
+                            (
+                                record.incremental_rows
+                                for record in reversed(unit.records)
+                                if record.incremental_rows is not None
+                            ),
+                            None,
+                        )
+                        self.snapshots.note_incremental_terminal(
+                            snapshot_state, rows=terminal_rows
+                        )
+                    if self.snapshots.schedule_incremental_swap(snapshot_state):
+                        self._swaps.append(snapshot_state)
+                elif unit.snapshot_last_for_table and snapshot_state is not None:
                     self._swaps.append(snapshot_state)
                 if unit.snapshot_last:
                     self._swap_all = True
@@ -266,6 +304,9 @@ class GroupPlan:
         """
         if not event.schema or not event.table:
             return
+        if event.qualified_table in getattr(self, "ignored_tables", ()):
+            self._count_event(event)
+            return
         if event.qualified_table in getattr(self, "_contained_tables", ()):
             self._count_event(event)
             self.stats["quarantined_events"] += 1
@@ -304,6 +345,11 @@ class GroupPlan:
                 if snapshot is not None
                 else self.snapshots.target_table(event.schema, event.table)
             )
+        snapshot_states = getattr(self.snapshots, "states", lambda: ())()
+        incremental_target = any(
+            state.incremental and state.shadow == target
+            for state in snapshot_states
+        )
         self._count_event(event)
         if event.kind == KIND_TRUNCATE:
             self._truncate(event, target, snapshot=snapshot)
@@ -313,7 +359,7 @@ class GroupPlan:
                 self.snapshots.event_id(event) if snapshot is not None else stream_event_id(event)
             )
         self._enrich_descriptors(event)
-        if snapshot is None and (
+        if snapshot is None and not event.incremental and (
             self.toast_admission_provider is not None or self.toast_policy_provider is not None
         ):
             try:
@@ -358,6 +404,7 @@ class GroupPlan:
             target,
             event,
             snapshot is not None,
+            incremental=incremental_target,
         )
         try:
             patch = table_work.patch_for(
@@ -878,4 +925,10 @@ def stream_event_id(event: PendingRecord) -> str:
     validation two accepted events could reach this function with the same triple
     and the keyless collection would silently keep one of them.
     """
+    if event.incremental:
+        if not event.snapshot_identity:
+            raise ValueError(
+                f"incremental event {event.qualified_table} has no stable identity"
+            )
+        return event.snapshot_identity
     return f"{event.lsn}:{event.txn_id}:{event.total_order}"

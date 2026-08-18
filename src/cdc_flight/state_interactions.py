@@ -313,6 +313,90 @@ def _ownership_snapshot(ownership, completion, ownership_owner, completion_owner
     )
 
 
+def _backfill_lifecycle(run, lifecycle, _run_owner, _lifecycle_owner):
+    pair = ("backfill_run", "table_lifecycle")
+    if run in {"requested", "preparing"} and lifecycle in {"none", "awaiting_snapshot", "in_progress"}:
+        return _allow(pair, run, lifecycle, "the request can establish or reattach its shadow")
+    if run in {"loading", "ready_to_swap", "swapping"} and lifecycle == "in_progress":
+        return _allow(pair, run, lifecycle, "active loading owns a nonterminal image")
+    if run == "complete" and lifecycle == "complete":
+        return _allow(pair, run, lifecycle, "publication and lifecycle completed together")
+    if run in {"retry_wait", "blocked"} and lifecycle in {"awaiting_snapshot", "in_progress", "complete"}:
+        return _allow(pair, run, lifecycle, "retry/blocked work retains a visible recovery disposition")
+    return _refuse(pair, run, lifecycle, "backfill and lifecycle do not describe one safe image")
+
+
+def _backfill_claim(run, claim, _run_owner, _claim_owner):
+    pair = ("backfill_run", "shadow_claim")
+    if run in {"requested", "preparing", "retry_wait", "blocked"} and claim in {"free", "backfill"}:
+        return _allow(pair, run, claim, "the claim is free or owned by the same backfill route")
+    if run in {"loading", "ready_to_swap", "swapping"} and claim == "backfill":
+        return _allow(pair, run, claim, "active publication retains the one table claim")
+    if run == "complete" and claim == "free":
+        return _allow(pair, run, claim, "completed publication released its claim")
+    return _refuse(pair, run, claim, "a backfill cannot overwrite another shadow owner")
+
+
+def _backfill_phase(run, phase, _run_owner, _phase_owner):
+    pair = ("backfill_run", "run_phase")
+    if phase in {"streaming", "recovering", "reconciling"} and run in {"requested", "preparing", "loading", "ready_to_swap", "retry_wait", "blocked"}:
+        return _allow(pair, run, phase, "per-table work is durable while the run remains live")
+    if phase == "snapshotting" and run in {"requested", "preparing", "loading", "retry_wait", "blocked"}:
+        return _allow(pair, run, phase, "blocking/full fallback uses the existing snapshot hand-off")
+    if phase in {"stopping", "stopped", "failed"} and run in {"retry_wait", "blocked", "complete"}:
+        return _allow(pair, run, phase, "run teardown leaves retry/terminal disposition durable")
+    return _refuse(pair, run, phase, "backfill mode is incompatible with the run phase")
+
+
+def _backfill_completion(run, completion, _run_owner, _completion_owner):
+    pair = ("backfill_run", "snapshot_completion")
+    if completion in {SNAPSHOT_CALLBACKS_COMPLETE, SNAPSHOT_NOT_REQUIRED, SNAPSHOT_STREAMING} and run in {"requested", "preparing", "loading", "ready_to_swap", "swapping", "complete"}:
+        return _allow(pair, run, completion, "initial completion is terminal before incremental admission")
+    if run in {"retry_wait", "blocked"} and completion in {"awaiting_callbacks", "callbacks_started", "completion_notified"}:
+        return _allow(pair, run, completion, "a blocked request retains callback evidence for retry")
+    return _refuse(pair, run, completion, "initial callback completion does not admit this backfill state")
+
+
+def _backfill_catalog(run, change, _run_owner, _change_owner):
+    pair = ("backfill_run", "catalog_change")
+    if change in {"pending", "marked", "due", "applied", "superseded"} and run in {"requested", "preparing", "loading", "ready_to_swap", "complete"}:
+        return _allow(pair, run, change, "the catalog epoch is observed by the backfill gate")
+    if change in {"deferred", "refused"} and run in {"retry_wait", "blocked"}:
+        return _allow(pair, run, change, "catalog refusal queues the table run")
+    return _refuse(pair, run, change, "an old or refused catalog epoch cannot be swapped")
+
+
+def _backfill_ownership(run, ownership, _run_owner, _ownership_owner):
+    pair = ("backfill_run", "destination_ownership")
+    if ownership == OWNERSHIP_ACTIVE and run in {"preparing", "loading", "ready_to_swap", "swapping"}:
+        return _allow(pair, run, ownership, "only the destination owner may signal and swap")
+    if ownership == OWNERSHIP_AVAILABLE and run in {"requested", "retry_wait", "blocked"}:
+        return _allow(pair, run, ownership, "unadmitted work waits for ownership")
+    if ownership in {"stopping", "stopped"} and run in {"retry_wait", "complete"}:
+        return _allow(pair, run, ownership, "ownership release leaves a durable retry/terminal state")
+    return _refuse(pair, run, ownership, "a non-owner cannot mutate a backfill shadow")
+
+
+def _claim_catalog(claim, change, _claim_owner, _change_owner):
+    pair = ("shadow_claim", "catalog_change")
+    if claim == "free" and change in _CHANGE_READY:
+        return _allow(pair, claim, change, "catalog work may acquire a free shadow")
+    if claim == "backfill" and change in {"pending", "marked", "deferred", "refused"}:
+        return _refuse(pair, claim, change, "catalog mutation waits for the backfill claim")
+    if claim in {"typed_change", "schema_rebuild"} and change in _CHANGE_READY:
+        return _refuse(pair, claim, change, "the typed/schema owner excludes backfill mutation")
+    return _allow(pair, claim, change, "the claim state records the owner hand-off")
+
+
+def _claim_ownership(claim, ownership, _claim_owner, _ownership_owner):
+    pair = ("shadow_claim", "destination_ownership")
+    if ownership == OWNERSHIP_ACTIVE and claim in {"free", "backfill", "typed_change", "schema_rebuild"}:
+        return _allow(pair, claim, ownership, "the active destination owner arbitrates claims")
+    if ownership == OWNERSHIP_AVAILABLE and claim == "free":
+        return _allow(pair, claim, ownership, "an unowned table has no active shadow mutation")
+    return _refuse(pair, claim, ownership, "claim acquisition/release requires destination ownership")
+
+
 def _check_streaming(pair, left, right, completion_owner, reason):
     if completion_owner is not None:
         try:
@@ -335,4 +419,12 @@ _POLICIES: dict[tuple[str, str], Callable[..., InteractionDecision]] = {
     ("schema_refusal", "table_lifecycle"): _refusal_lifecycle,
     ("snapshot_completion", "table_lifecycle"): _snapshot_lifecycle,
     ("destination_ownership", "snapshot_completion"): _ownership_snapshot,
+    ("backfill_run", "table_lifecycle"): _backfill_lifecycle,
+    ("backfill_run", "shadow_claim"): _backfill_claim,
+    ("backfill_run", "run_phase"): _backfill_phase,
+    ("backfill_run", "snapshot_completion"): _backfill_completion,
+    ("backfill_run", "catalog_change"): _backfill_catalog,
+    ("backfill_run", "destination_ownership"): _backfill_ownership,
+    ("shadow_claim", "catalog_change"): _claim_catalog,
+    ("shadow_claim", "destination_ownership"): _claim_ownership,
 }

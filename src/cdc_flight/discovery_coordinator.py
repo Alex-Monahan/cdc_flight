@@ -108,6 +108,12 @@ class LiveDiscoveryCoordinator:
             self.watcher is not None and self.source.auto_discovery and self._resnapshot_enabled
         )
         handled_discoveries = {relation.qualified for relation in self.discovered}
+        # The stock signal relation is captured for Debezium's source signalling,
+        # but it is an internal control channel rather than a discoverable data
+        # relation. Keep it out of both the hand-off predicate and the next-engine
+        # request set for the entire coordinator lifetime.
+        if self.props.get("signal.data.collection"):
+            handled_discoveries.add(self.props["signal.data.collection"])
         live_discovered: list[str] = []
         discovery_handoffs = 0
         run_started = time.monotonic()
@@ -410,6 +416,7 @@ class LiveDiscoveryCoordinator:
             namespace=self.namespace,
             dataset=self.destination.dataset_name,
             topic_prefix=self.replication.topic_prefix,
+            signal_data_collection=self.props.get("signal.data.collection"),
             marker_prefixes=("cdcf", self.catalog_cfg.marker_prefix),
             offset_path=self.replication.offset_file,
             resume_point=self.main_resume,

@@ -142,6 +142,38 @@ POINTS = (
     "post_ack",
 )
 
+# Backfill-only cuts are deliberately outside ``ALL_POINTS``.  The rubric 1.7
+# matrix owns the original commit/recovery vocabulary; these points use the same
+# registered source-tree hard-exit child without silently multiplying that matrix.
+BACKFILL_POINTS = (
+    "before_request_md_commit",
+    "after_request_commit_before_signal",
+    "after_signal_before_started",
+    "incremental_chunk_before_shadow_write",
+    "incremental_chunk_after_shadow_write_before_progress",
+    "incremental_chunk_after_progress_before_md_commit",
+    "after_md_commit_before_markProcessed",
+    "after_markProcessed_before_markBatchFinished",
+    "after_ack_before_next_poll",
+    "after_TABLE_SCAN_COMPLETED",
+    "after_COMPLETED_before_ready_to_swap",
+    "before_ready_to_swap_commit",
+    "before_DROP_live",
+    "between_DROP_live_and_RENAME_shadow",
+    "after_RENAME_before_state_update",
+    "before_swap_commit",
+    "after_swap_commit_before_ack",
+    "motherduck_commit_response_lost",
+    "signal_insert_network_ambiguous",
+    "source_kill_at_each_incremental_chunk",
+    "source_slot_loss",
+    "offset_file_ahead_behind_corrupt",
+    "shadow_claim_lease_loss",
+    "schema_change_during_chunk",
+    "typed_change_during_chunk",
+    "spill_write_failure",
+)
+
 #: Points that are **not** reached by `maybe_crash`: they describe something the
 #: destination does to us rather than somewhere we can stand. They are injected by
 #: `FaultyConnection`, which wraps the one destination connection, and their action
@@ -279,7 +311,7 @@ def parse_spec(raw: str | None) -> tuple[str, int, int | str] | None:
         return None
     parts = raw.split(":")
     point = parts[0].strip()
-    if point not in ALL_POINTS:
+    if point not in ALL_POINTS and point not in BACKFILL_POINTS:
         raise FaultSpecError(
             f"{ENV_VAR}: unknown point {parts[0]!r}; expected one of "
             f"{ALL_POINTS}"
@@ -891,6 +923,11 @@ def maybe_crash(point: str, nth: int) -> None:
     """
     spec = _spec()
     if spec is None:
+        return
+    # Backfill crash cuts are only meaningful through the source-tree child that
+    # installed the test handler.  A normal package process may carry the env var
+    # but can never arm this hard-exit seam.
+    if point in BACKFILL_POINTS and _matrix_crash_handler is None:
         return
     want_point, want_nth, action = spec
     if point != want_point or nth != want_nth:
