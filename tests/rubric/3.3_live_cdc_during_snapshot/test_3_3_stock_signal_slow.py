@@ -39,7 +39,9 @@ def test_stock_signal_runs_arbitrary_set_while_streaming(sandbox):
         assert {run.source_table for run in runs} == {"customers", "orders"}
 
     process = sandbox.spawn(max_seconds=240, idle_seconds=90, capture=True)
-    sandbox.wait_for_slot_active(process=process, timeout=45)
+    # The contended one-reader acquisition p99/max is 61.604 s; 74 s is its
+    # measured 20%-headroom bound, shared with the source-task start budget.
+    sandbox.wait_for_slot_active(process=process, timeout=74)
     payload = json.dumps(
         {
             "data-collections": list(signal.tables),

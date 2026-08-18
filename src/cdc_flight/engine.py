@@ -50,7 +50,7 @@ _SHUTDOWN_NOISE = (
 
 #: How long after an intentional `close()` a shutdown-noise failure is still
 #: attributable to that close. Debezium's teardown is bounded by
-#: `task.management.timeout.ms`, so anything later is a real failure.
+#: `internal.task.management.timeout.ms`, so anything later is a real failure.
 SHUTDOWN_NOISE_WINDOW_SEC = 60.0
 
 

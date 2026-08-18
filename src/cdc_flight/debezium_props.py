@@ -167,6 +167,12 @@ MONEY_LOCALE_NEUTRAL_OPTIONS = "-c lc_monetary=C"
 # reconciliation exist; until then, the correctness-preserving value is deliberately 1.
 PRODUCTION_SNAPSHOT_MAX_THREADS = "1"
 
+# Debezium's AsyncEngineConfig declares this field internal, so its effective
+# property name is ``internal.task.management.timeout.ms``. Three two-worker
+# contended one-reader acquisitions measured 60.688 s, 61.604 s, and 61.206 s;
+# 74 s is the measured 61.604 s p99/max plus 20% headroom.
+SOURCE_TASK_MANAGEMENT_TIMEOUT_MS = "74000"
+
 
 def build_properties(
     source: SourceConfig,
@@ -297,12 +303,12 @@ def build_properties(
         "lsn.flush.mode": LSN_FLUSH_MODE_SAFE,
         # ADR 0001 §4.10 / Opus m10: Debezium uses this bound for both source-task
         # start and stop (`AsyncEngineConfig.startSourceTasks`,
-        # `AsyncEngineConfig.java:76-80`). Thirty seconds is too short for a
-        # stock JVM/pgoutput task to start when the six-worker slow lane is under
-        # load; 120 seconds remains finite and leaves the supervisor's own
-        # close/source-dark bounds responsible for declaring a wedged run.
+        # `AsyncEngineConfig.java:76-80`). AsyncEngineConfig marks the field
+        # internal; the canonical key below is therefore what the engine reads.
+        # The value is measured from the contended one-reader acquisitions above,
+        # not selected as an unbounded retry or hang allowance.
         "offset.flush.timeout.ms": "5000",
-        "task.management.timeout.ms": "120000",
+        "internal.task.management.timeout.ms": SOURCE_TASK_MANAGEMENT_TIMEOUT_MS,
         # --- batching / latency ----------------------------------------------
         "max.batch.size": str(max_batch_size),
         "max.queue.size": str(max_batch_size * 4),
