@@ -173,11 +173,15 @@ def test_idle_source_heartbeat_advances_confirmed_flush_lsn(sandbox):
     first = sandbox.run(reset_state=True, max_seconds=150)
     assert first["returncode"] == 0, first
     before_rows = sandbox.pg_query("SELECT count(*) FROM app.customers")[0][0]
-    before = sandbox.pg_query(
-        "SELECT (confirmed_flush_lsn - '0/0')::bigint "
-        "FROM pg_replication_slots WHERE slot_name = %s",
-        (sandbox.slot,),
-    )[0][0]
+    slot_positions = (
+        "SELECT (confirmed_flush_lsn - '0/0')::bigint, "
+        "(restart_lsn - '0/0')::bigint, "
+        "pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint "
+        "FROM pg_replication_slots WHERE slot_name = %s"
+    )
+    before_confirmed, _before_restart, before_retained = sandbox.pg_query(
+        "".join(slot_positions), (sandbox.slot,)
+    )[0]
 
     process = sandbox.spawn(
         max_seconds=14,
@@ -191,16 +195,18 @@ def test_idle_source_heartbeat_advances_confirmed_flush_lsn(sandbox):
     try:
         sandbox.wait_for_slot_active(process=process, timeout=30)
         deadline = time.monotonic() + 9
-        observed = before
+        observed = before_confirmed
+        retained_samples = [before_retained]
         while time.monotonic() < deadline:
             row = sandbox.pg_query(
-                "SELECT (confirmed_flush_lsn - '0/0')::bigint "
-                "FROM pg_replication_slots WHERE slot_name = %s",
+                "".join(slot_positions),
                 (sandbox.slot,),
-            )
-            if row and row[0][0] is not None:
-                observed = row[0][0]
-                if observed > before:
+            )[0]
+            if row and row[0] is not None:
+                observed = row[0]
+                if row[2] is not None:
+                    retained_samples.append(row[2])
+                if observed > before_confirmed:
                     break
             time.sleep(0.25)
         returncode = process.wait(timeout=30)
@@ -211,14 +217,27 @@ def test_idle_source_heartbeat_advances_confirmed_flush_lsn(sandbox):
 
     summary = sandbox.last_summary()
     assert returncode == 0, summary
-    assert observed > before, (before, observed, summary)
+    sandbox.sql("CHECKPOINT")
+    after_confirmed, _after_restart, after_retained = sandbox.pg_query(
+        "".join(slot_positions), (sandbox.slot,)
+    )[0]
+    assert observed > before_confirmed, (before_confirmed, observed, summary)
+    assert after_retained is not None and before_retained is not None, summary
+    # Heartbeat WAL is acknowledged and, after a checkpoint, the slot's retained
+    # quantity stays bounded instead of growing with every quiet-source interval.
+    assert max([*retained_samples, after_retained]) <= before_retained + 64 * 1024, (
+        before_retained,
+        retained_samples,
+        after_retained,
+        summary,
+    )
     assert sandbox.pg_query("SELECT count(*) FROM app.customers")[0][0] == before_rows
     effective = summary.get("engine_effective_configuration", {})
     assert effective["heartbeat.interval.ms"] == 5000, effective
     assert effective["heartbeat.action.query"].startswith(
         "SELECT pg_logical_emit_message(true"
     ), effective
-    assert summary.get("slot_confirmed_pos", 0) >= observed, summary
+    assert summary.get("slot_confirmed_pos", 0) >= after_confirmed >= observed, summary
 
 
 @pytest.mark.slow
@@ -339,6 +358,12 @@ def test_real_motherduck_concurrent_slots_persist_one_alert(sandbox, motherduck_
             "WHERE code = ? ORDER BY raised_at",
             ["concurrent_destination_run"],
         ).fetchall()
+        operator_logs = md.execute(
+            f'SELECT count(*), max(replication_lag_bytes) '
+            f'FROM "{motherduck_case["control_schema"]}".run_logs '
+            "WHERE pipeline = ?",
+            [sandbox.env["CDC_PIPELINE_NAME"]],
+        ).fetchone()
     finally:
         md.close()
     assert rc_two != 0, (rc_one, rc_two, out_one[-3000:], out_two[-3000:])
@@ -347,6 +372,7 @@ def test_real_motherduck_concurrent_slots_persist_one_alert(sandbox, motherduck_
         row[0] == "critical" and row[1] == "concurrent_destination_run"
         for row in alerts
     ), (alerts, out_two[-3000:])
+    assert operator_logs[0] > 0 and operator_logs[1] is not None, operator_logs
 
 
 @pytest.mark.slow
