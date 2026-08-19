@@ -86,7 +86,12 @@ from .machines import (
     RECOVERY_ROW_DELETED,
 )
 from .naming import control_table
-from .occurrence import OccurrenceKey, RecoveryGeneration, SlotState
+from .occurrence import (
+    OccurrenceKey,
+    RecoveryGeneration,
+    SlotState,
+    occurrence_text,
+)
 
 log = logging.getLogger("cdc_flight.recovery")
 
@@ -298,6 +303,84 @@ def clear(
     runtime_state(recovery_phase=PHASE_ABSENT)
 
 
+def _prejournal_occurrence(
+    context: dict,
+    *,
+    decision: str,
+    slot_name: str,
+) -> OccurrenceKey:
+    """Return the retry-stable identity for a recovery with no journal yet.
+
+    This key is only used for a failed begin transaction.  It is intentionally based on
+    the observed slot decision rather than the fresh recovery UUID, because that UUID
+    is not durable until the journal transaction commits.
+    """
+    return OccurrenceKey.from_slot_state(
+        SlotState.from_mapping(context, decision=decision, slot_name=slot_name)
+    )
+
+
+def _alert_identity(condition_key: str, occurrence_key: OccurrenceKey) -> str:
+    return f"{condition_key}:occurrence:{occurrence_text(occurrence_key)}"
+
+
+def _pending_recovery_alert_exists(
+    con,
+    *,
+    pipeline: str,
+    code: str,
+    condition_key: str,
+    occurrence_key: OccurrenceKey,
+    control_schema: str | None,
+) -> bool:
+    """Find the durable alert left by a begin attempt that never journaled."""
+    identity_marker = f'%"alert_identity": "{_alert_identity(condition_key, occurrence_key)}"%'
+    try:
+        row = con.execute(
+            f"SELECT 1 FROM {control_table(resolve_control_schema(control_schema), 'alerts')} "
+            "WHERE pipeline = ? AND code = ? AND context LIKE ? "
+            "AND context LIKE ? LIMIT 1",
+            [pipeline, code, identity_marker, '%"recovery_begin_pending": true%'],
+        ).fetchone()
+    except Exception:  # pragma: no cover - a probe must not hide the recovery failure
+        log.warning("could not probe pending recovery alert %s", code, exc_info=True)
+        return False
+    return row is not None
+
+
+def _mark_recovery_alert_journaled(
+    con,
+    *,
+    pipeline: str,
+    code: str,
+    condition_key: str,
+    occurrence_key: OccurrenceKey,
+    recovery_id: str,
+    control_schema: str | None,
+) -> None:
+    """Close the pre-journal marker after its retry has committed the journal."""
+    identity_marker = f'%"alert_identity": "{_alert_identity(condition_key, occurrence_key)}"%'
+    table = control_table(resolve_control_schema(control_schema), "alerts")
+    try:
+        rows = con.execute(
+            f"SELECT raised_at, context FROM {table} "
+            "WHERE pipeline = ? AND code = ? AND context LIKE ? "
+            "AND context LIKE ?",
+            [pipeline, code, identity_marker, '%"recovery_begin_pending": true%'],
+        ).fetchall()
+        for raised_at, serialized in rows:
+            payload = json.loads(serialized or "{}")
+            payload["recovery_begin_pending"] = False
+            payload["recovery_journal_id"] = recovery_id
+            con.execute(
+                f"UPDATE {table} SET context = ? "
+                "WHERE pipeline = ? AND code = ? AND raised_at = ?",
+                [json.dumps(payload, default=str), pipeline, code, raised_at],
+            )
+    except Exception:  # pragma: no cover - retain the conservative pending marker
+        log.warning("could not close pending recovery alert %s", code, exc_info=True)
+
+
 def begin(
     con,
     *,
@@ -352,49 +435,19 @@ def begin(
         "each table's snapshot is complete and swapped in one transaction."
     )
     context = dict(context or {})
-    # A retry of the same missing/advanced slot is one standing occurrence, even
-    # though a new recovery row gets a new UUID.  Explicit reset/orphan commands are
-    # separate operator actions, so their recovery id deliberately starts a new
-    # occurrence.
-    if decision in {
-        "slot_missing",
-        "slot_ahead_of_destination",
-        "slot_recreated",
-        "source_identity_changed",
-        "source_timeline_changed",
-        "source_lsn_regressed",
-        "no_durable_destination_row",
-    }:
-        occurrence_key = OccurrenceKey.from_slot_state(
-            SlotState.from_mapping(
-                context,
-                decision=decision,
-                slot_name=slot_name,
-            )
-        )
-        condition_key = decision
-    else:
-        condition_key = decision
-        occurrence_key = OccurrenceKey.from_recovery_generation(
-            RecoveryGeneration(
-                pipeline=pipeline,
-                namespace=namespace,
-                recovery_id=record.recovery_id,
-                decision=decision,
-            )
-        )
-    context["recovery_id"] = record.recovery_id
-    raise_alert_once(
+    condition_key = decision
+    prejournal_key = _prejournal_occurrence(
+        context, decision=decision, slot_name=slot_name
+    )
+    pending_prejournal_alert = _pending_recovery_alert_exists(
         con,
         pipeline=pipeline,
-        severity=severity,
         code=decision,
-        message=alert_message,
         condition_key=condition_key,
-        occurrence_key=occurrence_key,
-        context=context,
+        occurrence_key=prejournal_key,
         control_schema=control_schema,
     )
+    context["recovery_id"] = record.recovery_id
     con.execute("BEGIN TRANSACTION")
     try:
         if decision in RESET_TABLE_DECISIONS:
@@ -466,6 +519,44 @@ def begin(
             ],
         )
         con.execute("COMMIT")
+
+        # The journal and its table obligation are now durable.  Only at this point may
+        # the normal recovery-generation identity become visible in the alert projection.
+        # A retry of a begin transaction that alerted before failing keeps the original
+        # stable identity, so the operator sees one row rather than one row per retry.
+        occurrence_key = (
+            prejournal_key
+            if pending_prejournal_alert
+            else OccurrenceKey.from_recovery_generation(
+                RecoveryGeneration(
+                    pipeline=pipeline,
+                    namespace=namespace,
+                    recovery_id=record.recovery_id,
+                    decision=decision,
+                )
+            )
+        )
+        raise_alert_once(
+            con,
+            pipeline=pipeline,
+            severity=severity,
+            code=decision,
+            message=alert_message,
+            condition_key=condition_key,
+            occurrence_key=occurrence_key,
+            context=context,
+            control_schema=control_schema,
+        )
+        if pending_prejournal_alert:
+            _mark_recovery_alert_journaled(
+                con,
+                pipeline=pipeline,
+                code=decision,
+                condition_key=condition_key,
+                occurrence_key=prejournal_key,
+                recovery_id=record.recovery_id,
+                control_schema=control_schema,
+            )
         runtime_state(recovery_phase=PHASE_REQUESTED)
         matrix_crash("recovery_requested_recorded")
         # rubric 1.7: the journal row and the to-do list are now durable and NOTHING
@@ -476,6 +567,22 @@ def begin(
             con.execute("ROLLBACK")
         except Exception:  # pragma: no cover - never mask the original error
             log.debug("rollback of the recovery journal failed", exc_info=True)
+        # The journal did not become durable, but the failed recovery still has to reach
+        # the operator.  Marking this alert pending gives a retry the same identity while
+        # keeping a never-retried failure visible as exactly one real alert row.
+        failed_context = dict(context)
+        failed_context["recovery_begin_pending"] = True
+        raise_alert_once(
+            con,
+            pipeline=pipeline,
+            severity=severity,
+            code=decision,
+            message=alert_message,
+            condition_key=condition_key,
+            occurrence_key=prejournal_key,
+            context=failed_context,
+            control_schema=control_schema,
+        )
         raise
     log.warning(
         "rubric 1.8 recovery %s REQUESTED (%s): %s table(s) owe a snapshot",

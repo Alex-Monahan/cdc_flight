@@ -25,6 +25,7 @@ The end-to-end pairing (a real crash, a real Postgres slot) is
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import duckdb
@@ -181,6 +182,62 @@ def test_the_marking_and_the_journal_are_one_transaction(world, monkeypatch):
         world.begin()
     assert world.journal() is None
     assert world.owed == [], "the to-do list must not outlive the journal that explains it"
+
+
+def _recovery_alerts(world):
+    return world.con.execute(
+        "SELECT code, context FROM _cdc_flight.alerts "
+        "WHERE pipeline = ? AND code = 'operator_reset' ORDER BY raised_at",
+        [PIPELINE],
+    ).fetchall()
+
+
+def test_prejournal_failure_that_is_never_retried_still_projects_one_real_alert(
+    world, monkeypatch
+):
+    """A failed journal transaction may not make the operator signal disappear."""
+    real_request_snapshot = recovery_mod.request_snapshot
+
+    def _mark_then_fail(*args, **kwargs):
+        real_request_snapshot(*args, **kwargs)
+        raise RuntimeError("destination went away before the recovery journal")
+
+    monkeypatch.setattr(recovery_mod, "request_snapshot", _mark_then_fail)
+    with pytest.raises(RuntimeError, match="before the recovery journal"):
+        world.begin(decision="operator_reset")
+
+    rows = _recovery_alerts(world)
+    assert len(rows) == 1
+    payload = json.loads(rows[0][1])
+    assert payload["recovery_begin_pending"] is True
+    assert world.journal() is None
+    assert world.owed == []
+
+
+def test_prejournal_failure_then_successful_retry_projects_one_real_alert(
+    world, monkeypatch
+):
+    """The pending pre-journal identity collapses a successful retry onto its alert."""
+    real_request_snapshot = recovery_mod.request_snapshot
+
+    def _mark_then_fail(*args, **kwargs):
+        real_request_snapshot(*args, **kwargs)
+        raise RuntimeError("destination went away before the recovery journal")
+
+    monkeypatch.setattr(recovery_mod, "request_snapshot", _mark_then_fail)
+    with pytest.raises(RuntimeError, match="before the recovery journal"):
+        world.begin(decision="operator_reset")
+
+    monkeypatch.setattr(recovery_mod, "request_snapshot", real_request_snapshot)
+    record = world.begin(decision="operator_reset")
+
+    rows = _recovery_alerts(world)
+    assert record.phase == PHASE_REQUESTED
+    assert len(rows) == 1
+    payload = json.loads(rows[0][1])
+    assert payload["recovery_begin_pending"] is False
+    assert payload["recovery_journal_id"] == record.recovery_id
+    assert world.journal().recovery_id == record.recovery_id
 
 
 # --------------------------------------------------------------------------- #
