@@ -46,6 +46,43 @@ class EngineFailure(RuntimeError):
         self.summary: dict = summary or {}
 
 
+class AlertPersistenceFailure(RuntimeError):
+    """The run's failure signal could not be written to its durable alert surface.
+
+    A failed alert write is not safe to downgrade to a log-only continuation. The
+    original failure is retained as an attribute, while this exception makes the
+    CLI's non-zero outcome explicitly say that alerting itself is broken.
+    """
+
+    def __init__(
+        self,
+        *,
+        code: str,
+        original_failure: BaseException,
+        alert_failure: BaseException,
+        summary: dict | None = None,
+    ):
+        self.code = code
+        self.original_failure = original_failure
+        self.alert_failure = alert_failure
+        self.summary = dict(summary or {})
+        self.summary.update(
+            {
+                "alerting_broken": True,
+                "alerting_code": code,
+                "alerting_error": f"{type(alert_failure).__name__}: {alert_failure}",
+                "original_failure": (
+                    f"{type(original_failure).__name__}: {original_failure}"
+                ),
+            }
+        )
+        super().__init__(
+            f"ALERTING BROKEN: could not persist {code} while reporting the original "
+            f"failure {type(original_failure).__name__}: {original_failure}; "
+            f"alert write failed with {type(alert_failure).__name__}: {alert_failure}"
+        )
+
+
 class OffsetFlushFailed(RuntimeError):
     """`markBatchFinished()` returned normally but did not flush the offset.
 
@@ -139,6 +176,12 @@ class OffsetUnusable(RuntimeError):
     position from which Debezium may start.  The caller must alert and exit before
     the engine is constructed.
     """
+
+    def __init__(self, message: str, *, occurrence_key: str | None = None):
+        super().__init__(message)
+        # The alert condition may be an exception fingerprint, but its occurrence
+        # comes from the durable offset row that could not be parsed.
+        self.occurrence_key = occurrence_key
 
 
 class AmbiguousDelete(RuntimeError):

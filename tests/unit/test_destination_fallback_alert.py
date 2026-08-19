@@ -81,8 +81,11 @@ def test_real_second_process_records_lock_failure_without_destination_connection
 def test_fallback_alert_failure_is_logged_critically(tmp_path, monkeypatch, caplog):
     import logging
 
+    import pytest
+
     from cdc_flight import destination as destination_mod
     from cdc_flight.config import DestinationConfig
+    from cdc_flight.errors import AlertPersistenceFailure
     from cdc_flight.pipeline import _record_run_failure_alert
 
     dest = DestinationConfig(kind="duckdb", duckdb_path=tmp_path / "missing.duckdb")
@@ -92,14 +95,45 @@ def test_fallback_alert_failure_is_logged_critically(tmp_path, monkeypatch, capl
         lambda *args, **kwargs: (_ for _ in ()).throw(OSError("sidecar denied")),
     )
     caplog.set_level(logging.CRITICAL, logger="cdc_flight.pipeline")
-    _record_run_failure_alert(
-        None,
-        dest=dest,
-        runner_id="runner",
-        exc=OSError("database locked"),
-        summary={"stop_reason": "destination_unavailable"},
-    )
+    with pytest.raises(AlertPersistenceFailure) as failure:
+        _record_run_failure_alert(
+            None,
+            dest=dest,
+            runner_id="runner",
+            exc=OSError("database locked"),
+            summary={"stop_reason": "destination_unavailable"},
+        )
     assert "fallback alert could not be persisted" in caplog.text
+    assert failure.value.summary["alerting_broken"] is True
+    assert "database locked" in str(failure.value.original_failure)
+
+
+def test_fallback_alert_directory_fails_loudly_without_sidecar(tmp_path, capsys):
+    import pytest
+
+    from cdc_flight.config import DestinationConfig
+    from cdc_flight.destination import fallback_alert_path
+    from cdc_flight.errors import AlertPersistenceFailure
+    from cdc_flight.pipeline import _record_run_failure_alert
+
+    dest = DestinationConfig(kind="duckdb", duckdb_path=tmp_path / "locked.duckdb")
+    episode_path = dest.duckdb_path.with_name(
+        dest.duckdb_path.name + ".cdc_alerts.jsonl.episode.json"
+    )
+    episode_path.mkdir()
+
+    with pytest.raises(AlertPersistenceFailure) as failure:
+        _record_run_failure_alert(
+            None,
+            dest=dest,
+            runner_id="runner",
+            exc=OSError("database locked"),
+            summary={"stop_reason": "destination_unavailable"},
+        )
+
+    assert not fallback_alert_path(dest).exists()
+    assert "ALERTING BROKEN" in str(failure.value)
+    assert "fallback alert failed" in capsys.readouterr().err
 
 
 def test_fallback_replay_keeps_distinct_outages_distinct(tmp_path):
@@ -132,8 +166,8 @@ def test_fallback_replay_keeps_distinct_outages_distinct(tmp_path):
         assert len(sidecar_rows) == 2
         assert [row["runner_id"] for row in sidecar_rows] == ["r1", "r2"]
         assert [row["marker_value"] for row in sidecar_rows] == [
-            "destination_unavailable:fallback-episodes:episode:1",
-            "destination_unavailable:fallback-episodes:episode:2",
+            "destination_unavailable:fallback-episodes:occurrence:episode:1",
+            "destination_unavailable:fallback-episodes:occurrence:episode:2",
         ]
 
         assert replay_fallback_alerts(con, dest) == 2
@@ -184,7 +218,7 @@ def test_fallback_replay_collapses_repeated_observations_of_one_outage(tmp_path)
         ]
         assert len(sidecar_rows) == 2
         assert {row["marker_value"] for row in sidecar_rows} == {
-            "destination_unavailable:fallback-repeat:episode:1"
+            "destination_unavailable:fallback-repeat:occurrence:episode:1"
         }
         assert replay_fallback_alerts(con, dest) == 1
         assert replay_fallback_alerts(con, dest) == 0
@@ -199,6 +233,47 @@ def test_fallback_replay_collapses_repeated_observations_of_one_outage(tmp_path)
             None, dest=dest, runner_id="r3", exc=OSError("same lock"), summary=summary
         )
         assert replay_fallback_alerts(con, dest) == 1
+        assert con.execute(
+            'SELECT count(*) FROM "_cdc_flight".alerts WHERE pipeline = ?',
+            [dest.pipeline_name],
+        ).fetchone()[0] == 2
+    finally:
+        con.close()
+
+
+def test_fallback_rebuilds_episode_floor_when_journal_is_lost(tmp_path):
+    import duckdb
+
+    from cdc_flight import destination as destination_mod
+    from cdc_flight.config import DestinationConfig
+    from cdc_flight.control_schema import ensure_control_schema
+    from cdc_flight.destination_alerts import _fallback_alert_episode_path
+    from cdc_flight.pipeline import _record_run_failure_alert
+
+    dest = DestinationConfig(
+        kind="duckdb",
+        pipeline_name="fallback-journal-loss",
+        duckdb_path=tmp_path / "dest.duckdb",
+    )
+    con = duckdb.connect(":memory:")
+    try:
+        ensure_control_schema(con)
+        summary = {"stop_reason": "destination_unavailable"}
+        _record_run_failure_alert(
+            None, dest=dest, runner_id="r1", exc=OSError("first lock"), summary=summary
+        )
+        assert destination_mod.replay_fallback_alerts(con, dest) == 1
+        _fallback_alert_episode_path(dest).unlink()
+
+        _record_run_failure_alert(
+            None, dest=dest, runner_id="r2", exc=OSError("second lock"), summary=summary
+        )
+        rows = [
+            json.loads(line)
+            for line in destination_mod.fallback_alert_path(dest).read_text().splitlines()
+        ]
+        assert [row["episode_id"] for row in rows] == [1, 2]
+        assert destination_mod.replay_fallback_alerts(con, dest) == 1
         assert con.execute(
             'SELECT count(*) FROM "_cdc_flight".alerts WHERE pipeline = ?',
             [dest.pipeline_name],

@@ -60,7 +60,13 @@ from .config import (
 )
 from .debezium_props import assert_no_internal_topic_collision, build_properties
 from .destination import Lease
-from .errors import EngineFailure, LeaseLost, OffsetUnusable, SlotAheadOfDestination
+from .errors import (
+    AlertPersistenceFailure,
+    EngineFailure,
+    LeaseLost,
+    OffsetUnusable,
+    SlotAheadOfDestination,
+)
 from .faults import validate_env as validate_fault_env
 from .machines import (
     PHASE_RECONCILING,
@@ -1025,7 +1031,7 @@ def _record_run_failure_alert(
     """
     if con is None:
         code = "destination_unavailable"
-        marker = f"{code}:{dest.pipeline_name}"
+        condition_key = f"{code}:{dest.pipeline_name}"
         incident_key = (
             f"{type(exc).__module__}.{type(exc).__qualname__}:"
             f"{hashlib.sha256(str(exc).encode()).hexdigest()}"
@@ -1042,8 +1048,8 @@ def _record_run_failure_alert(
                 severity="critical",
                 code=code,
                 message=message,
-                marker_value=marker,
-                occurrence_key=incident_key,
+                condition_key=condition_key,
+                incident_key=incident_key,
                 context={
                     "error_type": type(exc).__name__,
                     "stop_reason": summary.get("stop_reason"),
@@ -1053,9 +1059,10 @@ def _record_run_failure_alert(
             summary["fallback_alert_path"] = str(path)
             log.critical("destination unavailable; durable alert written to %s", path)
         except BaseException as alert_exc:
-            # The original failure still escapes, but an operator must see that the
-            # durable fallback itself failed.  A silent sidecar failure would turn a
-            # destination lock into exactly the exit-code-only defect §6 forbids.
+            # A failed fallback is itself a failed health signal. Do not return to the
+            # caller and let the original exception look like an ordinary, diagnosed
+            # failure: the replacement says plainly that alerting is broken and
+            # retains the original exception in `original_failure`.
             log.critical(
                 "destination unavailable and fallback alert could not be persisted",
                 exc_info=True,
@@ -1066,6 +1073,12 @@ def _record_run_failure_alert(
                 file=sys.stderr,
                 flush=True,
             )
+            raise AlertPersistenceFailure(
+                code=code,
+                original_failure=exc,
+                alert_failure=alert_exc,
+                summary=summary,
+            ) from alert_exc
         return
     if summary.get("connector_failure_alert") in {"recorded", "already_recorded"}:
         return
@@ -1081,22 +1094,26 @@ def _record_run_failure_alert(
         severity = "critical"
         # The runner id identifies the attempt, not the occurrence. LeaseLost carries
         # the holder/pipeline identity separately from its changing expiry text.
-        marker = f"{code}:{getattr(exc, 'occurrence_key', str(exc))}"
+        condition_key = code
+        occurrence_key = f"lease:{getattr(exc, 'occurrence_key', runner_id)}"
     elif isinstance(exc, OffsetUnusable):
         code = "offset_unusable"
         severity = "critical"
-        marker = f"{code}:{hashlib.sha256(str(exc).encode()).hexdigest()}"
+        condition_key = f"{code}:{hashlib.sha256(str(exc).encode()).hexdigest()}"
+        occurrence_key = getattr(exc, "occurrence_key", None) or f"run:{runner_id}"
     elif summary.get("slot_check"):
         code = str(summary["slot_check"].get("decision") or "slot_check_failed")
         severity = "critical"
         slot_check = summary["slot_check"]
-        marker = ":".join(
+        slot_state = ":".join(
             str(slot_check.get(name))
             for name in (
                 "decision", "slot_name", "system_identifier", "timeline_id",
                 "restart_lsn", "confirmed_flush_lsn", "durable_lsn",
             )
         )
+        condition_key = code
+        occurrence_key = f"slot-state:{slot_state}"
     elif summary.get("stop_reason") == "source_dark":
         code = "source_dark"
         severity = "critical"
@@ -1120,18 +1137,21 @@ def _record_run_failure_alert(
             else f"unresolved:{runner_id}"
         )
         summary["source_health_episode"] = episode_id
-        marker = f"{code}:{dest.pipeline_name}:episode:{episode_id}"
+        condition_key = code
+        occurrence_key = f"episode:{episode_id}"
     elif summary.get("stop_reason") in {"max_seconds", "engine_error", "hung"}:
         code = "run_incomplete"
         severity = "critical"
-        marker = (
+        condition_key = (
             f"{code}:{hashlib.sha256(str(exc).encode()).hexdigest()}:"
             f"{summary.get('stop_reason')}"
         )
+        occurrence_key = f"run:{runner_id}"
     else:
         code = "run_failure"
         severity = "critical"
-        marker = f"{code}:{hashlib.sha256(str(exc).encode()).hexdigest()}"
+        condition_key = f"{code}:{hashlib.sha256(str(exc).encode()).hexdigest()}"
+        occurrence_key = f"run:{runner_id}"
     message = (
         f"cdc_flight run for pipeline {dest.pipeline_name!r} failed before it could "
         f"claim success: {type(exc).__name__}: {exc}"
@@ -1150,11 +1170,12 @@ def _record_run_failure_alert(
             control_schema=dest.control_schema,
         )
         try:
-            alert_sink.raise_alert_once(
+            raised = alert_sink.raise_alert_once(
                 severity=severity,
                 code=code,
                 message=message,
-                marker_value=marker,
+                condition_key=condition_key,
+                occurrence_key=occurrence_key,
                 context={
                     "runner_id": runner_id,
                     "error_type": type(exc).__name__,
@@ -1162,8 +1183,26 @@ def _record_run_failure_alert(
                     "source_health_episode": source_health_episode,
                 },
             )
+            if not raised and not dest_mod.alert_identity_exists(
+                alert_sink._sink if alert_sink.independent else con,
+                pipeline=dest.pipeline_name,
+                code=code,
+                condition_key=condition_key,
+                occurrence_key=occurrence_key,
+                control_schema=dest.control_schema,
+            ):
+                raise AlertPersistenceFailure(
+                    code=code,
+                    original_failure=exc,
+                    alert_failure=RuntimeError(
+                        f"the alert sink did not persist {condition_key}"
+                    ),
+                    summary=summary,
+                )
         finally:
             alert_sink.close()
+    except AlertPersistenceFailure:
+        raise
     except Exception:
         log.warning("could not persist run failure alert %s", code, exc_info=True)
 

@@ -364,7 +364,7 @@ def begin(
         "source_lsn_regressed",
         "no_durable_destination_row",
     }:
-        marker_value = ":".join(
+        state_key = ":".join(
             str(value)
             for value in (
                 decision,
@@ -373,8 +373,11 @@ def begin(
                 context.get("durable_lsn"),
             )
         )
+        condition_key = decision
+        occurrence_key = f"slot-state:{state_key}"
     else:
-        marker_value = f"{decision}:{record.recovery_id}"
+        condition_key = decision
+        occurrence_key = f"recovery:{record.recovery_id}"
     context["recovery_id"] = record.recovery_id
     raise_alert_once(
         con,
@@ -382,7 +385,8 @@ def begin(
         severity=severity,
         code=decision,
         message=alert_message,
-        marker_value=marker_value,
+        condition_key=condition_key,
+        occurrence_key=occurrence_key,
         context=context,
         control_schema=control_schema,
     )

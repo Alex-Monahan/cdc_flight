@@ -9,6 +9,7 @@ design rests on.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
@@ -246,7 +247,7 @@ def read_resume_point(
 ) -> ResumePoint | None:
     rows = con.execute(
         f"SELECT resume_json, commit_id, last_lsn, last_txn_id, last_total_order, "
-        f"       snapshot_epoch, offset_blob, offset_key_blob "
+        f"       snapshot_epoch, updated_at, offset_blob, offset_key_blob "
         f"FROM {_control_table(control_schema, 'debezium_offsets')} "
         "WHERE pipeline = ? AND namespace = ?",
         [pipeline, namespace],
@@ -260,15 +261,26 @@ def read_resume_point(
         last_txn_id,
         last_total_order,
         snapshot_epoch,
+        updated_at,
         _blob,
         _key_blob,
     ) = rows[0]
+    updated_marker = (
+        updated_at.isoformat() if hasattr(updated_at, "isoformat") else str(updated_at)
+    )
+    durable_occurrence = (
+        f"offset-row:{pipeline}:{namespace}:commit:{int(commit_id or 0)}:"
+        f"snapshot:{int(snapshot_epoch or 0)}:last-lsn:{int(last_lsn or 0)}:"
+        f"updated:{updated_marker}:state:"
+        f"{hashlib.sha256(str(resume_json).encode('utf-8')).hexdigest()}"
+    )
     try:
         point = ResumePoint.from_json(resume_json)
     except OffsetUnusable as exc:
         raise OffsetUnusable(
             f"durable resume point for pipeline={pipeline!r}, namespace={namespace!r} "
-            f"is unusable: {exc}"
+            f"is unusable: {exc}",
+            occurrence_key=durable_occurrence,
         ) from exc
     point.commit_id = int(commit_id or 0)
     point.last_lsn = int(last_lsn or point.last_lsn or 0)
@@ -544,6 +556,7 @@ def write_keyless_events(
 # state owners remain independently measurable.
 from .destination_alerts import (  # noqa: E402, F401
     AlertSink,
+    alert_identity_exists,
     alert_marker_exists,
     destination_holds_rows,
     fallback_alert_path,

@@ -816,7 +816,6 @@ class Applier:
         place after a hard exit is the observable timeout; a successful group clears it
         only after the exclusion has closed.
         """
-        marker = f"commit:{commit_id}"
         armed = self.alerts.raise_alert_once(
             severity="critical",
             code="commit_timeout",
@@ -827,7 +826,8 @@ class Applier:
                 "destination may already be durable, so the next run must reconcile "
                 "it before claiming success"
             ),
-            marker_value=marker,
+            condition_key="commit_timeout",
+            occurrence_key=f"commit:{commit_id}",
             context={
                 "commit_id": commit_id,
                 "armed_before_commit_ack_window": True,
@@ -845,7 +845,8 @@ class Applier:
         """Clear the conservative watchdog alert after COMMIT_ACK has closed."""
         self.alerts.clear_alert_once(
             code="commit_timeout",
-            marker_value=f"commit:{commit_id}",
+            condition_key="commit_timeout",
+            occurrence_key=f"commit:{commit_id}",
         )
 
     def hold_streaming_tail(self, tables) -> None:

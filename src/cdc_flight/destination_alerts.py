@@ -23,6 +23,43 @@ faults = _d.faults
 table_lifecycle = _d.table_lifecycle
 quote = _d.quote
 
+
+def _alert_identity(condition_key: str, occurrence_key: str) -> str:
+    """Build a deduplication identity from two independently named parts."""
+    for name, value in (
+        ("condition_key", condition_key),
+        ("occurrence_key", occurrence_key),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            raise TypeError(f"{name} must be a non-empty string")
+    return f"{condition_key}:occurrence:{occurrence_key}"
+
+
+def _write_alert_row(
+    con,
+    *,
+    pipeline: str,
+    severity: str,
+    code: str,
+    message: str,
+    context=None,
+    control_schema: str | None = None,
+) -> bool:
+    payload = dict(context or {})
+    try:
+        con.execute(
+            f"INSERT INTO {_control_table(control_schema, 'alerts')} "
+            "(pipeline, raised_at, severity, code, message, context) VALUES (?,?,?,?,?,?)",
+            [pipeline, now(), severity, code, message,
+             json.dumps(payload, default=str) if payload else None],
+        )
+    except Exception:  # pragma: no cover - alerting must never mask the cause
+        log.warning("could not write alert %s", code, exc_info=True)
+        return False
+    log.warning("ALERT %s/%s: %s", severity, code, message)
+    return True
+
+
 class AlertSink:
     """`_cdc_flight.alerts` on its **own** connection (ADR §9.1, Codex 7 / Opus M-2).
 
@@ -70,22 +107,21 @@ class AlertSink:
         if not self.independent:
             payload["transactional"] = True
         con = self._sink if self.independent else self._main
-        try:
-            con.execute(
-                f"INSERT INTO {_control_table(self.control_schema, 'alerts')} "
-                "(pipeline, raised_at, severity, code, message, context) VALUES (?,?,?,?,?,?)",
-                [self.pipeline, now(), severity, code, message,
-                 json.dumps(payload, default=str) if payload else None],
-            )
-        except Exception:  # pragma: no cover - alerting must never mask the cause
-            log.warning("could not write alert %s", code, exc_info=True)
+        if not _write_alert_row(
+            con,
+            pipeline=self.pipeline,
+            severity=severity,
+            code=code,
+            message=message,
+            context=payload,
+            control_schema=self.control_schema,
+        ):
             return False
-        log.warning("ALERT %s/%s: %s", severity, code, message)
         return self.independent
 
     def raise_alert_once(
-        self, *, severity: str, code: str, message: str, marker_value: str,
-        context=None,
+        self, *, severity: str, code: str, message: str, condition_key: str,
+        occurrence_key: str, context=None,
     ) -> bool:
         """Write one durable alert for one condition occurrence.
 
@@ -94,26 +130,44 @@ class AlertSink:
         routing the alert through that same handle would make the operator signal
         disappear when the failed transaction is retired.
         """
+        identity = _alert_identity(condition_key, occurrence_key)
         con = self._sink if self.independent else self._main
-        if alert_marker_exists(
+        if alert_identity_exists(
             con,
             pipeline=self.pipeline,
             code=code,
-            marker_key="condition_marker",
-            marker_value=marker_value,
+            condition_key=condition_key,
+            occurrence_key=occurrence_key,
             control_schema=self.control_schema,
         ):
             return False
         payload = dict(context or {})
-        payload["condition_marker"] = marker_value
-        return self.raise_alert(
+        payload.update(
+            {
+                "condition_key": condition_key,
+                "occurrence_key": occurrence_key,
+                "alert_identity": identity,
+                # Compatibility for readers of the pre-split context field. It now
+                # carries the complete identity; the two components above are the
+                # authoritative fields.
+                "condition_marker": identity,
+            }
+        )
+        if not self.independent:
+            payload["transactional"] = True
+        return _write_alert_row(
+            con,
+            pipeline=self.pipeline,
             severity=severity,
             code=code,
             message=message,
             context=payload,
+            control_schema=self.control_schema,
         )
 
-    def clear_alert_once(self, *, code: str, marker_value: str) -> bool:
+    def clear_alert_once(
+        self, *, code: str, condition_key: str, occurrence_key: str
+    ) -> bool:
         """Remove a pre-armed alert after its bounded operation succeeds.
 
         This is intentionally called only after the commit/ack exclusion has closed.
@@ -121,7 +175,7 @@ class AlertSink:
         the next run to reconcile.
         """
         con = self._sink if self.independent else self._main
-        marker = f'%"condition_marker": "{marker_value}"%'
+        marker = f'%"alert_identity": "{_alert_identity(condition_key, occurrence_key)}"%'
         try:
             con.execute(
                 f"DELETE FROM {_control_table(self.control_schema, 'alerts')} "
@@ -209,6 +263,30 @@ def alert_marker_exists(
     return row is not None
 
 
+def alert_identity_exists(
+    con,
+    *,
+    pipeline: str,
+    code: str,
+    condition_key: str,
+    occurrence_key: str,
+    control_schema: str | None = None,
+) -> bool:
+    """Whether the durable alert table already carries this full identity."""
+    identity = _alert_identity(condition_key, occurrence_key)
+    marker = f'%"alert_identity": "{identity}"%'
+    try:
+        row = con.execute(
+            f"SELECT 1 FROM {_control_table(control_schema, 'alerts')} "
+            "WHERE pipeline = ? AND code = ? AND context LIKE ? LIMIT 1",
+            [pipeline, code, marker],
+        ).fetchone()
+    except Exception:  # pragma: no cover - dedup must never mask the caller
+        log.warning("could not probe existing %s alerts", code, exc_info=True)
+        return False
+    return row is not None
+
+
 def raise_alert(
     con, *, pipeline: str, severity: str, code: str, message: str, context=None,
     control_schema: str | None = None,
@@ -219,15 +297,15 @@ def raise_alert(
     connection has no open transaction and a separate one buys nothing. Anything
     inside a commit group must use `AlertSink`.
     """
-    try:
-        con.execute(
-            f"INSERT INTO {_control_table(control_schema, 'alerts')} "
-            "(pipeline, raised_at, severity, code, message, context) VALUES (?,?,?,?,?,?)",
-            [pipeline, now(), severity, code, message,
-             json.dumps(context, default=str) if context else None],
-        )
-    except Exception:  # pragma: no cover - alerting must never mask the cause
-        log.warning("could not write alert %s", code, exc_info=True)
+    return _write_alert_row(
+        con,
+        pipeline=pipeline,
+        severity=severity,
+        code=code,
+        message=message,
+        context=context,
+        control_schema=control_schema,
+    )
 
 
 def raise_alert_once(
@@ -237,30 +315,38 @@ def raise_alert_once(
     severity: str,
     code: str,
     message: str,
-    marker_value: str,
+    condition_key: str,
+    occurrence_key: str,
     context=None,
     control_schema: str | None = None,
 ) -> bool:
     """Persist one alert for one durable occurrence.
 
     Failure paths are often revisited on every bounded runner invocation.  The
-    condition marker makes that repetition a single operator incident while a
-    changed marker (for example a new slot LSN or a new failure fingerprint) is a
-    new occurrence.  A failed probe intentionally falls through to an insert:
-    losing the alert is worse than a duplicate.
+    condition key groups the fault; the required occurrence key makes a later
+    durable episode or run a new operator incident.  A failed probe intentionally
+    falls through to an insert: losing the alert is worse than a duplicate.
     """
-    if alert_marker_exists(
+    identity = _alert_identity(condition_key, occurrence_key)
+    if alert_identity_exists(
         con,
         pipeline=pipeline,
         code=code,
-        marker_key="condition_marker",
-        marker_value=marker_value,
+        condition_key=condition_key,
+        occurrence_key=occurrence_key,
         control_schema=control_schema,
     ):
         return False
     payload = dict(context or {})
-    payload["condition_marker"] = marker_value
-    raise_alert(
+    payload.update(
+        {
+            "condition_key": condition_key,
+            "occurrence_key": occurrence_key,
+            "alert_identity": identity,
+            "condition_marker": identity,
+        }
+    )
+    return raise_alert(
         con,
         pipeline=pipeline,
         severity=severity,
@@ -269,7 +355,6 @@ def raise_alert_once(
         context=payload,
         control_schema=control_schema,
     )
-    return True
 
 
 def fallback_alert_path(dest) -> Path:
@@ -311,6 +396,44 @@ def _fallback_alert_lock(dest):
         os.close(descriptor)
 
 
+def _empty_fallback_alert_episode() -> dict:
+    return {"episode_id": 0, "state": "recovered", "incident_key": None}
+
+
+def _episode_from_fallback_sidecar(dest) -> dict:
+    """Recover the monotone episode floor without resetting to episode one.
+
+    The episode journal is an optimization for the open/recovered bit. The JSONL is
+    the durable occurrence audit, so losing or corrupting the small journal must not
+    make a later occurrence reuse an old identity. A recovered reconstruction starts
+    a new episode conservatively; the next append recreates the journal and restores
+    repeat-collapse for that occurrence.
+    """
+    path = fallback_alert_path(dest)
+    if not path.exists():
+        return _empty_fallback_alert_episode()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise OSError(
+            f"fallback alert sidecar {path} exists but cannot be read"
+        ) from exc
+    maximum = 0
+    for line in lines:
+        try:
+            item = json.loads(line)
+            episode_id = int(item.get("episode_id"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if episode_id >= 0:
+            maximum = max(maximum, episode_id)
+    return {
+        "episode_id": maximum,
+        "state": "recovered",
+        "incident_key": None,
+    }
+
+
 def _read_fallback_alert_episode(dest) -> dict:
     path = _fallback_alert_episode_path(dest)
     try:
@@ -326,7 +449,7 @@ def _read_fallback_alert_episode(dest) -> dict:
             "incident_key": str(incident_key) if incident_key is not None else None,
         }
     except (OSError, TypeError, ValueError, json.JSONDecodeError, KeyError):
-        return {"episode_id": 0, "state": "recovered", "incident_key": None}
+        return _episode_from_fallback_sidecar(dest)
 
 
 def _write_fallback_alert_episode(dest, *, episode_id: int, state: str,
@@ -359,7 +482,7 @@ def _write_fallback_alert_episode(dest, *, episode_id: int, state: str,
 
 
 def _fallback_occurrence_marker(base_marker: str, episode_id: int) -> str:
-    return f"{base_marker}:episode:{episode_id}"
+    return _alert_identity(base_marker, f"episode:{episode_id}")
 
 
 def persist_fallback_alert(
@@ -369,8 +492,8 @@ def persist_fallback_alert(
     severity: str,
     code: str,
     message: str,
-    marker_value: str,
-    occurrence_key: str | None = None,
+    condition_key: str,
+    incident_key: str,
     context=None,
 ) -> Path:
     """Synchronously append and fsync an alert when no destination handle exists.
@@ -380,7 +503,10 @@ def persist_fallback_alert(
     non-zero run failure and emits a critical stderr diagnostic.
     """
     path = fallback_alert_path(dest)
-    incident_key = str(occurrence_key or marker_value)
+    _alert_identity(condition_key, "episode:pending")
+    incident_key = str(incident_key)
+    if not incident_key.strip():
+        raise TypeError("incident_key must be a non-empty string")
     with _fallback_alert_lock(dest):
         episode = _read_fallback_alert_episode(dest)
         if (
@@ -390,7 +516,8 @@ def persist_fallback_alert(
             episode_id = episode["episode_id"]
         else:
             episode_id = episode["episode_id"] + 1
-        occurrence_marker = _fallback_occurrence_marker(marker_value, episode_id)
+        occurrence_key = f"episode:{episode_id}"
+        occurrence_marker = _alert_identity(condition_key, occurrence_key)
         # Advance the episode journal before the append.  If the append fails, a
         # retry of the same observation reuses this identity rather than creating
         # a second alert occurrence.
@@ -403,6 +530,9 @@ def persist_fallback_alert(
         stored_context = dict(context or {})
         stored_context["fallback_episode_id"] = episode_id
         stored_context["fallback_incident_key"] = incident_key
+        stored_context["condition_key"] = condition_key
+        stored_context["occurrence_key"] = occurrence_key
+        stored_context["alert_identity"] = occurrence_marker
         payload = {
             "pipeline": dest.pipeline_name,
             "runner_id": runner_id,
@@ -411,6 +541,9 @@ def persist_fallback_alert(
             "code": code,
             "message": message,
             "marker_value": occurrence_marker,
+            "condition_key": condition_key,
+            "occurrence_key": occurrence_key,
+            "alert_identity": occurrence_marker,
             "episode_id": episode_id,
             "context": stored_context,
             "destination_kind": dest.kind,
@@ -460,17 +593,38 @@ def replay_fallback_alerts(con, dest) -> int:
                 continue
             pipeline = str(item.get("pipeline") or dest.pipeline_name)
             code = str(item.get("code") or "destination_unavailable")
-            marker_value = str(item.get("marker_value") or "fallback:unknown")
-            episode_id = item.get("episode_id")
-            if episode_id is not None and ":episode:" not in marker_value:
-                marker_value = _fallback_occurrence_marker(marker_value, int(episode_id))
+            condition_key = item.get("condition_key")
+            occurrence_key = item.get("occurrence_key")
+            if condition_key is None or occurrence_key is None:
+                # Read sidecars written before the condition/occurrence split. The
+                # current writer always emits both fields, while the old combined
+                # marker still contains an episode identity when one is available.
+                marker_value = str(item.get("marker_value") or "fallback:unknown")
+                episode_id = item.get("episode_id")
+                if ":occurrence:" in marker_value:
+                    condition_key, occurrence_key = marker_value.rsplit(
+                        ":occurrence:", 1
+                    )
+                elif episode_id is not None:
+                    condition_key = marker_value.rsplit(":episode:", 1)[0]
+                    occurrence_key = f"episode:{int(episode_id)}"
+                else:
+                    condition_key = marker_value
+                    occurrence_key = f"legacy-run:{item.get('runner_id') or 'unknown'}"
+            try:
+                _alert_identity(str(condition_key), str(occurrence_key))
+            except TypeError:
+                log.critical("fallback alert line has no occurrence identity in %s", path)
+                replay_complete = False
+                continue
             sink = AlertSink(con, pipeline=pipeline, control_schema=dest.control_schema)
             try:
                 raised = sink.raise_alert_once(
                     severity=str(item.get("severity") or "critical"),
                     code=code,
                     message=str(item.get("message") or "destination was unavailable"),
-                    marker_value=marker_value,
+                    condition_key=str(condition_key),
+                    occurrence_key=str(occurrence_key),
                     context=dict(item.get("context") or {}) | {
                         "fallback_alert_path": str(path),
                         "replayed": True,
@@ -480,12 +634,12 @@ def replay_fallback_alerts(con, dest) -> int:
                     recorded += 1
                 else:
                     probe_con = sink._sink if sink.independent else con
-                    if not alert_marker_exists(
+                    if not alert_identity_exists(
                         probe_con,
                         pipeline=pipeline,
                         code=code,
-                        marker_key="condition_marker",
-                        marker_value=marker_value,
+                        condition_key=str(condition_key),
+                        occurrence_key=str(occurrence_key),
                         control_schema=dest.control_schema,
                     ):
                         replay_complete = False
