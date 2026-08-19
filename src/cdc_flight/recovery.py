@@ -89,7 +89,8 @@ from .naming import control_table
 from .occurrence import (
     OccurrenceKey,
     RecoveryGeneration,
-    SlotState,
+    SlotStateReceipt,
+    _recovery_journal_receipt_after_commit,
     occurrence_text,
 )
 
@@ -304,20 +305,15 @@ def clear(
 
 
 def _prejournal_occurrence(
-    context: dict,
-    *,
-    decision: str,
-    slot_name: str,
+    slot_receipt: SlotStateReceipt,
 ) -> OccurrenceKey:
     """Return the retry-stable identity for a recovery with no journal yet.
 
     This key is only used for a failed begin transaction.  It is intentionally based on
-    the observed slot decision rather than the fresh recovery UUID, because that UUID
-    is not durable until the journal transaction commits.
+    the already committed slot observation rather than the fresh recovery UUID, because
+    that UUID is not durable until the journal transaction commits.
     """
-    return OccurrenceKey.from_slot_state(
-        SlotState.from_mapping(context, decision=decision, slot_name=slot_name)
-    )
+    return OccurrenceKey.from_slot_state(slot_receipt)
 
 
 def _alert_identity(condition_key: str, occurrence_key: OccurrenceKey) -> str:
@@ -392,6 +388,7 @@ def begin(
     offset_path: Path,
     captured_tables: list[tuple[str, str, str]],
     forget_catalog: bool,
+    slot_receipt: SlotStateReceipt,
     context: dict | None = None,
     state_dir: Path | None = None,
     severity: str = "critical",
@@ -436,9 +433,13 @@ def begin(
     )
     context = dict(context or {})
     condition_key = decision
-    prejournal_key = _prejournal_occurrence(
-        context, decision=decision, slot_name=slot_name
-    )
+    if type(slot_receipt) is not SlotStateReceipt:
+        raise TypeError("slot_receipt must be a SlotStateReceipt")
+    if slot_receipt.state.slot_name != slot_name:
+        raise ValueError(
+            "slot_receipt names a different slot than the recovery being journaled"
+        )
+    prejournal_key = _prejournal_occurrence(slot_receipt)
     pending_prejournal_alert = _pending_recovery_alert_exists(
         con,
         pipeline=pipeline,
@@ -524,10 +525,9 @@ def begin(
         # the normal recovery-generation identity become visible in the alert projection.
         # A retry of a begin transaction that alerted before failing keeps the original
         # stable identity, so the operator sees one row rather than one row per retry.
-        occurrence_key = (
-            prejournal_key
-            if pending_prejournal_alert
-            else OccurrenceKey.from_recovery_generation(
+        occurrence_key = prejournal_key
+        if not pending_prejournal_alert:
+            journal_receipt = _recovery_journal_receipt_after_commit(
                 RecoveryGeneration(
                     pipeline=pipeline,
                     namespace=namespace,
@@ -535,7 +535,7 @@ def begin(
                     decision=decision,
                 )
             )
-        )
+            occurrence_key = OccurrenceKey.from_recovery_generation(journal_receipt)
         raise_alert_once(
             con,
             pipeline=pipeline,

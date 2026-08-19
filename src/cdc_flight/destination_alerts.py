@@ -11,9 +11,14 @@ from pathlib import Path
 
 from . import destination as _d
 from .occurrence import (
+    EpisodeReceipt,
     EpisodeState,
     OccurrenceKey,
     RunState,
+    SlotState,
+    SlotStateReceipt,
+    _episode_receipt_after_durable,
+    _slot_state_receipt_after_commit,
     occurrence_text,
 )
 
@@ -457,8 +462,9 @@ def _read_fallback_alert_episode(dest) -> dict:
         return _episode_from_fallback_sidecar(dest)
 
 
-def _write_fallback_alert_episode(dest, *, episode_id: int, state: str,
-                                  incident_key: str | None) -> None:
+def _write_fallback_alert_episode(
+    dest, *, episode_id: int, state: str, incident_key: str | None
+) -> EpisodeReceipt:
     path = _fallback_alert_episode_path(dest)
     payload = json.dumps(
         {
@@ -484,6 +490,13 @@ def _write_fallback_alert_episode(dest, *, episode_id: int, state: str,
         with contextlib.suppress(OSError):
             os.unlink(temporary)
         raise
+    return _episode_receipt_after_durable(
+        EpisodeState(
+            pipeline=dest.pipeline_name,
+            episode_id=episode_id,
+            state=state,
+        )
+    )
 
 
 def persist_fallback_alert(
@@ -517,22 +530,17 @@ def persist_fallback_alert(
             episode_id = episode["episode_id"]
         else:
             episode_id = episode["episode_id"] + 1
-        episode_state = EpisodeState(
-            pipeline=dest.pipeline_name,
-            episode_id=episode_id,
-            state="open",
-        )
-        occurrence_key = OccurrenceKey.from_episode(episode_state)
-        occurrence_marker = _alert_identity(condition_key, occurrence_key)
         # Advance the episode journal before the append.  If the append fails, a
         # retry of the same observation reuses this identity rather than creating
         # a second alert occurrence.
-        _write_fallback_alert_episode(
+        episode_receipt = _write_fallback_alert_episode(
             dest,
             episode_id=episode_id,
             state="open",
             incident_key=incident_key,
         )
+        occurrence_key = OccurrenceKey.from_episode(episode_receipt)
+        occurrence_marker = _alert_identity(condition_key, occurrence_key)
         stored_context = dict(context or {})
         stored_context["fallback_episode_id"] = episode_id
         stored_context["fallback_incident_key"] = incident_key
@@ -606,12 +614,14 @@ def replay_fallback_alerts(con, dest) -> int:
                 replay_complete = False
                 continue
             try:
-                episode_state = EpisodeState(
-                    pipeline=pipeline,
-                    episode_id=int(episode_id),
-                    state="open",
+                episode_receipt = _episode_receipt_after_durable(
+                    EpisodeState(
+                        pipeline=pipeline,
+                        episode_id=int(episode_id),
+                        state="open",
+                    )
                 )
-                occurrence_key = OccurrenceKey.from_episode(episode_state)
+                occurrence_key = OccurrenceKey.from_episode(episode_receipt)
                 serialized_occurrence = item.get("occurrence_key")
                 if (
                     serialized_occurrence is not None
@@ -670,7 +680,7 @@ def observe_source_health(
     state: str,
     confirmed_flush_lsn: int | None = None,
     control_schema: str | None = None,
-) -> EpisodeState | None:
+) -> EpisodeReceipt | None:
     """Persist the source reachability episode used by ``source_dark`` alerts.
 
     ``reachable`` closes a prior dark episode. ``dark`` opens exactly one new episode
@@ -727,11 +737,13 @@ def observe_source_health(
         [pipeline],
     ).fetchone()
     return (
-        EpisodeState(
-            pipeline=pipeline,
-            episode_id=int(row[0]),
-            state=str(row[1]),
-            observed_at=row[2],
+        _episode_receipt_after_durable(
+            EpisodeState(
+                pipeline=pipeline,
+                episode_id=int(row[0]),
+                state=str(row[1]),
+                observed_at=row[2],
+            )
         )
         if row
         else None
@@ -740,7 +752,7 @@ def observe_source_health(
 
 def read_slot_state(
     con, pipeline: str, slot_name: str, *, control_schema: str | None = None
-) -> dict | None:
+) -> SlotStateReceipt | None:
     """The last recorded observation of this pipeline's slot, or None (rubric 1.8)."""
     rows = con.execute(
         f"SELECT system_identifier, timeline_id, restart_lsn, confirmed_flush_lsn, "
@@ -757,7 +769,19 @@ def read_slot_state(
         "current_wal_lsn", "durable_lsn", "observed_at", "verdict", "verdict_message",
         "verdict_at",
     )
-    return dict(zip(keys, rows[0], strict=True))
+    details = dict(zip(keys, rows[0], strict=True))
+    details["slot_name"] = slot_name
+    state = SlotState(
+        decision=str(details["verdict"] or "observed"),
+        slot_name=slot_name,
+        system_identifier=details["system_identifier"],
+        timeline_id=details["timeline_id"],
+        restart_lsn=details["restart_lsn"],
+        confirmed_flush_lsn=details["confirmed_flush_lsn"],
+        current_wal_lsn=details["current_wal_lsn"],
+        durable_lsn=details["durable_lsn"],
+    )
+    return _slot_state_receipt_after_commit(state, details)
 
 
 def write_slot_state(
@@ -769,7 +793,7 @@ def write_slot_state(
     verdict: str | None = None,
     verdict_message: str | None = None,
     control_schema: str | None = None,
-) -> None:
+) -> SlotStateReceipt:
     """Record what the slot and the source cluster look like now (rubric 1.8).
 
     DELETE + INSERT **in one transaction**. It used to be two autocommitted statements,
@@ -785,6 +809,8 @@ def write_slot_state(
     """
     if verdict is not None:
         verdict = SLOT_VERDICTS.parse(verdict)
+    observed_at = now()
+    verdict_at = now() if verdict is not None else None
     con.execute("BEGIN TRANSACTION")
     try:
         con.execute(
@@ -807,10 +833,10 @@ def write_slot_state(
                 observation.get("confirmed_flush_lsn"),
                 observation.get("current_wal_lsn"),
                 observation.get("durable_lsn"),
-                now(),
+                observed_at,
                 verdict,
                 verdict_message,
-                now() if verdict is not None else None,
+                verdict_at,
             ],
         )
         con.execute("COMMIT")
@@ -818,6 +844,32 @@ def write_slot_state(
         with contextlib.suppress(Exception):
             con.execute("ROLLBACK")
         raise
+    details = {
+        "slot_name": slot_name,
+        "system_identifier": observation.get("system_identifier"),
+        "timeline_id": observation.get("timeline_id"),
+        "restart_lsn": observation.get("restart_lsn"),
+        "confirmed_flush_lsn": observation.get("confirmed_flush_lsn"),
+        "current_wal_lsn": observation.get("current_wal_lsn"),
+        "durable_lsn": observation.get("durable_lsn"),
+        "observed_at": observed_at,
+        "verdict": verdict,
+        "verdict_message": verdict_message,
+        "verdict_at": verdict_at,
+    }
+    return _slot_state_receipt_after_commit(
+        SlotState(
+            decision=str(verdict or "observed"),
+            slot_name=slot_name,
+            system_identifier=observation.get("system_identifier"),
+            timeline_id=observation.get("timeline_id"),
+            restart_lsn=observation.get("restart_lsn"),
+            confirmed_flush_lsn=observation.get("confirmed_flush_lsn"),
+            current_wal_lsn=observation.get("current_wal_lsn"),
+            durable_lsn=observation.get("durable_lsn"),
+        ),
+        details,
+    )
 
 
 def tables_awaiting_snapshot(

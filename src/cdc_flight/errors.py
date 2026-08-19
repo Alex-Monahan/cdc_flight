@@ -7,7 +7,7 @@ not pay that cost just to name an exception.
 
 from __future__ import annotations
 
-from .occurrence import LeaseState, OffsetRowState
+from .occurrence import LeaseReceipt, OffsetRowReceipt
 
 # A refusal's durable class is deliberately not an origin label.  Origins are
 # useful diagnostics, but letting each raise site choose the durable class made
@@ -179,10 +179,10 @@ class OffsetUnusable(RuntimeError):
     the engine is constructed.
     """
 
-    def __init__(self, message: str, *, offset_row: OffsetRowState | None = None):
+    def __init__(self, message: str, *, offset_row: OffsetRowReceipt | None = None):
         super().__init__(message)
-        if offset_row is not None and type(offset_row) is not OffsetRowState:
-            raise TypeError("offset_row must be an OffsetRowState")
+        if offset_row is not None and type(offset_row) is not OffsetRowReceipt:
+            raise TypeError("offset_row must be an OffsetRowReceipt")
         # The alert condition may be an exception fingerprint, but its occurrence
         # comes from the durable offset row that could not be parsed.  The exception
         # never accepts an occurrence string, so a failure message cannot become one.
@@ -420,10 +420,10 @@ class RecoveryFailed(RuntimeError):
 class LeaseLost(RuntimeError):
     """Another runner owns `_cdc_flight.lease` for this pipeline (rubric 4.2)."""
 
-    def __init__(self, message: str, *, lease_state: LeaseState | None = None):
+    def __init__(self, message: str, *, lease_state: LeaseReceipt | None = None):
         super().__init__(message)
-        if lease_state is not None and type(lease_state) is not LeaseState:
-            raise TypeError("lease_state must be a LeaseState")
+        if lease_state is not None and type(lease_state) is not LeaseReceipt:
+            raise TypeError("lease_state must be a LeaseReceipt")
         # Expiry timestamps and runner wording change on every retry.  The alert
         # occurrence comes from the durable ownership identity instead, so repeated
         # contenders for one live lease remain one operator incident.

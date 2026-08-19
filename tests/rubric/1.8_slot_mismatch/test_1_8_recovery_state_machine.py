@@ -106,6 +106,14 @@ class _World:
         return recovery_mod.read(self.con, pipeline=PIPELINE, namespace=NAMESPACE)
 
     def begin(self, decision: str = "slot_ahead_of_destination"):
+        slot_receipt = dest_mod.write_slot_state(
+            self.con,
+            pipeline=PIPELINE,
+            slot_name="cdc_slot",
+            observation={},
+            verdict="fresh_start" if decision == recovery_mod.RESET_DECISION else decision,
+            verdict_message="the slot is ahead of the destination",
+        )
         return recovery_mod.begin(
             self.con,
             pipeline=PIPELINE,
@@ -116,6 +124,7 @@ class _World:
             offset_path=self.offset_path,
             captured_tables=TABLES,
             forget_catalog=False,
+            slot_receipt=slot_receipt,
         )
 
     def resume(self, *, crash_before: str | None = None):
@@ -380,6 +389,14 @@ def test_a_forgotten_catalog_is_part_of_the_same_transaction(world):
         "VALUES (?, 'app', 'customers', 1234, true, now(), now())",
         [PIPELINE],
     )
+    slot_receipt = dest_mod.write_slot_state(
+        world.con,
+        pipeline=PIPELINE,
+        slot_name="cdc_slot",
+        observation={},
+        verdict="source_timeline_changed",
+        verdict_message="the timeline forked",
+    )
     recovery_mod.begin(
         world.con,
         pipeline=PIPELINE,
@@ -390,6 +407,7 @@ def test_a_forgotten_catalog_is_part_of_the_same_transaction(world):
         offset_path=world.offset_path,
         captured_tables=TABLES,
         forget_catalog=True,
+        slot_receipt=slot_receipt,
     )
     remaining = world.con.execute(
         "SELECT count(*) FROM _cdc_flight.source_relations WHERE pipeline = ?",
@@ -497,6 +515,14 @@ def test_the_heartbeat_table_declared_by_the_adr_actually_exists(world):
 # Codex r2 BLOCKER-1 — a journal may only clear over POSITIVE terminal evidence
 # --------------------------------------------------------------------------- #
 def _armed_journal(world, *, decision: str, captured: list[tuple[str, str, str]]):
+    slot_receipt = dest_mod.write_slot_state(
+        world.con,
+        pipeline=PIPELINE,
+        slot_name="cdc_slot",
+        observation={},
+        verdict="fresh_start" if decision == recovery_mod.RESET_DECISION else decision,
+        verdict_message="a test",
+    )
     record = recovery_mod.begin(
         world.con,
         pipeline=PIPELINE,
@@ -507,6 +533,7 @@ def _armed_journal(world, *, decision: str, captured: list[tuple[str, str, str]]
         offset_path=Path("/tmp/does-not-matter"),
         captured_tables=captured,
         forget_catalog=False,
+        slot_receipt=slot_receipt,
     )
     world.con.execute(
         "UPDATE _cdc_flight.recovery_state SET phase = 'armed' WHERE pipeline = ?",

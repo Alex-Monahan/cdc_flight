@@ -58,7 +58,12 @@ from .config import (
     lease_ttl_seconds,
 )
 from .debezium_props import assert_no_internal_topic_collision, build_properties
-from .destination import EpisodeState, Lease, OccurrenceKey, RunState, SlotState
+from .destination import (
+    EpisodeReceipt,
+    Lease,
+    OccurrenceKey,
+    RunState,
+)
 from .errors import (
     AlertPersistenceFailure,
     EngineFailure,
@@ -382,6 +387,21 @@ def run(
         # `resume()` performs the file / row / slot ladder, idempotently, from whatever
         # phase survives.
         if reconciliation.decision == "orphan_accepted_resnapshot" and journal is None:
+            previous_slot = dest_mod.read_slot_state(
+                con,
+                dest.pipeline_name,
+                replication.slot_name,
+                control_schema=control_schema,
+            )
+            slot_receipt = dest_mod.write_slot_state(
+                con,
+                pipeline=dest.pipeline_name,
+                slot_name=replication.slot_name,
+                observation=previous_slot.as_dict() if previous_slot is not None else {},
+                verdict="no_durable_destination_row",
+                verdict_message="an operator accepted the orphan offsets resnapshot",
+                control_schema=control_schema,
+            )
             journal = recovery_mod.begin(
                 con,
                 pipeline=dest.pipeline_name,
@@ -396,6 +416,7 @@ def run(
                 offset_path=replication.offset_file,
                 captured_tables=captured_tables,
                 forget_catalog=False,
+                slot_receipt=slot_receipt,
                 context={"file_lsn": reconciliation.file_lsn},
                 control_schema=control_schema,
             )
@@ -1115,15 +1136,19 @@ def _record_run_failure_alert(
         slot_check = summary["slot_check"]
         condition_key = code
         slot_name = slot_check.get("slot_name")
-        occurrence_key = (
-            OccurrenceKey.from_slot_state(
-                SlotState.from_mapping(
-                    slot_check,
-                    decision=code,
-                    slot_name=slot_name,
-                )
+        slot_receipt = (
+            dest_mod.read_slot_state(
+                con,
+                dest.pipeline_name,
+                slot_name,
+                control_schema=dest.control_schema,
             )
             if isinstance(slot_name, str) and slot_name.strip()
+            else None
+        )
+        occurrence_key = (
+            OccurrenceKey.from_slot_state(slot_receipt)
+            if slot_receipt is not None
             else OccurrenceKey.from_run(run_state)
         )
     elif summary.get("stop_reason") == "source_dark":
@@ -1145,14 +1170,14 @@ def _record_run_failure_alert(
             log.critical("could not persist the source-dark episode", exc_info=True)
         episode_id = (
             source_health_episode.episode_id
-            if isinstance(source_health_episode, EpisodeState)
+            if isinstance(source_health_episode, EpisodeReceipt)
             else None
         )
         summary["source_health_episode"] = episode_id
         condition_key = code
         occurrence_key = (
             OccurrenceKey.from_episode(source_health_episode)
-            if isinstance(source_health_episode, EpisodeState)
+            if isinstance(source_health_episode, EpisodeReceipt)
             else OccurrenceKey.from_run(run_state)
         )
     elif summary.get("stop_reason") in {"max_seconds", "engine_error", "hung"}:
@@ -1198,7 +1223,7 @@ def _record_run_failure_alert(
                     "stop_reason": summary.get("stop_reason"),
                     "source_health_episode": (
                         source_health_episode.as_dict()
-                        if isinstance(source_health_episode, EpisodeState)
+                        if isinstance(source_health_episode, EpisodeReceipt)
                         else source_health_episode
                     ),
                 },

@@ -33,6 +33,7 @@ from .errors import (
 )
 from .machines import SLOT_VERDICTS
 from .naming import control_table
+from .occurrence import SlotStateReceipt
 from .offsets import Reconciliation, reconcile
 
 __all__ = ["Reconciliation", "reconcile"]
@@ -502,6 +503,7 @@ def recover_by_full_resnapshot(
     offset_path: Path,
     verdict: SlotVerdict,
     captured_tables: list[tuple[str, str, str]],
+    slot_receipt: SlotStateReceipt,
     forget_catalog: bool = False,
     on_phase=None,
     control_schema: str | None = None,
@@ -537,6 +539,7 @@ def recover_by_full_resnapshot(
         offset_path=Path(offset_path),
         captured_tables=captured_tables,
         forget_catalog=forget_catalog,
+        slot_receipt=slot_receipt,
         context=verdict.as_dict(),
         control_schema=control_schema,
     )

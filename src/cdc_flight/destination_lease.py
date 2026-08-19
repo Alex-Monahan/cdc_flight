@@ -12,7 +12,7 @@ from datetime import datetime
 
 from . import destination as _d
 from .errors import LeaseLost
-from .occurrence import LeaseState
+from .occurrence import LeaseState, _lease_receipt_from_durable
 from .retirement import RetirementResult, retire_handle
 
 log = _d.log
@@ -86,16 +86,19 @@ class Lease:
                 )
                 live = False
             if live:
+                lease_receipt = _lease_receipt_from_durable(
+                    LeaseState(
+                        pipeline=self.pipeline,
+                        owner_id=str(owner),
+                        operation="acquire",
+                    )
+                )
                 raise LeaseLost(
                     f"pipeline {self.name!r} is already leased by runner {owner} "
                     f"(pid {pid} on {host}) until {expires_at.isoformat()}; a second "
                     "concurrent Flight would double-write the shared destination "
                     f"(lease key {self.pipeline!r}, rubric 4.2)",
-                    lease_state=LeaseState(
-                        pipeline=self.pipeline,
-                        owner_id=str(owner),
-                        operation="acquire",
-                    ),
+                    lease_state=lease_receipt,
                 )
         self._upsert(con, current)
 
@@ -108,14 +111,17 @@ class Lease:
             [self.pipeline],
         ).fetchall()
         if rows and rows[0][0] != self.owner_id:
-            raise LeaseLost(
-                f"lease for {self.name!r} was taken by runner {rows[0][0]}; "
-                "this commit group must not be applied (rubric 4.2)",
-                lease_state=LeaseState(
+            lease_receipt = _lease_receipt_from_durable(
+                LeaseState(
                     pipeline=self.pipeline,
                     owner_id=str(rows[0][0]),
                     operation="renew",
-                ),
+                )
+            )
+            raise LeaseLost(
+                f"lease for {self.name!r} was taken by runner {rows[0][0]}; "
+                "this commit group must not be applied (rubric 4.2)",
+                lease_state=lease_receipt,
             )
         self._upsert(con, now())
 

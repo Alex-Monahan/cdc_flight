@@ -67,7 +67,7 @@ from .backfill import (
 from .catalog_apply import CatalogCoordinator, CatalogPlan
 from .commit_group import CommitResult, OpenGroup
 from .config import ApplierConfig, resolve_control_schema
-from .destination import AlertSink, CommitState, Lease, OccurrenceKey, ResumePoint
+from .destination import AlertSink, Lease, OccurrenceKey, ResumePoint
 from .envelope import (
     KIND_HEARTBEAT,
     KIND_SNAPSHOT_BOUNDARY,
@@ -83,6 +83,7 @@ from .errors import (
 )
 from .faults import maybe_crash
 from .marker_accounting import SourceMarkerReceiptCounter
+from .occurrence import _commit_reservation
 from .snapshot import SnapshotCoordinator
 from .snapshot_completion import (
     SnapshotCompletion,
@@ -828,7 +829,7 @@ class Applier:
             ),
             condition_key="commit_timeout",
             occurrence_key=OccurrenceKey.from_commit(
-                CommitState(pipeline=self.pipeline, commit_id=commit_id)
+                _commit_reservation(self.pipeline, commit_id)
             ),
             context={
                 "commit_id": commit_id,
@@ -849,7 +850,7 @@ class Applier:
             code="commit_timeout",
             condition_key="commit_timeout",
             occurrence_key=OccurrenceKey.from_commit(
-                CommitState(pipeline=self.pipeline, commit_id=commit_id)
+                _commit_reservation(self.pipeline, commit_id)
             ),
         )
 

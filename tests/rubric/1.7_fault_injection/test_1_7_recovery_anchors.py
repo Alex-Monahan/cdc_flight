@@ -149,6 +149,14 @@ class _World:
         return recovery_mod.read(self.con, pipeline=PIPELINE, namespace=NAMESPACE)
 
     def begin(self):
+        slot_receipt = dest_mod.write_slot_state(
+            self.con,
+            pipeline=PIPELINE,
+            slot_name="cdc_slot",
+            observation={},
+            verdict="slot_ahead_of_destination",
+            verdict_message="the slot is ahead of the destination",
+        )
         return recovery_mod.begin(
             self.con,
             pipeline=PIPELINE,
@@ -159,6 +167,7 @@ class _World:
             offset_path=self.offset_path,
             captured_tables=TABLES,
             forget_catalog=False,
+            slot_receipt=slot_receipt,
         )
 
     def resume(self):

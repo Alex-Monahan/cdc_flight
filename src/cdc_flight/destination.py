@@ -32,7 +32,7 @@ from .machines import (
     SLOT_VERDICTS,  # noqa: F401
 )
 from .naming import control_table, quote
-from .occurrence import OffsetRowState
+from .occurrence import OffsetRowState, _offset_row_receipt_from_durable
 
 # Re-exported: `source_relations.py` is a split of this module, not a new dependency
 # for its callers (Codex r3 MINOR / the destination ownership split).
@@ -274,13 +274,14 @@ def read_resume_point(
         last_lsn=int(last_lsn or 0),
         updated_at=updated_at,
     )
+    offset_receipt = _offset_row_receipt_from_durable(offset_row)
     try:
         point = ResumePoint.from_json(resume_json)
     except OffsetUnusable as exc:
         raise OffsetUnusable(
             f"durable resume point for pipeline={pipeline!r}, namespace={namespace!r} "
             f"is unusable: {exc}",
-            offset_row=offset_row,
+            offset_row=offset_receipt,
         ) from exc
     point.commit_id = int(commit_id or 0)
     point.last_lsn = int(last_lsn or point.last_lsn or 0)
@@ -596,11 +597,16 @@ from .destination_refusals import (  # noqa: E402, F401
     schema_refusal_state,
 )
 from .occurrence import (  # noqa: E402, F401
-    CommitState,
+    CommitReservation,
+    EpisodeReceipt,
     EpisodeState,
+    LeaseReceipt,
     LeaseState,
     OccurrenceKey,
+    OffsetRowReceipt,
     RecoveryGeneration,
+    RecoveryJournalReceipt,
     RunState,
     SlotState,
+    SlotStateReceipt,
 )

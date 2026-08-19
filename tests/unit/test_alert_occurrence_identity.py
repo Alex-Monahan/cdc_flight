@@ -125,7 +125,9 @@ def test_raise_alert_once_requires_occurrence_at_runtime():
 def test_occurrence_key_has_no_text_constructor_or_string_factory():
     from cdc_flight.destination import (
         EpisodeState,
+        LeaseState,
         OccurrenceKey,
+        OffsetRowState,
         RecoveryGeneration,
         RunState,
         SlotState,
@@ -140,23 +142,35 @@ def test_occurrence_key_has_no_text_constructor_or_string_factory():
         lambda: OccurrenceKey.from_recovery_generation(raw),
         lambda: OccurrenceKey.from_run(raw),
         lambda: OccurrenceKey.from_slot_state(raw),
+        lambda: OccurrenceKey.from_offset_row(raw),
+        lambda: OccurrenceKey.from_lease(raw),
     )
     for factory in factories:
         with pytest.raises(TypeError):
             factory()
 
-    # The accepted inputs are state owners, not strings.  These objects are the
-    # same shapes used by the production paths below.
-    assert str(OccurrenceKey.from_episode(EpisodeState("p", 1, "dark"))) == "episode:1"
-    assert str(
-        OccurrenceKey.from_recovery_generation(
-            RecoveryGeneration("p", "main", "generation-1", "slot_missing")
-        )
-    ) == "recovery:generation-1"
+    # Raw durable state is rejected even when it has the right fields. A receipt
+    # returned by the successful durable writer/read boundary is now mandatory.
+    raw_states = (
+        EpisodeState("p", 1, "dark"),
+        RecoveryGeneration("p", "main", "generation-1", "slot_missing"),
+        SlotState("slot_missing", "slot"),
+        OffsetRowState("p", "main", "{}", 1, 1, 1, None),
+        LeaseState("p", "owner", "acquire"),
+    )
+    factories = (
+        OccurrenceKey.from_episode,
+        OccurrenceKey.from_recovery_generation,
+        OccurrenceKey.from_slot_state,
+        OccurrenceKey.from_offset_row,
+        OccurrenceKey.from_lease,
+    )
+    for factory, state in zip(factories, raw_states, strict=True):
+        with pytest.raises(TypeError, match="receipt"):
+            factory(state)
+
+    # The run-owned UUID is deliberately the one durable-free exception.
     assert str(OccurrenceKey.from_run(RunState.new("p"))).startswith("run:")
-    assert str(
-        OccurrenceKey.from_slot_state(SlotState("slot_missing", "slot"))
-    ).startswith("slot-state:")
 
 
 def test_runtime_type_gate_closes_every_alias_and_raw_value_defeat():
@@ -220,7 +234,7 @@ def test_fingerprint_conditions_are_distinct_per_occurrence_and_idempotent(tmp_p
 
     from cdc_flight.config import DestinationConfig
     from cdc_flight.control_schema import ensure_control_schema
-    from cdc_flight.destination import OffsetRowState, RunState
+    from cdc_flight.destination import OffsetRowState, RunState, read_resume_point
     from cdc_flight.errors import OffsetUnusable
     from cdc_flight.pipeline import _record_run_failure_alert
 
@@ -233,7 +247,7 @@ def test_fingerprint_conditions_are_distinct_per_occurrence_and_idempotent(tmp_p
         (
             "offset_unusable",
             {"stop_reason": "error"},
-            lambda row: OffsetUnusable("identical malformed row", offset_row=row),
+            None,
         ),
         (
             "run_failure",
@@ -270,11 +284,35 @@ def test_fingerprint_conditions_are_distinct_per_occurrence_and_idempotent(tmp_p
             )
             first_run = RunState.new(dest.pipeline_name)
             second_run = RunState.new(dest.pipeline_name)
+            if code == "offset_unusable":
+                con.execute(
+                    "DELETE FROM _cdc_flight.debezium_offsets "
+                    "WHERE pipeline = ? AND namespace = ?",
+                    [dest.pipeline_name, "main"],
+                )
+                con.execute(
+                    "INSERT INTO _cdc_flight.debezium_offsets "
+                    "(pipeline, namespace, resume_json, commit_id, last_lsn, "
+                    "snapshot_epoch, updated_at) VALUES (?,?,?,?,?,?,now())",
+                    [
+                        dest.pipeline_name,
+                        "main",
+                        first_state.resume_json,
+                        first_state.commit_id,
+                        first_state.last_lsn,
+                        first_state.snapshot_epoch,
+                    ],
+                )
+                with pytest.raises(OffsetUnusable) as raised:
+                    read_resume_point(con, dest.pipeline_name, "main")
+                first_exc = raised.value
+            else:
+                first_exc = make_exc(first_state)
             _record_run_failure_alert(
                 con,
                 dest=dest,
                 run_state=first_run,
-                exc=make_exc(first_state),
+                exc=first_exc,
                 summary=dict(summary),
             )
             # A repeated observation of the same occurrence is idempotent, even
@@ -283,16 +321,40 @@ def test_fingerprint_conditions_are_distinct_per_occurrence_and_idempotent(tmp_p
                 con,
                 dest=dest,
                 run_state=first_run,
-                exc=make_exc(first_state),
+                exc=first_exc,
                 summary=dict(summary),
             )
             # A new durable run/generation after recovery must be visible even when
             # its exception text and condition fingerprint are identical.
+            if code == "offset_unusable":
+                con.execute(
+                    "DELETE FROM _cdc_flight.debezium_offsets "
+                    "WHERE pipeline = ? AND namespace = ?",
+                    [dest.pipeline_name, "main"],
+                )
+                con.execute(
+                    "INSERT INTO _cdc_flight.debezium_offsets "
+                    "(pipeline, namespace, resume_json, commit_id, last_lsn, "
+                    "snapshot_epoch, updated_at) VALUES (?,?,?,?,?,?,now())",
+                    [
+                        dest.pipeline_name,
+                        "main",
+                        second_state.resume_json,
+                        second_state.commit_id,
+                        second_state.last_lsn,
+                        second_state.snapshot_epoch,
+                    ],
+                )
+                with pytest.raises(OffsetUnusable) as raised:
+                    read_resume_point(con, dest.pipeline_name, "main")
+                second_exc = raised.value
+            else:
+                second_exc = make_exc(second_state)
             _record_run_failure_alert(
                 con,
                 dest=dest,
                 run_state=second_run,
-                exc=make_exc(second_state),
+                exc=second_exc,
                 summary=dict(summary),
             )
 
