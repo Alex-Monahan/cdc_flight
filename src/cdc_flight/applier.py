@@ -829,7 +829,8 @@ class Applier:
             ),
             condition_key="commit_timeout",
             occurrence_key=OccurrenceKey.from_commit(
-                _commit_reservation(self.pipeline, commit_id)
+                _commit_reservation(self.pipeline, commit_id),
+                pipeline=self.pipeline,
             ),
             context={
                 "commit_id": commit_id,
@@ -850,7 +851,8 @@ class Applier:
             code="commit_timeout",
             condition_key="commit_timeout",
             occurrence_key=OccurrenceKey.from_commit(
-                _commit_reservation(self.pipeline, commit_id)
+                _commit_reservation(self.pipeline, commit_id),
+                pipeline=self.pipeline,
             ),
         )
 

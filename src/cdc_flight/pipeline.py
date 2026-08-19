@@ -1117,18 +1117,24 @@ def _record_run_failure_alert(
         # the holder/pipeline identity separately from its changing expiry text.
         condition_key = code
         occurrence_key = (
-            OccurrenceKey.from_lease(exc.lease_state)
+            OccurrenceKey.from_lease(
+                exc.lease_state, pipeline=dest.pipeline_name
+            )
             if isinstance(exc, LeaseLost) and exc.lease_state is not None
-            else OccurrenceKey.from_run(run_state)
+            else OccurrenceKey.from_run(run_state, pipeline=dest.pipeline_name)
         )
     elif isinstance(exc, OffsetUnusable):
         code = "offset_unusable"
         severity = "critical"
         condition_key = f"{code}:{hashlib.sha256(str(exc).encode()).hexdigest()}"
         occurrence_key = (
-            OccurrenceKey.from_offset_row(exc.offset_row)
+            OccurrenceKey.from_offset_row(
+                exc.offset_row,
+                pipeline=dest.pipeline_name,
+                namespace=exc.offset_row.state.namespace,
+            )
             if exc.offset_row is not None
-            else OccurrenceKey.from_run(run_state)
+            else OccurrenceKey.from_run(run_state, pipeline=dest.pipeline_name)
         )
     elif summary.get("slot_check"):
         code = str(summary["slot_check"].get("decision") or "slot_check_failed")
@@ -1147,9 +1153,13 @@ def _record_run_failure_alert(
             else None
         )
         occurrence_key = (
-            OccurrenceKey.from_slot_state(slot_receipt)
+            OccurrenceKey.from_slot_state(
+                slot_receipt,
+                pipeline=dest.pipeline_name,
+                slot_name=slot_name,
+            )
             if slot_receipt is not None
-            else OccurrenceKey.from_run(run_state)
+            else OccurrenceKey.from_run(run_state, pipeline=dest.pipeline_name)
         )
     elif summary.get("stop_reason") == "source_dark":
         code = "source_dark"
@@ -1176,9 +1186,11 @@ def _record_run_failure_alert(
         summary["source_health_episode"] = episode_id
         condition_key = code
         occurrence_key = (
-            OccurrenceKey.from_episode(source_health_episode)
+            OccurrenceKey.from_episode(
+                source_health_episode, pipeline=dest.pipeline_name
+            )
             if isinstance(source_health_episode, EpisodeReceipt)
-            else OccurrenceKey.from_run(run_state)
+            else OccurrenceKey.from_run(run_state, pipeline=dest.pipeline_name)
         )
     elif summary.get("stop_reason") in {"max_seconds", "engine_error", "hung"}:
         code = "run_incomplete"
@@ -1187,12 +1199,16 @@ def _record_run_failure_alert(
             f"{code}:{hashlib.sha256(str(exc).encode()).hexdigest()}:"
             f"{summary.get('stop_reason')}"
         )
-        occurrence_key = OccurrenceKey.from_run(run_state)
+        occurrence_key = OccurrenceKey.from_run(
+            run_state, pipeline=dest.pipeline_name
+        )
     else:
         code = "run_failure"
         severity = "critical"
         condition_key = f"{code}:{hashlib.sha256(str(exc).encode()).hexdigest()}"
-        occurrence_key = OccurrenceKey.from_run(run_state)
+        occurrence_key = OccurrenceKey.from_run(
+            run_state, pipeline=dest.pipeline_name
+        )
     message = (
         f"cdc_flight run for pipeline {dest.pipeline_name!r} failed before it could "
         f"claim success: {type(exc).__name__}: {exc}"

@@ -112,10 +112,16 @@ class SlotState:
     confirmed_flush_lsn: Any = None
     current_wal_lsn: Any = None
     durable_lsn: Any = None
+    # Added after the original state shape so raw-state callers that only want to
+    # describe a slot remain source-compatible.  A receipt can only be issued when
+    # this is populated by the pipeline-owned writer/read boundary.
+    pipeline: str | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.decision, name="decision")
         _require_text(self.slot_name, name="slot_name")
+        if self.pipeline is not None:
+            _require_text(self.pipeline, name="pipeline")
 
     @classmethod
     def from_mapping(
@@ -124,6 +130,7 @@ class SlotState:
         *,
         decision: str,
         slot_name: str,
+        pipeline: str | None = None,
     ) -> SlotState:
         """Capture the actual slot verdict mapping, not an exception string."""
         return cls(
@@ -135,6 +142,7 @@ class SlotState:
             confirmed_flush_lsn=state.get("confirmed_flush_lsn"),
             current_wal_lsn=state.get("current_wal_lsn"),
             durable_lsn=state.get("durable_lsn"),
+            pipeline=pipeline,
         )
 
 
@@ -185,6 +193,10 @@ class CommitReservation:
     @property
     def commit_id(self) -> int:
         return self._commit_id
+
+    @property
+    def pipeline(self) -> str:
+        return self._pipeline
 
 
 def _commit_reservation(pipeline: str, commit_id: int) -> CommitReservation:
@@ -326,6 +338,8 @@ def _issue_receipt(receipt_type: type[_DurableReceipt], state: object, details=N
         LeaseReceipt: LeaseState,
     }[receipt_type]
     _require_state(state, expected, receipt_type.__name__)
+    if receipt_type is SlotStateReceipt and not isinstance(state.pipeline, str):
+        raise ValueError("SlotStateReceipt requires a pipeline-bound slot state")
     instance = object.__new__(receipt_type)
     object.__setattr__(instance, "_state", state)
     object.__setattr__(
@@ -339,8 +353,10 @@ def _issue_receipt(receipt_type: type[_DurableReceipt], state: object, details=N
 # These are intentionally private: there is no public ``from_state`` or string
 # helper on any receipt.  The callers are the state-owning write/read boundaries,
 # and they invoke these only after the durable operation has succeeded.
-def _episode_receipt_after_durable(state: EpisodeState) -> EpisodeReceipt:
-    return _issue_receipt(EpisodeReceipt, state)
+def _episode_receipt_after_durable(
+    state: EpisodeState, details: Mapping[str, Any] | None = None
+) -> EpisodeReceipt:
+    return _issue_receipt(EpisodeReceipt, state, details)
 
 
 def _recovery_journal_receipt_after_commit(
@@ -361,8 +377,10 @@ def _offset_row_receipt_from_durable(
     return _issue_receipt(OffsetRowReceipt, state)
 
 
-def _lease_receipt_from_durable(state: LeaseState) -> LeaseReceipt:
-    return _issue_receipt(LeaseReceipt, state)
+def _lease_receipt_from_durable(
+    state: LeaseState, details: Mapping[str, Any] | None = None
+) -> LeaseReceipt:
+    return _issue_receipt(LeaseReceipt, state, details)
 
 
 class OccurrenceKey:
@@ -375,7 +393,7 @@ class OccurrenceKey:
     occurrence. ``from_run`` is the intentional run-owned exception.
     """
 
-    __slots__ = ("_text",)
+    __slots__ = ("_binding", "_text")
 
     def __new__(cls, *args: object, **kwargs: object) -> OccurrenceKey:
         raise TypeError(
@@ -386,37 +404,87 @@ class OccurrenceKey:
         raise AttributeError("OccurrenceKey is immutable")
 
     @classmethod
-    def from_episode(cls, receipt: EpisodeReceipt) -> OccurrenceKey:
-        _require_receipt(receipt, EpisodeReceipt, "from_episode")
+    def _from_binding(cls, text: str, binding: tuple[Any, ...]) -> OccurrenceKey:
         instance = object.__new__(cls)
-        object.__setattr__(instance, "_text", f"episode:{receipt.state.episode_id}")
+        object.__setattr__(instance, "_text", text)
+        object.__setattr__(instance, "_binding", binding)
         return instance
 
     @classmethod
+    def from_episode(
+        cls, receipt: EpisodeReceipt, *, pipeline: str | None = None
+    ) -> OccurrenceKey:
+        _require_receipt(receipt, EpisodeReceipt, "from_episode")
+        bound_pipeline = _bound_pipeline(receipt.state.pipeline, pipeline, "from_episode")
+        owner = str(receipt.details.get("owner") or "source_health")
+        path = receipt.details.get("path")
+        return cls._from_binding(
+            f"episode:{receipt.state.episode_id}",
+            (
+                "episode",
+                owner,
+                bound_pipeline,
+                receipt.state.episode_id,
+                receipt.state.state,
+                str(path) if path is not None else None,
+            ),
+        )
+
+    @classmethod
     def from_recovery_generation(
-        cls, receipt: RecoveryJournalReceipt
+        cls,
+        receipt: RecoveryJournalReceipt,
+        *,
+        pipeline: str | None = None,
+        namespace: str | None = None,
     ) -> OccurrenceKey:
         _require_receipt(
             receipt, RecoveryJournalReceipt, "from_recovery_generation"
         )
-        instance = object.__new__(cls)
-        object.__setattr__(instance, "_text", f"recovery:{receipt.state.recovery_id}")
-        return instance
+        bound_pipeline = _bound_pipeline(
+            receipt.state.pipeline, pipeline, "from_recovery_generation"
+        )
+        bound_namespace = _bound_text(
+            receipt.state.namespace, namespace, "namespace", "from_recovery_generation"
+        )
+        return cls._from_binding(
+            f"recovery:{receipt.state.recovery_id}",
+            (
+                "recovery",
+                bound_pipeline,
+                bound_namespace,
+                receipt.state.recovery_id,
+                receipt.state.decision,
+            ),
+        )
 
     @classmethod
-    def from_run(cls, run: RunState) -> OccurrenceKey:
+    def from_run(
+        cls, run: RunState, *, pipeline: str | None = None
+    ) -> OccurrenceKey:
         _require_state(run, RunState, "from_run")
-        instance = object.__new__(cls)
-        object.__setattr__(instance, "_text", f"run:{run.runner_id}")
-        return instance
+        bound_pipeline = _bound_pipeline(run.pipeline, pipeline, "from_run")
+        return cls._from_binding(
+            f"run:{run.runner_id}", ("run", bound_pipeline, run.runner_id)
+        )
 
     @classmethod
-    def from_slot_state(cls, receipt: SlotStateReceipt) -> OccurrenceKey:
+    def from_slot_state(
+        cls,
+        receipt: SlotStateReceipt,
+        *,
+        pipeline: str | None = None,
+        slot_name: str | None = None,
+    ) -> OccurrenceKey:
         _require_receipt(receipt, SlotStateReceipt, "from_slot_state")
         state = receipt.state
+        bound_pipeline = _bound_pipeline(state.pipeline, pipeline, "from_slot_state")
+        bound_slot = _bound_text(
+            state.slot_name, slot_name, "slot_name", "from_slot_state"
+        )
         parts = (
             state.decision,
-            state.slot_name,
+            bound_slot,
             state.system_identifier,
             state.timeline_id,
             state.restart_lsn,
@@ -424,48 +492,103 @@ class OccurrenceKey:
             state.current_wal_lsn,
             state.durable_lsn,
         )
-        instance = object.__new__(cls)
-        object.__setattr__(
-            instance, "_text", "slot-state:" + ":".join(str(value) for value in parts)
+        return cls._from_binding(
+            "slot-state:" + ":".join(str(value) for value in parts),
+            (
+                "slot",
+                bound_pipeline,
+                bound_slot,
+                state.decision,
+                state.system_identifier,
+                state.timeline_id,
+                state.restart_lsn,
+                state.confirmed_flush_lsn,
+                state.current_wal_lsn,
+                state.durable_lsn,
+            ),
         )
-        return instance
 
     @classmethod
-    def from_offset_row(cls, receipt: OffsetRowReceipt) -> OccurrenceKey:
+    def from_offset_row(
+        cls,
+        receipt: OffsetRowReceipt,
+        *,
+        pipeline: str | None = None,
+        namespace: str | None = None,
+    ) -> OccurrenceKey:
         _require_receipt(receipt, OffsetRowReceipt, "from_offset_row")
         row = receipt.state
+        bound_pipeline = _bound_pipeline(row.pipeline, pipeline, "from_offset_row")
+        bound_namespace = _bound_text(
+            row.namespace, namespace, "namespace", "from_offset_row"
+        )
         resume_digest = hashlib.sha256(row.resume_json.encode("utf-8")).hexdigest()
         updated = (
             row.updated_at.isoformat()
             if hasattr(row.updated_at, "isoformat")
             else str(row.updated_at)
         )
-        instance = object.__new__(cls)
-        object.__setattr__(
-            instance,
-            "_text",
+        return cls._from_binding(
             f"offset-row:{row.pipeline}:{row.namespace}:commit:{row.commit_id}:"
             f"snapshot:{row.snapshot_epoch}:last-lsn:{row.last_lsn}:updated:{updated}:"
             f"state:{resume_digest}",
+            (
+                "offset",
+                bound_pipeline,
+                bound_namespace,
+                row.commit_id,
+                row.snapshot_epoch,
+                row.last_lsn,
+                updated,
+                resume_digest,
+            ),
         )
-        return instance
 
     @classmethod
-    def from_commit(cls, reservation: CommitReservation) -> OccurrenceKey:
+    def from_commit(
+        cls, reservation: CommitReservation, *, pipeline: str | None = None
+    ) -> OccurrenceKey:
         _require_receipt(reservation, CommitReservation, "from_commit")
-        instance = object.__new__(cls)
-        object.__setattr__(instance, "_text", f"commit:{reservation.commit_id}")
-        return instance
+        bound_pipeline = _bound_pipeline(
+            reservation.pipeline, pipeline, "from_commit"
+        )
+        return cls._from_binding(
+            f"commit:{reservation.commit_id}",
+            ("commit", bound_pipeline, reservation.commit_id),
+        )
 
     @classmethod
-    def from_lease(cls, receipt: LeaseReceipt) -> OccurrenceKey:
+    def from_lease(
+        cls,
+        receipt: LeaseReceipt,
+        *,
+        pipeline: str | None = None,
+        owner_id: str | None = None,
+    ) -> OccurrenceKey:
         _require_receipt(receipt, LeaseReceipt, "from_lease")
         lease = receipt.state
-        instance = object.__new__(cls)
-        object.__setattr__(
-            instance, "_text", f"{lease.operation}:{lease.pipeline}:{lease.owner_id}"
+        bound_pipeline = _bound_pipeline(lease.pipeline, None, "from_lease")
+        alert_pipeline = str(
+            receipt.details.get("alert_pipeline") or lease.pipeline
         )
-        return instance
+        bound_alert_pipeline = _bound_text(
+            alert_pipeline, pipeline, "pipeline", "from_lease"
+        )
+        bound_owner = _bound_text(
+            lease.owner_id, owner_id, "owner_id", "from_lease"
+        )
+        lease_stamp = _stable_value(receipt.details.get("acquired_at"))
+        return cls._from_binding(
+            f"{lease.operation}:{lease.pipeline}:{lease.owner_id}",
+            (
+                "lease",
+                bound_alert_pipeline,
+                bound_pipeline,
+                bound_owner,
+                lease.operation,
+                lease_stamp,
+            ),
+        )
 
     @property
     def text(self) -> str:
@@ -478,10 +601,14 @@ class OccurrenceKey:
         return f"OccurrenceKey({self._text!r})"
 
     def __hash__(self) -> int:
-        return hash(self._text)
+        return hash((self._text, self._binding))
 
     def __eq__(self, other: object) -> bool:
-        return type(other) is type(self) and self._text == other._text
+        return (
+            type(other) is type(self)
+            and self._text == other._text
+            and self._binding == other._binding
+        )
 
 
 def _require_state(value: object, expected: type, factory: str) -> None:
@@ -497,6 +624,47 @@ def _require_receipt(
             f"OccurrenceKey.{factory} requires {expected.__name__}; "
             "the durable write receipt is missing"
         )
+
+
+def _stable_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def _bound_text(
+    actual: str, expected: str | None, name: str, factory: str
+) -> str:
+    if expected is not None:
+        _require_text(expected, name=name)
+        if expected != actual:
+            raise ValueError(
+                f"OccurrenceKey.{factory} receipt names {name}={actual!r}, "
+                f"not {expected!r}"
+            )
+    return actual
+
+
+def _bound_pipeline(actual: str | None, expected: str | None, factory: str) -> str:
+    if not isinstance(actual, str) or not actual.strip():
+        raise TypeError(
+            f"OccurrenceKey.{factory} requires a receipt bound to a pipeline"
+        )
+    return _bound_text(actual, expected, "pipeline", factory)
+
+
+def _occurrence_binding(value: object) -> tuple[Any, ...]:
+    """Return the factory-owned binding for the alert boundary.
+
+    This is intentionally an internal nominal gate.  It exposes no constructor or
+    setter; ordinary callers can only obtain the tuple from a key already minted by
+    one of the factories above.
+    """
+    if type(value) is not OccurrenceKey:
+        raise TypeError("occurrence_key must be an OccurrenceKey")
+    return value._binding
 
 
 def occurrence_text(value: object) -> str:
@@ -520,5 +688,6 @@ __all__ = [
     "RunState",
     "SlotState",
     "SlotStateReceipt",
+    "_occurrence_binding",
     "occurrence_text",
 ]

@@ -74,7 +74,7 @@ from pathlib import Path
 
 from . import catalog_baseline, table_lifecycle
 from .config import resolve_control_schema
-from .destination import now, raise_alert_once, request_snapshot
+from .destination import now, raise_alert_once, read_slot_state, request_snapshot
 from .errors import RecoveryFailed
 from .faults import arrival, matrix_crash, maybe_crash, runtime_state
 from .machines import (
@@ -306,6 +306,9 @@ def clear(
 
 def _prejournal_occurrence(
     slot_receipt: SlotStateReceipt,
+    *,
+    pipeline: str,
+    slot_name: str,
 ) -> OccurrenceKey:
     """Return the retry-stable identity for a recovery with no journal yet.
 
@@ -313,7 +316,9 @@ def _prejournal_occurrence(
     the already committed slot observation rather than the fresh recovery UUID, because
     that UUID is not durable until the journal transaction commits.
     """
-    return OccurrenceKey.from_slot_state(slot_receipt)
+    return OccurrenceKey.from_slot_state(
+        slot_receipt, pipeline=pipeline, slot_name=slot_name
+    )
 
 
 def _alert_identity(condition_key: str, occurrence_key: OccurrenceKey) -> str:
@@ -435,11 +440,25 @@ def begin(
     condition_key = decision
     if type(slot_receipt) is not SlotStateReceipt:
         raise TypeError("slot_receipt must be a SlotStateReceipt")
+    if slot_receipt.state.pipeline != pipeline:
+        raise ValueError(
+            "slot_receipt belongs to a different pipeline than the recovery"
+        )
     if slot_receipt.state.slot_name != slot_name:
         raise ValueError(
             "slot_receipt names a different slot than the recovery being journaled"
         )
-    prejournal_key = _prejournal_occurrence(slot_receipt)
+    current_slot = read_slot_state(
+        con, pipeline, slot_name, control_schema=control_schema
+    )
+    if current_slot is None or current_slot.state != slot_receipt.state:
+        raise ValueError(
+            "slot_receipt is stale; the recovery must use the current committed "
+            "slot observation"
+        )
+    prejournal_key = _prejournal_occurrence(
+        slot_receipt, pipeline=pipeline, slot_name=slot_name
+    )
     pending_prejournal_alert = _pending_recovery_alert_exists(
         con,
         pipeline=pipeline,
@@ -535,7 +554,9 @@ def begin(
                     decision=decision,
                 )
             )
-            occurrence_key = OccurrenceKey.from_recovery_generation(journal_receipt)
+            occurrence_key = OccurrenceKey.from_recovery_generation(
+                journal_receipt, pipeline=pipeline, namespace=namespace
+            )
         raise_alert_once(
             con,
             pipeline=pipeline,

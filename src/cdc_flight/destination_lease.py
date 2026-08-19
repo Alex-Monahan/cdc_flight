@@ -62,14 +62,14 @@ class Lease:
 
     def acquire(self, con) -> None:
         rows = con.execute(
-            f"SELECT owner_id, expires_at, host, pid FROM "
+            f"SELECT owner_id, expires_at, host, pid, acquired_at, renewed_at FROM "
             f"{_control_table(self.control_schema, 'lease')} "
             "WHERE pipeline = ?",
             [self.pipeline],
         ).fetchall()
         current = now()
         if rows:
-            owner, expires_at, host, pid = rows[0]
+            owner, expires_at, host, pid, acquired_at, renewed_at = rows[0]
             live = owner != self.owner_id and expires_at is not None and expires_at > current
             if live and _is_dead(host, pid):
                 # A process that was SIGKILLed (or that fault injection `os._exit`ed)
@@ -86,13 +86,28 @@ class Lease:
                 )
                 live = False
             if live:
-                lease_receipt = _lease_receipt_from_durable(
-                    LeaseState(
-                        pipeline=self.pipeline,
-                        owner_id=str(owner),
-                        operation="acquire",
-                    )
+                committed_query = (
+                    f"SELECT owner_id, expires_at, host, pid, acquired_at, renewed_at FROM "
+                    f"{_control_table(self.control_schema, 'lease')} "
+                    "WHERE pipeline = ?"
                 )
+                lease_receipt = None
+                if _d._committed_row_matches(
+                    con, committed_query, [self.pipeline], rows[0]
+                ):
+                    lease_receipt = _lease_receipt_from_durable(
+                        LeaseState(
+                            pipeline=self.pipeline,
+                            owner_id=str(owner),
+                            operation="acquire",
+                        ),
+                        details={
+                            "alert_pipeline": self.label or self.pipeline,
+                            "acquired_at": acquired_at,
+                            "renewed_at": renewed_at,
+                            "expires_at": expires_at,
+                        },
+                    )
                 raise LeaseLost(
                     f"pipeline {self.name!r} is already leased by runner {owner} "
                     f"(pid {pid} on {host}) until {expires_at.isoformat()}; a second "
@@ -106,18 +121,34 @@ class Lease:
         """Renewed *inside* every commit group, so the loser of a race fails
         before it writes rather than after."""
         rows = con.execute(
-            f"SELECT owner_id FROM {_control_table(self.control_schema, 'lease')} "
+            f"SELECT owner_id, acquired_at, renewed_at, expires_at "
+            f"FROM {_control_table(self.control_schema, 'lease')} "
             "WHERE pipeline = ?",
             [self.pipeline],
         ).fetchall()
         if rows and rows[0][0] != self.owner_id:
-            lease_receipt = _lease_receipt_from_durable(
-                LeaseState(
-                    pipeline=self.pipeline,
-                    owner_id=str(rows[0][0]),
-                    operation="renew",
-                )
+            committed_query = (
+                f"SELECT owner_id, acquired_at, renewed_at, expires_at "
+                f"FROM {_control_table(self.control_schema, 'lease')} "
+                "WHERE pipeline = ?"
             )
+            lease_receipt = None
+            if _d._committed_row_matches(
+                con, committed_query, [self.pipeline], rows[0]
+            ):
+                lease_receipt = _lease_receipt_from_durable(
+                    LeaseState(
+                        pipeline=self.pipeline,
+                        owner_id=str(rows[0][0]),
+                        operation="renew",
+                    ),
+                    details={
+                        "alert_pipeline": self.label or self.pipeline,
+                        "acquired_at": rows[0][1],
+                        "renewed_at": rows[0][2],
+                        "expires_at": rows[0][3],
+                    },
+                )
             raise LeaseLost(
                 f"lease for {self.name!r} was taken by runner {rows[0][0]}; "
                 "this commit group must not be applied (rubric 4.2)",

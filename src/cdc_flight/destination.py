@@ -239,6 +239,32 @@ def now() -> datetime:
     return datetime.now(UTC)
 
 
+def _committed_row_matches(con, query: str, params, observed_row) -> bool:
+    """Prove that an observed row is in the committed database snapshot.
+
+    DuckDB's public ``cursor()`` API creates an independent connection/transaction.
+    It therefore cannot see writes that are still uncommitted on ``con``.  Read-side
+    receipt issuers use this helper with the complete row they observed: a receipt is
+    issued only when the independent snapshot returns that exact row.  Merely asking
+    the caller's connection to read again would validate its own uncommitted view and
+    would not establish durability.
+    """
+    independent = None
+    try:
+        independent = con.cursor()
+        committed_rows = independent.execute(query, params).fetchall()
+        return len(committed_rows) == 1 and tuple(committed_rows[0]) == tuple(observed_row)
+    except Exception:
+        log.warning("could not verify a read-side row through an independent snapshot", exc_info=True)
+        return False
+    finally:
+        if independent is not None:
+            try:
+                independent.close()
+            except Exception:  # pragma: no cover - cursor cleanup is best effort
+                log.debug("could not close independent durability cursor", exc_info=True)
+
+
 # --------------------------------------------------------------------------- #
 # resume point I/O
 # --------------------------------------------------------------------------- #
@@ -265,6 +291,15 @@ def read_resume_point(
         _blob,
         _key_blob,
     ) = rows[0]
+    committed_query = (
+        f"SELECT resume_json, commit_id, last_lsn, last_txn_id, last_total_order, "
+        f"       snapshot_epoch, updated_at, offset_blob, offset_key_blob "
+        f"FROM {_control_table(control_schema, 'debezium_offsets')} "
+        "WHERE pipeline = ? AND namespace = ?"
+    )
+    committed = _committed_row_matches(
+        con, committed_query, [pipeline, namespace], rows[0]
+    )
     offset_row = OffsetRowState(
         pipeline=pipeline,
         namespace=namespace,
@@ -274,10 +309,12 @@ def read_resume_point(
         last_lsn=int(last_lsn or 0),
         updated_at=updated_at,
     )
-    offset_receipt = _offset_row_receipt_from_durable(offset_row)
     try:
         point = ResumePoint.from_json(resume_json)
     except OffsetUnusable as exc:
+        offset_receipt = (
+            _offset_row_receipt_from_durable(offset_row) if committed else None
+        )
         raise OffsetUnusable(
             f"durable resume point for pipeline={pipeline!r}, namespace={namespace!r} "
             f"is unusable: {exc}",

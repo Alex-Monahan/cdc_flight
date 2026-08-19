@@ -372,3 +372,226 @@ def test_fingerprint_conditions_are_distinct_per_occurrence_and_idempotent(tmp_p
             assert contexts[0]["alert_identity"] != contexts[1]["alert_identity"]
     finally:
         con.close()
+
+
+def test_public_read_receipts_require_an_independent_committed_snapshot(tmp_path):
+    """An ordinary caller cannot receipt state that only its transaction can see."""
+    from datetime import UTC, datetime
+
+    import duckdb
+
+    from cdc_flight.control_schema import ensure_control_schema
+    from cdc_flight.destination import Lease, read_resume_point, read_slot_state
+    from cdc_flight.errors import LeaseLost, OffsetUnusable
+
+    con = duckdb.connect(str(tmp_path / "durability.duckdb"))
+    try:
+        ensure_control_schema(con)
+
+        con.execute("BEGIN TRANSACTION")
+        con.execute(
+            "INSERT INTO _cdc_flight.slot_state "
+            "(pipeline, slot_name, observed_at, verdict) VALUES (?, ?, now(), ?)",
+            ["uncommitted-slot", "slot-a", "slot_missing"],
+        )
+        assert read_slot_state(con, "uncommitted-slot", "slot-a") is None
+        con.execute("ROLLBACK")
+        assert con.execute(
+            "SELECT count(*) FROM _cdc_flight.slot_state WHERE pipeline = ?",
+            ["uncommitted-slot"],
+        ).fetchone()[0] == 0
+
+        con.execute("BEGIN TRANSACTION")
+        con.execute(
+            "INSERT INTO _cdc_flight.debezium_offsets "
+            "(pipeline, namespace, resume_json, commit_id, last_lsn, snapshot_epoch, "
+            "updated_at) VALUES (?, ?, ?, 7, 7, 1, now())",
+            ["uncommitted-offset", "main", "not-json"],
+        )
+        with pytest.raises(OffsetUnusable) as offset_failure:
+            read_resume_point(con, "uncommitted-offset", "main")
+        # The exception path is deliberately receipt-free when the malformed row is
+        # visible only to the caller transaction.
+        assert offset_failure.value.offset_row is None
+        con.execute("ROLLBACK")
+        assert con.execute(
+            "SELECT count(*) FROM _cdc_flight.debezium_offsets WHERE pipeline = ?",
+            ["uncommitted-offset"],
+        ).fetchone()[0] == 0
+
+        con.execute("BEGIN TRANSACTION")
+        now = datetime.now(UTC)
+        con.execute(
+            "INSERT INTO _cdc_flight.lease "
+            "(pipeline, owner_id, host, pid, acquired_at, renewed_at, expires_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                "uncommitted-acquire",
+                "other-owner",
+                "other-host",
+                999999,
+                now,
+                now,
+                now.replace(year=now.year + 1),
+            ],
+        )
+        with pytest.raises(LeaseLost) as acquire_failure:
+            Lease("uncommitted-acquire", owner_id="this-owner").acquire(con)
+        assert acquire_failure.value.lease_state is None
+        con.execute("ROLLBACK")
+
+        con.execute("BEGIN TRANSACTION")
+        now = datetime.now(UTC)
+        con.execute(
+            "INSERT INTO _cdc_flight.lease "
+            "(pipeline, owner_id, host, pid, acquired_at, renewed_at, expires_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                "uncommitted-renew",
+                "other-owner",
+                "other-host",
+                999999,
+                now,
+                now,
+                now.replace(year=now.year + 1),
+            ],
+        )
+        with pytest.raises(LeaseLost) as renew_failure:
+            Lease("uncommitted-renew", owner_id="this-owner").renew(con)
+        assert renew_failure.value.lease_state is None
+        con.execute("ROLLBACK")
+        assert con.execute(
+            "SELECT count(*) FROM _cdc_flight.lease WHERE pipeline LIKE 'uncommitted-%'"
+        ).fetchone()[0] == 0
+    finally:
+        con.close()
+
+
+def test_slot_receipt_rejects_foreign_pipeline_and_stale_cached_state(tmp_path):
+    import duckdb
+
+    from cdc_flight import destination as destination_mod
+    from cdc_flight import recovery as recovery_mod
+    from cdc_flight.control_schema import ensure_control_schema
+
+    con = duckdb.connect(str(tmp_path / "identity.duckdb"))
+    try:
+        ensure_control_schema(con)
+        old_receipt = destination_mod.write_slot_state(
+            con,
+            pipeline="pipeline-a",
+            slot_name="shared-slot",
+            observation={"current_wal_lsn": 10},
+            verdict="slot_missing",
+        )
+        with pytest.raises(ValueError, match="different pipeline"):
+            recovery_mod.begin(
+                con,
+                pipeline="pipeline-b",
+                namespace="main",
+                decision="slot_missing",
+                message="slot is missing",
+                slot_name="shared-slot",
+                offset_path=tmp_path / "offsets.dat",
+                captured_tables=[],
+                forget_catalog=False,
+                slot_receipt=old_receipt,
+            )
+
+        fresh_receipt = destination_mod.write_slot_state(
+            con,
+            pipeline="pipeline-a",
+            slot_name="shared-slot",
+            observation={"current_wal_lsn": 11},
+            verdict="slot_missing",
+        )
+        with pytest.raises(ValueError, match="stale"):
+            recovery_mod.begin(
+                con,
+                pipeline="pipeline-a",
+                namespace="main",
+                decision="slot_missing",
+                message="slot is missing",
+                slot_name="shared-slot",
+                offset_path=tmp_path / "offsets.dat",
+                captured_tables=[],
+                forget_catalog=False,
+                slot_receipt=old_receipt,
+            )
+
+        record = recovery_mod.begin(
+            con,
+            pipeline="pipeline-a",
+            namespace="main",
+            decision="slot_missing",
+            message="slot is missing",
+            slot_name="shared-slot",
+            offset_path=tmp_path / "offsets.dat",
+            captured_tables=[],
+            forget_catalog=False,
+            slot_receipt=fresh_receipt,
+        )
+        assert record.recovery_id
+    finally:
+        con.close()
+
+
+def test_cached_episode_key_is_rejected_but_distinct_episodes_are_two_alerts(tmp_path):
+    import duckdb
+
+    from cdc_flight.control_schema import ensure_control_schema
+    from cdc_flight.destination import OccurrenceKey, observe_source_health
+    from cdc_flight.destination_alerts import raise_alert_once
+
+    con = duckdb.connect(str(tmp_path / "episode-identity.duckdb"))
+    try:
+        ensure_control_schema(con)
+        observe_source_health(con, pipeline="episode-pipeline", state="reachable")
+        first = observe_source_health(con, pipeline="episode-pipeline", state="dark")
+        first_key = OccurrenceKey.from_episode(first, pipeline="episode-pipeline")
+        assert raise_alert_once(
+            con,
+            pipeline="episode-pipeline",
+            severity="critical",
+            code="source_dark",
+            message="source is dark",
+            condition_key="source_dark",
+            occurrence_key=first_key,
+        )
+        assert not raise_alert_once(
+            con,
+            pipeline="episode-pipeline",
+            severity="critical",
+            code="source_dark",
+            message="source is dark",
+            condition_key="source_dark",
+            occurrence_key=first_key,
+        )
+        observe_source_health(con, pipeline="episode-pipeline", state="reachable")
+        second = observe_source_health(con, pipeline="episode-pipeline", state="dark")
+        second_key = OccurrenceKey.from_episode(second, pipeline="episode-pipeline")
+        with pytest.raises(ValueError, match="stale"):
+            raise_alert_once(
+                con,
+                pipeline="episode-pipeline",
+                severity="critical",
+                code="source_dark",
+                message="source is dark",
+                condition_key="source_dark",
+                occurrence_key=first_key,
+            )
+        assert raise_alert_once(
+            con,
+            pipeline="episode-pipeline",
+            severity="critical",
+            code="source_dark",
+            message="source is dark",
+            condition_key="source_dark",
+            occurrence_key=second_key,
+        )
+        assert con.execute(
+            "SELECT count(*) FROM _cdc_flight.alerts WHERE pipeline = ? AND code = ?",
+            ["episode-pipeline", "source_dark"],
+        ).fetchone()[0] == 2
+    finally:
+        con.close()

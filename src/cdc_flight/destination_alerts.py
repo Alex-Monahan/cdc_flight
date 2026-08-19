@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import tempfile
@@ -18,6 +19,7 @@ from .occurrence import (
     SlotState,
     SlotStateReceipt,
     _episode_receipt_after_durable,
+    _occurrence_binding,
     _slot_state_receipt_after_commit,
     occurrence_text,
 )
@@ -43,6 +45,170 @@ def _alert_identity(condition_key: str, occurrence_key: OccurrenceKey) -> str:
     # string, None, or a value derived from an exception therefore fails before a
     # connection is queried or written, including through an aliased function.
     return f"{condition_key}:occurrence:{occurrence_text(occurrence_key)}"
+
+
+def _independent_fetchone(con, query: str, params):
+    """Read one owner row through a transaction independent of ``con``."""
+    independent = None
+    try:
+        independent = con.cursor()
+        return independent.execute(query, params).fetchone()
+    except Exception as exc:
+        raise ValueError("could not validate the durable occurrence owner") from exc
+    finally:
+        if independent is not None:
+            with contextlib.suppress(Exception):
+                independent.close()
+
+
+def _stable_value(value) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def _validate_occurrence_binding(
+    con, *, pipeline: str, occurrence_key: OccurrenceKey, control_schema: str | None
+) -> None:
+    """Reject a key whose receipt is for another or no-longer-current owner.
+
+    The factory binds the key to the owner identity.  This second check is at the
+    alert boundary, where the actual pipeline is known, and uses an independent
+    snapshot for state-backed keys.  It closes the ordinary stale-token route while
+    allowing repeated observations of the same owner state to retain one identity.
+    """
+    binding = _occurrence_binding(occurrence_key)
+    kind = binding[0]
+    bound_pipeline = binding[2] if kind == "episode" else binding[1]
+    if bound_pipeline != pipeline:
+        raise ValueError(
+            f"occurrence receipt is bound to pipeline {bound_pipeline!r}, "
+            f"not alert pipeline {pipeline!r}"
+        )
+
+    if kind == "run" or kind == "commit":
+        # These are deliberately run-owned/pre-COMMIT reservations, not durable-row
+        # receipts. Their pipeline binding is the complete applicable identity.
+        return
+
+    if kind == "episode":
+        _owner, _pipeline, episode_id, state_name, _path = binding[1:]
+        if _owner == "fallback":
+            # The fallback JSONL is an append-only historical audit surface. Replay
+            # must be allowed to project episode 1 after episode 2 is already open;
+            # its fsync+install receipt proves that historical occurrence itself.
+            return
+        row = _independent_fetchone(
+            con,
+            f"SELECT episode_id, state FROM {_control_table(control_schema, 'source_health_episodes')} "
+            "WHERE pipeline = ?",
+            [pipeline],
+        )
+        if row is None or int(row[0]) != int(episode_id) or str(row[1]) != state_name:
+            raise ValueError("source-health receipt is stale for this pipeline")
+        return
+
+    if kind == "recovery":
+        _pipeline, namespace, recovery_id, decision = binding[1:]
+        row = _independent_fetchone(
+            con,
+            f"SELECT recovery_id, decision FROM {_control_table(control_schema, 'recovery_state')} "
+            "WHERE pipeline = ? AND namespace = ?",
+            [pipeline, namespace],
+        )
+        if row is None or str(row[0]) != recovery_id or str(row[1]) != decision:
+            raise ValueError("recovery receipt is stale for this pipeline and namespace")
+        return
+
+    if kind == "slot":
+        (
+            _pipeline,
+            slot_name,
+            decision,
+            system_identifier,
+            timeline_id,
+            restart_lsn,
+            confirmed_flush_lsn,
+            current_wal_lsn,
+            durable_lsn,
+        ) = binding[1:]
+        row = _independent_fetchone(
+            con,
+            f"SELECT system_identifier, timeline_id, restart_lsn, confirmed_flush_lsn, "
+            f"       current_wal_lsn, durable_lsn, verdict "
+            f"FROM {_control_table(control_schema, 'slot_state')} "
+            "WHERE pipeline = ? AND slot_name = ?",
+            [pipeline, slot_name],
+        )
+        current = (
+            None
+            if row is None
+            else (
+                str(row[6] or "observed"),
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+                row[5],
+            )
+        )
+        expected = (
+            decision,
+            system_identifier,
+            timeline_id,
+            restart_lsn,
+            confirmed_flush_lsn,
+            current_wal_lsn,
+            durable_lsn,
+        )
+        if current != expected:
+            raise ValueError("slot-state receipt is stale for this pipeline and slot")
+        return
+
+    if kind == "offset":
+        _pipeline, namespace, commit_id, snapshot_epoch, last_lsn, updated, digest = binding[1:]
+        row = _independent_fetchone(
+            con,
+            f"SELECT resume_json, commit_id, last_lsn, snapshot_epoch, updated_at "
+            f"FROM {_control_table(control_schema, 'debezium_offsets')} "
+            "WHERE pipeline = ? AND namespace = ?",
+            [pipeline, namespace],
+        )
+        current = (
+            None
+            if row is None
+            else (
+                int(row[1] or 0),
+                int(row[3] or 0),
+                int(row[2] or 0),
+                _stable_value(row[4]),
+                hashlib.sha256(str(row[0]).encode("utf-8")).hexdigest(),
+            )
+        )
+        if current != (commit_id, snapshot_epoch, last_lsn, updated, digest):
+            raise ValueError("offset-row receipt is stale for this pipeline and namespace")
+        return
+
+    if kind == "lease":
+        _alert_pipeline, physical_pipeline, owner_id, _operation, acquired_at = binding[1:]
+        row = _independent_fetchone(
+            con,
+            f"SELECT owner_id, acquired_at FROM {_control_table(control_schema, 'lease')} "
+            "WHERE pipeline = ?",
+            [physical_pipeline],
+        )
+        if (
+            row is None
+            or str(row[0]) != owner_id
+            or (acquired_at is not None and _stable_value(row[1]) != acquired_at)
+        ):
+            raise ValueError("lease receipt is stale for this pipeline")
+        return
+
+    raise ValueError(f"unknown occurrence binding kind {kind!r}")
 
 
 def _write_alert_row(
@@ -142,6 +308,12 @@ class AlertSink:
         """
         identity = _alert_identity(condition_key, occurrence_key)
         con = self._sink if self.independent else self._main
+        _validate_occurrence_binding(
+            con,
+            pipeline=self.pipeline,
+            occurrence_key=occurrence_key,
+            control_schema=self.control_schema,
+        )
         if alert_identity_exists(
             con,
             pipeline=self.pipeline,
@@ -338,6 +510,12 @@ def raise_alert_once(
     falls through to an insert: losing the alert is worse than a duplicate.
     """
     identity = _alert_identity(condition_key, occurrence_key)
+    _validate_occurrence_binding(
+        con,
+        pipeline=pipeline,
+        occurrence_key=occurrence_key,
+        control_schema=control_schema,
+    )
     if alert_identity_exists(
         con,
         pipeline=pipeline,
@@ -495,7 +673,8 @@ def _write_fallback_alert_episode(
             pipeline=dest.pipeline_name,
             episode_id=episode_id,
             state=state,
-        )
+        ),
+        details={"owner": "fallback", "path": str(path)},
     )
 
 
@@ -539,7 +718,9 @@ def persist_fallback_alert(
             state="open",
             incident_key=incident_key,
         )
-        occurrence_key = OccurrenceKey.from_episode(episode_receipt)
+        occurrence_key = OccurrenceKey.from_episode(
+            episode_receipt, pipeline=dest.pipeline_name
+        )
         occurrence_marker = _alert_identity(condition_key, occurrence_key)
         stored_context = dict(context or {})
         stored_context["fallback_episode_id"] = episode_id
@@ -606,6 +787,14 @@ def replay_fallback_alerts(con, dest) -> int:
                 replay_complete = False
                 continue
             pipeline = str(item.get("pipeline") or dest.pipeline_name)
+            if pipeline != dest.pipeline_name:
+                log.critical(
+                    "fallback alert line belongs to pipeline %r, not %r",
+                    pipeline,
+                    dest.pipeline_name,
+                )
+                replay_complete = False
+                continue
             code = str(item.get("code") or "destination_unavailable")
             condition_key = item.get("condition_key")
             episode_id = item.get("episode_id")
@@ -619,9 +808,12 @@ def replay_fallback_alerts(con, dest) -> int:
                         pipeline=pipeline,
                         episode_id=int(episode_id),
                         state="open",
-                    )
+                    ),
+                    details={"owner": "fallback", "path": str(_fallback_alert_episode_path(dest))},
                 )
-                occurrence_key = OccurrenceKey.from_episode(episode_receipt)
+                occurrence_key = OccurrenceKey.from_episode(
+                    episode_receipt, pipeline=pipeline
+                )
                 serialized_occurrence = item.get("occurrence_key")
                 if (
                     serialized_occurrence is not None
@@ -736,17 +928,21 @@ def observe_source_health(
         f"SELECT episode_id, state, observed_at FROM {table} WHERE pipeline = ?",
         [pipeline],
     ).fetchone()
-    return (
-        _episode_receipt_after_durable(
-            EpisodeState(
-                pipeline=pipeline,
-                episode_id=int(row[0]),
-                state=str(row[1]),
-                observed_at=row[2],
-            )
-        )
-        if row
-        else None
+    if not row:
+        return None
+    committed_query = (
+        f"SELECT episode_id, state, observed_at FROM {table} WHERE pipeline = ?"
+    )
+    if not _d._committed_row_matches(con, committed_query, [pipeline], row):
+        return None
+    return _episode_receipt_after_durable(
+        EpisodeState(
+            pipeline=pipeline,
+            episode_id=int(row[0]),
+            state=str(row[1]),
+            observed_at=row[2],
+        ),
+        details={"owner": "source_health"},
     )
 
 
@@ -764,6 +960,16 @@ def read_slot_state(
     ).fetchall()
     if not rows:
         return None
+    committed_query = (
+        f"SELECT system_identifier, timeline_id, restart_lsn, confirmed_flush_lsn, "
+        f"       current_wal_lsn, durable_lsn, observed_at, verdict, verdict_message, "
+        f"       verdict_at FROM {_control_table(control_schema, 'slot_state')} "
+        "WHERE pipeline = ? AND slot_name = ?"
+    )
+    if not _d._committed_row_matches(
+        con, committed_query, [pipeline, slot_name], rows[0]
+    ):
+        return None
     keys = (
         "system_identifier", "timeline_id", "restart_lsn", "confirmed_flush_lsn",
         "current_wal_lsn", "durable_lsn", "observed_at", "verdict", "verdict_message",
@@ -780,6 +986,7 @@ def read_slot_state(
         confirmed_flush_lsn=details["confirmed_flush_lsn"],
         current_wal_lsn=details["current_wal_lsn"],
         durable_lsn=details["durable_lsn"],
+        pipeline=pipeline,
     )
     return _slot_state_receipt_after_commit(state, details)
 
@@ -867,6 +1074,7 @@ def write_slot_state(
             confirmed_flush_lsn=observation.get("confirmed_flush_lsn"),
             current_wal_lsn=observation.get("current_wal_lsn"),
             durable_lsn=observation.get("durable_lsn"),
+            pipeline=pipeline,
         ),
         details,
     )
