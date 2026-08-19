@@ -159,9 +159,25 @@ def run(
     # builders. `AlertSink`'s independent `cursor()` is delegated untouched on
     # purpose - see `faults.FaultyConnection`.
     con = None
-    con = faults_mod.wrap_destination(
-        dest_mod.connect(dest), control_schema=control_schema
-    )
+    try:
+        con = faults_mod.wrap_destination(
+            dest_mod.connect(dest), control_schema=control_schema
+        )
+    except BaseException as exc:
+        # DuckDB's file lock is acquired by `connect()` before the pipeline has a
+        # destination handle. Keep this failure on a durable local sidecar so a
+        # second pipeline cannot disappear with only a non-zero exit code.
+        failure_summary = {"stop_reason": "destination_unavailable"}
+        _record_run_failure_alert(
+            None,
+            dest=dest,
+            runner_id=runner_id,
+            exc=exc,
+            summary=failure_summary,
+        )
+        with contextlib.suppress(Exception):
+            exc.summary = failure_summary
+        raise
     summary_extra: dict = {}
     lease: Lease | None = None
     lease_held = False
@@ -200,6 +216,13 @@ def run(
     try:
         dest_mod.ensure_control_schema(con, control_schema)
         dest_mod.ensure_dataset(con, dest.dataset_name)
+        summary_extra["fallback_alerts_replayed"] = dest_mod.replay_fallback_alerts(
+            con, dest
+        )
+        # MotherDuck's database and schema comparison rules are resolved by the live
+        # catalog, not guessed from configuration spelling. Local DuckDB uses the
+        # opened file's device/inode plus the same server-resolved schema names.
+        destination_lease_key = dest.resolve_physical_lease_key(con)
         # rubric 1.9 / ADR §4.8: one `_cdc_flight.heartbeat` row per run, moved through
         # the `RUN_PHASE` machine on its OWN connection. "Where is this run" stops being
         # a source-line position in a 470-line function and becomes a query. The
@@ -227,7 +250,7 @@ def run(
         # deletes the resume point, drops the slot), and a second runner doing that
         # concurrently is exactly what rubric 4.2 exists to prevent.
         lease = Lease(
-            dest.lease_key,
+            destination_lease_key,
             owner_id=runner_id,
             ttl_seconds=lease_ttl_seconds(),
             control_schema=control_schema,
@@ -1001,6 +1024,43 @@ def _record_run_failure_alert(
     local summary record.
     """
     if con is None:
+        code = "destination_unavailable"
+        marker = f"{code}:{dest.pipeline_name}:{type(exc).__name__}"
+        message = (
+            f"cdc_flight could not open destination for pipeline {dest.pipeline_name!r}: "
+            f"{type(exc).__name__}: {exc}. The durable fallback alert is at the sidecar "
+            "path and will be replayed when the destination becomes available."
+        )
+        try:
+            path = dest_mod.persist_fallback_alert(
+                dest,
+                runner_id=runner_id,
+                severity="critical",
+                code=code,
+                message=message,
+                marker_value=marker,
+                context={
+                    "error_type": type(exc).__name__,
+                    "stop_reason": summary.get("stop_reason"),
+                    "destination_unavailable": True,
+                },
+            )
+            summary["fallback_alert_path"] = str(path)
+            log.critical("destination unavailable; durable alert written to %s", path)
+        except BaseException as alert_exc:
+            # The original failure still escapes, but an operator must see that the
+            # durable fallback itself failed.  A silent sidecar failure would turn a
+            # destination lock into exactly the exit-code-only defect §6 forbids.
+            log.critical(
+                "destination unavailable and fallback alert could not be persisted",
+                exc_info=True,
+            )
+            print(
+                "CRITICAL: destination unavailable and fallback alert failed: "
+                f"{type(alert_exc).__name__}: {alert_exc}",
+                file=sys.stderr,
+                flush=True,
+            )
         return
     if summary.get("connector_failure_alert") in {"recorded", "already_recorded"}:
         return
@@ -1010,13 +1070,13 @@ def _record_run_failure_alert(
     # for one loss of source position; the named verdict is the complete diagnosis.
     if isinstance(exc, SlotAheadOfDestination):
         return
+    source_health_episode = None
     if isinstance(exc, LeaseLost) or "lease" in str(exc).lower():
         code = "concurrent_destination_run"
         severity = "critical"
-        # The runner id identifies the attempt, not the occurrence.  Retrying the
-        # same contender while the same holder is alive must remain one operator
-        # incident; the holder/error text is the stable occurrence fingerprint.
-        marker = f"{code}:{hashlib.sha256(str(exc).encode()).hexdigest()}"
+        # The runner id identifies the attempt, not the occurrence. LeaseLost carries
+        # the holder/pipeline identity separately from its changing expiry text.
+        marker = f"{code}:{getattr(exc, 'occurrence_key', str(exc))}"
     elif isinstance(exc, OffsetUnusable):
         code = "offset_unusable"
         severity = "critical"
@@ -1024,11 +1084,38 @@ def _record_run_failure_alert(
     elif summary.get("slot_check"):
         code = str(summary["slot_check"].get("decision") or "slot_check_failed")
         severity = "critical"
-        marker = f"{code}:{summary['slot_check'].get('confirmed_flush_lsn')}"
+        slot_check = summary["slot_check"]
+        marker = ":".join(
+            str(slot_check.get(name))
+            for name in (
+                "decision", "slot_name", "system_identifier", "timeline_id",
+                "restart_lsn", "confirmed_flush_lsn", "durable_lsn",
+            )
+        )
     elif summary.get("stop_reason") == "source_dark":
         code = "source_dark"
         severity = "critical"
-        marker = f"{code}:{dest.pipeline_name}"
+        # This is an episode identity, not a pipeline identity.  It is updated before
+        # the alert is emitted, so recovery followed by another outage cannot reuse a
+        # once-ever marker.
+        with contextlib.suppress(Exception):
+            con.execute("ROLLBACK")
+        try:
+            source_health_episode = dest_mod.observe_source_health(
+                con,
+                pipeline=dest.pipeline_name,
+                state="dark",
+                control_schema=dest.control_schema,
+            )
+        except Exception:
+            log.critical("could not persist the source-dark episode", exc_info=True)
+        episode_id = (
+            source_health_episode.get("episode_id")
+            if source_health_episode is not None
+            else f"unresolved:{runner_id}"
+        )
+        summary["source_health_episode"] = episode_id
+        marker = f"{code}:{dest.pipeline_name}:episode:{episode_id}"
     elif summary.get("stop_reason") in {"max_seconds", "engine_error", "hung"}:
         code = "run_incomplete"
         severity = "critical"
@@ -1067,6 +1154,7 @@ def _record_run_failure_alert(
                     "runner_id": runner_id,
                     "error_type": type(exc).__name__,
                     "stop_reason": summary.get("stop_reason"),
+                    "source_health_episode": source_health_episode,
                 },
             )
         finally:

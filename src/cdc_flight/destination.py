@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from . import faults, table_lifecycle
-from .config import resolve_control_schema
+from .config import resolve_control_schema, resolve_motherduck_database
 from .control_schema import CONTROL_DDL, ensure_control_schema
 from .errors import CANONICAL_REFUSAL_CLASS, OffsetUnusable  # noqa: F401
 from .machines import (
@@ -202,11 +202,26 @@ def connect(dest) -> Any:
         bootstrap = duckdb.connect(f"md:?motherduck_token={token}", config=DUCKDB_CONNECT_CONFIG)
         try:
             assert_runtime_capabilities(bootstrap)
-            bootstrap.execute(f"CREATE DATABASE IF NOT EXISTS {quote(dest.motherduck_database)}")
+            # Resolve the account-level spelling before opening the database-specific
+            # connection. This makes case/whitespace/quoting aliases share the same
+            # MotherDuck local cache and the same physical catalog identity; the lease
+            # resolver repeats the server query after schemas are ready.
+            database = resolve_motherduck_database(bootstrap, dest.motherduck_database)
+            if database is None:
+                bootstrap.execute(
+                    f"CREATE DATABASE IF NOT EXISTS {quote(dest.motherduck_database)}"
+                )
+                database = resolve_motherduck_database(
+                    bootstrap, dest.motherduck_database
+                )
+            if database is None:
+                raise RuntimeError(
+                    f"MotherDuck did not resolve database {dest.motherduck_database!r}"
+                )
         finally:
             bootstrap.close()
         con = duckdb.connect(
-            f"md:{dest.motherduck_database}?motherduck_token={token}",
+            f"md:{database}?motherduck_token={token}",
             config=DUCKDB_CONNECT_CONFIG,
         )
         assert_runtime_capabilities(con)
@@ -531,7 +546,10 @@ from .destination_alerts import (  # noqa: E402, F401
     AlertSink,
     alert_marker_exists,
     destination_holds_rows,
+    fallback_alert_path,
     mark_awaiting_snapshot,
+    observe_source_health,
+    persist_fallback_alert,
     promote_interrupted_snapshots,
     raise_alert,
     raise_alert_once,
@@ -539,6 +557,7 @@ from .destination_alerts import (  # noqa: E402, F401
     read_snapshot_states,
     register_table,
     replacement_snapshot_is_current,
+    replay_fallback_alerts,
     request_snapshot,
     tables_awaiting_snapshot,
     write_slot_state,

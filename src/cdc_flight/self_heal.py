@@ -13,7 +13,6 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-import sys
 import threading
 
 from . import naming
@@ -124,70 +123,10 @@ def commit_watchdog(timeout: float, commit_id: int, stage=None, on_timeout=None)
         return
 
     def _fire() -> None:  # pragma: no cover - exercised by the fault test in a child
-        # WHICH stage stalled, because the stages need different operator responses
-        # (Codex r4 MAJOR-1). The window is entered before `COMMIT` runs, so a timer that
-        # fires while we are still waiting for the observability gate means the commit
-        # NEVER STARTED — reporting that as an ambiguous commit sends an operator looking
-        # for a half-applied transaction that does not exist.
-        where = stage() if stage is not None else "commit"
-        if on_timeout is not None:
-            # The destination operation is the thing that is wedged, so the alert
-            # must use the already-open independent observability sink. Keep this
-            # attempt bounded as well: a broken destination must not turn the
-            # watchdog into another unbounded wait. The hard exit remains the
-            # authoritative failure outcome if the alert sink cannot answer.
-            finished = threading.Event()
-
-            def _write_timeout_alert() -> None:
-                try:
-                    on_timeout(where)
-                except Exception:
-                    log.warning("could not persist the commit-timeout alert", exc_info=True)
-                finally:
-                    finished.set()
-
-            alert_thread = threading.Thread(
-                target=_write_timeout_alert,
-                name="cdc-commit-timeout-alert",
-                daemon=True,
-            )
-            alert_thread.start()
-            if not finished.wait(1.0):
-                log.error(
-                    "the commit-timeout alert sink did not answer within 1.0s; "
-                    "exiting with the watchdog outcome"
-                )
-        if where == "ack":
-            log.critical(
-                "destination COMMIT for commit_id=%s completed, but Debezium's "
-                "acknowledgement did not return within %.0fs; aborting the process. "
-                "The destination is durable and the unconfirmed callback is safe to "
-                "replay.",
-                commit_id, timeout,
-            )
-            sys.stdout.flush()
-            sys.stderr.flush()
-            os._exit(75)
-        if where != "commit":
-            log.critical(
-                "the destination COMMIT for commit_id=%s was never issued: the run "
-                "stalled for %.0fs at %s. The transaction is UNCOMMITTED and will roll "
-                "back with the process; nothing was acknowledged to Debezium, so the "
-                "next run replays it in full.",
-                commit_id, timeout, where,
-            )
-            sys.stdout.flush()
-            sys.stderr.flush()
-            os._exit(75)
-        log.critical(
-            "destination COMMIT for commit_id=%s did not return within %.0fs; aborting "
-            "the process. The commit is AMBIGUOUS and that is safe: nothing was "
-            "acknowledged to Debezium, so the next run resumes from whatever the "
-            "destination actually holds (ADR 0001 §4.6 F5).",
-            commit_id, timeout,
-        )
-        sys.stdout.flush()
-        sys.stderr.flush()
+        # This callback can run while COMMIT_ACK is active. It must not inspect the
+        # destination, write an alert, log, or flush a stream. The commit protocol
+        # pre-arms a durable alert before opening that window; leaving it in place is
+        # the timeout's observable record. The hard exit is the only operation here.
         os._exit(75)
 
     timer = threading.Timer(timeout, _fire)

@@ -394,6 +394,25 @@ def test_healthy_run_has_lagged_operator_log_without_failure_alert(sandbox):
     )
     assert logs[0][0] > 0, logs
     assert logs[0][1] is not None, logs
+    lag_rows = sandbox.duck_query(
+        "SELECT replication_lag_bytes, context FROM _cdc_flight.run_logs "
+        "WHERE pipeline = ? AND replication_lag_bytes IS NOT NULL",
+        [sandbox.env["CDC_PIPELINE_NAME"]],
+    )
+    checked = 0
+    for lag, context in lag_rows:
+        payload = json.loads(context or "{}")
+        received = payload.get("received_high_water_lsn")
+        confirmed = payload.get("confirmed_flush_lsn")
+        if received is None or confirmed is None:
+            continue
+        assert lag == max(0, int(received) - int(confirmed)), payload
+        assert payload["lag_definition"] == (
+            "max(0, received_high_water_lsn - confirmed_flush_lsn)"
+        )
+        assert payload.get("lag_sampled_at") is not None, payload
+        checked += 1
+    assert checked > 0, lag_rows
     # This module intentionally reuses one sandbox to keep the real-process proofs
     # affordable. Historical failures from the dropped-slot/offset tests remain
     # durable operator evidence, but they are not alerts for this healthy runner.

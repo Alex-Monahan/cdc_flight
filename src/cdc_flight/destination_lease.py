@@ -89,7 +89,8 @@ class Lease:
                     f"pipeline {self.name!r} is already leased by runner {owner} "
                     f"(pid {pid} on {host}) until {expires_at.isoformat()}; a second "
                     "concurrent Flight would double-write the shared destination "
-                    f"(lease key {self.pipeline!r}, rubric 4.2)"
+                    f"(lease key {self.pipeline!r}, rubric 4.2)",
+                    occurrence_key=f"acquire:{self.pipeline}:{owner}",
                 )
         self._upsert(con, current)
 
@@ -104,7 +105,8 @@ class Lease:
         if rows and rows[0][0] != self.owner_id:
             raise LeaseLost(
                 f"lease for {self.name!r} was taken by runner {rows[0][0]}; "
-                "this commit group must not be applied (rubric 4.2)"
+                "this commit group must not be applied (rubric 4.2)",
+                occurrence_key=f"renew:{self.pipeline}:{rows[0][0]}",
             )
         self._upsert(con, now())
 

@@ -235,8 +235,8 @@ def run_engine_bounded(
                 phases.record_log(
                     event="source_health",
                     message=f"slot health={health.state(dark_after=run.source_dark_seconds)}",
-                    replication_lag_bytes=(
-                        sample.lag_bytes if sample is not None else None
+                    replication_lag_bytes=health.per_slot_outstanding_bytes(
+                        getattr(handler, "highest_source_lsn", None)
                     ),
                     slot_confirmed_flush_lsn=(
                         sample.confirmed_pos if sample is not None else None
@@ -244,11 +244,16 @@ def run_engine_bounded(
                     slot_restart_lsn=(
                         sample.restart_pos if sample is not None else None
                     ),
-                    context={
-                        "slot_active": sample.active if sample is not None else None,
-                        "slot_exists": sample.exists if sample is not None else None,
-                        "slot_error": sample.error if sample is not None else None,
-                    },
+                    context=(
+                        health.operator_lag_context(
+                            getattr(handler, "highest_source_lsn", None)
+                        )
+                        | {
+                            "slot_active": sample.active if sample is not None else None,
+                            "slot_exists": sample.exists if sample is not None else None,
+                            "slot_error": sample.error if sample is not None else None,
+                        }
+                    ),
                 )
             if elapsed >= run.max_seconds:
                 outcome.record("max_seconds")
@@ -522,8 +527,8 @@ def run_engine_bounded(
                 level="ERROR" if outcome.failed else "INFO",
                 event="run_terminal_observation",
                 message=f"run stopping with outcome={outcome.value}",
-                replication_lag_bytes=(
-                    sample.lag_bytes if sample is not None else None
+                replication_lag_bytes=health.per_slot_outstanding_bytes(
+                    getattr(handler, "highest_source_lsn", None)
                 ),
                 slot_confirmed_flush_lsn=(
                     sample.confirmed_pos if sample is not None else None
@@ -531,10 +536,15 @@ def run_engine_bounded(
                 slot_restart_lsn=(
                     sample.restart_pos if sample is not None else None
                 ),
-                context={
-                    "slot_health": health.state(dark_after=run.source_dark_seconds),
-                    "source_unobservable_after_sec": source_unobservable_after,
-                },
+                context=(
+                    health.operator_lag_context(
+                        getattr(handler, "highest_source_lsn", None)
+                    )
+                    | {
+                        "slot_health": health.state(dark_after=run.source_dark_seconds),
+                        "source_unobservable_after_sec": source_unobservable_after,
+                    }
+                ),
                 force=True,
             )
         # ADR 0001 §3.2: the un-ENDed tail is DISCARDED, never guessed at. It is

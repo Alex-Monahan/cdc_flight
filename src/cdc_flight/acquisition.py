@@ -138,6 +138,17 @@ def check_the_slot(
     ).fetchall()
     durable_lsn = int(durable[0][0]) if durable else None
     observation = reconcile_mod.observe_slot(source.dsn, replication.slot_name)
+    # A reachable source closes the previous dark episode. An unobservable source is
+    # intentionally not treated as a transition here; the supervisor must first prove
+    # that a source which was answering has stayed dark for its configured threshold.
+    if observation.observable:
+        dest_mod.observe_source_health(
+            con,
+            pipeline=dest.pipeline_name,
+            state="reachable",
+            confirmed_flush_lsn=observation.confirmed_flush_lsn,
+            control_schema=dest.control_schema,
+        )
     previous = dest_mod.read_slot_state(
         con, dest.pipeline_name, replication.slot_name,
         control_schema=dest.control_schema,
@@ -161,6 +172,7 @@ def check_the_slot(
         previous=previous,
         destination_rows=destination_rows,
     )
+    verdict.context["slot_name"] = replication.slot_name
     log.info("slot check: %s (%s)", verdict.decision, verdict.message or "healthy")
 
     recovery = None
@@ -237,7 +249,10 @@ def check_the_slot(
             control_schema=dest.control_schema,
         )
     if observation.observable:
-        recorded = observation.as_dict() | {"durable_lsn": durable_lsn}
+        recorded = observation.as_dict() | {
+            "durable_lsn": durable_lsn,
+            "slot_name": replication.slot_name,
+        }
         if recovery is not None:
             # The recovery dropped this slot. Keeping its LSNs as the baseline would make
             # the next run compare a brand-new slot against a slot that no longer exists;

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
+from pathlib import Path
 
 from . import destination as _d
 
@@ -108,6 +110,26 @@ class AlertSink:
             message=message,
             context=payload,
         )
+
+    def clear_alert_once(self, *, code: str, marker_value: str) -> bool:
+        """Remove a pre-armed alert after its bounded operation succeeds.
+
+        This is intentionally called only after the commit/ack exclusion has closed.
+        A failed or hard-exited operation leaves the conservative alert in place for
+        the next run to reconcile.
+        """
+        con = self._sink if self.independent else self._main
+        marker = f'%"condition_marker": "{marker_value}"%'
+        try:
+            con.execute(
+                f"DELETE FROM {_control_table(self.control_schema, 'alerts')} "
+                "WHERE pipeline = ? AND code = ? AND context LIKE ?",
+                [self.pipeline, code, marker],
+            )
+        except Exception:  # pragma: no cover - conservative alert remains durable
+            log.warning("could not clear completed %s alert", code, exc_info=True)
+            return False
+        return True
 
     def request_snapshot(
         self, *, pipeline: str, schema: str, table: str, target: str
@@ -246,6 +268,177 @@ def raise_alert_once(
         control_schema=control_schema,
     )
     return True
+
+
+def fallback_alert_path(dest) -> Path:
+    """The local durable alert surface used when a destination cannot be opened.
+
+    A DuckDB file lock prevents a second connection from reaching
+    ``_cdc_flight.alerts``.  The sidecar is deliberately next to that exact file, so
+    it remains visible to the operator and is shared by every pipeline spelling that
+    points at the same destination. MotherDuck connection failures use the local
+    pipeline state directory until a destination connection can be restored.
+    """
+    if dest.kind == "duckdb":
+        resolved = Path(dest.duckdb_path).expanduser().resolve(strict=False)
+        return Path(f"{resolved}.cdc_alerts.jsonl")
+    return Path(dest.pipelines_dir) / f"{dest.pipeline_name}.cdc_alerts.jsonl"
+
+
+def persist_fallback_alert(
+    dest,
+    *,
+    runner_id: str,
+    severity: str,
+    code: str,
+    message: str,
+    marker_value: str,
+    context=None,
+) -> Path:
+    """Synchronously append and fsync an alert when no destination handle exists.
+
+    This is a bounded, append-only operator surface rather than a best-effort log.
+    A failure to create or fsync it is raised to the caller, which retains the original
+    non-zero run failure and emits a critical stderr diagnostic.
+    """
+    path = fallback_alert_path(dest)
+    payload = {
+        "pipeline": dest.pipeline_name,
+        "runner_id": runner_id,
+        "raised_at": now().isoformat(),
+        "severity": severity,
+        "code": code,
+        "message": message,
+        "marker_value": marker_value,
+        "context": dict(context or {}),
+        "destination_kind": dest.kind,
+        "destination_path": str(getattr(dest, "duckdb_path", "")),
+    }
+    line = (json.dumps(payload, default=str, sort_keys=True) + "\n").encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(
+        str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+        0o600,
+    )
+    try:
+        written = 0
+        while written < len(line):
+            written += os.write(descriptor, line[written:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return path
+
+
+def replay_fallback_alerts(con, dest) -> int:
+    """Project valid sidecar rows onto the normal durable alert table.
+
+    The sidecar is retained as an audit trail; the condition marker makes replay
+    idempotent. A partially written final line is left for the next run and does not
+    erase the complete lines before it.
+    """
+    path = fallback_alert_path(dest)
+    if not path.exists():
+        return 0
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:  # pragma: no cover - the sidecar itself remains operator-visible
+        log.critical("could not read fallback alert sidecar %s", path, exc_info=True)
+        return 0
+    recorded = 0
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            log.warning("ignoring an incomplete fallback alert line in %s", path)
+            continue
+        pipeline = str(item.get("pipeline") or dest.pipeline_name)
+        sink = AlertSink(con, pipeline=pipeline, control_schema=dest.control_schema)
+        try:
+            if sink.raise_alert_once(
+                severity=str(item.get("severity") or "critical"),
+                code=str(item.get("code") or "destination_unavailable"),
+                message=str(item.get("message") or "destination was unavailable"),
+                marker_value=str(item.get("marker_value") or "fallback:unknown"),
+                context=dict(item.get("context") or {}) | {
+                    "fallback_alert_path": str(path),
+                    "replayed": True,
+                },
+            ):
+                recorded += 1
+        finally:
+            sink.close()
+    return recorded
+
+
+def observe_source_health(
+    con,
+    *,
+    pipeline: str,
+    state: str,
+    confirmed_flush_lsn: int | None = None,
+    control_schema: str | None = None,
+) -> dict | None:
+    """Persist the source reachability episode used by ``source_dark`` alerts.
+
+    ``reachable`` closes a prior dark episode. ``dark`` opens exactly one new episode
+    until a reachable observation is recorded. ``unknown`` is intentionally not a
+    transition: a source that cannot be sampled must not fabricate a recovery or a
+    second incident.
+    """
+    if state not in {"reachable", "dark"}:
+        return None
+    table = _control_table(control_schema, "source_health_episodes")
+    current = con.execute(
+        f"SELECT episode_id, state FROM {table} WHERE pipeline = ?",
+        [pipeline],
+    ).fetchone()
+    timestamp = now()
+    con.execute("BEGIN TRANSACTION")
+    try:
+        if current is None:
+            episode_id = 0 if state == "reachable" else 1
+            con.execute(
+                f"INSERT INTO {table} "
+                "(pipeline, episode_id, state, opened_at, recovered_at, "
+                "last_confirmed_flush_lsn, observed_at) VALUES (?,?,?,?,?,?,?)",
+                [
+                    pipeline, episode_id, state,
+                    timestamp if state == "dark" else None,
+                    None, confirmed_flush_lsn, timestamp,
+                ],
+            )
+        else:
+            episode_id, previous_state = int(current[0]), str(current[1])
+            if state == "dark" and previous_state != "dark":
+                episode_id += 1
+                con.execute(
+                    f"UPDATE {table} SET episode_id = ?, state = ?, opened_at = ?, "
+                    "recovered_at = NULL, last_confirmed_flush_lsn = ?, observed_at = ? "
+                    "WHERE pipeline = ?",
+                    [episode_id, state, timestamp, confirmed_flush_lsn, timestamp, pipeline],
+                )
+            else:
+                con.execute(
+                    f"UPDATE {table} SET state = ?, recovered_at = ?, "
+                    "last_confirmed_flush_lsn = ?, observed_at = ? WHERE pipeline = ?",
+                    [state, timestamp if state == "reachable" else None,
+                     confirmed_flush_lsn, timestamp, pipeline],
+                )
+        con.execute("COMMIT")
+    except BaseException:
+        with contextlib.suppress(Exception):
+            con.execute("ROLLBACK")
+        raise
+    row = con.execute(
+        f"SELECT episode_id, state, observed_at FROM {table} WHERE pipeline = ?",
+        [pipeline],
+    ).fetchone()
+    return {
+        "episode_id": int(row[0]),
+        "state": str(row[1]),
+        "observed_at": row[2],
+    } if row else None
 
 
 def read_slot_state(

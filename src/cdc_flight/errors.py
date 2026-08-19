@@ -371,3 +371,10 @@ class RecoveryFailed(RuntimeError):
 
 class LeaseLost(RuntimeError):
     """Another runner owns `_cdc_flight.lease` for this pipeline (rubric 4.2)."""
+
+    def __init__(self, message: str, *, occurrence_key: str | None = None):
+        super().__init__(message)
+        # Expiry timestamps and runner wording change on every retry.  The alert
+        # marker needs the durable ownership identity instead, so repeated contenders
+        # for one live lease remain one operator incident.
+        self.occurrence_key = occurrence_key or message

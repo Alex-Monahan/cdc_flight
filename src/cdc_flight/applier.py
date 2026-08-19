@@ -808,24 +808,44 @@ class Applier:
             self.group.pending_alerts.append(alert)
         self.ambiguous_resnapshots_queued += int(recorded)
 
-    def _record_commit_timeout_alert(self, commit_id: int, stage: str) -> None:
-        """Persist the watchdog diagnosis before its hard, fail-closed exit."""
-        marker = f"commit:{commit_id}:{stage}"
-        self.alerts.raise_alert_once(
+    def _arm_commit_timeout_alert(self, commit_id: int) -> None:
+        """Arm a durable watchdog alert before the commit/ack exclusion opens.
+
+        The watchdog callback is intentionally not allowed to perform destination or
+        logging I/O: it can fire while ``COMMIT_ACK`` is active. Leaving this row in
+        place after a hard exit is the observable timeout; a successful group clears it
+        only after the exclusion has closed.
+        """
+        marker = f"commit:{commit_id}"
+        armed = self.alerts.raise_alert_once(
             severity="critical",
             code="commit_timeout",
             message=(
-                f"commit group {commit_id} exceeded the bounded commit watchdog "
-                f"while waiting at {stage}; the process will exit without claiming "
-                "success and the next run must reconcile the destination"
+                f"commit group {commit_id} has an armed bounded commit watchdog; if "
+                "this alert remains, the commit or acknowledgement did not return "
+                "within the watchdog timeout. The commit is AMBIGUOUS and the "
+                "destination may already be durable, so the next run must reconcile "
+                "it before claiming success"
             ),
             marker_value=marker,
             context={
                 "commit_id": commit_id,
-                "stage": stage,
+                "armed_before_commit_ack_window": True,
                 "timeout_seconds": self.cfg.commit_timeout,
                 "runner_id": self.runner_id,
             },
+        )
+        if not armed:
+            log.critical(
+                "could not durably arm the commit watchdog alert for commit_id=%s",
+                commit_id,
+            )
+
+    def _clear_commit_timeout_alert(self, commit_id: int) -> None:
+        """Clear the conservative watchdog alert after COMMIT_ACK has closed."""
+        self.alerts.clear_alert_once(
+            code="commit_timeout",
+            marker_value=f"commit:{commit_id}",
         )
 
     def hold_streaming_tail(self, tables) -> None:
