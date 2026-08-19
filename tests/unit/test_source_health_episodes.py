@@ -24,7 +24,7 @@ def test_pipeline_source_dark_alert_is_once_per_episode(tmp_path):
 
     from cdc_flight.config import DestinationConfig
     from cdc_flight.control_schema import ensure_control_schema
-    from cdc_flight.destination import observe_source_health
+    from cdc_flight.destination import RunState, observe_source_health
     from cdc_flight.pipeline import _record_run_failure_alert
 
     con = duckdb.connect(":memory:")
@@ -37,15 +37,18 @@ def test_pipeline_source_dark_alert_is_once_per_episode(tmp_path):
         ensure_control_schema(con)
         observe_source_health(con, pipeline=dest.pipeline_name, state="reachable")
         summary = {"stop_reason": "source_dark"}
+        first_run = RunState.new(dest.pipeline_name)
+        second_run = RunState.new(dest.pipeline_name)
+        third_run = RunState.new(dest.pipeline_name)
         _record_run_failure_alert(
-            con, dest=dest, runner_id="r1", exc=RuntimeError("blackhole"), summary=summary
+            con, dest=dest, run_state=first_run, exc=RuntimeError("blackhole"), summary=summary
         )
         _record_run_failure_alert(
-            con, dest=dest, runner_id="r2", exc=RuntimeError("blackhole"), summary=summary
+            con, dest=dest, run_state=second_run, exc=RuntimeError("blackhole"), summary=summary
         )
         observe_source_health(con, pipeline=dest.pipeline_name, state="reachable")
         _record_run_failure_alert(
-            con, dest=dest, runner_id="r3", exc=RuntimeError("blackhole"), summary=summary
+            con, dest=dest, run_state=third_run, exc=RuntimeError("blackhole"), summary=summary
         )
         rows = con.execute(
             'SELECT context FROM "_cdc_flight".alerts WHERE code = ? ORDER BY raised_at',

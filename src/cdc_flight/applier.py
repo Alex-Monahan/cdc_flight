@@ -67,7 +67,7 @@ from .backfill import (
 from .catalog_apply import CatalogCoordinator, CatalogPlan
 from .commit_group import CommitResult, OpenGroup
 from .config import ApplierConfig, resolve_control_schema
-from .destination import AlertSink, Lease, ResumePoint
+from .destination import AlertSink, CommitState, Lease, OccurrenceKey, ResumePoint
 from .envelope import (
     KIND_HEARTBEAT,
     KIND_SNAPSHOT_BOUNDARY,
@@ -827,7 +827,9 @@ class Applier:
                 "it before claiming success"
             ),
             condition_key="commit_timeout",
-            occurrence_key=f"commit:{commit_id}",
+            occurrence_key=OccurrenceKey.from_commit(
+                CommitState(pipeline=self.pipeline, commit_id=commit_id)
+            ),
             context={
                 "commit_id": commit_id,
                 "armed_before_commit_ack_window": True,
@@ -846,7 +848,9 @@ class Applier:
         self.alerts.clear_alert_once(
             code="commit_timeout",
             condition_key="commit_timeout",
-            occurrence_key=f"commit:{commit_id}",
+            occurrence_key=OccurrenceKey.from_commit(
+                CommitState(pipeline=self.pipeline, commit_id=commit_id)
+            ),
         )
 
     def hold_streaming_tail(self, tables) -> None:

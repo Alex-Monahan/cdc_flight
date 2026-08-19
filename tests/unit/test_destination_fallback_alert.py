@@ -85,6 +85,7 @@ def test_fallback_alert_failure_is_logged_critically(tmp_path, monkeypatch, capl
 
     from cdc_flight import destination as destination_mod
     from cdc_flight.config import DestinationConfig
+    from cdc_flight.destination import RunState
     from cdc_flight.errors import AlertPersistenceFailure
     from cdc_flight.pipeline import _record_run_failure_alert
 
@@ -99,7 +100,7 @@ def test_fallback_alert_failure_is_logged_critically(tmp_path, monkeypatch, capl
         _record_run_failure_alert(
             None,
             dest=dest,
-            runner_id="runner",
+            run_state=RunState.new(dest.pipeline_name),
             exc=OSError("database locked"),
             summary={"stop_reason": "destination_unavailable"},
         )
@@ -112,7 +113,7 @@ def test_fallback_alert_directory_fails_loudly_without_sidecar(tmp_path, capsys)
     import pytest
 
     from cdc_flight.config import DestinationConfig
-    from cdc_flight.destination import fallback_alert_path
+    from cdc_flight.destination import RunState, fallback_alert_path
     from cdc_flight.errors import AlertPersistenceFailure
     from cdc_flight.pipeline import _record_run_failure_alert
 
@@ -126,7 +127,7 @@ def test_fallback_alert_directory_fails_loudly_without_sidecar(tmp_path, capsys)
         _record_run_failure_alert(
             None,
             dest=dest,
-            runner_id="runner",
+            run_state=RunState.new(dest.pipeline_name),
             exc=OSError("database locked"),
             summary={"stop_reason": "destination_unavailable"},
         )
@@ -141,7 +142,7 @@ def test_fallback_replay_keeps_distinct_outages_distinct(tmp_path):
 
     from cdc_flight.config import DestinationConfig
     from cdc_flight.control_schema import ensure_control_schema
-    from cdc_flight.destination import fallback_alert_path, replay_fallback_alerts
+    from cdc_flight.destination import RunState, fallback_alert_path, replay_fallback_alerts
     from cdc_flight.pipeline import _record_run_failure_alert
 
     dest = DestinationConfig(
@@ -153,18 +154,23 @@ def test_fallback_replay_keeps_distinct_outages_distinct(tmp_path):
     try:
         ensure_control_schema(con)
         summary = {"stop_reason": "destination_unavailable"}
+        first_run = RunState.new(dest.pipeline_name)
+        second_run = RunState.new(dest.pipeline_name)
         _record_run_failure_alert(
-            None, dest=dest, runner_id="r1", exc=OSError("first lock"), summary=summary
+            None, dest=dest, run_state=first_run, exc=OSError("first lock"), summary=summary
         )
         _record_run_failure_alert(
-            None, dest=dest, runner_id="r2", exc=OSError("second lock"), summary=summary
+            None, dest=dest, run_state=second_run, exc=OSError("second lock"), summary=summary
         )
         sidecar_rows = [
             json.loads(line)
             for line in fallback_alert_path(dest).read_text().splitlines()
         ]
         assert len(sidecar_rows) == 2
-        assert [row["runner_id"] for row in sidecar_rows] == ["r1", "r2"]
+        assert [row["runner_id"] for row in sidecar_rows] == [
+            first_run.runner_id,
+            second_run.runner_id,
+        ]
         assert [row["marker_value"] for row in sidecar_rows] == [
             "destination_unavailable:fallback-episodes:occurrence:episode:1",
             "destination_unavailable:fallback-episodes:occurrence:episode:2",
@@ -194,7 +200,7 @@ def test_fallback_replay_collapses_repeated_observations_of_one_outage(tmp_path)
 
     from cdc_flight.config import DestinationConfig
     from cdc_flight.control_schema import ensure_control_schema
-    from cdc_flight.destination import fallback_alert_path, replay_fallback_alerts
+    from cdc_flight.destination import RunState, fallback_alert_path, replay_fallback_alerts
     from cdc_flight.pipeline import _record_run_failure_alert
 
     dest = DestinationConfig(
@@ -206,11 +212,14 @@ def test_fallback_replay_collapses_repeated_observations_of_one_outage(tmp_path)
     try:
         ensure_control_schema(con)
         summary = {"stop_reason": "destination_unavailable"}
+        first_run = RunState.new(dest.pipeline_name)
+        second_run = RunState.new(dest.pipeline_name)
+        third_run = RunState.new(dest.pipeline_name)
         _record_run_failure_alert(
-            None, dest=dest, runner_id="r1", exc=OSError("same lock"), summary=summary
+            None, dest=dest, run_state=first_run, exc=OSError("same lock"), summary=summary
         )
         _record_run_failure_alert(
-            None, dest=dest, runner_id="r2", exc=OSError("same lock"), summary=summary
+            None, dest=dest, run_state=second_run, exc=OSError("same lock"), summary=summary
         )
         sidecar_rows = [
             json.loads(line)
@@ -230,7 +239,7 @@ def test_fallback_replay_collapses_repeated_observations_of_one_outage(tmp_path)
         # Recovery closes episode 1; the same failure signature is a new episode
         # rather than a once-ever marker.
         _record_run_failure_alert(
-            None, dest=dest, runner_id="r3", exc=OSError("same lock"), summary=summary
+            None, dest=dest, run_state=third_run, exc=OSError("same lock"), summary=summary
         )
         assert replay_fallback_alerts(con, dest) == 1
         assert con.execute(
@@ -247,6 +256,7 @@ def test_fallback_rebuilds_episode_floor_when_journal_is_lost(tmp_path):
     from cdc_flight import destination as destination_mod
     from cdc_flight.config import DestinationConfig
     from cdc_flight.control_schema import ensure_control_schema
+    from cdc_flight.destination import RunState
     from cdc_flight.destination_alerts import _fallback_alert_episode_path
     from cdc_flight.pipeline import _record_run_failure_alert
 
@@ -259,14 +269,16 @@ def test_fallback_rebuilds_episode_floor_when_journal_is_lost(tmp_path):
     try:
         ensure_control_schema(con)
         summary = {"stop_reason": "destination_unavailable"}
+        first_run = RunState.new(dest.pipeline_name)
+        second_run = RunState.new(dest.pipeline_name)
         _record_run_failure_alert(
-            None, dest=dest, runner_id="r1", exc=OSError("first lock"), summary=summary
+            None, dest=dest, run_state=first_run, exc=OSError("first lock"), summary=summary
         )
         assert destination_mod.replay_fallback_alerts(con, dest) == 1
         _fallback_alert_episode_path(dest).unlink()
 
         _record_run_failure_alert(
-            None, dest=dest, runner_id="r2", exc=OSError("second lock"), summary=summary
+            None, dest=dest, run_state=second_run, exc=OSError("second lock"), summary=summary
         )
         rows = [
             json.loads(line)

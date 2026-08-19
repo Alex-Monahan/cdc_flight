@@ -86,6 +86,7 @@ from .machines import (
     RECOVERY_ROW_DELETED,
 )
 from .naming import control_table
+from .occurrence import OccurrenceKey, RecoveryGeneration, SlotState
 
 log = logging.getLogger("cdc_flight.recovery")
 
@@ -364,20 +365,24 @@ def begin(
         "source_lsn_regressed",
         "no_durable_destination_row",
     }:
-        state_key = ":".join(
-            str(value)
-            for value in (
-                decision,
-                slot_name,
-                context.get("confirmed_flush_lsn"),
-                context.get("durable_lsn"),
+        occurrence_key = OccurrenceKey.from_slot_state(
+            SlotState.from_mapping(
+                context,
+                decision=decision,
+                slot_name=slot_name,
             )
         )
         condition_key = decision
-        occurrence_key = f"slot-state:{state_key}"
     else:
         condition_key = decision
-        occurrence_key = f"recovery:{record.recovery_id}"
+        occurrence_key = OccurrenceKey.from_recovery_generation(
+            RecoveryGeneration(
+                pipeline=pipeline,
+                namespace=namespace,
+                recovery_id=record.recovery_id,
+                decision=decision,
+            )
+        )
     context["recovery_id"] = record.recovery_id
     raise_alert_once(
         con,

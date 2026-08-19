@@ -10,6 +10,12 @@ import tempfile
 from pathlib import Path
 
 from . import destination as _d
+from .occurrence import (
+    EpisodeState,
+    OccurrenceKey,
+    RunState,
+    occurrence_text,
+)
 
 log = _d.log
 now = _d.now
@@ -24,15 +30,14 @@ table_lifecycle = _d.table_lifecycle
 quote = _d.quote
 
 
-def _alert_identity(condition_key: str, occurrence_key: str) -> str:
+def _alert_identity(condition_key: str, occurrence_key: OccurrenceKey) -> str:
     """Build a deduplication identity from two independently named parts."""
-    for name, value in (
-        ("condition_key", condition_key),
-        ("occurrence_key", occurrence_key),
-    ):
-        if not isinstance(value, str) or not value.strip():
-            raise TypeError(f"{name} must be a non-empty string")
-    return f"{condition_key}:occurrence:{occurrence_key}"
+    if not isinstance(condition_key, str) or not condition_key.strip():
+        raise TypeError("condition_key must be a non-empty string")
+    # This is deliberately the first operation involving the occurrence.  A raw
+    # string, None, or a value derived from an exception therefore fails before a
+    # connection is queried or written, including through an aliased function.
+    return f"{condition_key}:occurrence:{occurrence_text(occurrence_key)}"
 
 
 def _write_alert_row(
@@ -121,7 +126,7 @@ class AlertSink:
 
     def raise_alert_once(
         self, *, severity: str, code: str, message: str, condition_key: str,
-        occurrence_key: str, context=None,
+        occurrence_key: OccurrenceKey, context=None,
     ) -> bool:
         """Write one durable alert for one condition occurrence.
 
@@ -145,7 +150,7 @@ class AlertSink:
         payload.update(
             {
                 "condition_key": condition_key,
-                "occurrence_key": occurrence_key,
+                "occurrence_key": occurrence_text(occurrence_key),
                 "alert_identity": identity,
                 # Compatibility for readers of the pre-split context field. It now
                 # carries the complete identity; the two components above are the
@@ -166,7 +171,7 @@ class AlertSink:
         )
 
     def clear_alert_once(
-        self, *, code: str, condition_key: str, occurrence_key: str
+        self, *, code: str, condition_key: str, occurrence_key: OccurrenceKey
     ) -> bool:
         """Remove a pre-armed alert after its bounded operation succeeds.
 
@@ -269,7 +274,7 @@ def alert_identity_exists(
     pipeline: str,
     code: str,
     condition_key: str,
-    occurrence_key: str,
+    occurrence_key: OccurrenceKey,
     control_schema: str | None = None,
 ) -> bool:
     """Whether the durable alert table already carries this full identity."""
@@ -316,7 +321,7 @@ def raise_alert_once(
     code: str,
     message: str,
     condition_key: str,
-    occurrence_key: str,
+    occurrence_key: OccurrenceKey,
     context=None,
     control_schema: str | None = None,
 ) -> bool:
@@ -341,7 +346,7 @@ def raise_alert_once(
     payload.update(
         {
             "condition_key": condition_key,
-            "occurrence_key": occurrence_key,
+            "occurrence_key": occurrence_text(occurrence_key),
             "alert_identity": identity,
             "condition_marker": identity,
         }
@@ -481,14 +486,10 @@ def _write_fallback_alert_episode(dest, *, episode_id: int, state: str,
         raise
 
 
-def _fallback_occurrence_marker(base_marker: str, episode_id: int) -> str:
-    return _alert_identity(base_marker, f"episode:{episode_id}")
-
-
 def persist_fallback_alert(
     dest,
     *,
-    runner_id: str,
+    run_state: RunState,
     severity: str,
     code: str,
     message: str,
@@ -503,9 +504,9 @@ def persist_fallback_alert(
     non-zero run failure and emits a critical stderr diagnostic.
     """
     path = fallback_alert_path(dest)
-    _alert_identity(condition_key, "episode:pending")
-    incident_key = str(incident_key)
-    if not incident_key.strip():
+    if type(run_state) is not RunState:
+        raise TypeError("run_state must be a RunState")
+    if not isinstance(incident_key, str) or not incident_key.strip():
         raise TypeError("incident_key must be a non-empty string")
     with _fallback_alert_lock(dest):
         episode = _read_fallback_alert_episode(dest)
@@ -516,7 +517,12 @@ def persist_fallback_alert(
             episode_id = episode["episode_id"]
         else:
             episode_id = episode["episode_id"] + 1
-        occurrence_key = f"episode:{episode_id}"
+        episode_state = EpisodeState(
+            pipeline=dest.pipeline_name,
+            episode_id=episode_id,
+            state="open",
+        )
+        occurrence_key = OccurrenceKey.from_episode(episode_state)
         occurrence_marker = _alert_identity(condition_key, occurrence_key)
         # Advance the episode journal before the append.  If the append fails, a
         # retry of the same observation reuses this identity rather than creating
@@ -531,18 +537,18 @@ def persist_fallback_alert(
         stored_context["fallback_episode_id"] = episode_id
         stored_context["fallback_incident_key"] = incident_key
         stored_context["condition_key"] = condition_key
-        stored_context["occurrence_key"] = occurrence_key
+        stored_context["occurrence_key"] = occurrence_text(occurrence_key)
         stored_context["alert_identity"] = occurrence_marker
         payload = {
             "pipeline": dest.pipeline_name,
-            "runner_id": runner_id,
+            "runner_id": run_state.runner_id,
             "raised_at": now().isoformat(),
             "severity": severity,
             "code": code,
             "message": message,
             "marker_value": occurrence_marker,
             "condition_key": condition_key,
-            "occurrence_key": occurrence_key,
+            "occurrence_key": occurrence_text(occurrence_key),
             "alert_identity": occurrence_marker,
             "episode_id": episode_id,
             "context": stored_context,
@@ -594,26 +600,25 @@ def replay_fallback_alerts(con, dest) -> int:
             pipeline = str(item.get("pipeline") or dest.pipeline_name)
             code = str(item.get("code") or "destination_unavailable")
             condition_key = item.get("condition_key")
-            occurrence_key = item.get("occurrence_key")
-            if condition_key is None or occurrence_key is None:
-                # Read sidecars written before the condition/occurrence split. The
-                # current writer always emits both fields, while the old combined
-                # marker still contains an episode identity when one is available.
-                marker_value = str(item.get("marker_value") or "fallback:unknown")
-                episode_id = item.get("episode_id")
-                if ":occurrence:" in marker_value:
-                    condition_key, occurrence_key = marker_value.rsplit(
-                        ":occurrence:", 1
-                    )
-                elif episode_id is not None:
-                    condition_key = marker_value.rsplit(":episode:", 1)[0]
-                    occurrence_key = f"episode:{int(episode_id)}"
-                else:
-                    condition_key = marker_value
-                    occurrence_key = f"legacy-run:{item.get('runner_id') or 'unknown'}"
+            episode_id = item.get("episode_id")
+            if not isinstance(condition_key, str) or not condition_key.strip():
+                log.critical("fallback alert line has no condition identity in %s", path)
+                replay_complete = False
+                continue
             try:
-                _alert_identity(str(condition_key), str(occurrence_key))
-            except TypeError:
+                episode_state = EpisodeState(
+                    pipeline=pipeline,
+                    episode_id=int(episode_id),
+                    state="open",
+                )
+                occurrence_key = OccurrenceKey.from_episode(episode_state)
+                serialized_occurrence = item.get("occurrence_key")
+                if (
+                    serialized_occurrence is not None
+                    and str(serialized_occurrence) != occurrence_text(occurrence_key)
+                ):
+                    raise TypeError("fallback alert occurrence does not match its episode")
+            except (TypeError, ValueError):
                 log.critical("fallback alert line has no occurrence identity in %s", path)
                 replay_complete = False
                 continue
@@ -623,8 +628,8 @@ def replay_fallback_alerts(con, dest) -> int:
                     severity=str(item.get("severity") or "critical"),
                     code=code,
                     message=str(item.get("message") or "destination was unavailable"),
-                    condition_key=str(condition_key),
-                    occurrence_key=str(occurrence_key),
+                    condition_key=condition_key,
+                    occurrence_key=occurrence_key,
                     context=dict(item.get("context") or {}) | {
                         "fallback_alert_path": str(path),
                         "replayed": True,
@@ -638,8 +643,8 @@ def replay_fallback_alerts(con, dest) -> int:
                         probe_con,
                         pipeline=pipeline,
                         code=code,
-                        condition_key=str(condition_key),
-                        occurrence_key=str(occurrence_key),
+                        condition_key=condition_key,
+                        occurrence_key=occurrence_key,
                         control_schema=dest.control_schema,
                     ):
                         replay_complete = False
@@ -665,7 +670,7 @@ def observe_source_health(
     state: str,
     confirmed_flush_lsn: int | None = None,
     control_schema: str | None = None,
-) -> dict | None:
+) -> EpisodeState | None:
     """Persist the source reachability episode used by ``source_dark`` alerts.
 
     ``reachable`` closes a prior dark episode. ``dark`` opens exactly one new episode
@@ -721,11 +726,16 @@ def observe_source_health(
         f"SELECT episode_id, state, observed_at FROM {table} WHERE pipeline = ?",
         [pipeline],
     ).fetchone()
-    return {
-        "episode_id": int(row[0]),
-        "state": str(row[1]),
-        "observed_at": row[2],
-    } if row else None
+    return (
+        EpisodeState(
+            pipeline=pipeline,
+            episode_id=int(row[0]),
+            state=str(row[1]),
+            observed_at=row[2],
+        )
+        if row
+        else None
+    )
 
 
 def read_slot_state(

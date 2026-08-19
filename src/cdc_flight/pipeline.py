@@ -27,7 +27,6 @@ import logging
 import os
 import sys
 import threading
-import uuid
 from pathlib import Path
 
 # Runtime compatibility, not a test workaround. This must run before any project import
@@ -59,7 +58,7 @@ from .config import (
     lease_ttl_seconds,
 )
 from .debezium_props import assert_no_internal_topic_collision, build_properties
-from .destination import Lease
+from .destination import EpisodeState, Lease, OccurrenceKey, RunState, SlotState
 from .errors import (
     AlertPersistenceFailure,
     EngineFailure,
@@ -152,7 +151,8 @@ def run(
         table for table in source.tables if not is_signal_relation(table)
     )
     namespace = props["name"]
-    runner_id = uuid.uuid4().hex
+    run_state = RunState.new(dest.pipeline_name)
+    runner_id = run_state.runner_id
 
     log.info(
         "source=%s:%s/%s tables=%s slot=%s snapshot=%s destination=%s",
@@ -177,7 +177,7 @@ def run(
         _record_run_failure_alert(
             None,
             dest=dest,
-            runner_id=runner_id,
+            run_state=run_state,
             exc=exc,
             summary=failure_summary,
         )
@@ -952,7 +952,7 @@ def run(
             _record_run_failure_alert(
                 con,
                 dest=dest,
-                runner_id=runner_id,
+                run_state=run_state,
                 exc=failure,
                 summary=reported,
             )
@@ -994,7 +994,7 @@ def run(
         _record_run_failure_alert(
             con,
             dest=dest,
-            runner_id=runner_id,
+            run_state=run_state,
             exc=exc,
             summary=reported,
         )
@@ -1018,7 +1018,7 @@ def _record_run_failure_alert(
     con,
     *,
     dest: DestinationConfig,
-    runner_id: str,
+    run_state: RunState,
     exc: BaseException,
     summary: dict,
 ) -> None:
@@ -1044,7 +1044,7 @@ def _record_run_failure_alert(
         try:
             path = dest_mod.persist_fallback_alert(
                 dest,
-                runner_id=runner_id,
+                run_state=run_state,
                 severity="critical",
                 code=code,
                 message=message,
@@ -1095,25 +1095,37 @@ def _record_run_failure_alert(
         # The runner id identifies the attempt, not the occurrence. LeaseLost carries
         # the holder/pipeline identity separately from its changing expiry text.
         condition_key = code
-        occurrence_key = f"lease:{getattr(exc, 'occurrence_key', runner_id)}"
+        occurrence_key = (
+            OccurrenceKey.from_lease(exc.lease_state)
+            if isinstance(exc, LeaseLost) and exc.lease_state is not None
+            else OccurrenceKey.from_run(run_state)
+        )
     elif isinstance(exc, OffsetUnusable):
         code = "offset_unusable"
         severity = "critical"
         condition_key = f"{code}:{hashlib.sha256(str(exc).encode()).hexdigest()}"
-        occurrence_key = getattr(exc, "occurrence_key", None) or f"run:{runner_id}"
+        occurrence_key = (
+            OccurrenceKey.from_offset_row(exc.offset_row)
+            if exc.offset_row is not None
+            else OccurrenceKey.from_run(run_state)
+        )
     elif summary.get("slot_check"):
         code = str(summary["slot_check"].get("decision") or "slot_check_failed")
         severity = "critical"
         slot_check = summary["slot_check"]
-        slot_state = ":".join(
-            str(slot_check.get(name))
-            for name in (
-                "decision", "slot_name", "system_identifier", "timeline_id",
-                "restart_lsn", "confirmed_flush_lsn", "durable_lsn",
-            )
-        )
         condition_key = code
-        occurrence_key = f"slot-state:{slot_state}"
+        slot_name = slot_check.get("slot_name")
+        occurrence_key = (
+            OccurrenceKey.from_slot_state(
+                SlotState.from_mapping(
+                    slot_check,
+                    decision=code,
+                    slot_name=slot_name,
+                )
+            )
+            if isinstance(slot_name, str) and slot_name.strip()
+            else OccurrenceKey.from_run(run_state)
+        )
     elif summary.get("stop_reason") == "source_dark":
         code = "source_dark"
         severity = "critical"
@@ -1132,13 +1144,17 @@ def _record_run_failure_alert(
         except Exception:
             log.critical("could not persist the source-dark episode", exc_info=True)
         episode_id = (
-            source_health_episode.get("episode_id")
-            if source_health_episode is not None
-            else f"unresolved:{runner_id}"
+            source_health_episode.episode_id
+            if isinstance(source_health_episode, EpisodeState)
+            else None
         )
         summary["source_health_episode"] = episode_id
         condition_key = code
-        occurrence_key = f"episode:{episode_id}"
+        occurrence_key = (
+            OccurrenceKey.from_episode(source_health_episode)
+            if isinstance(source_health_episode, EpisodeState)
+            else OccurrenceKey.from_run(run_state)
+        )
     elif summary.get("stop_reason") in {"max_seconds", "engine_error", "hung"}:
         code = "run_incomplete"
         severity = "critical"
@@ -1146,12 +1162,12 @@ def _record_run_failure_alert(
             f"{code}:{hashlib.sha256(str(exc).encode()).hexdigest()}:"
             f"{summary.get('stop_reason')}"
         )
-        occurrence_key = f"run:{runner_id}"
+        occurrence_key = OccurrenceKey.from_run(run_state)
     else:
         code = "run_failure"
         severity = "critical"
         condition_key = f"{code}:{hashlib.sha256(str(exc).encode()).hexdigest()}"
-        occurrence_key = f"run:{runner_id}"
+        occurrence_key = OccurrenceKey.from_run(run_state)
     message = (
         f"cdc_flight run for pipeline {dest.pipeline_name!r} failed before it could "
         f"claim success: {type(exc).__name__}: {exc}"
@@ -1177,10 +1193,14 @@ def _record_run_failure_alert(
                 condition_key=condition_key,
                 occurrence_key=occurrence_key,
                 context={
-                    "runner_id": runner_id,
+                    "runner_id": run_state.runner_id,
                     "error_type": type(exc).__name__,
                     "stop_reason": summary.get("stop_reason"),
-                    "source_health_episode": source_health_episode,
+                    "source_health_episode": (
+                        source_health_episode.as_dict()
+                        if isinstance(source_health_episode, EpisodeState)
+                        else source_health_episode
+                    ),
                 },
             )
             if not raised and not dest_mod.alert_identity_exists(

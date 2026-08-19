@@ -12,6 +12,7 @@ from datetime import datetime
 
 from . import destination as _d
 from .errors import LeaseLost
+from .occurrence import LeaseState
 from .retirement import RetirementResult, retire_handle
 
 log = _d.log
@@ -90,7 +91,11 @@ class Lease:
                     f"(pid {pid} on {host}) until {expires_at.isoformat()}; a second "
                     "concurrent Flight would double-write the shared destination "
                     f"(lease key {self.pipeline!r}, rubric 4.2)",
-                    occurrence_key=f"acquire:{self.pipeline}:{owner}",
+                    lease_state=LeaseState(
+                        pipeline=self.pipeline,
+                        owner_id=str(owner),
+                        operation="acquire",
+                    ),
                 )
         self._upsert(con, current)
 
@@ -106,7 +111,11 @@ class Lease:
             raise LeaseLost(
                 f"lease for {self.name!r} was taken by runner {rows[0][0]}; "
                 "this commit group must not be applied (rubric 4.2)",
-                occurrence_key=f"renew:{self.pipeline}:{rows[0][0]}",
+                lease_state=LeaseState(
+                    pipeline=self.pipeline,
+                    owner_id=str(rows[0][0]),
+                    operation="renew",
+                ),
             )
         self._upsert(con, now())
 

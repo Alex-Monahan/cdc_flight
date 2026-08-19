@@ -9,7 +9,6 @@ design rests on.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
@@ -33,6 +32,7 @@ from .machines import (
     SLOT_VERDICTS,  # noqa: F401
 )
 from .naming import control_table, quote
+from .occurrence import OffsetRowState
 
 # Re-exported: `source_relations.py` is a split of this module, not a new dependency
 # for its callers (Codex r3 MINOR / the destination ownership split).
@@ -265,14 +265,14 @@ def read_resume_point(
         _blob,
         _key_blob,
     ) = rows[0]
-    updated_marker = (
-        updated_at.isoformat() if hasattr(updated_at, "isoformat") else str(updated_at)
-    )
-    durable_occurrence = (
-        f"offset-row:{pipeline}:{namespace}:commit:{int(commit_id or 0)}:"
-        f"snapshot:{int(snapshot_epoch or 0)}:last-lsn:{int(last_lsn or 0)}:"
-        f"updated:{updated_marker}:state:"
-        f"{hashlib.sha256(str(resume_json).encode('utf-8')).hexdigest()}"
+    offset_row = OffsetRowState(
+        pipeline=pipeline,
+        namespace=namespace,
+        resume_json=str(resume_json),
+        commit_id=int(commit_id or 0),
+        snapshot_epoch=int(snapshot_epoch or 0),
+        last_lsn=int(last_lsn or 0),
+        updated_at=updated_at,
     )
     try:
         point = ResumePoint.from_json(resume_json)
@@ -280,7 +280,7 @@ def read_resume_point(
         raise OffsetUnusable(
             f"durable resume point for pipeline={pipeline!r}, namespace={namespace!r} "
             f"is unusable: {exc}",
-            occurrence_key=durable_occurrence,
+            offset_row=offset_row,
         ) from exc
     point.commit_id = int(commit_id or 0)
     point.last_lsn = int(last_lsn or point.last_lsn or 0)
@@ -594,4 +594,13 @@ from .destination_refusals import (  # noqa: E402, F401
     record_schema_refusal,
     resolve_schema_refusal,
     schema_refusal_state,
+)
+from .occurrence import (  # noqa: E402, F401
+    CommitState,
+    EpisodeState,
+    LeaseState,
+    OccurrenceKey,
+    RecoveryGeneration,
+    RunState,
+    SlotState,
 )

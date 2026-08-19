@@ -7,6 +7,8 @@ not pay that cost just to name an exception.
 
 from __future__ import annotations
 
+from .occurrence import LeaseState, OffsetRowState
+
 # A refusal's durable class is deliberately not an origin label.  Origins are
 # useful diagnostics, but letting each raise site choose the durable class made
 # the same source condition alternate between ``pending`` and ``quarantined``.
@@ -177,11 +179,14 @@ class OffsetUnusable(RuntimeError):
     the engine is constructed.
     """
 
-    def __init__(self, message: str, *, occurrence_key: str | None = None):
+    def __init__(self, message: str, *, offset_row: OffsetRowState | None = None):
         super().__init__(message)
+        if offset_row is not None and type(offset_row) is not OffsetRowState:
+            raise TypeError("offset_row must be an OffsetRowState")
         # The alert condition may be an exception fingerprint, but its occurrence
-        # comes from the durable offset row that could not be parsed.
-        self.occurrence_key = occurrence_key
+        # comes from the durable offset row that could not be parsed.  The exception
+        # never accepts an occurrence string, so a failure message cannot become one.
+        self.offset_row = offset_row
 
 
 class AmbiguousDelete(RuntimeError):
@@ -415,9 +420,11 @@ class RecoveryFailed(RuntimeError):
 class LeaseLost(RuntimeError):
     """Another runner owns `_cdc_flight.lease` for this pipeline (rubric 4.2)."""
 
-    def __init__(self, message: str, *, occurrence_key: str | None = None):
+    def __init__(self, message: str, *, lease_state: LeaseState | None = None):
         super().__init__(message)
+        if lease_state is not None and type(lease_state) is not LeaseState:
+            raise TypeError("lease_state must be a LeaseState")
         # Expiry timestamps and runner wording change on every retry.  The alert
-        # marker needs the durable ownership identity instead, so repeated contenders
-        # for one live lease remain one operator incident.
-        self.occurrence_key = occurrence_key or message
+        # occurrence comes from the durable ownership identity instead, so repeated
+        # contenders for one live lease remain one operator incident.
+        self.lease_state = lease_state
