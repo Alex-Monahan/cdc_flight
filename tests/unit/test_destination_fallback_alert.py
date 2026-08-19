@@ -100,3 +100,108 @@ def test_fallback_alert_failure_is_logged_critically(tmp_path, monkeypatch, capl
         summary={"stop_reason": "destination_unavailable"},
     )
     assert "fallback alert could not be persisted" in caplog.text
+
+
+def test_fallback_replay_keeps_distinct_outages_distinct(tmp_path):
+    import duckdb
+
+    from cdc_flight.config import DestinationConfig
+    from cdc_flight.control_schema import ensure_control_schema
+    from cdc_flight.destination import fallback_alert_path, replay_fallback_alerts
+    from cdc_flight.pipeline import _record_run_failure_alert
+
+    dest = DestinationConfig(
+        kind="duckdb",
+        pipeline_name="fallback-episodes",
+        duckdb_path=tmp_path / "dest.duckdb",
+    )
+    con = duckdb.connect(":memory:")
+    try:
+        ensure_control_schema(con)
+        summary = {"stop_reason": "destination_unavailable"}
+        _record_run_failure_alert(
+            None, dest=dest, runner_id="r1", exc=OSError("first lock"), summary=summary
+        )
+        _record_run_failure_alert(
+            None, dest=dest, runner_id="r2", exc=OSError("second lock"), summary=summary
+        )
+        sidecar_rows = [
+            json.loads(line)
+            for line in fallback_alert_path(dest).read_text().splitlines()
+        ]
+        assert len(sidecar_rows) == 2
+        assert [row["runner_id"] for row in sidecar_rows] == ["r1", "r2"]
+        assert [row["marker_value"] for row in sidecar_rows] == [
+            "destination_unavailable:fallback-episodes:episode:1",
+            "destination_unavailable:fallback-episodes:episode:2",
+        ]
+
+        assert replay_fallback_alerts(con, dest) == 2
+        rows = con.execute(
+            'SELECT code, context FROM "_cdc_flight".alerts '
+            "WHERE pipeline = ? ORDER BY raised_at",
+            [dest.pipeline_name],
+        ).fetchall()
+        assert [row[0] for row in rows] == [
+            "destination_unavailable", "destination_unavailable"
+        ]
+        assert ["episode:1" in row[1] for row in rows] == [True, False]
+        assert replay_fallback_alerts(con, dest) == 0
+        assert con.execute(
+            'SELECT count(*) FROM "_cdc_flight".alerts WHERE pipeline = ?',
+            [dest.pipeline_name],
+        ).fetchone()[0] == 2
+    finally:
+        con.close()
+
+
+def test_fallback_replay_collapses_repeated_observations_of_one_outage(tmp_path):
+    import duckdb
+
+    from cdc_flight.config import DestinationConfig
+    from cdc_flight.control_schema import ensure_control_schema
+    from cdc_flight.destination import fallback_alert_path, replay_fallback_alerts
+    from cdc_flight.pipeline import _record_run_failure_alert
+
+    dest = DestinationConfig(
+        kind="duckdb",
+        pipeline_name="fallback-repeat",
+        duckdb_path=tmp_path / "dest.duckdb",
+    )
+    con = duckdb.connect(":memory:")
+    try:
+        ensure_control_schema(con)
+        summary = {"stop_reason": "destination_unavailable"}
+        _record_run_failure_alert(
+            None, dest=dest, runner_id="r1", exc=OSError("same lock"), summary=summary
+        )
+        _record_run_failure_alert(
+            None, dest=dest, runner_id="r2", exc=OSError("same lock"), summary=summary
+        )
+        sidecar_rows = [
+            json.loads(line)
+            for line in fallback_alert_path(dest).read_text().splitlines()
+        ]
+        assert len(sidecar_rows) == 2
+        assert {row["marker_value"] for row in sidecar_rows} == {
+            "destination_unavailable:fallback-repeat:episode:1"
+        }
+        assert replay_fallback_alerts(con, dest) == 1
+        assert replay_fallback_alerts(con, dest) == 0
+        assert con.execute(
+            'SELECT count(*) FROM "_cdc_flight".alerts WHERE pipeline = ?',
+            [dest.pipeline_name],
+        ).fetchone()[0] == 1
+
+        # Recovery closes episode 1; the same failure signature is a new episode
+        # rather than a once-ever marker.
+        _record_run_failure_alert(
+            None, dest=dest, runner_id="r3", exc=OSError("same lock"), summary=summary
+        )
+        assert replay_fallback_alerts(con, dest) == 1
+        assert con.execute(
+            'SELECT count(*) FROM "_cdc_flight".alerts WHERE pipeline = ?',
+            [dest.pipeline_name],
+        ).fetchone()[0] == 2
+    finally:
+        con.close()

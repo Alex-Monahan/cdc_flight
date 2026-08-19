@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
+import tempfile
 from pathlib import Path
 
 from . import destination as _d
@@ -285,6 +287,81 @@ def fallback_alert_path(dest) -> Path:
     return Path(dest.pipelines_dir) / f"{dest.pipeline_name}.cdc_alerts.jsonl"
 
 
+def _fallback_alert_episode_path(dest) -> Path:
+    return Path(f"{fallback_alert_path(dest)}.episode.json")
+
+
+@contextlib.contextmanager
+def _fallback_alert_lock(dest):
+    """Serialize sidecar observations and the recovery transition.
+
+    The JSONL remains the audit trail.  A separate lock keeps an available
+    destination from closing an episode while another runner is appending a
+    pre-connection observation.
+    """
+    lock_path = Path(f"{fallback_alert_path(dest)}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _read_fallback_alert_episode(dest) -> dict:
+    path = _fallback_alert_episode_path(dest)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        episode_id = int(payload["episode_id"])
+        state = str(payload["state"])
+        incident_key = payload.get("incident_key")
+        if episode_id < 0 or state not in {"open", "recovered"}:
+            raise ValueError("invalid fallback episode state")
+        return {
+            "episode_id": episode_id,
+            "state": state,
+            "incident_key": str(incident_key) if incident_key is not None else None,
+        }
+    except (OSError, TypeError, ValueError, json.JSONDecodeError, KeyError):
+        return {"episode_id": 0, "state": "recovered", "incident_key": None}
+
+
+def _write_fallback_alert_episode(dest, *, episode_id: int, state: str,
+                                  incident_key: str | None) -> None:
+    path = _fallback_alert_episode_path(dest)
+    payload = json.dumps(
+        {
+            "episode_id": episode_id,
+            "state": state,
+            "incident_key": incident_key,
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    try:
+        written = 0
+        while written < len(payload):
+            written += os.write(descriptor, payload[written:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
+
+
+def _fallback_occurrence_marker(base_marker: str, episode_id: int) -> str:
+    return f"{base_marker}:episode:{episode_id}"
+
+
 def persist_fallback_alert(
     dest,
     *,
@@ -293,6 +370,7 @@ def persist_fallback_alert(
     code: str,
     message: str,
     marker_value: str,
+    occurrence_key: str | None = None,
     context=None,
 ) -> Path:
     """Synchronously append and fsync an alert when no destination handle exists.
@@ -302,31 +380,55 @@ def persist_fallback_alert(
     non-zero run failure and emits a critical stderr diagnostic.
     """
     path = fallback_alert_path(dest)
-    payload = {
-        "pipeline": dest.pipeline_name,
-        "runner_id": runner_id,
-        "raised_at": now().isoformat(),
-        "severity": severity,
-        "code": code,
-        "message": message,
-        "marker_value": marker_value,
-        "context": dict(context or {}),
-        "destination_kind": dest.kind,
-        "destination_path": str(getattr(dest, "duckdb_path", "")),
-    }
-    line = (json.dumps(payload, default=str, sort_keys=True) + "\n").encode("utf-8")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(
-        str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT,
-        0o600,
-    )
-    try:
-        written = 0
-        while written < len(line):
-            written += os.write(descriptor, line[written:])
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    incident_key = str(occurrence_key or marker_value)
+    with _fallback_alert_lock(dest):
+        episode = _read_fallback_alert_episode(dest)
+        if (
+            episode["state"] == "open"
+            and episode["incident_key"] == incident_key
+        ):
+            episode_id = episode["episode_id"]
+        else:
+            episode_id = episode["episode_id"] + 1
+        occurrence_marker = _fallback_occurrence_marker(marker_value, episode_id)
+        # Advance the episode journal before the append.  If the append fails, a
+        # retry of the same observation reuses this identity rather than creating
+        # a second alert occurrence.
+        _write_fallback_alert_episode(
+            dest,
+            episode_id=episode_id,
+            state="open",
+            incident_key=incident_key,
+        )
+        stored_context = dict(context or {})
+        stored_context["fallback_episode_id"] = episode_id
+        stored_context["fallback_incident_key"] = incident_key
+        payload = {
+            "pipeline": dest.pipeline_name,
+            "runner_id": runner_id,
+            "raised_at": now().isoformat(),
+            "severity": severity,
+            "code": code,
+            "message": message,
+            "marker_value": occurrence_marker,
+            "episode_id": episode_id,
+            "context": stored_context,
+            "destination_kind": dest.kind,
+            "destination_path": str(getattr(dest, "duckdb_path", "")),
+        }
+        line = (json.dumps(payload, default=str, sort_keys=True) + "\n").encode("utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(
+            str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+            0o600,
+        )
+        try:
+            written = 0
+            while written < len(line):
+                written += os.write(descriptor, line[written:])
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
     return path
 
 
@@ -338,36 +440,67 @@ def replay_fallback_alerts(con, dest) -> int:
     erase the complete lines before it.
     """
     path = fallback_alert_path(dest)
-    if not path.exists():
-        return 0
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except Exception:  # pragma: no cover - the sidecar itself remains operator-visible
-        log.critical("could not read fallback alert sidecar %s", path, exc_info=True)
-        return 0
-    recorded = 0
-    for line in lines:
+    with _fallback_alert_lock(dest):
+        if not path.exists():
+            return 0
         try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            log.warning("ignoring an incomplete fallback alert line in %s", path)
-            continue
-        pipeline = str(item.get("pipeline") or dest.pipeline_name)
-        sink = AlertSink(con, pipeline=pipeline, control_schema=dest.control_schema)
-        try:
-            if sink.raise_alert_once(
-                severity=str(item.get("severity") or "critical"),
-                code=str(item.get("code") or "destination_unavailable"),
-                message=str(item.get("message") or "destination was unavailable"),
-                marker_value=str(item.get("marker_value") or "fallback:unknown"),
-                context=dict(item.get("context") or {}) | {
-                    "fallback_alert_path": str(path),
-                    "replayed": True,
-                },
-            ):
-                recorded += 1
-        finally:
-            sink.close()
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except Exception:  # pragma: no cover - the sidecar itself remains operator-visible
+            log.critical("could not read fallback alert sidecar %s", path, exc_info=True)
+            return 0
+        recorded = 0
+        replay_complete = True
+        replayed_any = False
+        for line in lines:
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                log.warning("ignoring an incomplete fallback alert line in %s", path)
+                replay_complete = False
+                continue
+            pipeline = str(item.get("pipeline") or dest.pipeline_name)
+            code = str(item.get("code") or "destination_unavailable")
+            marker_value = str(item.get("marker_value") or "fallback:unknown")
+            episode_id = item.get("episode_id")
+            if episode_id is not None and ":episode:" not in marker_value:
+                marker_value = _fallback_occurrence_marker(marker_value, int(episode_id))
+            sink = AlertSink(con, pipeline=pipeline, control_schema=dest.control_schema)
+            try:
+                raised = sink.raise_alert_once(
+                    severity=str(item.get("severity") or "critical"),
+                    code=code,
+                    message=str(item.get("message") or "destination was unavailable"),
+                    marker_value=marker_value,
+                    context=dict(item.get("context") or {}) | {
+                        "fallback_alert_path": str(path),
+                        "replayed": True,
+                    },
+                )
+                if raised:
+                    recorded += 1
+                else:
+                    probe_con = sink._sink if sink.independent else con
+                    if not alert_marker_exists(
+                        probe_con,
+                        pipeline=pipeline,
+                        code=code,
+                        marker_key="condition_marker",
+                        marker_value=marker_value,
+                        control_schema=dest.control_schema,
+                    ):
+                        replay_complete = False
+                replayed_any = True
+            finally:
+                sink.close()
+        if replay_complete and replayed_any:
+            episode = _read_fallback_alert_episode(dest)
+            if episode["state"] == "open":
+                _write_fallback_alert_episode(
+                    dest,
+                    episode_id=episode["episode_id"],
+                    state="recovered",
+                    incident_key=episode["incident_key"],
+                )
     return recorded
 
 

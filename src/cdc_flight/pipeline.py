@@ -1025,7 +1025,11 @@ def _record_run_failure_alert(
     """
     if con is None:
         code = "destination_unavailable"
-        marker = f"{code}:{dest.pipeline_name}:{type(exc).__name__}"
+        marker = f"{code}:{dest.pipeline_name}"
+        incident_key = (
+            f"{type(exc).__module__}.{type(exc).__qualname__}:"
+            f"{hashlib.sha256(str(exc).encode()).hexdigest()}"
+        )
         message = (
             f"cdc_flight could not open destination for pipeline {dest.pipeline_name!r}: "
             f"{type(exc).__name__}: {exc}. The durable fallback alert is at the sidecar "
@@ -1039,6 +1043,7 @@ def _record_run_failure_alert(
                 code=code,
                 message=message,
                 marker_value=marker,
+                occurrence_key=incident_key,
                 context={
                     "error_type": type(exc).__name__,
                     "stop_reason": summary.get("stop_reason"),
