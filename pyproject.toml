@@ -35,6 +35,7 @@ dev = [
 
 [project.scripts]
 cdc-flight = "cdc_flight.pipeline:main"
+cdc-flight-service = "cdc_flight.service:main"
 cdc-datagen = "cdc_flight.datagen:main"
 
 [build-system]

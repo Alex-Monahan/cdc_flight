@@ -65,13 +65,24 @@ CONTROL_DDL = [
             PRIMARY KEY (pipeline, commit_id)
         )""",
     f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.lease (
-            pipeline        VARCHAR     PRIMARY KEY,
-            owner_id        VARCHAR     NOT NULL,
-            host            VARCHAR,
-            pid             BIGINT,
-            acquired_at     TIMESTAMPTZ NOT NULL,
-            renewed_at      TIMESTAMPTZ NOT NULL,
-            expires_at      TIMESTAMPTZ NOT NULL
+            -- ``pipeline`` remains the compatibility column.  Its value is the
+            -- resolved physical key, never a configured pipeline name.
+            pipeline             VARCHAR     PRIMARY KEY,
+            lease_key            VARCHAR,
+            lease_id             VARCHAR,
+            fencing_epoch        BIGINT      DEFAULT 1,
+            service_id           VARCHAR,
+            worker_generation    VARCHAR,
+            owner_id             VARCHAR     NOT NULL,
+            host                 VARCHAR,
+            pid                  BIGINT,
+            process_start_token  VARCHAR,
+            worker_pid           BIGINT,
+            worker_start_token   VARCHAR,
+            acquired_at          TIMESTAMPTZ NOT NULL,
+            renewed_at           TIMESTAMPTZ NOT NULL,
+            expires_at           TIMESTAMPTZ NOT NULL,
+            state                VARCHAR     DEFAULT 'supervisor_held'
         )""",
     f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.table_state (
             pipeline        VARCHAR     NOT NULL,

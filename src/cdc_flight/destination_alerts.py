@@ -193,7 +193,14 @@ def _validate_occurrence_binding(
         return
 
     if kind == "lease":
-        _alert_pipeline, physical_pipeline, owner_id, _operation, acquired_at = binding[1:]
+        # Lease occurrence bindings also carry lease_id/epoch/service/generation.
+        # Validate the identity fields below without making the alert boundary
+        # positionally depend on the optional tail of the typed receipt.
+        _alert_pipeline = binding[1]
+        physical_pipeline = binding[2]
+        owner_id = binding[3]
+        _operation = binding[4]
+        acquired_at = binding[5]
         row = _independent_fetchone(
             con,
             f"SELECT owner_id, acquired_at FROM {_control_table(control_schema, 'lease')} "

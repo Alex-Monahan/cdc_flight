@@ -610,6 +610,32 @@ class Sandbox:
             text=capture,
         )
 
+    def spawn_service(
+        self,
+        *,
+        destination: str = "duckdb",
+        extra_env: dict[str, str] | None = None,
+        capture: bool = False,
+        matrix_arm: bool = False,
+    ) -> subprocess.Popen:
+        """Start the real supervisor; it starts the real service worker child."""
+        sink = subprocess.PIPE if capture else subprocess.DEVNULL
+        env = {**self.env, **(extra_env or {})}
+        executable = (
+            [sys.executable, str(MATRIX_CHILD), "--service"]
+            if matrix_arm
+            else [_executable("cdc-flight-service")]
+        )
+        command = [*executable, "--destination", destination]
+        return subprocess.Popen(
+            command,
+            env=env,
+            cwd=PROJECT_DIR,
+            stdout=sink,
+            stderr=sink,
+            text=capture,
+        )
+
     def last_summary(self) -> dict:
         """The JSON summary the CLI wrote for its most recent run, if any."""
         path = self.state_dir / "last_run.json"

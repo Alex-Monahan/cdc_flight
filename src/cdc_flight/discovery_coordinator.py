@@ -19,6 +19,7 @@ from . import resnapshot as resnapshot_mod
 from .applier import Applier
 from .config import CatalogConfig, ReplicationConfig, RunConfig, SourceConfig
 from .errors import EngineFailure
+from .flight_worker import FlightWorker
 from .machines import PHASE_SNAPSHOTTING, PHASE_STREAMING
 from .ownership import DestinationOwnership
 from .run_state import RunOutcome, RunPhaseWriter
@@ -62,6 +63,7 @@ class LiveDiscoveryCoordinator:
         resnapshot_enabled: bool,
         descriptor_provider=None,
         catalog_flush_exclude: set[str] | None = None,
+        service_context=None,
     ) -> None:
         self.con = con
         self.source = source
@@ -93,6 +95,7 @@ class LiveDiscoveryCoordinator:
         # immutable provider by pipeline.py.
         self.descriptor_provider = descriptor_provider
         self.catalog_flush_exclude = set(catalog_flush_exclude or ())
+        self.service_context = service_context
 
         self.applier = None
         self.health = None
@@ -105,7 +108,10 @@ class LiveDiscoveryCoordinator:
         # The setting is evaluated by the same policy helper as the startup path.  It
         # is passed in as a boolean so this module does not own environment parsing.
         discovery_handoff_enabled = bool(
-            self.watcher is not None and self.source.auto_discovery and self._resnapshot_enabled
+            self.service_context is None
+            and self.watcher is not None
+            and self.source.auto_discovery
+            and self._resnapshot_enabled
         )
         handled_discoveries = {relation.qualified for relation in self.discovered}
         # The stock signal relation is captured for Debezium's source signalling,
@@ -121,8 +127,12 @@ class LiveDiscoveryCoordinator:
 
         try:
             while True:
-                remaining = self.run_cfg.max_seconds - (time.monotonic() - run_started)
-                if remaining <= 0:
+                remaining = (
+                    float("inf")
+                    if self.service_context is not None
+                    else self.run_cfg.max_seconds - (time.monotonic() - run_started)
+                )
+                if self.service_context is None and remaining <= 0:
                     raise EngineFailure(
                         "the live discovery hand-off exhausted the run deadline before "
                         "the resumed engine could start",
@@ -188,24 +198,37 @@ class LiveDiscoveryCoordinator:
                         and current_watcher.new_relations(exclude=excluded)
                     )
 
-                self.result = run_engine_bounded(
-                    engine,
-                    self.applier,
-                    dataclasses.replace(self.run_cfg, max_seconds=remaining),
-                    self.health,
-                    engine_terminates_normally=(
-                        engine_props["snapshot.mode"] in {"initial_only", "recovery_only"}
-                    ),
-                    catalog=self.watcher,
-                    catalog_drain_seconds=self.catalog_cfg.drain_seconds,
-                    phases=self.phases,
-                    # Intermediate engines have local outcomes; the final engine owns
-                    # the run-level outcome so ``work_done`` cannot mask clean idle.
-                    outcome=iteration_outcome,
-                    completion=completion_for_engine,
-                    quiescence_observer=self.ownership.quiescence_observer(self.applier),
-                    keep_catalog=discovery_handoff_enabled,
-                    stop_when=discovery_ready if discovery_handoff_enabled else None,
+                worker = FlightWorker(
+                    engine=engine,
+                    handler=self.applier,
+                    run_config=dataclasses.replace(self.run_cfg, max_seconds=remaining),
+                    health=self.health,
+                    runner=run_engine_bounded,
+                    supervisor_options={
+                        "engine_terminates_normally": (
+                            engine_props["snapshot.mode"] in {"initial_only", "recovery_only"}
+                        ),
+                        "catalog": self.watcher,
+                        "catalog_drain_seconds": self.catalog_cfg.drain_seconds,
+                        "phases": self.phases,
+                        # Intermediate engines have local outcomes; the final engine
+                        # owns the run-level outcome so ``work_done`` cannot mask clean
+                        # idle.
+                        "outcome": iteration_outcome,
+                        "completion": completion_for_engine,
+                        "quiescence_observer": self.ownership.quiescence_observer(
+                            self.applier
+                        ),
+                        "keep_catalog": discovery_handoff_enabled,
+                        "stop_when": (
+                            discovery_ready if discovery_handoff_enabled else None
+                        ),
+                    },
+                )
+                self.result = (
+                    worker.run_service(self.service_context)
+                    if self.service_context is not None
+                    else worker.run_batch()
                 )
                 # A background catalog poll can discover an incomplete strict
                 # descriptor after startup.  The watcher is quiesced by
@@ -458,6 +481,7 @@ class LiveDiscoveryCoordinator:
             binary_handling_mode=self.props.get("binary.handling.mode", "base64"),
             hstore_handling_mode=self.props.get("hstore.handling.mode", "map"),
             control_schema=self.destination.control_schema,
+            service_context=self.service_context,
         )
         self.ownership.attach(applier)
         return applier

@@ -7,6 +7,7 @@ from a test fixture, a Makefile target, or (later) a MotherDuck Flight.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -679,6 +680,73 @@ class CatalogConfig:
 
 def lease_ttl_seconds() -> float:
     return float(_env("CDC_LEASE_TTL", "60"))
+
+
+@dataclass(frozen=True)
+class ServiceConfig:
+    """Bounded control-plane policy for the explicit long-running adapter.
+
+    The service process is intentionally unbounded; these values bound every
+    operation around it.  Keeping this policy separate from :class:`RunConfig`
+    prevents the finite CLI's max/idle semantics from leaking into service mode.
+    """
+
+    service_id: str = field(
+        default_factory=lambda: _env("CDC_SERVICE_ID", _env("CDC_PIPELINE_NAME", "cdc-flight"))
+    )
+    lease_ttl_seconds: float = field(
+        default_factory=lambda: float(_env("CDC_SERVICE_LEASE_TTL", "60"))
+    )
+    lease_renew_seconds: float = field(
+        default_factory=lambda: float(_env("CDC_SERVICE_LEASE_RENEW_SECONDS", "15"))
+    )
+    parent_heartbeat_seconds: float = field(
+        default_factory=lambda: float(_env("CDC_SERVICE_PARENT_HEARTBEAT_SECONDS", "1"))
+    )
+    parent_loss_seconds: float = field(
+        default_factory=lambda: float(_env("CDC_SERVICE_PARENT_LOSS_SECONDS", "5"))
+    )
+    worker_start_timeout: float = field(
+        default_factory=lambda: float(_env("CDC_SERVICE_WORKER_START_TIMEOUT", "20"))
+    )
+    worker_heartbeat_timeout: float = field(
+        default_factory=lambda: float(_env("CDC_SERVICE_WORKER_HEARTBEAT_TIMEOUT", "10"))
+    )
+    drain_deadline_seconds: float = field(
+        default_factory=lambda: float(_env("CDC_SERVICE_DRAIN_DEADLINE_SECONDS", "30"))
+    )
+    operation_timeout_seconds: float = field(
+        default_factory=lambda: float(_env("CDC_SERVICE_OPERATION_TIMEOUT_SECONDS", "60"))
+    )
+    max_worker_restarts: int = field(
+        default_factory=lambda: int(_env("CDC_SERVICE_MAX_WORKER_RESTARTS", "5"))
+    )
+
+    def __post_init__(self) -> None:
+        values = (
+            ("lease_ttl_seconds", self.lease_ttl_seconds),
+            ("lease_renew_seconds", self.lease_renew_seconds),
+            ("parent_heartbeat_seconds", self.parent_heartbeat_seconds),
+            ("parent_loss_seconds", self.parent_loss_seconds),
+            ("worker_start_timeout", self.worker_start_timeout),
+            ("worker_heartbeat_timeout", self.worker_heartbeat_timeout),
+            ("drain_deadline_seconds", self.drain_deadline_seconds),
+            ("operation_timeout_seconds", self.operation_timeout_seconds),
+        )
+        for name, value in values:
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"service {name} must be a positive finite number")
+        if self.lease_renew_seconds > self.lease_ttl_seconds / 3:
+            raise ValueError(
+                "CDC_SERVICE_LEASE_RENEW_SECONDS must be no greater than one third "
+                "of CDC_SERVICE_LEASE_TTL"
+            )
+        if self.parent_loss_seconds >= self.lease_ttl_seconds:
+            raise ValueError(
+                "CDC_SERVICE_PARENT_LOSS_SECONDS must be less than the lease TTL"
+            )
+        if self.max_worker_restarts < 0:
+            raise ValueError("CDC_SERVICE_MAX_WORKER_RESTARTS must be non-negative")
 
 
 def motherduck_token() -> str | None:

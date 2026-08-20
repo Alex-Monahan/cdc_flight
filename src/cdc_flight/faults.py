@@ -172,6 +172,21 @@ BACKFILL_POINTS = (
     "schema_change_during_chunk",
     "typed_change_during_chunk",
     "spill_write_failure",
+    # Long-running service cuts.  They are registered separately from the
+    # inherited 1.7 anchors so the finite matrix remains exactly the baseline
+    # cardinality while service-mode children can target mid-stream edges.
+    "service_worker_startup",
+    "service_callback_midstream",
+    "service_before_md_commit",
+    "service_after_md_commit_before_ack",
+    "service_after_one_ack_before_finish",
+    "service_pg_transaction_open",
+    "service_lease_acquire",
+    "service_lease_renewal",
+    "service_lease_release",
+    "service_heartbeat_write",
+    "service_run_log_write",
+    "service_source_health_write",
 )
 
 #: Points that are **not** reached by `maybe_crash`: they describe something the
@@ -277,6 +292,24 @@ MATRIX_POINTS = (
     "watermark_reached",
     "shutdown_idle_marker_written",
     "shutdown_idle_marker_acknowledged",
+)
+
+# Service-mode cuts are a separate vocabulary so the finite compatibility matrix
+# remains exactly the baseline set while a service child can target its own
+# long-lived lifecycle edges.
+SERVICE_MATRIX_POINTS = (
+    "service_worker_startup",
+    "service_callback_midstream",
+    "service_before_md_commit",
+    "service_after_md_commit_before_ack",
+    "service_after_one_ack_before_finish",
+    "service_pg_transaction_open",
+    "service_lease_acquire",
+    "service_lease_renewal",
+    "service_lease_release",
+    "service_heartbeat_write",
+    "service_run_log_write",
+    "service_source_health_write",
 )
 
 DEFAULT_EXIT_CODE = 137
@@ -405,10 +438,10 @@ def parse_matrix_spec(raw: str | None) -> tuple[str, int] | None:
         return None
     parts = raw.split(":")
     point = parts[0].strip()
-    if point not in MATRIX_POINTS:
+    if point not in MATRIX_POINTS + SERVICE_MATRIX_POINTS:
         raise FaultSpecError(
             f"{MATRIX_ENV_VAR}: unknown point {parts[0]!r}; expected one of "
-            f"{MATRIX_POINTS}"
+            f"{MATRIX_POINTS + SERVICE_MATRIX_POINTS}"
         )
     try:
         nth = int(parts[1]) if len(parts) > 1 and parts[1] else 1
