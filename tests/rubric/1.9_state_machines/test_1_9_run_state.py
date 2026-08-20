@@ -28,6 +28,7 @@ import pytest
 
 from cdc_flight import destination as dest_mod
 from cdc_flight import machines as m
+from cdc_flight.config import DestinationConfig
 from cdc_flight.run_state import RunOutcome, RunPhaseWriter
 from cdc_flight.states import IllegalTransition
 
@@ -599,14 +600,19 @@ def test_a_pre_engine_failure_agrees_with_the_heartbeat(tmp_path_factory, postgr
         # A live incumbent lease held by a runner whose pid is this (very much alive)
         # test process, so `Lease.acquire` cannot reclaim it.
         pipeline = box.env["CDC_PIPELINE_NAME"]
+        lease_key = DestinationConfig(
+            kind="duckdb",
+            pipeline_name=pipeline,
+            duckdb_path=box.duckdb_path,
+        ).lease_key
         con = duckdb.connect(str(box.duckdb_path))
         try:
-            con.execute("DELETE FROM _cdc_flight.lease WHERE pipeline = ?", [pipeline])
+            con.execute("DELETE FROM _cdc_flight.lease WHERE pipeline = ?", [lease_key])
             con.execute(
                 "INSERT INTO _cdc_flight.lease (pipeline, owner_id, host, pid, "
                 "acquired_at, renewed_at, expires_at) VALUES (?,?,?,?, now(), now(), "
                 "now() + INTERVAL 1 HOUR)",
-                [pipeline, _uuid.uuid4().hex, "not-this-host", 1],
+                [lease_key, _uuid.uuid4().hex, "not-this-host", 1],
             )
         finally:
             con.close()

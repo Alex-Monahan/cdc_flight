@@ -16,9 +16,9 @@ from datetime import UTC, datetime
 from typing import Any
 
 from . import faults, table_lifecycle
-from .config import resolve_control_schema
+from .config import resolve_control_schema, resolve_motherduck_database
 from .control_schema import CONTROL_DDL, ensure_control_schema
-from .errors import CANONICAL_REFUSAL_CLASS  # noqa: F401
+from .errors import CANONICAL_REFUSAL_CLASS, OffsetUnusable  # noqa: F401
 from .machines import (
     KEYLESS_EVENT,
     KEYLESS_EVENT_APPLIED,
@@ -32,6 +32,7 @@ from .machines import (
     SLOT_VERDICTS,  # noqa: F401
 )
 from .naming import control_table, quote
+from .occurrence import OffsetRowState, _offset_row_receipt_from_durable
 
 # Re-exported: `source_relations.py` is a split of this module, not a new dependency
 # for its callers (Codex r3 MINOR / the destination ownership split).
@@ -151,15 +152,30 @@ class ResumePoint:
 
     @classmethod
     def from_json(cls, text: str, **extra) -> ResumePoint:
-        payload = json.loads(text)
-        return cls(
-            partition=payload.get("partition") or {},
-            offset=payload.get("offset") or {},
-            last_lsn=int(payload.get("last_lsn") or 0),
-            last_txn_id=payload.get("last_txn_id"),
-            last_total_order=payload.get("last_total_order"),
-            **extra,
-        )
+        try:
+            payload = json.loads(text)
+            if not isinstance(payload, dict):
+                raise ValueError("resume JSON must be an object")
+            partition = payload.get("partition") or {}
+            offset = payload.get("offset") or {}
+            if not isinstance(partition, dict) or not isinstance(offset, dict):
+                raise ValueError("resume partition and offset must be objects")
+            last_lsn = int(payload.get("last_lsn") or 0)
+            if last_lsn < 0:
+                raise ValueError("resume last_lsn must be non-negative")
+            total_order = payload.get("last_total_order")
+            if total_order is not None:
+                total_order = int(total_order)
+            return cls(
+                partition=partition,
+                offset=offset,
+                last_lsn=last_lsn,
+                last_txn_id=payload.get("last_txn_id"),
+                last_total_order=total_order,
+                **extra,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise OffsetUnusable(f"resume point is not usable JSON: {exc}") from exc
 
 
 # --------------------------------------------------------------------------- #
@@ -187,11 +203,26 @@ def connect(dest) -> Any:
         bootstrap = duckdb.connect(f"md:?motherduck_token={token}", config=DUCKDB_CONNECT_CONFIG)
         try:
             assert_runtime_capabilities(bootstrap)
-            bootstrap.execute(f"CREATE DATABASE IF NOT EXISTS {quote(dest.motherduck_database)}")
+            # Resolve the account-level spelling before opening the database-specific
+            # connection. This makes case/whitespace/quoting aliases share the same
+            # MotherDuck local cache and the same physical catalog identity; the lease
+            # resolver repeats the server query after schemas are ready.
+            database = resolve_motherduck_database(bootstrap, dest.motherduck_database)
+            if database is None:
+                bootstrap.execute(
+                    f"CREATE DATABASE IF NOT EXISTS {quote(dest.motherduck_database)}"
+                )
+                database = resolve_motherduck_database(
+                    bootstrap, dest.motherduck_database
+                )
+            if database is None:
+                raise RuntimeError(
+                    f"MotherDuck did not resolve database {dest.motherduck_database!r}"
+                )
         finally:
             bootstrap.close()
         con = duckdb.connect(
-            f"md:{dest.motherduck_database}?motherduck_token={token}",
+            f"md:{database}?motherduck_token={token}",
             config=DUCKDB_CONNECT_CONFIG,
         )
         assert_runtime_capabilities(con)
@@ -208,6 +239,32 @@ def now() -> datetime:
     return datetime.now(UTC)
 
 
+def _committed_row_matches(con, query: str, params, observed_row) -> bool:
+    """Prove that an observed row is in the committed database snapshot.
+
+    DuckDB's public ``cursor()`` API creates an independent connection/transaction.
+    It therefore cannot see writes that are still uncommitted on ``con``.  Read-side
+    receipt issuers use this helper with the complete row they observed: a receipt is
+    issued only when the independent snapshot returns that exact row.  Merely asking
+    the caller's connection to read again would validate its own uncommitted view and
+    would not establish durability.
+    """
+    independent = None
+    try:
+        independent = con.cursor()
+        committed_rows = independent.execute(query, params).fetchall()
+        return len(committed_rows) == 1 and tuple(committed_rows[0]) == tuple(observed_row)
+    except Exception:
+        log.warning("could not verify a read-side row through an independent snapshot", exc_info=True)
+        return False
+    finally:
+        if independent is not None:
+            try:
+                independent.close()
+            except Exception:  # pragma: no cover - cursor cleanup is best effort
+                log.debug("could not close independent durability cursor", exc_info=True)
+
+
 # --------------------------------------------------------------------------- #
 # resume point I/O
 # --------------------------------------------------------------------------- #
@@ -216,7 +273,7 @@ def read_resume_point(
 ) -> ResumePoint | None:
     rows = con.execute(
         f"SELECT resume_json, commit_id, last_lsn, last_txn_id, last_total_order, "
-        f"       snapshot_epoch, offset_blob, offset_key_blob "
+        f"       snapshot_epoch, updated_at, offset_blob, offset_key_blob "
         f"FROM {_control_table(control_schema, 'debezium_offsets')} "
         "WHERE pipeline = ? AND namespace = ?",
         [pipeline, namespace],
@@ -230,10 +287,39 @@ def read_resume_point(
         last_txn_id,
         last_total_order,
         snapshot_epoch,
+        updated_at,
         _blob,
         _key_blob,
     ) = rows[0]
-    point = ResumePoint.from_json(resume_json)
+    committed_query = (
+        f"SELECT resume_json, commit_id, last_lsn, last_txn_id, last_total_order, "
+        f"       snapshot_epoch, updated_at, offset_blob, offset_key_blob "
+        f"FROM {_control_table(control_schema, 'debezium_offsets')} "
+        "WHERE pipeline = ? AND namespace = ?"
+    )
+    committed = _committed_row_matches(
+        con, committed_query, [pipeline, namespace], rows[0]
+    )
+    offset_row = OffsetRowState(
+        pipeline=pipeline,
+        namespace=namespace,
+        resume_json=str(resume_json),
+        commit_id=int(commit_id or 0),
+        snapshot_epoch=int(snapshot_epoch or 0),
+        last_lsn=int(last_lsn or 0),
+        updated_at=updated_at,
+    )
+    try:
+        point = ResumePoint.from_json(resume_json)
+    except OffsetUnusable as exc:
+        offset_receipt = (
+            _offset_row_receipt_from_durable(offset_row) if committed else None
+        )
+        raise OffsetUnusable(
+            f"durable resume point for pipeline={pipeline!r}, namespace={namespace!r} "
+            f"is unusable: {exc}",
+            offset_row=offset_receipt,
+        ) from exc
     point.commit_id = int(commit_id or 0)
     point.last_lsn = int(last_lsn or point.last_lsn or 0)
     point.last_txn_id = last_txn_id
@@ -508,15 +594,21 @@ def write_keyless_events(
 # state owners remain independently measurable.
 from .destination_alerts import (  # noqa: E402, F401
     AlertSink,
+    alert_identity_exists,
     alert_marker_exists,
     destination_holds_rows,
+    fallback_alert_path,
     mark_awaiting_snapshot,
+    observe_source_health,
+    persist_fallback_alert,
     promote_interrupted_snapshots,
     raise_alert,
+    raise_alert_once,
     read_slot_state,
     read_snapshot_states,
     register_table,
     replacement_snapshot_is_current,
+    replay_fallback_alerts,
     request_snapshot,
     tables_awaiting_snapshot,
     write_slot_state,
@@ -540,4 +632,18 @@ from .destination_refusals import (  # noqa: E402, F401
     record_schema_refusal,
     resolve_schema_refusal,
     schema_refusal_state,
+)
+from .occurrence import (  # noqa: E402, F401
+    CommitReservation,
+    EpisodeReceipt,
+    EpisodeState,
+    LeaseReceipt,
+    LeaseState,
+    OccurrenceKey,
+    OffsetRowReceipt,
+    RecoveryGeneration,
+    RecoveryJournalReceipt,
+    RunState,
+    SlotState,
+    SlotStateReceipt,
 )

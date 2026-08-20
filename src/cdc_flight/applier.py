@@ -67,7 +67,7 @@ from .backfill import (
 from .catalog_apply import CatalogCoordinator, CatalogPlan
 from .commit_group import CommitResult, OpenGroup
 from .config import ApplierConfig, resolve_control_schema
-from .destination import AlertSink, Lease, ResumePoint
+from .destination import AlertSink, Lease, OccurrenceKey, ResumePoint
 from .envelope import (
     KIND_HEARTBEAT,
     KIND_SNAPSHOT_BOUNDARY,
@@ -83,6 +83,7 @@ from .errors import (
 )
 from .faults import maybe_crash
 from .marker_accounting import SourceMarkerReceiptCounter
+from .occurrence import _commit_reservation
 from .snapshot import SnapshotCoordinator
 from .snapshot_completion import (
     SnapshotCompletion,
@@ -301,6 +302,11 @@ class Applier:
         self.source_marker_records_received = 0
         self._source_marker_receipts = SourceMarkerReceiptCounter(marker_prefixes)
         self.last_batch_at = time.monotonic()
+        # A stock Debezium heartbeat is a control-only callback. It must advance the
+        # slot, but it must not reset the completion watermark's data-quiet clock or a
+        # read-only fallback can wait forever on a quiet source that heartbeats every
+        # five seconds.
+        self._last_callback_had_data = False
 
         # -- counters surfaced in the run summary (rubric 6.1) --------------- #
         self.record_count = 0
@@ -534,12 +540,14 @@ class Applier:
         finally:
             with self._quiescence:
                 self._in_flight -= 1
-                self.last_batch_at = time.monotonic()
+                if self._last_callback_had_data:
+                    self.last_batch_at = time.monotonic()
                 if self._in_flight == 0:
                     self._quiescence.notify_all()
 
     def _handle(self, records, committer) -> None:
         self._committer = committer
+        self._last_callback_had_data = False
         # The previous group's offset flush is verified here, outside the
         # commit->ack window, now that Debezium has polled at least once since it
         # (Codex 7).
@@ -641,6 +649,7 @@ class Applier:
             self.record_count += source_records
             if data_in_batch:
                 self.data_batch_count += 1
+        self._last_callback_had_data = bool(data_in_batch)
 
         if data_in_batch:
             maybe_crash("decode", self.data_batch_count)
@@ -799,6 +808,53 @@ class Applier:
         if alert is not None:
             self.group.pending_alerts.append(alert)
         self.ambiguous_resnapshots_queued += int(recorded)
+
+    def _arm_commit_timeout_alert(self, commit_id: int) -> None:
+        """Arm a durable watchdog alert before the commit/ack exclusion opens.
+
+        The watchdog callback is intentionally not allowed to perform destination or
+        logging I/O: it can fire while ``COMMIT_ACK`` is active. Leaving this row in
+        place after a hard exit is the observable timeout; a successful group clears it
+        only after the exclusion has closed.
+        """
+        armed = self.alerts.raise_alert_once(
+            severity="critical",
+            code="commit_timeout",
+            message=(
+                f"commit group {commit_id} has an armed bounded commit watchdog; if "
+                "this alert remains, the commit or acknowledgement did not return "
+                "within the watchdog timeout. The commit is AMBIGUOUS and the "
+                "destination may already be durable, so the next run must reconcile "
+                "it before claiming success"
+            ),
+            condition_key="commit_timeout",
+            occurrence_key=OccurrenceKey.from_commit(
+                _commit_reservation(self.pipeline, commit_id),
+                pipeline=self.pipeline,
+            ),
+            context={
+                "commit_id": commit_id,
+                "armed_before_commit_ack_window": True,
+                "timeout_seconds": self.cfg.commit_timeout,
+                "runner_id": self.runner_id,
+            },
+        )
+        if not armed:
+            log.critical(
+                "could not durably arm the commit watchdog alert for commit_id=%s",
+                commit_id,
+            )
+
+    def _clear_commit_timeout_alert(self, commit_id: int) -> None:
+        """Clear the conservative watchdog alert after COMMIT_ACK has closed."""
+        self.alerts.clear_alert_once(
+            code="commit_timeout",
+            condition_key="commit_timeout",
+            occurrence_key=OccurrenceKey.from_commit(
+                _commit_reservation(self.pipeline, commit_id),
+                pipeline=self.pipeline,
+            ),
+        )
 
     def hold_streaming_tail(self, tables) -> None:
         """Hold these relations' ordinary stream rows out of a retained image.

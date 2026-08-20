@@ -138,6 +138,17 @@ def check_the_slot(
     ).fetchall()
     durable_lsn = int(durable[0][0]) if durable else None
     observation = reconcile_mod.observe_slot(source.dsn, replication.slot_name)
+    # A reachable source closes the previous dark episode. An unobservable source is
+    # intentionally not treated as a transition here; the supervisor must first prove
+    # that a source which was answering has stayed dark for its configured threshold.
+    if observation.observable:
+        dest_mod.observe_source_health(
+            con,
+            pipeline=dest.pipeline_name,
+            state="reachable",
+            confirmed_flush_lsn=observation.confirmed_flush_lsn,
+            control_schema=dest.control_schema,
+        )
     previous = dest_mod.read_slot_state(
         con, dest.pipeline_name, replication.slot_name,
         control_schema=dest.control_schema,
@@ -161,6 +172,7 @@ def check_the_slot(
         previous=previous,
         destination_rows=destination_rows,
     )
+    verdict.context["slot_name"] = replication.slot_name
     log.info("slot check: %s (%s)", verdict.decision, verdict.message or "healthy")
 
     recovery = None
@@ -211,6 +223,24 @@ def check_the_slot(
             message=f"{verdict.message}; deferred to the orphan-offsets refusal",
             context=verdict.context,
         )
+    # Commit the exact slot observation before any recovery journal attempt. A
+    # pre-journal failure needs a retry-stable occurrence owner, and this receipt
+    # proves that owner existed before `recovery.begin()` could mint an alert key.
+    slot_receipt = None
+    if observation.observable:
+        recorded = observation.as_dict() | {
+            "durable_lsn": durable_lsn,
+            "slot_name": replication.slot_name,
+        }
+        slot_receipt = dest_mod.write_slot_state(
+            con,
+            pipeline=dest.pipeline_name,
+            slot_name=replication.slot_name,
+            observation=recorded,
+            verdict=verdict.decision,
+            verdict_message=verdict.message or None,
+            control_schema=dest.control_schema,
+        )
     if verdict.resnapshot:
         if not resnapshot_enabled():
             # The rubric's 4 rather than its 5, chosen explicitly.
@@ -224,6 +254,10 @@ def check_the_slot(
                 f"{verdict.decision}: {verdict.message}. CDC_RESNAPSHOT=0, so the "
                 "automatic re-snapshot that would repair this is disabled."
             )
+        if slot_receipt is None:  # pragma: no cover - a resnapshot needs an observation
+            raise RuntimeError(
+                "cannot journal slot recovery without a committed slot observation"
+            )
         recovery = reconcile_mod.recover_by_full_resnapshot(
             con,
             pipeline=dest.pipeline_name,
@@ -233,18 +267,17 @@ def check_the_slot(
             offset_path=replication.offset_file,
             verdict=verdict,
             captured_tables=captured,
+            slot_receipt=slot_receipt,
             forget_catalog=verdict.decision in reconcile_mod.FORGET_CATALOG_DECISIONS,
             control_schema=dest.control_schema,
         )
-    if observation.observable:
-        recorded = observation.as_dict() | {"durable_lsn": durable_lsn}
-        if recovery is not None:
-            # The recovery dropped this slot. Keeping its LSNs as the baseline would make
-            # the next run compare a brand-new slot against a slot that no longer exists;
-            # the cluster's identity is the part that stays meaningful.
-            recorded |= {
-                "restart_lsn": None, "confirmed_flush_lsn": None, "durable_lsn": None
-            }
+    if observation.observable and recovery is not None:
+        # The recovery dropped this slot. Keeping its LSNs as the baseline would make
+        # the next run compare a brand-new slot against a slot that no longer exists;
+        # the cluster's identity is the part that stays meaningful.
+        recorded |= {
+            "restart_lsn": None, "confirmed_flush_lsn": None, "durable_lsn": None
+        }
         dest_mod.write_slot_state(
             con,
             pipeline=dest.pipeline_name,
@@ -287,6 +320,24 @@ def journal_the_reset(
     only pairs a snapshot with an exact WAL position when it creates the slot itself.
     """
     phases.ensure(PHASE_RECOVERING, detail="--reset-state")
+    previous_slot = dest_mod.read_slot_state(
+        con,
+        dest.pipeline_name,
+        replication.slot_name,
+        control_schema=dest.control_schema,
+    )
+    # The reset is itself a recovery decision. Persist its slot owner before the
+    # journal attempt so a pre-journal failure has a durable, retry-stable identity
+    # even when this destination has never recorded a slot observation before.
+    slot_receipt = dest_mod.write_slot_state(
+        con,
+        pipeline=dest.pipeline_name,
+        slot_name=replication.slot_name,
+        observation=previous_slot.as_dict() if previous_slot is not None else {},
+        verdict="fresh_start",
+        verdict_message="operator requested a full state reset",
+        control_schema=dest.control_schema,
+    )
     record = recovery_mod.begin(
         con,
         pipeline=dest.pipeline_name,
@@ -304,6 +355,7 @@ def journal_the_reset(
         # meaningless; keeping them makes the catalog watcher call every table
         # dropped-and-recreated, which the mass-drop breaker then refuses.
         forget_catalog=True,
+        slot_receipt=slot_receipt,
         state_dir=replication.state_dir,
         severity="warning",
         control_schema=dest.control_schema,

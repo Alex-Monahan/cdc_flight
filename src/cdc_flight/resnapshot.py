@@ -127,6 +127,7 @@ from .config import (
     RunConfig,
     SourceConfig,
     resolve_control_schema,
+    source_connection_kwargs,
 )
 from .debezium_props import build_properties
 from .destination import ResumePoint
@@ -487,7 +488,14 @@ def run(
 
         from .catalog_descriptors import RelationDescriptorProvider
 
-        descriptor_connection = psycopg.connect(source.dsn, autocommit=True)
+        descriptor_connection = psycopg.connect(
+            source.dsn,
+            autocommit=True,
+            **source_connection_kwargs(
+                connect_timeout=run_cfg.jdbc_connect_timeout_seconds,
+                socket_timeout_seconds=run_cfg.jdbc_socket_timeout_seconds,
+            ),
+        )
         descriptor_provider = RelationDescriptorProvider.from_tables(
             descriptor_connection, tables, source_dsn=source.dsn
         ).descriptors_for
@@ -497,6 +505,7 @@ def run(
             namespace=f"{namespace}::resnapshot",
             dataset=dataset,
             topic_prefix=replication.topic_prefix,
+            marker_prefixes=("cdcf", "cdc_flight_heartbeat"),
             signal_data_collection=props.get("signal.data.collection"),
             offset_path=resnap_replication.offset_file,
             resume_point=ResumePoint(snapshot_epoch=epoch_base),

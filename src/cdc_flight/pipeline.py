@@ -21,12 +21,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import logging
 import os
 import sys
 import threading
-import uuid
 from pathlib import Path
 
 # Runtime compatibility, not a test workaround. This must run before any project import
@@ -58,8 +58,19 @@ from .config import (
     lease_ttl_seconds,
 )
 from .debezium_props import assert_no_internal_topic_collision, build_properties
-from .destination import Lease
-from .errors import EngineFailure
+from .destination import (
+    EpisodeReceipt,
+    Lease,
+    OccurrenceKey,
+    RunState,
+)
+from .errors import (
+    AlertPersistenceFailure,
+    EngineFailure,
+    LeaseLost,
+    OffsetUnusable,
+    SlotAheadOfDestination,
+)
 from .faults import validate_env as validate_fault_env
 from .machines import (
     PHASE_RECONCILING,
@@ -128,6 +139,8 @@ def run(
         replication,
         snapshot_mode=snapshot_mode,
         truncate_mode=settings["truncate_mode"],
+        jdbc_socket_timeout_seconds=run_cfg.jdbc_socket_timeout_seconds,
+        jdbc_connect_timeout_seconds=run_cfg.jdbc_connect_timeout_seconds,
     )
     # A captured table whose topic collides with `<prefix>.transaction` would be
     # decoded as transaction metadata and never applied. Not reachable with the
@@ -143,7 +156,8 @@ def run(
         table for table in source.tables if not is_signal_relation(table)
     )
     namespace = props["name"]
-    runner_id = uuid.uuid4().hex
+    run_state = RunState.new(dest.pipeline_name)
+    runner_id = run_state.runner_id
 
     log.info(
         "source=%s:%s/%s tables=%s slot=%s snapshot=%s destination=%s",
@@ -155,9 +169,26 @@ def run(
     # the applier writes through, rather than by scattering anchors through the SQL
     # builders. `AlertSink`'s independent `cursor()` is delegated untouched on
     # purpose - see `faults.FaultyConnection`.
-    con = faults_mod.wrap_destination(
-        dest_mod.connect(dest), control_schema=control_schema
-    )
+    con = None
+    try:
+        con = faults_mod.wrap_destination(
+            dest_mod.connect(dest), control_schema=control_schema
+        )
+    except BaseException as exc:
+        # DuckDB's file lock is acquired by `connect()` before the pipeline has a
+        # destination handle. Keep this failure on a durable local sidecar so a
+        # second pipeline cannot disappear with only a non-zero exit code.
+        failure_summary = {"stop_reason": "destination_unavailable"}
+        _record_run_failure_alert(
+            None,
+            dest=dest,
+            run_state=run_state,
+            exc=exc,
+            summary=failure_summary,
+        )
+        with contextlib.suppress(Exception):
+            exc.summary = failure_summary
+        raise
     summary_extra: dict = {}
     lease: Lease | None = None
     lease_held = False
@@ -196,6 +227,13 @@ def run(
     try:
         dest_mod.ensure_control_schema(con, control_schema)
         dest_mod.ensure_dataset(con, dest.dataset_name)
+        summary_extra["fallback_alerts_replayed"] = dest_mod.replay_fallback_alerts(
+            con, dest
+        )
+        # MotherDuck's database and schema comparison rules are resolved by the live
+        # catalog, not guessed from configuration spelling. Local DuckDB uses the
+        # opened file's device/inode plus the same server-resolved schema names.
+        destination_lease_key = dest.resolve_physical_lease_key(con)
         # rubric 1.9 / ADR §4.8: one `_cdc_flight.heartbeat` row per run, moved through
         # the `RUN_PHASE` machine on its OWN connection. "Where is this run" stops being
         # a source-line position in a 470-line function and becomes a query. The
@@ -207,19 +245,6 @@ def run(
             outcome=outcome,
             control_schema=control_schema,
         )
-
-        if reset_state:
-            # The one part of `--reset-state` that is NOT journalled, and the one part
-            # that does not need to be: a lease row destroys no data and records no
-            # obligation. It is cleared before the lease is acquired because an operator
-            # saying "start over" is also saying "break whatever claims to hold this
-            # pipeline"; `Lease.acquire` reclaims a dead owner on its own, so this only
-            # covers an owner whose host we cannot check.
-            con.execute(
-                f"DELETE FROM {control_table(control_schema, 'lease')} "
-                "WHERE pipeline = ?",
-                [dest.pipeline_name],
-            )
 
         applier_cfg = ApplierConfig(
             max_batch_size=int(props["max.batch.size"]),
@@ -236,10 +261,11 @@ def run(
         # deletes the resume point, drops the slot), and a second runner doing that
         # concurrently is exactly what rubric 4.2 exists to prevent.
         lease = Lease(
-            dest.pipeline_name,
+            destination_lease_key,
             owner_id=runner_id,
             ttl_seconds=lease_ttl_seconds(),
             control_schema=control_schema,
+            label=dest.pipeline_name,
         )
         lease.acquire(con)
         lease_held = True
@@ -361,6 +387,21 @@ def run(
         # `resume()` performs the file / row / slot ladder, idempotently, from whatever
         # phase survives.
         if reconciliation.decision == "orphan_accepted_resnapshot" and journal is None:
+            previous_slot = dest_mod.read_slot_state(
+                con,
+                dest.pipeline_name,
+                replication.slot_name,
+                control_schema=control_schema,
+            )
+            slot_receipt = dest_mod.write_slot_state(
+                con,
+                pipeline=dest.pipeline_name,
+                slot_name=replication.slot_name,
+                observation=previous_slot.as_dict() if previous_slot is not None else {},
+                verdict="no_durable_destination_row",
+                verdict_message="an operator accepted the orphan offsets resnapshot",
+                control_schema=control_schema,
+            )
             journal = recovery_mod.begin(
                 con,
                 pipeline=dest.pipeline_name,
@@ -375,6 +416,7 @@ def run(
                 offset_path=replication.offset_file,
                 captured_tables=captured_tables,
                 forget_catalog=False,
+                slot_receipt=slot_receipt,
                 context={"file_lsn": reconciliation.file_lsn},
                 control_schema=control_schema,
             )
@@ -923,6 +965,18 @@ def run(
         except EngineFailure as failure:
             outcome.record(failure.summary.get("stop_reason") or "engine_error")
             reported = failure.summary
+            # EngineFailure is the normal fail-closed boundary for supervisor-owned
+            # failures (source-dark, bounded timeout, incomplete watermark, and
+            # connector shutdown).  It must take the same durable alert path as an
+            # acquisition/lease exception; otherwise the process exits non-zero while
+            # the operator sees only the local summary.
+            _record_run_failure_alert(
+                con,
+                dest=dest,
+                run_state=run_state,
+                exc=failure,
+                summary=reported,
+            )
             raise
     except BaseException as exc:
         # Anything that unwound before (or around) the engine: a refusal, a lease loss,
@@ -944,6 +998,27 @@ def run(
         reported.update(dict(getattr(exc, "summary", {}) or {}))
         reported.update(summary_extra)
         reported.setdefault("stop_reason", outcome.value)
+        if phases is not None and hasattr(phases, "record_log"):
+            phases.record_log(
+                level="CRITICAL",
+                event="run_failure",
+                message=(
+                    f"run failed before success could be claimed: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                context={
+                    "error_type": type(exc).__name__,
+                    "stop_reason": reported.get("stop_reason"),
+                },
+                force=True,
+            )
+        _record_run_failure_alert(
+            con,
+            dest=dest,
+            run_state=run_state,
+            exc=exc,
+            summary=reported,
+        )
         with contextlib.suppress(Exception):  # a BaseException without a __dict__
             exc.summary = reported
         raise
@@ -958,6 +1033,239 @@ def run(
             run_ok=run_ok,
             hard_exit_on_transfer=True,
         )
+
+
+def _record_run_failure_alert(
+    con,
+    *,
+    dest: DestinationConfig,
+    run_state: RunState,
+    exc: BaseException,
+    summary: dict,
+) -> None:
+    """Project every pre-engine/run-boundary failure onto the durable alert surface.
+
+    The supervisor owns connector-time failures, while this outer boundary owns
+    acquisition, lease, offset, and teardown failures. Keeping this projection here
+    means a failure before an Applier/AlertSink exists cannot silently become only a
+    local summary record.
+    """
+    if con is None:
+        code = "destination_unavailable"
+        condition_key = f"{code}:{dest.pipeline_name}"
+        incident_key = (
+            f"{type(exc).__module__}.{type(exc).__qualname__}:"
+            f"{hashlib.sha256(str(exc).encode()).hexdigest()}"
+        )
+        message = (
+            f"cdc_flight could not open destination for pipeline {dest.pipeline_name!r}: "
+            f"{type(exc).__name__}: {exc}. The durable fallback alert is at the sidecar "
+            "path and will be replayed when the destination becomes available."
+        )
+        try:
+            path = dest_mod.persist_fallback_alert(
+                dest,
+                run_state=run_state,
+                severity="critical",
+                code=code,
+                message=message,
+                condition_key=condition_key,
+                incident_key=incident_key,
+                context={
+                    "error_type": type(exc).__name__,
+                    "stop_reason": summary.get("stop_reason"),
+                    "destination_unavailable": True,
+                },
+            )
+            summary["fallback_alert_path"] = str(path)
+            log.critical("destination unavailable; durable alert written to %s", path)
+        except BaseException as alert_exc:
+            # A failed fallback is itself a failed health signal. Do not return to the
+            # caller and let the original exception look like an ordinary, diagnosed
+            # failure: the replacement says plainly that alerting is broken and
+            # retains the original exception in `original_failure`.
+            log.critical(
+                "destination unavailable and fallback alert could not be persisted",
+                exc_info=True,
+            )
+            print(
+                "CRITICAL: destination unavailable and fallback alert failed: "
+                f"{type(alert_exc).__name__}: {alert_exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise AlertPersistenceFailure(
+                code=code,
+                original_failure=exc,
+                alert_failure=alert_exc,
+                summary=summary,
+            ) from alert_exc
+        return
+    if summary.get("connector_failure_alert") in {"recorded", "already_recorded"}:
+        return
+    # Slot reconciliation raises after it has durably emitted the named verdict
+    # (`slot_missing`, `slot_ahead_of_destination`, or `slot_recreated`).  Projecting
+    # the same exception again as a generic run_failure creates two operator incidents
+    # for one loss of source position; the named verdict is the complete diagnosis.
+    if isinstance(exc, SlotAheadOfDestination):
+        return
+    source_health_episode = None
+    if isinstance(exc, LeaseLost) or "lease" in str(exc).lower():
+        code = "concurrent_destination_run"
+        severity = "critical"
+        # The runner id identifies the attempt, not the occurrence. LeaseLost carries
+        # the holder/pipeline identity separately from its changing expiry text.
+        condition_key = code
+        occurrence_key = (
+            OccurrenceKey.from_lease(
+                exc.lease_state, pipeline=dest.pipeline_name
+            )
+            if isinstance(exc, LeaseLost) and exc.lease_state is not None
+            else OccurrenceKey.from_run(run_state, pipeline=dest.pipeline_name)
+        )
+    elif isinstance(exc, OffsetUnusable):
+        code = "offset_unusable"
+        severity = "critical"
+        condition_key = f"{code}:{hashlib.sha256(str(exc).encode()).hexdigest()}"
+        occurrence_key = (
+            OccurrenceKey.from_offset_row(
+                exc.offset_row,
+                pipeline=dest.pipeline_name,
+                namespace=exc.offset_row.state.namespace,
+            )
+            if exc.offset_row is not None
+            else OccurrenceKey.from_run(run_state, pipeline=dest.pipeline_name)
+        )
+    elif summary.get("slot_check"):
+        code = str(summary["slot_check"].get("decision") or "slot_check_failed")
+        severity = "critical"
+        slot_check = summary["slot_check"]
+        condition_key = code
+        slot_name = slot_check.get("slot_name")
+        slot_receipt = (
+            dest_mod.read_slot_state(
+                con,
+                dest.pipeline_name,
+                slot_name,
+                control_schema=dest.control_schema,
+            )
+            if isinstance(slot_name, str) and slot_name.strip()
+            else None
+        )
+        occurrence_key = (
+            OccurrenceKey.from_slot_state(
+                slot_receipt,
+                pipeline=dest.pipeline_name,
+                slot_name=slot_name,
+            )
+            if slot_receipt is not None
+            else OccurrenceKey.from_run(run_state, pipeline=dest.pipeline_name)
+        )
+    elif summary.get("stop_reason") == "source_dark":
+        code = "source_dark"
+        severity = "critical"
+        # This is an episode identity, not a pipeline identity.  It is updated before
+        # the alert is emitted, so recovery followed by another outage cannot reuse a
+        # once-ever marker.
+        with contextlib.suppress(Exception):
+            con.execute("ROLLBACK")
+        try:
+            source_health_episode = dest_mod.observe_source_health(
+                con,
+                pipeline=dest.pipeline_name,
+                state="dark",
+                control_schema=dest.control_schema,
+            )
+        except Exception:
+            log.critical("could not persist the source-dark episode", exc_info=True)
+        episode_id = (
+            source_health_episode.episode_id
+            if isinstance(source_health_episode, EpisodeReceipt)
+            else None
+        )
+        summary["source_health_episode"] = episode_id
+        condition_key = code
+        occurrence_key = (
+            OccurrenceKey.from_episode(
+                source_health_episode, pipeline=dest.pipeline_name
+            )
+            if isinstance(source_health_episode, EpisodeReceipt)
+            else OccurrenceKey.from_run(run_state, pipeline=dest.pipeline_name)
+        )
+    elif summary.get("stop_reason") in {"max_seconds", "engine_error", "hung"}:
+        code = "run_incomplete"
+        severity = "critical"
+        condition_key = (
+            f"{code}:{hashlib.sha256(str(exc).encode()).hexdigest()}:"
+            f"{summary.get('stop_reason')}"
+        )
+        occurrence_key = OccurrenceKey.from_run(
+            run_state, pipeline=dest.pipeline_name
+        )
+    else:
+        code = "run_failure"
+        severity = "critical"
+        condition_key = f"{code}:{hashlib.sha256(str(exc).encode()).hexdigest()}"
+        occurrence_key = OccurrenceKey.from_run(
+            run_state, pipeline=dest.pipeline_name
+        )
+    message = (
+        f"cdc_flight run for pipeline {dest.pipeline_name!r} failed before it could "
+        f"claim success: {type(exc).__name__}: {exc}"
+    )
+    try:
+        # A failed lease acquisition can leave the destination connection inside the
+        # implicit transaction opened by its probe (MotherDuck reports this as a
+        # conflict/aborted transaction).  The alert is an operator-side fact, not part
+        # of that failed attempt; clear the probe transaction before writing it so the
+        # failure cannot be durable only in last_run.json.
+        with contextlib.suppress(Exception):
+            con.execute("ROLLBACK")
+        alert_sink = dest_mod.AlertSink(
+            con,
+            pipeline=dest.pipeline_name,
+            control_schema=dest.control_schema,
+        )
+        try:
+            raised = alert_sink.raise_alert_once(
+                severity=severity,
+                code=code,
+                message=message,
+                condition_key=condition_key,
+                occurrence_key=occurrence_key,
+                context={
+                    "runner_id": run_state.runner_id,
+                    "error_type": type(exc).__name__,
+                    "stop_reason": summary.get("stop_reason"),
+                    "source_health_episode": (
+                        source_health_episode.as_dict()
+                        if isinstance(source_health_episode, EpisodeReceipt)
+                        else source_health_episode
+                    ),
+                },
+            )
+            if not raised and not dest_mod.alert_identity_exists(
+                alert_sink._sink if alert_sink.independent else con,
+                pipeline=dest.pipeline_name,
+                code=code,
+                condition_key=condition_key,
+                occurrence_key=occurrence_key,
+                control_schema=dest.control_schema,
+            ):
+                raise AlertPersistenceFailure(
+                    code=code,
+                    original_failure=exc,
+                    alert_failure=RuntimeError(
+                        f"the alert sink did not persist {condition_key}"
+                    ),
+                    summary=summary,
+                )
+        finally:
+            alert_sink.close()
+    except AlertPersistenceFailure:
+        raise
+    except Exception:
+        log.warning("could not persist run failure alert %s", code, exc_info=True)
 
 
 def _teardown_destination(

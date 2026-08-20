@@ -146,7 +146,6 @@ def commit_group(self, trigger: str) -> CommitResult:
         # mid-statement when the window opens) and left after the acknowledgement.
         # One attribute assignment, no lock, no allocation - see
         # `run_state._CommitAckWindow` for why that is the only acceptable cost here.
-        stage = ["observability_gate"]
         marked = 0
         # A non-snapshot group can be durable without containing a replacement
         # image. Keep discard-only handles pending across that boundary too; the
@@ -156,16 +155,17 @@ def commit_group(self, trigger: str) -> CommitResult:
             if self.group.is_snapshot
             else []
         )
-        with self_heal.commit_watchdog(
-            self.cfg.commit_timeout, commit_id, stage=lambda: stage[0]
-        ):
+        # Arm the durable timeout fact before the exclusion opens. The watchdog
+        # callback is deliberately I/O-free: if it fires, it may be running inside
+        # COMMIT_ACK and may only terminate the process.
+        self._arm_commit_timeout_alert(commit_id)
+        with self_heal.commit_watchdog(self.cfg.commit_timeout, commit_id):
             # INSIDE the watchdog (Codex r3 MAJOR-2). `enter()` waits, without a
             # bound of its own, until no independent write is in flight — that is
             # what makes the exclusion absolute rather than instrumented — and the
             # watchdog bounds both COMMIT and every acknowledgement below.
             COMMIT_ACK.enter()
             try:
-                stage[0] = "commit"
                 self.con.execute("COMMIT")
                 self.group.txn_open = False
                 if has_incremental:
@@ -179,7 +179,6 @@ def commit_group(self, trigger: str) -> CommitResult:
                 # acknowledgement calls. Pending snapshot notifications join the
                 # same plan only once the pure pre-commit completion check says this
                 # group will make the callback proof terminal.
-                stage[0] = "ack"
                 pending = (
                     list(self._pending_snapshot_notifications)
                     if acknowledge_snapshot_notifications
@@ -215,6 +214,9 @@ def commit_group(self, trigger: str) -> CommitResult:
                 del self._pending_snapshot_notifications[: len(pending)]
             if pending_discards:
                 del self._pending_discarded_records[: len(pending_discards)]
+        # This DELETE is observability I/O, so it is intentionally after
+        # COMMIT_ACK.leave() and outside the watchdog's guarded window.
+        self._clear_commit_timeout_alert(commit_id)
     except AdmissionError as error:
         refused = as_schema_refusal(error, refusal_origin="typed_planner")
         self._contextualize_schema_refusal(refused)

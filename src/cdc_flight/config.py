@@ -6,6 +6,7 @@ from a test fixture, a Makefile target, or (later) a MotherDuck Flight.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -14,17 +15,122 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_CONTROL_SCHEMA = "_cdc_flight"
 
+# One source-side wait policy shared by catalog, snapshot, backfill, and liveness
+# connections.  The embedded Debezium engine has its own pgjdbc properties; these
+# values cover the psycopg connections opened by the Flight itself.  Keeping the
+# server statement timeout and the client TCP timeout together matters: the former
+# cannot fire when the server is unreachable, while the latter cannot cancel a query
+# that the server is still executing.
+DEFAULT_SOURCE_CONNECT_TIMEOUT_SECONDS = 5
+DEFAULT_SOURCE_SOCKET_TIMEOUT_SECONDS = 60
+DEFAULT_SOURCE_STATEMENT_TIMEOUT_MS = 4000
+
+
+def source_connection_kwargs(
+    *,
+    connect_timeout: float = DEFAULT_SOURCE_CONNECT_TIMEOUT_SECONDS,
+    socket_timeout_seconds: float = DEFAULT_SOURCE_SOCKET_TIMEOUT_SECONDS,
+    statement_timeout_ms: int = DEFAULT_SOURCE_STATEMENT_TIMEOUT_MS,
+) -> dict[str, object]:
+    """Return bounded psycopg connection options for every Flight source wait."""
+    connect = max(1, int(connect_timeout))
+    socket_ms = max(250, int(float(socket_timeout_seconds) * 1000))
+    statement_ms = max(1, int(statement_timeout_ms))
+    return {
+        "connect_timeout": connect,
+        "options": f"-c statement_timeout={statement_ms}",
+        "keepalives": 1,
+        "keepalives_idle": 1,
+        "keepalives_interval": 1,
+        "keepalives_count": 2,
+        "tcp_user_timeout": socket_ms,
+    }
+
 
 def _env(name: str, default: str) -> str:
     value = os.environ.get(name)
     return default if value is None or value == "" else value
 
 
+def normalize_identifier_spelling(value: str) -> str:
+    """Normalize configuration syntax before asking the destination to resolve it.
+
+    Destination identifiers are SQL identifiers, not arbitrary display strings.  The
+    service receives the unquoted identifier; surrounding whitespace and one layer of
+    SQL double quoting are configuration syntax, while the spelling/case of the
+    resulting identifier is resolved from the live catalog.  Keeping this parser here
+    also means the connection URI, DDL and lease resolver all see the same input.
+    """
+    text = str(value).strip()
+    if len(text) >= 2 and text[0] == text[-1] == '"':
+        text = text[1:-1].replace('""', '"').strip()
+    if not text:
+        raise ValueError("destination identifiers may not be empty")
+    return text
+
+
 def resolve_control_schema(value: str | None = None) -> str:
     """Resolve the destination control schema from the one destination config surface."""
     if value is not None and value != "":
-        return value
-    return _env("CDC_CONTROL_SCHEMA", DEFAULT_CONTROL_SCHEMA)
+        return normalize_identifier_spelling(value)
+    return normalize_identifier_spelling(_env("CDC_CONTROL_SCHEMA", DEFAULT_CONTROL_SCHEMA))
+
+
+def _local_physical_identity(path: Path) -> str:
+    """Return an identity for the file, not for the spelling used to reach it.
+
+    The connection is opened before this value is used by the pipeline, so an existing
+    DuckDB file can be identified by device/inode.  That collapses relative paths,
+    ``..``, symlinks, trailing separators and case-only spellings on a case-insensitive
+    filesystem.  The resolved path is the honest fallback for a file that has not been
+    created yet (for example while reporting a failed first open).
+    """
+    resolved = path.expanduser().resolve(strict=False)
+    try:
+        stat = resolved.stat()
+    except OSError:
+        return f"path:{resolved}"
+    return f"inode:{stat.st_dev}:{stat.st_ino}"
+
+
+def _server_ilike_pattern(spelling: str) -> str:
+    """Escape an identifier before using the server's case-insensitive match."""
+    pattern = normalize_identifier_spelling(spelling)
+    return pattern.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def resolve_motherduck_database(con, spelling: str) -> str | None:
+    """Resolve a MotherDuck database spelling through its account catalog."""
+    rows = con.execute(
+        "SELECT database_name FROM duckdb_databases() "
+        "WHERE database_name ILIKE ? ESCAPE '\\' LIMIT 1",
+        [_server_ilike_pattern(spelling)],
+    ).fetchall()
+    return str(rows[0][0]) if rows else None
+
+
+def _motherduck_schema_identity(con, spelling: str) -> str:
+    """Ask the MotherDuck catalog for the physical schema spelling.
+
+    DuckDB/MotherDuck identifiers compare case-insensitively, while the catalog keeps
+    the name originally created.  ``ILIKE`` is deliberately executed by the server;
+    this is not a client-side case-folding guess.  The caller has already ensured the
+    required schema exists, so a missing match is a configuration/runtime refusal.
+    """
+    # Escape wildcard characters before handing the comparison to the server.  The
+    # comparison semantics therefore remain DuckDB/MotherDuck's, while a perfectly
+    # legal identifier containing '%' or '_' cannot resolve to a different schema.
+    pattern = _server_ilike_pattern(spelling)
+    rows = con.execute(
+        "SELECT schema_name FROM information_schema.schemata "
+        "WHERE schema_name ILIKE ? ESCAPE '\\' LIMIT 1",
+        [pattern],
+    ).fetchall()
+    if not rows:
+        raise RuntimeError(
+            f"MotherDuck did not resolve destination schema {spelling!r} in its catalog"
+        )
+    return str(rows[0][0])
 
 
 def _instance_id() -> str:
@@ -170,6 +276,106 @@ class DestinationConfig:
             )
         )
     )
+    _resolved_lease_key: str | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        """Make every destination spelling reach one connection/DDL surface."""
+        object.__setattr__(self, "kind", str(self.kind).strip().lower())
+        object.__setattr__(self, "dataset_name", normalize_identifier_spelling(self.dataset_name))
+        object.__setattr__(
+            self, "motherduck_database", normalize_identifier_spelling(self.motherduck_database)
+        )
+        object.__setattr__(self, "control_schema", resolve_control_schema(self.control_schema))
+        object.__setattr__(self, "duckdb_path", Path(self.duckdb_path))
+        object.__setattr__(self, "pipelines_dir", Path(self.pipelines_dir))
+
+    def resolve_physical_lease_key(self, con) -> str:
+        """Resolve and cache the physical destination identity used by ``Lease``.
+
+        Local DuckDB identity is device/inode based.  MotherDuck identity is queried
+        from ``current_database()`` and the server's information schema after the
+        required schemas have been created.  A MotherDuck lease must never be built
+        from raw configuration text.
+        """
+        if self._resolved_lease_key is not None:
+            return self._resolved_lease_key
+        if self.kind == "duckdb":
+            identity = {
+                "kind": self.kind,
+                "file": _local_physical_identity(self.duckdb_path),
+                "dataset": _motherduck_schema_identity(con, self.dataset_name),
+                "control_schema": _motherduck_schema_identity(con, self.control_schema),
+            }
+        elif self.kind == "motherduck":
+            database_row = con.execute("SELECT current_database()").fetchone()
+            if not database_row or database_row[0] is None:
+                raise RuntimeError("MotherDuck did not report current_database()")
+            identity = {
+                "kind": self.kind,
+                "database": str(database_row[0]),
+                "dataset": _motherduck_schema_identity(con, self.dataset_name),
+                "control_schema": _motherduck_schema_identity(con, self.control_schema),
+            }
+        else:
+            identity = {
+                "kind": self.kind,
+                "location": str(self.duckdb_path.expanduser().resolve(strict=False)),
+                "dataset": self.dataset_name,
+                "control_schema": self.control_schema,
+            }
+        key = "destination:" + json.dumps(
+            identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        object.__setattr__(self, "_resolved_lease_key", key)
+        return key
+
+    @property
+    def lease_key(self) -> str:
+        """Stable single-writer key for this physical destination.
+
+        Pipeline names are not ownership boundaries: two slots/pipelines can point at
+        the same DuckDB file (or MotherDuck database/schema) and would otherwise both
+        pass the old per-pipeline lease.  Local keys can be resolved without a server;
+        MotherDuck keys deliberately require :meth:`resolve_physical_lease_key` so a
+        caller cannot accidentally fall back to a database spelling.
+        """
+        if self.kind == "duckdb":
+            return self._resolved_lease_key or (
+                "destination:" + json.dumps(
+                    {
+                        "kind": self.kind,
+                        "file": _local_physical_identity(self.duckdb_path),
+                        # A local DuckDB file can also be reached with case-only
+                        # schema spellings.  The pipeline replaces this provisional
+                        # key with the server-resolved key before acquisition.
+                        "dataset": self.dataset_name,
+                        "control_schema": self.control_schema,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                )
+            )
+        if self.kind == "motherduck" and self._resolved_lease_key is None:
+            raise RuntimeError(
+                "MotherDuck lease identity is unresolved; call "
+                "resolve_physical_lease_key(connection) after destination setup"
+            )
+        return self._resolved_lease_key or (
+            "destination:" + json.dumps(
+                {
+                    "kind": self.kind,
+                    "location": str(self.duckdb_path.expanduser().resolve(strict=False)),
+                    "dataset": self.dataset_name,
+                    "control_schema": self.control_schema,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -235,6 +441,35 @@ class RunConfig:
     #: next run resumes at exactly what the destination holds.
     commit_timeout: float = field(
         default_factory=lambda: float(_env("CDC_COMMIT_TIMEOUT", "300"))
+    )
+    #: pgjdbc's bounded socket read timeout, in seconds.  This is distinct from the
+    #: Python sampler's statement timeout: Debezium itself must not remain blocked on a
+    #: source socket after the sampler has declared the source dark (rubric 4.6c).
+    jdbc_socket_timeout_seconds: float = field(
+        default_factory=lambda: float(_env("CDC_JDBC_SOCKET_TIMEOUT_SECONDS", "60"))
+    )
+    #: pgjdbc handshake bound, in seconds.  Kept explicit so every source wait has a
+    #: named budget and the connector properties cannot silently fall back to infinity.
+    jdbc_connect_timeout_seconds: float = field(
+        default_factory=lambda: float(_env("CDC_JDBC_CONNECT_TIMEOUT_SECONDS", "5"))
+    )
+    #: Startup grace for the independent source sampler.  A sampler that has never
+    #: returned a successful observation is not evidence of a healthy source; after
+    #: this bounded grace the run fails closed instead of taking the old timer-only
+    #: success path (A51 row 50).
+    source_probe_startup_seconds: float = field(
+        default_factory=lambda: float(_env("CDC_SOURCE_PROBE_STARTUP_SECONDS", "8"))
+    )
+    #: Bound for the final join of the Debezium engine thread after ``close``.  The old
+    #: hard-coded 60 s was a wait with no operator-configured budget.
+    engine_thread_timeout: float = field(
+        default_factory=lambda: float(_env("CDC_ENGINE_THREAD_TIMEOUT", "30"))
+    )
+    #: Maximum time the embedded engine may take to publish its first source-health
+    #: observation after the thread is started.  It is a separate startup bound so a
+    #: connector that never reaches a live slot cannot masquerade as an idle run.
+    engine_start_timeout: float = field(
+        default_factory=lambda: float(_env("CDC_ENGINE_START_TIMEOUT", "15"))
     )
 
 

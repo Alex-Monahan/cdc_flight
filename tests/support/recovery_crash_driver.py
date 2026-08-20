@@ -49,6 +49,16 @@ def main(argv: list[str]) -> int:
     con = duckdb.connect(duckdb_path)
     try:
         if step == "begin":
+            from cdc_flight import destination as dest_mod
+
+            slot_receipt = dest_mod.write_slot_state(
+                con,
+                pipeline=PIPELINE,
+                slot_name="cdc_slot",
+                observation={},
+                verdict="slot_ahead_of_destination",
+                verdict_message="the slot is ahead of the destination",
+            )
             recovery_mod.begin(
                 con,
                 pipeline=PIPELINE,
@@ -59,6 +69,7 @@ def main(argv: list[str]) -> int:
                 offset_path=Path(offsets_path),
                 captured_tables=TABLES,
                 forget_catalog=False,
+                slot_receipt=slot_receipt,
             )
         elif step == "baseline":
             # rubric 1.9's catalog-baseline machine has two crash cuts of its own, and

@@ -74,6 +74,10 @@ NON_ADMISSION_EXCEPTIONS: dict[str, str] = {
         "the Debezium engine terminated; scoped to the run, not to a source value "
         "or relation, and it carries the partial summary the CLI must still write"
     ),
+    "AlertPersistenceFailure": (
+        "the durable alert sink itself failed; it is a run-scoped observability "
+        "failure that must fail loudly and is not a source-value admission"
+    ),
     "OffsetFlushFailed": (
         "a durability-protocol failure of `markBatchFinished()`; nothing about a "
         "source value, and quarantining a relation for it would be a fiction"
@@ -138,6 +142,10 @@ NON_ADMISSION_EXCEPTIONS: dict[str, str] = {
         "run with the journal intact, which is the opposite of containment"
     ),
     "LeaseLost": "another runner owns the pipeline lease; this run must not write",
+    "OffsetUnusable": (
+        "a durable resume point is malformed or semantically unusable; the run must "
+        "refuse before streaming rather than inventing an offset or relation scope"
+    ),
     # --- faults.py: the test-only fault harness ----------------------------- #
     "DestinationFault": "injected destination fault (rubric 1.7 harness)",
     "InjectedFault": "injected fault signal (rubric 1.7 harness)",

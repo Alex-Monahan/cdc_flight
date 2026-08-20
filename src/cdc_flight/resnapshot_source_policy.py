@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from . import destination as dest_mod
 from . import naming, table_lifecycle
 from . import resnapshot_projection as projection
-from .config import DROP_IGNORE, DROP_LOG, DROP_REPLICATE
+from .config import DROP_IGNORE, DROP_LOG, DROP_REPLICATE, source_connection_kwargs
 from .naming import quote
 from .resnapshot_projection import ProjectionEvent
 
@@ -64,12 +64,14 @@ def gather_emptiness_evidence(
     try:
         import psycopg
 
-        with psycopg.connect(dsn, autocommit=True, connect_timeout=10) as conn:
+        with psycopg.connect(
+            dsn, autocommit=True, **source_connection_kwargs()
+        ) as conn:
             row = conn.execute(
                 "SELECT (pg_current_wal_lsn() - '0/0')::bigint"
             ).fetchone()
             wal_lsn = int(row[0]) if row and row[0] is not None else None
-        with psycopg.connect(dsn, connect_timeout=10) as conn:
+        with psycopg.connect(dsn, **source_connection_kwargs()) as conn:
             conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             for schema, table, _target in pending:
                 exists = conn.execute(

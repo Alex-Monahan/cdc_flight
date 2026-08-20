@@ -173,6 +173,18 @@ PRODUCTION_SNAPSHOT_MAX_THREADS = "1"
 # 74 s is the measured 61.604 s p99/max plus 20% headroom.
 SOURCE_TASK_MANAGEMENT_TIMEOUT_MS = "74000"
 
+# Idle-slot liveness.  The action is a transactional logical message, not a table
+# write: it advances the slot without changing application data and Debezium's stock
+# pgoutput decoder carries it as a complete BEGIN/message/END unit.  ``true`` is
+# deliberate; a non-transactional message is not a reliable restart/WAL-position
+# boundary for Debezium (see ``source_marker.py`` and its measured proof).
+HEARTBEAT_INTERVAL_MS = "5000"
+HEARTBEAT_ACTION_QUERY = (
+    "SELECT pg_logical_emit_message(true, 'cdc_flight_heartbeat', '')"
+)
+JDBC_SOCKET_TIMEOUT_SECONDS = "60"
+JDBC_CONNECT_TIMEOUT_SECONDS = "5"
+
 
 def build_properties(
     source: SourceConfig,
@@ -183,6 +195,8 @@ def build_properties(
     poll_interval_ms: int = 500,
     overrides: dict[str, str] | None = None,
     truncate_mode: str = "replicate",
+    jdbc_socket_timeout_seconds: float | None = None,
+    jdbc_connect_timeout_seconds: float | None = None,
 ) -> dict[str, str]:
     """Return Debezium engine properties as a plain dict.
 
@@ -206,6 +220,18 @@ def build_properties(
         "slot.name": replication.slot_name,
         "plugin.name": "pgoutput",
         "snapshot.max.threads": PRODUCTION_SNAPSHOT_MAX_THREADS,
+        "heartbeat.interval.ms": HEARTBEAT_INTERVAL_MS,
+        "heartbeat.action.query": HEARTBEAT_ACTION_QUERY,
+        "driver.socketTimeout": str(
+            int(jdbc_socket_timeout_seconds)
+            if jdbc_socket_timeout_seconds is not None
+            else JDBC_SOCKET_TIMEOUT_SECONDS
+        ),
+        "driver.connectTimeout": str(
+            int(jdbc_connect_timeout_seconds)
+            if jdbc_connect_timeout_seconds is not None
+            else JDBC_CONNECT_TIMEOUT_SECONDS
+        ),
     }
     protected_reasons = {
         **INVARIANT_O_REASONS,
@@ -223,6 +249,22 @@ def build_properties(
             "parallel source snapshot readers can publish a keyless row twice across "
             "the snapshot/live boundary; the destination has one writer and no "
             "primary-key identity with which to reconcile it"
+        ),
+        "heartbeat.interval.ms": (
+            "an idle source must advance confirmed_flush_lsn on a bounded cadence; "
+            "disabling it permits retained WAL to grow without an operator-visible "
+            "failure"
+        ),
+        "heartbeat.action.query": (
+            "the source-side action is the transactional, data-free logical heartbeat "
+            "that makes the cadence effective"
+        ),
+        "driver.socketTimeout": (
+            "stock pgjdbc must fail a dead established source socket within the "
+            "declared bound"
+        ),
+        "driver.connectTimeout": (
+            "stock pgjdbc must bound source connection establishment"
         ),
     }
     for key, value in (overrides or {}).items():
@@ -249,6 +291,20 @@ def build_properties(
         # packet, so it applies to BOTH the snapshot connection and the
         # replication (walsender) connection that renders streamed `money`.
         "driver.options": MONEY_LOCALE_NEUTRAL_OPTIONS,
+        # pgjdbc properties are passed through by stock Debezium after stripping the
+        # ``driver.`` prefix.  Both halves are bounded: the connector cannot hang on
+        # its source handshake or on a read from an already-established dead socket.
+        "driver.socketTimeout": str(
+            int(jdbc_socket_timeout_seconds)
+            if jdbc_socket_timeout_seconds is not None
+            else JDBC_SOCKET_TIMEOUT_SECONDS
+        ),
+        "driver.connectTimeout": str(
+            int(jdbc_connect_timeout_seconds)
+            if jdbc_connect_timeout_seconds is not None
+            else JDBC_CONNECT_TIMEOUT_SECONDS
+        ),
+        "driver.tcpKeepAlive": "true",
         # --- logical decoding -------------------------------------------------
         # pgoutput is built into Postgres: no wal2json / decoderbufs extension.
         # (Rubric 7.1 wants exactly this.)
@@ -296,6 +352,11 @@ def build_properties(
         # the connector's already-flushed offset; it cannot advance the slot past a
         # destination commit that has not happened.
         "status.update.interval.ms": "1000",
+        # A quiet source still emits a source-side WAL message often enough for
+        # ``confirmed_flush_lsn`` to advance.  This is separate from the Python
+        # completion marker: it is a connector-level liveness/retained-WAL guard.
+        "heartbeat.interval.ms": HEARTBEAT_INTERVAL_MS,
+        "heartbeat.action.query": HEARTBEAT_ACTION_QUERY,
         # PINNED, not left to the default. See LSN_FLUSH_MODE_SAFE above: this is
         # the one path that can confirm WAL to Postgres without ever reading the
         # offset store, i.e. the one thing that could break Invariant O from
@@ -379,9 +440,6 @@ def build_properties(
         "errors.max.retries": "3",
         "errors.retry.delay.initial.ms": "300",
         "errors.retry.delay.max.ms": "10000",
-        # NOTE (baseline gap): no `heartbeat.interval.ms` / `heartbeat.action.query`
-        # yet. Rubric 4.4/4.5/4.6 require an idle-slot heartbeat; that is Phase 4
-        # work and is deliberately absent from the baseline so the gap is visible.
     }
     # In discovery mode the publication is the capture contract. A static table or
     # schema include list would make a catalog watcher capable of observing a new

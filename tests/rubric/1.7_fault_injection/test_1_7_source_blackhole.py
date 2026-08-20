@@ -26,8 +26,11 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 import time
+from contextlib import suppress
 
+import duckdb
 import psycopg
 import pytest
 from support.fixtures import PROJECT_DIR, TEST_INSTANCE_ID, TEST_SLOT_PREFIX, _executable
@@ -105,6 +108,15 @@ def test_a_blackholed_source_never_reports_ok(tmp_path, postgres_cluster, relay)
 
     summary_path = state / "last_run.json"
     summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
+    control = duckdb.connect(str(tmp_path / "cdc_flight.duckdb"), read_only=True)
+    try:
+        alerts = control.execute(
+            "SELECT severity, code FROM _cdc_flight.alerts "
+            "WHERE pipeline = ? ORDER BY raised_at",
+            (env["CDC_PIPELINE_NAME"],),
+        ).fetchall()
+    finally:
+        control.close()
     assert returncode != 0, (
         f"a blackholed Postgres produced a SUCCESSFUL run: returncode={returncode} "
         f"summary={ {k: v for k, v in summary.items() if k != 'output'} }"
@@ -115,6 +127,15 @@ def test_a_blackholed_source_never_reports_ok(tmp_path, postgres_cluster, relay)
     # MINOR-5). The mechanism has a name and the summary carries it.
     assert summary.get("stop_reason") == "source_dark", summary
     assert "unreachable" in (summary.get("error") or "").lower(), summary.get("error")
+    source_dark_alerts = [
+        (severity, code) for severity, code in alerts
+        if severity == "critical" and code == "source_dark"
+    ]
+    assert len(source_dark_alerts) == 1, alerts
+    assert any(
+        severity == "critical" and code == "source_dark"
+        for severity, code in alerts
+    ), alerts
     # And the BOUND is measured, not asserted from the configuration. RUBRIC_STATUS
     # claims detection "within CDC_SOURCE_DARK_SECONDS (45 s)"; with `--max-seconds 70`
     # the run could equally have died of the not-streaming guard at 70 s, so the claim
@@ -145,6 +166,91 @@ def test_a_blackholed_source_never_reports_ok(tmp_path, postgres_cluster, relay)
             "engine.close() hung AND the run reported the hang: the symptom replaced "
             f"the diagnosis, which is exactly A49 ({summary})"
         )
+
+
+@pytest.mark.slow
+def test_stock_jdbc_blackhole_times_out_without_the_python_sampler(
+    tmp_path, postgres_cluster, relay
+):
+    """An independent stock Debezium/JDBC connection detects the real blackhole.
+
+    The engine is driven directly, with no ``SourceHealth`` or pipeline supervisor.
+    A separate psycopg connection talks to the real PostgreSQL port and remains
+    healthy while only the relay path is blackholed. That isolates pgjdbc's bounded
+    socket timeout from the Python sampler's outage detector.
+    """
+    from pydbzengine import BasePythonChangeHandler
+
+    from cdc_flight.config import ReplicationConfig, SourceConfig
+    from cdc_flight.debezium_props import build_properties
+    from cdc_flight.engine import SupervisedDebeziumEngine
+
+    class NoopHandler(BasePythonChangeHandler):
+        def handleJsonBatch(self, records):
+            return None
+
+    slot = f"{TEST_SLOT_PREFIX}jdbc_blackhole_{os.getpid()}"[:63]
+    state = tmp_path / "jdbc_state"
+    relay_source = SourceConfig(
+        host=postgres_cluster.host,
+        port=relay.port,
+        user=postgres_cluster.user,
+        password=postgres_cluster.password,
+        dbname=postgres_cluster.dbname,
+        schema=postgres_cluster.schema,
+    )
+    replication = ReplicationConfig(slot_name=slot, state_dir=state)
+    props = build_properties(
+        relay_source,
+        replication,
+        snapshot_mode="no_data",
+        jdbc_socket_timeout_seconds=3,
+        jdbc_connect_timeout_seconds=2,
+    )
+    _drop(postgres_cluster.dsn, slot)
+    engine = SupervisedDebeziumEngine(
+        props,
+        NoopHandler(),
+        offset_file=replication.offset_file,
+        always_commit_offsets=True,
+    )
+    runner = threading.Thread(target=engine.run, name="jdbc-only-blackhole", daemon=True)
+    direct_successes = 0
+    blackholed_at = None
+    try:
+        runner.start()
+        assert _wait_for(lambda: relay.connections > 0, timeout=30), (
+            "stock Debezium never opened the relay connection"
+        )
+        # Let the connector finish startup and put a heartbeat/query on the wire.
+        assert _wait_for(lambda: relay.bytes_relayed > 100, timeout=30), (
+            "stock Debezium never exchanged bytes through the relay"
+        )
+        with psycopg.connect(postgres_cluster.dsn, autocommit=True) as direct:
+            direct.execute("SELECT 1")
+            relay.blackhole()
+            blackholed_at = time.monotonic()
+            deadline = blackholed_at + 15
+            while time.monotonic() < deadline and engine.failure is None:
+                direct.execute("SELECT 1")
+                direct_successes += 1
+                time.sleep(0.25)
+        runner.join(timeout=20)
+        assert engine.failure is not None, (
+            "stock Debezium/JDBC did not report the relay blackhole within its "
+            f"socket timeout; effective={engine.effective_configuration}"
+        )
+        assert direct_successes >= 2, direct_successes
+        assert blackholed_at is not None
+        assert time.monotonic() - blackholed_at < 15
+        assert engine.effective_configuration["driver.socketTimeout"] == "3"
+    finally:
+        if runner.is_alive():
+            with_suppress = getattr(engine, "close", lambda **kwargs: None)
+            with suppress(Exception):
+                with_suppress(intentional=False)
+            runner.join(timeout=20)
+        _drop(postgres_cluster.dsn, slot)
 
 
 def _drop(dsn: str, slot: str) -> None:

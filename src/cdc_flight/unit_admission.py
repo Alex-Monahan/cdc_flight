@@ -8,7 +8,13 @@ import time
 from . import table_lifecycle
 from .assembler import UNIT_SNAPSHOT_CHUNK, UNIT_TXN
 from .config import DROP_LOG
-from .envelope import KIND_SNAPSHOT_BOUNDARY
+from .envelope import (
+    KIND_HEARTBEAT,
+    KIND_MESSAGE,
+    KIND_SNAPSHOT_BOUNDARY,
+    KIND_TXN_BEGIN,
+    KIND_TXN_END,
+)
 from .errors import AdmissionError, as_schema_refusal
 from .snapshot_completion import SnapshotObservationError
 
@@ -58,6 +64,7 @@ def _admit_unit(applier, unit) -> None:
     if applier.catalog is not None:
         applier.catalog.observe_unit(unit)
     is_snapshot = is_snapshot_unit(unit)
+    is_idle_heartbeat = idle_heartbeat_unit(unit)
     was_snapshot = applier.group.is_snapshot
     if not is_snapshot:
         if (
@@ -67,12 +74,13 @@ def _admit_unit(applier, unit) -> None:
         ):
             result = applier.commit_group("snapshot_chunk")
             if result.value != "committed":
-                applier.snapshot_completion.check_streaming_admission()
+                if not is_idle_heartbeat:
+                    applier.snapshot_completion.check_streaming_admission()
                 raise SnapshotObservationError(
                     "cannot cross the snapshot phase boundary with commit result "
                     f"{result.value}"
                 )
-        else:
+        elif not is_idle_heartbeat:
             applier.snapshot_completion.check_streaming_admission()
     if applier.group.units and is_snapshot != applier.group.is_snapshot:
         result = applier.commit_group(
@@ -83,9 +91,35 @@ def _admit_unit(applier, unit) -> None:
                 "cannot cross the snapshot phase boundary with commit result "
                 f"{result.value}"
             )
-    if not is_snapshot:
+    if not is_snapshot and not is_idle_heartbeat:
         applier.snapshot_completion.enter_streaming()
     append_unit(applier, unit, is_snapshot=is_snapshot)
+
+
+def idle_heartbeat_unit(unit) -> bool:
+    """True only for Debezium's data-free heartbeat/control message.
+
+    Debezium's heartbeat.action.query is delivered as a transactional logical
+    message, and it can arrive while the initial snapshot callback machine is still
+    collecting its terminal notification. It must advance the slot without pretending
+    that the snapshot phase ended. A mixed message/data transaction is deliberately
+    not granted this exception.
+    """
+    records = [
+        record
+        for record in unit.records
+        if record.kind not in {KIND_TXN_BEGIN, KIND_TXN_END}
+    ]
+    if not records:
+        return False
+    return all(
+        record.kind == KIND_HEARTBEAT
+        or (
+            record.kind == KIND_MESSAGE
+            and record.message_prefix == "cdc_flight_heartbeat"
+        )
+        for record in records
+    )
 
 
 def hold_log_owed_tail(applier, unit) -> None:

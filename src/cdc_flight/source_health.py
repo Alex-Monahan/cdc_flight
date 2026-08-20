@@ -36,6 +36,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 from . import faults
 from .machines import SOURCE_HEALTH_STATES
@@ -65,6 +66,8 @@ SELECT s.active,
        s.confirmed_flush_lsn IS NOT NULL AS has_confirmed,
        CASE WHEN s.confirmed_flush_lsn IS NULL THEN NULL
             ELSE (s.confirmed_flush_lsn - '0/0')::BIGINT END AS confirmed_pos,
+       CASE WHEN s.restart_lsn IS NULL THEN NULL
+            ELSE (s.restart_lsn - '0/0')::BIGINT END AS restart_pos,
        COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), s.confirmed_flush_lsn), 0)::BIGINT
 FROM pg_replication_slots s
 WHERE s.slot_name = %s
@@ -80,7 +83,11 @@ class SlotSample:
     active: bool = False
     lag_bytes: int | None = None
     confirmed_pos: int | None = None
+    restart_pos: int | None = None
     error: str | None = None
+    #: Wall-clock time near the SQL result. ``at`` remains monotonic for duration
+    #: clocks; this value makes the persisted operator sample attributable to a time.
+    observed_at: datetime | None = None
 
     @property
     def streaming(self) -> bool:
@@ -142,10 +149,24 @@ class SourceHealth:
         self._thread.start()
         return self
 
-    def stop(self) -> None:
+    def stop(self, *, timeout: float | None = None) -> bool:
+        """Stop the sampler under an explicit bound and report quiescence.
+
+        A join of interval*3 was shorter than the configured JDBC query budget, so a
+        sampler blocked in a source read could outlive the run with no durable verdict.
+        The default covers one bounded query plus the connection handshake; callers
+        with a run-level budget may provide a tighter/longer bound.
+        """
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=self.interval * 3)
+            wait = (
+                timeout
+                if timeout is not None
+                else self.connect_timeout + self.query_timeout_ms / 1000.0 + 1.0
+            )
+            self._thread.join(timeout=max(0.01, wait))
+            return not self._thread.is_alive()
+        return True
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -252,16 +273,22 @@ class SourceHealth:
             ) as conn:
                 row = conn.execute(_SLOT_SQL, (self.slot_name,)).fetchone()
         except Exception as exc:
-            return SlotSample(at=now, error=f"{type(exc).__name__}: {exc}")
+            return SlotSample(
+                at=now,
+                error=f"{type(exc).__name__}: {exc}",
+                observed_at=datetime.now(UTC),
+            )
         if row is None:
-            return SlotSample(at=now, exists=False)
-        active, has_confirmed, confirmed_pos, lag = row
+            return SlotSample(at=now, exists=False, observed_at=datetime.now(UTC))
+        active, has_confirmed, confirmed_pos, restart_pos, lag = row
         return SlotSample(
             at=now,
             exists=True,
             active=bool(active),
             confirmed_pos=(int(confirmed_pos) if has_confirmed else None),
+            restart_pos=(int(restart_pos) if restart_pos is not None else None),
             lag_bytes=int(lag) if has_confirmed else None,
+            observed_at=datetime.now(UTC),
         )
 
     # -- what the supervisor asks ------------------------------------------- #
@@ -501,11 +528,51 @@ class SourceHealth:
         sample = self.last
         if sample is None or sample.lag_bytes is None:
             return None
-        if received_high_water is None or sample.confirmed_pos is None:
+        per_slot = self.per_slot_outstanding_bytes(received_high_water)
+        if per_slot is None:
             # No per-slot reference available: fall back to the retained-WAL
             # figure rather than inventing a smaller one.
             return sample.lag_bytes
+        return per_slot
+
+    def per_slot_outstanding_bytes(self, received_high_water: int | None) -> int | None:
+        """Return ``received_high_water_lsn - confirmed_flush_lsn`` in bytes.
+
+        Both LSNs are sampled/maintained as PostgreSQL's numeric WAL byte positions:
+        the high-water mark is the greatest source LSN delivered to this handler, and
+        ``confirmed_flush_lsn`` is the slot acknowledgement observed in the same
+        source-health query. This is the lag written to ``run_logs``; it is not the
+        cluster-wide retained-WAL figure in ``SlotSample.lag_bytes``.
+        """
+        sample = self.last
+        if (
+            sample is None
+            or sample.confirmed_pos is None
+            or received_high_water is None
+        ):
+            return None
         return max(0, int(received_high_water) - int(sample.confirmed_pos))
+
+    def operator_lag_context(self, received_high_water: int | None) -> dict:
+        """Describe the exact pair and timestamp behind an operator lag value."""
+        sample = self.last
+        return {
+            "lag_definition": (
+                "max(0, received_high_water_lsn - confirmed_flush_lsn)"
+            ),
+            "received_high_water_lsn": received_high_water,
+            "confirmed_flush_lsn": (
+                sample.confirmed_pos if sample is not None else None
+            ),
+            "cluster_retained_lag_bytes": (
+                sample.lag_bytes if sample is not None else None
+            ),
+            "lag_sampled_at": (
+                sample.observed_at.isoformat()
+                if sample is not None and sample.observed_at is not None
+                else None
+            ),
+        }
 
     def fall_behind_reason(
         self,
@@ -631,7 +698,13 @@ class SourceHealth:
             "slot_exists": sample.exists,
             "slot_active": sample.active,
             "slot_confirmed_pos": sample.confirmed_pos,
+            "slot_restart_pos": sample.restart_pos,
             "slot_lag_bytes": sample.lag_bytes,
+            "slot_lag_sampled_at": (
+                sample.observed_at.isoformat()
+                if sample.observed_at is not None
+                else None
+            ),
             "slot_streaming_for_sec": round(self.streaming_for, 1),
             "slot_ever_streamed": self.ever_streamed,
             "slot_lag_steady_for_sec": round(self.lag_steady_for, 1),

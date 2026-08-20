@@ -3,9 +3,26 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
+import hashlib
 import json
+import os
+import tempfile
+from pathlib import Path
 
 from . import destination as _d
+from .occurrence import (
+    EpisodeReceipt,
+    EpisodeState,
+    OccurrenceKey,
+    RunState,
+    SlotState,
+    SlotStateReceipt,
+    _episode_receipt_after_durable,
+    _occurrence_binding,
+    _slot_state_receipt_after_commit,
+    occurrence_text,
+)
 
 log = _d.log
 now = _d.now
@@ -18,6 +35,206 @@ SLOT_VERDICTS = _d.SLOT_VERDICTS
 faults = _d.faults
 table_lifecycle = _d.table_lifecycle
 quote = _d.quote
+
+
+def _alert_identity(condition_key: str, occurrence_key: OccurrenceKey) -> str:
+    """Build a deduplication identity from two independently named parts."""
+    if not isinstance(condition_key, str) or not condition_key.strip():
+        raise TypeError("condition_key must be a non-empty string")
+    # This is deliberately the first operation involving the occurrence.  A raw
+    # string, None, or a value derived from an exception therefore fails before a
+    # connection is queried or written, including through an aliased function.
+    return f"{condition_key}:occurrence:{occurrence_text(occurrence_key)}"
+
+
+def _independent_fetchone(con, query: str, params):
+    """Read one owner row through a transaction independent of ``con``."""
+    independent = None
+    try:
+        independent = con.cursor()
+        return independent.execute(query, params).fetchone()
+    except Exception as exc:
+        raise ValueError("could not validate the durable occurrence owner") from exc
+    finally:
+        if independent is not None:
+            with contextlib.suppress(Exception):
+                independent.close()
+
+
+def _stable_value(value) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def _validate_occurrence_binding(
+    con, *, pipeline: str, occurrence_key: OccurrenceKey, control_schema: str | None
+) -> None:
+    """Reject a key whose receipt is for another or no-longer-current owner.
+
+    The factory binds the key to the owner identity.  This second check is at the
+    alert boundary, where the actual pipeline is known, and uses an independent
+    snapshot for state-backed keys.  It closes the ordinary stale-token route while
+    allowing repeated observations of the same owner state to retain one identity.
+    """
+    binding = _occurrence_binding(occurrence_key)
+    kind = binding[0]
+    bound_pipeline = binding[2] if kind == "episode" else binding[1]
+    if bound_pipeline != pipeline:
+        raise ValueError(
+            f"occurrence receipt is bound to pipeline {bound_pipeline!r}, "
+            f"not alert pipeline {pipeline!r}"
+        )
+
+    if kind == "run" or kind == "commit":
+        # These are deliberately run-owned/pre-COMMIT reservations, not durable-row
+        # receipts. Their pipeline binding is the complete applicable identity.
+        return
+
+    if kind == "episode":
+        _owner, _pipeline, episode_id, state_name, _path = binding[1:]
+        if _owner == "fallback":
+            # The fallback JSONL is an append-only historical audit surface. Replay
+            # must be allowed to project episode 1 after episode 2 is already open;
+            # its fsync+install receipt proves that historical occurrence itself.
+            return
+        row = _independent_fetchone(
+            con,
+            f"SELECT episode_id, state FROM {_control_table(control_schema, 'source_health_episodes')} "
+            "WHERE pipeline = ?",
+            [pipeline],
+        )
+        if row is None or int(row[0]) != int(episode_id) or str(row[1]) != state_name:
+            raise ValueError("source-health receipt is stale for this pipeline")
+        return
+
+    if kind == "recovery":
+        _pipeline, namespace, recovery_id, decision = binding[1:]
+        row = _independent_fetchone(
+            con,
+            f"SELECT recovery_id, decision FROM {_control_table(control_schema, 'recovery_state')} "
+            "WHERE pipeline = ? AND namespace = ?",
+            [pipeline, namespace],
+        )
+        if row is None or str(row[0]) != recovery_id or str(row[1]) != decision:
+            raise ValueError("recovery receipt is stale for this pipeline and namespace")
+        return
+
+    if kind == "slot":
+        (
+            _pipeline,
+            slot_name,
+            decision,
+            system_identifier,
+            timeline_id,
+            restart_lsn,
+            confirmed_flush_lsn,
+            current_wal_lsn,
+            durable_lsn,
+        ) = binding[1:]
+        row = _independent_fetchone(
+            con,
+            f"SELECT system_identifier, timeline_id, restart_lsn, confirmed_flush_lsn, "
+            f"       current_wal_lsn, durable_lsn, verdict "
+            f"FROM {_control_table(control_schema, 'slot_state')} "
+            "WHERE pipeline = ? AND slot_name = ?",
+            [pipeline, slot_name],
+        )
+        current = (
+            None
+            if row is None
+            else (
+                str(row[6] or "observed"),
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+                row[5],
+            )
+        )
+        expected = (
+            decision,
+            system_identifier,
+            timeline_id,
+            restart_lsn,
+            confirmed_flush_lsn,
+            current_wal_lsn,
+            durable_lsn,
+        )
+        if current != expected:
+            raise ValueError("slot-state receipt is stale for this pipeline and slot")
+        return
+
+    if kind == "offset":
+        _pipeline, namespace, commit_id, snapshot_epoch, last_lsn, updated, digest = binding[1:]
+        row = _independent_fetchone(
+            con,
+            f"SELECT resume_json, commit_id, last_lsn, snapshot_epoch, updated_at "
+            f"FROM {_control_table(control_schema, 'debezium_offsets')} "
+            "WHERE pipeline = ? AND namespace = ?",
+            [pipeline, namespace],
+        )
+        current = (
+            None
+            if row is None
+            else (
+                int(row[1] or 0),
+                int(row[3] or 0),
+                int(row[2] or 0),
+                _stable_value(row[4]),
+                hashlib.sha256(str(row[0]).encode("utf-8")).hexdigest(),
+            )
+        )
+        if current != (commit_id, snapshot_epoch, last_lsn, updated, digest):
+            raise ValueError("offset-row receipt is stale for this pipeline and namespace")
+        return
+
+    if kind == "lease":
+        _alert_pipeline, physical_pipeline, owner_id, _operation, acquired_at = binding[1:]
+        row = _independent_fetchone(
+            con,
+            f"SELECT owner_id, acquired_at FROM {_control_table(control_schema, 'lease')} "
+            "WHERE pipeline = ?",
+            [physical_pipeline],
+        )
+        if (
+            row is None
+            or str(row[0]) != owner_id
+            or (acquired_at is not None and _stable_value(row[1]) != acquired_at)
+        ):
+            raise ValueError("lease receipt is stale for this pipeline")
+        return
+
+    raise ValueError(f"unknown occurrence binding kind {kind!r}")
+
+
+def _write_alert_row(
+    con,
+    *,
+    pipeline: str,
+    severity: str,
+    code: str,
+    message: str,
+    context=None,
+    control_schema: str | None = None,
+) -> bool:
+    payload = dict(context or {})
+    try:
+        con.execute(
+            f"INSERT INTO {_control_table(control_schema, 'alerts')} "
+            "(pipeline, raised_at, severity, code, message, context) VALUES (?,?,?,?,?,?)",
+            [pipeline, now(), severity, code, message,
+             json.dumps(payload, default=str) if payload else None],
+        )
+    except Exception:  # pragma: no cover - alerting must never mask the cause
+        log.warning("could not write alert %s", code, exc_info=True)
+        return False
+    log.warning("ALERT %s/%s: %s", severity, code, message)
+    return True
+
 
 class AlertSink:
     """`_cdc_flight.alerts` on its **own** connection (ADR §9.1, Codex 7 / Opus M-2).
@@ -66,18 +283,91 @@ class AlertSink:
         if not self.independent:
             payload["transactional"] = True
         con = self._sink if self.independent else self._main
+        if not _write_alert_row(
+            con,
+            pipeline=self.pipeline,
+            severity=severity,
+            code=code,
+            message=message,
+            context=payload,
+            control_schema=self.control_schema,
+        ):
+            return False
+        return self.independent
+
+    def raise_alert_once(
+        self, *, severity: str, code: str, message: str, condition_key: str,
+        occurrence_key: OccurrenceKey, context=None,
+    ) -> bool:
+        """Write one durable alert for one condition occurrence.
+
+        Use the sink's independent cursor for both the probe and the insert.  A
+        pre-engine failure can leave the applier connection in an aborted transaction;
+        routing the alert through that same handle would make the operator signal
+        disappear when the failed transaction is retired.
+        """
+        identity = _alert_identity(condition_key, occurrence_key)
+        con = self._sink if self.independent else self._main
+        _validate_occurrence_binding(
+            con,
+            pipeline=self.pipeline,
+            occurrence_key=occurrence_key,
+            control_schema=self.control_schema,
+        )
+        if alert_identity_exists(
+            con,
+            pipeline=self.pipeline,
+            code=code,
+            condition_key=condition_key,
+            occurrence_key=occurrence_key,
+            control_schema=self.control_schema,
+        ):
+            return False
+        payload = dict(context or {})
+        payload.update(
+            {
+                "condition_key": condition_key,
+                "occurrence_key": occurrence_text(occurrence_key),
+                "alert_identity": identity,
+                # Compatibility for readers of the pre-split context field. It now
+                # carries the complete identity; the two components above are the
+                # authoritative fields.
+                "condition_marker": identity,
+            }
+        )
+        if not self.independent:
+            payload["transactional"] = True
+        return _write_alert_row(
+            con,
+            pipeline=self.pipeline,
+            severity=severity,
+            code=code,
+            message=message,
+            context=payload,
+            control_schema=self.control_schema,
+        )
+
+    def clear_alert_once(
+        self, *, code: str, condition_key: str, occurrence_key: OccurrenceKey
+    ) -> bool:
+        """Remove a pre-armed alert after its bounded operation succeeds.
+
+        This is intentionally called only after the commit/ack exclusion has closed.
+        A failed or hard-exited operation leaves the conservative alert in place for
+        the next run to reconcile.
+        """
+        con = self._sink if self.independent else self._main
+        marker = f'%"alert_identity": "{_alert_identity(condition_key, occurrence_key)}"%'
         try:
             con.execute(
-                f"INSERT INTO {_control_table(self.control_schema, 'alerts')} "
-                "(pipeline, raised_at, severity, code, message, context) VALUES (?,?,?,?,?,?)",
-                [self.pipeline, now(), severity, code, message,
-                 json.dumps(payload, default=str) if payload else None],
+                f"DELETE FROM {_control_table(self.control_schema, 'alerts')} "
+                "WHERE pipeline = ? AND code = ? AND context LIKE ?",
+                [self.pipeline, code, marker],
             )
-        except Exception:  # pragma: no cover - alerting must never mask the cause
-            log.warning("could not write alert %s", code, exc_info=True)
+        except Exception:  # pragma: no cover - conservative alert remains durable
+            log.warning("could not clear completed %s alert", code, exc_info=True)
             return False
-        log.warning("ALERT %s/%s: %s", severity, code, message)
-        return self.independent
+        return True
 
     def request_snapshot(
         self, *, pipeline: str, schema: str, table: str, target: str
@@ -155,6 +445,30 @@ def alert_marker_exists(
     return row is not None
 
 
+def alert_identity_exists(
+    con,
+    *,
+    pipeline: str,
+    code: str,
+    condition_key: str,
+    occurrence_key: OccurrenceKey,
+    control_schema: str | None = None,
+) -> bool:
+    """Whether the durable alert table already carries this full identity."""
+    identity = _alert_identity(condition_key, occurrence_key)
+    marker = f'%"alert_identity": "{identity}"%'
+    try:
+        row = con.execute(
+            f"SELECT 1 FROM {_control_table(control_schema, 'alerts')} "
+            "WHERE pipeline = ? AND code = ? AND context LIKE ? LIMIT 1",
+            [pipeline, code, marker],
+        ).fetchone()
+    except Exception:  # pragma: no cover - dedup must never mask the caller
+        log.warning("could not probe existing %s alerts", code, exc_info=True)
+        return False
+    return row is not None
+
+
 def raise_alert(
     con, *, pipeline: str, severity: str, code: str, message: str, context=None,
     control_schema: str | None = None,
@@ -165,20 +479,476 @@ def raise_alert(
     connection has no open transaction and a separate one buys nothing. Anything
     inside a commit group must use `AlertSink`.
     """
+    return _write_alert_row(
+        con,
+        pipeline=pipeline,
+        severity=severity,
+        code=code,
+        message=message,
+        context=context,
+        control_schema=control_schema,
+    )
+
+
+def raise_alert_once(
+    con,
+    *,
+    pipeline: str,
+    severity: str,
+    code: str,
+    message: str,
+    condition_key: str,
+    occurrence_key: OccurrenceKey,
+    context=None,
+    control_schema: str | None = None,
+) -> bool:
+    """Persist one alert for one durable occurrence.
+
+    Failure paths are often revisited on every bounded runner invocation.  The
+    condition key groups the fault; the required occurrence key makes a later
+    durable episode or run a new operator incident.  A failed probe intentionally
+    falls through to an insert: losing the alert is worse than a duplicate.
+    """
+    identity = _alert_identity(condition_key, occurrence_key)
+    _validate_occurrence_binding(
+        con,
+        pipeline=pipeline,
+        occurrence_key=occurrence_key,
+        control_schema=control_schema,
+    )
+    if alert_identity_exists(
+        con,
+        pipeline=pipeline,
+        code=code,
+        condition_key=condition_key,
+        occurrence_key=occurrence_key,
+        control_schema=control_schema,
+    ):
+        return False
+    payload = dict(context or {})
+    payload.update(
+        {
+            "condition_key": condition_key,
+            "occurrence_key": occurrence_text(occurrence_key),
+            "alert_identity": identity,
+            "condition_marker": identity,
+        }
+    )
+    return raise_alert(
+        con,
+        pipeline=pipeline,
+        severity=severity,
+        code=code,
+        message=message,
+        context=payload,
+        control_schema=control_schema,
+    )
+
+
+def fallback_alert_path(dest) -> Path:
+    """The local durable alert surface used when a destination cannot be opened.
+
+    A DuckDB file lock prevents a second connection from reaching
+    ``_cdc_flight.alerts``.  The sidecar is deliberately next to that exact file, so
+    it remains visible to the operator and is shared by every pipeline spelling that
+    points at the same destination. MotherDuck connection failures use the local
+    pipeline state directory until a destination connection can be restored.
+    """
+    if dest.kind == "duckdb":
+        resolved = Path(dest.duckdb_path).expanduser().resolve(strict=False)
+        return Path(f"{resolved}.cdc_alerts.jsonl")
+    return Path(dest.pipelines_dir) / f"{dest.pipeline_name}.cdc_alerts.jsonl"
+
+
+def _fallback_alert_episode_path(dest) -> Path:
+    return Path(f"{fallback_alert_path(dest)}.episode.json")
+
+
+@contextlib.contextmanager
+def _fallback_alert_lock(dest):
+    """Serialize sidecar observations and the recovery transition.
+
+    The JSONL remains the audit trail.  A separate lock keeps an available
+    destination from closing an episode while another runner is appending a
+    pre-connection observation.
+    """
+    lock_path = Path(f"{fallback_alert_path(dest)}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        con.execute(
-            f"INSERT INTO {_control_table(control_schema, 'alerts')} "
-            "(pipeline, raised_at, severity, code, message, context) VALUES (?,?,?,?,?,?)",
-            [pipeline, now(), severity, code, message,
-             json.dumps(context, default=str) if context else None],
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _empty_fallback_alert_episode() -> dict:
+    return {"episode_id": 0, "state": "recovered", "incident_key": None}
+
+
+def _episode_from_fallback_sidecar(dest) -> dict:
+    """Recover the monotone episode floor without resetting to episode one.
+
+    The episode journal is an optimization for the open/recovered bit. The JSONL is
+    the durable occurrence audit, so losing or corrupting the small journal must not
+    make a later occurrence reuse an old identity. A recovered reconstruction starts
+    a new episode conservatively; the next append recreates the journal and restores
+    repeat-collapse for that occurrence.
+    """
+    path = fallback_alert_path(dest)
+    if not path.exists():
+        return _empty_fallback_alert_episode()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise OSError(
+            f"fallback alert sidecar {path} exists but cannot be read"
+        ) from exc
+    maximum = 0
+    for line in lines:
+        try:
+            item = json.loads(line)
+            episode_id = int(item.get("episode_id"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if episode_id >= 0:
+            maximum = max(maximum, episode_id)
+    return {
+        "episode_id": maximum,
+        "state": "recovered",
+        "incident_key": None,
+    }
+
+
+def _read_fallback_alert_episode(dest) -> dict:
+    path = _fallback_alert_episode_path(dest)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        episode_id = int(payload["episode_id"])
+        state = str(payload["state"])
+        incident_key = payload.get("incident_key")
+        if episode_id < 0 or state not in {"open", "recovered"}:
+            raise ValueError("invalid fallback episode state")
+        return {
+            "episode_id": episode_id,
+            "state": state,
+            "incident_key": str(incident_key) if incident_key is not None else None,
+        }
+    except (OSError, TypeError, ValueError, json.JSONDecodeError, KeyError):
+        return _episode_from_fallback_sidecar(dest)
+
+
+def _write_fallback_alert_episode(
+    dest, *, episode_id: int, state: str, incident_key: str | None
+) -> EpisodeReceipt:
+    path = _fallback_alert_episode_path(dest)
+    payload = json.dumps(
+        {
+            "episode_id": episode_id,
+            "state": state,
+            "incident_key": incident_key,
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    try:
+        written = 0
+        while written < len(payload):
+            written += os.write(descriptor, payload[written:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
+    return _episode_receipt_after_durable(
+        EpisodeState(
+            pipeline=dest.pipeline_name,
+            episode_id=episode_id,
+            state=state,
+        ),
+        details={"owner": "fallback", "path": str(path)},
+    )
+
+
+def persist_fallback_alert(
+    dest,
+    *,
+    run_state: RunState,
+    severity: str,
+    code: str,
+    message: str,
+    condition_key: str,
+    incident_key: str,
+    context=None,
+) -> Path:
+    """Synchronously append and fsync an alert when no destination handle exists.
+
+    This is a bounded, append-only operator surface rather than a best-effort log.
+    A failure to create or fsync it is raised to the caller, which retains the original
+    non-zero run failure and emits a critical stderr diagnostic.
+    """
+    path = fallback_alert_path(dest)
+    if type(run_state) is not RunState:
+        raise TypeError("run_state must be a RunState")
+    if not isinstance(incident_key, str) or not incident_key.strip():
+        raise TypeError("incident_key must be a non-empty string")
+    with _fallback_alert_lock(dest):
+        episode = _read_fallback_alert_episode(dest)
+        if (
+            episode["state"] == "open"
+            and episode["incident_key"] == incident_key
+        ):
+            episode_id = episode["episode_id"]
+        else:
+            episode_id = episode["episode_id"] + 1
+        # Advance the episode journal before the append.  If the append fails, a
+        # retry of the same observation reuses this identity rather than creating
+        # a second alert occurrence.
+        episode_receipt = _write_fallback_alert_episode(
+            dest,
+            episode_id=episode_id,
+            state="open",
+            incident_key=incident_key,
         )
-    except Exception:  # pragma: no cover - alerting must never mask the cause
-        log.warning("could not write alert %s", code, exc_info=True)
+        occurrence_key = OccurrenceKey.from_episode(
+            episode_receipt, pipeline=dest.pipeline_name
+        )
+        occurrence_marker = _alert_identity(condition_key, occurrence_key)
+        stored_context = dict(context or {})
+        stored_context["fallback_episode_id"] = episode_id
+        stored_context["fallback_incident_key"] = incident_key
+        stored_context["condition_key"] = condition_key
+        stored_context["occurrence_key"] = occurrence_text(occurrence_key)
+        stored_context["alert_identity"] = occurrence_marker
+        payload = {
+            "pipeline": dest.pipeline_name,
+            "runner_id": run_state.runner_id,
+            "raised_at": now().isoformat(),
+            "severity": severity,
+            "code": code,
+            "message": message,
+            "marker_value": occurrence_marker,
+            "condition_key": condition_key,
+            "occurrence_key": occurrence_text(occurrence_key),
+            "alert_identity": occurrence_marker,
+            "episode_id": episode_id,
+            "context": stored_context,
+            "destination_kind": dest.kind,
+            "destination_path": str(getattr(dest, "duckdb_path", "")),
+        }
+        line = (json.dumps(payload, default=str, sort_keys=True) + "\n").encode("utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(
+            str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+            0o600,
+        )
+        try:
+            written = 0
+            while written < len(line):
+                written += os.write(descriptor, line[written:])
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    return path
+
+
+def replay_fallback_alerts(con, dest) -> int:
+    """Project valid sidecar rows onto the normal durable alert table.
+
+    The sidecar is retained as an audit trail; the condition marker makes replay
+    idempotent. A partially written final line is left for the next run and does not
+    erase the complete lines before it.
+    """
+    path = fallback_alert_path(dest)
+    with _fallback_alert_lock(dest):
+        if not path.exists():
+            return 0
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except Exception:  # pragma: no cover - the sidecar itself remains operator-visible
+            log.critical("could not read fallback alert sidecar %s", path, exc_info=True)
+            return 0
+        recorded = 0
+        replay_complete = True
+        replayed_any = False
+        for line in lines:
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                log.warning("ignoring an incomplete fallback alert line in %s", path)
+                replay_complete = False
+                continue
+            pipeline = str(item.get("pipeline") or dest.pipeline_name)
+            if pipeline != dest.pipeline_name:
+                log.critical(
+                    "fallback alert line belongs to pipeline %r, not %r",
+                    pipeline,
+                    dest.pipeline_name,
+                )
+                replay_complete = False
+                continue
+            code = str(item.get("code") or "destination_unavailable")
+            condition_key = item.get("condition_key")
+            episode_id = item.get("episode_id")
+            if not isinstance(condition_key, str) or not condition_key.strip():
+                log.critical("fallback alert line has no condition identity in %s", path)
+                replay_complete = False
+                continue
+            try:
+                episode_receipt = _episode_receipt_after_durable(
+                    EpisodeState(
+                        pipeline=pipeline,
+                        episode_id=int(episode_id),
+                        state="open",
+                    ),
+                    details={"owner": "fallback", "path": str(_fallback_alert_episode_path(dest))},
+                )
+                occurrence_key = OccurrenceKey.from_episode(
+                    episode_receipt, pipeline=pipeline
+                )
+                serialized_occurrence = item.get("occurrence_key")
+                if (
+                    serialized_occurrence is not None
+                    and str(serialized_occurrence) != occurrence_text(occurrence_key)
+                ):
+                    raise TypeError("fallback alert occurrence does not match its episode")
+            except (TypeError, ValueError):
+                log.critical("fallback alert line has no occurrence identity in %s", path)
+                replay_complete = False
+                continue
+            sink = AlertSink(con, pipeline=pipeline, control_schema=dest.control_schema)
+            try:
+                raised = sink.raise_alert_once(
+                    severity=str(item.get("severity") or "critical"),
+                    code=code,
+                    message=str(item.get("message") or "destination was unavailable"),
+                    condition_key=condition_key,
+                    occurrence_key=occurrence_key,
+                    context=dict(item.get("context") or {}) | {
+                        "fallback_alert_path": str(path),
+                        "replayed": True,
+                    },
+                )
+                if raised:
+                    recorded += 1
+                else:
+                    probe_con = sink._sink if sink.independent else con
+                    if not alert_identity_exists(
+                        probe_con,
+                        pipeline=pipeline,
+                        code=code,
+                        condition_key=condition_key,
+                        occurrence_key=occurrence_key,
+                        control_schema=dest.control_schema,
+                    ):
+                        replay_complete = False
+                replayed_any = True
+            finally:
+                sink.close()
+        if replay_complete and replayed_any:
+            episode = _read_fallback_alert_episode(dest)
+            if episode["state"] == "open":
+                _write_fallback_alert_episode(
+                    dest,
+                    episode_id=episode["episode_id"],
+                    state="recovered",
+                    incident_key=episode["incident_key"],
+                )
+    return recorded
+
+
+def observe_source_health(
+    con,
+    *,
+    pipeline: str,
+    state: str,
+    confirmed_flush_lsn: int | None = None,
+    control_schema: str | None = None,
+) -> EpisodeReceipt | None:
+    """Persist the source reachability episode used by ``source_dark`` alerts.
+
+    ``reachable`` closes a prior dark episode. ``dark`` opens exactly one new episode
+    until a reachable observation is recorded. ``unknown`` is intentionally not a
+    transition: a source that cannot be sampled must not fabricate a recovery or a
+    second incident.
+    """
+    if state not in {"reachable", "dark"}:
+        return None
+    table = _control_table(control_schema, "source_health_episodes")
+    current = con.execute(
+        f"SELECT episode_id, state FROM {table} WHERE pipeline = ?",
+        [pipeline],
+    ).fetchone()
+    timestamp = now()
+    con.execute("BEGIN TRANSACTION")
+    try:
+        if current is None:
+            episode_id = 0 if state == "reachable" else 1
+            con.execute(
+                f"INSERT INTO {table} "
+                "(pipeline, episode_id, state, opened_at, recovered_at, "
+                "last_confirmed_flush_lsn, observed_at) VALUES (?,?,?,?,?,?,?)",
+                [
+                    pipeline, episode_id, state,
+                    timestamp if state == "dark" else None,
+                    None, confirmed_flush_lsn, timestamp,
+                ],
+            )
+        else:
+            episode_id, previous_state = int(current[0]), str(current[1])
+            if state == "dark" and previous_state != "dark":
+                episode_id += 1
+                con.execute(
+                    f"UPDATE {table} SET episode_id = ?, state = ?, opened_at = ?, "
+                    "recovered_at = NULL, last_confirmed_flush_lsn = ?, observed_at = ? "
+                    "WHERE pipeline = ?",
+                    [episode_id, state, timestamp, confirmed_flush_lsn, timestamp, pipeline],
+                )
+            else:
+                con.execute(
+                    f"UPDATE {table} SET state = ?, recovered_at = ?, "
+                    "last_confirmed_flush_lsn = ?, observed_at = ? WHERE pipeline = ?",
+                    [state, timestamp if state == "reachable" else None,
+                     confirmed_flush_lsn, timestamp, pipeline],
+                )
+        con.execute("COMMIT")
+    except BaseException:
+        with contextlib.suppress(Exception):
+            con.execute("ROLLBACK")
+        raise
+    row = con.execute(
+        f"SELECT episode_id, state, observed_at FROM {table} WHERE pipeline = ?",
+        [pipeline],
+    ).fetchone()
+    if not row:
+        return None
+    committed_query = (
+        f"SELECT episode_id, state, observed_at FROM {table} WHERE pipeline = ?"
+    )
+    if not _d._committed_row_matches(con, committed_query, [pipeline], row):
+        return None
+    return _episode_receipt_after_durable(
+        EpisodeState(
+            pipeline=pipeline,
+            episode_id=int(row[0]),
+            state=str(row[1]),
+            observed_at=row[2],
+        ),
+        details={"owner": "source_health"},
+    )
 
 
 def read_slot_state(
     con, pipeline: str, slot_name: str, *, control_schema: str | None = None
-) -> dict | None:
+) -> SlotStateReceipt | None:
     """The last recorded observation of this pipeline's slot, or None (rubric 1.8)."""
     rows = con.execute(
         f"SELECT system_identifier, timeline_id, restart_lsn, confirmed_flush_lsn, "
@@ -190,12 +960,35 @@ def read_slot_state(
     ).fetchall()
     if not rows:
         return None
+    committed_query = (
+        f"SELECT system_identifier, timeline_id, restart_lsn, confirmed_flush_lsn, "
+        f"       current_wal_lsn, durable_lsn, observed_at, verdict, verdict_message, "
+        f"       verdict_at FROM {_control_table(control_schema, 'slot_state')} "
+        "WHERE pipeline = ? AND slot_name = ?"
+    )
+    if not _d._committed_row_matches(
+        con, committed_query, [pipeline, slot_name], rows[0]
+    ):
+        return None
     keys = (
         "system_identifier", "timeline_id", "restart_lsn", "confirmed_flush_lsn",
         "current_wal_lsn", "durable_lsn", "observed_at", "verdict", "verdict_message",
         "verdict_at",
     )
-    return dict(zip(keys, rows[0], strict=True))
+    details = dict(zip(keys, rows[0], strict=True))
+    details["slot_name"] = slot_name
+    state = SlotState(
+        decision=str(details["verdict"] or "observed"),
+        slot_name=slot_name,
+        system_identifier=details["system_identifier"],
+        timeline_id=details["timeline_id"],
+        restart_lsn=details["restart_lsn"],
+        confirmed_flush_lsn=details["confirmed_flush_lsn"],
+        current_wal_lsn=details["current_wal_lsn"],
+        durable_lsn=details["durable_lsn"],
+        pipeline=pipeline,
+    )
+    return _slot_state_receipt_after_commit(state, details)
 
 
 def write_slot_state(
@@ -207,7 +1000,7 @@ def write_slot_state(
     verdict: str | None = None,
     verdict_message: str | None = None,
     control_schema: str | None = None,
-) -> None:
+) -> SlotStateReceipt:
     """Record what the slot and the source cluster look like now (rubric 1.8).
 
     DELETE + INSERT **in one transaction**. It used to be two autocommitted statements,
@@ -223,6 +1016,8 @@ def write_slot_state(
     """
     if verdict is not None:
         verdict = SLOT_VERDICTS.parse(verdict)
+    observed_at = now()
+    verdict_at = now() if verdict is not None else None
     con.execute("BEGIN TRANSACTION")
     try:
         con.execute(
@@ -245,10 +1040,10 @@ def write_slot_state(
                 observation.get("confirmed_flush_lsn"),
                 observation.get("current_wal_lsn"),
                 observation.get("durable_lsn"),
-                now(),
+                observed_at,
                 verdict,
                 verdict_message,
-                now() if verdict is not None else None,
+                verdict_at,
             ],
         )
         con.execute("COMMIT")
@@ -256,6 +1051,33 @@ def write_slot_state(
         with contextlib.suppress(Exception):
             con.execute("ROLLBACK")
         raise
+    details = {
+        "slot_name": slot_name,
+        "system_identifier": observation.get("system_identifier"),
+        "timeline_id": observation.get("timeline_id"),
+        "restart_lsn": observation.get("restart_lsn"),
+        "confirmed_flush_lsn": observation.get("confirmed_flush_lsn"),
+        "current_wal_lsn": observation.get("current_wal_lsn"),
+        "durable_lsn": observation.get("durable_lsn"),
+        "observed_at": observed_at,
+        "verdict": verdict,
+        "verdict_message": verdict_message,
+        "verdict_at": verdict_at,
+    }
+    return _slot_state_receipt_after_commit(
+        SlotState(
+            decision=str(verdict or "observed"),
+            slot_name=slot_name,
+            system_identifier=observation.get("system_identifier"),
+            timeline_id=observation.get("timeline_id"),
+            restart_lsn=observation.get("restart_lsn"),
+            confirmed_flush_lsn=observation.get("confirmed_flush_lsn"),
+            current_wal_lsn=observation.get("current_wal_lsn"),
+            durable_lsn=observation.get("durable_lsn"),
+            pipeline=pipeline,
+        ),
+        details,
+    )
 
 
 def tables_awaiting_snapshot(

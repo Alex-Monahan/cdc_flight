@@ -220,11 +220,41 @@ def run_engine_bounded(
     )
     idle_blocked_by_source = 0
     source_dark_after: float | None = None
+    source_unobservable_after: float | None = None
+    source_probe_bound = min(
+        run.source_probe_startup_seconds,
+        run.engine_start_timeout,
+    )
     close_hung = False
     shutdown_sequence = ShutdownSequence()
     try:
         while thread.is_alive():
             elapsed = time.monotonic() - started
+            if phases is not None and health is not None and hasattr(phases, "record_log"):
+                sample = health.last
+                phases.record_log(
+                    event="source_health",
+                    message=f"slot health={health.state(dark_after=run.source_dark_seconds)}",
+                    replication_lag_bytes=health.per_slot_outstanding_bytes(
+                        getattr(handler, "highest_source_lsn", None)
+                    ),
+                    slot_confirmed_flush_lsn=(
+                        sample.confirmed_pos if sample is not None else None
+                    ),
+                    slot_restart_lsn=(
+                        sample.restart_pos if sample is not None else None
+                    ),
+                    context=(
+                        health.operator_lag_context(
+                            getattr(handler, "highest_source_lsn", None)
+                        )
+                        | {
+                            "slot_active": sample.active if sample is not None else None,
+                            "slot_exists": sample.exists if sample is not None else None,
+                            "slot_error": sample.error if sample is not None else None,
+                        }
+                    ),
+                )
             if elapsed >= run.max_seconds:
                 outcome.record("max_seconds")
                 break
@@ -244,6 +274,14 @@ def run_engine_bounded(
             ):
                 outcome.record("source_dark")
                 source_dark_after = round(elapsed, 2)
+                break
+            if (
+                health is not None
+                and not health.ever_sampled
+                and elapsed >= source_probe_bound
+            ):
+                outcome.record("engine_error")
+                source_unobservable_after = round(elapsed, 2)
                 break
             # An explicit "the work this engine was started for is done" signal. Only
             # `cdc_flight.resnapshot` supplies one: a re-snapshot is finished the moment
@@ -447,9 +485,12 @@ def run_engine_bounded(
                 shutdown_sequence.to(SHUTDOWN_ENGINE_CLOSED)
 
             if shutdown_sequence.state != SHUTDOWN_HUNG:
-                thread.join(timeout=60)
+                thread.join(timeout=run.engine_thread_timeout)
                 if thread.is_alive():
-                    log.error("debezium engine thread did not stop within 60s")
+                    log.error(
+                        "debezium engine thread did not stop within %.1fs",
+                        run.engine_thread_timeout,
+                    )
                     close_hung = True
                     shutdown_sequence.to(SHUTDOWN_HUNG)
                     outcome.record("hung")
@@ -480,6 +521,32 @@ def run_engine_bounded(
                 phases.to(PHASE_DRAINING, detail=f"stop_reason={outcome.value}")
             except Exception:  # pragma: no cover - the edge is declared
                 log.error("could not record the draining phase", exc_info=True)
+        if phases is not None and health is not None and hasattr(phases, "record_log"):
+            sample = health.last
+            phases.record_log(
+                level="ERROR" if outcome.failed else "INFO",
+                event="run_terminal_observation",
+                message=f"run stopping with outcome={outcome.value}",
+                replication_lag_bytes=health.per_slot_outstanding_bytes(
+                    getattr(handler, "highest_source_lsn", None)
+                ),
+                slot_confirmed_flush_lsn=(
+                    sample.confirmed_pos if sample is not None else None
+                ),
+                slot_restart_lsn=(
+                    sample.restart_pos if sample is not None else None
+                ),
+                context=(
+                    health.operator_lag_context(
+                        getattr(handler, "highest_source_lsn", None)
+                    )
+                    | {
+                        "slot_health": health.state(dark_after=run.source_dark_seconds),
+                        "source_unobservable_after_sec": source_unobservable_after,
+                    }
+                ),
+                force=True,
+            )
         # ADR 0001 §3.2: the un-ENDed tail is DISCARDED, never guessed at. It is
         # safe to discard precisely because Invariant O means the offset store
         # still points before it, so it replays on the next run.
@@ -515,12 +582,17 @@ def run_engine_bounded(
         # to exit - the process still has to tear down a JVM whose connector is blocked
         # on a dead socket, which is another minute (Opus MINOR-5).
         summary["source_dark_detected_after_sec"] = source_dark_after
+    if source_unobservable_after is not None:
+        summary["source_unobservable_after_sec"] = source_unobservable_after
     if health is not None:
         summary.update(health.summary())
     if acknowledgement_timeout is not None:
         summary["slot_acknowledgement_timeout"] = acknowledgement_timeout
     if engine.suppressed_message:
         summary["suppressed_engine_message"] = engine.suppressed_message
+    effective = getattr(engine, "effective_configuration", None)
+    if effective:
+        summary["engine_effective_configuration"] = effective
 
     failure = engine.failure
     if acknowledgement_timeout is not None:
@@ -529,6 +601,14 @@ def run_engine_bounded(
             f"{acknowledgement_timeout['durable_lsn']}, but the live source slot "
             "did not confirm that LSN before shutdown; refusing to report a "
             "successful or contained run",
+            summary,
+        )
+    if source_unobservable_after is not None:
+        raise EngineFailure(
+            "the source-health sampler produced no successful observation within "
+            f"{source_unobservable_after:.1f}s of engine startup (bound="
+            f"{source_probe_bound:.1f}s); an unobserved source "
+            "cannot be called idle or complete",
             summary,
         )
     if not applier_quiesced:
@@ -558,14 +638,31 @@ def run_engine_bounded(
         # supervisor also has a Python-side consequence (for example a snapshot
         # callback phase error).  The old `cause is None` guard made the durable
         # connector alert unreachable for exactly that shape.
-        if failure is not None:
+        # A sampler may have already established the source-dark diagnosis before
+        # the connector reports the shutdown consequence.  Preserve that cause: a
+        # later Debezium/SnapshotObservationError must not turn a measured dead
+        # source into a generic engine_error (the same cause-before-symptom rule as
+        # the close-hang path below).
+        source_dark_detected = source_dark_after is not None or outcome.value == "source_dark"
+        if failure is not None and not source_dark_detected:
             _record_connector_failure(handler, str(failure), summary)
-        outcome.record("engine_error")
+        if not source_dark_detected:
+            outcome.record("engine_error")
         summary["stop_reason"] = outcome.value
+        if source_dark_detected:
+            unknown_for = health.unknown_for if health is not None else 0.0
+            message = (
+                f"the source has been unreachable for {unknown_for:.1f}s "
+                f"({health.summary() if health is not None else 'no source health'}); "
+                "the connector then terminated: " + (" | ".join(parts) or "unknown")
+            )
         raise EngineFailure(message, summary) from cause
 
     if outcome.value == "hung":
-        raise EngineFailure("debezium engine thread did not stop within 60s", summary)
+        raise EngineFailure(
+            f"debezium engine thread did not stop within {run.engine_thread_timeout:.1f}s",
+            summary,
+        )
 
     if outcome.value == "source_dark":
         raise EngineFailure(

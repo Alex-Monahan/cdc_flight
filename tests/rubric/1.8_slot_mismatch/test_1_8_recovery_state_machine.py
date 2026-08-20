@@ -25,6 +25,7 @@ The end-to-end pairing (a real crash, a real Postgres slot) is
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import duckdb
@@ -105,6 +106,14 @@ class _World:
         return recovery_mod.read(self.con, pipeline=PIPELINE, namespace=NAMESPACE)
 
     def begin(self, decision: str = "slot_ahead_of_destination"):
+        slot_receipt = dest_mod.write_slot_state(
+            self.con,
+            pipeline=PIPELINE,
+            slot_name="cdc_slot",
+            observation={},
+            verdict="fresh_start" if decision == recovery_mod.RESET_DECISION else decision,
+            verdict_message="the slot is ahead of the destination",
+        )
         return recovery_mod.begin(
             self.con,
             pipeline=PIPELINE,
@@ -115,6 +124,7 @@ class _World:
             offset_path=self.offset_path,
             captured_tables=TABLES,
             forget_catalog=False,
+            slot_receipt=slot_receipt,
         )
 
     def resume(self, *, crash_before: str | None = None):
@@ -181,6 +191,62 @@ def test_the_marking_and_the_journal_are_one_transaction(world, monkeypatch):
         world.begin()
     assert world.journal() is None
     assert world.owed == [], "the to-do list must not outlive the journal that explains it"
+
+
+def _recovery_alerts(world):
+    return world.con.execute(
+        "SELECT code, context FROM _cdc_flight.alerts "
+        "WHERE pipeline = ? AND code = 'operator_reset' ORDER BY raised_at",
+        [PIPELINE],
+    ).fetchall()
+
+
+def test_prejournal_failure_that_is_never_retried_still_projects_one_real_alert(
+    world, monkeypatch
+):
+    """A failed journal transaction may not make the operator signal disappear."""
+    real_request_snapshot = recovery_mod.request_snapshot
+
+    def _mark_then_fail(*args, **kwargs):
+        real_request_snapshot(*args, **kwargs)
+        raise RuntimeError("destination went away before the recovery journal")
+
+    monkeypatch.setattr(recovery_mod, "request_snapshot", _mark_then_fail)
+    with pytest.raises(RuntimeError, match="before the recovery journal"):
+        world.begin(decision="operator_reset")
+
+    rows = _recovery_alerts(world)
+    assert len(rows) == 1
+    payload = json.loads(rows[0][1])
+    assert payload["recovery_begin_pending"] is True
+    assert world.journal() is None
+    assert world.owed == []
+
+
+def test_prejournal_failure_then_successful_retry_projects_one_real_alert(
+    world, monkeypatch
+):
+    """The pending pre-journal identity collapses a successful retry onto its alert."""
+    real_request_snapshot = recovery_mod.request_snapshot
+
+    def _mark_then_fail(*args, **kwargs):
+        real_request_snapshot(*args, **kwargs)
+        raise RuntimeError("destination went away before the recovery journal")
+
+    monkeypatch.setattr(recovery_mod, "request_snapshot", _mark_then_fail)
+    with pytest.raises(RuntimeError, match="before the recovery journal"):
+        world.begin(decision="operator_reset")
+
+    monkeypatch.setattr(recovery_mod, "request_snapshot", real_request_snapshot)
+    record = world.begin(decision="operator_reset")
+
+    rows = _recovery_alerts(world)
+    assert record.phase == PHASE_REQUESTED
+    assert len(rows) == 1
+    payload = json.loads(rows[0][1])
+    assert payload["recovery_begin_pending"] is False
+    assert payload["recovery_journal_id"] == record.recovery_id
+    assert world.journal().recovery_id == record.recovery_id
 
 
 # --------------------------------------------------------------------------- #
@@ -323,6 +389,14 @@ def test_a_forgotten_catalog_is_part_of_the_same_transaction(world):
         "VALUES (?, 'app', 'customers', 1234, true, now(), now())",
         [PIPELINE],
     )
+    slot_receipt = dest_mod.write_slot_state(
+        world.con,
+        pipeline=PIPELINE,
+        slot_name="cdc_slot",
+        observation={},
+        verdict="source_timeline_changed",
+        verdict_message="the timeline forked",
+    )
     recovery_mod.begin(
         world.con,
         pipeline=PIPELINE,
@@ -333,6 +407,7 @@ def test_a_forgotten_catalog_is_part_of_the_same_transaction(world):
         offset_path=world.offset_path,
         captured_tables=TABLES,
         forget_catalog=True,
+        slot_receipt=slot_receipt,
     )
     remaining = world.con.execute(
         "SELECT count(*) FROM _cdc_flight.source_relations WHERE pipeline = ?",
@@ -440,6 +515,14 @@ def test_the_heartbeat_table_declared_by_the_adr_actually_exists(world):
 # Codex r2 BLOCKER-1 — a journal may only clear over POSITIVE terminal evidence
 # --------------------------------------------------------------------------- #
 def _armed_journal(world, *, decision: str, captured: list[tuple[str, str, str]]):
+    slot_receipt = dest_mod.write_slot_state(
+        world.con,
+        pipeline=PIPELINE,
+        slot_name="cdc_slot",
+        observation={},
+        verdict="fresh_start" if decision == recovery_mod.RESET_DECISION else decision,
+        verdict_message="a test",
+    )
     record = recovery_mod.begin(
         world.con,
         pipeline=PIPELINE,
@@ -450,6 +533,7 @@ def _armed_journal(world, *, decision: str, captured: list[tuple[str, str, str]]
         offset_path=Path("/tmp/does-not-matter"),
         captured_tables=captured,
         forget_catalog=False,
+        slot_receipt=slot_receipt,
     )
     world.con.execute(
         "UPDATE _cdc_flight.recovery_state SET phase = 'armed' WHERE pipeline = ?",

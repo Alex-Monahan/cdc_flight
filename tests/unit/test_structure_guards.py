@@ -12,15 +12,13 @@ from pathlib import Path
 
 import pytest
 
-#: RE-MEASURED FROM THE REAL LANE COLLECTIONS after the §3 gap coverage.
-#: The pre-gap selected baselines were 2156 / 195 / 48. This round adds twelve
-#: default-lane nodes and six slow-lane nodes; the guard module still contributes
-#: 11 / 1 / 1 items. These are collection counts, not a module-size rule. The
-#: expected values below subtract only this guard module.
+#: RE-MEASURED FROM THE REAL LANE COLLECTIONS after the §3 gap coverage and the
+#: detection/alerting proofs. These are collection counts, not a module-size rule.
+#: The expected values below subtract only this guard module.
 _BASELINE_SELECTED = {
-    "not motherduck and not slow": 2169,
-    "slow and not motherduck": 201,
-    "motherduck": 48,
+    "not motherduck and not slow": 2196,
+    "slow and not motherduck": 207,
+    "motherduck": 50,
 }
 
 
@@ -116,7 +114,13 @@ def test_commit_protocol_owns_the_durability_boundary():
 
 
 def test_commit_ack_window_has_no_crash_matrix_persistence():
-    """The disarmed and armed paths share a post-COMMIT region containing only ack."""
+    """The COMMIT-to-ack region contains no alert, log, or flush I/O.
+
+    This is deliberately a source guard: putting the timeout alert back in the
+    watchdog callback or adding a log statement between ``COMMIT`` and
+    ``COMMIT_ACK.leave`` makes this test fail before a timing-sensitive integration
+    run can hide the violation.
+    """
     from cdc_flight import commit_protocol
 
     source = Path(commit_protocol.__file__).read_text()
@@ -126,6 +130,18 @@ def test_commit_ack_window_has_no_crash_matrix_persistence():
     assert "runtime_state" not in boundary
     assert "os.replace" not in boundary
     assert "fsync" not in boundary
+    for forbidden in (
+        "raise_alert",
+        "AlertSink",
+        "clear_alert",
+        "log.",
+        "logging.",
+        "record_log",
+        "flush(",
+        "_arm_commit_timeout_alert",
+        "_clear_commit_timeout_alert",
+    ):
+        assert forbidden not in boundary, forbidden
 
 
 def test_snapshot_protocol_and_notifications_share_one_public_module():
