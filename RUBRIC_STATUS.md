@@ -1854,7 +1854,7 @@ therefore mutated by a path the design did not enumerate.**
 Explicit machines do not make the system correct. They make the **unenumerated path** a
 run-time error instead of a review finding.
 
-#### What was built — seventeen focused machines and one precedence
+#### What was built — eighteen focused machines and one precedence
 
 | machine | owns | states | edges | persistence |
 |---|---|---|---|---|
@@ -1875,6 +1875,7 @@ run-time error instead of a review finding.
 | `snapshot_completion` | have all ordered snapshot callbacks arrived | 6 | 9 | **memory only** |
 | `completion_watermark` | has this run reached a source position it can prove the destination is durably past | 4 | 3 | **memory only** |
 | `shutdown_sequence` | has source feedback, callback quiescence, own teardown, and stock engine stop completed in order | 13 | 17 | **memory only** |
+| `service_control` | which authenticated service-control phase owns renewal dispatch and drain, including an in-flight renewal's bounded resolution | 5 | 10 | **memory only** |
 | `runtime_root_lifecycle` | is the disposable root reusable or committed to cleanup | 6 | 10 | project-local root and parent markers |
 
 Style, deliberately minimal: `cdc_flight/states.py` is 293 lines with **no dependencies**

@@ -3089,6 +3089,24 @@ persistence: **memory only** · initial: `open` · terminal: `callback_owned`,
 | `open` | `ack_pending` | no |
 | `own_executors_stopped` | `engine_closing` | no |
 
+**`service_control`** — Which authenticated service-control phase owns renewal
+dispatch and drain, including the bounded resolution of a renewal already in flight?
+
+persistence: **memory only** · initial: `active` · terminal: `closed`
+
+| from | to | terminal |
+|---|---|---|
+| `active` | `closed` | yes |
+| `active` | `draining` | no |
+| `active` | `renewing` | no |
+| `closed` | `closed` | yes |
+| `draining` | `closed` | yes |
+| `draining` | `draining` | no |
+| `draining_with_renewal` | `draining` | no |
+| `draining_with_renewal` | `draining_with_renewal` | no |
+| `renewing` | `active` | no |
+| `renewing` | `draining_with_renewal` | no |
+
 **`runtime_root_lifecycle`** — Is the project-local disposable root healthy and
 reusable, privately provisioning, or irreversibly committed to cleanup?
 
@@ -3489,7 +3507,7 @@ machine is ceremony — worse than ceremony, because it advertises recoverable i
 states that do not exist. If yes, the state needs a name, a persisted value and a
 transition table.
 
-#### What was built (seventeen focused machines + one precedence)
+#### What was built (eighteen focused machines + one precedence)
 
 | machine | owns | states | edges | persistence |
 |---|---|---|---|---|
@@ -3510,6 +3528,7 @@ transition table.
 | `snapshot_completion` | have all ordered snapshot callbacks arrived | 6 | 9 | **memory only** |
 | `completion_watermark` | has this run reached a source position it can prove the destination is durably past | 4 | 3 | **memory only** |
 | `shutdown_sequence` | has source feedback, callback quiescence, own teardown, and stock engine stop completed in order | 13 | 17 | **memory only** |
+| `service_control` | which authenticated service-control phase owns renewal dispatch and drain, including an in-flight renewal's bounded resolution | 5 | 10 | **memory only** |
 | `runtime_root_lifecycle` | is the disposable root reusable or committed to cleanup | 6 | 10 | project-local root and parent markers |
 
 Generated transition tables: §A51.1. Declarations: `cdc_flight/machines.py`, which is one

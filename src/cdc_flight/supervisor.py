@@ -109,6 +109,8 @@ def run_engine_bounded(
     quiescence_observer=None,
     keep_catalog: bool = False,
     watermark: CompletionWatermark | None = None,
+    service_context=None,
+    service_recheck=None,
 ) -> dict:
     """Run the Debezium engine until the destination has REACHED a source position.
 
@@ -173,6 +175,7 @@ def run_engine_bounded(
     # this low-level helper useful for streaming-only fakes without inventing a second
     # completion definition.
     completion = completion or SnapshotCompletion.streaming_only()
+    service_mode = service_context is not None
     started = time.monotonic()
     error_box: list[BaseException] = []
     final_poll_done = False
@@ -185,6 +188,7 @@ def run_engine_bounded(
         getattr(getattr(handler, "resume_point", None), "last_lsn", 0) or 0
     )
     acknowledgement_timeout: dict[str, int | float] | None = None
+    service_recheck_result: dict | None = None
 
     def pending_fenced():
         if catalog is None:
@@ -215,22 +219,39 @@ def run_engine_bounded(
     # `completion_watermark`: the run ends on a source POSITION it has reached,
     # and the `--idle-seconds` quiet window survives only as the declared fallback
     # for a source that cannot be marked.
-    watermark = watermark if watermark is not None else CompletionWatermark.for_run(
-        health, run, completion=completion
+    watermark = (
+        None
+        if service_mode
+        else watermark
+        if watermark is not None
+        else CompletionWatermark.for_run(health, run, completion=completion)
     )
     idle_blocked_by_source = 0
     source_dark_after: float | None = None
     source_unobservable_after: float | None = None
+    drain_started_at: float | None = None
     source_probe_bound = min(
         run.source_probe_startup_seconds,
         run.engine_start_timeout,
     )
     close_hung = False
     shutdown_sequence = ShutdownSequence()
+    next_service_recheck = started + float(
+        getattr(service_context, "invariant_check_seconds", 30.0)
+    ) if service_mode else None
     try:
         while thread.is_alive():
             elapsed = time.monotonic() - started
+            if service_mode and service_context.parent_lost:
+                # Parent loss is a write barrier.  Check it before the periodic
+                # source-health/run-log projection so a dead supervisor cannot
+                # even emit observability I/O while the worker is unwinding.
+                outcome.record("engine_error")
+                break
             if phases is not None and health is not None and hasattr(phases, "record_log"):
+                if service_mode:
+                    faults.matrix_crash("service_source_health_write")
+                    faults.matrix_crash("service_run_log_write")
                 sample = health.last
                 phases.record_log(
                     event="source_health",
@@ -255,6 +276,62 @@ def run_engine_bounded(
                         }
                     ),
                 )
+            if service_mode:
+                if (
+                    service_recheck is not None
+                    and next_service_recheck is not None
+                    and time.monotonic() >= next_service_recheck
+                ):
+                    try:
+                        service_recheck_result = service_recheck(handler)
+                    except BaseException as exc:
+                        # This is a read-only, serialized invariant check.  Its
+                        # failure is a service error, never a reason to continue
+                        # streaming on stale slot/offset assumptions.
+                        error_box.append(exc)
+                        outcome.record("engine_error")
+                        break
+                    next_service_recheck = time.monotonic() + float(
+                        getattr(service_context, "invariant_check_seconds", 30.0)
+                    )
+                if service_context.drain_requested:
+                    # Drain intent is admitted while callbacks are still live.  The
+                    # applier remains the only owner allowed to commit/ack a group;
+                    # this request merely lets the next callback close a complete
+                    # group before admission is sealed below.  This branch is
+                    # deliberately before renewal: once the worker-side control
+                    # machine enters drain, no queued renewal may reach lease I/O.
+                    if drain_started_at is None:
+                        drain_started_at = time.monotonic()
+                    handler.request_drain()
+                    if not handler.busy:
+                        outcome.record("work_done")
+                        break
+                    if time.monotonic() - drain_started_at >= run.close_timeout:
+                        # A callback which cannot finish within the operation bound
+                        # must reach the common seal/quiescence proof.  Leaving the
+                        # service loop here is what lets ownership transfer to the
+                        # live callback instead of waiting forever for a callback
+                        # that the parent has already been asked to drain.
+                        outcome.record("hung")
+                        break
+                    time.sleep(0.05)
+                    continue
+                if service_context.renew_requested:
+                    try:
+                        handler.renew_service_lease()
+                    except BaseException as exc:
+                        handler.error = exc
+                        outcome.record("engine_error")
+                        break
+                if error_box or engine.failure is not None:
+                    outcome.record("engine_error")
+                    break
+                # There is no completion watermark in a service.  Liveness is
+                # supplied by the parent heartbeat and the worker heartbeat, while
+                # every callback/transaction/close operation retains its own bound.
+                time.sleep(0.25)
+                continue
             if elapsed >= run.max_seconds:
                 outcome.record("max_seconds")
                 break
@@ -339,6 +416,13 @@ def run_engine_bounded(
         else:
             outcome.record("engine_finished")
     finally:
+        if service_mode:
+            if service_context.parent_lost:
+                outcome.record("engine_error")
+            # Set drain intent before any final source hand-off.  If a callback is
+            # admitted during that bounded hand-off it can still close a complete
+            # group; ``shutdown`` below then seals admission and waits for it.
+            handler.request_drain()
         # The shutdown state machine is deliberately linear.  The source feedback
         # hand-off happens while callbacks are still admitted; then admission is
         # sealed, admitted callbacks are drained, our own timer is retired, and only
@@ -355,6 +439,7 @@ def run_engine_bounded(
             and health.ever_sampled
             and not getattr(getattr(handler, "cfg", None), "resnapshot", False)
             and outcome.value not in {"source_dark", "hung"}
+            and not (service_mode and service_context.parent_lost)
         )
         if not final_ack_required:
             shutdown_sequence.to(SHUTDOWN_ACK_NOT_REQUIRED)
@@ -568,7 +653,15 @@ def run_engine_bounded(
         **handler.stats(),
     }
     summary.update(completion.as_dict())
-    summary.update(watermark.as_dict())
+    if watermark is None:
+        summary.update(
+            {
+                "service_mode": True,
+                "completion_watermark": "service_unbounded",
+            }
+        )
+    else:
+        summary.update(watermark.as_dict())
     if close_hung:
         # Recorded even when it is not the reported reason, because "we could not shut
         # the engine down" is operationally interesting whatever caused it.
@@ -586,6 +679,8 @@ def run_engine_bounded(
         summary["source_unobservable_after_sec"] = source_unobservable_after
     if health is not None:
         summary.update(health.summary())
+    if service_recheck_result is not None:
+        summary["service_invariant_recheck"] = service_recheck_result
     if acknowledgement_timeout is not None:
         summary["slot_acknowledgement_timeout"] = acknowledgement_timeout
     if engine.suppressed_message:
@@ -698,7 +793,7 @@ def run_engine_bounded(
             summary,
         )
 
-    if outcome.value == "max_seconds" and watermark.state in (
+    if not service_mode and outcome.value == "max_seconds" and watermark.state in (
         WATERMARK_ARMED, WATERMARK_UNARMED,
     ):
         # `--max-seconds` IS A SAFETY CEILING, NOT AN EXIT PATH (rubric 4.5, and
@@ -732,7 +827,7 @@ def run_engine_bounded(
             summary,
         )
 
-    if health is not None and outcome.value == "max_seconds":
+    if not service_mode and health is not None and outcome.value == "max_seconds":
         not_streaming_for = health.not_streaming_for
         if not_streaming_for >= run.idle_seconds:
             raise EngineFailure(

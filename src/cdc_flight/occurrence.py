@@ -33,7 +33,7 @@ class RunState:
     existing consumers use the read-only ``runner_id`` property.
     """
 
-    __slots__ = ("_pipeline", "_runner_id")
+    __slots__ = ("_lease_epoch", "_pipeline", "_runner_id", "_service_id")
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         raise TypeError("RunState is allocated by RunState.new()")
@@ -44,6 +44,25 @@ class RunState:
         instance = object.__new__(cls)
         object.__setattr__(instance, "_pipeline", pipeline)
         object.__setattr__(instance, "_runner_id", uuid.uuid4().hex)
+        object.__setattr__(instance, "_service_id", None)
+        object.__setattr__(instance, "_lease_epoch", None)
+        return instance
+
+    @classmethod
+    def service(
+        cls, pipeline: str, *, service_id: str, worker_generation: str, lease_epoch: int
+    ) -> RunState:
+        """Allocate the compatibility run identity for one service generation."""
+        pipeline = _require_text(pipeline, name="pipeline")
+        service_id = _require_text(service_id, name="service_id")
+        worker_generation = _require_text(worker_generation, name="worker_generation")
+        if not isinstance(lease_epoch, int) or lease_epoch < 1:
+            raise TypeError("lease_epoch must be a positive integer")
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "_pipeline", pipeline)
+        object.__setattr__(instance, "_runner_id", worker_generation)
+        object.__setattr__(instance, "_service_id", service_id)
+        object.__setattr__(instance, "_lease_epoch", lease_epoch)
         return instance
 
     @property
@@ -53,6 +72,14 @@ class RunState:
     @property
     def runner_id(self) -> str:
         return self._runner_id
+
+    @property
+    def service_id(self) -> str | None:
+        return self._service_id
+
+    @property
+    def lease_epoch(self) -> int | None:
+        return self._lease_epoch
 
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError("RunState is immutable")
@@ -216,11 +243,21 @@ class LeaseState:
     pipeline: str
     owner_id: str
     operation: str
+    lease_id: str | None = None
+    fencing_epoch: int | None = None
+    service_id: str | None = None
+    worker_generation: str | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.pipeline, name="pipeline")
         _require_text(self.owner_id, name="owner_id")
         _require_text(self.operation, name="operation")
+        if self.lease_id is not None:
+            _require_text(self.lease_id, name="lease_id")
+        if self.fencing_epoch is not None and (
+            not isinstance(self.fencing_epoch, int) or self.fencing_epoch < 1
+        ):
+            raise TypeError("fencing_epoch must be a positive integer")
 
 
 class _DurableReceipt:
@@ -464,6 +501,21 @@ class OccurrenceKey:
     ) -> OccurrenceKey:
         _require_state(run, RunState, "from_run")
         bound_pipeline = _bound_pipeline(run.pipeline, pipeline, "from_run")
+        if run.service_id is not None:
+            # A service lifetime is not one alert occurrence.  One occurrence is
+            # one worker generation under one service identity and fencing epoch;
+            # a restart or takeover must therefore mint a distinct run key even
+            # when the configured pipeline and service ID are unchanged.
+            return cls._from_binding(
+                f"run:{run.service_id}:{run.runner_id}:epoch:{run.lease_epoch}",
+                (
+                    "run",
+                    bound_pipeline,
+                    run.service_id,
+                    run.runner_id,
+                    run.lease_epoch,
+                ),
+            )
         return cls._from_binding(
             f"run:{run.runner_id}", ("run", bound_pipeline, run.runner_id)
         )
@@ -579,7 +631,8 @@ class OccurrenceKey:
         )
         lease_stamp = _stable_value(receipt.details.get("acquired_at"))
         return cls._from_binding(
-            f"{lease.operation}:{lease.pipeline}:{lease.owner_id}",
+            f"{lease.operation}:{lease.pipeline}:{lease.owner_id}:"
+            f"epoch:{lease.fencing_epoch if lease.fencing_epoch is not None else 'legacy'}",
             (
                 "lease",
                 bound_alert_pipeline,
@@ -587,6 +640,10 @@ class OccurrenceKey:
                 bound_owner,
                 lease.operation,
                 lease_stamp,
+                lease.lease_id,
+                lease.fencing_epoch,
+                lease.service_id,
+                lease.worker_generation,
             ),
         )
 

@@ -6,6 +6,8 @@ from BEGIN through the guarded COMMIT/ack boundary and post-commit bookkeeping.
 
 from __future__ import annotations
 
+import functools
+
 from . import commit_metadata, destination, offsets, self_heal, table_writer
 from .commit_group import CommitResult, OpenGroup
 from .errors import (
@@ -16,12 +18,34 @@ from .errors import (
     TableWriteFailure,
     as_schema_refusal,
 )
-from .faults import arm_group, maybe_crash
+from .faults import arm_group, matrix_crash, maybe_crash
 from .run_state import COMMIT_ACK
 
 OWNER = "commit-durability"
 
 
+def _bounded_service_destination_operation(function):
+    """Bound service destination work before the commit/ack hand-off."""
+    @functools.wraps(function)
+    def wrapped(self, trigger: str) -> CommitResult:
+        if self.service_context is None or not self.group.units:
+            return function(self, trigger)
+        commit_id = self.group.spill_commit_id or self._next_commit_id
+        # If native destination work hangs before the existing inner watchdog is
+        # armed, leave the same durable diagnostic behind.  No timeout callback
+        # performs destination or telemetry I/O.
+        self._arm_commit_timeout_alert(commit_id)
+        with self_heal.destination_operation_watchdog(self.cfg.commit_timeout) as stop:
+            self._destination_operation_deadline_stop = stop
+            try:
+                return function(self, trigger)
+            finally:
+                self._destination_operation_deadline_stop = None
+
+    return wrapped
+
+
+@_bounded_service_destination_operation
 def commit_group(self, trigger: str) -> CommitResult:
     """Commit the one destination-owned group.
 
@@ -54,12 +78,25 @@ def commit_group(self, trigger: str) -> CommitResult:
     arm_group(fault_group)
     has_incremental = any(getattr(unit, "incremental", False) for unit in group)
     has_snapshot_unit = any(unit.kind == "snapshot_chunk" for unit in group)
+    if self.service_context is not None:
+        # Admission is a worker/parent protocol check, not a best-effort
+        # observation.  A worker that has lost its parent must fail before it
+        # can open a destination transaction, and the lease identity is checked
+        # once more on the same connection immediately before BEGIN.
+        self.service_context.assert_writable()
+        self.lease.assert_current(self.con)
     if not self.group.txn_open:
         self.con.execute("BEGIN TRANSACTION")
         self.group.txn_open = True
     try:
         self._apply_backfill_notifications()
-        self.lease.renew(self.con)
+        # The service path fences the exact lease epoch inside the destination
+        # transaction before any data/state DML.  The finite adapter retains its
+        # established renew call and therefore its existing batch behaviour.
+        if self.service_context is not None:
+            self.lease.fence(self.con)
+        else:
+            self.lease.renew(self.con)
         new_point = offsets.point_for(
             group,
             previous=self.resume_point,
@@ -141,6 +178,16 @@ def commit_group(self, trigger: str) -> CommitResult:
         # HERE, before the commit, because it is only a *forensic* baseline -
         # it does not need to lengthen the commit->ack path (Codex 7).
         offset_fingerprint = self.verifier.before() if self.verifier else None
+        stop_destination_deadline = getattr(
+            self, "_destination_operation_deadline_stop", None
+        )
+        if stop_destination_deadline is not None:
+            # From this point the commit watchdog and the IPC deadline own the
+            # minimal COMMIT -> source acknowledgement interval.  The broader
+            # destination deadline does not add a second timer to that window.
+            stop_destination_deadline()
+        if self.service_context is not None:
+            matrix_crash("service_before_md_commit")
         # rubric 1.9 / ADR §20: the commit->ack exclusion, as a flag other threads
         # can read. Entered BEFORE the COMMIT (so no observability write can be
         # mid-statement when the window opens) and left after the acknowledgement.
@@ -159,15 +206,33 @@ def commit_group(self, trigger: str) -> CommitResult:
         # callback is deliberately I/O-free: if it fires, it may be running inside
         # COMMIT_ACK and may only terminate the process.
         self._arm_commit_timeout_alert(commit_id)
+        if self.service_context is not None:
+            # The parent marks the physical lease gate before acknowledging this
+            # request.  It must defer its renewal until commit_complete arrives.
+            # No database or alert operation is performed by this handshake.
+            self.service_context.before_commit_ack(timeout=self.cfg.commit_timeout)
+        ack_entered = False
         with self_heal.commit_watchdog(self.cfg.commit_timeout, commit_id):
             # INSIDE the watchdog (Codex r3 MAJOR-2). `enter()` waits, without a
             # bound of its own, until no independent write is in flight — that is
             # what makes the exclusion absolute rather than instrumented — and the
             # watchdog bounds both COMMIT and every acknowledgement below.
             COMMIT_ACK.enter()
+            ack_entered = True
             try:
+                if self.service_context is not None:
+                    # Recheck the IPC write barrier immediately before COMMIT.
+                    # This is an in-process event read only; control-plane and
+                    # observability statements remain structurally absent here.
+                    self.service_context.assert_writable()
                 self.con.execute("COMMIT")
                 self.group.txn_open = False
+                if self.service_context is not None:
+                    matrix_crash("service_after_md_commit_before_ack")
+                    # A parent loss after the destination commit is still a
+                    # no-ack path.  The durable destination wins and the source
+                    # record replays on the next generation.
+                    self.service_context.assert_writable()
                 if has_incremental:
                     maybe_crash("after_md_commit_before_markProcessed", fault_group)
                 if has_snapshot_unit:
@@ -190,14 +255,20 @@ def commit_group(self, trigger: str) -> CommitResult:
                             continue
                         self._committer.markProcessed(rec.raw)
                         marked += 1
+                        if self.service_context is not None and marked == 1:
+                            matrix_crash("service_after_one_ack_before_finish")
                 for raw in pending:
                     self._committer.markProcessed(raw)
                     marked += 1
+                    if self.service_context is not None and marked == 1:
+                        matrix_crash("service_after_one_ack_before_finish")
                 for record in pending_discards:
                     if record.raw is None:
                         continue
                     self._committer.markProcessed(record.raw)
                     marked += 1
+                    if self.service_context is not None and marked == 1:
+                        matrix_crash("service_after_one_ack_before_finish")
                 if has_incremental:
                     maybe_crash("after_markProcessed_before_markBatchFinished", fault_group)
                 self._committer.markBatchFinished()
@@ -205,7 +276,13 @@ def commit_group(self, trigger: str) -> CommitResult:
                 # A mark call can raise; a stuck window would silently drop every
                 # later phase write, so the gate is closed immediately after the
                 # last acknowledgement in all cases.
-                COMMIT_ACK.leave()
+                if ack_entered:
+                    COMMIT_ACK.leave()
+                if self.service_context is not None:
+                    # This is intentionally after COMMIT_ACK.leave(): the parent
+                    # may resume lease renewal only after the acknowledgement
+                    # window has completely closed.
+                    self.service_context.after_commit_ack()
             if has_incremental:
                 maybe_crash("after_ack_before_next_poll", fault_group)
             self._pending_backfill_notifications.clear()

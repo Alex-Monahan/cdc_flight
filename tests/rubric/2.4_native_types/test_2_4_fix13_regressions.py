@@ -89,6 +89,10 @@ NON_ADMISSION_EXCEPTIONS: dict[str, str] = {
         "a configuration refusal raised before any data exists; there is no "
         "relation to contain it to and the run must not start"
     ),
+    "_RemoteOperationError": (
+        "a supervisor control child returned a serialised failure; it is a "
+        "control-plane transport wrapper, not a source-value admission refusal"
+    ),
     "EnvelopeDecodeError": (
         "an unknown Debezium control message; the transaction boundary itself is "
         "unreadable, so no per-relation disposition is meaningful"

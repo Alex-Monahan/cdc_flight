@@ -1,4 +1,4 @@
-"""The `_cdc_flight` control schema and its create-only DDL.
+"""The `_cdc_flight` control schema and its compatibility-safe DDL.
 
 Split out of `destination.py` (Codex B6). That module is the destination *connection*
 and the readers and writers that use it; three hundred lines of `CREATE TABLE IF NOT
@@ -65,13 +65,24 @@ CONTROL_DDL = [
             PRIMARY KEY (pipeline, commit_id)
         )""",
     f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.lease (
-            pipeline        VARCHAR     PRIMARY KEY,
-            owner_id        VARCHAR     NOT NULL,
-            host            VARCHAR,
-            pid             BIGINT,
-            acquired_at     TIMESTAMPTZ NOT NULL,
-            renewed_at      TIMESTAMPTZ NOT NULL,
-            expires_at      TIMESTAMPTZ NOT NULL
+            -- ``pipeline`` remains the compatibility column.  Its value is the
+            -- resolved physical key, never a configured pipeline name.
+            pipeline             VARCHAR     PRIMARY KEY,
+            lease_key            VARCHAR,
+            lease_id             VARCHAR,
+            fencing_epoch        BIGINT      DEFAULT 1,
+            service_id           VARCHAR,
+            worker_generation    VARCHAR,
+            owner_id             VARCHAR     NOT NULL,
+            host                 VARCHAR,
+            pid                  BIGINT,
+            process_start_token  VARCHAR,
+            worker_pid           BIGINT,
+            worker_start_token   VARCHAR,
+            acquired_at          TIMESTAMPTZ NOT NULL,
+            renewed_at           TIMESTAMPTZ NOT NULL,
+            expires_at           TIMESTAMPTZ NOT NULL,
+            state                VARCHAR     DEFAULT 'supervisor_held'
         )""",
     f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.table_state (
             pipeline        VARCHAR     NOT NULL,
@@ -478,19 +489,60 @@ def control_ddl(control_schema: str | None = None) -> list[str]:
     ]
 
 
-def ensure_control_schema(con, control_schema: str | None = None) -> None:
-    """Create the current control schema as one idempotent transaction.
+def _migrate_legacy_lease(con, control_schema: str | None = None) -> None:
+    """Add the service lease columns to a destination made by the parent branch.
 
-    This repository is still in testing; control state written by an earlier build is
-    explicitly out of scope. There is deliberately no ALTER/backfill/legacy-copy path
-    here. A fresh destination gets the complete current DDL, and an old destination
-    must be recreated by the test/deployment harness rather than silently converted by
-    the application.
+    The service lease is an additive schema evolution.  ``CREATE TABLE IF NOT
+    EXISTS`` cannot change the seven-column lease table shipped by the parent, so
+    the first service acquire on an existing batch destination used to fail while
+    selecting ``lease_key``.  Every added column is nullable to preserve old rows;
+    the lease implementation treats a null service-only identity as legacy and
+    upgrades it on the next conditional takeover.
     """
+    schema = resolve_control_schema(control_schema)
+    table = quote(schema) + ".lease"
+    existing = {
+        str(row[0])
+        for row in con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = ? AND table_name = 'lease'",
+            [schema],
+        ).fetchall()
+    }
+    additions = (
+        ("lease_key", "VARCHAR"),
+        ("lease_id", "VARCHAR"),
+        ("fencing_epoch", "BIGINT"),
+        ("service_id", "VARCHAR"),
+        ("worker_generation", "VARCHAR"),
+        ("process_start_token", "VARCHAR"),
+        ("worker_pid", "BIGINT"),
+        ("worker_start_token", "VARCHAR"),
+        ("state", "VARCHAR"),
+    )
+    for name, type_name in additions:
+        if name not in existing:
+            con.execute(
+                f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {quote(name)} {type_name}"
+            )
+    # The old row remains the incumbent until its old expiry.  These defaults are
+    # descriptive upgrades only; they do not make a live legacy owner reclaimable.
+    con.execute(
+        f"UPDATE {table} SET lease_key=coalesce(lease_key, pipeline), "
+        "fencing_epoch=coalesce(fencing_epoch, 1), "
+        "service_id=coalesce(service_id, owner_id), "
+        "worker_generation=coalesce(worker_generation, owner_id), "
+        "state=coalesce(state, 'supervisor_held')"
+    )
+
+
+def ensure_control_schema(con, control_schema: str | None = None) -> None:
+    """Create the current control schema and apply its additive lease migration."""
     con.execute("BEGIN TRANSACTION")
     try:
         for statement in control_ddl(control_schema):
             con.execute(statement)
+        _migrate_legacy_lease(con, control_schema)
         con.execute("COMMIT")
     except BaseException:
         with contextlib.suppress(Exception):

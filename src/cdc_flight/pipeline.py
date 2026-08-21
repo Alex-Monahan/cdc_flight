@@ -53,6 +53,7 @@ from .config import (
     DestinationConfig,
     ReplicationConfig,
     RunConfig,
+    ServiceConfig,
     SourceConfig,
     applier_settings,
     lease_ttl_seconds,
@@ -99,6 +100,7 @@ def run(
     snapshot_mode: str | None = None,
     reset_state: bool = False,
     accept_orphan_offsets: bool = False,
+    service_context=None,
 ) -> dict:
     """Run one Flight invocation.
 
@@ -107,6 +109,27 @@ def run(
     to an in-process caller, because the callback owns resources which must not outlive
     the lease and overlap another invocation in the same interpreter.
     """
+    if service_context is None and os.environ.get("CDC_SERVICE_WORKER") == "1":
+        from .service_protocol import ServiceWorkerContext
+
+        service_context = ServiceWorkerContext.from_environment()
+    service_mode = service_context is not None
+    service_policy = ServiceConfig() if service_mode else None
+    if service_context is not None:
+        # The hello/heartbeat channel starts before destination acquisition.  A
+        # supervisor can therefore distinguish a child that never started from one
+        # that failed while opening the destination, and parent loss is visible to
+        # the worker before it can enter a data transaction.
+        service_context.start()
+        service_context.wait_for_start(
+            float(os.environ.get("CDC_SERVICE_WORKER_START_TIMEOUT", "20"))
+        )
+        # This is the authenticated worker-start cut: the lease epoch is bound,
+        # the parent has released the start gate, and the child is still before
+        # destination acquisition.  A matrix arm here must kill only this child;
+        # it cannot manufacture a second owner or advance an offset.
+        faults_mod.matrix_crash("service_worker_startup")
+
     # Parse CDC_FAULT_INJECT once, here, so a typo fails the run instead of
     # leaving a fault test vacuously green (Codex 9).
     fault_spec = validate_fault_env()
@@ -117,17 +140,20 @@ def run(
     replication = ReplicationConfig()
     dest = DestinationConfig(**({"kind": destination} if destination else {}))
     control_schema = dest.control_schema
-    run_cfg = RunConfig(
-        **{
-            k: v
-            for k, v in {
-                "max_seconds": max_seconds,
-                "idle_seconds": idle_seconds,
-                "min_records": min_records,
-            }.items()
-            if v is not None
-        }
-    )
+    run_values = {
+        k: v
+        for k, v in {
+            "max_seconds": max_seconds,
+            "idle_seconds": idle_seconds,
+            "min_records": min_records,
+        }.items()
+        if v is not None
+    }
+    if service_mode:
+        # Service lifetime is unbounded.  The operation-level bounds remain the
+        # RunConfig values used by commit/close/source helpers.
+        run_values["max_seconds"] = float("inf")
+    run_cfg = RunConfig(**run_values)
 
     replication.state_dir.mkdir(parents=True, exist_ok=True)
     settings = applier_settings()
@@ -156,7 +182,16 @@ def run(
         table for table in source.tables if not is_signal_relation(table)
     )
     namespace = props["name"]
-    run_state = RunState.new(dest.pipeline_name)
+    run_state = (
+        RunState.service(
+            dest.pipeline_name,
+            service_id=service_context.service_id,
+            worker_generation=service_context.worker_generation,
+            lease_epoch=service_context.fencing_epoch,
+        )
+        if service_context is not None
+        else RunState.new(dest.pipeline_name)
+    )
     runner_id = run_state.runner_id
 
     log.info(
@@ -260,15 +295,38 @@ def run(
         # The lease is taken first: this path mutates destination state (marks tables,
         # deletes the resume point, drops the slot), and a second runner doing that
         # concurrently is exactly what rubric 4.2 exists to prevent.
-        lease = Lease(
-            destination_lease_key,
-            owner_id=runner_id,
-            ttl_seconds=lease_ttl_seconds(),
-            control_schema=control_schema,
-            label=dest.pipeline_name,
-        )
-        lease.acquire(con)
-        lease_held = True
+        if service_context is not None:
+            if service_context.lease_key != destination_lease_key:
+                raise LeaseLost(
+                    "the worker was handed a lease for a different physical destination"
+                )
+            lease = Lease(
+                destination_lease_key,
+                owner_id=service_context.service_id,
+                ttl_seconds=service_policy.lease_ttl_seconds,
+                control_schema=control_schema,
+                label=dest.pipeline_name,
+                lease_id=service_context.lease_id,
+                fencing_epoch=service_context.fencing_epoch,
+                service_id=service_context.service_id,
+                worker_generation=service_context.worker_generation,
+                process_start_token=service_context.parent_start_token,
+                worker_pid=os.getpid(),
+                worker_start_token=service_context.worker_start_token,
+            )
+            # The supervisor acquired and assigned this epoch.  The worker only
+            # attaches; it can never reacquire or silently replace the parent.
+            lease.attach(con)
+        else:
+            lease = Lease(
+                destination_lease_key,
+                owner_id=runner_id,
+                ttl_seconds=lease_ttl_seconds(),
+                control_schema=control_schema,
+                label=dest.pipeline_name,
+            )
+            lease.acquire(con)
+            lease_held = True
 
         # rubric 4.7: a throwaway `_rs` slot left behind by an interrupted re-snapshot
         # holds WAL on the source for ever and counts against `max_replication_slots`.
@@ -957,6 +1015,7 @@ def run(
             resnapshot_enabled=acquisition.resnapshot_enabled(),
             descriptor_provider=descriptor_provider,
             catalog_flush_exclude=catalog_flush_exclude,
+            service_context=service_context,
         )
         try:
             reported = coordinator.run()
@@ -1023,16 +1082,20 @@ def run(
             exc.summary = reported
         raise
     finally:
-        _teardown_destination(
-            con=con,
-            ownership=ownership,
-            reported=reported,
-            phases=phases,
-            lease=lease,
-            lease_held=lease_held,
-            run_ok=run_ok,
-            hard_exit_on_transfer=True,
-        )
+        try:
+            _teardown_destination(
+                con=con,
+                ownership=ownership,
+                reported=reported,
+                phases=phases,
+                lease=lease,
+                lease_held=lease_held,
+                run_ok=run_ok,
+                hard_exit_on_transfer=True,
+            )
+        finally:
+            if service_context is not None:
+                service_context.close()
 
 
 def _record_run_failure_alert(

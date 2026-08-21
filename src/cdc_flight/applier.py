@@ -81,7 +81,7 @@ from .errors import (
     SchemaEvolutionRefused,
     as_schema_refusal,
 )
-from .faults import maybe_crash
+from .faults import matrix_crash, maybe_crash
 from .marker_accounting import SourceMarkerReceiptCounter
 from .occurrence import _commit_reservation
 from .snapshot import SnapshotCoordinator
@@ -122,6 +122,7 @@ class Applier:
         snapshot_audit=None, descriptor_provider=None,
         binary_handling_mode: str = "base64", hstore_handling_mode: str = "map",
         control_schema: str | None = None,
+        service_context=None,
     ):
         self.con = con
         self.pipeline = pipeline
@@ -140,6 +141,9 @@ class Applier:
         self.verifier = verifier
         self.transactional_ddl = transactional_ddl
         self.control_schema = resolve_control_schema(control_schema)
+        # Service mode supplies the parent/epoch fence; batch callers leave this
+        # unset and retain the finite adapter's exact callback surface.
+        self.service_context = service_context
         #: `catalog.CatalogWatcher` or None. The only source of DROP TABLE knowledge
         #: (rubric 1.5): logical decoding does not carry DDL at all.
         self.catalog = catalog
@@ -290,11 +294,16 @@ class Applier:
         self._committer = None
         self._lock = threading.Lock()
         self._quiescence = threading.Condition(self._lock)
+        # The service supervisor may request a lease renewal while Debezium is
+        # otherwise idle.  All destination-connection users share this lock, so a
+        # renewal can never race a callback transaction or the COMMIT_ACK gate.
+        self._destination_operation_lock = threading.RLock()
         self._in_flight = 0
         self._callback_sealed = False
         self._callback_seal_reason: str | None = None
         self._callback_batches_rejected = 0
         self._callback_records_rejected = 0
+        self._drain_requested = False
         #: Raw records belonging to Flight-owned source marker transactions that
         #: crossed this callback boundary.  This is deliberately based on receipt,
         #: not on SourceMarker.writes: a shutdown marker can be written and then be
@@ -454,6 +463,7 @@ class Applier:
             "callback_batches_rejected": self._callback_batches_rejected,
             "callback_records_rejected": self._callback_records_rejected,
             "callback_quiesced": self.callback_quiesced,
+            "drain_requested": self._drain_requested,
             "source_marker_records_received": self.source_marker_records_received,
             **self.catalog_coordinator.summary(),
             **(self.catalog.summary() if self.catalog is not None else {}),
@@ -521,29 +531,40 @@ class Applier:
     # the Debezium callback
     # ------------------------------------------------------------------ #
     def handle_batch(self, records, committer) -> None:
-        with self._quiescence:
-            if self._callback_sealed:
-                self._callback_batches_rejected += 1
-                self._callback_records_rejected += len(records)
-                log.error(
-                    "rejected a Debezium callback containing %s record(s): the callback "
-                    "boundary is sealed (%s)",
-                    len(records), self._callback_seal_reason,
-                )
-                return
-            self._in_flight += 1
-        try:
-            self._handle(records, committer)
-        except BaseException as exc:
-            self.error = exc
-            raise
-        finally:
+        with self._destination_operation_lock:
             with self._quiescence:
-                self._in_flight -= 1
-                if self._last_callback_had_data:
-                    self.last_batch_at = time.monotonic()
-                if self._in_flight == 0:
-                    self._quiescence.notify_all()
+                if self._callback_sealed:
+                    self._callback_batches_rejected += 1
+                    self._callback_records_rejected += len(records)
+                    log.error(
+                        "rejected a Debezium callback containing %s record(s): the callback "
+                        "boundary is sealed (%s)",
+                        len(records), self._callback_seal_reason,
+                    )
+                    return
+                self._in_flight += 1
+            try:
+                self._handle(records, committer)
+            except BaseException as exc:
+                self.error = exc
+                raise
+            finally:
+                with self._quiescence:
+                    self._in_flight -= 1
+                    if self._last_callback_had_data:
+                        self.last_batch_at = time.monotonic()
+                    if self._in_flight == 0:
+                        self._quiescence.notify_all()
+
+    def renew_service_lease(self) -> bool:
+        """Apply one parent-authorized renewal when the callback is quiescent."""
+        if self.service_context is None or not self.service_context.renew_requested:
+            return False
+        with self._destination_operation_lock:
+            with self._quiescence:
+                if self._callback_sealed or self._in_flight:
+                    return False
+            return self.service_context.renew_once(self.lease, self.con)
 
     def _handle(self, records, committer) -> None:
         self._committer = committer
@@ -653,6 +674,20 @@ class Applier:
 
         if data_in_batch:
             maybe_crash("decode", self.data_batch_count)
+            if self.service_context is not None:
+                # This runs on the callback thread after records entered the
+                # in-memory assembler but before commit admission.  A hard child
+                # death here leaves the durable resume point untouched.
+                matrix_crash("service_callback_midstream")
+
+        if (
+            self.service_context is not None
+            and self.assembler.open_transaction_id is not None
+        ):
+            # An incomplete Postgres unit may span callbacks, but it is never a
+            # destination durability boundary.  A restart replays it from the
+            # last committed source point.
+            matrix_crash("service_pg_transaction_open")
 
         if not self.group.units:
             # A discard-only re-snapshot poll has no destination transaction. The
@@ -672,6 +707,8 @@ class Applier:
             # group's transaction, so committing now would drain a PARTIAL Postgres
             # transaction into the destination. Wait for its END.
             return
+        if self._drain_requested:
+            self.group.close_requested = True
         if self.group.close_requested or drained or self._soft_trigger_hit():
             self.commit_group(self._trigger_name(drained))
 
@@ -1186,3 +1223,13 @@ class Applier:
             if self.error is None:
                 self.error = exc
         return self.assembler.discard_open_unit()
+
+    def request_drain(self) -> None:
+        """Ask the next admitted callback to flush a complete group before seal.
+
+        The age timer and this request only set intent.  ``handle_batch`` remains the
+        sole owner of ``commit_group`` and of Debezium acknowledgements, preserving
+        the callback-thread ownership rule during a service drain.
+        """
+        self._drain_requested = True
+        self.group.close_requested = True
