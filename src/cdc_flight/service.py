@@ -529,8 +529,17 @@ class ServiceSupervisor:
         try:
             self.channel.request_drain()
             self._drain_sent = True
-        except (BrokenPipeError, OSError):
-            self.hard_stop_requested.set()
+        except (BrokenPipeError, OSError, TimeoutError) as exc:
+            # The drain transition was already recorded before the frame was
+            # attempted.  A closed worker channel is real transport information,
+            # not permission to dispatch another renewal and not by itself a
+            # failed safe stop.  The loop now waits for a bounded worker exit or
+            # fences that generation at the existing drain deadline.
+            self._drain_sent = True
+            log.warning(
+                "worker drain channel was already closed; awaiting worker exit: %s",
+                exc,
+            )
 
     # -- service loop -------------------------------------------------------
     def run(self) -> int:
@@ -568,6 +577,18 @@ class ServiceSupervisor:
                         self.generation,
                         return_code,
                     )
+                    if renew_pending is not None:
+                        # The child is the only party that could answer this
+                        # request.  Its exit is therefore a bounded generation
+                        # fence, not an unresolved renewal that cleanup might
+                        # mistake for a live control operation.
+                        channel.abandon_renewal(renew_pending)
+                        log.info(
+                            "worker exit fenced unanswered lease renewal during "
+                            "generation teardown"
+                        )
+                        renew_pending = None
+                        renew_deadline = None
                     self._finish_generation()
                     if self.stop_requested.is_set():
                         exit_code = 0 if return_code == 0 else 1
@@ -587,9 +608,56 @@ class ServiceSupervisor:
                     break
 
                 if self.stop_requested.is_set():
+                    # This transition is deliberately before all renewal work.
+                    # Once it succeeds, the control machine has no edge back to
+                    # ``renewing``; the scheduled branch below is consequently
+                    # unreachable during drain.
                     self._request_drain()
                     if drain_deadline is None:
                         drain_deadline = now + self.policy.drain_deadline_seconds
+
+                    if renew_pending is not None:
+                        result = channel.renew_result(renew_pending)
+                        if result is not None:
+                            message_type = result.get("type")
+                            if not (
+                                message_type == "renew_cancelled"
+                                or (
+                                    message_type == "renew_complete"
+                                    and result.get("ok") is True
+                                )
+                            ):
+                                log.critical(
+                                    "in-flight lease renewal failed while draining: %s",
+                                    result,
+                                )
+                                self._kill_worker(process)
+                                self._finish_generation()
+                                exit_code = 1
+                                break
+                            log.info(
+                                "in-flight lease renewal resolved as %s during drain",
+                                message_type,
+                            )
+                            renew_pending = None
+                            renew_deadline = None
+                        elif renew_deadline is not None and now >= renew_deadline:
+                            # The response bound is independent of the longer
+                            # drain bound.  Fence the generation explicitly so
+                            # this interleaving cannot fall into the generic
+                            # hard-stop/failure path.
+                            channel.abandon_renewal(renew_pending)
+                            renew_pending = None
+                            renew_deadline = None
+                            log.warning(
+                                "in-flight lease renewal was unanswered during "
+                                "drain; fencing the worker generation"
+                            )
+                            stopped = self._kill_worker(process)
+                            self._finish_generation()
+                            exit_code = 0 if stopped else 1
+                            break
+
                     if now >= drain_deadline:
                         log.error("worker did not drain before the bounded deadline")
                         self.hard_stop_requested.set()
@@ -615,12 +683,29 @@ class ServiceSupervisor:
                         self._kill_worker(process)
                         self._finish_generation()
                         break
-                elif now >= next_renewal and not channel.gate_active:
+                elif (
+                    not self.stop_requested.is_set()
+                    and channel.renewal_allowed
+                    and now >= next_renewal
+                    and not channel.gate_active
+                ):
                     try:
                         faults.matrix_crash("service_lease_renewal")
                         renew_pending = channel.request_renew()
                         renew_deadline = now + self.policy.operation_timeout_seconds
                     except BaseException as exc:
+                        if self.stop_requested.is_set() and channel.drain_requested:
+                            # A signal can arrive in the tiny interval between
+                            # the loop guard and the dispatch call.  The channel
+                            # transition is still real information, but an
+                            # intentional drain makes that lost dispatch a clean
+                            # stop rather than an ambiguous hard-stop failure.
+                            log.warning(
+                                "lease renewal dispatch was overtaken by drain; "
+                                "worker fence is the clean-stop outcome: %s",
+                                exc,
+                            )
+                            continue
                         log.critical("physical lease renewal request failed closed: %s", exc)
                         self.hard_stop_requested.set()
                         self._kill_worker(process)

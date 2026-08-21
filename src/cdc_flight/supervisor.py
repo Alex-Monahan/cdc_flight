@@ -294,18 +294,13 @@ def run_engine_bounded(
                     next_service_recheck = time.monotonic() + float(
                         getattr(service_context, "invariant_check_seconds", 30.0)
                     )
-                if service_context.renew_requested:
-                    try:
-                        handler.renew_service_lease()
-                    except BaseException as exc:
-                        handler.error = exc
-                        outcome.record("engine_error")
-                        break
                 if service_context.drain_requested:
                     # Drain intent is admitted while callbacks are still live.  The
                     # applier remains the only owner allowed to commit/ack a group;
                     # this request merely lets the next callback close a complete
-                    # group before admission is sealed below.
+                    # group before admission is sealed below.  This branch is
+                    # deliberately before renewal: once the worker-side control
+                    # machine enters drain, no queued renewal may reach lease I/O.
                     if drain_started_at is None:
                         drain_started_at = time.monotonic()
                     handler.request_drain()
@@ -322,6 +317,13 @@ def run_engine_bounded(
                         break
                     time.sleep(0.05)
                     continue
+                if service_context.renew_requested:
+                    try:
+                        handler.renew_service_lease()
+                    except BaseException as exc:
+                        handler.error = exc
+                        outcome.record("engine_error")
+                        break
                 if error_box or engine.failure is not None:
                     outcome.record("engine_error")
                     break

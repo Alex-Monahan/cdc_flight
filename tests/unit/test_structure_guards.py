@@ -16,7 +16,7 @@ import pytest
 #: detection/alerting proofs. These are collection counts, not a module-size rule.
 #: The expected values below subtract only this guard module.
 _BASELINE_SELECTED = {
-    "not motherduck and not slow": 2216,
+    "not motherduck and not slow": 2218,
     "slow and not motherduck": 237,
     "motherduck": 51,
 }

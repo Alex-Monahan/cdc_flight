@@ -21,9 +21,19 @@ import uuid
 
 from . import faults
 from .errors import LeaseLost
+from .machines import (
+    SERVICE_CONTROL,
+    SERVICE_CONTROL_ACTIVE,
+    SERVICE_CONTROL_CLOSED,
+    SERVICE_CONTROL_DRAINING,
+    SERVICE_CONTROL_DRAINING_WITH_RENEWAL,
+    SERVICE_CONTROL_RENEWING,
+)
+from .states import IllegalTransition
 
 __all__ = [
     "ParentChannel",
+    "ServiceControlState",
     "ServiceWorkerContext",
     "process_start_token",
 ]
@@ -58,6 +68,113 @@ def process_start_token(pid: int | None = None) -> str:
 
 
 DEFAULT_IPC_TIMEOUT_SECONDS = 5.0
+
+
+class ServiceControlState:
+    """Serialize the renewal/drain boundary for one worker generation.
+
+    The socket reader and the worker/supervisor loop are separate threads.  A
+    boolean drain flag cannot say whether a renewal was already authorized when
+    drain arrived, so both sides use this one guarded state owner.  The machine
+    intentionally has no ``draining -> renewing`` edge; callers that attempt it
+    receive :class:`IllegalTransition`.
+    """
+
+    def __init__(self) -> None:
+        self._state = SERVICE_CONTROL.initial
+        self._lock = threading.RLock()
+
+    @property
+    def state(self) -> str:
+        with self._lock:
+            return self._state
+
+    @property
+    def drain_started(self) -> bool:
+        return self.state in {
+            SERVICE_CONTROL_DRAINING_WITH_RENEWAL,
+            SERVICE_CONTROL_DRAINING,
+            SERVICE_CONTROL_CLOSED,
+        }
+
+    @property
+    def renewal_in_flight(self) -> bool:
+        return self.state in {
+            SERVICE_CONTROL_RENEWING,
+            SERVICE_CONTROL_DRAINING_WITH_RENEWAL,
+        }
+
+    @property
+    def renewal_allowed(self) -> bool:
+        return self.state == SERVICE_CONTROL_ACTIVE
+
+    def _to(self, state: str) -> None:
+        SERVICE_CONTROL.check(self._state, state)
+        self._state = state
+
+    def begin_renewal(self) -> None:
+        """Authorize one renewal dispatch, rejecting every drain state."""
+        with self._lock:
+            self._to(SERVICE_CONTROL_RENEWING)
+
+    def begin_drain(self) -> None:
+        """Enter drain, preserving whether a renewal was already in flight."""
+        with self._lock:
+            if self._state == SERVICE_CONTROL_ACTIVE:
+                self._to(SERVICE_CONTROL_DRAINING)
+            elif self._state == SERVICE_CONTROL_RENEWING:
+                self._to(SERVICE_CONTROL_DRAINING_WITH_RENEWAL)
+            elif self._state in {
+                SERVICE_CONTROL_DRAINING_WITH_RENEWAL,
+                SERVICE_CONTROL_DRAINING,
+            }:
+                self._to(self._state)
+            elif self._state == SERVICE_CONTROL_CLOSED:
+                raise IllegalTransition(
+                    "service_control: closed cannot begin drain"
+                )
+
+    def resolve_renewal(self) -> None:
+        """Resolve a renewal response or its bounded cancellation/fence."""
+        with self._lock:
+            if self._state == SERVICE_CONTROL_RENEWING:
+                self._to(SERVICE_CONTROL_ACTIVE)
+            elif self._state == SERVICE_CONTROL_DRAINING_WITH_RENEWAL:
+                self._to(SERVICE_CONTROL_DRAINING)
+            else:
+                raise IllegalTransition(
+                    "service_control: renewal resolved without an in-flight renewal"
+                )
+
+    def fence_unanswered_renewal(self) -> None:
+        """Record a worker fence when an in-flight response cannot arrive."""
+        with self._lock:
+            if self._state == SERVICE_CONTROL_RENEWING:
+                self._to(SERVICE_CONTROL_DRAINING_WITH_RENEWAL)
+            if self._state == SERVICE_CONTROL_DRAINING_WITH_RENEWAL:
+                self._to(SERVICE_CONTROL_DRAINING)
+            elif self._state not in {
+                SERVICE_CONTROL_ACTIVE,
+                SERVICE_CONTROL_DRAINING,
+                SERVICE_CONTROL_CLOSED,
+            }:
+                raise IllegalTransition(
+                    f"service_control: cannot fence from {self._state!r}"
+                )
+
+    def close(self) -> None:
+        """Close only after drain or an explicit unanswered-renewal fence."""
+        with self._lock:
+            if self._state in {
+                SERVICE_CONTROL_CLOSED,
+                SERVICE_CONTROL_ACTIVE,
+                SERVICE_CONTROL_DRAINING,
+            }:
+                self._to(SERVICE_CONTROL_CLOSED)
+            else:
+                raise IllegalTransition(
+                    f"service_control: cannot close with {self._state!r} renewal"
+                )
 
 
 def _send(
@@ -119,12 +236,14 @@ class ParentChannel:
         self._closed = threading.Event()
         self._parent_lost = threading.Event()
         self._drain = threading.Event()
+        self._transport_error: str | None = None
         self._gate_active = threading.Event()
         self._last_parent_heartbeat = time.monotonic()
         self._last_worker_heartbeat = time.monotonic()
         self._pending: dict[str, tuple[threading.Event, dict | None]] = {}
         self._pending_lock = threading.Lock()
         self._renew_requests: queue.SimpleQueue[str] = queue.SimpleQueue()
+        self._control = ServiceControlState()
         self._hello_event = threading.Event()
         self._start_event = threading.Event()
         self._hello: dict | None = None
@@ -142,13 +261,36 @@ class ParentChannel:
                 {"type": message_type, **payload},
                 timeout=self.io_timeout_seconds,
             )
-        except (BrokenPipeError, OSError, TimeoutError):
+        except (BrokenPipeError, OSError, TimeoutError) as exc:
             # A failed frame is a write barrier.  The caller may decide whether
             # to restart or release the lease, but this channel must never be
             # treated as writable after its overall deadline expired.
-            self._parent_lost.set()
-            self._drain.set()
+            self._mark_transport_lost(exc)
             raise
+
+    def _mark_drain(self) -> None:
+        """Publish transport/drain loss through the control state owner."""
+        self._drain.set()
+        if self._control.state != SERVICE_CONTROL_CLOSED:
+            try:
+                self._control.begin_drain()
+            except IllegalTransition:
+                # A reader/heartbeat can observe the peer close concurrently
+                # with the supervisor's final channel.close().  The closed
+                # state is already the terminal fence; do not turn that cleanup
+                # race into a daemon-thread exception.
+                if self._control.state != SERVICE_CONTROL_CLOSED:
+                    raise
+
+    def _mark_transport_lost(self, exc: BaseException | None = None) -> None:
+        if exc is not None:
+            self._transport_error = f"{type(exc).__name__}: {exc}"
+        self._parent_lost.set()
+        self._mark_drain()
+
+    @property
+    def transport_error(self) -> str | None:
+        return self._transport_error
 
     @property
     def parent_lost(self) -> bool:
@@ -163,6 +305,18 @@ class ParentChannel:
         return self._gate_active.is_set()
 
     @property
+    def control_state(self) -> str:
+        return self._control.state
+
+    @property
+    def renewal_allowed(self) -> bool:
+        return self._control.renewal_allowed
+
+    @property
+    def renewal_in_flight(self) -> bool:
+        return self._control.renewal_in_flight
+
+    @property
     def last_parent_heartbeat(self) -> float:
         return self._last_parent_heartbeat
 
@@ -171,6 +325,9 @@ class ParentChannel:
         return self._last_worker_heartbeat
 
     def close(self) -> None:
+        if self._control.renewal_in_flight:
+            self._control.fence_unanswered_renewal()
+        self._control.close()
         self._stop.set()
         self._closed.set()
         with contextlib.suppress(OSError):
@@ -218,14 +375,12 @@ class ParentChannel:
             )
             while not self._stop.wait(self.heartbeat_seconds):
                 if time.monotonic() - self._last_parent_heartbeat > loss_seconds:
-                    self._parent_lost.set()
-                    self._drain.set()
+                    self._mark_transport_lost()
                     return
                 faults.matrix_crash("service_heartbeat_write")
                 self.send("worker_heartbeat", pid=os.getpid(), at=time.time())
         except (BrokenPipeError, OSError, TimeoutError):
-            self._parent_lost.set()
-            self._drain.set()
+            self._mark_transport_lost()
 
     def _worker_reader(self) -> None:
         buffer = bytearray()
@@ -234,8 +389,7 @@ class ParentChannel:
             try:
                 ready, _, _ = select.select([self.sock], [], [], 0.25)
             except (OSError, ValueError):
-                self._parent_lost.set()
-                self._drain.set()
+                self._mark_transport_lost()
                 return
             if not ready:
                 if (
@@ -243,8 +397,7 @@ class ParentChannel:
                     and frame_started_at is not None
                     and time.monotonic() - frame_started_at >= self.io_timeout_seconds
                 ):
-                    self._parent_lost.set()
-                    self._drain.set()
+                    self._mark_transport_lost()
                     return
                 continue
             try:
@@ -252,12 +405,10 @@ class ParentChannel:
             except BlockingIOError:
                 continue
             except OSError:
-                self._parent_lost.set()
-                self._drain.set()
+                self._mark_transport_lost()
                 return
             if not chunk:
-                self._parent_lost.set()
-                self._drain.set()
+                self._mark_transport_lost()
                 return
             if not buffer:
                 frame_started_at = time.monotonic()
@@ -268,8 +419,7 @@ class ParentChannel:
                 try:
                     message = json.loads(raw.decode())
                 except (UnicodeDecodeError, json.JSONDecodeError):
-                    self._parent_lost.set()
-                    self._drain.set()
+                    self._mark_transport_lost()
                     return
                 self._handle_worker_message(message)
                 frame_started_at = time.monotonic() if buffer else None
@@ -280,7 +430,7 @@ class ParentChannel:
             self._last_parent_heartbeat = time.monotonic()
             return
         if message_type == "drain":
-            self._drain.set()
+            self._mark_drain()
             return
         if message_type == "start":
             self._start_event.set()
@@ -329,6 +479,10 @@ class ParentChannel:
         return self._renew_requests.qsize() > 0
 
     def request_renew(self) -> str:
+        # This is the parent-side dispatch gate.  It is intentionally a machine
+        # transition rather than ``if not drain_requested``: a drain->renew call
+        # is an illegal protocol edge and must fail loudly.
+        self._control.begin_renewal()
         request_id = uuid.uuid4().hex
         done = threading.Event()
         with self._pending_lock:
@@ -338,6 +492,8 @@ class ParentChannel:
         except BaseException:
             with self._pending_lock:
                 self._pending.pop(request_id, None)
+            if self._control.renewal_in_flight:
+                self._control.fence_unanswered_renewal()
             raise
         return request_id
 
@@ -347,7 +503,16 @@ class ParentChannel:
             if pending is None or not pending[0].is_set():
                 return None
             self._pending.pop(request_id, None)
-            return pending[1]
+            result = pending[1]
+        self._control.resolve_renewal()
+        return result
+
+    def abandon_renewal(self, request_id: str | None = None) -> None:
+        """Resolve an unanswered renewal after its operation bound expires."""
+        if request_id is not None:
+            with self._pending_lock:
+                self._pending.pop(request_id, None)
+        self._control.fence_unanswered_renewal()
 
     def after_commit_ack(self) -> None:
         self._gate_active.clear()
@@ -375,8 +540,8 @@ class ParentChannel:
             try:
                 faults.matrix_crash("service_heartbeat_write")
                 self.send("parent_heartbeat", pid=os.getpid(), at=time.time())
-            except (BrokenPipeError, OSError, TimeoutError):
-                self._parent_lost.set()
+            except (BrokenPipeError, OSError, TimeoutError) as exc:
+                self._mark_transport_lost(exc)
                 return
 
     def _supervisor_reader(self) -> None:
@@ -385,7 +550,8 @@ class ParentChannel:
         while not self._stop.is_set():
             try:
                 ready, _, _ = select.select([self.sock], [], [], 0.25)
-            except (OSError, ValueError):
+            except (OSError, ValueError) as exc:
+                self._mark_transport_lost(exc)
                 return
             if not ready:
                 if (
@@ -400,9 +566,11 @@ class ParentChannel:
                 chunk = self.sock.recv(65536)
             except BlockingIOError:
                 continue
-            except OSError:
+            except OSError as exc:
+                self._mark_transport_lost(exc)
                 return
             if not chunk:
+                self._mark_transport_lost()
                 return
             if not buffer:
                 frame_started_at = time.monotonic()
@@ -412,8 +580,9 @@ class ParentChannel:
                 buffer = bytearray(remainder)
                 try:
                     message = json.loads(raw.decode())
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    continue
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    self._mark_transport_lost(exc)
+                    return
                 self._handle_supervisor_message(message)
                 frame_started_at = time.monotonic() if buffer else None
 
@@ -439,7 +608,7 @@ class ParentChannel:
         if message_type == "commit_complete":
             self._gate_active.clear()
             return
-        if message_type in {"renew_complete", "renew_failed"}:
+        if message_type in {"renew_complete", "renew_failed", "renew_cancelled"}:
             request_id = str(message.get("request_id", ""))
             with self._pending_lock:
                 pending = self._pending.get(request_id)
@@ -457,6 +626,11 @@ class ParentChannel:
         return self.hello or {}
 
     def request_drain(self) -> None:
+        # Enter the declared drain state before the frame is dispatched.  A
+        # concurrent/scheduled renewal therefore sees the rejected edge even if
+        # the worker has not processed this frame yet.
+        self._control.begin_drain()
+        self._drain.set()
         self.send("drain")
 
     def allow_start(self) -> None:
@@ -589,19 +763,69 @@ class ServiceWorkerContext:
         if request_id is None:
             return False
         try:
+            # The worker loop checks drain first, but the reader thread can queue
+            # a renewal just before it publishes the drain frame.  The same state
+            # machine therefore guards the worker-side dispatch too.  A queued
+            # stale request is answered as a cancellation and never reaches lease
+            # I/O.
+            self.channel._control.begin_renewal()
+        except IllegalTransition:
+            if not self.channel.drain_requested:
+                raise
+            try:
+                self.channel.send(
+                    "renew_cancelled",
+                    request_id=request_id,
+                    ok=False,
+                    reason="drain_started_before_renewal_dispatch",
+                )
+            except (BrokenPipeError, OSError, TimeoutError) as transport:
+                # ``send`` has already published channel loss and drain.  Keep
+                # the transport error as an explicit outcome even when its peer
+                # can no longer receive the cancellation frame.
+                self.channel._mark_transport_lost(transport)
+            return True
+        try:
             # A renewal request can be queued just before the socket observes
             # parent EOF.  The worker must not turn that stale request into a
             # lease write after the parent-loss barrier is already set.
             self.assert_writable()
             lease.renew_control(con)
         except BaseException as exc:
-            with contextlib.suppress(BrokenPipeError, OSError):
+            if self.channel.drain_requested and isinstance(
+                exc, (BrokenPipeError, OSError, TimeoutError)
+            ):
+                try:
+                    self.channel.send(
+                        "renew_cancelled",
+                        request_id=request_id,
+                        ok=False,
+                        reason=f"drain_in_flight_transport:{type(exc).__name__}",
+                    )
+                except (BrokenPipeError, OSError, TimeoutError) as transport:
+                    self.channel._mark_transport_lost(transport)
+                self.channel._control.resolve_renewal()
+                return True
+            try:
                 self.channel.send(
                     "renew_failed", request_id=request_id, error=f"{type(exc).__name__}: {exc}"
                 )
+            except (BrokenPipeError, OSError, TimeoutError) as transport:
+                self.channel._mark_transport_lost(transport)
+            self.channel._control.resolve_renewal()
             raise
-        with contextlib.suppress(BrokenPipeError, OSError):
+        try:
             self.channel.send("renew_complete", request_id=request_id, ok=True)
+        except (BrokenPipeError, OSError, TimeoutError) as transport:
+            # The peer has already closed its side while this authorized renewal
+            # was finishing.  The channel's transport-loss state is the real
+            # information; drain makes the resulting worker exit intentional.
+            self.channel._mark_transport_lost(transport)
+            self.channel._control.resolve_renewal()
+            if not self.channel.drain_requested:
+                raise
+            return True
+        self.channel._control.resolve_renewal()
         return True
 
     def close(self) -> None:

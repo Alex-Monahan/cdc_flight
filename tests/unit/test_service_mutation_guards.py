@@ -28,7 +28,12 @@ from cdc_flight.errors import LeaseLost
 from cdc_flight.occurrence import OccurrenceKey, RunState
 from cdc_flight.run_state import COMMIT_ACK
 from cdc_flight.service import ServiceSupervisor, _bounded_call
-from cdc_flight.service_protocol import ParentChannel, ServiceWorkerContext
+from cdc_flight.service_protocol import (
+    ParentChannel,
+    ServiceControlState,
+    ServiceWorkerContext,
+)
+from cdc_flight.states import IllegalTransition
 
 _STALE_LEASE_CHILD = r'''
 import os
@@ -429,6 +434,68 @@ def test_commit_ack_window_has_no_lease_or_telemetry_path_and_mutation_fails():
 
     with pytest.raises(AssertionError):
         invariant_checker()
+
+
+def _assert_drain_rejects_renewal(channel: ParentChannel) -> None:
+    try:
+        channel.request_renew()
+    except IllegalTransition as exc:
+        assert "service_control" in str(exc)
+        return
+    raise AssertionError("service_control allowed a drain -> renew transition")
+
+
+def test_service_drain_renewal_boundary_is_declared_and_mutation_sensitive():
+    """Drain owns the control plane; a queued worker renewal is fenced explicitly."""
+    supervisor_sock, peer_sock = socket.socketpair()
+    channel = ParentChannel(supervisor_sock, io_timeout_seconds=0.2)
+    try:
+        request_id = channel.request_renew()
+        assert channel.control_state == "renewing"
+        channel.request_drain()
+        assert channel.control_state == "draining_with_renewal"
+        channel.abandon_renewal(request_id)
+        assert channel.control_state == "draining"
+
+        _assert_drain_rejects_renewal(channel)
+
+        # A mutant that removes the state-machine call in request_renew must make
+        # this same invariant checker fail; the proof is not merely a happy-path
+        # assertion about the current implementation.
+        original = ServiceControlState.begin_renewal
+        try:
+            ServiceControlState.begin_renewal = lambda self: None
+            with pytest.raises(AssertionError):
+                _assert_drain_rejects_renewal(channel)
+        finally:
+            ServiceControlState.begin_renewal = original
+    finally:
+        channel.close()
+        peer_sock.close()
+
+
+def test_worker_cancels_queued_renewal_after_drain_without_lease_io():
+    supervisor_sock, worker_sock = socket.socketpair()
+    channel = ParentChannel(worker_sock, io_timeout_seconds=0.2)
+    context = object.__new__(ServiceWorkerContext)
+    context.channel = channel
+
+    class LeaseProbe:
+        called = False
+
+        def renew_control(self, _con):
+            self.called = True
+
+    lease = LeaseProbe()
+    try:
+        channel._renew_requests.put("queued-before-drain")
+        channel._handle_worker_message({"type": "drain"})
+        assert context.renew_once(lease, None) is True
+        assert lease.called is False
+        assert channel.control_state == "draining"
+    finally:
+        channel.close()
+        supervisor_sock.close()
 
 
 def test_service_generation_is_the_run_identity_for_occurrences():
