@@ -718,6 +718,9 @@ class ServiceConfig:
     operation_timeout_seconds: float = field(
         default_factory=lambda: float(_env("CDC_SERVICE_OPERATION_TIMEOUT_SECONDS", "60"))
     )
+    invariant_check_seconds: float = field(
+        default_factory=lambda: float(_env("CDC_SERVICE_INVARIANT_CHECK_SECONDS", "30"))
+    )
     max_worker_restarts: int = field(
         default_factory=lambda: int(_env("CDC_SERVICE_MAX_WORKER_RESTARTS", "5"))
     )
@@ -732,6 +735,7 @@ class ServiceConfig:
             ("worker_heartbeat_timeout", self.worker_heartbeat_timeout),
             ("drain_deadline_seconds", self.drain_deadline_seconds),
             ("operation_timeout_seconds", self.operation_timeout_seconds),
+            ("invariant_check_seconds", self.invariant_check_seconds),
         )
         for name, value in values:
             if not math.isfinite(value) or value <= 0:

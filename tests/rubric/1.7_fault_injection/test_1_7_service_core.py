@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 import signal
 import time
@@ -9,6 +10,57 @@ import time
 import duckdb
 import pytest
 from support.fixtures import Sandbox
+from support.motherduck_probe import connect as motherduck_connect
+
+from cdc_flight import faults
+from cdc_flight.discovery_coordinator import LiveDiscoveryCoordinator
+
+# Plan §4.4 is an inventory, not a claim that one generic crash anchor covers every
+# lifetime edge.  Keep the mapping explicit so a newly reachable service cut cannot
+# disappear into the batch-only matrix.
+SERVICE_CUT_COVERAGE = {
+    "worker authenticated startup": ("service_worker_startup",),
+    "callback before complete unit": ("service_callback_midstream",),
+    "complete unit staged before destination commit": ("service_before_md_commit",),
+    "destination commit before acknowledgement": (
+        "service_after_md_commit_before_ack",
+    ),
+    "one acknowledgement before batch finish": ("service_after_one_ack_before_finish",),
+    "open PostgreSQL transaction across callbacks": ("service_pg_transaction_open",),
+    "incremental backfill transaction edges": (
+        "incremental_chunk_before_shadow_write",
+        "incremental_chunk_after_shadow_write_before_progress",
+        "incremental_chunk_after_progress_before_md_commit",
+        "after_md_commit_before_markProcessed",
+        "after_markProcessed_before_markBatchFinished",
+        "after_ack_before_next_poll",
+    ),
+    "physical lease acquire/renew/release": (
+        "service_lease_acquire",
+        "service_lease_renewal",
+        "service_lease_release",
+    ),
+    "heartbeat/run-log/source-health writes": (
+        "service_heartbeat_write",
+        "service_run_log_write",
+        "service_source_health_write",
+    ),
+}
+
+UNREACHABLE_SERVICE_CUTS = {
+    "scheduler request": (
+        "no service scheduler thread issues a second source signal; incremental "
+        "requests are the existing callback-owned stock path"
+    ),
+    "full-refresh handoff": (
+        "LiveDiscoveryCoordinator requires service_context is None for a live "
+        "handoff; service mode has only startup full-refresh consumption"
+    ),
+    "completion/watermark/shutdown terminal markers": (
+        "these are finite batch/drain markers, not reachable mid-stream service cuts; "
+        "the shared batch matrix retains them"
+    ),
+}
 
 
 def _wait_for_worker(box: Sandbox, process, *, timeout: float = 45.0) -> int:
@@ -79,6 +131,290 @@ def test_service_real_process_drains_and_releases_one_epoch(
             "WHERE name = ?",
             ["service-core-row"],
         ) == 1
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=30)
+        box.cleanup()
+        box.reseed()
+
+
+@pytest.mark.slow
+def test_service_destination_write_hang_is_bounded_before_commit_ack(
+    tmp_path_factory, postgres_cluster
+):
+    """A real worker blocked in pre-COMMIT destination I/O is hard-fenced."""
+    box = Sandbox(
+        "service_core_destination_hang",
+        tmp_path_factory.mktemp("sbx_service_core_destination_hang"),
+        postgres_cluster,
+    )
+    process = None
+    try:
+        box.reseed()
+        box.run(reset_state=True, max_seconds=150, timeout=240)
+        process = box.spawn_service(
+            matrix_arm=True,
+            capture=True,
+            extra_env={
+                "CDC_SERVICE_ID": "service-core-destination-hang",
+                "CDC_SERVICE_LEASE_TTL": "12",
+                "CDC_SERVICE_LEASE_RENEW_SECONDS": "2",
+                "CDC_SERVICE_PARENT_HEARTBEAT_SECONDS": "0.25",
+                "CDC_SERVICE_PARENT_LOSS_SECONDS": "3",
+                "CDC_SERVICE_MAX_WORKER_RESTARTS": "0",
+                "CDC_SERVICE_OPERATION_TIMEOUT_SECONDS": "5",
+                "CDC_FAULT_INJECT": "destination_hang:1",
+                "CDC_FAULT_HANG_PHASE": "pre_commit",
+                "CDC_FAULT_HANG_SECONDS": "600",
+                "CDC_COMMIT_TIMEOUT": "2",
+            },
+        )
+        box.wait_for_slot_active(process=process, timeout=45)
+        box.sql(
+            "INSERT INTO app.customers (name, email) VALUES "
+            "('service-destination-hang', 'service-destination-hang@example.com')"
+        )
+        fired_at = None
+        deadline = time.monotonic() + 20
+        while process.poll() is None and time.monotonic() < deadline:
+            fired = box.fired_fault()
+            if fired and fired["point"] == "destination_hang":
+                fired_at = time.monotonic()
+                break
+            time.sleep(0.05)
+        assert fired_at is not None, box.fired_fault()
+        returncode = process.wait(timeout=20)
+        assert returncode != 0
+        assert time.monotonic() - fired_at < 8, (
+            "the pre-COMMIT destination hang outlived its 2-second service bound"
+        )
+        fired = box.fired_fault()
+        assert fired and fired["action"].startswith("hang:600.0:pre_commit"), fired
+        assert box.duck_query(
+            "SELECT state, service_id, worker_pid FROM _cdc_flight.lease"
+        ) == [("released", "service-core-destination-hang", None)]
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=30)
+        if process is not None:
+            process.communicate(timeout=5)
+        box.cleanup()
+        box.reseed()
+
+
+@pytest.mark.slow
+def test_service_rechecks_and_fails_closed_after_mid_life_slot_drop(
+    tmp_path_factory, postgres_cluster
+):
+    """Dropping the live source slot is detected after startup, not on next run."""
+    box = Sandbox(
+        "service_core_slot_drop",
+        tmp_path_factory.mktemp("sbx_service_core_slot_drop"),
+        postgres_cluster,
+    )
+    process = None
+    try:
+        box.reseed()
+        box.run(reset_state=True, max_seconds=150, timeout=240)
+        process = box.spawn_service(
+            capture=True,
+            extra_env={
+                "CDC_SERVICE_ID": "service-core-slot-drop",
+                "CDC_SERVICE_LEASE_TTL": "12",
+                "CDC_SERVICE_LEASE_RENEW_SECONDS": "2",
+                "CDC_SERVICE_PARENT_HEARTBEAT_SECONDS": "0.25",
+                "CDC_SERVICE_PARENT_LOSS_SECONDS": "3",
+                "CDC_SERVICE_MAX_WORKER_RESTARTS": "0",
+                "CDC_SERVICE_INVARIANT_CHECK_SECONDS": "0.5",
+            },
+        )
+        box.wait_for_slot_active(process=process, timeout=45)
+        box.sql(
+            "INSERT INTO app.customers (name, email) VALUES "
+            "('service-slot-drop', 'service-slot-drop@example.com')"
+        )
+        box.kill_walsender()
+        drop_deadline = time.monotonic() + 15
+        while True:
+            try:
+                box.pg_query(
+                    "SELECT pg_drop_replication_slot(%s)",
+                    (box.slot,),
+                )
+                break
+            except Exception:
+                if time.monotonic() >= drop_deadline:
+                    raise
+                box.kill_walsender()
+                time.sleep(0.1)
+        returncode = process.wait(timeout=30)
+        output = ""
+        if process.stdout is not None:
+            output = process.stdout.read() or ""
+        if process.stderr is not None:
+            output += process.stderr.read() or ""
+        assert returncode != 0, output
+        assert "disappeared during streaming" in output.lower(), output[-5000:]
+        assert box.duck_query(
+            "SELECT state, service_id, worker_pid FROM _cdc_flight.lease"
+        ) == [("released", "service-core-slot-drop", None)]
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=30)
+        if process is not None:
+            process.communicate(timeout=5)
+        box.cleanup()
+        box.reseed()
+
+
+@pytest.mark.slow
+def test_service_one_worker_long_life_keeps_one_generation_and_exact_waves(
+    tmp_path_factory, postgres_cluster
+):
+    """Several separated commits run through one live worker generation."""
+    box = Sandbox(
+        "service_core_long_life",
+        tmp_path_factory.mktemp("sbx_service_core_long_life"),
+        postgres_cluster,
+    )
+    process = None
+    pipeline = box.env["CDC_PIPELINE_NAME"]
+    try:
+        box.reseed()
+        box.run(reset_state=True, max_seconds=150, timeout=240)
+        process = box.spawn_service(
+            extra_env={
+                "CDC_SERVICE_ID": "service-core-long-life",
+                "CDC_SERVICE_LEASE_TTL": "30",
+                "CDC_SERVICE_LEASE_RENEW_SECONDS": "5",
+                "CDC_SERVICE_PARENT_HEARTBEAT_SECONDS": "0.25",
+                "CDC_SERVICE_PARENT_LOSS_SECONDS": "3",
+                "CDC_SERVICE_MAX_WORKER_RESTARTS": "0",
+                "CDC_SERVICE_INVARIANT_CHECK_SECONDS": "1",
+                "CDC_COMMIT_MAX_AGE": "0.25",
+                "CDC_COMMIT_MAX_EVENTS": "1",
+            }
+        )
+        box.wait_for_slot_active(process=process, timeout=45)
+        time.sleep(1.0)
+        for wave in range(5):
+            box.sql(
+                "INSERT INTO app.customers (name, email) VALUES "
+                f"('service-long-life-{wave}', "
+                f"'service-long-life-{wave}@example.com')"
+            )
+            # Separate source transactions and a gap longer than the service age
+            # trigger force observable commit groups rather than one callback batch.
+            time.sleep(1.1)
+        time.sleep(2.0)
+        assert _stop(process) == 0
+        process = None
+
+        runners = box.duck_query(
+            "SELECT DISTINCT runner_id FROM _cdc_flight.commit_log "
+            "WHERE pipeline = ? AND runner_id LIKE ?",
+            [pipeline, "service-core-long-life:%"],
+        )
+        assert len(runners) == 1, runners
+        service_commits = box.scalar(
+            "SELECT count(*) FROM _cdc_flight.commit_log "
+            "WHERE pipeline = ? AND runner_id = ? AND event_count > 0",
+            [pipeline, runners[0][0]],
+        )
+        assert service_commits >= 5, service_commits
+        assert box.scalar(
+            f"SELECT count(*) FROM {box.table('cdcflight_app_customers')} "
+            "WHERE name LIKE 'service-long-life-%'"
+        ) == 5
+        assert box.duck_query(
+            "SELECT state, service_id, worker_pid FROM _cdc_flight.lease"
+        ) == [("released", "service-core-long-life", None)]
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=30)
+        box.cleanup()
+        box.reseed()
+
+
+@pytest.mark.slow
+@pytest.mark.motherduck
+def test_service_cli_runs_against_real_motherduck_destination(
+    tmp_path_factory, postgres_cluster, motherduck_case
+):
+    """The supervisor's CLI destination reaches the worker's real MD connection."""
+    case = motherduck_case
+    box = Sandbox(
+        "service_core_motherduck",
+        tmp_path_factory.mktemp("sbx_service_core_motherduck"),
+        postgres_cluster,
+    )
+    process = None
+    environment = {
+        "CDC_MD_DATABASE": case["database"],
+        "CDC_DATASET": case["dataset"],
+        "CDC_CONTROL_SCHEMA": case["control_schema"],
+        "MOTHERDUCK_TOKEN": case["token"],
+        "motherduck_token": case["token"],
+        "CDC_SERVICE_ID": "service-core-motherduck",
+        # MotherDuck's first worker/JVM snapshot is a real remote operation; keep
+        # the documented 60-second lease margin rather than making bootstrap itself
+        # race a deliberately tiny local-test TTL.
+        "CDC_SERVICE_LEASE_TTL": "60",
+        "CDC_SERVICE_LEASE_RENEW_SECONDS": "10",
+        "CDC_SERVICE_PARENT_HEARTBEAT_SECONDS": "0.25",
+        "CDC_SERVICE_PARENT_LOSS_SECONDS": "3",
+        "CDC_SERVICE_OPERATION_TIMEOUT_SECONDS": "30",
+    }
+    try:
+        box.reseed()
+        baseline = box.run(
+            reset_state=True,
+            destination="motherduck",
+            extra_env=environment,
+            max_seconds=180,
+            timeout=300,
+        )
+        assert baseline["ok"] is True, baseline
+        process = box.spawn_service(
+            destination="motherduck",
+            extra_env=environment,
+            capture=True,
+        )
+        try:
+            box.wait_for_slot_active(process=process, timeout=60)
+        except AssertionError as exc:
+            output = ""
+            if process.stdout is not None:
+                output += process.stdout.read() or ""
+            if process.stderr is not None:
+                output += process.stderr.read() or ""
+            raise AssertionError(f"{exc}\n--- service output ---\n{output[-12000:]}") from exc
+        box.sql(
+            "INSERT INTO app.customers (name, email) VALUES "
+            "('service-motherduck-row', 'service-motherduck@example.com')"
+        )
+        time.sleep(6)
+        assert _stop(process) == 0
+        process = None
+
+        con = motherduck_connect(case["token"], case["database"])
+        try:
+            count = con.execute(
+                f'SELECT count(*) FROM "{case["dataset"]}"."cdcflight_app_customers" '
+                "WHERE name = ?",
+                ["service-motherduck-row"],
+            ).fetchone()[0]
+            assert count == 1
+            lease = con.execute(
+                f'SELECT state, service_id FROM "{case["control_schema"]}"."lease"'
+            ).fetchall()
+            assert lease == [("released", "service-core-motherduck")], lease
+        finally:
+            con.close()
     finally:
         if process is not None and process.poll() is None:
             process.kill()
@@ -234,6 +570,29 @@ SERVICE_CUTS = (
     "service_source_health_write",
 )
 
+
+def test_plan_4_4_service_cut_inventory_names_every_gap():
+    covered = {
+        point
+        for points in SERVICE_CUT_COVERAGE.values()
+        for point in points
+    }
+    assert set(faults.SERVICE_MATRIX_POINTS) <= set(SERVICE_CUTS)
+    assert covered <= set(SERVICE_CUTS) | set(faults.BACKFILL_POINTS)
+    assert "service_worker_startup" in set(SERVICE_CUTS)
+    assert set(UNREACHABLE_SERVICE_CUTS) == {
+        "scheduler request",
+        "full-refresh handoff",
+        "completion/watermark/shutdown terminal markers",
+    }
+
+    coordinator_source = inspect.getsource(LiveDiscoveryCoordinator.run)
+    assert "self.service_context is None" in coordinator_source
+    assert "discovery_handoff_enabled" in coordinator_source
+    # The explicit exclusions are part of the evidence: they prevent a future
+    # reviewer from treating an unimplemented service handoff as a green cell.
+    assert all(UNREACHABLE_SERVICE_CUTS.values())
+
 SIGKILL_SERVICE_CUTS = (
     "service_worker_startup",
     "service_callback_midstream",
@@ -322,6 +681,18 @@ def _wait_for_pid_exit(pid: int | None, *, timeout: float = 45.0) -> None:
 def _run_one_service_cut(box: Sandbox, cut: str) -> dict:
     box.reseed()
     box.run(reset_state=True, max_seconds=150, timeout=240)
+    pipeline = box.env["CDC_PIPELINE_NAME"]
+    baseline_commit_count = box.scalar(
+        "SELECT count(*) FROM _cdc_flight.commit_log WHERE pipeline = ?",
+        [pipeline],
+    )
+    baseline_resume = box.duck_query(
+        "SELECT last_lsn FROM _cdc_flight.debezium_offsets "
+        "WHERE pipeline = ? AND namespace = ?",
+        [pipeline, "cdc-flight-engine"],
+    )
+    assert baseline_resume, "service matrix baseline has no durable resume point"
+    baseline_lsn = int(baseline_resume[0][0])
     tag = f"service-cut-row-{cut}"
     if cut in {*INHERITED_SERVICE_CUTS, "service_callback_midstream"}:
         # The matrix arm is in the worker callback, not in this parent process.
@@ -398,6 +769,40 @@ def _run_one_service_cut(box: Sandbox, cut: str) -> dict:
             "FROM _cdc_flight.lease"
         )
         _wait_for_pid_exit(lease_before_recovery[0][2])
+        # This is intentionally before `box.run()` below.  Recovery is allowed to
+        # repair a missing state row, but it must not be the reason this test claims
+        # data/state atomicity.  The post-MD-commit cut must expose both facts from
+        # the crashed worker's own durable transaction while no recovery worker owns
+        # the destination.
+        pre_recovery_row_count = (
+            box.scalar(
+                'SELECT count(*) FROM "cdc_raw"."cdcflight_app_customers" '
+                "WHERE name = ?",
+                [tag],
+            )
+            if cut != "service_pg_transaction_open"
+            else box.scalar(
+                'SELECT count(*) FROM "cdc_raw"."cdcflight_app_customers" '
+                "WHERE name LIKE \'service-open-%\'"
+            )
+        )
+        pre_recovery_commit_count = box.scalar(
+            "SELECT count(*) FROM _cdc_flight.commit_log WHERE pipeline = ?",
+            [pipeline],
+        )
+        pre_recovery_resume = box.duck_query(
+            "SELECT last_lsn FROM _cdc_flight.debezium_offsets "
+            "WHERE pipeline = ? AND namespace = ?",
+            [pipeline, "cdc-flight-engine"],
+        )
+        pre_recovery = {
+            "row_count": pre_recovery_row_count,
+            "new_commit_count": pre_recovery_commit_count - baseline_commit_count,
+            "baseline_lsn": baseline_lsn,
+            "resume_last_lsn": (
+                int(pre_recovery_resume[0][0]) if pre_recovery_resume else None
+            ),
+        }
         recovery = box.run(
             max_seconds=180,
             timeout=260,
@@ -422,6 +827,7 @@ def _run_one_service_cut(box: Sandbox, cut: str) -> dict:
             "row_count": row_count,
             "lease": lease_before_recovery,
             "lease_after_recovery": lease_after_recovery,
+            "pre_recovery": pre_recovery,
         }
     finally:
         if process.poll() is None:
@@ -484,6 +890,16 @@ def test_every_service_cut_is_a_real_child_death_with_durable_recovery(
         "service_after_one_ack_before_finish",
     }:
         assert result["row_count"] == 1, result
+
+
+def test_service_data_and_state_are_observed_atomic_before_recovery(service_crash_matrix):
+    """The post-commit cut exposes data and its state before repair can mask a mutant."""
+    result = service_crash_matrix["service_after_md_commit_before_ack"]
+    pre = result["pre_recovery"]
+    assert pre["row_count"] == 1, pre
+    assert pre["new_commit_count"] == 1, pre
+    assert pre["resume_last_lsn"] is not None
+    assert pre["resume_last_lsn"] > pre["baseline_lsn"], pre
 
 
 @pytest.mark.slow

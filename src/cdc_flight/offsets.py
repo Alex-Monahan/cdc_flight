@@ -36,7 +36,7 @@ from .assembler import CompleteUnit
 from .destination import ResumePoint, raise_alert, read_offset_blobs
 from .envelope import PendingRecord
 from .envelope import offsets_of as envelope_offsets
-from .errors import ReconciliationRefused, ResumePointDrift
+from .errors import OffsetUnusable, ReconciliationRefused, ResumePointDrift
 from .machines import RECONCILE_DECISIONS
 
 log = logging.getLogger("cdc_flight.offsets")
@@ -358,6 +358,79 @@ def _offset_map_difference(
         ]
         return "; ".join(deltas)
     return None
+
+
+def _offset_map_is_behind(actual: dict[str, Any], durable: dict[str, Any]) -> bool:
+    """Return whether a valid file is an older Debezium point, not an alien one."""
+    actual_lsn = lsn_of(actual)
+    durable_lsn = lsn_of(durable)
+    if actual_lsn is None or durable_lsn is None or actual_lsn >= durable_lsn:
+        return False
+    # A file flush can legitimately trail the destination transaction for a short
+    # interval after markBatchFinished().  Once the primary LSN is behind, fields
+    # belonging to the previous source transaction may also be absent/present in
+    # different combinations; the destination remains the authority and the next
+    # reconciliation can rebuild the file.  Any file ahead of the durable LSN is
+    # never accepted by this helper.
+    return all(
+        not isinstance(value, int)
+        or not isinstance(durable.get(key), int)
+        or value <= durable[key]
+        for key, value in actual.items()
+        if key in durable
+    )
+
+
+def verify_service_offset(
+    con,
+    *,
+    pipeline: str,
+    namespace: str,
+    offset_path: Path,
+    control_schema: str | None = None,
+) -> dict[str, object]:
+    """Fail closed when a live service loses its usable Debezium offset.
+
+    Startup reconciliation may repair a missing file.  During service life a
+    missing, corrupt, foreign, or ahead file is a mid-stream invariant failure:
+    silently allowing the engine to continue would turn a lost resume point into
+    an unbounded replay/skip decision.  This read-only check is called while the
+    applier's destination-operation lock is held and never enters COMMIT_ACK.
+    """
+    from .destination import read_resume_point
+
+    row = read_resume_point(
+        con, pipeline, namespace, control_schema=control_schema
+    )
+    if row is None or not row.offset:
+        return {"checked": False, "reason": "no durable typed offset yet"}
+    path = Path(offset_path)
+    if not path.exists() or path.stat().st_size <= 0:
+        raise OffsetUnusable(
+            f"service offset file {path} disappeared while durable destination "
+            f"offset {row.last_lsn} exists"
+        )
+    entries = read(path)
+    difference = _offset_map_difference(entries, namespace, row)
+    if difference is not None:
+        parsed = parse_offsets(entries)
+        if len(entries) == 1 and parsed and _offset_map_is_behind(parsed[0][1], row.offset):
+            return {
+                "checked": True,
+                "behind": True,
+                "last_lsn": row.last_lsn,
+                "entries": len(entries),
+                "reason": "offset file flush trails the durable destination point",
+            }
+        raise OffsetUnusable(
+            f"service offset file no longer matches durable destination offset "
+            f"{row.last_lsn}: {difference}"
+        )
+    return {
+        "checked": True,
+        "last_lsn": row.last_lsn,
+        "entries": len(entries),
+    }
 
 
 def _repair(con, pipeline, namespace, offset_path: Path, row: ResumePoint, repair: bool) -> bool:

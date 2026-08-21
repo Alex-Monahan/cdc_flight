@@ -14,6 +14,8 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import duckdb
@@ -25,8 +27,8 @@ from cdc_flight.destination_lease import Lease
 from cdc_flight.errors import LeaseLost
 from cdc_flight.occurrence import OccurrenceKey, RunState
 from cdc_flight.run_state import COMMIT_ACK
-from cdc_flight.service import ServiceSupervisor
-from cdc_flight.service_protocol import ServiceWorkerContext
+from cdc_flight.service import ServiceSupervisor, _bounded_call
+from cdc_flight.service_protocol import ParentChannel, ServiceWorkerContext
 
 _STALE_LEASE_CHILD = r'''
 import os
@@ -276,6 +278,119 @@ def test_parent_loss_write_barrier_is_mutation_sensitive(monkeypatch):
     finally:
         context.close()
         parent_sock.close()
+
+
+def test_service_ipc_send_has_one_overall_deadline_on_a_filled_socket():
+    """A peer that never reads cannot retain the service lease indefinitely."""
+    parent_sock, peer_sock = socket.socketpair()
+    channel = ParentChannel(parent_sock, io_timeout_seconds=0.20)
+    try:
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            channel.send("large_heartbeat", blob="x" * (8 * 1024 * 1024))
+        elapsed = time.monotonic() - started
+        assert elapsed < 1.0, elapsed
+        assert channel.parent_lost and channel.drain_requested
+    finally:
+        channel.close()
+        peer_sock.close()
+
+
+def test_service_ipc_receive_has_a_frame_deadline_when_peer_stalls():
+    """A partial frame is a failed receive, not an invitation to wait forever."""
+    parent_sock, child_sock = socket.socketpair()
+    channel = ParentChannel(child_sock, io_timeout_seconds=0.20)
+    reader = threading.Thread(target=channel._worker_reader, daemon=True)
+    try:
+        reader.start()
+        parent_sock.sendall(b'{"type":"parent_heartbeat"')
+        reader.join(timeout=2.0)
+        assert not reader.is_alive()
+        assert channel.parent_lost and channel.drain_requested
+    finally:
+        channel.close()
+        parent_sock.close()
+
+
+def test_timed_out_control_operation_is_cancelled_before_it_can_write(tmp_path):
+    """The timeout proof includes the child-side absence of a late side effect."""
+    marker = tmp_path / "late-control-write.txt"
+
+    def operation():
+        marker.write_text("started", encoding="utf-8")
+        time.sleep(0.8)
+        marker.write_text("late", encoding="utf-8")
+
+    with pytest.raises(TimeoutError) as caught:
+        _bounded_call(operation, 0.20)
+    assert getattr(caught.value, "cancelled", False) is True
+    assert getattr(caught.value, "operation_fenced", False) is True
+    time.sleep(1.0)
+    assert not marker.exists() or marker.read_text(encoding="utf-8") == "started"
+
+
+def _assert_ack_after_durability(source: str) -> None:
+    commit = source.index('self.con.execute("COMMIT")')
+    ack = source.index("self._committer.markProcessed")
+    assert commit < ack, "acknowledgement moved before destination COMMIT"
+
+
+def _assert_state_before_commit(source: str) -> None:
+    commit = source.index('self.con.execute("COMMIT")')
+    for state_write in ("destination.write_commit_log(", "destination.write_resume_point("):
+        assert source.index(state_write) < commit, (
+            f"{state_write} moved after destination COMMIT"
+        )
+
+
+def test_service_ack_ordering_guard_detects_an_inverted_ack_mutant():
+    source = inspect.getsource(commit_protocol.commit_group)
+    _assert_ack_after_durability(source)
+    mutated = source.replace(
+        '                self.con.execute("COMMIT")',
+        '                self._committer.markProcessed(object())\n'
+        '                self.con.execute("COMMIT")',
+        1,
+    )
+    with pytest.raises(AssertionError, match="acknowledgement"):
+        _assert_ack_after_durability(mutated)
+
+
+def test_service_atomicity_guard_detects_state_after_commit_mutant():
+    source = inspect.getsource(commit_protocol.commit_group)
+    _assert_state_before_commit(source)
+    mutated = source.replace(
+        "        destination.write_resume_point(",
+        '        self.con.execute("COMMIT")\n'
+        "        destination.write_resume_point(",
+        1,
+    )
+    with pytest.raises(AssertionError, match="moved after"):
+        _assert_state_before_commit(mutated)
+
+
+def test_service_destination_deadline_stops_before_commit_ack_window():
+    source = inspect.getsource(commit_protocol.commit_group)
+    stop = source.index("stop_destination_deadline()")
+    commit = source.index('self.con.execute("COMMIT")')
+    ack_gate = source.index("COMMIT_ACK.enter()")
+    assert stop < ack_gate < commit
+
+    mutated = source.replace(
+        "            stop_destination_deadline()",
+        "            pass",
+        1,
+    ).replace(
+        '                self.con.execute("COMMIT")',
+        '                stop_destination_deadline()\n'
+        '                self.con.execute("COMMIT")',
+        1,
+    )
+    moved_stop = mutated.index("stop_destination_deadline()")
+    with pytest.raises(AssertionError, match="COMMIT_ACK"):
+        assert moved_stop < mutated.index("COMMIT_ACK.enter()"), (
+            "destination deadline moved into COMMIT_ACK"
+        )
 
 
 def test_callback_renewal_serialization_is_mutation_sensitive():

@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import logging
+import multiprocessing
 import os
 import signal
 import socket
@@ -30,27 +32,172 @@ from .service_protocol import ParentChannel, process_start_token
 log = logging.getLogger("cdc_flight.service")
 
 
-def _bounded_call(operation, timeout: float):
-    """Run one control operation with a finite wait and one owning thread."""
-    done = threading.Event()
-    result: list[object] = []
-    failure: list[BaseException] = []
+class _RemoteOperationError(RuntimeError):
+    """An exception reported by a killable control-operation child."""
 
-    def invoke() -> None:
-        try:
-            result.append(operation())
-        except BaseException as exc:  # pass the real failure to the owner
-            failure.append(exc)
-        finally:
-            done.set()
+    def __init__(self, type_name: str, message: str):
+        self.type_name = type_name
+        super().__init__(message)
 
-    thread = threading.Thread(target=invoke, name="cdc-service-control-operation", daemon=True)
-    thread.start()
-    if not done.wait(timeout):
-        raise TimeoutError(f"service control operation exceeded {timeout:.1f}s")
-    if failure:
-        raise failure[0]
-    return result[0] if result else None
+
+def _callable_child(operation, sender) -> None:
+    """Execute one picklable operation and return only a serialisable outcome."""
+    try:
+        sender.send(("ok", operation()))
+    except BaseException as exc:
+        with contextlib.suppress(Exception):
+            sender.send(("error", type(exc).__name__, str(exc)))
+    finally:
+        with contextlib.suppress(Exception):
+            sender.close()
+
+
+def _bounded_call(operation, timeout: float, *, process_context: str = "fork"):
+    """Run one operation in a process that can actually be cancelled.
+
+    A daemon thread can bound the caller's wait but cannot stop a blocked database
+    call.  The old implementation therefore left a live operation behind.  The
+    service supervisor uses the ``spawn`` context and a serialisable request; the
+    default ``fork`` context keeps this small helper useful for direct local probes
+    whose callable is not importable.  On expiry the child is terminated and joined
+    before the timeout is reported, so no operation thread or process can continue
+    writing after the caller has failed closed.
+    """
+    if timeout <= 0:
+        raise ValueError("service control operation timeout must be positive")
+    try:
+        context = multiprocessing.get_context(process_context)
+    except ValueError:
+        context = multiprocessing.get_context()
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(target=_callable_child, args=(operation, sender))
+    process.daemon = True
+    process.start()
+    sender.close()
+    deadline = time.monotonic() + float(timeout)
+    outcome = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if receiver.poll(min(0.05, remaining)):
+            outcome = receiver.recv()
+            break
+        if not process.is_alive():
+            break
+    if outcome is None and process.is_alive():
+        process.terminate()
+        process.join(timeout=min(1.0, max(0.05, timeout)))
+        if process.is_alive():
+            with contextlib.suppress(Exception):
+                process.kill()
+            process.join(timeout=1.0)
+        receiver.close()
+        error = TimeoutError(f"service control operation exceeded {timeout:.1f}s")
+        # These attributes are deliberately part of the proof surface: callers
+        # can distinguish a cancelled/fenced operation from a mere wait timeout.
+        error.cancelled = True
+        error.operation_fenced = not process.is_alive()
+        raise error
+    if outcome is None:
+        with contextlib.suppress(Exception):
+            if receiver.poll(0.1):
+                outcome = receiver.recv()
+    process.join(timeout=1.0)
+    receiver.close()
+    if outcome is None:
+        raise _RemoteOperationError(
+            "ChildProcessError",
+            f"service control operation exited without a result (code={process.exitcode})",
+        )
+    if outcome[0] == "error":
+        raise _RemoteOperationError(outcome[1], outcome[2])
+    return outcome[1]
+
+
+def _control_operation(payload: dict):
+    """Open, perform, and close one bounded supervisor control operation.
+
+    The process boundary is intentional.  A DuckDB/MotherDuck connection is never
+    inherited by a worker or retained by the supervisor between operations, and a
+    timed-out connect/query/DDL/lease write is killed with its owning process.
+    """
+    con = None
+    try:
+        dest = payload["destination"]
+        con = dest_mod.connect(dest)
+        if payload.get("ensure_schema"):
+            dest_mod.ensure_control_schema(con, dest.control_schema)
+            dest_mod.ensure_dataset(con, dest.dataset_name)
+        operation = payload["operation"]
+        if operation == "acquire":
+            lease_key = dest.resolve_physical_lease_key(con)
+            lease = Lease(
+                lease_key,
+                owner_id=payload["service_id"],
+                ttl_seconds=payload["ttl_seconds"],
+                control_schema=dest.control_schema,
+                label=dest.pipeline_name,
+                lease_id=payload["lease_id"],
+                service_id=payload["service_id"],
+                worker_generation="supervisor",
+                process_start_token=payload["parent_start_token"],
+            )
+            lease.acquire(con)
+            return {"lease_key": lease_key, "epoch": lease.epoch}
+
+        lease_key = payload.get("lease_key")
+        if operation == "release_identity":
+            # Re-resolve even when the supervisor has a provisional DuckDB key:
+            # a timed-out acquire may have resolved a physical MotherDuck key
+            # before its response was fenced.
+            lease_key = dest.resolve_physical_lease_key(con)
+        lease = Lease(
+            lease_key,
+            owner_id=payload["service_id"],
+            ttl_seconds=payload["ttl_seconds"],
+            control_schema=dest.control_schema,
+            label=dest.pipeline_name,
+            lease_id=payload["lease_id"],
+            fencing_epoch=payload.get("epoch"),
+            service_id=payload["service_id"],
+            worker_generation=payload.get("generation") or "supervisor",
+            process_start_token=payload["parent_start_token"],
+        )
+        if operation == "assign_worker":
+            lease.assign_worker(
+                con,
+                pid=payload["pid"],
+                start_token=payload["start_token"],
+                generation=payload["generation"],
+            )
+        elif operation == "confirm_worker":
+            lease.confirm_worker(
+                con,
+                generation=payload["generation"],
+                start_token=payload["start_token"],
+            )
+        elif operation == "mark_worker_finished":
+            lease.mark_worker_finished(con, generation=payload["generation"])
+        elif operation == "release":
+            lease.release(con, retain=True)
+        elif operation == "release_identity":
+            # Used only after a control child timed out before it could return its
+            # acquired epoch.  The exact lease_id/owner predicate prevents this
+            # cleanup from touching a successor epoch.
+            con.execute(
+                f"UPDATE {dest_mod._control_table(dest.control_schema, 'lease')} "
+                "SET state='released', worker_pid=NULL, worker_start_token=NULL "
+                "WHERE pipeline=? AND owner_id=? AND lease_id=?",
+                [lease_key, payload["service_id"], payload["lease_id"]],
+            )
+        else:
+            raise ValueError(f"unknown service control operation {operation!r}")
+        return None
+    finally:
+        if con is not None:
+            with contextlib.suppress(Exception):
+                con.close()
 
 
 class ServiceSupervisor:
@@ -87,6 +234,8 @@ class ServiceSupervisor:
         self.restart_count = 0
         self._drain_sent = False
         self._hard_stop_failed = False
+        self._control_fenced = False
+        self._lease_id = uuid.uuid4().hex
 
     # -- signal boundary ----------------------------------------------------
     def _install_signal_handlers(self) -> None:
@@ -109,24 +258,48 @@ class ServiceSupervisor:
         self._old_handlers.clear()
 
     # -- control/lease ------------------------------------------------------
-    def _control(self, operation):
-        return _bounded_call(operation, self.policy.operation_timeout_seconds)
-
-    def _open_control(self):
-        """Open a lease connection only while the worker has no data handle."""
-        return dest_mod.connect(self.dest)
+    def _control(self, payload: dict):
+        """Run one serialised, killable control-plane operation."""
+        try:
+            return _bounded_call(
+                functools.partial(_control_operation, payload),
+                self.policy.operation_timeout_seconds,
+                process_context="spawn",
+            )
+        except _RemoteOperationError as exc:
+            if exc.type_name == "LeaseLost":
+                raise LeaseLost(str(exc)) from exc
+            raise
+        except TimeoutError:
+            # _bounded_call has terminated and joined the child.  Its database
+            # work cannot continue, but an acquire may have committed before the
+            # response was lost; the exact lease id is retained for cleanup.
+            self._control_fenced = True
+            raise
 
     def _close_control(self) -> None:
-        if self.con is not None:
-            with contextlib.suppress(Exception):
-                self.con.close()
-            self.con = None
+        # Control connections are opened and retired inside _control's child.
+        self.con = None
 
     def _open_lease(self) -> None:
-        self.con = dest_mod.connect(self.dest)
-        dest_mod.ensure_control_schema(self.con, self.dest.control_schema)
-        dest_mod.ensure_dataset(self.con, self.dest.dataset_name)
-        self.destination_lease_key = self.dest.resolve_physical_lease_key(self.con)
+        # A local key is available before the control child resolves it.  For
+        # MotherDuck the child fills it from the live catalog; a timed-out acquire
+        # is still cleanable by the exact lease id below once that resolution is
+        # retried in the cleanup child.
+        if self.dest.kind == "duckdb":
+            self.destination_lease_key = self.dest.lease_key
+        result = self._control(
+            {
+                "operation": "acquire",
+                "destination": self.dest,
+                "ensure_schema": True,
+                "service_id": self.service_id,
+                "lease_id": self._lease_id,
+                "ttl_seconds": self.policy.lease_ttl_seconds,
+                "parent_start_token": self.parent_start_token,
+            }
+        )
+        self.destination_lease_key = result["lease_key"]
         self.lease = Lease(
             self.destination_lease_key,
             owner_id=self.service_id,
@@ -135,9 +308,10 @@ class ServiceSupervisor:
             label=self.dest.pipeline_name,
             service_id=self.service_id,
             worker_generation="supervisor",
+            lease_id=self._lease_id,
             process_start_token=self.parent_start_token,
         )
-        self._control(lambda: self.lease.acquire(self.con))
+        self.lease.fencing_epoch = int(result["epoch"])
         self.lease_held = True
         faults.matrix_crash("service_lease_acquire")
         log.info(
@@ -156,8 +330,6 @@ class ServiceSupervisor:
     def _launch_worker(self) -> None:
         if self.lease is None:
             raise LeaseLost("cannot launch a worker without a physical lease")
-        if self.con is None:
-            self.con = self._open_control()
         generation = f"{self.service_id}:{uuid.uuid4().hex}"
         parent_sock, child_sock = socket.socketpair()
         child_fd = child_sock.fileno()
@@ -178,7 +350,14 @@ class ServiceSupervisor:
                 ),
                 "CDC_SERVICE_PARENT_LOSS_SECONDS": str(self.policy.parent_loss_seconds),
                 "CDC_SERVICE_WORKER_START_TIMEOUT": str(self.policy.worker_start_timeout),
+                "CDC_SERVICE_IPC_TIMEOUT_SECONDS": str(
+                    self.policy.operation_timeout_seconds
+                ),
                 "CDC_SERVICE_IPC_FD": str(child_fd),
+                # The CLI destination is part of the authenticated worker
+                # configuration.  Without this, a MotherDuck supervisor handed
+                # a MotherDuck lease to a worker that defaulted to DuckDB.
+                "CDC_DESTINATION": self.dest.kind,
             }
         )
         try:
@@ -198,7 +377,9 @@ class ServiceSupervisor:
                 child_sock.close()
 
         channel = ParentChannel(
-            parent_sock, heartbeat_seconds=self.policy.parent_heartbeat_seconds
+            parent_sock,
+            heartbeat_seconds=self.policy.parent_heartbeat_seconds,
+            io_timeout_seconds=self.policy.operation_timeout_seconds,
         )
         channel.start_supervisor(
             parent_heartbeat_seconds=self.policy.parent_heartbeat_seconds
@@ -212,21 +393,35 @@ class ServiceSupervisor:
             # The child is held at its start gate while this row becomes the one
             # durable worker assignment for the current fencing epoch.
             self._control(
-                lambda: self.lease.assign_worker(
-                    self.con,
-                    pid=process.pid,
-                    start_token=pending_token,
-                    generation=generation,
-                )
+                {
+                    "operation": "assign_worker",
+                    "destination": self.dest,
+                    "service_id": self.service_id,
+                    "lease_id": self.lease.lease_id,
+                    "lease_key": self.destination_lease_key,
+                    "epoch": self.lease.epoch,
+                    "ttl_seconds": self.policy.lease_ttl_seconds,
+                    "parent_start_token": self.parent_start_token,
+                    "pid": process.pid,
+                    "start_token": pending_token,
+                    "generation": generation,
+                }
             )
             hello = channel.wait_for_hello(self.policy.worker_start_timeout)
             self._validate_hello(hello, process, generation)
             self._control(
-                lambda: self.lease.confirm_worker(
-                    self.con,
-                    generation=generation,
-                    start_token=str(hello["worker_start_token"]),
-                )
+                {
+                    "operation": "confirm_worker",
+                    "destination": self.dest,
+                    "service_id": self.service_id,
+                    "lease_id": self.lease.lease_id,
+                    "lease_key": self.destination_lease_key,
+                    "epoch": self.lease.epoch,
+                    "ttl_seconds": self.policy.lease_ttl_seconds,
+                    "parent_start_token": self.parent_start_token,
+                    "start_token": str(hello["worker_start_token"]),
+                    "generation": generation,
+                }
             )
             # A local DuckDB destination has a process-level file lock.  The
             # supervisor relinquishes its control handle before the worker opens
@@ -239,12 +434,18 @@ class ServiceSupervisor:
             self._kill_worker(process)
             channel.close()
             with contextlib.suppress(Exception):
-                if self.con is None:
-                    self.con = self._open_control()
                 self._control(
-                    lambda: self.lease.mark_worker_finished(
-                        self.con, generation=generation
-                    )
+                    {
+                        "operation": "mark_worker_finished",
+                        "destination": self.dest,
+                        "service_id": self.service_id,
+                        "lease_id": self.lease.lease_id,
+                        "lease_key": self.destination_lease_key,
+                        "epoch": self.lease.epoch,
+                        "ttl_seconds": self.policy.lease_ttl_seconds,
+                        "parent_start_token": self.parent_start_token,
+                        "generation": generation,
+                    }
                 )
             self._close_control()
             self.worker = None
@@ -300,20 +501,23 @@ class ServiceSupervisor:
         if channel is not None:
             channel.close()
         if self.lease is not None and self.lease_held:
-            control = None
             try:
-                control = self.con or self._open_control()
                 self._control(
-                    lambda: self.lease.mark_worker_finished(
-                        control, generation=generation
-                    )
+                    {
+                        "operation": "mark_worker_finished",
+                        "destination": self.dest,
+                        "service_id": self.service_id,
+                        "lease_id": self.lease.lease_id,
+                        "lease_key": self.destination_lease_key,
+                        "epoch": self.lease.epoch,
+                        "ttl_seconds": self.policy.lease_ttl_seconds,
+                        "parent_start_token": self.parent_start_token,
+                        "generation": generation,
+                    }
                 )
             except Exception:
                 log.warning("could not mark worker generation finished", exc_info=True)
             finally:
-                if control is not None:
-                    with contextlib.suppress(Exception):
-                        control.close()
                 self.con = None
         self.worker = None
         self.channel = None
@@ -440,7 +644,7 @@ class ServiceSupervisor:
                     continue
                 time.sleep(min(0.25, self.policy.parent_heartbeat_seconds))
             return exit_code
-        except (LeaseLost, OSError, RuntimeError) as exc:
+        except (LeaseLost, OSError, RuntimeError, TimeoutError) as exc:
             log.critical("service supervisor failed closed: %s", exc, exc_info=True)
             return 1
         finally:
@@ -453,15 +657,39 @@ class ServiceSupervisor:
                 self.lease_held
                 and self.lease is not None
                 and not self._hard_stop_failed
+                and not self._control_fenced
             ):
                 with contextlib.suppress(Exception):
                     faults.matrix_crash("service_lease_release")
-                    control = self._open_control()
-                    try:
-                        self._control(lambda: self.lease.release(control, retain=True))
-                    finally:
-                        with contextlib.suppress(Exception):
-                            control.close()
+                    self._control(
+                        {
+                            "operation": "release",
+                            "destination": self.dest,
+                            "service_id": self.service_id,
+                            "lease_id": self.lease.lease_id,
+                            "lease_key": self.destination_lease_key,
+                            "epoch": self.lease.epoch,
+                            "ttl_seconds": self.policy.lease_ttl_seconds,
+                            "parent_start_token": self.parent_start_token,
+                        }
+                    )
+            elif self._control_fenced:
+                # A timed-out child may have committed an acquire before its
+                # response was lost.  Release only that exact identity; if the
+                # cleanup itself cannot complete, durable expiry remains the
+                # fail-closed fence rather than an active orphan writer.
+                with contextlib.suppress(Exception):
+                    self._control(
+                        {
+                            "operation": "release_identity",
+                            "destination": self.dest,
+                            "service_id": self.service_id,
+                            "lease_id": self._lease_id,
+                            "lease_key": self.destination_lease_key,
+                            "ttl_seconds": self.policy.lease_ttl_seconds,
+                            "parent_start_token": self.parent_start_token,
+                        }
+                    )
             elif self._hard_stop_failed:
                 log.critical(
                     "worker hard-stop was not proven; leaving the physical lease "

@@ -136,3 +136,37 @@ def commit_watchdog(timeout: float, commit_id: int, stage=None, on_timeout=None)
         yield
     finally:
         timer.cancel()
+
+
+@contextlib.contextmanager
+def destination_operation_watchdog(timeout: float):
+    """Bound pre-COMMIT destination work without adding work to COMMIT_ACK.
+
+    The service worker is a hard process boundary, so terminating it is the only
+    reliable cancellation for a native DuckDB/MotherDuck call that does not return.
+    This guard is intentionally stopped immediately before the commit/ack protocol;
+    the existing ``commit_watchdog`` owns that smaller window and its callback is
+    likewise I/O-free.
+    """
+    if not timeout or timeout <= 0:
+        yield lambda: None
+        return
+
+    def _fire() -> None:  # pragma: no cover - exercised by a real service child
+        os._exit(75)
+
+    timer = threading.Timer(timeout, _fire)
+    timer.daemon = True
+    timer.start()
+    stopped = False
+
+    def stop() -> None:
+        nonlocal stopped
+        if not stopped:
+            stopped = True
+            timer.cancel()
+
+    try:
+        yield stop
+    finally:
+        stop()

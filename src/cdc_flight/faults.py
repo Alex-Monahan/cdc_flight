@@ -59,6 +59,7 @@ all places *we* stand; they cannot express "the destination refused the write" o
                                             # genuinely AMBIGUOUS (§4.6 F5)
     CDC_FAULT_INJECT=destination_hang:1     # COMMIT never returns (bounded by
                                             # CDC_COMMIT_TIMEOUT, then exit 75)
+    CDC_FAULT_HANG_PHASE=pre_commit        # service-only probe: a data write hangs
     CDC_FAULT_INJECT=destination_close:1    # the connection is severed mid-transaction
     CDC_FAULT_INJECT=swap:1                 # between the DROP and the RENAME of a
                                             # backfill swap (1.6)
@@ -759,6 +760,20 @@ class FaultyConnection:
 
     def _maybe_fire(self, statement: str) -> None:
         lowered = statement.lstrip().lower()
+        if (
+            self._point == "destination_hang"
+            and os.environ.get("CDC_FAULT_HANG_PHASE", "commit") == "pre_commit"
+            and _is_data_statement(statement, self._control_schema)
+        ):
+            self.fired = True
+            record_fired(self._point, self._nth, f"hang:{self._hang_seconds}:pre_commit")
+            log.error(
+                "FAULT INJECTION: destination data write hangs for %ss (group %s)",
+                self._hang_seconds,
+                self._nth,
+            )
+            sys.stdout.flush()
+            time.sleep(self._hang_seconds)
         if self._point == "destination_write" and _is_data_statement(
             statement, self._control_schema
         ):

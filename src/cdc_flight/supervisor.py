@@ -110,6 +110,7 @@ def run_engine_bounded(
     keep_catalog: bool = False,
     watermark: CompletionWatermark | None = None,
     service_context=None,
+    service_recheck=None,
 ) -> dict:
     """Run the Debezium engine until the destination has REACHED a source position.
 
@@ -187,6 +188,7 @@ def run_engine_bounded(
         getattr(getattr(handler, "resume_point", None), "last_lsn", 0) or 0
     )
     acknowledgement_timeout: dict[str, int | float] | None = None
+    service_recheck_result: dict | None = None
 
     def pending_fenced():
         if catalog is None:
@@ -234,6 +236,9 @@ def run_engine_bounded(
     )
     close_hung = False
     shutdown_sequence = ShutdownSequence()
+    next_service_recheck = started + float(
+        getattr(service_context, "invariant_check_seconds", 30.0)
+    ) if service_mode else None
     try:
         while thread.is_alive():
             elapsed = time.monotonic() - started
@@ -272,6 +277,23 @@ def run_engine_bounded(
                     ),
                 )
             if service_mode:
+                if (
+                    service_recheck is not None
+                    and next_service_recheck is not None
+                    and time.monotonic() >= next_service_recheck
+                ):
+                    try:
+                        service_recheck_result = service_recheck(handler)
+                    except BaseException as exc:
+                        # This is a read-only, serialized invariant check.  Its
+                        # failure is a service error, never a reason to continue
+                        # streaming on stale slot/offset assumptions.
+                        error_box.append(exc)
+                        outcome.record("engine_error")
+                        break
+                    next_service_recheck = time.monotonic() + float(
+                        getattr(service_context, "invariant_check_seconds", 30.0)
+                    )
                 if service_context.renew_requested:
                     try:
                         handler.renew_service_lease()
@@ -655,6 +677,8 @@ def run_engine_bounded(
         summary["source_unobservable_after_sec"] = source_unobservable_after
     if health is not None:
         summary.update(health.summary())
+    if service_recheck_result is not None:
+        summary["service_invariant_recheck"] = service_recheck_result
     if acknowledgement_timeout is not None:
         summary["slot_acknowledgement_timeout"] = acknowledgement_timeout
     if engine.suppressed_message:

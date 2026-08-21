@@ -14,7 +14,8 @@ import time
 from typing import Any
 
 from . import destination as dest_mod
-from . import naming
+from . import naming, offsets
+from . import reconcile as reconcile_mod
 from . import resnapshot as resnapshot_mod
 from .applier import Applier
 from .config import CatalogConfig, ReplicationConfig, RunConfig, SourceConfig
@@ -222,6 +223,9 @@ class LiveDiscoveryCoordinator:
                         "keep_catalog": discovery_handoff_enabled,
                         "stop_when": (
                             discovery_ready if discovery_handoff_enabled else None
+                        ),
+                        "service_recheck": (
+                            self._service_recheck if self.service_context is not None else None
                         ),
                     },
                 )
@@ -448,6 +452,94 @@ class LiveDiscoveryCoordinator:
             self.summary_extra["catalog_schema_refusals"] = [
                 str(refused) for refused in refusals
             ]
+
+    def _service_recheck(self, handler) -> dict:
+        """Revalidate slot, source identity, Invariant O, and offsets mid-life."""
+        context = self.service_context
+        if context is None:
+            return {"checked": False, "reason": "batch adapter"}
+        context.assert_writable()
+        # The applier owns this connection.  Do not let the read-only source check
+        # race a callback transaction or the commit/ack gate.
+        with handler._destination_operation_lock:
+            with handler._quiescence:
+                if handler._callback_sealed:
+                    return {"checked": False, "reason": "callback admission sealed"}
+            observation = reconcile_mod.observe_slot(
+                self.source.dsn,
+                self.replication.slot_name,
+                connect_timeout=max(1, int(self.run_cfg.jdbc_connect_timeout_seconds)),
+            )
+            if not observation.observable:
+                raise EngineFailure(
+                    "service mid-life slot recheck could not observe the source: "
+                    f"{observation.error}",
+                    {"service_invariant_recheck": {"checked": False, "error": observation.error}},
+                )
+            if not observation.slot_exists:
+                raise EngineFailure(
+                    f"service replication slot {self.replication.slot_name!r} disappeared "
+                    "during streaming; stopping before any further acknowledgement",
+                    {"service_invariant_recheck": {"checked": True, "slot_exists": False}},
+                )
+            durable = dest_mod.read_resume_point(
+                self.con,
+                self.destination.pipeline_name,
+                self.namespace,
+                control_schema=self.destination.control_schema,
+            )
+            if (
+                durable is not None
+                and observation.confirmed_flush_lsn is not None
+                and observation.confirmed_flush_lsn > durable.last_lsn
+            ):
+                raise EngineFailure(
+                    "service mid-life Invariant O violation: the source slot confirmed "
+                    f"{observation.confirmed_flush_lsn} ahead of durable destination "
+                    f"offset {durable.last_lsn}",
+                    {
+                        "service_invariant_recheck": {
+                            "checked": True,
+                            "slot_confirmed_flush_lsn": observation.confirmed_flush_lsn,
+                            "durable_lsn": durable.last_lsn,
+                        }
+                    },
+                )
+            previous = dest_mod.read_slot_state(
+                self.con,
+                self.destination.pipeline_name,
+                self.replication.slot_name,
+                control_schema=self.destination.control_schema,
+            )
+            if previous is not None:
+                for field in ("system_identifier", "timeline_id"):
+                    old = previous[field]
+                    new = getattr(observation, field)
+                    if old is not None and new is not None and old != new:
+                        raise EngineFailure(
+                            f"service source {field} changed during streaming: "
+                            f"durable={old!r} observed={new!r}",
+                            {"service_invariant_recheck": {"checked": True, field: new}},
+                        )
+            offset_result = offsets.verify_service_offset(
+                self.con,
+                pipeline=self.destination.pipeline_name,
+                namespace=self.namespace,
+                offset_path=self.replication.offset_file,
+                control_schema=self.destination.control_schema,
+            )
+            result = {
+                "checked": True,
+                "slot_exists": True,
+                "slot_active": observation.active,
+                "slot_confirmed_flush_lsn": observation.confirmed_flush_lsn,
+                "slot_restart_lsn": observation.restart_lsn,
+                "durable_lsn": durable.last_lsn if durable is not None else None,
+                "offset": offset_result,
+            }
+        context.assert_writable()
+        self.summary_extra["service_invariant_recheck"] = result
+        return result
 
     def _resume_properties(self) -> dict:
         """Make the second engine an explicit stream resume."""

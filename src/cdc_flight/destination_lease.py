@@ -356,7 +356,14 @@ class Lease:
         else:
             refresh()
         row = self._row(con)
-        if not self._matches(row):
+        # ``UPDATE ... WHERE expires_at > current`` may affect zero rows after
+        # expiry.  Identity alone is not an acknowledgement of renewal: the row
+        # must also be live in a fresh destination-clock observation.
+        live_after = True
+        if require_live:
+            observed_now = self._server_now(con)
+            live_after = bool(row is not None and row[14] is not None and row[14] > observed_now)
+        if not self._matches(row) or not live_after:
             raise LeaseLost(
                 f"lease for {self.name!r} was lost during {operation}; refusing data write",
                 lease_state=self._durable_receipt(con, row, operation),

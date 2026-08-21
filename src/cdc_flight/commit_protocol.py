@@ -6,6 +6,8 @@ from BEGIN through the guarded COMMIT/ack boundary and post-commit bookkeeping.
 
 from __future__ import annotations
 
+import functools
+
 from . import commit_metadata, destination, offsets, self_heal, table_writer
 from .commit_group import CommitResult, OpenGroup
 from .errors import (
@@ -22,6 +24,28 @@ from .run_state import COMMIT_ACK
 OWNER = "commit-durability"
 
 
+def _bounded_service_destination_operation(function):
+    """Bound service destination work before the commit/ack hand-off."""
+    @functools.wraps(function)
+    def wrapped(self, trigger: str) -> CommitResult:
+        if self.service_context is None or not self.group.units:
+            return function(self, trigger)
+        commit_id = self.group.spill_commit_id or self._next_commit_id
+        # If native destination work hangs before the existing inner watchdog is
+        # armed, leave the same durable diagnostic behind.  No timeout callback
+        # performs destination or telemetry I/O.
+        self._arm_commit_timeout_alert(commit_id)
+        with self_heal.destination_operation_watchdog(self.cfg.commit_timeout) as stop:
+            self._destination_operation_deadline_stop = stop
+            try:
+                return function(self, trigger)
+            finally:
+                self._destination_operation_deadline_stop = None
+
+    return wrapped
+
+
+@_bounded_service_destination_operation
 def commit_group(self, trigger: str) -> CommitResult:
     """Commit the one destination-owned group.
 
@@ -154,6 +178,14 @@ def commit_group(self, trigger: str) -> CommitResult:
         # HERE, before the commit, because it is only a *forensic* baseline -
         # it does not need to lengthen the commit->ack path (Codex 7).
         offset_fingerprint = self.verifier.before() if self.verifier else None
+        stop_destination_deadline = getattr(
+            self, "_destination_operation_deadline_stop", None
+        )
+        if stop_destination_deadline is not None:
+            # From this point the commit watchdog and the IPC deadline own the
+            # minimal COMMIT -> source acknowledgement interval.  The broader
+            # destination deadline does not add a second timer to that window.
+            stop_destination_deadline()
         if self.service_context is not None:
             matrix_crash("service_before_md_commit")
         # rubric 1.9 / ADR §20: the commit->ack exclusion, as a flag other threads

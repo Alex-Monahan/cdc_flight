@@ -57,17 +57,39 @@ def process_start_token(pid: int | None = None) -> str:
     return f"{socket.gethostname()}:{pid}:nonce:{uuid.uuid4().hex}"
 
 
-def _send(sock: socket.socket, lock: threading.Lock, message: dict) -> None:
+DEFAULT_IPC_TIMEOUT_SECONDS = 5.0
+
+
+def _send(
+    sock: socket.socket,
+    lock: threading.Lock,
+    message: dict,
+    *,
+    timeout: float = DEFAULT_IPC_TIMEOUT_SECONDS,
+) -> None:
+    """Send one complete frame under one operation deadline.
+
+    A non-blocking socket only makes each individual ``send`` bounded.  The old
+    loop reset its 250 ms select slice forever when the peer stopped reading.  The
+    deadline belongs to the frame, so a full local socket fails closed instead of
+    retaining a lease or a drain request indefinitely.
+    """
     payload = (json.dumps(message, separators=(",", ":"), sort_keys=True) + "\n").encode()
+    deadline = time.monotonic() + max(0.001, float(timeout))
     with lock:
         view = memoryview(payload)
         while view:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("service IPC send exceeded its overall deadline")
             try:
                 sent = sock.send(view)
             except BlockingIOError:
-                _, writable, _ = select.select([], [sock], [], 0.25)
+                _, writable, _ = select.select([], [sock], [], min(0.25, remaining))
                 if not writable:
                     continue
+                continue
+            except InterruptedError:
                 continue
             if sent <= 0:
                 raise BrokenPipeError("service IPC channel made no progress")
@@ -81,10 +103,17 @@ class ParentChannel:
     reader owns command handling; the supervisor reader owns lease-gate state.
     """
 
-    def __init__(self, sock: socket.socket, *, heartbeat_seconds: float = 1.0) -> None:
+    def __init__(
+        self,
+        sock: socket.socket,
+        *,
+        heartbeat_seconds: float = 1.0,
+        io_timeout_seconds: float = DEFAULT_IPC_TIMEOUT_SECONDS,
+    ) -> None:
         self.sock = sock
         self.sock.setblocking(False)
         self.heartbeat_seconds = heartbeat_seconds
+        self.io_timeout_seconds = max(0.001, float(io_timeout_seconds))
         self._send_lock = threading.Lock()
         self._stop = threading.Event()
         self._closed = threading.Event()
@@ -106,7 +135,20 @@ class ParentChannel:
     def send(self, message_type: str, **payload) -> None:
         if self._closed.is_set():
             raise BrokenPipeError("service IPC channel is closed")
-        _send(self.sock, self._send_lock, {"type": message_type, **payload})
+        try:
+            _send(
+                self.sock,
+                self._send_lock,
+                {"type": message_type, **payload},
+                timeout=self.io_timeout_seconds,
+            )
+        except (BrokenPipeError, OSError, TimeoutError):
+            # A failed frame is a write barrier.  The caller may decide whether
+            # to restart or release the lease, but this channel must never be
+            # treated as writable after its overall deadline expired.
+            self._parent_lost.set()
+            self._drain.set()
+            raise
 
     @property
     def parent_lost(self) -> bool:
@@ -181,12 +223,13 @@ class ParentChannel:
                     return
                 faults.matrix_crash("service_heartbeat_write")
                 self.send("worker_heartbeat", pid=os.getpid(), at=time.time())
-        except (BrokenPipeError, OSError):
+        except (BrokenPipeError, OSError, TimeoutError):
             self._parent_lost.set()
             self._drain.set()
 
     def _worker_reader(self) -> None:
         buffer = bytearray()
+        frame_started_at: float | None = None
         while not self._stop.is_set():
             try:
                 ready, _, _ = select.select([self.sock], [], [], 0.25)
@@ -195,6 +238,14 @@ class ParentChannel:
                 self._drain.set()
                 return
             if not ready:
+                if (
+                    buffer
+                    and frame_started_at is not None
+                    and time.monotonic() - frame_started_at >= self.io_timeout_seconds
+                ):
+                    self._parent_lost.set()
+                    self._drain.set()
+                    return
                 continue
             try:
                 chunk = self.sock.recv(65536)
@@ -208,6 +259,8 @@ class ParentChannel:
                 self._parent_lost.set()
                 self._drain.set()
                 return
+            if not buffer:
+                frame_started_at = time.monotonic()
             buffer.extend(chunk)
             while b"\n" in buffer:
                 raw, _, remainder = buffer.partition(b"\n")
@@ -219,6 +272,7 @@ class ParentChannel:
                     self._drain.set()
                     return
                 self._handle_worker_message(message)
+                frame_started_at = time.monotonic() if buffer else None
 
     def _handle_worker_message(self, message: dict) -> None:
         message_type = message.get("type")
@@ -279,7 +333,12 @@ class ParentChannel:
         done = threading.Event()
         with self._pending_lock:
             self._pending[request_id] = [done, None]
-        self.send("renew", request_id=request_id)
+        try:
+            self.send("renew", request_id=request_id)
+        except BaseException:
+            with self._pending_lock:
+                self._pending.pop(request_id, None)
+            raise
         return request_id
 
     def renew_result(self, request_id: str) -> dict | None:
@@ -316,18 +375,26 @@ class ParentChannel:
             try:
                 faults.matrix_crash("service_heartbeat_write")
                 self.send("parent_heartbeat", pid=os.getpid(), at=time.time())
-            except (BrokenPipeError, OSError):
+            except (BrokenPipeError, OSError, TimeoutError):
                 self._parent_lost.set()
                 return
 
     def _supervisor_reader(self) -> None:
         buffer = bytearray()
+        frame_started_at: float | None = None
         while not self._stop.is_set():
             try:
                 ready, _, _ = select.select([self.sock], [], [], 0.25)
             except (OSError, ValueError):
                 return
             if not ready:
+                if (
+                    buffer
+                    and frame_started_at is not None
+                    and time.monotonic() - frame_started_at >= self.io_timeout_seconds
+                ):
+                    self._parent_lost.set()
+                    return
                 continue
             try:
                 chunk = self.sock.recv(65536)
@@ -337,6 +404,8 @@ class ParentChannel:
                 return
             if not chunk:
                 return
+            if not buffer:
+                frame_started_at = time.monotonic()
             buffer.extend(chunk)
             while b"\n" in buffer:
                 raw, _, remainder = buffer.partition(b"\n")
@@ -346,6 +415,7 @@ class ParentChannel:
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     continue
                 self._handle_supervisor_message(message)
+                frame_started_at = time.monotonic() if buffer else None
 
     def _handle_supervisor_message(self, message: dict) -> None:
         message_type = message.get("type")
@@ -413,6 +483,8 @@ class ServiceWorkerContext:
         ipc_fd: int,
         heartbeat_seconds: float,
         parent_loss_seconds: float,
+        io_timeout_seconds: float = DEFAULT_IPC_TIMEOUT_SECONDS,
+        invariant_check_seconds: float = 30.0,
     ) -> None:
         self.service_id = service_id
         self.lease_key = lease_key
@@ -423,9 +495,12 @@ class ServiceWorkerContext:
         self.parent_start_token = parent_start_token
         self.worker_start_token = worker_start_token
         self.channel = ParentChannel(
-            socket.socket(fileno=int(ipc_fd)), heartbeat_seconds=heartbeat_seconds
+            socket.socket(fileno=int(ipc_fd)),
+            heartbeat_seconds=heartbeat_seconds,
+            io_timeout_seconds=io_timeout_seconds,
         )
         self.parent_loss_seconds = parent_loss_seconds
+        self.invariant_check_seconds = max(0.1, float(invariant_check_seconds))
         self.stop_event = threading.Event()
         self._started = False
 
@@ -452,6 +527,15 @@ class ServiceWorkerContext:
             worker_start_token=process_start_token(),
             heartbeat_seconds=float(os.environ.get("CDC_SERVICE_PARENT_HEARTBEAT_SECONDS", "1")),
             parent_loss_seconds=float(os.environ.get("CDC_SERVICE_PARENT_LOSS_SECONDS", "5")),
+            io_timeout_seconds=float(
+                os.environ.get(
+                    "CDC_SERVICE_IPC_TIMEOUT_SECONDS",
+                    str(DEFAULT_IPC_TIMEOUT_SECONDS),
+                )
+            ),
+            invariant_check_seconds=float(
+                os.environ.get("CDC_SERVICE_INVARIANT_CHECK_SECONDS", "30")
+            ),
         )
 
     def start(self) -> None:
