@@ -17,8 +17,11 @@ import pytest
 #: The expected values below subtract only this guard module.
 _BASELINE_SELECTED = {
     "not motherduck and not slow": 2218,
-    "slow and not motherduck": 237,
-    "motherduck": 51,
+    "slow and not motherduck": 236,
+    # The single-process SIGSTOP/SIGCONT fencing proof is a new MotherDuck-only
+    # real-process node; it is required because a local DuckDB file lock cannot
+    # exercise cloud takeover while the frozen process retains its handle.
+    "motherduck": 53,
 }
 
 

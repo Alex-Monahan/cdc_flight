@@ -79,10 +79,10 @@ def commit_group(self, trigger: str) -> CommitResult:
     has_incremental = any(getattr(unit, "incremental", False) for unit in group)
     has_snapshot_unit = any(unit.kind == "snapshot_chunk" for unit in group)
     if self.service_context is not None:
-        # Admission is a worker/parent protocol check, not a best-effort
-        # observation.  A worker that has lost its parent must fail before it
-        # can open a destination transaction, and the lease identity is checked
-        # once more on the same connection immediately before BEGIN.
+        # Admission is a lease/fence check, not a best-effort observation.  A
+        # Flight that has lost its lease must fail before it can open a
+        # destination transaction, and the identity is checked once more on the
+        # same connection immediately before BEGIN.
         self.service_context.assert_writable()
         self.lease.assert_current(self.con)
     if not self.group.txn_open:
@@ -182,9 +182,9 @@ def commit_group(self, trigger: str) -> CommitResult:
             self, "_destination_operation_deadline_stop", None
         )
         if stop_destination_deadline is not None:
-            # From this point the commit watchdog and the IPC deadline own the
-            # minimal COMMIT -> source acknowledgement interval.  The broader
-            # destination deadline does not add a second timer to that window.
+            # From this point the commit watchdog owns the minimal COMMIT -> source
+            # acknowledgement interval.  The broader destination deadline does not
+            # add a second timer to that window.
             stop_destination_deadline()
         if self.service_context is not None:
             matrix_crash("service_before_md_commit")
@@ -206,11 +206,6 @@ def commit_group(self, trigger: str) -> CommitResult:
         # callback is deliberately I/O-free: if it fires, it may be running inside
         # COMMIT_ACK and may only terminate the process.
         self._arm_commit_timeout_alert(commit_id)
-        if self.service_context is not None:
-            # The parent marks the physical lease gate before acknowledging this
-            # request.  It must defer its renewal until commit_complete arrives.
-            # No database or alert operation is performed by this handshake.
-            self.service_context.before_commit_ack(timeout=self.cfg.commit_timeout)
         ack_entered = False
         with self_heal.commit_watchdog(self.cfg.commit_timeout, commit_id):
             # INSIDE the watchdog (Codex r3 MAJOR-2). `enter()` waits, without a
@@ -221,17 +216,17 @@ def commit_group(self, trigger: str) -> CommitResult:
             ack_entered = True
             try:
                 if self.service_context is not None:
-                    # Recheck the IPC write barrier immediately before COMMIT.
-                    # This is an in-process event read only; control-plane and
-                    # observability statements remain structurally absent here.
+                    # Recheck the local lease write barrier immediately before
+                    # COMMIT; the commit/ack window itself contains no lease or
+                    # observability I/O.
                     self.service_context.assert_writable()
                 self.con.execute("COMMIT")
                 self.group.txn_open = False
                 if self.service_context is not None:
                     matrix_crash("service_after_md_commit_before_ack")
-                    # A parent loss after the destination commit is still a
+                    # A lease loss after the destination commit is still a
                     # no-ack path.  The durable destination wins and the source
-                    # record replays on the next generation.
+                    # record replays on the next Flight generation.
                     self.service_context.assert_writable()
                 if has_incremental:
                     maybe_crash("after_md_commit_before_markProcessed", fault_group)
@@ -278,11 +273,6 @@ def commit_group(self, trigger: str) -> CommitResult:
                 # last acknowledgement in all cases.
                 if ack_entered:
                     COMMIT_ACK.leave()
-                if self.service_context is not None:
-                    # This is intentionally after COMMIT_ACK.leave(): the parent
-                    # may resume lease renewal only after the acknowledgement
-                    # window has completely closed.
-                    self.service_context.after_commit_ack()
             if has_incremental:
                 maybe_crash("after_ack_before_next_poll", fault_group)
             self._pending_backfill_notifications.clear()

@@ -54,7 +54,7 @@ inside the Python process via JPype; Postgres is a project-local Homebrew cluste
 | Debezium | **3.6.0.Final** | bundled inside `pydbzengine` 3.6.0.0 |
 | pydbzengine | **3.6.0.0** | installed from GitHub (not on PyPI any more) |
 | dlt | **1.19.x** | `dlt[duckdb,motherduck]` |
-| DuckDB | **1.4.x** | |
+| DuckDB | **1.5.4** | pinned to the MotherDuck-supported runtime |
 | Python | **3.13** | managed by `uv` |
 
 ```bash

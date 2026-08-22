@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import os
 import signal
@@ -19,7 +20,7 @@ from cdc_flight.discovery_coordinator import LiveDiscoveryCoordinator
 # lifetime edge.  Keep the mapping explicit so a newly reachable service cut cannot
 # disappear into the batch-only matrix.
 SERVICE_CUT_COVERAGE = {
-    "worker authenticated startup": ("service_worker_startup",),
+    "single-process startup admission": ("service_startup",),
     "callback before complete unit": ("service_callback_midstream",),
     "complete unit staged before destination commit": ("service_before_md_commit",),
     "destination commit before acknowledgement": (
@@ -63,8 +64,8 @@ UNREACHABLE_SERVICE_CUTS = {
 }
 
 
-def _wait_for_worker(box: Sandbox, process, *, timeout: float = 45.0) -> int:
-    """Use PostgreSQL liveness while the worker owns the DuckDB file lock."""
+def _wait_for_service(box: Sandbox, process, *, timeout: float = 45.0) -> int:
+    """Use PostgreSQL liveness while the one service process owns the destination."""
     box.wait_for_slot_active(process=process, timeout=timeout)
     return process.pid
 
@@ -74,7 +75,9 @@ def _stop(process, *, expected: set[int] | None = None) -> int:
     if process.poll() is None:
         process.send_signal(signal.SIGTERM)
     returncode = process.wait(timeout=90)
-    assert returncode in expected, returncode
+    if returncode not in expected:
+        output = _service_process_output(process)
+        raise AssertionError(f"returncode={returncode}\n{output[-12000:]}")
     return returncode
 
 
@@ -92,29 +95,30 @@ def test_service_real_process_drains_and_releases_one_epoch(
         box.reseed()
         box.run(reset_state=True, max_seconds=150, timeout=240)
         process = box.spawn_service(
-            matrix_arm=True,
-            extra_env={
+                matrix_arm=True,
+                capture=True,
+                extra_env={
                 "CDC_SERVICE_ID": "service-core-drain",
-                "CDC_SERVICE_LEASE_TTL": "12",
-                "CDC_SERVICE_LEASE_RENEW_SECONDS": "2",
-                "CDC_SERVICE_PARENT_HEARTBEAT_SECONDS": "0.25",
-                    "CDC_SERVICE_PARENT_LOSS_SECONDS": "3",
-                    "CDC_SERVICE_WORKER_HEARTBEAT_TIMEOUT": "8",
-                    # Keep the graceful-drain proof finite while allowing the
-                    # stock JVM close to complete under the two-worker slow lane.
-                    "CDC_CLOSE_TIMEOUT": "60",
-                    "CDC_ENGINE_THREAD_TIMEOUT": "60",
-                    "CDC_SERVICE_DRAIN_DEADLINE_SECONDS": "90",
-                },
+                "CDC_SERVICE_LEASE_TTL": "120",
+                "CDC_SERVICE_LEASE_RENEW_SECONDS": "10",
+                "CDC_SERVICE_COMMIT_TIMEOUT": "30",
+                "CDC_SERVICE_HEARTBEAT_BOUND_SECONDS": "30",
+                "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "45",
+                "CDC_SERVICE_STALL_EXIT_GRACE_SECONDS": "5",
+                # Keep the graceful-drain proof finite while allowing the stock
+                # JVM close to complete under the slow lane.
+                "CDC_CLOSE_TIMEOUT": "60",
+                "CDC_ENGINE_THREAD_TIMEOUT": "60",
+            },
             )
-        worker_pid = _wait_for_worker(box, process)
-        assert worker_pid == process.pid
+        service_pid = _wait_for_service(box, process)
+        assert service_pid == process.pid
         box.wait_for_slot_active(process=process, timeout=45)
         box.sql(
             "INSERT INTO app.customers (name, email) "
             "VALUES ('service-core-row', 'service-core@example.com')"
         )
-        # DuckDB is intentionally not queried while the service worker owns its
+        # DuckDB is intentionally not queried while the service process owns its
         # process-level file lock.  Allow the live connector to consume the row,
         # then assert the durable result after the bounded drain closes the handle.
         time.sleep(5)
@@ -122,10 +126,10 @@ def test_service_real_process_drains_and_releases_one_epoch(
         assert _stop(process) == 0
         process = None
         released = box.duck_query(
-            "SELECT state, fencing_epoch, service_id, worker_pid "
+            "SELECT state, fencing_epoch, service_id "
             "FROM _cdc_flight.lease"
         )
-        assert released == [("released", 1, "service-core-drain", None)]
+        assert released == [("released", 1, "service-core-drain")]
         assert box.scalar(
             'SELECT count(*) FROM "cdc_raw"."cdcflight_app_customers" '
             "WHERE name = ?",
@@ -143,7 +147,7 @@ def test_service_real_process_drains_and_releases_one_epoch(
 def test_service_destination_write_hang_is_bounded_before_commit_ack(
     tmp_path_factory, postgres_cluster
 ):
-    """A real worker blocked in pre-COMMIT destination I/O is hard-fenced."""
+    """A real Flight blocked in pre-COMMIT destination I/O is hard-fenced."""
     box = Sandbox(
         "service_core_destination_hang",
         tmp_path_factory.mktemp("sbx_service_core_destination_hang"),
@@ -160,10 +164,10 @@ def test_service_destination_write_hang_is_bounded_before_commit_ack(
                 "CDC_SERVICE_ID": "service-core-destination-hang",
                 "CDC_SERVICE_LEASE_TTL": "12",
                 "CDC_SERVICE_LEASE_RENEW_SECONDS": "2",
-                "CDC_SERVICE_PARENT_HEARTBEAT_SECONDS": "0.25",
-                "CDC_SERVICE_PARENT_LOSS_SECONDS": "3",
-                "CDC_SERVICE_MAX_WORKER_RESTARTS": "0",
-                "CDC_SERVICE_OPERATION_TIMEOUT_SECONDS": "5",
+                "CDC_SERVICE_COMMIT_TIMEOUT": "2",
+                "CDC_SERVICE_HEARTBEAT_BOUND_SECONDS": "6",
+                "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "3",
+                "CDC_SERVICE_STALL_EXIT_GRACE_SECONDS": "2",
                 "CDC_FAULT_INJECT": "destination_hang:1",
                 "CDC_FAULT_HANG_PHASE": "pre_commit",
                 "CDC_FAULT_HANG_SECONDS": "600",
@@ -192,8 +196,8 @@ def test_service_destination_write_hang_is_bounded_before_commit_ack(
         fired = box.fired_fault()
         assert fired and fired["action"].startswith("hang:600.0:pre_commit"), fired
         assert box.duck_query(
-            "SELECT state, service_id, worker_pid FROM _cdc_flight.lease"
-        ) == [("released", "service-core-destination-hang", None)]
+            "SELECT state, service_id FROM _cdc_flight.lease"
+        ) == [("held", "service-core-destination-hang")]
     finally:
         if process is not None and process.poll() is None:
             process.kill()
@@ -224,9 +228,10 @@ def test_service_rechecks_and_fails_closed_after_mid_life_slot_drop(
                 "CDC_SERVICE_ID": "service-core-slot-drop",
                 "CDC_SERVICE_LEASE_TTL": "12",
                 "CDC_SERVICE_LEASE_RENEW_SECONDS": "2",
-                "CDC_SERVICE_PARENT_HEARTBEAT_SECONDS": "0.25",
-                "CDC_SERVICE_PARENT_LOSS_SECONDS": "3",
-                "CDC_SERVICE_MAX_WORKER_RESTARTS": "0",
+                "CDC_SERVICE_COMMIT_TIMEOUT": "2",
+                "CDC_SERVICE_HEARTBEAT_BOUND_SECONDS": "6",
+                "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "3",
+                "CDC_SERVICE_STALL_EXIT_GRACE_SECONDS": "2",
                 "CDC_SERVICE_INVARIANT_CHECK_SECONDS": "0.5",
             },
         )
@@ -258,8 +263,8 @@ def test_service_rechecks_and_fails_closed_after_mid_life_slot_drop(
         assert returncode != 0, output
         assert "disappeared during streaming" in output.lower(), output[-5000:]
         assert box.duck_query(
-            "SELECT state, service_id, worker_pid FROM _cdc_flight.lease"
-        ) == [("released", "service-core-slot-drop", None)]
+            "SELECT state, service_id FROM _cdc_flight.lease"
+        ) == [("released", "service-core-slot-drop")]
     finally:
         if process is not None and process.poll() is None:
             process.kill()
@@ -271,10 +276,10 @@ def test_service_rechecks_and_fails_closed_after_mid_life_slot_drop(
 
 
 @pytest.mark.slow
-def test_service_one_worker_long_life_keeps_one_generation_and_exact_waves(
+def test_service_one_process_long_life_keeps_one_generation_and_exact_waves(
     tmp_path_factory, postgres_cluster
 ):
-    """Several separated commits run through one live worker generation."""
+    """Several separated commits run through one live process generation."""
     box = Sandbox(
         "service_core_long_life",
         tmp_path_factory.mktemp("sbx_service_core_long_life"),
@@ -290,9 +295,10 @@ def test_service_one_worker_long_life_keeps_one_generation_and_exact_waves(
                 "CDC_SERVICE_ID": "service-core-long-life",
                 "CDC_SERVICE_LEASE_TTL": "30",
                 "CDC_SERVICE_LEASE_RENEW_SECONDS": "5",
-                "CDC_SERVICE_PARENT_HEARTBEAT_SECONDS": "0.25",
-                "CDC_SERVICE_PARENT_LOSS_SECONDS": "3",
-                "CDC_SERVICE_MAX_WORKER_RESTARTS": "0",
+                "CDC_SERVICE_COMMIT_TIMEOUT": "10",
+                "CDC_SERVICE_HEARTBEAT_BOUND_SECONDS": "15",
+                "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "10",
+                "CDC_SERVICE_STALL_EXIT_GRACE_SECONDS": "5",
                 "CDC_SERVICE_INVARIANT_CHECK_SECONDS": "1",
                 "CDC_COMMIT_MAX_AGE": "0.25",
                 "CDC_COMMIT_MAX_EVENTS": "1",
@@ -330,8 +336,8 @@ def test_service_one_worker_long_life_keeps_one_generation_and_exact_waves(
             "WHERE name LIKE 'service-long-life-%'"
         ) == 5
         assert box.duck_query(
-            "SELECT state, service_id, worker_pid FROM _cdc_flight.lease"
-        ) == [("released", "service-core-long-life", None)]
+            "SELECT state, service_id FROM _cdc_flight.lease"
+        ) == [("released", "service-core-long-life")]
     finally:
         if process is not None and process.poll() is None:
             process.kill()
@@ -345,7 +351,7 @@ def test_service_one_worker_long_life_keeps_one_generation_and_exact_waves(
 def test_service_cli_runs_against_real_motherduck_destination(
     tmp_path_factory, postgres_cluster, motherduck_case
 ):
-    """The supervisor's CLI destination reaches the worker's real MD connection."""
+    """The single-process CLI reaches the real MotherDuck connection."""
     case = motherduck_case
     box = Sandbox(
         "service_core_motherduck",
@@ -360,14 +366,15 @@ def test_service_cli_runs_against_real_motherduck_destination(
         "MOTHERDUCK_TOKEN": case["token"],
         "motherduck_token": case["token"],
         "CDC_SERVICE_ID": "service-core-motherduck",
-        # MotherDuck's first worker/JVM snapshot is a real remote operation; keep
+        # MotherDuck's first JVM snapshot is a real remote operation; keep
         # the documented 60-second lease margin rather than making bootstrap itself
         # race a deliberately tiny local-test TTL.
         "CDC_SERVICE_LEASE_TTL": "60",
         "CDC_SERVICE_LEASE_RENEW_SECONDS": "10",
-        "CDC_SERVICE_PARENT_HEARTBEAT_SECONDS": "0.25",
-        "CDC_SERVICE_PARENT_LOSS_SECONDS": "3",
-        "CDC_SERVICE_OPERATION_TIMEOUT_SECONDS": "30",
+        "CDC_SERVICE_COMMIT_TIMEOUT": "30",
+        "CDC_SERVICE_HEARTBEAT_BOUND_SECONDS": "30",
+        "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "30",
+        "CDC_SERVICE_STALL_EXIT_GRACE_SECONDS": "5",
     }
     try:
         box.reseed()
@@ -424,46 +431,97 @@ def test_service_cli_runs_against_real_motherduck_destination(
 
 
 @pytest.mark.slow
-def test_two_real_service_supervisors_cannot_start_two_workers(
-    tmp_path_factory, postgres_cluster
+@pytest.mark.motherduck
+def test_two_real_service_instances_have_one_holder_and_one_stand_down(
+    tmp_path_factory, postgres_cluster, motherduck_case
 ):
     box = Sandbox(
         "service_core_contention",
         tmp_path_factory.mktemp("sbx_service_core_contention"),
         postgres_cluster,
     )
-    first = second = None
+    first = second = third = None
+    case = motherduck_case
+    environment = {
+        "CDC_MD_DATABASE": case["database"],
+        "CDC_DATASET": case["dataset"],
+        "CDC_CONTROL_SCHEMA": case["control_schema"],
+        "MOTHERDUCK_TOKEN": case["token"],
+        "motherduck_token": case["token"],
+        "CDC_SERVICE_LEASE_TTL": "120",
+        "CDC_SERVICE_LEASE_RENEW_SECONDS": "10",
+        "CDC_SERVICE_COMMIT_TIMEOUT": "30",
+        "CDC_SERVICE_HEARTBEAT_BOUND_SECONDS": "30",
+        "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "45",
+        "CDC_SERVICE_STALL_EXIT_GRACE_SECONDS": "5",
+    }
+
+    def md_query(statement: str, params=None) -> list[tuple]:
+        con = motherduck_connect(case["token"], case["database"])
+        try:
+            return con.execute(statement, params or []).fetchall()
+        finally:
+            con.close()
+
+    alerts_table = f'"{case["control_schema"]}"."alerts"'
     try:
         box.reseed()
-        box.run(reset_state=True, max_seconds=150, timeout=240)
+        box.run(
+            reset_state=True,
+            destination="motherduck",
+            extra_env=environment,
+            max_seconds=180,
+            timeout=300,
+        )
         first = box.spawn_service(
             matrix_arm=True,
+            destination="motherduck",
             extra_env={
+                **environment,
                 "CDC_SERVICE_ID": "service-core-a",
-                "CDC_SERVICE_LEASE_TTL": "12",
-                "CDC_SERVICE_LEASE_RENEW_SECONDS": "2",
-                "CDC_SERVICE_PARENT_HEARTBEAT_SECONDS": "0.25",
-                "CDC_SERVICE_PARENT_LOSS_SECONDS": "3",
             },
         )
-        incumbent_pid = _wait_for_worker(box, first)
         second = box.spawn_service(
             matrix_arm=True,
+            capture=True,
+            destination="motherduck",
             extra_env={
+                **environment,
                 "CDC_SERVICE_ID": "service-core-b",
-                "CDC_SERVICE_LEASE_TTL": "12",
-                "CDC_SERVICE_LEASE_RENEW_SECONDS": "2",
-                "CDC_SERVICE_PARENT_HEARTBEAT_SECONDS": "0.25",
-                "CDC_SERVICE_PARENT_LOSS_SECONDS": "3",
             },
         )
-        assert second.wait(timeout=45) != 0
-        assert first.poll() is None
-        assert first.pid == incumbent_pid
-        _stop(first)
-        first = None
+        deadline = time.monotonic() + 60
+        while first.poll() is None and second.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert (first.poll() is None) != (second.poll() is None), (
+            _service_process_output(first) + _service_process_output(second)
+        )
+        holder = first if first.poll() is None else second
+        stand_down = second if holder is first else first
+        assert stand_down.returncode == 0, _service_process_output(stand_down)
+        assert box.last_summary()["run_outcome"] == "stand_down"
+        assert box.last_summary()["status"] == "SUCCEEDED"
+        assert box.last_summary()["stand_down"] is True
+        box.wait_for_slot_active(process=holder, timeout=60)
+
+        alerts_before = md_query(f"SELECT count(*) FROM {alerts_table}")[0][0]
+        third = box.spawn_service(
+            matrix_arm=True,
+            capture=True,
+            destination="motherduck",
+            extra_env={**environment, "CDC_SERVICE_ID": "service-core-c"},
+        )
+        assert third.wait(timeout=60) == 0, _service_process_output(third)
+        assert box.last_summary()["run_outcome"] == "stand_down"
+        assert md_query(f"SELECT count(*) FROM {alerts_table}")[0][0] == alerts_before
+
+        _stop(holder)
+        if holder is first:
+            first = None
+        else:
+            second = None
     finally:
-        for process in (first, second):
+        for process in (first, second, third):
             if process is not None and process.poll() is None:
                 process.kill()
                 process.wait(timeout=30)
@@ -472,10 +530,10 @@ def test_two_real_service_supervisors_cannot_start_two_workers(
 
 
 @pytest.mark.slow
-def test_sigkill_supervisor_fences_old_worker_before_same_destination_takeover(
+def test_crashed_instance_is_reclaimed_after_expiry_and_fences_old_generation(
     tmp_path_factory, postgres_cluster
 ):
-    """A real parent death leaves no old generation able to publish after epoch 2."""
+    """A real Flight death leaves no old generation able to publish after epoch 2."""
     box = Sandbox(
         "service_core_parent_loss",
         tmp_path_factory.mktemp("sbx_service_core_parent_loss"),
@@ -491,49 +549,55 @@ def test_sigkill_supervisor_fences_old_worker_before_same_destination_takeover(
                 "CDC_SERVICE_ID": "service-core-old",
                 "CDC_SERVICE_LEASE_TTL": "8",
                 "CDC_SERVICE_LEASE_RENEW_SECONDS": "2",
-                "CDC_SERVICE_PARENT_HEARTBEAT_SECONDS": "0.25",
-                "CDC_SERVICE_PARENT_LOSS_SECONDS": "2",
-                "CDC_SERVICE_MAX_WORKER_RESTARTS": "0",
+                "CDC_SERVICE_COMMIT_TIMEOUT": "2",
+                "CDC_SERVICE_HEARTBEAT_BOUND_SECONDS": "4",
+                "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "6",
+                "CDC_SERVICE_STALL_EXIT_GRACE_SECONDS": "1",
             },
         )
-        _wait_for_worker(box, first)
+        _wait_for_service(box, first)
         os.kill(first.pid, signal.SIGKILL)
         assert first.wait(timeout=30) == -signal.SIGKILL
 
-        # The worker receives EOF on the parent IPC channel and must drain/close
-        # before the replacement is admitted.  This wait is deliberately longer
-        # than the configured parent-loss bound and is followed by durable checks.
-        time.sleep(5)
+        # A hard-dead Flight cannot release.  The replacement waits for the
+        # authoritative lease expiry, then takes the next fencing epoch.
+        time.sleep(9)
         box.sql(
             "INSERT INTO app.customers (name, email) VALUES "
             "('after-parent-loss', 'after-parent-loss@example.com')"
         )
         second = box.spawn_service(
             matrix_arm=True,
+            capture=True,
             extra_env={
                 "CDC_SERVICE_ID": "service-core-new",
                 "CDC_SERVICE_LEASE_TTL": "8",
                 "CDC_SERVICE_LEASE_RENEW_SECONDS": "2",
-                "CDC_SERVICE_PARENT_HEARTBEAT_SECONDS": "0.25",
-                "CDC_SERVICE_PARENT_LOSS_SECONDS": "2",
-                "CDC_SERVICE_MAX_WORKER_RESTARTS": "0",
+                "CDC_SERVICE_COMMIT_TIMEOUT": "2",
+                "CDC_SERVICE_HEARTBEAT_BOUND_SECONDS": "4",
+                "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "6",
+                "CDC_SERVICE_STALL_EXIT_GRACE_SECONDS": "1",
             },
         )
-        _wait_for_worker(box, second)
+        _wait_for_service(box, second)
         time.sleep(5)
         assert _stop(second) == 0
         second = None
 
         row = box.duck_query(
-            "SELECT state, fencing_epoch, service_id, worker_pid "
+            "SELECT state, fencing_epoch, service_id "
             "FROM _cdc_flight.lease"
         )
-        assert row == [("released", 2, "service-core-new", None)]
+        assert row == [("released", 2, "service-core-new")]
         assert box.scalar(
             'SELECT count(*) FROM "cdc_raw"."cdcflight_app_customers" '
             "WHERE name = ?",
             ["after-parent-loss"],
         ) == 1
+        assert box.duck_query(
+            "SELECT code FROM _cdc_flight.alerts "
+            "WHERE code = 'service_holder_reclaimed'"
+        ) == [("service_holder_reclaimed",)]
     finally:
         for process in (first, second):
             if process is not None and process.poll() is None:
@@ -541,6 +605,165 @@ def test_sigkill_supervisor_fences_old_worker_before_same_destination_takeover(
                 process.wait(timeout=30)
         box.cleanup()
         box.reseed()
+
+
+@pytest.mark.slow
+@pytest.mark.motherduck
+def test_sigstop_expiry_takeover_sigcont_has_zero_old_fence_writes(
+    tmp_path_factory, postgres_cluster, motherduck_case
+):
+    """A frozen real process cannot resurrect as a writer after epoch takeover."""
+    case = motherduck_case
+    box = Sandbox(
+        "service_core_sigstop_resurrection",
+        tmp_path_factory.mktemp("sbx_service_core_sigstop_resurrection"),
+        postgres_cluster,
+    )
+    first = second = None
+    environment = {
+        "CDC_MD_DATABASE": case["database"],
+        "CDC_DATASET": case["dataset"],
+        "CDC_CONTROL_SCHEMA": case["control_schema"],
+        "MOTHERDUCK_TOKEN": case["token"],
+        "motherduck_token": case["token"],
+        "CDC_SERVICE_LEASE_TTL": "30",
+        "CDC_SERVICE_LEASE_RENEW_SECONDS": "5",
+        "CDC_SERVICE_COMMIT_TIMEOUT": "10",
+        "CDC_SERVICE_HEARTBEAT_BOUND_SECONDS": "15",
+        "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "20",
+        "CDC_SERVICE_STALL_EXIT_GRACE_SECONDS": "5",
+    }
+
+    def md_query(statement: str, params=None) -> list[tuple]:
+        con = motherduck_connect(case["token"], case["database"])
+        try:
+            return con.execute(statement, params or []).fetchall()
+        finally:
+            con.close()
+
+    lease_table = f'"{case["control_schema"]}"."lease"'
+    commit_table = f'"{case["control_schema"]}"."commit_log"'
+    data_table = f'"{case["dataset"]}"."cdcflight_app_customers"'
+    try:
+        box.reseed()
+        baseline = box.run(
+            reset_state=True,
+            destination="motherduck",
+            extra_env=environment,
+            max_seconds=180,
+            timeout=300,
+        )
+        assert baseline["ok"] is True, baseline
+
+        old_environment = {
+            **environment,
+            "CDC_SERVICE_ID": "service-freeze-old",
+        }
+        first = box.spawn_service(
+            destination="motherduck",
+            extra_env=old_environment,
+            capture=True,
+        )
+        box.wait_for_slot_active(process=first, timeout=60)
+        old_row = md_query(
+            f"SELECT worker_generation, fencing_epoch, expires_at "
+            f"FROM {lease_table} WHERE state = 'held'"
+        )
+        assert len(old_row) == 1, old_row
+        old_generation, old_epoch, expires_at = old_row[0]
+        old_commits_before = md_query(
+            f"SELECT count(*) FROM {commit_table} WHERE runner_id = ?",
+            [old_generation],
+        )[0][0]
+
+        os.kill(first.pid, signal.SIGSTOP)
+        # Use the destination's own clock to prove the old lease is expired.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if md_query(
+                f"SELECT expires_at <= current_timestamp FROM {lease_table} "
+                "WHERE fencing_epoch = ?",
+                [old_epoch],
+            )[0][0]:
+                break
+            time.sleep(0.25)
+        else:
+            raise AssertionError(f"epoch {old_epoch} did not expire after {expires_at}")
+
+        # The stopped Debezium connection owns the source slot.  Releasing that
+        # source-side connection lets the successor attach; the old process stays
+        # SIGSTOP-frozen and is resumed only after the successor is live.
+        box.kill_walsender()
+        tag = "service-sigstop-successor-row"
+        box.sql(
+            "INSERT INTO app.customers (name, email) VALUES "
+            f"('{tag}', '{tag}@example.com')"
+        )
+        second = box.spawn_service(
+            destination="motherduck",
+            extra_env={**environment, "CDC_SERVICE_ID": "service-freeze-new"},
+            capture=True,
+        )
+        box.wait_for_slot_active(process=second, timeout=60)
+
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            if md_query(
+                f"SELECT count(*) FROM {data_table} WHERE name = ?", [tag]
+            )[0][0] == 1:
+                break
+            if second.poll() is not None:
+                break
+            time.sleep(0.5)
+        assert second.poll() is None, _service_process_output(second)
+        assert md_query(
+            f"SELECT count(*) FROM {data_table} WHERE name = ?", [tag]
+        )[0][0] == 1
+
+        # Resurrect the old process.  It may report the source connection loss or
+        # drain, but any callback that reaches a destination commit must fail the
+        # epoch fence.  The count below measures old-generation commit rows, not
+        # merely the final row count.
+        os.kill(first.pid, signal.SIGCONT)
+        time.sleep(8)
+        if first.poll() is None:
+            first.send_signal(signal.SIGTERM)
+        first.wait(timeout=45)
+        old_commits_after = md_query(
+            f"SELECT count(*) FROM {commit_table} WHERE runner_id = ?",
+            [old_generation],
+        )[0][0]
+        assert old_commits_after - old_commits_before == 0
+        assert md_query(
+            f"SELECT count(*) FROM {data_table} WHERE name = ?", [tag]
+        )[0][0] == 1
+
+        second.send_signal(signal.SIGTERM)
+        assert second.wait(timeout=90) == 0
+        current = md_query(
+            f"SELECT state, fencing_epoch, service_id FROM {lease_table}"
+        )
+        assert current == [("released", old_epoch + 1, "service-freeze-new")], current
+    finally:
+        if first is not None and first.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(first.pid, signal.SIGCONT)
+            first.kill()
+            first.wait(timeout=30)
+        if second is not None and second.poll() is None:
+            second.kill()
+            second.wait(timeout=30)
+        box.cleanup()
+        box.reseed()
+
+
+def _service_process_output(process) -> str:
+    output = ""
+    if process.stdout is not None:
+        output += process.stdout.read() or ""
+    if process.stderr is not None:
+        output += process.stderr.read() or ""
+    return output[-12000:]
 
 
 INHERITED_SERVICE_CUTS = (
@@ -556,7 +779,7 @@ INHERITED_SERVICE_CUTS = (
 
 SERVICE_CUTS = (
     *INHERITED_SERVICE_CUTS,
-    "service_worker_startup",
+    "service_startup",
     "service_callback_midstream",
     "service_before_md_commit",
     "service_after_md_commit_before_ack",
@@ -579,7 +802,7 @@ def test_plan_4_4_service_cut_inventory_names_every_gap():
     }
     assert set(faults.SERVICE_MATRIX_POINTS) <= set(SERVICE_CUTS)
     assert covered <= set(SERVICE_CUTS) | set(faults.BACKFILL_POINTS)
-    assert "service_worker_startup" in set(SERVICE_CUTS)
+    assert "service_startup" in set(SERVICE_CUTS)
     assert set(UNREACHABLE_SERVICE_CUTS) == {
         "scheduler request",
         "full-refresh handoff",
@@ -594,7 +817,7 @@ def test_plan_4_4_service_cut_inventory_names_every_gap():
     assert all(UNREACHABLE_SERVICE_CUTS.values())
 
 SIGKILL_SERVICE_CUTS = (
-    "service_worker_startup",
+    "service_startup",
     "service_callback_midstream",
     "service_after_md_commit_before_ack",
     "service_lease_renewal",
@@ -608,19 +831,32 @@ def _service_cut_environment(box: Sandbox, cut: str) -> dict[str, str]:
         "CDC_SERVICE_ID": f"service-cut-{cut}",
         "CDC_SERVICE_LEASE_TTL": "8",
         "CDC_SERVICE_LEASE_RENEW_SECONDS": "1",
-        "CDC_SERVICE_PARENT_HEARTBEAT_SECONDS": "0.25",
-        "CDC_SERVICE_PARENT_LOSS_SECONDS": "2",
-        "CDC_SERVICE_MAX_WORKER_RESTARTS": "0",
+        "CDC_SERVICE_COMMIT_TIMEOUT": "2",
+        "CDC_SERVICE_HEARTBEAT_BOUND_SECONDS": "4",
+        "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "6",
+        "CDC_SERVICE_STALL_EXIT_GRACE_SECONDS": "1",
     }
     if cut == "ownership_callback_owned":
         # Force the real callback-quiescence failure to its bounded transfer.  The
         # child then hard-exits at the production ownership transition; no test state
-        # is assigned by the harness.
+        # is assigned by the harness. Give this proof a separate watchdog margin:
+        # the callback must publish its failed-quiescence transfer before either the
+        # destination commit bound or the local service stall bound expires.
         environment.update(
             {
+                "CDC_SERVICE_LEASE_TTL": "30",
+                "CDC_SERVICE_LEASE_RENEW_SECONDS": "5",
+                "CDC_SERVICE_HEARTBEAT_BOUND_SECONDS": "15",
+                "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "20",
+                "CDC_SERVICE_STALL_EXIT_GRACE_SECONDS": "2",
+                "CDC_SERVICE_COMMIT_TIMEOUT": "28",
                 "CDC_FAULT_INJECT": "destination_hang:1",
                 "CDC_FAULT_HANG_SECONDS": "30",
-                "CDC_COMMIT_TIMEOUT": "300",
+                # The callback-owned cell needs the bounded drain/quiescence proof
+                # to publish ownership before the independent destination watchdog
+                # fires. Keep the commit bound below the thirty-second lease, while
+                # leaving the close bound at one second as the actual proof bound.
+                "CDC_COMMIT_TIMEOUT": "28",
                 "CDC_CLOSE_TIMEOUT": "1",
             }
         )
@@ -649,8 +885,8 @@ def _advance_slot_past_new_rows(box: Sandbox) -> None:
     )
 
 
-def _duck_query_after_worker_exit(box: Sandbox, statement: str) -> list[tuple]:
-    """Wait for a child-owned DuckDB handle to retire before probing durability."""
+def _duck_query_after_service_exit(box: Sandbox, statement: str) -> list[tuple]:
+    """Wait for the service-owned DuckDB handle to retire before probing durability."""
     deadline = time.monotonic() + 45
     while True:
         try:
@@ -659,23 +895,6 @@ def _duck_query_after_worker_exit(box: Sandbox, statement: str) -> list[tuple]:
             if "Conflicting lock" not in str(exc) or time.monotonic() >= deadline:
                 raise
             time.sleep(0.1)
-
-
-def _wait_for_pid_exit(pid: int | None, *, timeout: float = 45.0) -> None:
-    """Prove the old service worker is gone before a takeover attempt."""
-    if pid is None:
-        return
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            os.kill(int(pid), 0)
-        except ProcessLookupError:
-            return
-        except PermissionError:
-            pass
-        if time.monotonic() >= deadline:
-            raise AssertionError(f"service worker pid {pid} did not exit before takeover")
-        time.sleep(0.1)
 
 
 def _run_one_service_cut(box: Sandbox, cut: str) -> dict:
@@ -695,7 +914,7 @@ def _run_one_service_cut(box: Sandbox, cut: str) -> dict:
     baseline_lsn = int(baseline_resume[0][0])
     tag = f"service-cut-row-{cut}"
     if cut in {*INHERITED_SERVICE_CUTS, "service_callback_midstream"}:
-        # The matrix arm is in the worker callback, not in this parent process.
+        # The matrix arm is in the service callback, not in this test process.
         box.sql(
             [
                 "SET synchronous_commit = on",
@@ -732,9 +951,10 @@ def _run_one_service_cut(box: Sandbox, cut: str) -> dict:
     }:
         _advance_slot_past_new_rows(box)
 
+    service_environment = _service_cut_environment(box, cut)
     process = box.spawn_service(
         matrix_arm=True,
-        extra_env=_service_cut_environment(box, cut),
+        extra_env=service_environment,
     )
     try:
         if cut in {
@@ -752,27 +972,23 @@ def _run_one_service_cut(box: Sandbox, cut: str) -> dict:
                     break
                 time.sleep(0.05)
         returncode = process.wait(timeout=90)
-        # Parent-loss cleanup is bounded by the worker's IPC timeout.  It is
-        # important to wait before reopening DuckDB for the recovery child.  The
-        # bounded lock-retrying probe below is the synchronization point; a fixed
-        # post-exit sleep only adds host contention to this 20-cell real-process
-        # matrix without proving anything about handle retirement.
+        # The bounded lock-retrying probe below is the synchronization point for
+        # the single process's destination handle retirement.
         fired = box.fired_fault()
         # Capture the generation's durable ownership record before the finite
         # recovery adapter acquires and releases the same physical lease.  The
         # post-recovery table is intentionally empty on the batch path, so
         # querying only after recovery would erase the evidence of the service
         # generation's terminal fence.
-        lease_before_recovery = _duck_query_after_worker_exit(
+        lease_before_recovery = _duck_query_after_service_exit(
             box,
-            "SELECT state, fencing_epoch, worker_pid, worker_generation "
+            "SELECT state, fencing_epoch, service_id "
             "FROM _cdc_flight.lease"
         )
-        _wait_for_pid_exit(lease_before_recovery[0][2])
         # This is intentionally before `box.run()` below.  Recovery is allowed to
         # repair a missing state row, but it must not be the reason this test claims
         # data/state atomicity.  The post-MD-commit cut must expose both facts from
-        # the crashed worker's own durable transaction while no recovery worker owns
+        # the crashed Flight's own durable transaction while no recovery run owns
         # the destination.
         pre_recovery_row_count = (
             box.scalar(
@@ -803,6 +1019,10 @@ def _run_one_service_cut(box: Sandbox, cut: str) -> dict:
                 int(pre_recovery_resume[0][0]) if pre_recovery_resume else None
             ),
         }
+        if lease_before_recovery[0][0] == "held":
+            # A hard process death leaves the row held until the authoritative
+            # expiry.  Batch recovery must not bypass that fence.
+            time.sleep(float(service_environment["CDC_SERVICE_LEASE_TTL"]) + 1)
         recovery = box.run(
             max_seconds=180,
             timeout=260,
@@ -816,9 +1036,9 @@ def _run_one_service_cut(box: Sandbox, cut: str) -> dict:
             "SELECT count(*) FROM \"cdc_raw\".\"cdcflight_app_customers\" "
             "WHERE name LIKE 'service-open-%'"
         )
-        lease_after_recovery = _duck_query_after_worker_exit(
+        lease_after_recovery = _duck_query_after_service_exit(
             box,
-            "SELECT state, fencing_epoch, worker_pid FROM _cdc_flight.lease"
+            "SELECT state, fencing_epoch, service_id FROM _cdc_flight.lease"
         )
         return {
             "returncode": returncode,
@@ -866,12 +1086,7 @@ def test_every_service_cut_is_a_real_child_death_with_durable_recovery(
     assert result["recovery"]["returncode"] == 0, result
     assert result["recovery"].get("ok") is True, result
     assert len(result["lease"]) == 1, result
-    assert result["lease"][0][0] in {
-        "released",
-        "supervisor_held",
-        "worker_active",
-        "worker_starting",
-    }, result
+    assert result["lease"][0][0] in {"released", "held"}, result
     assert result["lease_after_recovery"] == [], result
     if cut == "service_pg_transaction_open":
         assert result["row_count"] == 3000, result
@@ -951,18 +1166,14 @@ def test_service_sigkill_edges_leave_one_durable_owner(
         # Parent loss and bounded engine retirement are separate operation bounds;
         # retry the read-only probe while the child-owned DuckDB handle retires, but
         # fail if it does not release within the finite crash-harness bound.
-        lease = _duck_query_after_worker_exit(
+        lease = _duck_query_after_service_exit(
             box,
-            "SELECT state, fencing_epoch, worker_pid FROM _cdc_flight.lease"
+            "SELECT state, fencing_epoch, service_id FROM _cdc_flight.lease"
         )
         assert len(lease) == 1, lease
-        assert lease[0][0] in {
-            "released",
-            "supervisor_held",
-            "worker_active",
-            "worker_starting",
-        }, lease
-        _wait_for_pid_exit(lease[0][2])
+        assert lease[0][0] in {"released", "held"}, lease
+        if lease[0][0] == "held":
+            time.sleep(9)
 
         recovery = box.run(max_seconds=180, timeout=260, expect_success=False)
         assert recovery["returncode"] == 0, recovery

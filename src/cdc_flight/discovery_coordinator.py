@@ -158,6 +158,12 @@ class LiveDiscoveryCoordinator:
                     offset_file=self.replication.offset_file,
                     always_commit_offsets=engine_props.get("offset.flush.interval.ms") == "0",
                 )
+                if self.service_context is not None:
+                    # JPype/JVM startup installs native SIGTERM/SIGINT handlers.
+                    # Reapply the Flight's drain handler after that point so an
+                    # operator signal requests a bounded drain instead of making
+                    # the JVM call System.exit underneath the lease owner.
+                    self.service_context.rearm_process_signals()
                 self._wire_consumer(engine, self.applier)
                 self.health = SourceHealth(
                     dsn=self.source.dsn,

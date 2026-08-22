@@ -210,6 +210,13 @@ def run_engine_bounded(
 
     thread = threading.Thread(target=_run, name="debezium-engine", daemon=True)
     thread.start()
+    if service_mode:
+        # The stock engine may install its native signal handlers as streaming
+        # starts, after the coordinator's construction-time rearm.  Reapply the
+        # Python drain handler from the main thread once the engine thread exists;
+        # the loop repeats this at every boundary so an operator signal cannot turn
+        # into an unbounded JVM/default-handler shutdown race.
+        service_context.rearm_process_signals()
 
     # rubric 1.9: a precedence, not a string. `record()` keeps the most severe value it
     # has been given, so no later assignment can overwrite an earlier diagnosis. ONE
@@ -241,14 +248,37 @@ def run_engine_bounded(
     ) if service_mode else None
     try:
         while thread.is_alive():
+            if service_mode:
+                service_context.rearm_process_signals()
             elapsed = time.monotonic() - started
-            if service_mode and service_context.parent_lost:
-                # Parent loss is a write barrier.  Check it before the periodic
-                # source-health/run-log projection so a dead supervisor cannot
-                # even emit observability I/O while the worker is unwinding.
+            if service_mode and (service_context.lease_lost or service_context.stalled):
+                # A lost lease or a local stall is a write barrier.  Check it
+                # before periodic source-health/run-log projection so a failed
+                # Flight cannot emit observability I/O while it is unwinding.
                 outcome.record("engine_error")
                 break
-            if phases is not None and health is not None and hasattr(phases, "record_log"):
+            if service_mode and not handler.busy:
+                # An idle engine is making progress through this bounded
+                # monitoring loop. A live callback is different: its own
+                # operation timestamps must advance, otherwise a wedged
+                # callback could be mistaken for a healthy idle Flight.
+                service_context.mark_progress()
+            if (
+                phases is not None
+                and health is not None
+                and hasattr(phases, "record_log")
+                # In service mode a live callback owns the destination operation
+                # lock.  Do not let best-effort telemetry become the main thread's
+                # next blocking wait behind that callback: the drain/stall decision
+                # below must remain reachable even when COMMIT is wedged.
+                and (
+                    not service_mode
+                    or (
+                        not service_context.drain_requested
+                        and not handler.busy
+                    )
+                )
+            ):
                 if service_mode:
                     faults.matrix_crash("service_source_health_write")
                     faults.matrix_crash("service_run_log_write")
@@ -328,8 +358,8 @@ def run_engine_bounded(
                     outcome.record("engine_error")
                     break
                 # There is no completion watermark in a service.  Liveness is
-                # supplied by the parent heartbeat and the worker heartbeat, while
-                # every callback/transaction/close operation retains its own bound.
+                # supplied by the destination lease heartbeat, while every
+                # callback/transaction/close operation retains its own bound.
                 time.sleep(0.25)
                 continue
             if elapsed >= run.max_seconds:
@@ -417,7 +447,7 @@ def run_engine_bounded(
             outcome.record("engine_finished")
     finally:
         if service_mode:
-            if service_context.parent_lost:
+            if service_context.lease_lost or service_context.stalled:
                 outcome.record("engine_error")
             # Set drain intent before any final source hand-off.  If a callback is
             # admitted during that bounded hand-off it can still close a complete
@@ -439,7 +469,7 @@ def run_engine_bounded(
             and health.ever_sampled
             and not getattr(getattr(handler, "cfg", None), "resnapshot", False)
             and outcome.value not in {"source_dark", "hung"}
-            and not (service_mode and service_context.parent_lost)
+            and not (service_mode and (service_context.lease_lost or service_context.stalled))
         )
         if not final_ack_required:
             shutdown_sequence.to(SHUTDOWN_ACK_NOT_REQUIRED)

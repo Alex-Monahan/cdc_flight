@@ -142,11 +142,11 @@ def commit_watchdog(timeout: float, commit_id: int, stage=None, on_timeout=None)
 def destination_operation_watchdog(timeout: float):
     """Bound pre-COMMIT destination work without adding work to COMMIT_ACK.
 
-    The service worker is a hard process boundary, so terminating it is the only
-    reliable cancellation for a native DuckDB/MotherDuck call that does not return.
-    This guard is intentionally stopped immediately before the commit/ack protocol;
-    the existing ``commit_watchdog`` owns that smaller window and its callback is
-    likewise I/O-free.
+    The Flight is a hard process boundary, so terminating the whole instance is the
+    only reliable cancellation for a native DuckDB/MotherDuck call that does not
+    return.  This guard is intentionally stopped immediately before the commit/ack
+    protocol; the existing ``commit_watchdog`` owns that smaller window and its
+    callback is likewise I/O-free.
     """
     if not timeout or timeout <= 0:
         yield lambda: None

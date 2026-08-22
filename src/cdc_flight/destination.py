@@ -181,13 +181,15 @@ class ResumePoint:
 # --------------------------------------------------------------------------- #
 # connection
 # --------------------------------------------------------------------------- #
-def connect(dest) -> Any:
+def connect(dest, *, read_only: bool = False) -> Any:
     """Open the one destination connection the applier writes through."""
     import duckdb
 
     if dest.kind == "duckdb":
         dest.duckdb_path.parent.mkdir(parents=True, exist_ok=True)
-        con = duckdb.connect(str(dest.duckdb_path), config=DUCKDB_CONNECT_CONFIG)
+        con = duckdb.connect(
+            str(dest.duckdb_path), config=DUCKDB_CONNECT_CONFIG, read_only=read_only
+        )
         assert_runtime_capabilities(con)
         return con
 
@@ -224,6 +226,7 @@ def connect(dest) -> Any:
         con = duckdb.connect(
             f"md:{database}?motherduck_token={token}",
             config=DUCKDB_CONNECT_CONFIG,
+            read_only=read_only,
         )
         assert_runtime_capabilities(con)
         return con
@@ -615,7 +618,6 @@ from .destination_alerts import (  # noqa: E402, F401
 )
 from .destination_lease import (  # noqa: E402, F401
     Lease,
-    _is_dead,
     probe_transactional_ddl,
     release_connection,
 )

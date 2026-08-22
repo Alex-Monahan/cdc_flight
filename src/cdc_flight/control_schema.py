@@ -82,7 +82,9 @@ CONTROL_DDL = [
             acquired_at          TIMESTAMPTZ NOT NULL,
             renewed_at           TIMESTAMPTZ NOT NULL,
             expires_at           TIMESTAMPTZ NOT NULL,
-            state                VARCHAR     DEFAULT 'supervisor_held'
+            -- ``renewed_at`` is the service heartbeat.  The row is retained as
+            -- ``released`` on a clean service stop so the next epoch is visible.
+            state                VARCHAR     DEFAULT 'held'
         )""",
     f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.table_state (
             pipeline        VARCHAR     NOT NULL,
@@ -532,7 +534,7 @@ def _migrate_legacy_lease(con, control_schema: str | None = None) -> None:
         "fencing_epoch=coalesce(fencing_epoch, 1), "
         "service_id=coalesce(service_id, owner_id), "
         "worker_generation=coalesce(worker_generation, owner_id), "
-        "state=coalesce(state, 'supervisor_held')"
+        "state=coalesce(state, 'held')"
     )
 
 

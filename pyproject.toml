@@ -15,7 +15,7 @@ dependencies = [
     "dlt[duckdb,motherduck]>=1.19.0",
     # Upper bound is deliberate: MotherDuck only supports DuckDB releases it has
     # shipped an extension for (1.5.5 is rejected at connect time, 1.5.4 works).
-    "duckdb>=1.4.0,<1.5.5",
+    "duckdb==1.5.4",
     "psycopg[binary]>=3.2.0",
     # The apply path inserts through a registered Arrow table. MEASURED: 200 000
     # rows x 19 columns take 1.37 s that way and 410 s via `executemany`, and

@@ -543,12 +543,16 @@ class Applier:
                     )
                     return
                 self._in_flight += 1
+            if self.service_context is not None:
+                self.service_context.operation_started()
             try:
                 self._handle(records, committer)
             except BaseException as exc:
                 self.error = exc
                 raise
             finally:
+                if self.service_context is not None:
+                    self.service_context.operation_finished()
                 with self._quiescence:
                     self._in_flight -= 1
                     if self._last_callback_had_data:
@@ -557,7 +561,7 @@ class Applier:
                         self._quiescence.notify_all()
 
     def renew_service_lease(self) -> bool:
-        """Apply one parent-authorized renewal when the callback is quiescent."""
+        """Apply one serialized service renewal when the callback is quiescent."""
         if self.service_context is None or not self.service_context.renew_requested:
             return False
         with self._destination_operation_lock:
@@ -664,6 +668,11 @@ class Applier:
                 self.skipped_count += 1
             for unit in self.assembler.feed(rec):
                 self._add_unit(unit)
+            if self.service_context is not None:
+                # A large callback is healthy only while it is actually
+                # consuming records. If one native/decode operation wedges,
+                # the watchdog must distinguish it from an idle stream.
+                self.service_context.mark_progress()
 
         with self._lock:
             self.batch_count += 1

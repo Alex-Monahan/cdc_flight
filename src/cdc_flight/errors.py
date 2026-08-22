@@ -128,6 +128,20 @@ class AdmissionError(ValueError):
     """
 
 
+class ServiceStandDown(AdmissionError):
+    """This scheduled Flight is healthy but not the live destination holder.
+
+    It is a successful scheduler outcome, not a pipeline failure.  The service
+    entry point catches it before the ordinary alerting boundary so a minute-by-
+    minute schedule does not emit one incident for every no-op run.  Admission
+    owns this decision, so it remains inside the package's typed admission root.
+    """
+
+    def __init__(self, message: str, summary: dict | None = None):
+        super().__init__(message)
+        self.summary = dict(summary or {})
+
+
 # --------------------------------------------------------------------------- #
 # transactional applier (ADR 0001 §3, §4)
 # --------------------------------------------------------------------------- #

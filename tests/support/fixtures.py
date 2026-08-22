@@ -618,7 +618,7 @@ class Sandbox:
         capture: bool = False,
         matrix_arm: bool = False,
     ) -> subprocess.Popen:
-        """Start the real supervisor; it starts the real service worker child."""
+        """Start one real service Flight child for process-death assertions."""
         sink = subprocess.PIPE if capture else subprocess.DEVNULL
         env = {**self.env, **(extra_env or {})}
         executable = (

@@ -176,7 +176,7 @@ BACKFILL_POINTS = (
     # Long-running service cuts.  They are registered separately from the
     # inherited 1.7 anchors so the finite matrix remains exactly the baseline
     # cardinality while service-mode children can target mid-stream edges.
-    "service_worker_startup",
+    "service_startup",
     "service_callback_midstream",
     "service_before_md_commit",
     "service_after_md_commit_before_ack",
@@ -299,7 +299,7 @@ MATRIX_POINTS = (
 # remains exactly the baseline set while a service child can target its own
 # long-lived lifecycle edges.
 SERVICE_MATRIX_POINTS = (
-    "service_worker_startup",
+    "service_startup",
     "service_callback_midstream",
     "service_before_md_commit",
     "service_after_md_commit_before_ack",
