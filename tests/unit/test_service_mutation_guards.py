@@ -366,6 +366,40 @@ def test_service_stall_is_a_write_barrier_and_self_exit_is_bounded(monkeypatch):
         context.close()
 
 
+def test_service_source_dark_preserves_diagnosis_through_watchdog_teardown():
+    policy = ServiceConfig(
+        lease_ttl_seconds=1.0,
+        lease_renew_seconds=0.1,
+        heartbeat_bound_seconds=0.2,
+        stall_timeout_seconds=0.05,
+        stall_exit_grace_seconds=0.05,
+        watchdog_poll_seconds=0.01,
+        commit_timeout_seconds=0.2,
+        close_timeout_seconds=0.2,
+        invariant_check_seconds=0.1,
+    )
+    exited: list[int] = []
+    context = ServiceContext(
+        service_id="service-a",
+        lease_id="lease-a",
+        worker_generation="service-a:generation",
+        policy=policy,
+        exit_fn=exited.append,
+    )
+    try:
+        # The supervisor has already diagnosed the source and requested a drain,
+        # while the local stall clock may have fired in the same polling interval.
+        context._stall_event.set()
+        context.note_source_dark()
+        context.request_drain()
+        context.start_watchdog()
+        time.sleep(0.2)
+        assert exited == []
+        assert context.source_health_status == "dark"
+    finally:
+        context.close()
+
+
 def test_same_process_generation_is_attached_to_one_admitted_lease(tmp_path):
     con, holder = _lease(tmp_path, owner="holder")
     context = ServiceContext(
@@ -534,10 +568,57 @@ def test_service_heartbeat_uses_the_same_admitted_connection():
     connection = object()
     try:
         context.bind(lease, connection)
+        context.set_engine_thread_alive(True)
+        context.note_engine_callback()
+        context.note_engine_commit(100)
+        context.note_engine_ack(100)
         context.observe_source_health("connected_quiet", time.monotonic())
         context._next_heartbeat = time.monotonic() - 1
         assert context.renew_once() is True
         assert lease.called_with is connection
+    finally:
+        context.close()
+
+
+def test_service_dead_engine_cannot_renew_through_a_live_slot_witness():
+    class LeaseProbe:
+        lease_key = "physical:test"
+        epoch = 1
+        renewed = 0
+
+        def renew_control(self, _connection):
+            self.renewed += 1
+
+    context = ServiceContext(
+        service_id="service-a",
+        lease_id="lease-a",
+        worker_generation="service-a:generation",
+        policy=ServiceConfig(),
+    )
+    lease = LeaseProbe()
+    try:
+        context.bind(lease, object())
+        context.set_engine_thread_alive(True)
+        context.note_engine_callback()
+        context.note_engine_commit(100)
+        context.note_engine_ack(100)
+        context.observe_source_health(
+            "connected_quiet", time.monotonic(), engine_thread_alive=True
+        )
+        context._next_heartbeat = time.monotonic() - 1
+        assert context.renew_once() is True
+
+        # Callback/commit timestamps without our durable acknowledgement position
+        # are not enough to renew, even while the slot witness still says quiet.
+        context._last_engine_ack_lsn = None
+        context._next_heartbeat = time.monotonic() - 1
+        assert context.renew_once() is False
+        assert lease.renewed == 1
+        context._last_engine_ack_lsn = 100
+        context.set_engine_thread_alive(False)
+        context._next_heartbeat = time.monotonic() - 1
+        assert context.renew_once() is False
+        assert lease.renewed == 1
     finally:
         context.close()
 

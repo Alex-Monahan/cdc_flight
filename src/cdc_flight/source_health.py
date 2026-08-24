@@ -27,7 +27,11 @@ The source can: while the connector holds the replication stream, its slot is
 
 This module samples `pg_replication_slots` on its own short-timeout connection
 (which is also the 4.6 silently-dead-node detector) and answers one question:
-**is it safe to call this stream idle?**
+**is it safe to call this stream idle?**  In service mode, a slot sample is only
+corroboration.  The service witness also requires the admitted engine thread to
+be alive and a recent callback/commit/ack from this Flight.  A different client
+can keep a slot active, and an attached walsender can hold WAL without delivering
+anything; neither can satisfy that local proof.
 """
 
 from __future__ import annotations
@@ -64,6 +68,7 @@ DEFAULT_MAX_IDLE_LAG_BYTES = 64 * 1024
 
 _SLOT_SQL = """
 SELECT s.active,
+       s.active_pid,
        s.confirmed_flush_lsn IS NOT NULL AS has_confirmed,
        CASE WHEN s.confirmed_flush_lsn IS NULL THEN NULL
             ELSE (s.confirmed_flush_lsn - '0/0')::BIGINT END AS confirmed_pos,
@@ -82,6 +87,10 @@ class SlotSample:
     at: float
     exists: bool = False
     active: bool = False
+    #: PostgreSQL's current walsender PID.  It is operator corroboration only:
+    #: the PID changes on every legitimate reconnect/takeover and is never used
+    #: as the service's identity proof.
+    active_pid: int | None = None
     lag_bytes: int | None = None
     confirmed_pos: int | None = None
     restart_pos: int | None = None
@@ -152,6 +161,13 @@ class SourceHealth:
     _ever_streamed: bool = field(default=False, repr=False)
     _unknown_samples: int = field(default=0, repr=False)
     _last_idle_marker_lsn: int | None = field(default=None, repr=False)
+    #: Service-mode evidence is kept separately from the generic slot fold.  A
+    #: sampler can say "active" while our engine is dead or while no callback has
+    #: completed; those observations must age into source_dark instead of renewing.
+    _service_status: str | None = field(default=None, repr=False)
+    _service_stalled_since: float | None = field(default=None, repr=False)
+    _service_engine_thread_dead: bool = field(default=False, repr=False)
+    _service_lag_bytes: int | None = field(default=None, repr=False)
 
     # -- lifecycle ---------------------------------------------------------- #
     def start(self) -> SourceHealth:
@@ -301,11 +317,12 @@ class SourceHealth:
             )
         if row is None:
             return SlotSample(at=now, exists=False, observed_at=datetime.now(UTC))
-        active, has_confirmed, confirmed_pos, restart_pos, lag = row
+        active, active_pid, has_confirmed, confirmed_pos, restart_pos, lag = row
         return SlotSample(
             at=now,
             exists=True,
             active=bool(active),
+            active_pid=(int(active_pid) if active_pid is not None else None),
             confirmed_pos=(int(confirmed_pos) if has_confirmed else None),
             restart_pos=(int(restart_pos) if restart_pos is not None else None),
             lag_bytes=int(lag) if has_confirmed else None,
@@ -369,7 +386,14 @@ class SourceHealth:
     @property
     def dark_for(self) -> float:
         """Seconds the last successful source has been dark or unaskable."""
-        return max(self.not_streaming_for, self.unknown_for, self.retrying_for)
+        with self._lock:
+            service_since = self._service_stalled_since
+        service_for = (
+            max(0.0, time.monotonic() - service_since)
+            if service_since is not None
+            else 0.0
+        )
+        return max(self.not_streaming_for, self.unknown_for, self.retrying_for, service_for)
 
     @property
     def ever_sampled(self) -> bool:
@@ -554,29 +578,163 @@ class SourceHealth:
             "streaming" if sample.streaming else "not_streaming"
         )
 
-    def service_status(self, received_high_water: int | None = None) -> str:
+    def _publish_service_status(
+        self,
+        status: str,
+        *,
+        observed_at: float,
+        engine_thread_alive: bool,
+        lag_bytes: int | None,
+    ) -> str:
+        """Record the service verdict and its fail-closed aging clock."""
+        with self._lock:
+            self._service_status = status
+            self._service_engine_thread_dead = not engine_thread_alive
+            self._service_lag_bytes = lag_bytes
+            if status in {"connected_quiet", "connected_busy"}:
+                self._service_stalled_since = None
+            elif (
+                status in {"stalled", "unproven", "engine_thread_dead"}
+                and self._service_stalled_since is None
+            ):
+                self._service_stalled_since = observed_at
+        return status
+
+    def service_status(
+        self,
+        received_high_water: int | None = None,
+        *,
+        engine_thread_alive: bool,
+        own_progress_at: float | None,
+        own_ack_at: float | None,
+        own_ack_lsn: int | None,
+        durable_lsn: int | None,
+        progress_stale_after: float,
+    ) -> str:
         """Classify source evidence for the single-process lease watchdog.
 
-        ``connected_quiet`` is the only state that lets an otherwise idle service
-        renew: the slot is active, the sampler observation is recent, and any WAL
-        outstanding for this handler is within the established quiet bound.  A live
-        slot with a real backlog is ``connected_busy`` and must be kept alive by
-        callbacks/commits.  A missing/inactive/error observation is disconnected
-        evidence; it stops renewal and is handled by the source-dark branch.
+        The service witness is deliberately conjunctive:
+
+        * the sampler observation is fresh and the slot is active;
+        * the *admitted* Debezium engine thread is still alive;
+        * this process has recently completed a callback/commit and a
+          ``markBatchFinished`` acknowledgement tied to a durable resume point.
+
+        ``connected_quiet`` and ``connected_busy`` are therefore classifications
+        of a proven Flight-owned stream.  If that proof goes stale, the source's
+        retained-WAL lag is used as the discriminator: pending source WAL with no
+        Flight progress is ``stalled``.  The cluster-side lag is not used as a
+        stand-alone heartbeat and no slot activity can bypass these checks.
+
+        ``max_lag_bytes`` is intentionally not part of this service decision.  The
+        exact source-position relation (zero versus pending WAL) and our own
+        progress are the signal; a size cutoff would turn an outage into a tuning
+        exercise and would recreate the gate's false-green shape.
         """
+        now = time.monotonic()
         sample = self.last
         if sample is None:
-            return "unobserved"
-        if time.monotonic() - sample.at > max(self.interval * 3.0, 1.0):
-            return "stale"
+            return self._publish_service_status(
+                "unobserved",
+                observed_at=now,
+                engine_thread_alive=engine_thread_alive,
+                lag_bytes=None,
+            )
+        if now - sample.at > max(self.interval * 3.0, 1.0):
+            return self._publish_service_status(
+                "stale",
+                observed_at=now,
+                engine_thread_alive=engine_thread_alive,
+                lag_bytes=sample.lag_bytes,
+            )
         if sample.unknown or not sample.streaming:
-            return "unknown" if sample.unknown else "disconnected"
-        if self.retrying_for > 0:
-            return "retrying"
-        outstanding = self.outstanding_bytes(received_high_water)
-        if outstanding is None or outstanding <= self.max_lag_bytes:
-            return "connected_quiet"
-        return "connected_busy"
+            return self._publish_service_status(
+                "unknown" if sample.unknown else "disconnected",
+                observed_at=now,
+                engine_thread_alive=engine_thread_alive,
+                lag_bytes=sample.lag_bytes,
+            )
+        if not engine_thread_alive:
+            return self._publish_service_status(
+                "engine_thread_dead",
+                observed_at=now,
+                engine_thread_alive=False,
+                lag_bytes=sample.lag_bytes,
+            )
+
+        # A reconnect after a walsender interruption is not recovery until this
+        # Flight's confirmed position advances.  If PostgreSQL is retaining WAL
+        # while that proof is absent, start the fail-closed stall clock at the
+        # interruption rather than granting a fresh active sample a new lease.
+        if (
+            self.stream_interruptions
+            and not self.recovered_after_interruption
+            and (sample.lag_bytes or 0) > 0
+        ):
+            return self._publish_service_status(
+                "stalled",
+                observed_at=now,
+                engine_thread_alive=True,
+                lag_bytes=sample.lag_bytes,
+            )
+
+        # The local proof is required even when a different client has already
+        # moved confirmed_flush_lsn to the current WAL.  That client cannot create
+        # any of these timestamps or the durable LSN owned by this process.
+        missing_own_proof = (
+            own_progress_at is None
+            or own_ack_at is None
+            or own_ack_lsn is None
+            or durable_lsn is None
+        )
+        if missing_own_proof:
+            status = "stalled" if (sample.lag_bytes or 0) > 0 else "unproven"
+            return self._publish_service_status(
+                status,
+                observed_at=now,
+                engine_thread_alive=True,
+                lag_bytes=sample.lag_bytes,
+            )
+
+        if sample.confirmed_pos is not None and sample.confirmed_pos > durable_lsn:
+            # This is the source-side form of Invariant O: another client may have
+            # acknowledged the slot beyond this Flight's durable destination point.
+            return self._publish_service_status(
+                "stalled",
+                observed_at=now,
+                engine_thread_alive=True,
+                lag_bytes=sample.lag_bytes,
+            )
+
+        progress_age = now - max(float(own_progress_at), float(own_ack_at))
+        if progress_age > max(float(progress_stale_after), 0.0):
+            status = "stalled" if (sample.lag_bytes or 0) > 0 else "unproven"
+            return self._publish_service_status(
+                status,
+                observed_at=now,
+                engine_thread_alive=True,
+                lag_bytes=sample.lag_bytes,
+            )
+
+        # A Flight-owned acknowledgement is the only quiet-position proof.  The
+        # per-slot value is exact here: zero means our delivered high-water is at
+        # or below the slot confirmation; positive means the live Flight is busy
+        # catching up.  The cluster-retained lag above remains the fail-closed
+        # discriminator when this local progress proof disappears.
+        outstanding = self.per_slot_outstanding_bytes(received_high_water)
+        if outstanding is None:
+            return self._publish_service_status(
+                "unproven",
+                observed_at=now,
+                engine_thread_alive=True,
+                lag_bytes=sample.lag_bytes,
+            )
+        return self._publish_service_status(
+            "connected_quiet" if outstanding == 0 else "connected_busy",
+            observed_at=now,
+            engine_thread_alive=True,
+            lag_bytes=sample.lag_bytes,
+        )
 
     def outstanding_bytes(self, received_high_water: int | None) -> int | None:
         """OUR undelivered backlog, in bytes, or ``None`` when it cannot be read.
@@ -770,6 +928,7 @@ class SourceHealth:
             "slot_health": self.state(),
             "slot_exists": sample.exists,
             "slot_active": sample.active,
+            "slot_active_pid": sample.active_pid,
             "slot_confirmed_pos": sample.confirmed_pos,
             "slot_restart_pos": sample.restart_pos,
             "slot_lag_bytes": sample.lag_bytes,
@@ -784,6 +943,15 @@ class SourceHealth:
             "slot_lag_steady_for_sec": round(self.lag_steady_for, 1),
             "slot_stream_interruptions": self.stream_interruptions,
             "slot_recovered_after_interruption": self.recovered_after_interruption,
+            "service_liveness_status": self._service_status,
+            "service_engine_thread_dead": self._service_engine_thread_dead,
+            "service_lag_bytes": self._service_lag_bytes,
+            "service_stalled_for_sec": round(
+                max(0.0, time.monotonic() - self._service_stalled_since)
+                if self._service_stalled_since is not None
+                else 0.0,
+                1,
+            ),
             **(
                 {
                     "source_marker": self.source_marker.summary()

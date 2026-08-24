@@ -225,7 +225,7 @@ def commit_group(self, trigger: str) -> CommitResult:
                 if self.service_context is not None:
                     # A durable destination commit is real forward motion.  A
                     # lease heartbeat or a supervisor loop iteration is not.
-                    self.service_context.mark_progress()
+                    self.service_context.note_engine_commit(new_point.last_lsn)
                     matrix_crash("service_after_md_commit_before_ack")
                     # A lease loss after the destination commit is still a
                     # no-ack path.  The durable destination wins and the source
@@ -364,6 +364,11 @@ def commit_group(self, trigger: str) -> CommitResult:
     self.last_commit_id = commit_id
     self.resume_point = new_point
     self._next_commit_id = max(self._next_commit_id, commit_id + 1)
+    if self.service_context is not None:
+        # This is deliberately after markBatchFinished() and after the durable
+        # resume point has been installed.  Another client's slot activity cannot
+        # manufacture this own-ack edge.
+        self.service_context.note_engine_ack(new_point.last_lsn)
     # A throwaway re-snapshot has its own Debezium offset file, which may already
     # include acknowledged duplicate streaming records that arrived after the
     # snapshot image's point. It is disposable handoff evidence, not the main

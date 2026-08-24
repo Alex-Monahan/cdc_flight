@@ -65,11 +65,20 @@ class ServiceContext:
         self._next_heartbeat = time.monotonic() + policy.lease_renew_seconds
         self._last_source_observation: float | None = None
         self._source_health_status: str | None = None
+        #: The source sampler is not a local heartbeat.  These fields are updated
+        #: only by the admitted Debezium callback/commit/ack path and are the
+        #: inputs the service witness uses alongside the sampler's corroboration.
+        self._engine_thread_alive: bool | None = None
+        self._last_engine_callback: float | None = None
+        self._last_engine_commit: float | None = None
+        self._last_engine_ack: float | None = None
+        self._last_engine_ack_lsn: int | None = None
         self._stall_message: str | None = None
         self._lease_failure: BaseException | None = None
         self._watchdog: threading.Thread | None = None
         self._exit_fn = exit_fn or os._exit
         self._started = False
+        self._teardown_started = False
         self._signal_reinstaller = None
 
     def set_signal_reinstaller(self, callback) -> None:
@@ -104,13 +113,19 @@ class ServiceContext:
         with self._lock:
             self._lease_release_attempted = True
 
-    def observe_source_health(self, status: str, observed_at: float | None) -> None:
-        """Publish a sampler observation without manufacturing application progress.
+    def observe_source_health(
+        self,
+        status: str,
+        observed_at: float | None,
+        *,
+        engine_thread_alive: bool | None = None,
+    ) -> None:
+        """Publish the combined source/local witness, never application progress.
 
-        ``status`` is a source witness, not a heartbeat.  The watchdog may use a
-        fresh ``connected_quiet`` observation to preserve a legitimately idle
-        source, while ``disconnected``/``unknown`` deliberately stop renewals and
-        are left to the supervisor's bounded source-dark decision.
+        ``status`` is computed by :class:`SourceHealth` from the slot sample and
+        the local callback/commit/ack signal.  A sampler callback by itself must
+        never refresh this value or the watchdog: an active slot is not evidence
+        that this engine is receiving anything.
         """
         if observed_at is None:
             return
@@ -122,6 +137,62 @@ class ServiceContext:
                 return
             self._last_source_observation = float(observed_at)
             self._source_health_status = str(status)
+            if engine_thread_alive is not None:
+                self._engine_thread_alive = bool(engine_thread_alive)
+
+    def set_engine_thread_alive(self, alive: bool) -> None:
+        """Publish the engine thread's current state as a required witness input."""
+        with self._lock:
+            self._engine_thread_alive = bool(alive)
+
+    def _note_engine_signal(
+        self,
+        kind: str,
+        *,
+        durable_lsn: int | None = None,
+    ) -> None:
+        now = time.monotonic()
+        with self._lock:
+            if kind == "callback":
+                self._last_engine_callback = now
+            elif kind == "commit":
+                self._last_engine_commit = now
+            elif kind == "ack":
+                self._last_engine_ack = now
+                if durable_lsn is not None:
+                    self._last_engine_ack_lsn = int(durable_lsn)
+            else:  # pragma: no cover - internal programming error
+                raise ValueError(f"unknown engine liveness signal {kind!r}")
+            # The local watchdog is allowed to see only completed callback/commit/
+            # acknowledgement edges.  It never advances from the sampler loop.
+            self._last_progress = now
+
+    def note_engine_callback(self) -> None:
+        """Record a successfully returned Debezium callback from this engine."""
+        self._note_engine_signal("callback")
+
+    def note_engine_commit(self, durable_lsn: int | None = None) -> None:
+        """Record a destination COMMIT performed by this engine."""
+        self._note_engine_signal("commit", durable_lsn=durable_lsn)
+
+    def note_engine_ack(self, durable_lsn: int | None = None) -> None:
+        """Record our post-COMMIT ``markBatchFinished`` acknowledgement."""
+        self._note_engine_signal("ack", durable_lsn=durable_lsn)
+
+    def engine_liveness_signal(self) -> dict[str, object]:
+        """Return the local progress facts consumed by ``SourceHealth``."""
+        with self._lock:
+            values = (
+                self._last_engine_callback,
+                self._last_engine_commit,
+                self._last_engine_ack,
+            )
+            return {
+                "engine_thread_alive": self._engine_thread_alive,
+                "own_progress_at": max((value for value in values if value is not None), default=None),
+                "own_ack_at": self._last_engine_ack,
+                "own_ack_lsn": self._last_engine_ack_lsn,
+            }
 
     @property
     def source_health_status(self) -> str | None:
@@ -129,14 +200,37 @@ class ServiceContext:
             return self._source_health_status
 
     def source_health_allows_renewal(self) -> bool:
-        """Only a fresh connected-and-quiet source may renew without source work."""
+        """Renew only on a fresh source sample plus our live engine proof."""
         with self._lock:
             observed = self._last_source_observation
             status = self._source_health_status
-        if observed is None or status != "connected_quiet":
+            engine_alive = self._engine_thread_alive
+            progress_values = (
+                self._last_engine_callback,
+                self._last_engine_commit,
+                self._last_engine_ack,
+            )
+            own_progress = max(
+                (value for value in progress_values if value is not None),
+                default=None,
+            )
+            own_ack = self._last_engine_ack
+            own_ack_lsn = self._last_engine_ack_lsn
+        if (
+            observed is None
+            or status not in {"connected_quiet", "connected_busy"}
+            or engine_alive is not True
+            or own_progress is None
+            or own_ack is None
+            or own_ack_lsn is None
+        ):
             return False
         return (
             time.monotonic() - observed
+            <= self.policy.source_health_stale_seconds
+            and time.monotonic() - own_progress
+            <= self.policy.source_health_stale_seconds
+            and time.monotonic() - own_ack
             <= self.policy.source_health_stale_seconds
         )
 
@@ -144,6 +238,11 @@ class ServiceContext:
         """Record a diagnosed source outage for the fail-closed teardown path."""
         with self._lock:
             self._source_health_status = "dark"
+
+    def begin_teardown(self) -> None:
+        """Tell the watchdog that the supervisor owns the bounded shutdown path."""
+        with self._lock:
+            self._teardown_started = True
 
     def start_watchdog(self) -> None:
         if self._started:
@@ -159,28 +258,16 @@ class ServiceContext:
     def _watchdog_loop(self) -> None:
         while not self._closed.wait(self.policy.watchdog_poll_seconds):
             with self._lock:
-                now = time.monotonic()
                 stalled_for = time.monotonic() - self._last_progress
                 already_stalled = self._stall_event.is_set()
-                source_observation = self._last_source_observation
-                source_status = self._source_health_status
-            source_witness_fresh = (
-                source_observation is not None
-                and now - source_observation
-                <= self.policy.source_health_stale_seconds
-            )
-            if source_witness_fresh and source_status in {
-                "connected_quiet",
-                "disconnected",
-                "unknown",
-                "unobserved",
-                "retrying",
-                "dark",
-            }:
-                # A fresh source observation is real external evidence.  It may
-                # preserve quiet or carry a diagnosed outage to the supervisor, but
-                # it never advances ``_last_progress`` and never permits renewal on
-                # a disconnected source.
+                source_dark = self._source_health_status == "dark"
+                teardown_started = self._teardown_started
+            # Source-dark is already a fail-closed drain decision made by the
+            # supervisor.  Do not let the independent local-stall hard-exit race
+            # that diagnosis and erase the durable alert/summary before the
+            # bounded engine teardown can publish it.  Renewal is impossible once
+            # drain/source-dark is set; this branch only preserves attribution.
+            if source_dark or teardown_started:
                 continue
             if stalled_for < self.policy.stall_timeout_seconds:
                 continue
@@ -203,7 +290,9 @@ class ServiceContext:
                 # write an alert or release its lease.  The next Flight sees
                 # the expired heartbeat and records the recovery/failure.
                 log.critical(
-                    "service watchdog hard-exiting after %.1fs without progress",
+                    "service watchdog hard-exiting after %.1fs without progress; "
+                    "the replication slot disappeared during streaming or the "
+                    "Flight stopped making progress",
                     stalled_for,
                 )
                 self._exit_fn(1)
@@ -312,6 +401,15 @@ class ServiceContext:
 
     def heartbeat_summary(self) -> dict[str, object]:
         with self._lock:
+            progress_values = (
+                self._last_engine_callback,
+                self._last_engine_commit,
+                self._last_engine_ack,
+            )
+            own_progress = max(
+                (value for value in progress_values if value is not None),
+                default=None,
+            )
             return {
                 "service_id": self.service_id,
                 "lease_id": self.lease_id,
@@ -320,6 +418,28 @@ class ServiceContext:
                 "last_progress_age_sec": round(time.monotonic() - self._last_progress, 3),
                 "last_heartbeat_age_sec": round(time.monotonic() - self._last_heartbeat, 3),
                 "source_health_status": self._source_health_status,
+                "engine_thread_alive": self._engine_thread_alive,
+                "engine_callback_age_sec": (
+                    round(time.monotonic() - self._last_engine_callback, 3)
+                    if self._last_engine_callback is not None
+                    else None
+                ),
+                "engine_commit_age_sec": (
+                    round(time.monotonic() - self._last_engine_commit, 3)
+                    if self._last_engine_commit is not None
+                    else None
+                ),
+                "engine_ack_age_sec": (
+                    round(time.monotonic() - self._last_engine_ack, 3)
+                    if self._last_engine_ack is not None
+                    else None
+                ),
+                "engine_progress_age_sec": (
+                    round(time.monotonic() - own_progress, 3)
+                    if own_progress is not None
+                    else None
+                ),
+                "engine_ack_lsn": self._last_engine_ack_lsn,
                 "source_health_observation_age_sec": (
                     round(time.monotonic() - self._last_source_observation, 3)
                     if self._last_source_observation is not None

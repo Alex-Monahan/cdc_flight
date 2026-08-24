@@ -251,24 +251,30 @@ def run_engine_bounded(
         while thread.is_alive():
             if service_mode:
                 service_context.rearm_process_signals()
+                service_context.set_engine_thread_alive(thread.is_alive())
             elapsed = time.monotonic() - started
-            if service_mode and (service_context.lease_lost or service_context.stalled):
-                # A lost lease or a local stall is a write barrier.  Check it
-                # before periodic source-health/run-log projection so a failed
-                # Flight cannot emit observability I/O while it is unwinding.
-                outcome.record("engine_error")
-                break
             if service_mode and health is not None:
-                # The sampler is independent evidence.  Reading the same sample on
-                # several loop iterations is not a new observation and never
-                # advances the local progress clock.
+                # The sampler is independent corroboration.  The service verdict
+                # also receives the live engine thread and the callback/commit/ack
+                # facts published by this process; reading a slot sample never
+                # advances any of those local clocks.
+                signal = service_context.engine_liveness_signal()
                 source_status = health.service_status(
-                    getattr(handler, "highest_source_lsn", None)
+                    getattr(handler, "highest_source_lsn", None),
+                    engine_thread_alive=thread.is_alive(),
+                    own_progress_at=signal["own_progress_at"],
+                    own_ack_at=signal["own_ack_at"],
+                    own_ack_lsn=signal["own_ack_lsn"],
+                    durable_lsn=getattr(
+                        getattr(handler, "resume_point", None), "last_lsn", None
+                    ),
+                    progress_stale_after=service_context.policy.source_health_stale_seconds,
                 )
                 sample = health.last
                 service_context.observe_source_health(
                     source_status,
                     sample.at if sample is not None else None,
+                    engine_thread_alive=thread.is_alive(),
                 )
                 if (
                     run.source_dark_seconds > 0
@@ -288,6 +294,24 @@ def run_engine_bounded(
                     outcome.record("engine_error")
                     source_unobservable_after = round(elapsed, 2)
                     break
+            if service_mode and (service_context.lease_lost or service_context.stalled):
+                # A lost lease or a local stall is a write barrier.  Check it only
+                # after the source-dark fold above so a stalled delivery reports its
+                # cause (source_dark) instead of the watchdog symptom (engine_error).
+                if service_context.stalled and health is not None:
+                    # The watchdog can win the race with the Debezium completion
+                    # callback and close the engine before the serialized recheck
+                    # observes the dropped slot.  Keep the established source
+                    # failure wording while retaining the new local-progress
+                    # attribution; this is diagnostic output only.
+                    log.error(
+                        "service replication slot %r disappeared during streaming "
+                        "or stopped making Flight progress; stopping before any "
+                        "further acknowledgement",
+                        health.slot_name,
+                    )
+                outcome.record("engine_error")
+                break
             if (
                 phases is not None
                 and health is not None
@@ -380,6 +404,57 @@ def run_engine_bounded(
                         outcome.record("engine_error")
                         break
                 if error_box or engine.failure is not None:
+                    if service_mode and health is not None:
+                        sample = health.last
+                        if (
+                            engine.failure is not None
+                            or (
+                                sample is not None
+                                and not sample.exists
+                                and not sample.unknown
+                            )
+                        ):
+                            # Preserve the source-specific diagnosis when the
+                            # stock engine reports the dropped slot before the
+                            # next serialized invariant recheck gets the lock.
+                            # This is a failure log, never a renewal signal.
+                            log.error(
+                                "service replication slot %r disappeared during "
+                                "streaming; stopping before any further acknowledgement",
+                                health.slot_name,
+                            )
+                    # A stock Debezium completion callback can report a failure
+                    # and return normally.  If the admitted engine is now dead
+                    # while the slot sample is still active, classify the local
+                    # witness as source-dark before the generic engine-error path;
+                    # another client may be the only thing keeping that slot
+                    # active.  The engine-thread input must therefore affect both
+                    # renewal and the durable failure diagnosis.
+                    if not thread.is_alive() and health is not None:
+                        signal = service_context.engine_liveness_signal()
+                        sample = health.last
+                        dead_status = health.service_status(
+                            getattr(handler, "highest_source_lsn", None),
+                            engine_thread_alive=False,
+                            own_progress_at=signal["own_progress_at"],
+                            own_ack_at=signal["own_ack_at"],
+                            own_ack_lsn=signal["own_ack_lsn"],
+                            durable_lsn=getattr(
+                                getattr(handler, "resume_point", None), "last_lsn", None
+                            ),
+                            progress_stale_after=service_context.policy.source_health_stale_seconds,
+                        )
+                        service_context.observe_source_health(
+                            dead_status,
+                            sample.at if sample is not None else None,
+                            engine_thread_alive=False,
+                        )
+                        if dead_status == "engine_thread_dead":
+                            service_context.note_source_dark()
+                            outcome.record("source_dark")
+                            source_dark_after = round(time.monotonic() - started, 2)
+                            engine_thread_alive_at_source_dark = False
+                            break
                     outcome.record("engine_error")
                     break
                 # There is no completion watermark in a service.  Liveness is
@@ -469,9 +544,55 @@ def run_engine_bounded(
             # is polled at the ordinary granularity.
             time.sleep(0.05 if watermark.state == WATERMARK_ARMED else 0.25)
         else:
-            outcome.record("engine_finished")
+            if service_mode:
+                # A service engine has no legitimate self-terminating success path.
+                # Evaluate the final sample with the thread explicitly dead before
+                # teardown can mistake another client's active slot for our engine.
+                service_context.set_engine_thread_alive(False)
+                if service_context.stalled and health is not None:
+                    log.error(
+                        "service replication slot %r disappeared during streaming "
+                        "or stopped making Flight progress; stopping before any "
+                        "further acknowledgement",
+                        health.slot_name,
+                    )
+                if not service_context.drain_requested and health is not None:
+                    signal = service_context.engine_liveness_signal()
+                    sample = health.last
+                    source_status = health.service_status(
+                        getattr(handler, "highest_source_lsn", None),
+                        engine_thread_alive=False,
+                        own_progress_at=signal["own_progress_at"],
+                        own_ack_at=signal["own_ack_at"],
+                        own_ack_lsn=signal["own_ack_lsn"],
+                        durable_lsn=getattr(
+                            getattr(handler, "resume_point", None), "last_lsn", None
+                        ),
+                        progress_stale_after=service_context.policy.source_health_stale_seconds,
+                    )
+                    service_context.observe_source_health(
+                        source_status,
+                        sample.at if sample is not None else None,
+                        engine_thread_alive=False,
+                    )
+                    if source_status == "engine_thread_dead":
+                        service_context.note_source_dark()
+                        outcome.record("source_dark")
+                        source_dark_after = round(time.monotonic() - started, 2)
+                        engine_thread_alive_at_source_dark = False
+                    else:
+                        outcome.record("engine_error")
+                else:
+                    outcome.record("engine_error")
+            else:
+                outcome.record("engine_finished")
     finally:
         if service_mode:
+            # The watchdog has already made the write-barrier decision when this
+            # is a stalled teardown. Mark the bounded shutdown phase explicitly so
+            # it cannot call os._exit while engine.close() is releasing the lease;
+            # this is not a renewal or a quiet-source witness.
+            service_context.begin_teardown()
             if service_context.lease_lost or service_context.stalled:
                 outcome.record("engine_error")
             # Set drain intent before any final source hand-off.  If a callback is
@@ -707,6 +828,8 @@ def run_engine_bounded(
         **shutdown_sequence.summary(),
         **handler.stats(),
     }
+    if service_mode:
+        summary["engine_thread_dead"] = not thread.is_alive()
     summary.update(completion.as_dict())
     if watermark is None:
         summary.update(

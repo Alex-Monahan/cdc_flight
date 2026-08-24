@@ -545,15 +545,22 @@ class Applier:
                 self._in_flight += 1
             if self.service_context is not None:
                 self.service_context.operation_started()
+            callback_progressed = False
             try:
                 self._handle(records, committer)
+                # A callback is Flight-owned evidence only after the handler has
+                # returned successfully.  A sampler observation or a callback that
+                # is still wedged in decode/commit is not forward progress.
+                callback_progressed = bool(records)
+                if self.service_context is not None and callback_progressed:
+                    self.service_context.note_engine_callback()
             except BaseException as exc:
                 self.error = exc
                 raise
             finally:
                 if self.service_context is not None:
                     self.service_context.operation_finished(
-                        progressed=self._last_callback_had_data
+                        progressed=(callback_progressed or self._last_callback_had_data)
                     )
                 with self._quiescence:
                     self._in_flight -= 1
@@ -670,12 +677,6 @@ class Applier:
                 self.skipped_count += 1
             for unit in self.assembler.feed(rec):
                 self._add_unit(unit)
-            if self.service_context is not None:
-                # A large callback is healthy only while it is actually
-                # consuming records. If one native/decode operation wedges,
-                # the watchdog must distinguish it from an idle stream.
-                self.service_context.mark_progress()
-
         with self._lock:
             self.batch_count += 1
             self.record_count += source_records

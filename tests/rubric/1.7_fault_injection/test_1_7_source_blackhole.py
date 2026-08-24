@@ -351,9 +351,24 @@ def test_service_liveness_witness_keeps_quiet_source_healthy_but_stops_retry_ren
     )
     try:
         context.bind(lease, object())
-        context.observe_source_health("connected_quiet", now)
+        context.set_engine_thread_alive(True)
+        context.note_engine_callback()
+        context.note_engine_commit(100)
+        context.note_engine_ack(100)
+        signal = context.engine_liveness_signal()
+        context.observe_source_health(
+            "connected_quiet", now, engine_thread_alive=True
+        )
         context._next_heartbeat = time.monotonic() - 1
-        assert health.service_status(100) == "connected_quiet"
+        assert health.service_status(
+            100,
+            engine_thread_alive=signal["engine_thread_alive"],
+            own_progress_at=signal["own_progress_at"],
+            own_ack_at=signal["own_ack_at"],
+            own_ack_lsn=signal["own_ack_lsn"],
+            durable_lsn=100,
+            progress_stale_after=policy.source_health_stale_seconds,
+        ) == "connected_quiet"
         assert context.renew_once() is True
         assert lease.renewed == 1
 
@@ -367,9 +382,21 @@ def test_service_liveness_witness_keeps_quiet_source_healthy_but_stops_retry_ren
             )
         )
         sample = health.last
-        context.observe_source_health(health.service_status(100), sample.at)
+        signal = context.engine_liveness_signal()
+        disconnected = health.service_status(
+            100,
+            engine_thread_alive=signal["engine_thread_alive"],
+            own_progress_at=signal["own_progress_at"],
+            own_ack_at=signal["own_ack_at"],
+            own_ack_lsn=signal["own_ack_lsn"],
+            durable_lsn=100,
+            progress_stale_after=policy.source_health_stale_seconds,
+        )
+        context.observe_source_health(
+            disconnected, sample.at, engine_thread_alive=True
+        )
         context._next_heartbeat = time.monotonic() - 1
-        assert health.service_status(100) == "disconnected"
+        assert disconnected == "disconnected"
         assert context.renew_once() is False
         assert lease.renewed == 1
     finally:
