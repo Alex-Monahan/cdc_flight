@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 
 from . import destination as _d
+from .destination_fence import unwrap_destination_handle
 from .errors import LeaseLost, ServiceStandDown
 from .occurrence import LeaseState, _lease_receipt_from_durable
 from .retirement import RetirementResult, retire_handle
@@ -114,13 +115,13 @@ class Lease:
             raise LeaseLost(f"lease {operation} is forbidden inside the COMMIT_ACK window")
 
     def _server_now(self, con):
-        row = con.execute("SELECT current_timestamp").fetchone()
+        row = unwrap_destination_handle(con).execute("SELECT current_timestamp").fetchone()
         if not row or row[0] is None:
             raise RuntimeError("destination did not return its server clock")
         return row[0]
 
     def _row(self, con):
-        return con.execute(
+        return unwrap_destination_handle(con).execute(
             f"SELECT pipeline, lease_key, lease_id, fencing_epoch, service_id, "
             f"worker_generation, owner_id, host, pid, process_start_token, "
             f"worker_pid, worker_start_token, acquired_at, renewed_at, expires_at, state "
@@ -159,7 +160,9 @@ class Lease:
             f"worker_pid, worker_start_token, acquired_at, renewed_at, expires_at, state "
             f"FROM {_control_table(self.control_schema, 'lease')} WHERE pipeline = ?"
         )
-        if not _d._committed_row_matches(con, query, [self.pipeline], row):
+        if not _d._committed_row_matches(
+            unwrap_destination_handle(con), query, [self.pipeline], row
+        ):
             return None
         return self._receipt(row, operation)
 
@@ -280,7 +283,6 @@ class Lease:
         *,
         heartbeat_bound_seconds: float | None = None,
         wait_for_expiry: bool = False,
-        progress_callback=None,
     ) -> None:
         """Acquire or conditionally take over one physical destination key.
 
@@ -295,8 +297,6 @@ class Lease:
         # turning a lease-expiry wait into an unbounded operation.
         admission_started = time.monotonic()
         admission_budget = self.ttl_seconds + 1.0
-        if progress_callback is not None:
-            progress_callback()
         current = self._server_now(con)
         row = self._row(con)
         if row is None:
@@ -359,8 +359,6 @@ class Lease:
                 # protected.  Waiting is bounded by the row's expiry; the next
                 # server-clock read remains the authority before the CAS.
                 while True:
-                    if progress_callback is not None:
-                        progress_callback()
                     if time.monotonic() - admission_started >= admission_budget:
                         raise LeaseLost(
                             "the bounded wait for the unhealthy lease to expire was "
@@ -386,8 +384,6 @@ class Lease:
                     if remaining <= 0:
                         break
                     time.sleep(min(0.25, remaining))
-                    if progress_callback is not None:
-                        progress_callback()
                 current = self._server_now(con)
                 row = self._row(con)
                 if row is None:
@@ -396,7 +392,6 @@ class Lease:
                         con,
                         heartbeat_bound_seconds=heartbeat_bound_seconds,
                         wait_for_expiry=wait_for_expiry,
-                        progress_callback=progress_callback,
                     )
         else:
             expires_at = row[14]
@@ -451,8 +446,6 @@ class Lease:
             )
 
         self._retry_lease_write(con, "takeover", takeover)
-        if progress_callback is not None:
-            progress_callback()
         observed = self._row(con)
         if observed is None or observed[2] != self.lease_id or int(observed[3] or 0) != next_epoch:
             if observed is not None:
@@ -492,7 +485,8 @@ class Lease:
     ) -> None:
         if self.fencing_epoch is None:
             raise LeaseLost(f"cannot {operation} a lease without an epoch")
-        current = self._server_now(con)
+        raw_con = unwrap_destination_handle(con)
+        current = self._server_now(raw_con)
         params = [
             current,
             current + timedelta(seconds=self.ttl_seconds),
@@ -509,7 +503,7 @@ class Lease:
         if require_live:
             params.append(current)
         def refresh():
-            return con.execute(
+            return raw_con.execute(
                 f"UPDATE {_control_table(self.control_schema, 'lease')} SET renewed_at=?, "
                 "expires_at=? WHERE pipeline=? AND owner_id=? AND lease_id=? "
                 f"AND fencing_epoch=?{identity_predicate}AND state <> 'released'"
@@ -527,7 +521,7 @@ class Lease:
         # must also be live in a fresh destination-clock observation.
         live_after = True
         if require_live:
-            observed_now = self._server_now(con)
+            observed_now = self._server_now(raw_con)
             live_after = bool(row is not None and row[14] is not None and row[14] > observed_now)
         if not self._matches(row) or not live_after:
             raise LeaseLost(

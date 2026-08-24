@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 
 from .config import DEFAULT_CONTROL_SCHEMA, resolve_control_schema
+from .errors import ServiceStandDown
 from .naming import quote
 
 # Keep the published default DDL byte-for-byte compatible with the original
@@ -544,6 +545,88 @@ def ensure_control_schema(con, control_schema: str | None = None) -> None:
     try:
         for statement in control_ddl(control_schema):
             con.execute(statement)
+        _migrate_legacy_lease(con, control_schema)
+        con.execute("COMMIT")
+    except BaseException:
+        with contextlib.suppress(Exception):
+            con.execute("ROLLBACK")
+        raise
+
+
+def ensure_service_lease_bootstrap(con, control_schema: str | None = None) -> None:
+    """Make only the admission lease table available before an epoch exists.
+
+    A service cannot fence the first lease-row/schema creation because there is no
+    epoch yet.  This narrowly scoped bootstrap therefore mutates only when the
+    lease table is absent, or when an expired legacy batch table needs its additive
+    service columns.  It never rewrites a live incumbent: a legacy row whose
+    destination-clock expiry is still in the future is a stand-down, and all
+    current-schema control/catalog/recovery DDL runs only after the service wrapper
+    has attached the acquired epoch.
+    """
+    schema = resolve_control_schema(control_schema)
+    table_rows = con.execute(
+        "SELECT table_name FROM information_schema.tables "
+        "WHERE table_schema = ? AND table_name = 'lease'",
+        [schema],
+    ).fetchall()
+    table = quote(schema) + ".lease"
+    if not table_rows:
+        con.execute(f"CREATE SCHEMA IF NOT EXISTS {quote(schema)}")
+        con.execute(
+            f"""CREATE TABLE IF NOT EXISTS {table} (
+                pipeline VARCHAR PRIMARY KEY,
+                lease_key VARCHAR,
+                lease_id VARCHAR,
+                fencing_epoch BIGINT DEFAULT 1,
+                service_id VARCHAR,
+                worker_generation VARCHAR,
+                owner_id VARCHAR NOT NULL,
+                host VARCHAR,
+                pid BIGINT,
+                process_start_token VARCHAR,
+                worker_pid BIGINT,
+                worker_start_token VARCHAR,
+                acquired_at TIMESTAMPTZ NOT NULL,
+                renewed_at TIMESTAMPTZ NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                state VARCHAR DEFAULT 'held'
+            )"""
+        )
+        return
+
+    columns = {
+        str(row[0])
+        for row in con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = ? AND table_name = 'lease'",
+            [schema],
+        ).fetchall()
+    }
+    required = {
+        "lease_key", "lease_id", "fencing_epoch", "service_id",
+        "worker_generation", "process_start_token", "worker_pid",
+        "worker_start_token", "state",
+    }
+    if required <= columns:
+        return
+
+    # The only compatibility migration allowed before an epoch is attached is one
+    # for a row already expired on the destination's own clock.  A live legacy
+    # holder remains protected and the scheduled invocation stands down.
+    row = con.execute(
+        f"SELECT expires_at, owner_id FROM {table} LIMIT 1"
+    ).fetchone()
+    if row is not None:
+        current = con.execute("SELECT current_timestamp").fetchone()[0]
+        if row[0] is not None and row[0] > current:
+            raise ServiceStandDown(
+                "a legacy Flight holds a live lease while service compatibility "
+                "columns are unavailable; refusing an unfenced migration",
+                {"health": "legacy_lease_live", "owner_id": row[1]},
+            )
+    con.execute("BEGIN TRANSACTION")
+    try:
         _migrate_legacy_lease(con, control_schema)
         con.execute("COMMIT")
     except BaseException:

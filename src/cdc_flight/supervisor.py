@@ -235,6 +235,7 @@ def run_engine_bounded(
     )
     idle_blocked_by_source = 0
     source_dark_after: float | None = None
+    engine_thread_alive_at_source_dark = False
     source_unobservable_after: float | None = None
     drain_started_at: float | None = None
     source_probe_bound = min(
@@ -257,12 +258,36 @@ def run_engine_bounded(
                 # Flight cannot emit observability I/O while it is unwinding.
                 outcome.record("engine_error")
                 break
-            if service_mode and not handler.busy:
-                # An idle engine is making progress through this bounded
-                # monitoring loop. A live callback is different: its own
-                # operation timestamps must advance, otherwise a wedged
-                # callback could be mistaken for a healthy idle Flight.
-                service_context.mark_progress()
+            if service_mode and health is not None:
+                # The sampler is independent evidence.  Reading the same sample on
+                # several loop iterations is not a new observation and never
+                # advances the local progress clock.
+                source_status = health.service_status(
+                    getattr(handler, "highest_source_lsn", None)
+                )
+                sample = health.last
+                service_context.observe_source_health(
+                    source_status,
+                    sample.at if sample is not None else None,
+                )
+                if (
+                    run.source_dark_seconds > 0
+                    and health.ever_sampled
+                    and health.dark_for >= run.source_dark_seconds
+                ):
+                    service_context.note_source_dark()
+                    outcome.record("source_dark")
+                    # This branch is inside ``while thread.is_alive()``. Publish
+                    # the witness explicitly so the real retry probe can prove it
+                    # diagnosed a live stock Debezium engine, not an already-dead
+                    # connector callback.
+                    engine_thread_alive_at_source_dark = thread.is_alive()
+                    source_dark_after = round(elapsed, 2)
+                    break
+                if not health.ever_sampled and elapsed >= source_probe_bound:
+                    outcome.record("engine_error")
+                    source_unobservable_after = round(elapsed, 2)
+                    break
             if (
                 phases is not None
                 and health is not None
@@ -705,6 +730,7 @@ def run_engine_bounded(
         # to exit - the process still has to tear down a JVM whose connector is blocked
         # on a dead socket, which is another minute (Opus MINOR-5).
         summary["source_dark_detected_after_sec"] = source_dark_after
+        summary["engine_thread_alive_at_source_dark"] = engine_thread_alive_at_source_dark
     if source_unobservable_after is not None:
         summary["source_unobservable_after_sec"] = source_unobservable_after
     if health is not None:
@@ -775,9 +801,9 @@ def run_engine_bounded(
             outcome.record("engine_error")
         summary["stop_reason"] = outcome.value
         if source_dark_detected:
-            unknown_for = health.unknown_for if health is not None else 0.0
+            dark_for = health.dark_for if health is not None else 0.0
             message = (
-                f"the source has been unreachable for {unknown_for:.1f}s "
+                f"the source has been unreachable for {dark_for:.1f}s "
                 f"({health.summary() if health is not None else 'no source health'}); "
                 "the connector then terminated: " + (" | ".join(parts) or "unknown")
             )
@@ -791,7 +817,7 @@ def run_engine_bounded(
 
     if outcome.value == "source_dark":
         raise EngineFailure(
-            f"the source has been unreachable for {health.unknown_for:.1f}s "
+            f"the source has been unreachable for {health.dark_for:.1f}s "
             f"({health.summary()}); the delivery cannot be shown to be complete, so "
             "this run is not a success (TODO 4.6(b))",
             summary,

@@ -48,6 +48,11 @@ class ServiceContext:
         self.fencing_epoch: int | None = None
         self.lease = None
         self.connection = None
+        # The pipeline owns the admitted connection and normally performs the
+        # retained release in its terminal teardown.  The service wrapper must not
+        # open a second MotherDuck writer after that teardown: besides being
+        # unnecessary, that secondary connect can outlive the bounded engine close.
+        self._lease_release_attempted = False
         self.stop_event = threading.Event()
         self.hard_stop_event = threading.Event()
         self._drain_event = threading.Event()
@@ -58,6 +63,8 @@ class ServiceContext:
         self._last_progress = time.monotonic()
         self._last_heartbeat = time.monotonic()
         self._next_heartbeat = time.monotonic() + policy.lease_renew_seconds
+        self._last_source_observation: float | None = None
+        self._source_health_status: str | None = None
         self._stall_message: str | None = None
         self._lease_failure: BaseException | None = None
         self._watchdog: threading.Thread | None = None
@@ -86,7 +93,57 @@ class ServiceContext:
         self.connection = connection
         self.lease_key = lease.lease_key
         self.fencing_epoch = lease.epoch
-        self.mark_progress()
+
+    @property
+    def lease_release_attempted(self) -> bool:
+        with self._lock:
+            return self._lease_release_attempted
+
+    def note_lease_release_attempted(self) -> None:
+        """Publish that pipeline teardown consumed the admitted lease handle."""
+        with self._lock:
+            self._lease_release_attempted = True
+
+    def observe_source_health(self, status: str, observed_at: float | None) -> None:
+        """Publish a sampler observation without manufacturing application progress.
+
+        ``status`` is a source witness, not a heartbeat.  The watchdog may use a
+        fresh ``connected_quiet`` observation to preserve a legitimately idle
+        source, while ``disconnected``/``unknown`` deliberately stop renewals and
+        are left to the supervisor's bounded source-dark decision.
+        """
+        if observed_at is None:
+            return
+        with self._lock:
+            if (
+                self._last_source_observation is not None
+                and observed_at <= self._last_source_observation
+            ):
+                return
+            self._last_source_observation = float(observed_at)
+            self._source_health_status = str(status)
+
+    @property
+    def source_health_status(self) -> str | None:
+        with self._lock:
+            return self._source_health_status
+
+    def source_health_allows_renewal(self) -> bool:
+        """Only a fresh connected-and-quiet source may renew without source work."""
+        with self._lock:
+            observed = self._last_source_observation
+            status = self._source_health_status
+        if observed is None or status != "connected_quiet":
+            return False
+        return (
+            time.monotonic() - observed
+            <= self.policy.source_health_stale_seconds
+        )
+
+    def note_source_dark(self) -> None:
+        """Record a diagnosed source outage for the fail-closed teardown path."""
+        with self._lock:
+            self._source_health_status = "dark"
 
     def start_watchdog(self) -> None:
         if self._started:
@@ -102,8 +159,29 @@ class ServiceContext:
     def _watchdog_loop(self) -> None:
         while not self._closed.wait(self.policy.watchdog_poll_seconds):
             with self._lock:
+                now = time.monotonic()
                 stalled_for = time.monotonic() - self._last_progress
                 already_stalled = self._stall_event.is_set()
+                source_observation = self._last_source_observation
+                source_status = self._source_health_status
+            source_witness_fresh = (
+                source_observation is not None
+                and now - source_observation
+                <= self.policy.source_health_stale_seconds
+            )
+            if source_witness_fresh and source_status in {
+                "connected_quiet",
+                "disconnected",
+                "unknown",
+                "unobserved",
+                "retrying",
+                "dark",
+            }:
+                # A fresh source observation is real external evidence.  It may
+                # preserve quiet or carry a diagnosed outage to the supervisor, but
+                # it never advances ``_last_progress`` and never permits renewal on
+                # a disconnected source.
+                continue
             if stalled_for < self.policy.stall_timeout_seconds:
                 continue
             if not already_stalled:
@@ -143,11 +221,14 @@ class ServiceContext:
         blocked. Its polling alone is not evidence that the callback is making
         progress, so the callback owns this timestamp until it completes.
         """
-        self.mark_progress()
+        # Admission to a callback is not forward motion.  The callback marks each
+        # received source record and the durable COMMIT marks destination progress.
+        return None
 
-    def operation_finished(self) -> None:
-        """Mark completion of a callback or destination operation."""
-        self.mark_progress()
+    def operation_finished(self, *, progressed: bool = False) -> None:
+        """Mark completion only when the callback actually moved data forward."""
+        if progressed:
+            self.mark_progress()
 
     @property
     def last_progress(self) -> float:
@@ -209,6 +290,8 @@ class ServiceContext:
         con = con or self.connection
         if lease is None or con is None:
             raise LeaseLost("service heartbeat has no admitted lease connection")
+        if not self.source_health_allows_renewal():
+            return False
         self.assert_writable()
         try:
             faults.matrix_crash("service_lease_renewal")
@@ -225,7 +308,6 @@ class ServiceContext:
             self._next_heartbeat = (
                 self._last_heartbeat + self.policy.lease_renew_seconds
             )
-            self._last_progress = self._last_heartbeat
         return True
 
     def heartbeat_summary(self) -> dict[str, object]:
@@ -237,6 +319,12 @@ class ServiceContext:
                 "fencing_epoch": self.fencing_epoch,
                 "last_progress_age_sec": round(time.monotonic() - self._last_progress, 3),
                 "last_heartbeat_age_sec": round(time.monotonic() - self._last_heartbeat, 3),
+                "source_health_status": self._source_health_status,
+                "source_health_observation_age_sec": (
+                    round(time.monotonic() - self._last_source_observation, 3)
+                    if self._last_source_observation is not None
+                    else None
+                ),
                 "stalled": self.stalled,
                 "lease_lost": self.lease_lost,
             }

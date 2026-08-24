@@ -305,6 +305,77 @@ def test_stale_active_sample_cannot_prove_idle():
     assert health.may_declare_idle(min_seconds=5) is False
 
 
+def test_service_liveness_witness_keeps_quiet_source_healthy_but_stops_retry_renewal():
+    """The single-process replacement for the removed IPC frame-deadline property."""
+    from cdc_flight.config import ServiceConfig
+    from cdc_flight.service_runtime import ServiceContext
+    from cdc_flight.source_health import SlotSample, SourceHealth
+
+    class LeaseProbe:
+        lease_key = "physical:test"
+        epoch = 1
+        renewed = 0
+
+        def renew_control(self, _connection):
+            self.renewed += 1
+
+    health = SourceHealth(dsn="postgresql://nope", slot_name="x")
+    now = time.monotonic()
+    health._ingest(
+        SlotSample(
+            at=now,
+            exists=True,
+            active=True,
+            confirmed_pos=100,
+            lag_bytes=0,
+        )
+    )
+    policy = ServiceConfig(
+        lease_ttl_seconds=2,
+        lease_renew_seconds=0.1,
+        heartbeat_bound_seconds=0.3,
+        stall_timeout_seconds=0.8,
+        stall_exit_grace_seconds=0.2,
+        watchdog_poll_seconds=0.01,
+        commit_timeout_seconds=0.3,
+        close_timeout_seconds=0.3,
+        invariant_check_seconds=0.1,
+        source_health_stale_seconds=0.5,
+    )
+    lease = LeaseProbe()
+    context = ServiceContext(
+        service_id="service",
+        lease_id="lease",
+        worker_generation="service:generation",
+        policy=policy,
+    )
+    try:
+        context.bind(lease, object())
+        context.observe_source_health("connected_quiet", now)
+        context._next_heartbeat = time.monotonic() - 1
+        assert health.service_status(100) == "connected_quiet"
+        assert context.renew_once() is True
+        assert lease.renewed == 1
+
+        health._ingest(
+            SlotSample(
+                at=time.monotonic(),
+                exists=True,
+                active=False,
+                confirmed_pos=100,
+                lag_bytes=2_000_000,
+            )
+        )
+        sample = health.last
+        context.observe_source_health(health.service_status(100), sample.at)
+        context._next_heartbeat = time.monotonic() - 1
+        assert health.service_status(100) == "disconnected"
+        assert context.renew_once() is False
+        assert lease.renewed == 1
+    finally:
+        context.close()
+
+
 def test_reconnected_stream_must_advance_confirmed_wal_before_large_lag_is_idle():
     """A retry reattachment is not proof that the interrupted delivery recovered."""
     from cdc_flight.source_health import SlotSample, SourceHealth

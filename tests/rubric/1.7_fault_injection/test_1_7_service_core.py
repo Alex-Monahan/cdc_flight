@@ -276,6 +276,230 @@ def test_service_rechecks_and_fails_closed_after_mid_life_slot_drop(
 
 
 @pytest.mark.slow
+@pytest.mark.motherduck
+def test_service_quiet_connected_holder_survives_watchdog_and_successors_stand_down(
+    tmp_path_factory, postgres_cluster, motherduck_case
+):
+    """A real active stock slot, with no changes, is not a hung service."""
+    box = Sandbox(
+        "service_quiet_connected",
+        tmp_path_factory.mktemp("sbx_service_quiet_connected"),
+        postgres_cluster,
+    )
+    holder = None
+    successors = []
+    case = motherduck_case
+    service_env = {
+        "CDC_MD_DATABASE": case["database"],
+        "CDC_DATASET": case["dataset"],
+        "CDC_CONTROL_SCHEMA": case["control_schema"],
+        "MOTHERDUCK_TOKEN": case["token"],
+        "motherduck_token": case["token"],
+        "CDC_SERVICE_ID": "service-quiet-connected",
+        "CDC_SERVICE_LEASE_TTL": "75",
+        "CDC_SERVICE_LEASE_RENEW_SECONDS": "5",
+        "CDC_SERVICE_HEARTBEAT_BOUND_SECONDS": "30",
+        "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "45",
+        "CDC_SERVICE_STALL_EXIT_GRACE_SECONDS": "5",
+        "CDC_SERVICE_SOURCE_HEALTH_STALE_SECONDS": "15",
+        "CDC_SERVICE_INVARIANT_CHECK_SECONDS": "5",
+        "CDC_SERVICE_CLOSE_TIMEOUT": "20",
+        "CDC_CLOSE_TIMEOUT": "20",
+        "CDC_ENGINE_THREAD_TIMEOUT": "20",
+    }
+
+    def md_query(statement: str, params=None) -> list[tuple]:
+        con = motherduck_connect(case["token"], case["database"])
+        try:
+            return con.execute(statement, params or []).fetchall()
+        finally:
+            con.close()
+
+    try:
+        box.reseed()
+        box.run(
+            reset_state=True,
+            destination="motherduck",
+            extra_env=service_env,
+            max_seconds=180,
+            timeout=300,
+        )
+        holder = box.spawn_service(
+            destination="motherduck", capture=True, extra_env=service_env
+        )
+        box.wait_for_slot_active(process=holder, timeout=45)
+
+        # This crosses both the 45 s local stall threshold and the 50 s
+        # stall+grace boundary. The only thing keeping the holder healthy is
+        # the fresh active/quiet slot observation and its lease CAS.
+        time.sleep(52)
+        assert holder.poll() is None, _service_process_output(holder)
+
+        for _ in range(2):
+            successor = box.spawn_service(
+                destination="motherduck", capture=True, extra_env=service_env
+            )
+            successors.append(successor)
+            assert successor.wait(timeout=20) == 0, _service_process_output(successor)
+            summary = box.last_summary()
+            assert summary.get("stop_reason") == "stand_down", summary
+            assert summary.get("status") == "SUCCEEDED", summary
+            assert holder.poll() is None, _service_process_output(holder)
+
+        assert _stop(holder) == 0
+        holder = None
+    finally:
+        for process in successors:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=30)
+        if holder is not None and holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=30)
+        if holder is not None:
+            holder.communicate(timeout=5)
+        for process in successors:
+            process.communicate(timeout=5)
+        box.cleanup()
+        box.reseed()
+
+
+@pytest.mark.slow
+@pytest.mark.motherduck
+def test_service_stock_walsender_retry_backoff_fails_closed_alerts_and_successor_takes_over(
+    tmp_path_factory, postgres_cluster, motherduck_case
+):
+    """Kill the real stock walsender repeatedly while Debezium's Java thread retries."""
+    box = Sandbox(
+        "service_walsender_retry_backoff",
+        tmp_path_factory.mktemp("sbx_service_walsender_retry_backoff"),
+        postgres_cluster,
+    )
+    holder = None
+    successor = None
+    case = motherduck_case
+    service_env = {
+        "CDC_MD_DATABASE": case["database"],
+        "CDC_DATASET": case["dataset"],
+        "CDC_CONTROL_SCHEMA": case["control_schema"],
+        "MOTHERDUCK_TOKEN": case["token"],
+        "motherduck_token": case["token"],
+        "CDC_SERVICE_ID": "service-walsender-retry",
+        "CDC_SERVICE_LEASE_TTL": "75",
+        "CDC_SERVICE_LEASE_RENEW_SECONDS": "5",
+        "CDC_SERVICE_HEARTBEAT_BOUND_SECONDS": "30",
+        "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "45",
+        "CDC_SERVICE_STALL_EXIT_GRACE_SECONDS": "5",
+        "CDC_SERVICE_SOURCE_HEALTH_STALE_SECONDS": "15",
+        "CDC_SERVICE_INVARIANT_CHECK_SECONDS": "30",
+        # Keep this real stock retry proof bounded in the slow lane while the
+        # quiet-direction test separately crosses the production 45/50 s watchdog.
+        "CDC_SOURCE_DARK_SECONDS": "20",
+        "CDC_SERVICE_CLOSE_TIMEOUT": "20",
+        "CDC_CLOSE_TIMEOUT": "20",
+        "CDC_ENGINE_THREAD_TIMEOUT": "20",
+    }
+
+    def md_query(statement: str, params=None) -> list[tuple]:
+        con = motherduck_connect(case["token"], case["database"])
+        try:
+            return con.execute(statement, params or []).fetchall()
+        finally:
+            con.close()
+
+    try:
+        box.reseed()
+        box.run(
+            reset_state=True,
+            destination="motherduck",
+            extra_env=service_env,
+            max_seconds=180,
+            timeout=300,
+        )
+        holder = box.spawn_service(
+            destination="motherduck", capture=True, extra_env=service_env
+        )
+        box.wait_for_slot_active(process=holder, timeout=45)
+        # Give the independent sampler time to record the healthy stock
+        # walsender before the first kill.  Without this witness the run would
+        # prove only startup absence, not a live engine entering retry/backoff.
+        time.sleep(2)
+
+        killed_at = time.monotonic()
+        # The helper kills only this sandbox's slot. Debezium remains alive and
+        # retries the stock JDBC replication connection; whenever it reattaches,
+        # kill that new walsender too so the source stays in the real retry shape.
+        engine_was_alive_during_retry = False
+        while holder.poll() is None and time.monotonic() - killed_at < 60:
+            box.kill_walsender()
+            time.sleep(0.2)
+            if not engine_was_alive_during_retry and time.monotonic() - killed_at >= 12:
+                assert holder.poll() is None, _service_process_output(holder)
+                engine_was_alive_during_retry = True
+
+        returncode = holder.wait(timeout=60)
+        output = _service_process_output(holder)
+        summary = box.last_summary()
+        assert engine_was_alive_during_retry, output
+        assert returncode != 0, output
+        assert summary.get("slot_ever_streamed") is True, (summary, output)
+        assert summary.get("slot_stream_interruptions", 0) >= 1, (summary, output)
+        assert summary.get("engine_thread_alive_at_source_dark") is True, (
+            summary,
+            output,
+        )
+        assert summary.get("stop_reason") == "source_dark", (summary, output)
+        assert summary.get("source_dark_detected_after_sec") is not None, (
+            summary,
+            output,
+        )
+        assert summary["source_dark_detected_after_sec"] < 35, (summary, output)
+        alert_rows = md_query(
+            f'SELECT severity, code FROM "{case["control_schema"]}"."alerts" '
+            "WHERE pipeline = ? AND code = 'source_dark'",
+            [box.env["CDC_PIPELINE_NAME"]],
+        )
+        assert alert_rows == [("critical", "source_dark")], (alert_rows, summary, output)
+
+        # The failed holder released its retained lease; this is a new scheduled
+        # instance, not an in-process restart. It must acquire the next epoch and
+        # attach the same stock slot rather than stand down.
+        successor = box.spawn_service(
+            destination="motherduck", capture=True, extra_env=service_env
+        )
+        box.wait_for_slot_active(process=successor, timeout=60)
+        assert successor.poll() is None, _service_process_output(successor)
+        box.sql(
+            "INSERT INTO app.customers (name, email) VALUES "
+            "('service-retry-successor', 'service-retry-successor@example.com')"
+        )
+        time.sleep(4)
+        assert _stop(successor) == 0
+        successor = None
+        assert md_query(
+            f'SELECT fencing_epoch FROM "{case["control_schema"]}"."lease"'
+        ) == [(2,)]
+        assert md_query(
+            f'SELECT count(*) FROM "{case["dataset"]}"."cdcflight_app_customers" '
+            "WHERE name = ?",
+            ["service-retry-successor"],
+        ) == [(1,)]
+    finally:
+        if successor is not None and successor.poll() is None:
+            successor.kill()
+            successor.wait(timeout=30)
+        if holder is not None and holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=30)
+        if holder is not None:
+            holder.communicate(timeout=5)
+        if successor is not None:
+            successor.communicate(timeout=5)
+        box.cleanup()
+        box.reseed()
+
+
+@pytest.mark.slow
 def test_service_one_process_long_life_keeps_one_generation_and_exact_waves(
     tmp_path_factory, postgres_cluster
 ):
@@ -504,7 +728,14 @@ def test_two_real_service_instances_have_one_holder_and_one_stand_down(
         assert box.last_summary()["stand_down"] is True
         box.wait_for_slot_active(process=holder, timeout=60)
 
-        alerts_before = md_query(f"SELECT count(*) FROM {alerts_table}")[0][0]
+        def alert_rows() -> list[tuple]:
+            return md_query(
+                f"SELECT raised_at, severity, code, message, context "
+                f"FROM {alerts_table} "
+                "ORDER BY raised_at, severity, code, message, context"
+            )
+
+        alerts_before = alert_rows()
         third = box.spawn_service(
             matrix_arm=True,
             capture=True,
@@ -513,7 +744,21 @@ def test_two_real_service_instances_have_one_holder_and_one_stand_down(
         )
         assert third.wait(timeout=60) == 0, _service_process_output(third)
         assert box.last_summary()["run_outcome"] == "stand_down"
-        assert md_query(f"SELECT count(*) FROM {alerts_table}")[0][0] == alerts_before
+        # MotherDuck can expose a fresh connection's catalog snapshot before the
+        # previous read's rows are visible.  Wait for the same durable row set, but
+        # fail if a stand-down adds any alert; this is stronger than comparing a
+        # count and preserves the no-mutation property under cloud read jitter.
+        deadline = time.monotonic() + 15
+        while True:
+            alerts_after = alert_rows()
+            if alerts_after == alerts_before:
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    "stand-down changed the durable alert rows: "
+                    f"before={alerts_before!r} after={alerts_after!r}"
+                )
+            time.sleep(0.5)
 
         _stop(holder)
         if holder is first:

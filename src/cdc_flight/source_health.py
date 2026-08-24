@@ -35,6 +35,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -125,6 +126,10 @@ class SourceHealth:
     #: sampler blocked for ever, which is how "the source is dark" stopped being
     #: observable at all (Codex r2 MAJOR-4).
     query_timeout_ms: int = 4000
+    #: Optional in-process liveness projection. It is called by the sampler thread
+    #: itself so a slow destination run-log write cannot make a fresh source witness
+    #: look stale to the service watchdog.
+    observation_callback: Callable[[SourceHealth], None] | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _stop: threading.Event = field(default_factory=threading.Event, repr=False)
     _thread: threading.Thread | None = field(default=None, repr=False)
@@ -134,6 +139,11 @@ class SourceHealth:
     _stream_interruptions: int = field(default=0, repr=False)
     _interruption_confirmed_pos: int | None = field(default=None, repr=False)
     _recovered_after_interruption: bool = field(default=False, repr=False)
+    #: A walsender that repeatedly reattaches without advancing confirmed WAL is
+    #: still in retry/backoff, even though point samples occasionally say active.
+    #: The clock clears after stable streaming or confirmed-LSN movement; a single
+    #: brief network blip therefore does not turn a quiet connected source dark.
+    _retrying_since: float | None = field(default=None, repr=False)
     _lag_stable_since: float | None = field(default=None, repr=False)
     _prev_lag: int | None = field(default=None, repr=False)
     #: when the sampler last started failing outright, and whether it ever worked
@@ -194,6 +204,8 @@ class SourceHealth:
                 self._stream_interruptions += 1
                 self._interruption_confirmed_pos = self._last.confirmed_pos
                 self._recovered_after_interruption = False
+                if self._retrying_since is None:
+                    self._retrying_since = sample.at
             elif (
                 self._interruption_confirmed_pos is not None
                 and sample.streaming
@@ -201,6 +213,7 @@ class SourceHealth:
                 and sample.confirmed_pos > self._interruption_confirmed_pos
             ):
                 self._recovered_after_interruption = True
+                self._retrying_since = None
             self._last = sample
             if sample.streaming:
                 self._ever_streamed = True
@@ -225,6 +238,11 @@ class SourceHealth:
             if sample.streaming:
                 if self._streaming_since is None:
                     self._streaming_since = sample.at
+                elif (
+                    self._retrying_since is not None
+                    and sample.at - self._streaming_since >= max(self.interval * 10, 5.0)
+                ):
+                    self._retrying_since = None
             else:
                 self._streaming_since = None
 
@@ -238,6 +256,9 @@ class SourceHealth:
                 if self._prev_lag is None or lag != self._prev_lag:
                     self._lag_stable_since = sample.at
                 self._prev_lag = lag
+        callback = self.observation_callback
+        if callback is not None:
+            callback(self)
 
     # -- sampling ----------------------------------------------------------- #
     def sample_once(self) -> SlotSample:
@@ -336,6 +357,19 @@ class SourceHealth:
             if self._unknown_since is None:
                 return 0.0
             return time.monotonic() - self._unknown_since
+
+    @property
+    def retrying_for(self) -> float:
+        """Seconds since an interrupted stream last proved stable recovery."""
+        with self._lock:
+            if self._retrying_since is None:
+                return 0.0
+            return time.monotonic() - self._retrying_since
+
+    @property
+    def dark_for(self) -> float:
+        """Seconds the last successful source has been dark or unaskable."""
+        return max(self.not_streaming_for, self.unknown_for, self.retrying_for)
 
     @property
     def ever_sampled(self) -> bool:
@@ -502,9 +536,47 @@ class SourceHealth:
             if dark_after > 0 and self.unknown_for >= dark_after:
                 return SOURCE_HEALTH_STATES.parse("dark")
             return SOURCE_HEALTH_STATES.parse("unknown")
+        if (
+            dark_after > 0
+            and self.ever_sampled
+            and not sample.streaming
+            and self.dark_for >= dark_after
+        ):
+            return SOURCE_HEALTH_STATES.parse("dark")
+        if (
+            dark_after > 0
+            and self.ever_sampled
+            and sample.streaming
+            and self.retrying_for >= dark_after
+        ):
+            return SOURCE_HEALTH_STATES.parse("dark")
         return SOURCE_HEALTH_STATES.parse(
             "streaming" if sample.streaming else "not_streaming"
         )
+
+    def service_status(self, received_high_water: int | None = None) -> str:
+        """Classify source evidence for the single-process lease watchdog.
+
+        ``connected_quiet`` is the only state that lets an otherwise idle service
+        renew: the slot is active, the sampler observation is recent, and any WAL
+        outstanding for this handler is within the established quiet bound.  A live
+        slot with a real backlog is ``connected_busy`` and must be kept alive by
+        callbacks/commits.  A missing/inactive/error observation is disconnected
+        evidence; it stops renewal and is handled by the source-dark branch.
+        """
+        sample = self.last
+        if sample is None:
+            return "unobserved"
+        if time.monotonic() - sample.at > max(self.interval * 3.0, 1.0):
+            return "stale"
+        if sample.unknown or not sample.streaming:
+            return "unknown" if sample.unknown else "disconnected"
+        if self.retrying_for > 0:
+            return "retrying"
+        outstanding = self.outstanding_bytes(received_high_water)
+        if outstanding is None or outstanding <= self.max_lag_bytes:
+            return "connected_quiet"
+        return "connected_busy"
 
     def outstanding_bytes(self, received_high_water: int | None) -> int | None:
         """OUR undelivered backlog, in bytes, or ``None`` when it cannot be read.
@@ -690,6 +762,7 @@ class SourceHealth:
                 "slot_ever_sampled": self.ever_sampled,
                 "slot_ever_streamed": self.ever_streamed,
                 "slot_not_streaming_for_sec": round(self.not_streaming_for, 1),
+                "slot_retrying_for_sec": round(self.retrying_for, 1),
                 "slot_stream_interruptions": self.stream_interruptions,
                 "slot_recovered_after_interruption": self.recovered_after_interruption,
             }
@@ -706,6 +779,7 @@ class SourceHealth:
                 else None
             ),
             "slot_streaming_for_sec": round(self.streaming_for, 1),
+            "slot_retrying_for_sec": round(self.retrying_for, 1),
             "slot_ever_streamed": self.ever_streamed,
             "slot_lag_steady_for_sec": round(self.lag_steady_for, 1),
             "slot_stream_interruptions": self.stream_interruptions,

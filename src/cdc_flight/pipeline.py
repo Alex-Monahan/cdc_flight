@@ -64,6 +64,7 @@ from .destination import (
     OccurrenceKey,
     RunState,
 )
+from .destination_fence import EpochFencedConnection
 from .errors import (
     AlertPersistenceFailure,
     EngineFailure,
@@ -112,7 +113,6 @@ def run(
     service_policy = service_context.policy if service_mode else None
     if service_context is not None:
         service_context.assert_writable()
-        service_context.mark_progress()
 
     # Parse CDC_FAULT_INJECT once, here, so a typo fails the run instead of
     # leaving a fault test vacuously green (Codex 9).
@@ -201,9 +201,10 @@ def run(
     # purpose - see `faults.FaultyConnection`.
     con = None
     try:
-        con = faults_mod.wrap_destination(
-            dest_mod.connect(dest), control_schema=control_schema
-        )
+        # A service bootstrap must not create a MotherDuck database before it owns
+        # an epoch.  The admission step has already proved the physical destination
+        # exists; the pipeline attaches the epoch before exposing a writable handle.
+        con = dest_mod.connect(dest, create_database=not service_mode)
     except BaseException as exc:
         # DuckDB's file lock is acquired by `connect()` before the pipeline has a
         # destination handle. Keep this failure on a durable local sidecar so a
@@ -255,6 +256,30 @@ def run(
     #: while the run was still `draining`.
     reported: dict | None = None
     try:
+        if service_context is not None:
+            destination_lease_key = dest.resolve_physical_lease_key(con)
+            lease = service_context.lease or Lease(
+                destination_lease_key,
+                owner_id=service_context.service_id,
+                ttl_seconds=service_policy.lease_ttl_seconds,
+                control_schema=control_schema,
+                label=dest.pipeline_name,
+                lease_id=service_context.lease_id,
+                fencing_epoch=service_context.fencing_epoch,
+                service_id=service_context.service_id,
+                worker_generation=service_context.worker_generation,
+            )
+            lease.attach(con)
+            con = EpochFencedConnection(con, lease, service_context)
+            con = faults_mod.wrap_destination(
+                con, control_schema=control_schema
+            )
+            service_context.bind(lease, con)
+            lease_held = True
+        else:
+            con = faults_mod.wrap_destination(
+                con, control_schema=control_schema
+            )
         dest_mod.ensure_control_schema(con, control_schema)
         dest_mod.ensure_dataset(con, dest.dataset_name)
         summary_extra["fallback_alerts_replayed"] = dest_mod.replay_fallback_alerts(
@@ -295,23 +320,11 @@ def run(
                 raise LeaseLost(
                     "the service was admitted for a different physical destination"
                 )
-            lease = service_context.lease or Lease(
-                destination_lease_key,
-                owner_id=service_context.service_id,
-                ttl_seconds=service_policy.lease_ttl_seconds,
-                control_schema=control_schema,
-                label=dest.pipeline_name,
-                lease_id=service_context.lease_id,
-                fencing_epoch=service_context.fencing_epoch,
-                service_id=service_context.service_id,
-                worker_generation=service_context.worker_generation,
-            )
             # Admission happened before the engine was constructed.  The same
             # process now attaches its one data connection to that exact epoch;
             # it never reacquires or starts a second process generation.
-            lease.attach(con)
-            service_context.bind(lease, con)
-            lease_held = True
+            if lease is None:
+                raise LeaseLost("service pipeline has no admitted lease")
             reclaimed = getattr(lease, "reclaimed_receipt", None)
             if reclaimed is not None:
                 # The predecessor may have been SIGKILLed or hard-exited by its
@@ -1116,6 +1129,7 @@ def run(
                 lease_held=lease_held,
                 run_ok=run_ok,
                 service_mode=service_context is not None,
+                service_context=service_context,
                 hard_exit_on_transfer=True,
             )
         finally:
@@ -1378,6 +1392,7 @@ def _teardown_destination(
     *, con, ownership: DestinationOwnership, reported: dict | None,
     phases: RunPhaseWriter | None, lease: Lease | None, lease_held: bool, run_ok: bool,
     service_mode: bool = False,
+    service_context=None,
     hard_exit_on_transfer: bool = False,
 ) -> None:
     """Make the one terminal ownership decision for every destination handle."""
@@ -1426,7 +1441,14 @@ def _teardown_destination(
         # admission can advance the fencing epoch visibly.  Batch leases keep
         # their established delete-on-release behavior.
         if service_mode:
+            # This is the production release edge, rather than the admission
+            # fallback below.  Keeping the matrix point on the actual write
+            # path preserves the hard-death proof after the single-process
+            # teardown has already attempted the fenced release.
+            faults_mod.matrix_crash("service_lease_release")
             lease.release(con, retain=True)
+            if service_context is not None:
+                service_context.note_lease_release_attempted()
         else:
             lease.release(con)
     if phases is not None:
@@ -1454,12 +1476,18 @@ def shutdown_and_exit(code: int = 0, timeout: float = 15.0) -> None:
     Debezium leaves non-daemon JVM threads behind, so a plain `return` from
     `main()` leaves the interpreter hanging forever after the work is done.
     """
-    sys.stdout.flush()
-    sys.stderr.flush()
+    # Arm the hard-exit bound BEFORE touching output.  A subprocess whose parent
+    # is waiting for its exit can fill the stdout pipe with stock Debezium/JVM
+    # diagnostics; flushing that pipe is I/O, not a safe precondition for the
+    # watchdog.  Previously the watchdog was created after these flushes, so a
+    # source-dark close could write its accurate summary and then remain alive
+    # forever in ``flush()`` while the scheduled successor waited.
     watchdog = threading.Timer(timeout, lambda: os._exit(code))
     watchdog.daemon = True
     watchdog.start()
     try:
+        sys.stdout.flush()
+        sys.stderr.flush()
         import jpype
         if jpype.isJVMStarted():
             jpype.shutdownJVM()

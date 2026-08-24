@@ -552,7 +552,9 @@ class Applier:
                 raise
             finally:
                 if self.service_context is not None:
-                    self.service_context.operation_finished()
+                    self.service_context.operation_finished(
+                        progressed=self._last_callback_had_data
+                    )
                 with self._quiescence:
                     self._in_flight -= 1
                     if self._last_callback_had_data:

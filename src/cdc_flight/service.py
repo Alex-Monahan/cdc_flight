@@ -21,6 +21,8 @@ import uuid
 
 from . import destination as dest_mod
 from .config import DestinationConfig, ServiceConfig
+from .control_schema import ensure_service_lease_bootstrap
+from .destination_fence import EpochFencedConnection
 from .destination_lease import Lease
 from .errors import AdmissionError, ServiceStandDown
 from .service_runtime import ServiceContext
@@ -95,7 +97,7 @@ class SingleProcessFlight:
         con = None
         try:
             try:
-                con = dest_mod.connect(self.dest)
+                con = dest_mod.connect(self.dest, create_database=False)
             except Exception as connect_error:
                 # A local DuckDB holder owns an OS file lock, so a successor
                 # cannot even open a normal connection to read the lease.  A
@@ -108,7 +110,9 @@ class SingleProcessFlight:
                     connect_error
                 ).lower():
                     raise
-                con = dest_mod.connect(self.dest, read_only=True)
+                con = dest_mod.connect(
+                    self.dest, read_only=True, create_database=False
+                )
                 lease_key = self.dest.resolve_physical_lease_key(con)
                 lease = self._make_lease(lease_key)
                 health = lease.inspect_health(
@@ -125,15 +129,16 @@ class SingleProcessFlight:
                         },
                     ) from connect_error
                 raise connect_error
-            dest_mod.ensure_control_schema(con, self.dest.control_schema)
-            dest_mod.ensure_dataset(con, self.dest.dataset_name)
+            # Before an epoch exists, only the admission lease table may be
+            # bootstrapped.  All current control/catalog/recovery DDL is routed
+            # through the epoch-fenced pipeline handle after this CAS.
+            ensure_service_lease_bootstrap(con, self.dest.control_schema)
             lease_key = self.dest.resolve_physical_lease_key(con)
             lease = self._make_lease(lease_key)
             lease.acquire(
                 con,
                 heartbeat_bound_seconds=self.policy.heartbeat_bound_seconds,
                 wait_for_expiry=True,
-                progress_callback=self.context.mark_progress,
             )
             self.lease = lease
             self.admitted = True
@@ -158,14 +163,25 @@ class SingleProcessFlight:
     def _release_if_needed(self) -> None:
         if not self.admitted or self.lease is None:
             return
+        if self.context.lease_release_attempted:
+            # The pipeline's terminal teardown already used the epoch-fenced
+            # destination handle.  Reopening a second MotherDuck writer here can
+            # hang after a source-dark engine close and adds no safety: a failed
+            # release remains protected by the durable lease expiry.
+            self.admitted = False
+            return
         con = None
+        fenced_con = None
         try:
-            con = dest_mod.connect(self.dest)
-            dest_mod.ensure_control_schema(con, self.dest.control_schema)
+            con = dest_mod.connect(self.dest, create_database=False)
+            fenced_con = EpochFencedConnection(con, self.lease, self.context)
             from . import faults
 
             faults.matrix_crash("service_lease_release")
-            self.lease.release(con, retain=True)
+            # Lease.release is still an exact identity/epoch operation, and the
+            # wrapper adds the same immediate fence that protects every other
+            # service-owned mutation.
+            self.lease.release(fenced_con, retain=True)
             log.info("released service lease epoch %s", self.lease.epoch)
         except Exception:
             # A clean release is preferred, but a failure here must not turn

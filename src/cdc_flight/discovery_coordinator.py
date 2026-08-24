@@ -186,6 +186,22 @@ class LiveDiscoveryCoordinator:
                             int(self.run_cfg.jdbc_socket_timeout_seconds * 1000),
                         ),
                     ),
+                    observation_callback=(
+                        (
+                            lambda current_health: self.service_context.observe_source_health(
+                                current_health.service_status(
+                                    getattr(self.applier, "highest_source_lsn", None)
+                                ),
+                                (
+                                    current_health.last.at
+                                    if current_health.last is not None
+                                    else None
+                                ),
+                            )
+                        )
+                        if self.service_context is not None
+                        else None
+                    ),
                 ).start()
                 if self.phases.phase != PHASE_STREAMING:
                     self.phases.to(PHASE_STREAMING)

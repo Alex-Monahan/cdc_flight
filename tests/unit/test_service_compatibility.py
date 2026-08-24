@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import threading
 import time
+from types import SimpleNamespace
 
 import duckdb
 import pytest
@@ -11,7 +13,7 @@ from cdc_flight import destination as destination_module
 from cdc_flight import offsets
 from cdc_flight.destination import ResumePoint
 from cdc_flight.destination_lease import Lease
-from cdc_flight.errors import LeaseLost, OffsetUnusable
+from cdc_flight.errors import EngineFailure, LeaseLost, OffsetUnusable
 
 
 def _legacy_lease_table(con) -> None:
@@ -115,5 +117,78 @@ def test_service_offset_recheck_fails_when_a_live_offset_file_disappears(tmp_pat
                 offset_path=tmp_path / "missing-offsets.dat",
                 control_schema="_cdc_flight",
             )
+    finally:
+        con.close()
+
+
+def test_service_recheck_invariant_o_guard_is_mutation_sensitive(tmp_path, monkeypatch):
+    """A confirmed source LSN ahead of durable state must stop a service run."""
+    from cdc_flight import reconcile
+    from cdc_flight.discovery_coordinator import LiveDiscoveryCoordinator
+
+    con = duckdb.connect(str(tmp_path / "service-invariant-o.duckdb"))
+    context = SimpleNamespace(assert_writable=lambda: None)
+    coordinator = object.__new__(LiveDiscoveryCoordinator)
+    coordinator.service_context = context
+    coordinator.source = SimpleNamespace(dsn="postgresql://source")
+    coordinator.replication = SimpleNamespace(
+        slot_name="service-slot",
+        offset_file=tmp_path / "offsets.dat",
+    )
+    coordinator.run_cfg = SimpleNamespace(jdbc_connect_timeout_seconds=1)
+    coordinator.con = con
+    coordinator.destination = SimpleNamespace(
+        pipeline_name="service-invariant-o",
+        control_schema="_cdc_flight",
+    )
+    coordinator.namespace = "cdc-flight-engine"
+    coordinator.summary_extra = {}
+
+    class Handler:
+        _destination_operation_lock = threading.RLock()
+        _quiescence = threading.Condition(_destination_operation_lock)
+        _callback_sealed = False
+
+    destination_module.ensure_control_schema(con, "_cdc_flight")
+    point = ResumePoint(
+        partition={"server": "cdcflight"},
+        offset={"lsn": 100},
+        last_lsn=100,
+        commit_id=1,
+    )
+    destination_module.write_resume_point(
+        con,
+        pipeline="service-invariant-o",
+        namespace="cdc-flight-engine",
+        point=point,
+        commit_id=1,
+        offset_blob=None,
+        offset_key_blob=None,
+        control_schema="_cdc_flight",
+    )
+    monkeypatch.setattr(
+        reconcile,
+        "observe_slot",
+        lambda *_args, **_kwargs: reconcile.SlotObservation(
+            slot_exists=True,
+            active=True,
+            confirmed_flush_lsn=101,
+            restart_lsn=90,
+            system_identifier="system",
+            timeline_id=1,
+        ),
+    )
+    monkeypatch.setattr(
+        destination_module,
+        "read_slot_state",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "cdc_flight.discovery_coordinator.offsets.verify_service_offset",
+        lambda *_args, **_kwargs: {"verified": True},
+    )
+    try:
+        with pytest.raises(EngineFailure, match="Invariant O violation"):
+            coordinator._service_recheck(Handler())
     finally:
         con.close()

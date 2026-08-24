@@ -342,6 +342,44 @@ SHUTDOWN_SEQUENCE = Machine(
     purpose="Which shutdown boundary has been proved before stock engine close?",
 )
 
+# SM-B(vi) · ServiceControl — memory only, the service loop's authenticated owner.
+# These transitions are reachable in the single-process runtime and are documented
+# in ADR §A51.1. Declaring them here keeps that inventory generated from code.
+SERVICE_ACTIVE = "active"
+SERVICE_CLOSED = "closed"
+SERVICE_DRAINING = "draining"
+SERVICE_RENEWING = "renewing"
+SERVICE_DRAINING_WITH_RENEWAL = "draining_with_renewal"
+SERVICE_CONTROL = Machine(
+    "service_control",
+    states=(
+        SERVICE_ACTIVE,
+        SERVICE_CLOSED,
+        SERVICE_DRAINING,
+        SERVICE_RENEWING,
+        SERVICE_DRAINING_WITH_RENEWAL,
+    ),
+    edges=(
+        (SERVICE_ACTIVE, SERVICE_CLOSED),
+        (SERVICE_ACTIVE, SERVICE_DRAINING),
+        (SERVICE_ACTIVE, SERVICE_RENEWING),
+        (SERVICE_CLOSED, SERVICE_CLOSED),
+        (SERVICE_DRAINING, SERVICE_CLOSED),
+        (SERVICE_DRAINING, SERVICE_DRAINING),
+        (SERVICE_DRAINING_WITH_RENEWAL, SERVICE_DRAINING),
+        (SERVICE_DRAINING_WITH_RENEWAL, SERVICE_DRAINING_WITH_RENEWAL),
+        (SERVICE_RENEWING, SERVICE_ACTIVE),
+        (SERVICE_RENEWING, SERVICE_DRAINING_WITH_RENEWAL),
+    ),
+    terminal=(SERVICE_CLOSED,),
+    initial=SERVICE_ACTIVE,
+    durable=None,
+    purpose=(
+        "Which authenticated service-control phase owns renewal dispatch and drain, "
+        "including an in-flight renewal's bounded resolution?"
+    ),
+)
+
 
 SNAPSHOT_CALLBACK_OBSERVATIONS = Domain(
     "snapshot_callback_observations",

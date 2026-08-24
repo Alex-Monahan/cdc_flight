@@ -181,7 +181,9 @@ class ResumePoint:
 # --------------------------------------------------------------------------- #
 # connection
 # --------------------------------------------------------------------------- #
-def connect(dest, *, read_only: bool = False) -> Any:
+def connect(
+    dest, *, read_only: bool = False, create_database: bool = True
+) -> Any:
     """Open the one destination connection the applier writes through."""
     import duckdb
 
@@ -211,6 +213,12 @@ def connect(dest, *, read_only: bool = False) -> Any:
             # resolver repeats the server query after schemas are ready.
             database = resolve_motherduck_database(bootstrap, dest.motherduck_database)
             if database is None:
+                if not create_database:
+                    raise RuntimeError(
+                        f"MotherDuck destination database {dest.motherduck_database!r} "
+                        "does not exist; a service Flight will not create a database "
+                        "before it owns a fencing epoch"
+                    )
                 bootstrap.execute(
                     f"CREATE DATABASE IF NOT EXISTS {quote(dest.motherduck_database)}"
                 )

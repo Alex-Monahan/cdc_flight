@@ -620,7 +620,13 @@ class Sandbox:
     ) -> subprocess.Popen:
         """Start one real service Flight child for process-death assertions."""
         sink = subprocess.PIPE if capture else subprocess.DEVNULL
-        env = {**self.env, **(extra_env or {})}
+        # The packaged service entrypoint enforces the continuous Flight contract;
+        # every test-spawned service is an explicit unbounded deployment.
+        env = {
+            **self.env,
+            "max_runtime_sec": "0",
+            **(extra_env or {}),
+        }
         executable = (
             [sys.executable, str(MATRIX_CHILD), "--service"]
             if matrix_arm

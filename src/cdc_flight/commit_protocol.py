@@ -223,6 +223,9 @@ def commit_group(self, trigger: str) -> CommitResult:
                 self.con.execute("COMMIT")
                 self.group.txn_open = False
                 if self.service_context is not None:
+                    # A durable destination commit is real forward motion.  A
+                    # lease heartbeat or a supervisor loop iteration is not.
+                    self.service_context.mark_progress()
                     matrix_crash("service_after_md_commit_before_ack")
                     # A lease loss after the destination commit is still a
                     # no-ack path.  The durable destination wins and the source

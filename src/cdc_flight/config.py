@@ -727,6 +727,14 @@ class ServiceConfig:
     invariant_check_seconds: float = field(
         default_factory=lambda: float(_env("CDC_SERVICE_INVARIANT_CHECK_SECONDS", "30"))
     )
+    #: A source-health observation is a liveness witness only while it is fresh.
+    #: The watchdog may preserve a genuinely quiet connected source on that witness,
+    #: but never on the fact that its Python loop is still iterating.
+    source_health_stale_seconds: float = field(
+        default_factory=lambda: float(
+            _env("CDC_SERVICE_SOURCE_HEALTH_STALE_SECONDS", "15")
+        )
+    )
 
     def __post_init__(self) -> None:
         values = (
@@ -739,6 +747,7 @@ class ServiceConfig:
             ("commit_timeout_seconds", self.commit_timeout_seconds),
             ("close_timeout_seconds", self.close_timeout_seconds),
             ("invariant_check_seconds", self.invariant_check_seconds),
+            ("source_health_stale_seconds", self.source_health_stale_seconds),
         )
         for name, value in values:
             if not math.isfinite(value) or value <= 0:

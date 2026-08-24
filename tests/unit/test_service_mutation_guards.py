@@ -15,9 +15,10 @@ import time
 import duckdb
 import pytest
 
-from cdc_flight import commit_protocol
+from cdc_flight import commit_protocol, flight_entrypoint
 from cdc_flight import destination as destination_module
 from cdc_flight.config import ServiceConfig
+from cdc_flight.destination_fence import EpochFencedConnection
 from cdc_flight.destination_lease import Lease
 from cdc_flight.errors import LeaseLost, ServiceStandDown
 from cdc_flight.occurrence import OccurrenceKey, RunState
@@ -170,6 +171,153 @@ def test_old_epoch_cannot_fence_after_takeover_and_mutation_fails(tmp_path, monk
         with pytest.raises(AssertionError, match="stale epoch"):
             invariant_checker()
     finally:
+        con.close()
+
+
+def test_service_connection_and_independent_cursor_fence_every_mutation_path(tmp_path):
+    """A resumed old generation cannot write data or control state through either handle."""
+    con, old = _lease(tmp_path, owner="old")
+    context = ServiceContext(
+        service_id="old",
+        lease_id=old.lease_id,
+        worker_generation=old.worker_generation,
+        policy=ServiceConfig(),
+    )
+    try:
+        context.bind(old, None)
+        fenced = EpochFencedConnection(con, old, context)
+        fenced.execute("CREATE SCHEMA service_fence_test")
+        fenced.execute("CREATE TABLE service_fence_test.rows (value INTEGER)")
+        fenced.execute("INSERT INTO service_fence_test.rows VALUES (1)")
+        cursor = fenced.cursor()
+        cursor.execute("INSERT INTO service_fence_test.rows VALUES (2)")
+        cursor.close()
+
+        old.release(con, retain=True)
+        new = _service_lease(old, service_id="new")
+        new.acquire(con)
+
+        with pytest.raises(LeaseLost):
+            fenced.execute("INSERT INTO service_fence_test.rows VALUES (3)")
+        with pytest.raises(LeaseLost):
+            stale_cursor = fenced.cursor()
+            stale_cursor.execute("INSERT INTO service_fence_test.rows VALUES (4)")
+
+        assert con.execute(
+            "SELECT value FROM service_fence_test.rows ORDER BY value"
+        ).fetchall() == [(1,), (2,)]
+    finally:
+        context.close()
+        con.close()
+
+
+def test_resurrected_service_handle_fences_every_destination_mutation_class(tmp_path):
+    """Measure zero stale-generation writes across the complete write surface."""
+    con, old = _lease(tmp_path, owner="old")
+    context = ServiceContext(
+        service_id="old",
+        lease_id=old.lease_id,
+        worker_generation=old.worker_generation,
+        policy=ServiceConfig(),
+    )
+    fenced = EpochFencedConnection(con, old, context)
+    try:
+        # Exercise the actual setup writers while the old epoch is valid.  Every
+        # later production writer receives this same handle: the fence is a
+        # property of the write boundary, not a checklist at these call sites.
+        destination_module.ensure_control_schema(fenced, "_cdc_flight")
+        destination_module.ensure_dataset(fenced, "fence_data")
+        fenced.execute('CREATE TABLE "fence_data"."rows" (value INTEGER)')
+        fenced.execute('INSERT INTO "fence_data"."rows" VALUES (1)')
+        fenced.execute('CREATE TABLE "fence_data"."catalog_probe" (value INTEGER)')
+
+        old.release(con, retain=True)
+        new = _service_lease(old, service_id="new")
+        new.acquire(con)
+
+        # These are the mutation families reachable from the service pipeline:
+        # data/materialization, control schema and dataset/catalog DDL, commit and
+        # resume state, run logs and phases, alerts, lease/state rows, catalog
+        # registry, recovery journal, plus every driver write primitive used by
+        # the bulk/cursor paths.
+        def cursor_mutation():
+            cursor = fenced.cursor()
+            try:
+                cursor.execute('INSERT INTO "fence_data"."rows" VALUES (3)')
+            finally:
+                cursor.close()
+
+        mutations = {
+            "data": lambda: fenced.execute(
+                'INSERT INTO "fence_data"."rows" VALUES (2)'
+            ),
+            "control_schema": lambda: destination_module.ensure_control_schema(
+                fenced, "_cdc_flight"
+            ),
+            "dataset_catalog": lambda: destination_module.ensure_dataset(
+                fenced, "fence_data_new"
+            ),
+            "commit_state": lambda: fenced.execute(
+                'UPDATE "_cdc_flight"."commit_log" '
+                "SET event_count=event_count WHERE pipeline='missing'"
+            ),
+            "resume_state": lambda: fenced.execute(
+                'UPDATE "_cdc_flight"."debezium_offsets" '
+                "SET commit_id=commit_id WHERE pipeline='missing'"
+            ),
+            "run_logs": lambda: fenced.execute(
+                'UPDATE "_cdc_flight"."run_logs" SET message=message'
+            ),
+            "alerts": lambda: fenced.execute(
+                'UPDATE "_cdc_flight"."alerts" SET message=message'
+            ),
+            "lease": lambda: fenced.execute(
+                'UPDATE "_cdc_flight"."lease" SET state=state'
+            ),
+            "catalog_registry": lambda: fenced.execute(
+                'UPDATE "_cdc_flight"."source_relations" '
+                "SET source_table=source_table"
+            ),
+            "recovery_journal": lambda: fenced.execute(
+                'UPDATE "_cdc_flight"."recovery_state" SET message=message'
+            ),
+            "cursor": cursor_mutation,
+            "executemany": lambda: fenced.executemany(
+                'INSERT INTO "fence_data"."rows" VALUES (?)', [(4,)]
+            ),
+            "sql": lambda: fenced.sql(
+                'INSERT INTO "fence_data"."rows" VALUES (5)'
+            ),
+            "with_dml": lambda: fenced.execute(
+                'WITH stale(value) AS (SELECT 6) '
+                'INSERT INTO "fence_data"."rows" SELECT value FROM stale'
+            ),
+        }
+        fenced_failures = 0
+        for _family, mutation in mutations.items():
+            with pytest.raises(LeaseLost, match="lease"):
+                mutation()
+            fenced_failures += 1
+
+        remaining_rows = con.execute(
+            'SELECT value FROM "fence_data"."rows" ORDER BY value'
+        ).fetchall()
+        assert remaining_rows == [(1,)]
+        new_schema_count = con.execute(
+            "SELECT count(*) FROM information_schema.schemata "
+            "WHERE schema_name='fence_data_new'"
+        ).fetchone()[0]
+        old_generation_delta = len(remaining_rows) - 1
+        assert old_generation_delta == 0
+        assert new_schema_count == 0
+        assert fenced_failures == len(mutations)
+        assert set(mutations) == {
+            "data", "control_schema", "dataset_catalog", "commit_state",
+            "resume_state", "run_logs", "alerts", "lease", "catalog_registry",
+            "recovery_journal", "cursor", "executemany", "sql", "with_dml",
+        }
+    finally:
+        context.close()
         con.close()
 
 
@@ -386,6 +534,7 @@ def test_service_heartbeat_uses_the_same_admitted_connection():
     connection = object()
     try:
         context.bind(lease, connection)
+        context.observe_source_health("connected_quiet", time.monotonic())
         context._next_heartbeat = time.monotonic() - 1
         assert context.renew_once() is True
         assert lease.called_with is connection
@@ -422,3 +571,17 @@ def test_service_generation_is_the_run_identity_for_occurrences():
     assert first_key != second_key
     assert "stable-service" in first_key.text
     assert "epoch:7" in first_key.text
+
+
+def test_flight_entrypoint_requires_an_explicit_unbounded_runtime(monkeypatch):
+    for name in ("max_runtime_sec", "MAX_RUNTIME_SEC", "FLIGHT_MAX_RUNTIME_SEC"):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(RuntimeError, match="max_runtime_sec=0"):
+        flight_entrypoint._require_unbounded_flight()
+
+    monkeypatch.setenv("max_runtime_sec", "30")
+    with pytest.raises(RuntimeError, match="would let the platform terminate"):
+        flight_entrypoint._require_unbounded_flight()
+
+    monkeypatch.setenv("max_runtime_sec", "0")
+    assert flight_entrypoint._require_unbounded_flight() == 0
