@@ -21,6 +21,7 @@ import time
 from . import faults
 from .config import ServiceConfig
 from .errors import LeaseLost
+from .witness_contract import RenewalWitnessEvidence, renewal_witness_allows
 
 log = logging.getLogger("cdc_flight.service_runtime")
 
@@ -73,6 +74,11 @@ class ServiceContext:
         self._last_engine_commit: float | None = None
         self._last_engine_ack: float | None = None
         self._last_engine_ack_lsn: int | None = None
+        #: A callback owns the destination operation boundary until it returns.
+        #: This is intentionally separate from ``_last_progress``: a long,
+        #: admitted unit is work in flight, not evidence that the Flight is dead.
+        self._operation_started_at: float | None = None
+        self._operation_active = False
         self._stall_message: str | None = None
         self._lease_failure: BaseException | None = None
         self._watchdog: threading.Thread | None = None
@@ -216,22 +222,17 @@ class ServiceContext:
             )
             own_ack = self._last_engine_ack
             own_ack_lsn = self._last_engine_ack_lsn
-        if (
-            observed is None
-            or status not in {"connected_quiet", "connected_busy"}
-            or engine_alive is not True
-            or own_progress is None
-            or own_ack is None
-            or own_ack_lsn is None
-        ):
-            return False
-        return (
-            time.monotonic() - observed
-            <= self.policy.source_health_stale_seconds
-            and time.monotonic() - own_progress
-            <= self.policy.source_health_stale_seconds
-            and time.monotonic() - own_ack
-            <= self.policy.source_health_stale_seconds
+        return renewal_witness_allows(
+            RenewalWitnessEvidence(
+                now=time.monotonic(),
+                source_status=status,
+                source_observed_at=observed,
+                engine_thread_alive=engine_alive,
+                own_progress_at=own_progress,
+                own_ack_at=own_ack,
+                own_ack_lsn=own_ack_lsn,
+                stale_after=self.policy.source_health_stale_seconds,
+            )
         )
 
     def note_source_dark(self) -> None:
@@ -262,12 +263,47 @@ class ServiceContext:
                 already_stalled = self._stall_event.is_set()
                 source_dark = self._source_health_status == "dark"
                 teardown_started = self._teardown_started
+                operation_started_at = self._operation_started_at
+                operation_active = self._operation_active
             # Source-dark is already a fail-closed drain decision made by the
             # supervisor.  Do not let the independent local-stall hard-exit race
             # that diagnosis and erase the durable alert/summary before the
             # bounded engine teardown can publish it.  Renewal is impossible once
             # drain/source-dark is set; this branch only preserves attribution.
             if source_dark or teardown_started:
+                continue
+            if operation_active:
+                # Do not apply the idle-progress clock to a callback that has
+                # admitted a real source unit and is still processing it.  That
+                # was the false-stall shape in the SIGSTOP successor proof: the
+                # successor was writing the real row when its own 20 s clock
+                # fenced it.  A separate operation budget still bounds a wedged
+                # callback before the destination lease expires.
+                operation_for = time.monotonic() - float(operation_started_at)
+                if operation_for < self.policy.operation_timeout_seconds:
+                    continue
+                if not already_stalled:
+                    message = (
+                        "service operation stalled while remaining active for "
+                        f"{operation_for:.1f}s without returning; stopping before "
+                        "the lease can be renewed"
+                    )
+                    with self._lock:
+                        self._stall_message = message
+                        self._stall_event.set()
+                    log.critical(message)
+                    self.request_drain()
+                if operation_for >= (
+                    self.policy.operation_timeout_seconds
+                    + self.policy.stall_exit_grace_seconds
+                ):
+                    log.critical(
+                        "service watchdog hard-exiting after %.1fs of active "
+                        "operation; the operation budget expired",
+                        operation_for,
+                    )
+                    self._exit_fn(1)
+                    return
                 continue
             if stalled_for < self.policy.stall_timeout_seconds:
                 continue
@@ -310,12 +346,15 @@ class ServiceContext:
         blocked. Its polling alone is not evidence that the callback is making
         progress, so the callback owns this timestamp until it completes.
         """
-        # Admission to a callback is not forward motion.  The callback marks each
-        # received source record and the durable COMMIT marks destination progress.
-        return None
+        with self._lock:
+            self._operation_started_at = time.monotonic()
+            self._operation_active = True
 
     def operation_finished(self, *, progressed: bool = False) -> None:
         """Mark completion only when the callback actually moved data forward."""
+        with self._lock:
+            self._operation_active = False
+            self._operation_started_at = None
         if progressed:
             self.mark_progress()
 

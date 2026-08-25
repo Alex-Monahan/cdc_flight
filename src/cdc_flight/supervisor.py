@@ -176,6 +176,12 @@ def run_engine_bounded(
     # completion definition.
     completion = completion or SnapshotCompletion.streaming_only()
     service_mode = service_context is not None
+    if service_mode:
+        # This covers a live-discovery hand-off as well as the first engine:
+        # construction and source/catalog setup are bounded work, not an idle
+        # Flight.  The operation is completed as soon as the engine thread is
+        # started, before the ordinary no-progress clock resumes.
+        service_context.operation_started()
     started = time.monotonic()
     error_box: list[BaseException] = []
     final_poll_done = False
@@ -211,6 +217,7 @@ def run_engine_bounded(
     thread = threading.Thread(target=_run, name="debezium-engine", daemon=True)
     thread.start()
     if service_mode:
+        service_context.operation_finished(progressed=True)
         # The stock engine may install its native signal handlers as streaming
         # starts, after the coordinator's construction-time rearm.  Reapply the
         # Python drain handler from the main thread once the engine thread exists;
@@ -350,7 +357,29 @@ def run_engine_bounded(
                         )
                         | {
                             "slot_active": sample.active if sample is not None else None,
+                            "slot_attached": (
+                                sample.streaming if sample is not None else None
+                            ),
                             "slot_exists": sample.exists if sample is not None else None,
+                            "slot_active_pid": (
+                                sample.active_pid if sample is not None else None
+                            ),
+                            "slot_active_application_name": (
+                                sample.activity_application_name
+                                if sample is not None
+                                else None
+                            ),
+                            "slot_replication_pid": (
+                                sample.replication_pid if sample is not None else None
+                            ),
+                            "slot_replication_application_name": (
+                                sample.replication_application_name
+                                if sample is not None
+                                else None
+                            ),
+                            "slot_walsender_identity": (
+                                sample.identity_context if sample is not None else None
+                            ),
                             "slot_error": sample.error if sample is not None else None,
                         }
                     ),

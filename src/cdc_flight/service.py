@@ -206,6 +206,12 @@ class SingleProcessFlight:
         # MotherDuck health read cannot leave a scheduled Flight hanging
         # forever; the watchdog exits the unreadable instance fail-closed.
         self.context.start_watchdog()
+        # Admission is the first bounded operation, before ``pipeline.run`` has
+        # a chance to install its own startup marker.  Without this boundary a
+        # slow but legitimate MotherDuck lease/readiness handshake was judged by
+        # the idle-progress clock and the holder could die before its walsender
+        # ever attached.
+        self.context.operation_started()
         try:
             try:
                 self._admit()

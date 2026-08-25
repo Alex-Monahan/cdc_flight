@@ -366,6 +366,40 @@ def test_service_stall_is_a_write_barrier_and_self_exit_is_bounded(monkeypatch):
         context.close()
 
 
+def test_completed_active_operation_does_not_trip_the_idle_stall_clock():
+    policy = ServiceConfig(
+        lease_ttl_seconds=2.0,
+        lease_renew_seconds=0.1,
+        heartbeat_bound_seconds=0.5,
+        stall_timeout_seconds=0.2,
+        stall_exit_grace_seconds=0.1,
+        watchdog_poll_seconds=0.01,
+        commit_timeout_seconds=0.3,
+        close_timeout_seconds=0.2,
+        invariant_check_seconds=0.1,
+    )
+    exited: list[int] = []
+    context = ServiceContext(
+        service_id="service-operation",
+        lease_id="lease-operation",
+        worker_generation="service-operation:generation",
+        policy=policy,
+        exit_fn=exited.append,
+    )
+    try:
+        context.operation_started()
+        context.start_watchdog()
+        time.sleep(0.24)
+        assert exited == []
+        assert not context.stalled
+        context.operation_finished(progressed=True)
+        time.sleep(0.05)
+        assert exited == []
+        assert not context.stalled
+    finally:
+        context.close()
+
+
 def test_service_source_dark_preserves_diagnosis_through_watchdog_teardown():
     policy = ServiceConfig(
         lease_ttl_seconds=1.0,

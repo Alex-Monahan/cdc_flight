@@ -55,7 +55,7 @@ from .config import (
     RunConfig,
     SourceConfig,
     applier_settings,
-    lease_ttl_seconds,
+    finite_run_lease_ttl,
 )
 from .debezium_props import assert_no_internal_topic_collision, build_properties
 from .destination import (
@@ -113,6 +113,12 @@ def run(
     service_policy = service_context.policy if service_mode else None
     if service_context is not None:
         service_context.assert_writable()
+        # Admission/reconciliation/engine construction is one bounded startup
+        # operation.  MotherDuck and source catalog work can legitimately take
+        # longer than the ordinary idle-progress clock on a contended Flight;
+        # the service watchdog must use its separate operation budget until the
+        # Debezium thread is actually running.
+        service_context.operation_started()
 
     # Parse CDC_FAULT_INJECT once, here, so a typo fails the run instead of
     # leaving a fault test vacuously green (Codex 9).
@@ -358,7 +364,7 @@ def run(
             lease = Lease(
                 destination_lease_key,
                 owner_id=runner_id,
-                ttl_seconds=lease_ttl_seconds(),
+                ttl_seconds=finite_run_lease_ttl(run_cfg),
                 control_schema=control_schema,
                 label=dest.pipeline_name,
             )

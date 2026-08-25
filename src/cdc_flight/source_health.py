@@ -46,6 +46,11 @@ from datetime import UTC, datetime
 from . import faults
 from .machines import SOURCE_HEALTH_STATES
 from .source_marker import IDLE_HEARTBEAT, SourceMarker
+from .witness_contract import (
+    STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+    ServiceWitnessEvidence,
+    evaluate_service_witness,
+)
 
 log = logging.getLogger("cdc_flight.source_health")
 
@@ -67,16 +72,27 @@ log = logging.getLogger("cdc_flight.source_health")
 DEFAULT_MAX_IDLE_LAG_BYTES = 64 * 1024
 
 _SLOT_SQL = """
-SELECT s.active,
+SELECT (s.slot_name IS NOT NULL) AS slot_exists,
+       -- Keep activity independent from existence.  A missing row must not
+       -- accidentally satisfy a future ``active``-only witness mutation.
+       COALESCE(s.active, TRUE) AS active,
        s.active_pid,
+       a.pid AS activity_pid,
+       a.application_name AS activity_application_name,
+       a.backend_type AS activity_backend_type,
+       a.backend_start AS activity_backend_start,
+       r.pid AS replication_pid,
+       r.application_name AS replication_application_name,
        s.confirmed_flush_lsn IS NOT NULL AS has_confirmed,
        CASE WHEN s.confirmed_flush_lsn IS NULL THEN NULL
             ELSE (s.confirmed_flush_lsn - '0/0')::BIGINT END AS confirmed_pos,
        CASE WHEN s.restart_lsn IS NULL THEN NULL
             ELSE (s.restart_lsn - '0/0')::BIGINT END AS restart_pos,
        COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), s.confirmed_flush_lsn), 0)::BIGINT
-FROM pg_replication_slots s
-WHERE s.slot_name = %s
+FROM (SELECT %s::name AS slot_name) requested
+LEFT JOIN pg_replication_slots s ON s.slot_name = requested.slot_name
+LEFT JOIN pg_stat_activity a ON a.pid = s.active_pid
+LEFT JOIN pg_stat_replication r ON r.pid = s.active_pid
 """
 
 
@@ -87,10 +103,15 @@ class SlotSample:
     at: float
     exists: bool = False
     active: bool = False
-    #: PostgreSQL's current walsender PID.  It is operator corroboration only:
-    #: the PID changes on every legitimate reconnect/takeover and is never used
-    #: as the service's identity proof.
+    #: PostgreSQL's current walsender PID.  The PID is joined to both server-side
+    #: activity views below; it is not persisted across reconnects.
     active_pid: int | None = None
+    activity_pid: int | None = None
+    activity_application_name: str | None = None
+    activity_backend_type: str | None = None
+    activity_backend_start: datetime | None = None
+    replication_pid: int | None = None
+    replication_application_name: str | None = None
     lag_bytes: int | None = None
     confirmed_pos: int | None = None
     restart_pos: int | None = None
@@ -103,6 +124,27 @@ class SlotSample:
     def streaming(self) -> bool:
         """True when a walsender is attached to our slot right now."""
         return self.exists and self.active
+
+    @property
+    def identity_context(self) -> str:
+        """Classify the slot PID's server-side identity evidence."""
+        if not self.streaming:
+            return "not_streaming"
+        if (
+            self.active_pid is None
+            or self.activity_pid != self.active_pid
+            or self.replication_pid != self.active_pid
+        ):
+            return "unproven"
+        if (
+            self.activity_backend_type != "walsender"
+            or self.activity_application_name
+            != STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME
+            or self.replication_application_name
+            != STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME
+        ):
+            return "foreign_walsender"
+        return "stock_debezium"
 
     @property
     def unknown(self) -> bool:
@@ -121,6 +163,11 @@ class SourceHealth:
 
     dsn: str
     slot_name: str
+    #: Stock Debezium 3.6 hard-codes this value on its replication JDBC
+    #: connection.  ``None`` is retained for pure unit fakes; every production
+    #: SourceHealth is constructed with the constant and therefore requires the
+    #: joined server-side identity proof.
+    expected_application_name: str | None = None
     #: A separate write route for the one-shot transactional marker used to make
     #: the post-commit hand-off observable on a quiet source.  It is deliberately
     #: not the Debezium replication connection; in a hot-standby topology this is
@@ -168,6 +215,12 @@ class SourceHealth:
     _service_stalled_since: float | None = field(default=None, repr=False)
     _service_engine_thread_dead: bool = field(default=False, repr=False)
     _service_lag_bytes: int | None = field(default=None, repr=False)
+    #: A source callback/ack observed after this exact backend identity was
+    #: sampled certifies the PID for this process generation.  The PID alone is
+    #: not durable across reconnects; backend_start closes the PID-reuse gap.
+    _bound_walsender_pid: int | None = field(default=None, repr=False)
+    _bound_walsender_backend_start: datetime | None = field(default=None, repr=False)
+    _bound_walsender_ack_at: float | None = field(default=None, repr=False)
 
     # -- lifecycle ---------------------------------------------------------- #
     def start(self) -> SourceHealth:
@@ -315,14 +368,44 @@ class SourceHealth:
                 error=f"{type(exc).__name__}: {exc}",
                 observed_at=datetime.now(UTC),
             )
-        if row is None:
+        if row is None:  # pragma: no cover - the requested-row query always returns one
             return SlotSample(at=now, exists=False, observed_at=datetime.now(UTC))
-        active, active_pid, has_confirmed, confirmed_pos, restart_pos, lag = row
+        (
+            exists,
+            active,
+            active_pid,
+            activity_pid,
+            activity_application_name,
+            activity_backend_type,
+            activity_backend_start,
+            replication_pid,
+            replication_application_name,
+            has_confirmed,
+            confirmed_pos,
+            restart_pos,
+            lag,
+        ) = row
         return SlotSample(
-            at=now,
-            exists=True,
+            at=time.monotonic(),
+            exists=bool(exists),
             active=bool(active),
             active_pid=(int(active_pid) if active_pid is not None else None),
+            activity_pid=(int(activity_pid) if activity_pid is not None else None),
+            activity_application_name=(
+                str(activity_application_name)
+                if activity_application_name is not None
+                else None
+            ),
+            activity_backend_type=(
+                str(activity_backend_type) if activity_backend_type is not None else None
+            ),
+            activity_backend_start=activity_backend_start,
+            replication_pid=(int(replication_pid) if replication_pid is not None else None),
+            replication_application_name=(
+                str(replication_application_name)
+                if replication_application_name is not None
+                else None
+            ),
             confirmed_pos=(int(confirmed_pos) if has_confirmed else None),
             restart_pos=(int(restart_pos) if restart_pos is not None else None),
             lag_bytes=int(lag) if has_confirmed else None,
@@ -594,11 +677,65 @@ class SourceHealth:
             if status in {"connected_quiet", "connected_busy"}:
                 self._service_stalled_since = None
             elif (
-                status in {"stalled", "unproven", "engine_thread_dead"}
+                status
+                in {
+                    "stalled",
+                    "unproven",
+                    "foreign_walsender",
+                    "engine_thread_dead",
+                }
                 and self._service_stalled_since is None
             ):
                 self._service_stalled_since = observed_at
         return status
+
+    def _walsender_is_ours(
+        self,
+        sample: SlotSample | None,
+        *,
+        own_ack_at: float | None,
+    ) -> bool:
+        """Require a current PID to be certified by this Flight's own ack.
+
+        Stock Debezium 3.6 hard-codes ``Debezium Streaming`` for its logical
+        replication connection, so that application name is a class marker, not
+        a process-unique name.  The sampler therefore binds the slot PID and
+        PostgreSQL ``backend_start`` only after a post-ack sample.  A foreign
+        client that takes the slot during the ack-freshness window gets a new
+        identity tuple and cannot inherit the old certificate.  A legitimate
+        reconnect is admitted only after the restarted stock engine produces a
+        new acknowledgement observed with that new backend.
+        """
+        if self.expected_application_name is None or sample is None:
+            return False
+        if sample.identity_context != "stock_debezium":
+            return False
+        if sample.active_pid is None or sample.activity_backend_start is None:
+            return False
+        current = (sample.active_pid, sample.activity_backend_start)
+        with self._lock:
+            bound = (
+                self._bound_walsender_pid,
+                self._bound_walsender_backend_start,
+            )
+            newer_ack = (
+                own_ack_at is not None
+                and (
+                    self._bound_walsender_ack_at is None
+                    or own_ack_at > self._bound_walsender_ack_at
+                )
+            )
+            if current != bound:
+                if not newer_ack or sample.at < own_ack_at:
+                    return False
+                self._bound_walsender_pid = sample.active_pid
+                self._bound_walsender_backend_start = sample.activity_backend_start
+                self._bound_walsender_ack_at = own_ack_at
+            return (
+                self._bound_walsender_pid == sample.active_pid
+                and self._bound_walsender_backend_start
+                == sample.activity_backend_start
+            )
 
     def service_status(
         self,
@@ -633,107 +770,47 @@ class SourceHealth:
         """
         now = time.monotonic()
         sample = self.last
-        if sample is None:
-            return self._publish_service_status(
-                "unobserved",
-                observed_at=now,
-                engine_thread_alive=engine_thread_alive,
-                lag_bytes=None,
-            )
-        if now - sample.at > max(self.interval * 3.0, 1.0):
-            return self._publish_service_status(
-                "stale",
-                observed_at=now,
-                engine_thread_alive=engine_thread_alive,
-                lag_bytes=sample.lag_bytes,
-            )
-        if sample.unknown or not sample.streaming:
-            return self._publish_service_status(
-                "unknown" if sample.unknown else "disconnected",
-                observed_at=now,
-                engine_thread_alive=engine_thread_alive,
-                lag_bytes=sample.lag_bytes,
-            )
-        if not engine_thread_alive:
-            return self._publish_service_status(
-                "engine_thread_dead",
-                observed_at=now,
-                engine_thread_alive=False,
-                lag_bytes=sample.lag_bytes,
-            )
-
-        # A reconnect after a walsender interruption is not recovery until this
-        # Flight's confirmed position advances.  If PostgreSQL is retaining WAL
-        # while that proof is absent, start the fail-closed stall clock at the
-        # interruption rather than granting a fresh active sample a new lease.
-        if (
-            self.stream_interruptions
-            and not self.recovered_after_interruption
-            and (sample.lag_bytes or 0) > 0
-        ):
-            return self._publish_service_status(
-                "stalled",
-                observed_at=now,
-                engine_thread_alive=True,
-                lag_bytes=sample.lag_bytes,
-            )
-
-        # The local proof is required even when a different client has already
-        # moved confirmed_flush_lsn to the current WAL.  That client cannot create
-        # any of these timestamps or the durable LSN owned by this process.
-        missing_own_proof = (
-            own_progress_at is None
-            or own_ack_at is None
-            or own_ack_lsn is None
-            or durable_lsn is None
+        sample_age = float("inf") if sample is None else max(0.0, now - sample.at)
+        evidence = ServiceWitnessEvidence(
+            now=now,
+            sample_present=sample is not None,
+            sample_error=bool(sample is not None and sample.unknown),
+            sample_age=sample_age,
+            sample_stale_after=max(self.interval * 3.0, 1.0),
+            slot_exists=bool(sample is not None and sample.exists),
+            slot_active=bool(sample is not None and sample.active),
+            walsender_identity=(
+                (
+                    sample is not None
+                    and sample.streaming
+                    and self.expected_application_name is None
+                )
+                or (
+                    self.expected_application_name
+                    == STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME
+                    and self._walsender_is_ours(sample, own_ack_at=own_ack_at)
+                )
+            ),
+            engine_thread_alive=bool(engine_thread_alive),
+            stream_recovery_pending=bool(
+                self.stream_interruptions
+                and not self.recovered_after_interruption
+            ),
+            retained_lag_bytes=sample.lag_bytes if sample is not None else None,
+            own_progress_at=own_progress_at,
+            own_ack_at=own_ack_at,
+            own_ack_lsn=own_ack_lsn,
+            durable_lsn=durable_lsn,
+            confirmed_pos=(sample.confirmed_pos if sample is not None else None),
+            received_high_water=received_high_water,
+            progress_stale_after=max(float(progress_stale_after), 0.0),
         )
-        if missing_own_proof:
-            status = "stalled" if (sample.lag_bytes or 0) > 0 else "unproven"
-            return self._publish_service_status(
-                status,
-                observed_at=now,
-                engine_thread_alive=True,
-                lag_bytes=sample.lag_bytes,
-            )
-
-        if sample.confirmed_pos is not None and sample.confirmed_pos > durable_lsn:
-            # This is the source-side form of Invariant O: another client may have
-            # acknowledged the slot beyond this Flight's durable destination point.
-            return self._publish_service_status(
-                "stalled",
-                observed_at=now,
-                engine_thread_alive=True,
-                lag_bytes=sample.lag_bytes,
-            )
-
-        progress_age = now - max(float(own_progress_at), float(own_ack_at))
-        if progress_age > max(float(progress_stale_after), 0.0):
-            status = "stalled" if (sample.lag_bytes or 0) > 0 else "unproven"
-            return self._publish_service_status(
-                status,
-                observed_at=now,
-                engine_thread_alive=True,
-                lag_bytes=sample.lag_bytes,
-            )
-
-        # A Flight-owned acknowledgement is the only quiet-position proof.  The
-        # per-slot value is exact here: zero means our delivered high-water is at
-        # or below the slot confirmation; positive means the live Flight is busy
-        # catching up.  The cluster-retained lag above remains the fail-closed
-        # discriminator when this local progress proof disappears.
-        outstanding = self.per_slot_outstanding_bytes(received_high_water)
-        if outstanding is None:
-            return self._publish_service_status(
-                "unproven",
-                observed_at=now,
-                engine_thread_alive=True,
-                lag_bytes=sample.lag_bytes,
-            )
+        status = evaluate_service_witness(evidence)
         return self._publish_service_status(
-            "connected_quiet" if outstanding == 0 else "connected_busy",
+            status,
             observed_at=now,
-            engine_thread_alive=True,
-            lag_bytes=sample.lag_bytes,
+            engine_thread_alive=engine_thread_alive,
+            lag_bytes=sample.lag_bytes if sample is not None else None,
         )
 
     def outstanding_bytes(self, received_high_water: int | None) -> int | None:
@@ -864,6 +941,15 @@ class SourceHealth:
         # on its next bounded poll instead of allowing stale state to become success.
         if time.monotonic() - sample.at > max(self.interval * 3.0, 1.0):
             return False
+        # A foreign client can keep the slot active while this Flight is idle.
+        # In production the stock connector identity is mandatory; pure unit
+        # fakes leave ``expected_application_name`` unset and retain the older
+        # generic source-health semantics.
+        if (
+            self.expected_application_name is not None
+            and sample.identity_context != "stock_debezium"
+        ):
+            return False
         # (1) A walsender must have been attached to our slot for the whole quiet
         #     window. This is the signal that catches the B5 failure: during a
         #     retriable restart the slot is released, and the connector briefly
@@ -928,7 +1014,20 @@ class SourceHealth:
             "slot_health": self.state(),
             "slot_exists": sample.exists,
             "slot_active": sample.active,
+            "slot_attached": sample.streaming,
             "slot_active_pid": sample.active_pid,
+            "slot_active_activity_pid": sample.activity_pid,
+            "slot_active_application_name": sample.activity_application_name,
+            "slot_active_backend_type": sample.activity_backend_type,
+            "slot_active_backend_start": (
+                sample.activity_backend_start.isoformat()
+                if sample.activity_backend_start is not None
+                else None
+            ),
+            "slot_replication_pid": sample.replication_pid,
+            "slot_replication_application_name": sample.replication_application_name,
+            "slot_walsender_identity": sample.identity_context,
+            "slot_expected_application_name": self.expected_application_name,
             "slot_confirmed_pos": sample.confirmed_pos,
             "slot_restart_pos": sample.restart_pos,
             "slot_lag_bytes": sample.lag_bytes,

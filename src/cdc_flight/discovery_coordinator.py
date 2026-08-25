@@ -28,6 +28,7 @@ from .snapshot_completion import SnapshotCompletion
 from .source_health import SourceHealth
 from .source_marker import SourceMarker
 from .supervisor import run_engine_bounded
+from .witness_contract import STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME
 
 log = logging.getLogger("cdc_flight.discovery_coordinator")
 
@@ -168,6 +169,7 @@ class LiveDiscoveryCoordinator:
                 self.health = SourceHealth(
                     dsn=self.source.dsn,
                     slot_name=self.replication.slot_name,
+                    expected_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
                     primary_dsn=self.source.primary_dsn,
                     source_marker=(
                         getattr(self.watcher, "marker", None)

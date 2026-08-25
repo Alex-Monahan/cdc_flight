@@ -1,8 +1,19 @@
 from __future__ import annotations
 
 import time
+from datetime import UTC, datetime
+
+import pytest
 
 from cdc_flight.source_health import SlotSample, SourceHealth
+from cdc_flight.witness_contract import (
+    STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+    WITNESS_INPUTS,
+    canonical_renewal_evidence,
+    canonical_service_evidence,
+    evaluate_service_witness,
+    renewal_witness_allows,
+)
 
 _UNSET = object()
 
@@ -53,11 +64,12 @@ def _service_status(
     progress_stale_after=15.0,
 ):
     now = time.monotonic()
+    sample_at = health.last.at if health.last is not None else now
     return health.service_status(
         received_high_water,
         engine_thread_alive=engine_thread_alive,
-        own_progress_at=now if own_progress_at is _UNSET else own_progress_at,
-        own_ack_at=now if own_ack_at is _UNSET else own_ack_at,
+        own_progress_at=sample_at if own_progress_at is _UNSET else own_progress_at,
+        own_ack_at=sample_at if own_ack_at is _UNSET else own_ack_at,
         own_ack_lsn=own_ack_lsn,
         durable_lsn=durable_lsn,
         progress_stale_after=progress_stale_after,
@@ -65,13 +77,24 @@ def _service_status(
 
 
 def _active_health(*, lag_bytes=0, confirmed_pos=100):
-    health = SourceHealth(dsn="postgresql://unused", slot_name="slot")
+    backend_start = datetime(2026, 1, 1, tzinfo=UTC)
+    health = SourceHealth(
+        dsn="postgresql://unused",
+        slot_name="slot",
+        expected_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+    )
     health._ingest(
         SlotSample(
             at=time.monotonic(),
             exists=True,
             active=True,
             active_pid=3210,
+            activity_pid=3210,
+            activity_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+            activity_backend_type="walsender",
+            activity_backend_start=backend_start,
+            replication_pid=3210,
+            replication_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
             confirmed_pos=confirmed_pos,
             lag_bytes=lag_bytes,
         )
@@ -95,7 +118,7 @@ def test_service_witness_requires_our_callback_commit_and_ack():
     assert _service_status(
         health,
         own_progress_at=now,
-        own_ack_at=now,
+        own_ack_at=health.last.at,
         own_ack_lsn=100,
         durable_lsn=100,
     ) == "connected_quiet"
@@ -108,7 +131,7 @@ def test_service_witness_dead_engine_never_becomes_quiet():
         health,
         engine_thread_alive=False,
         own_progress_at=now,
-        own_ack_at=now,
+        own_ack_at=health.last.at,
     ) == "engine_thread_dead"
     assert health.summary()["service_engine_thread_dead"] is True
 
@@ -119,7 +142,7 @@ def test_service_witness_requires_our_ack_position_and_durable_resume_point():
     assert _service_status(
         health,
         own_progress_at=now,
-        own_ack_at=now,
+        own_ack_at=health.last.at,
         own_ack_lsn=None,
         durable_lsn=100,
     ) == "unproven"
@@ -128,7 +151,7 @@ def test_service_witness_requires_our_ack_position_and_durable_resume_point():
     assert _service_status(
         ahead,
         own_progress_at=now,
-        own_ack_at=now,
+        own_ack_at=ahead.last.at,
         own_ack_lsn=100,
         durable_lsn=100,
     ) == "stalled"
@@ -157,6 +180,12 @@ def test_service_witness_transient_stall_recovers_with_our_next_ack():
             exists=True,
             active=True,
             active_pid=3211,
+            activity_pid=3211,
+            activity_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+            activity_backend_type="walsender",
+            activity_backend_start=datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC),
+            replication_pid=3211,
+            replication_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
             confirmed_pos=200,
             lag_bytes=1_000,
         )
@@ -165,7 +194,7 @@ def test_service_witness_transient_stall_recovers_with_our_next_ack():
     assert _service_status(
         health,
         own_progress_at=now,
-        own_ack_at=now,
+        own_ack_at=health.last.at,
         own_ack_lsn=200,
         durable_lsn=200,
         received_high_water=200,
@@ -173,35 +202,73 @@ def test_service_witness_transient_stall_recovers_with_our_next_ack():
     assert health.dark_for < 1
 
 
-def test_service_witness_mutation_guards_cover_each_required_input():
-    """Each independent witness input has a committed negative cell."""
-    now = time.monotonic()
-
-    # Removing the own-progress requirement would make this active slot quiet.
-    progress_missing = _active_health(lag_bytes=0)
+def test_service_witness_rejects_a_new_stock_pid_until_its_ack_certifies_it():
+    health = _active_health(lag_bytes=0)
+    first_ack = health.last.at
     assert _service_status(
-        progress_missing,
-        own_progress_at=None,
-        own_ack_at=now,
-        own_ack_lsn=100,
-        durable_lsn=100,
-    ) == "unproven"
+        health,
+        own_progress_at=first_ack,
+        own_ack_at=first_ack,
+    ) == "connected_quiet"
 
-    # Removing the engine-thread requirement would let the dead engine renew.
-    dead_engine = _active_health(lag_bytes=0)
+    health._ingest(
+        SlotSample(
+            at=time.monotonic(),
+            exists=True,
+            active=True,
+            active_pid=3211,
+            activity_pid=3211,
+            activity_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+            activity_backend_type="walsender",
+            activity_backend_start=datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC),
+            replication_pid=3211,
+            replication_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+            confirmed_pos=100,
+            lag_bytes=0,
+        )
+    )
     assert _service_status(
-        dead_engine,
-        engine_thread_alive=False,
-        own_progress_at=now,
-        own_ack_at=now,
-    ) == "engine_thread_dead"
+        health,
+        own_progress_at=first_ack,
+        own_ack_at=first_ack,
+    ) == "foreign_walsender"
+    assert _service_status(
+        health,
+        own_progress_at=health.last.at,
+        own_ack_at=health.last.at,
+    ) == "connected_quiet"
 
-    # Replacing retained lag with only per-slot outstanding would turn this into
-    # the gate's false green: high-water equals confirmed, but source WAL is pending.
-    lag_removed = _active_health(lag_bytes=3_860_000)
-    stale = now - 30
-    assert _service_status(
-        lag_removed,
-        own_progress_at=stale,
-        own_ack_at=stale,
-    ) == "stalled"
+
+@pytest.mark.parametrize(
+    "spec",
+    WITNESS_INPUTS,
+    ids=lambda spec: spec.key.value,
+)
+def test_service_witness_mutation_guards_cover_each_required_input(spec):
+    """The production witness registry is also the complete mutation collection.
+
+    There is no separately maintained test-side list.  Each registered input
+    supplies its own negative cell, and the pure production folds are evaluated
+    against that cell.  A new guard without a negative case fails registry import;
+    a guard omitted from the production fold fails this collection's expectation.
+    """
+    if spec.layer == "service":
+        canonical = canonical_service_evidence()
+        assert spec.service_guard is not None
+        # The positive half catches a guard replaced by an unconditional
+        # failure; the registered negative cell catches a guard removed or a
+        # derived-input calculation disabled.  Both halves come from the same
+        # production registry, so neither is a second hand-maintained list.
+        assert spec.service_guard(canonical) is True
+        mutated = spec.negative_case(canonical)
+        if spec.negative_guard_must_fail:
+            assert spec.service_guard(mutated) is False
+        assert evaluate_service_witness(mutated) == spec.expected
+    else:
+        canonical = canonical_renewal_evidence()
+        assert spec.renewal_guard is not None
+        assert spec.renewal_guard(canonical) is True
+        mutated = spec.negative_case(canonical)
+        if spec.negative_guard_must_fail:
+            assert spec.renewal_guard(mutated) is False
+        assert renewal_witness_allows(mutated) is spec.expected

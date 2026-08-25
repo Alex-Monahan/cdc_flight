@@ -459,7 +459,7 @@ class RunConfig:
     #: this bounded grace the run fails closed instead of taking the old timer-only
     #: success path (A51 row 50).
     source_probe_startup_seconds: float = field(
-        default_factory=lambda: float(_env("CDC_SOURCE_PROBE_STARTUP_SECONDS", "8"))
+        default_factory=lambda: float(_env("CDC_SOURCE_PROBE_STARTUP_SECONDS", "15"))
     )
     #: Bound for the final join of the Debezium engine thread after ``close``.  The old
     #: hard-coded 60 s was a wait with no operator-configured budget.
@@ -682,6 +682,25 @@ def lease_ttl_seconds() -> float:
     return float(_env("CDC_LEASE_TTL", "60"))
 
 
+def finite_run_lease_ttl(run: RunConfig) -> float:
+    """Keep a finite run's destination admission through its explicit budget.
+
+    The source snapshot is allowed to be a long, legitimate callback.  A fixed
+    60-second destination lease expired while that callback was still writing and
+    made the next fence report ``LeaseLost``.  The finite adapter already has a
+    process-local crash-recovery rule, so its lease can cover the declared run,
+    close, and engine-thread budgets without changing the service watchdog or its
+    freshness proof.
+    """
+    configured = lease_ttl_seconds()
+    if not math.isfinite(run.max_seconds):
+        return configured
+    return max(
+        configured,
+        float(run.max_seconds) + run.close_timeout + run.engine_thread_timeout,
+    )
+
+
 @dataclass(frozen=True)
 class ServiceConfig:
     """Lease and liveness policy for the one-process Flight runtime.
@@ -778,6 +797,24 @@ class ServiceConfig:
                 "service commit timeout must be less than the lease TTL so a stalled "
                 "data transaction cannot outlive its fencing lease"
             )
+
+    @property
+    def operation_timeout_seconds(self) -> float:
+        """Bound one admitted callback without using the idle-progress clock.
+
+        A callback that is actively processing a legitimate source unit is not a
+        stalled Flight.  Its independent operation budget ends before the lease
+        expires, so an actually wedged callback still cannot renew indefinitely;
+        the ordinary stall clock remains available immediately after the callback
+        boundary.
+        """
+        return min(
+            self.lease_ttl_seconds - self.stall_exit_grace_seconds,
+            max(
+                self.stall_timeout_seconds + self.stall_exit_grace_seconds,
+                self.commit_timeout_seconds,
+            ),
+        )
 
 
 def motherduck_token() -> str | None:
