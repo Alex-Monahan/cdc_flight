@@ -329,14 +329,12 @@ def test_service_witness_mutation_guards_cover_each_required_input(spec):
         # production registry, so neither is a second hand-maintained list.
         assert spec.service_guard(canonical) is True
         mutated = spec.negative_case(canonical)
-        if spec.negative_guard_must_fail:
-            assert spec.service_guard(mutated) is False
+        assert spec.service_guard(mutated) is False
         assert evaluate_service_witness(mutated) == spec.expected
     else:
         canonical = canonical_renewal_evidence()
         assert spec.renewal_guard is not None
         assert spec.renewal_guard(canonical) is True
         mutated = spec.negative_case(canonical)
-        if spec.negative_guard_must_fail:
-            assert spec.renewal_guard(mutated) is False
+        assert spec.renewal_guard(mutated) is False
         assert renewal_witness_allows(mutated) is spec.expected

@@ -115,10 +115,6 @@ class WitnessInputSpec:
     service_guard: ServiceGuard | None = None
     service_failure: FailureStatus | None = None
     renewal_guard: RenewalGuard | None = None
-    #: Most negative cells falsify the named boolean guard directly.  A derived
-    #: output input (currently the received high-water calculation) instead
-    #: keeps its guard true and proves the resulting classification.
-    negative_guard_must_fail: bool = True
 
 
 def _stalled_or_unproven(evidence: ServiceWitnessEvidence) -> str:
@@ -186,21 +182,33 @@ def _service_guard_ack_not_ahead(e: ServiceWitnessEvidence) -> bool:
 
 
 def _service_guard_progress_fresh(e: ServiceWitnessEvidence) -> bool:
-    return (
-        e.own_progress_at is not None
-        and e.now - e.own_progress_at <= max(e.progress_stale_after, 0.0)
+    # Presence is a separate registered input. Keeping ``None`` out of this
+    # guard makes deletion of either production use site observable.
+    return e.own_progress_at is None or e.now - e.own_progress_at <= max(
+        e.progress_stale_after, 0.0
     )
 
 
 def _service_guard_ack_fresh(e: ServiceWitnessEvidence) -> bool:
-    return (
-        e.own_ack_at is not None
-        and e.now - e.own_ack_at <= max(e.progress_stale_after, 0.0)
+    # Presence is a separate registered input. Keeping ``None`` out of this
+    # guard makes deletion of either production use site observable.
+    return e.own_ack_at is None or e.now - e.own_ack_at <= max(
+        e.progress_stale_after, 0.0
     )
 
 
 def _service_guard_received_high_water(e: ServiceWitnessEvidence) -> bool:
-    return e.received_high_water is not None and e.confirmed_pos is not None
+    return (
+        e.received_high_water is not None
+        and e.confirmed_pos is not None
+        and e.received_high_water <= e.confirmed_pos
+    )
+
+
+def _service_failure_received_high_water(e: ServiceWitnessEvidence) -> str:
+    if e.received_high_water is None or e.confirmed_pos is None:
+        return "unproven"
+    return "connected_busy"
 
 
 def _renewal_guard_status(e: RenewalWitnessEvidence) -> bool:
@@ -231,16 +239,18 @@ def _renewal_guard_source_observation_fresh(e: RenewalWitnessEvidence) -> bool:
 
 
 def _renewal_guard_progress_fresh(e: RenewalWitnessEvidence) -> bool:
-    return (
-        e.own_progress_at is not None
-        and e.now - e.own_progress_at <= max(e.stale_after, 0.0)
+    # Presence is a separate registered input. Keeping ``None`` out of this
+    # guard makes deletion of either production use site observable.
+    return e.own_progress_at is None or e.now - e.own_progress_at <= max(
+        e.stale_after, 0.0
     )
 
 
 def _renewal_guard_ack_fresh(e: RenewalWitnessEvidence) -> bool:
-    return (
-        e.own_ack_at is not None
-        and e.now - e.own_ack_at <= max(e.stale_after, 0.0)
+    # Presence is a separate registered input. Keeping ``None`` out of this
+    # guard makes deletion of either production use site observable.
+    return e.own_ack_at is None or e.now - e.own_ack_at <= max(
+        e.stale_after, 0.0
     )
 
 
@@ -385,8 +395,7 @@ WITNESS_INPUTS: tuple[WitnessInputSpec, ...] = (
         _service_negative(lambda e: replace(e, received_high_water=200)),
         "connected_busy",
         service_guard=_service_guard_received_high_water,
-        service_failure=lambda _e: "unproven",
-        negative_guard_must_fail=False,
+        service_failure=_service_failure_received_high_water,
     ),
     WitnessInputSpec(
         WitnessInput.RENEWAL_STATUS,
@@ -463,13 +472,22 @@ def _validate_registry() -> None:
         if spec.layer == "service":
             if spec.service_guard is None or spec.service_failure is None:
                 raise RuntimeError(f"service witness input lacks a production guard: {spec.key}")
-        elif spec.renewal_guard is None:
-            raise RuntimeError(f"renewal witness input lacks a production guard: {spec.key}")
+            canonical = canonical_service_evidence()
+            guard = spec.service_guard
+        elif spec.layer == "renewal":
+            if spec.renewal_guard is None:
+                raise RuntimeError(f"renewal witness input lacks a production guard: {spec.key}")
+            canonical = canonical_renewal_evidence()
+            guard = spec.renewal_guard
+        else:  # pragma: no cover - Literal plus the registry entries above
+            raise RuntimeError(f"unknown witness layer: {spec.key}")
         if not callable(spec.negative_case):
             raise RuntimeError(f"witness input lacks a negative cell: {spec.key}")
-
-
-_validate_registry()
+        if guard(canonical) is not True:
+            raise RuntimeError(f"canonical witness case fails its guard: {spec.key}")
+        negative = spec.negative_case(canonical)
+        if guard(negative) is not False:
+            raise RuntimeError(f"negative witness case does not fail its guard: {spec.key}")
 
 
 def evaluate_service_witness(evidence: ServiceWitnessEvidence) -> str:
@@ -481,11 +499,7 @@ def evaluate_service_witness(evidence: ServiceWitnessEvidence) -> str:
         if not spec.service_guard(evidence):
             assert spec.service_failure is not None
             return spec.service_failure(evidence)
-    outstanding = max(
-        0,
-        int(evidence.received_high_water) - int(evidence.confirmed_pos),
-    )
-    return "connected_quiet" if outstanding == 0 else "connected_busy"
+    return "connected_quiet"
 
 
 def renewal_witness_allows(evidence: RenewalWitnessEvidence) -> bool:
@@ -535,3 +549,6 @@ def canonical_renewal_evidence(*, now: float = 1_000.0) -> RenewalWitnessEvidenc
         own_ack_lsn=100,
         stale_after=15.0,
     )
+
+
+_validate_registry()
