@@ -83,22 +83,24 @@ def _active_health(*, lag_bytes=0, confirmed_pos=100):
         slot_name="slot",
         expected_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
     )
-    health._ingest(
-        SlotSample(
-            at=time.monotonic(),
-            exists=True,
-            active=True,
-            active_pid=3210,
-            activity_pid=3210,
-            activity_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
-            activity_backend_type="walsender",
-            activity_backend_start=backend_start,
-            replication_pid=3210,
-            replication_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
-            confirmed_pos=confirmed_pos,
-            lag_bytes=lag_bytes,
+    first_at = time.monotonic()
+    for sample_at in (first_at, time.monotonic()):
+        health._ingest(
+            SlotSample(
+                at=sample_at,
+                exists=True,
+                active=True,
+                active_pid=3210,
+                activity_pid=3210,
+                activity_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+                activity_backend_type="walsender",
+                activity_backend_start=backend_start,
+                replication_pid=3210,
+                replication_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+                confirmed_pos=confirmed_pos,
+                lag_bytes=lag_bytes,
+            )
         )
-    )
     return health
 
 
@@ -190,6 +192,22 @@ def test_service_witness_transient_stall_recovers_with_our_next_ack():
             lag_bytes=1_000,
         )
     )
+    health._ingest(
+        SlotSample(
+            at=time.monotonic(),
+            exists=True,
+            active=True,
+            active_pid=3211,
+            activity_pid=3211,
+            activity_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+            activity_backend_type="walsender",
+            activity_backend_start=datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC),
+            replication_pid=3211,
+            replication_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+            confirmed_pos=200,
+            lag_bytes=1_000,
+        )
+    )
     now = time.monotonic()
     assert _service_status(
         health,
@@ -232,11 +250,61 @@ def test_service_witness_rejects_a_new_stock_pid_until_its_ack_certifies_it():
         own_progress_at=first_ack,
         own_ack_at=first_ack,
     ) == "foreign_walsender"
+    health._ingest(
+        SlotSample(
+            at=time.monotonic(),
+            exists=True,
+            active=True,
+            active_pid=3211,
+            activity_pid=3211,
+            activity_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+            activity_backend_type="walsender",
+            activity_backend_start=datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC),
+            replication_pid=3211,
+            replication_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+            confirmed_pos=100,
+            lag_bytes=0,
+        )
+    )
     assert _service_status(
         health,
         own_progress_at=health.last.at,
         own_ack_at=health.last.at,
     ) == "connected_quiet"
+
+
+def test_service_witness_rejects_a_new_stock_backend_after_a_fresh_ack():
+    """A generic stock app name cannot certify a backend seen only post-ack."""
+    health = _active_health(lag_bytes=0)
+    first_ack = health.last.at
+    assert _service_status(
+        health,
+        own_progress_at=first_ack,
+        own_ack_at=first_ack,
+    ) == "connected_quiet"
+
+    fresh_ack = time.monotonic()
+    health._ingest(
+        SlotSample(
+            at=time.monotonic(),
+            exists=True,
+            active=True,
+            active_pid=3211,
+            activity_pid=3211,
+            activity_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+            activity_backend_type="walsender",
+            activity_backend_start=datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC),
+            replication_pid=3211,
+            replication_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+            confirmed_pos=100,
+            lag_bytes=0,
+        )
+    )
+    assert _service_status(
+        health,
+        own_progress_at=fresh_ack,
+        own_ack_at=fresh_ack,
+    ) == "foreign_walsender"
 
 
 @pytest.mark.parametrize(

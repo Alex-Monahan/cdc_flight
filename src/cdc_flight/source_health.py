@@ -189,6 +189,10 @@ class SourceHealth:
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _stop: threading.Event = field(default_factory=threading.Event, repr=False)
     _thread: threading.Thread | None = field(default=None, repr=False)
+    #: The immediately preceding observation is needed to bracket an own ack.
+    #: A post-ack sample alone cannot prove that a newly attached, generic-stock-
+    #: labelled backend was the connector that produced the ack.
+    _previous: SlotSample | None = field(default=None, repr=False)
     _last: SlotSample | None = field(default=None, repr=False)
     _not_streaming_since: float | None = field(default=None, repr=False)
     _streaming_since: float | None = field(default=None, repr=False)
@@ -283,6 +287,7 @@ class SourceHealth:
             ):
                 self._recovered_after_interruption = True
                 self._retrying_since = None
+            self._previous = self._last
             self._last = sample
             if sample.streaming:
                 self._ever_streamed = True
@@ -700,11 +705,12 @@ class SourceHealth:
         Stock Debezium 3.6 hard-codes ``Debezium Streaming`` for its logical
         replication connection, so that application name is a class marker, not
         a process-unique name.  The sampler therefore binds the slot PID and
-        PostgreSQL ``backend_start`` only after a post-ack sample.  A foreign
-        client that takes the slot during the ack-freshness window gets a new
-        identity tuple and cannot inherit the old certificate.  A legitimate
-        reconnect is admitted only after the restarted stock engine produces a
-        new acknowledgement observed with that new backend.
+        PostgreSQL ``backend_start`` only when two adjacent stock-labelled samples
+        bracket this Flight's acknowledgement.  A post-ack sample alone is not
+        enough: a foreign client could take the slot immediately after our ack and
+        present the same generic application name.  A legitimate reconnect is
+        admitted only after the restarted stock engine is observed before and after
+        its new acknowledgement.
         """
         if self.expected_application_name is None or sample is None:
             return False
@@ -718,6 +724,7 @@ class SourceHealth:
                 self._bound_walsender_pid,
                 self._bound_walsender_backend_start,
             )
+            previous = self._previous
             newer_ack = (
                 own_ack_at is not None
                 and (
@@ -726,7 +733,17 @@ class SourceHealth:
                 )
             )
             if current != bound:
-                if not newer_ack or sample.at < own_ack_at:
+                if (
+                    not newer_ack
+                    or own_ack_at is None
+                    or sample.at < own_ack_at
+                    or previous is None
+                    or not previous.streaming
+                    or previous.identity_context != "stock_debezium"
+                    or previous.active_pid != sample.active_pid
+                    or previous.activity_backend_start != sample.activity_backend_start
+                    or previous.at > own_ack_at
+                ):
                     return False
                 self._bound_walsender_pid = sample.active_pid
                 self._bound_walsender_backend_start = sample.activity_backend_start
