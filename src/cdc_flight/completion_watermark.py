@@ -277,6 +277,11 @@ class CompletionWatermark:
             f"state: {self._state!r}"
         )
 
+    @property
+    def stop_decision_at(self) -> float | None:
+        """The monotonic instant at which supervision accepted completion."""
+        return self._stop_at
+
     # -- the watermark ------------------------------------------------------ #
     def _may_stop(self, handler) -> bool:
         """The preconditions no completion route may ever skip."""

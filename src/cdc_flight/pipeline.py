@@ -27,6 +27,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 # Runtime compatibility, not a test workaround. This must run before any project import
@@ -1581,6 +1582,16 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _write_summary(summary: dict) -> None:
+    # This is the last observable point before ``shutdown_and_exit``.  Keeping
+    # the interval keyed to the accepted completion decision, rather than to
+    # process start, makes the assertion insensitive to JVM startup and other
+    # unrelated host load while still covering destination drain, engine close,
+    # lease release, and the outer pipeline teardown.
+    stop_at = summary.pop("_completion_stop_at_monotonic", None)
+    if stop_at is not None:
+        summary["completion_stop_to_summary_sec"] = round(
+            max(0.0, time.monotonic() - float(stop_at)), 3
+        )
     payload = json.dumps(summary, indent=2, sort_keys=True, default=str)
     print(payload)
     try:

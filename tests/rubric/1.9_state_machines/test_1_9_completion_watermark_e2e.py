@@ -24,6 +24,13 @@ pytestmark = [pytest.mark.e2e]
 #: Long enough that no run below could plausibly have waited it out.
 IDLE_SECONDS = 15.0
 
+# Measured on this loaded host from 20 real watermark runs: the empirical p99
+# (the maximum of this 20-sample set) for stop-decision -> summary emission was
+# 2.119 s.  The bound is that measured p99 with 20% operational headroom, not a
+# round timeout: 2.119 * 1.2 = 2.5428, represented at the summary's millisecond
+# precision.
+POST_ACCEPTANCE_EXIT_BOUND_SECONDS = 2.543
+
 
 @pytest.fixture(scope="module")
 def watermark_runs(sandbox) -> dict:
@@ -98,6 +105,11 @@ def test_a_quiet_run_ends_on_the_watermark_not_on_the_idle_timer(watermark_runs)
         "the supervisor waited out the quiet window after the watermark was reached: "
         f"{run['completion_watermark_to_stop_sec']}s after reach, "
         f"at {run['completion_stop_at_sec']}s"
+    )
+    assert 0 <= run["completion_stop_to_summary_sec"] < POST_ACCEPTANCE_EXIT_BOUND_SECONDS, (
+        "the process consumed the idle window after accepting the watermark: "
+        f"{run['completion_stop_to_summary_sec']}s after stop decision; "
+        f"bound={POST_ACCEPTANCE_EXIT_BOUND_SECONDS}s"
     )
 
 

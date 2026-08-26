@@ -848,6 +848,12 @@ def run_engine_bounded(
             if discarded:
                 log.info("discarded %s un-committed tail events at shutdown", discarded)
 
+    # Keep the post-decision phase separate from the completion predicate.  The
+    # watermark interval proves that the predicate was accepted promptly; this
+    # second interval covers the supervisor's bounded drain/close path after that
+    # acceptance.  The pipeline carries the private monotonic instant forward so
+    # its final summary can include the outer teardown as well.
+    supervisor_finished_at = time.monotonic()
     summary = {
         "stop_reason": outcome.value,
         "elapsed_sec": round(time.monotonic() - started, 2),
@@ -871,7 +877,15 @@ def run_engine_bounded(
             }
         )
     else:
-        summary.update(watermark.as_dict())
+        watermark_summary = watermark.as_dict()
+        if watermark.stop_decision_at is not None:
+            watermark_summary["_completion_stop_at_monotonic"] = (
+                watermark.stop_decision_at
+            )
+            watermark_summary["completion_stop_to_supervisor_exit_sec"] = round(
+                max(0.0, supervisor_finished_at - watermark.stop_decision_at), 3
+            )
+        summary.update(watermark_summary)
     if close_hung:
         # Recorded even when it is not the reported reason, because "we could not shut
         # the engine down" is operationally interesting whatever caused it.
