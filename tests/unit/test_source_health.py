@@ -104,6 +104,38 @@ def _active_health(*, lag_bytes=0, confirmed_pos=100):
     return health
 
 
+def test_service_witness_rejects_an_empty_configured_publication():
+    health = SourceHealth(
+        dsn="postgresql://unused",
+        slot_name="slot",
+        expected_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+        publication_name="empty_publication",
+    )
+    backend_start = datetime(2026, 1, 1, tzinfo=UTC)
+    now = time.monotonic()
+    for sample_at in (now - 0.1, now):
+        health._ingest(
+            SlotSample(
+                at=sample_at,
+                exists=True,
+                active=True,
+                active_pid=3210,
+                activity_pid=3210,
+                activity_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+                activity_backend_type="walsender",
+                activity_backend_start=backend_start,
+                replication_pid=3210,
+                replication_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+                confirmed_pos=100,
+                lag_bytes=0,
+                publication_has_tables=False,
+            )
+        )
+
+    assert _service_status(health) == "unproven"
+    assert health.summary()["source_publication_has_tables"] is False
+
+
 def test_service_witness_requires_our_callback_commit_and_ack():
     """An active slot with no Flight-owned progress is stalled, not quiet."""
     health = _active_health(lag_bytes=3_315_744)

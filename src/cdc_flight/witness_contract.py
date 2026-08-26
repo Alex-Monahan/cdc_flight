@@ -30,6 +30,7 @@ class WitnessInput(StrEnum):
     SAMPLE_PRESENT = "sample_present"
     SLOT_EXISTS = "slot_exists"
     SLOT_ACTIVE = "slot_active"
+    PUBLICATION_MEMBERSHIP = "publication_membership"
     WALSENDER_IDENTITY = "walsender_identity"
     SAMPLER_OBSERVATION_FRESHNESS = "sampler_observation_freshness"
     ENGINE_THREAD_ALIVE = "engine_thread_alive"
@@ -64,6 +65,7 @@ class ServiceWitnessEvidence:
     sample_stale_after: float
     slot_exists: bool
     slot_active: bool
+    publication_has_tables: bool
     walsender_identity: bool
     engine_thread_alive: bool
     stream_recovery_pending: bool
@@ -131,6 +133,11 @@ def _service_guard_slot_exists(e: ServiceWitnessEvidence) -> bool:
 
 def _service_guard_slot_active(e: ServiceWitnessEvidence) -> bool:
     return e.slot_active
+
+
+def _service_guard_publication_membership(e: ServiceWitnessEvidence) -> bool:
+    """Require the configured logical publication to contain a source table."""
+    return e.publication_has_tables
 
 
 def _service_guard_identity(e: ServiceWitnessEvidence) -> bool:
@@ -290,6 +297,14 @@ WITNESS_INPUTS: tuple[WitnessInputSpec, ...] = (
         "disconnected",
         service_guard=_service_guard_slot_active,
         service_failure=lambda _e: "disconnected",
+    ),
+    WitnessInputSpec(
+        WitnessInput.PUBLICATION_MEMBERSHIP,
+        _SERVICE_CASE,
+        _service_negative(lambda e: replace(e, publication_has_tables=False)),
+        "unproven",
+        service_guard=_service_guard_publication_membership,
+        service_failure=_stalled_or_unproven,
     ),
     WitnessInputSpec(
         WitnessInput.SAMPLER_OBSERVATION_FRESHNESS,
@@ -523,6 +538,7 @@ def canonical_service_evidence(*, now: float = 1_000.0) -> ServiceWitnessEvidenc
         sample_stale_after=1.0,
         slot_exists=True,
         slot_active=True,
+        publication_has_tables=True,
         walsender_identity=True,
         engine_thread_alive=True,
         stream_recovery_pending=False,

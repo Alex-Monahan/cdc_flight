@@ -175,6 +175,11 @@ class LiveDiscoveryCoordinator:
                         else None
                     ),
                     identity_required=self.service_context is not None,
+                    publication_name=(
+                        self.props.get("publication.name")
+                        if self.service_context is not None
+                        else None
+                    ),
                     primary_dsn=self.source.primary_dsn,
                     source_marker=(
                         getattr(self.watcher, "marker", None)

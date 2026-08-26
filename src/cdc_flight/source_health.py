@@ -112,6 +112,14 @@ LEFT JOIN pg_stat_activity a ON a.pid = s.active_pid
 LEFT JOIN pg_stat_replication r ON r.pid = s.active_pid
 """
 
+_PUBLICATION_HAS_TABLES_SQL = """
+SELECT EXISTS (
+    SELECT 1
+    FROM pg_publication_tables
+    WHERE pubname = %s
+)
+"""
+
 
 @dataclass
 class SlotSample:
@@ -136,6 +144,9 @@ class SlotSample:
     #: Wall-clock time near the SQL result. ``at`` remains monotonic for duration
     #: clocks; this value makes the persisted operator sample attributable to a time.
     observed_at: datetime | None = None
+    #: ``None`` means the optional publication contract was not requested (finite
+    #: runs); ``False`` is a real empty-publication observation.
+    publication_has_tables: bool | None = None
 
     @property
     def streaming(self) -> bool:
@@ -189,6 +200,10 @@ class SourceHealth:
     #: every ordinary slot sample scan the cluster-wide activity views while the
     #: 12-worker harness is creating and dropping databases.
     identity_required: bool = False
+    #: Service mode must prove that Debezium's configured publication contains at
+    #: least one source table. Heartbeats and logical messages can advance an empty
+    #: publication while delivering no data; that is not a healthy service.
+    publication_name: str | None = None
     #: A separate write route for the one-shot transactional marker used to make
     #: the post-commit hand-off observable on a quiet source.  It is deliberately
     #: not the Debezium replication connection; in a hot-standby topology this is
@@ -389,6 +404,14 @@ class SourceHealth:
             ) as conn:
                 sql = _SLOT_SQL if self.identity_required else _SLOT_SQL_FAST
                 row = conn.execute(sql, (self.slot_name,)).fetchone()
+                publication_has_tables = None
+                if self.publication_name is not None:
+                    publication_row = conn.execute(
+                        _PUBLICATION_HAS_TABLES_SQL, (self.publication_name,)
+                    ).fetchone()
+                    publication_has_tables = bool(
+                        publication_row is not None and publication_row[0]
+                    )
         except Exception as exc:
             return SlotSample(
                 at=now,
@@ -396,7 +419,12 @@ class SourceHealth:
                 observed_at=datetime.now(UTC),
             )
         if row is None:  # pragma: no cover - the requested-row query always returns one
-            return SlotSample(at=now, exists=False, observed_at=datetime.now(UTC))
+            return SlotSample(
+                at=now,
+                exists=False,
+                publication_has_tables=publication_has_tables,
+                observed_at=datetime.now(UTC),
+            )
         if not self.identity_required:
             active, active_pid, has_confirmed, confirmed_pos, restart_pos, lag = row
             return SlotSample(
@@ -407,6 +435,7 @@ class SourceHealth:
                 confirmed_pos=(int(confirmed_pos) if has_confirmed else None),
                 restart_pos=(int(restart_pos) if restart_pos is not None else None),
                 lag_bytes=int(lag) if has_confirmed else None,
+                publication_has_tables=publication_has_tables,
                 observed_at=datetime.now(UTC),
             )
         (
@@ -448,6 +477,7 @@ class SourceHealth:
             confirmed_pos=(int(confirmed_pos) if has_confirmed else None),
             restart_pos=(int(restart_pos) if restart_pos is not None else None),
             lag_bytes=int(lag) if has_confirmed else None,
+            publication_has_tables=publication_has_tables,
             observed_at=datetime.now(UTC),
         )
 
@@ -830,6 +860,10 @@ class SourceHealth:
             sample_stale_after=max(self.interval * 3.0, 1.0),
             slot_exists=bool(sample is not None and sample.exists),
             slot_active=bool(sample is not None and sample.active),
+            publication_has_tables=(
+                self.publication_name is None
+                or bool(sample is not None and sample.publication_has_tables)
+            ),
             walsender_identity=(
                 (
                     sample is not None
@@ -1046,7 +1080,10 @@ class SourceHealth:
     def summary(self) -> dict:
         sample = self.last
         if sample is None:
-            return {"slot_health": self.state()}
+            return {
+                "slot_health": self.state(),
+                "source_publication": self.publication_name,
+            }
         if sample.unknown:
             return {
                 # The declared classification, so `unknown_never_sampled` - the
@@ -1061,6 +1098,8 @@ class SourceHealth:
                 "slot_retrying_for_sec": round(self.retrying_for, 1),
                 "slot_stream_interruptions": self.stream_interruptions,
                 "slot_recovered_after_interruption": self.recovered_after_interruption,
+                "source_publication": self.publication_name,
+                "source_publication_has_tables": sample.publication_has_tables,
             }
         return {
             "slot_health": self.state(),
@@ -1094,6 +1133,8 @@ class SourceHealth:
             "slot_lag_steady_for_sec": round(self.lag_steady_for, 1),
             "slot_stream_interruptions": self.stream_interruptions,
             "slot_recovered_after_interruption": self.recovered_after_interruption,
+            "source_publication": self.publication_name,
+            "source_publication_has_tables": sample.publication_has_tables,
             "service_liveness_status": self._service_status,
             "service_engine_thread_dead": self._service_engine_thread_dead,
             "service_lag_bytes": self._service_lag_bytes,
