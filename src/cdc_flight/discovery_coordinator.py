@@ -169,7 +169,12 @@ class LiveDiscoveryCoordinator:
                 self.health = SourceHealth(
                     dsn=self.source.dsn,
                     slot_name=self.replication.slot_name,
-                    expected_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+                    expected_application_name=(
+                        STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME
+                        if self.service_context is not None
+                        else None
+                    ),
+                    identity_required=self.service_context is not None,
                     primary_dsn=self.source.primary_dsn,
                     source_marker=(
                         getattr(self.watcher, "marker", None)

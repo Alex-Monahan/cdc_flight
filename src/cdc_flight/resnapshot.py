@@ -143,7 +143,6 @@ from .resnapshot_source_policy import (
 from .resnapshot_source_policy import gather_emptiness_evidence as _gather_emptiness_evidence
 from .snapshot_completion import SnapshotCompletion
 from .source_health import SourceHealth
-from .witness_contract import STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME
 
 log = logging.getLogger("cdc_flight.resnapshot")
 OWNER = "resnapshot-protocol"
@@ -538,10 +537,7 @@ def run(
         applier.verifier = None
         engine.consumer  # noqa: B018 - builds the consumer and attaches the verifier
         health = SourceHealth(
-            dsn=source.dsn,
-            slot_name=slot,
-            expected_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
-            max_lag_bytes=run_cfg.idle_max_lag_bytes,
+            dsn=source.dsn, slot_name=slot, max_lag_bytes=run_cfg.idle_max_lag_bytes
         ).start()
         ownership.activate(applier)
         try:

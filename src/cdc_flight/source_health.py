@@ -71,6 +71,23 @@ log = logging.getLogger("cdc_flight.source_health")
 #: consumer has durably taken.
 DEFAULT_MAX_IDLE_LAG_BYTES = 64 * 1024
 
+# The finite-run sampler only needs the slot liveness and confirmed position. The
+# service watchdog opts into the identity join below; keeping that expensive,
+# cluster-wide statistics lookup off the ordinary watermark path matters because
+# xdist workers create/drop databases while their bounded runs are sampling.
+_SLOT_SQL_FAST = """
+SELECT s.active,
+       s.active_pid,
+       s.confirmed_flush_lsn IS NOT NULL AS has_confirmed,
+       CASE WHEN s.confirmed_flush_lsn IS NULL THEN NULL
+            ELSE (s.confirmed_flush_lsn - '0/0')::BIGINT END AS confirmed_pos,
+       CASE WHEN s.restart_lsn IS NULL THEN NULL
+            ELSE (s.restart_lsn - '0/0')::BIGINT END AS restart_pos,
+       COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), s.confirmed_flush_lsn), 0)::BIGINT
+FROM pg_replication_slots s
+WHERE s.slot_name = %s
+"""
+
 _SLOT_SQL = """
 SELECT (s.slot_name IS NOT NULL) AS slot_exists,
        -- Keep activity independent from existence.  A missing row must not
@@ -164,10 +181,14 @@ class SourceHealth:
     dsn: str
     slot_name: str
     #: Stock Debezium 3.6 hard-codes this value on its replication JDBC
-    #: connection.  ``None`` is retained for pure unit fakes; every production
-    #: SourceHealth is constructed with the constant and therefore requires the
-    #: joined server-side identity proof.
+    #: connection.  ``None`` is retained for pure unit fakes; service-mode
+    #: SourceHealth instances require the joined server-side identity proof.
     expected_application_name: str | None = None
+    #: The identity join is a service watchdog witness. Finite runs still use
+    #: source-health corroboration and the completion watermark, but must not make
+    #: every ordinary slot sample scan the cluster-wide activity views while the
+    #: 12-worker harness is creating and dropping databases.
+    identity_required: bool = False
     #: A separate write route for the one-shot transactional marker used to make
     #: the post-commit hand-off observable on a quiet source.  It is deliberately
     #: not the Debezium replication connection; in a hot-standby topology this is
@@ -366,7 +387,8 @@ class SourceHealth:
                 keepalives_count=2,
                 tcp_user_timeout=self.query_timeout_ms,
             ) as conn:
-                row = conn.execute(_SLOT_SQL, (self.slot_name,)).fetchone()
+                sql = _SLOT_SQL if self.identity_required else _SLOT_SQL_FAST
+                row = conn.execute(sql, (self.slot_name,)).fetchone()
         except Exception as exc:
             return SlotSample(
                 at=now,
@@ -375,6 +397,18 @@ class SourceHealth:
             )
         if row is None:  # pragma: no cover - the requested-row query always returns one
             return SlotSample(at=now, exists=False, observed_at=datetime.now(UTC))
+        if not self.identity_required:
+            active, active_pid, has_confirmed, confirmed_pos, restart_pos, lag = row
+            return SlotSample(
+                at=time.monotonic(),
+                exists=True,
+                active=bool(active),
+                active_pid=(int(active_pid) if active_pid is not None else None),
+                confirmed_pos=(int(confirmed_pos) if has_confirmed else None),
+                restart_pos=(int(restart_pos) if restart_pos is not None else None),
+                lag_bytes=int(lag) if has_confirmed else None,
+                observed_at=datetime.now(UTC),
+            )
         (
             exists,
             active,
@@ -963,7 +997,8 @@ class SourceHealth:
         # fakes leave ``expected_application_name`` unset and retain the older
         # generic source-health semantics.
         if (
-            self.expected_application_name is not None
+            self.identity_required
+            and self.expected_application_name is not None
             and sample.identity_context != "stock_debezium"
         ):
             return False
