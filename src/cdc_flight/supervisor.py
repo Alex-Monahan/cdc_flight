@@ -238,7 +238,9 @@ def run_engine_bounded(
         if service_mode
         else watermark
         if watermark is not None
-        else CompletionWatermark.for_run(health, run, completion=completion)
+        else CompletionWatermark.for_run(
+            health, run, completion=completion, clock_started_at=started
+        )
     )
     idle_blocked_by_source = 0
     source_dark_after: float | None = None
@@ -566,6 +568,7 @@ def run_engine_bounded(
                     time.sleep(0.25)
                     continue
                 catalog_unresolved = unresolved
+                watermark.record_stop_decision(handler)
                 outcome.record("idle")
                 break
             # A run with a position to reach is one destination COMMIT away from

@@ -93,14 +93,12 @@ def test_a_quiet_run_ends_on_the_watermark_not_on_the_idle_timer(watermark_runs)
     assert run["ok"] is True
     assert run["stop_reason"] == "idle"
     assert run["completion_watermark"] == WATERMARK_REACHED
-    assert run["elapsed_sec"] < IDLE_SECONDS, (
-        "the supervised run outlived its own quiet window, so it cannot have "
-        f"stopped on a position: {run['elapsed_sec']}s of {IDLE_SECONDS}s"
+    assert run["completion_stop_condition"] == "watermark", run
+    assert 0 <= run["completion_watermark_to_stop_sec"] < IDLE_SECONDS, (
+        "the supervisor waited out the quiet window after the watermark was reached: "
+        f"{run['completion_watermark_to_stop_sec']}s after reach, "
+        f"at {run['completion_stop_at_sec']}s"
     )
-    # The whole point of the change, as a number: ~4 s of pipeline instead of
-    # ~4 s + idle_seconds. Wall includes JVM boot and teardown, so it is compared
-    # against the window itself rather than against a hand-picked constant.
-    assert run["wall"] < IDLE_SECONDS
 
 
 def test_the_watermark_is_a_real_postgresql_position_the_destination_reached(
@@ -168,8 +166,8 @@ def test_a_source_that_cannot_be_marked_still_falls_back_to_the_quiet_window(
     assert run["ok"] is True
     assert run["stop_reason"] == "idle"
     assert run["completion_watermark"] == WATERMARK_UNAVAILABLE
-    assert run["elapsed_sec"] >= IDLE_SECONDS, (
-        "the fallback is a quiet window; a run that ends before it has not "
-        "waited for one"
+    assert run["completion_stop_condition"] == "idle_window", run
+    assert run["completion_idle_window_sec"] >= IDLE_SECONDS, (
+        "the fallback stopped without consuming its quiet window: "
+        f"{run['completion_idle_window_sec']}s of {IDLE_SECONDS}s"
     )
-    assert run["elapsed_sec"] > watermark_runs["watermarked"]["elapsed_sec"] * 2

@@ -139,11 +139,15 @@ class CompletionWatermark:
         completion=None,
         marker=None,
         quiet_seconds: float = DEFAULT_QUIET_SECONDS,
+        clock_started_at: float | None = None,
     ):
         self.health = health
         self.run = run
         self.completion = completion
         self.marker = marker
+        self._clock_started_at = (
+            time.monotonic() if clock_started_at is None else clock_started_at
+        )
         #: Never longer than the fallback window it replaces: a caller that asks
         #: for a sub-second idle window gets a sub-second arming delay too.
         self.quiet_seconds = max(0.0, min(quiet_seconds, run.idle_seconds))
@@ -152,9 +156,28 @@ class CompletionWatermark:
         self._state = COMPLETION_WATERMARK.initial
         self._idle_candidate_since: float | None = None
         self._blocked = 0
+        #: These are decision events, not a second copy of the state machine.  The
+        #: reached timestamp says when the durable position became true; the stop
+        #: timestamp is recorded by the supervisor only when it actually accepts the
+        #: completion predicate.  Their interval excludes pipeline/JVM work before
+        #: the watermark and therefore does not turn host load into a completion
+        #: verdict.
+        self._watermark_reached_at: float | None = None
+        self._stop_at: float | None = None
+        self._stop_condition: str | None = None
+        self._watermark_to_stop_seconds: float | None = None
+        self._idle_window_seconds: float | None = None
 
     @classmethod
-    def for_run(cls, health, run, *, completion=None, prefix: str = "cdcf"):
+    def for_run(
+        cls,
+        health,
+        run,
+        *,
+        completion=None,
+        prefix: str = "cdcf",
+        clock_started_at: float | None = None,
+    ):
         """The production constructor: a marker of this run's own.
 
         Deliberately NOT the catalog watcher's marker: a fence that cannot be
@@ -168,6 +191,7 @@ class CompletionWatermark:
             completion=completion,
             marker=SourceMarker(prefix=prefix, enabled=run.watermark_enabled),
             quiet_seconds=run.watermark_quiet_seconds,
+            clock_started_at=clock_started_at,
         )
 
     # -- state -------------------------------------------------------------- #
@@ -178,6 +202,8 @@ class CompletionWatermark:
     def _to(self, state: str) -> None:
         COMPLETION_WATERMARK.check(self._state, state)
         self._state = state
+        if state == WATERMARK_REACHED:
+            self._watermark_reached_at = time.monotonic()
         faults.runtime_state(watermark=state)
         if state == WATERMARK_ARMED:
             faults.matrix_crash("watermark_armed")
@@ -223,6 +249,33 @@ class CompletionWatermark:
                     getattr(self.marker, "last_error", None),
                 )
         return self._quiet_window(handler, elapsed)
+
+    def record_stop_decision(self, handler) -> None:
+        """Record the completion predicate the supervisor actually accepted.
+
+        ``completion_watermark`` is the state reached by the mechanism. This is a
+        separate observation of the terminal decision: it distinguishes a position
+        that became durable from a supervisor that did (or did not) wait for the
+        fallback's quiet interval before breaking its loop.
+        """
+        if self._stop_at is not None:
+            return
+        self._stop_at = time.monotonic()
+        if self._state == WATERMARK_REACHED:
+            self._stop_condition = "watermark"
+            if self._watermark_reached_at is not None:
+                self._watermark_to_stop_seconds = (
+                    self._stop_at - self._watermark_reached_at
+                )
+            return
+        if self._state == WATERMARK_UNAVAILABLE:
+            self._stop_condition = "idle_window"
+            self._idle_window_seconds = handler.seconds_since_last_batch
+            return
+        raise RuntimeError(
+            "the completion predicate returned true without a terminal watermark "
+            f"state: {self._state!r}"
+        )
 
     # -- the watermark ------------------------------------------------------ #
     def _may_stop(self, handler) -> bool:
@@ -367,6 +420,27 @@ class CompletionWatermark:
         summary = {
             "completion_watermark": self._state,
             "completion_watermark_arms": self.arms,
+            "completion_stop_condition": self._stop_condition,
+            "completion_watermark_reached_at_sec": (
+                round(self._watermark_reached_at - self._clock_started_at, 3)
+                if self._watermark_reached_at is not None
+                else None
+            ),
+            "completion_stop_at_sec": (
+                round(self._stop_at - self._clock_started_at, 3)
+                if self._stop_at is not None
+                else None
+            ),
+            "completion_watermark_to_stop_sec": (
+                round(self._watermark_to_stop_seconds, 3)
+                if self._watermark_to_stop_seconds is not None
+                else None
+            ),
+            "completion_idle_window_sec": (
+                round(self._idle_window_seconds, 3)
+                if self._idle_window_seconds is not None
+                else None
+            ),
         }
         if self.target_lsn is not None:
             summary["completion_watermark_lsn"] = self.target_lsn
