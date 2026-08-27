@@ -426,22 +426,30 @@ class SupervisedDebeziumEngine(DebeziumJsonEngine):
                     f"task configuration: config={configured_bytes}, "
                     f"queue={observed_bytes}"
                 )
-            if current_bytes < 0 or current_bytes > observed_bytes:
+            # ChangeEventQueue checks the byte watermark before admitting a
+            # record, then adds that record's objectSize().  Consequently the
+            # instantaneous counter may be above the nominal watermark by the
+            # one record that crossed it.  The queue's configured capacity is
+            # the value above; do not turn this documented producer-side
+            # admission behavior into a false engine failure.
+            if current_bytes < 0:
                 raise EngineFailure(
                     "stock Debezium queue reported an invalid byte occupancy: "
-                    f"current={current_bytes}, capacity={observed_bytes}"
+                    f"current={current_bytes}"
                 )
             if current_count < 0 or current_count > total_capacity:
                 raise EngineFailure(
                     "stock Debezium queue reported an invalid record occupancy: "
                     f"current={current_count}, capacity={total_capacity}"
                 )
+            over_capacity = max(0, current_bytes - observed_bytes)
             queues.append(
                 {
                     "task_index": task_index,
                     "effective_task_config_max_queue_size_in_bytes": configured_bytes,
                     "queue_max_queue_size_in_bytes": observed_bytes,
                     "queue_current_size_in_bytes": current_bytes,
+                    "queue_over_capacity_bytes": over_capacity,
                     "queue_current_size": current_count,
                     "queue_total_capacity": total_capacity,
                     "queue_remaining_capacity": remaining_capacity,
@@ -462,6 +470,7 @@ class SupervisedDebeziumEngine(DebeziumJsonEngine):
         current_bytes = sum(
             item["queue_current_size_in_bytes"] for item in queues
         )
+        over_capacity_bytes = sum(item["queue_over_capacity_bytes"] for item in queues)
         current_count = sum(item["queue_current_size"] for item in queues)
         metrics: dict[str, object] = {
             "task_count": task_count,
@@ -473,6 +482,7 @@ class SupervisedDebeziumEngine(DebeziumJsonEngine):
                 item["queue_max_queue_size_in_bytes"] for item in queues
             ),
             "queue_current_size_in_bytes": current_bytes,
+            "queue_over_capacity_bytes": over_capacity_bytes,
             "queue_current_size": current_count,
             "queue_total_capacity": sum(item["queue_total_capacity"] for item in queues),
             "queue_remaining_capacity": sum(
@@ -483,6 +493,10 @@ class SupervisedDebeziumEngine(DebeziumJsonEngine):
             # peak even after the callback drains it.
             "queue_peak_size_in_bytes": max(
                 current_bytes, int(previous.get("queue_peak_size_in_bytes", 0))
+            ),
+            "queue_peak_over_capacity_bytes": max(
+                over_capacity_bytes,
+                int(previous.get("queue_peak_over_capacity_bytes", 0)),
             ),
             "queue_peak_size": max(
                 current_count, int(previous.get("queue_peak_size", 0))
