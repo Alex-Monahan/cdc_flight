@@ -248,7 +248,13 @@ def run_engine_bounded(
     source_unobservable_after: float | None = None
     live_queue_probe = getattr(engine, "probe_live_queue", None)
     live_queue_metrics: dict | None = None
-    live_queue_probe_deadline = started + run.engine_start_timeout
+    # Publishing the stock task/queue object is a separate startup observation from
+    # source-health publication.  Under the repository's 12-worker lane the JVM can
+    # be scheduled after the 15-second source-health bound even though it is still
+    # starting normally.  Reuse the existing finite engine-thread budget for this
+    # inspection, without changing the source-health/liveness clock below.
+    live_queue_probe_bound = max(run.engine_start_timeout, run.engine_thread_timeout)
+    live_queue_probe_deadline = started + live_queue_probe_bound
     drain_started_at: float | None = None
     source_probe_bound = min(
         run.source_probe_startup_seconds,
@@ -287,7 +293,7 @@ def run_engine_bounded(
                     error_box.append(
                         EngineFailure(
                             "stock Debezium source-task queue was not initialized "
-                            f"within {run.engine_start_timeout:.1f}s; refusing to run "
+                            f"within {live_queue_probe_bound:.1f}s; refusing to run "
                             "without a runtime byte-bound proof"
                         )
                     )
