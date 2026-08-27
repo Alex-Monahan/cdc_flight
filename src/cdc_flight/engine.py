@@ -458,6 +458,11 @@ class SupervisedDebeziumEngine(DebeziumJsonEngine):
                 "stock Debezium source tasks disagree about the effective queue "
                 f"byte bound: {sorted(configured_values)}"
             )
+        previous = self._live_queue_metrics or {}
+        current_bytes = sum(
+            item["queue_current_size_in_bytes"] for item in queues
+        )
+        current_count = sum(item["queue_current_size"] for item in queues)
         metrics: dict[str, object] = {
             "task_count": task_count,
             "queues": queues,
@@ -467,13 +472,20 @@ class SupervisedDebeziumEngine(DebeziumJsonEngine):
             "queue_max_queue_size_in_bytes": sum(
                 item["queue_max_queue_size_in_bytes"] for item in queues
             ),
-            "queue_current_size_in_bytes": sum(
-                item["queue_current_size_in_bytes"] for item in queues
-            ),
-            "queue_current_size": sum(item["queue_current_size"] for item in queues),
+            "queue_current_size_in_bytes": current_bytes,
+            "queue_current_size": current_count,
             "queue_total_capacity": sum(item["queue_total_capacity"] for item in queues),
             "queue_remaining_capacity": sum(
                 item["queue_remaining_capacity"] for item in queues
+            ),
+            # The supervisor polls this object while the engine is alive.  Preserve
+            # high-water marks so the final run summary retains a transient queue
+            # peak even after the callback drains it.
+            "queue_peak_size_in_bytes": max(
+                current_bytes, int(previous.get("queue_peak_size_in_bytes", 0))
+            ),
+            "queue_peak_size": max(
+                current_count, int(previous.get("queue_peak_size", 0))
             ),
         }
         self._live_queue_metrics = metrics
