@@ -58,10 +58,12 @@ def _service_status(
     engine_thread_alive=True,
     own_progress_at=_UNSET,
     own_ack_at=_UNSET,
+    own_identity_at=_UNSET,
     own_ack_lsn=100,
     durable_lsn=100,
     received_high_water=100,
     progress_stale_after=15.0,
+    quiet_source_ready=False,
 ):
     now = time.monotonic()
     sample_at = health.last.at if health.last is not None else now
@@ -73,6 +75,10 @@ def _service_status(
         own_ack_lsn=own_ack_lsn,
         durable_lsn=durable_lsn,
         progress_stale_after=progress_stale_after,
+        quiet_source_ready=quiet_source_ready,
+        own_identity_at=(
+            sample_at if own_identity_at is _UNSET else own_identity_at
+        ),
     )
 
 
@@ -134,6 +140,57 @@ def test_service_witness_rejects_an_empty_configured_publication():
 
     assert _service_status(health) == "unproven"
     assert health.summary()["source_publication_has_tables"] is False
+
+
+def test_service_witness_rejects_membership_without_configured_route():
+    """Some published table membership cannot prove this connector can deliver."""
+    health = SourceHealth(
+        dsn="postgresql://unused",
+        slot_name="slot",
+        expected_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+        publication_name="cdc_flight_pub",
+        capture_tables=("app.orders",),
+    )
+    backend_start = datetime(2026, 1, 1, tzinfo=UTC)
+    now = time.monotonic()
+    for sample_at in (now - 0.1, now):
+        health._ingest(
+            SlotSample(
+                at=sample_at,
+                exists=True,
+                active=True,
+                active_pid=3210,
+                activity_pid=3210,
+                activity_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+                activity_backend_type="walsender",
+                activity_backend_start=backend_start,
+                replication_pid=3210,
+                replication_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+                confirmed_pos=100,
+                lag_bytes=0,
+                publication_has_tables=True,
+                publication_has_configured_tables=False,
+            )
+        )
+
+    assert _service_status(health) == "unproven"
+    summary = health.summary()
+    assert summary["source_publication_has_tables"] is True
+    assert summary["source_publication_has_configured_tables"] is False
+
+
+def test_service_witness_accepts_a_completed_caught_up_quiet_route_without_data_ack():
+    """An empty but valid configured source is quiet, not inert or stalled."""
+    health = _active_health(lag_bytes=3_315_744)
+    assert _service_status(
+        health,
+        own_progress_at=None,
+        own_ack_at=None,
+        own_ack_lsn=None,
+        durable_lsn=100,
+        quiet_source_ready=True,
+        own_identity_at=health.last.at,
+    ) == "connected_quiet"
 
 
 def test_service_witness_requires_our_callback_commit_and_ack():

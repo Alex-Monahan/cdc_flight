@@ -168,6 +168,10 @@ class Applier:
         #: a co-tenant made every bounded run burn its whole `--max-seconds`).
         #: `highest_source_lsn - confirmed_flush_lsn` is ours and only ours.
         self.highest_source_lsn: int = int(resume_point.last_lsn or 0)
+        #: The highest LSN of an application-data record delivered to this Flight.
+        #: Heartbeats, logical messages, and the Flight's signal table advance the
+        #: ordinary source offset above, but never this liveness high-water mark.
+        self.highest_source_data_lsn: int = int(resume_point.last_lsn or 0)
 
         self.registry = apply_sql.SchemaRegistry(
             con, dataset, constraints=config.destination_constraints
@@ -551,16 +555,27 @@ class Applier:
                 # A callback is Flight-owned evidence only after the handler has
                 # returned successfully.  A sampler observation or a callback that
                 # is still wedged in decode/commit is not forward progress.
-                callback_progressed = bool(records)
-                if self.service_context is not None and callback_progressed:
-                    self.service_context.note_engine_callback()
+                # Only source-data records are liveness progress. Debezium
+                # heartbeats, transaction metadata, and Flight bookkeeping can
+                # make a non-empty callback without delivering any application
+                # data; counting that callback kept an excluded route alive.
+                callback_progressed = self._last_callback_had_data
+                if self.service_context is not None:
+                    if records:
+                        # A callback can certify the admitted stock walsender even
+                        # when it carries only a heartbeat. This is identity
+                        # evidence, not liveness progress, and the context keeps
+                        # those clocks separate.
+                        self.service_context.note_engine_identity()
+                    if callback_progressed:
+                        self.service_context.note_engine_callback()
             except BaseException as exc:
                 self.error = exc
                 raise
             finally:
                 if self.service_context is not None:
                     self.service_context.operation_finished(
-                        progressed=(callback_progressed or self._last_callback_had_data)
+                        progressed=callback_progressed
                     )
                 with self._quiescence:
                     self._in_flight -= 1
@@ -636,7 +651,8 @@ class Applier:
 
             source_records += 1
             rec = decode(raw, topic_prefix=self.topic_prefix)
-            if rec.qualified_table in self.ignored_source_tables:
+            ignored_source_record = rec.qualified_table in self.ignored_source_tables
+            if ignored_source_record:
                 # The source signal row is a control-plane request.  It still
                 # participates in the source transaction/offset proof as a
                 # counted data event, but GroupPlan ignores the relation before
@@ -671,7 +687,11 @@ class Applier:
             self.source_marker_records_received += self._source_marker_receipts.observe(rec)
             if rec.lsn is not None:
                 self.highest_source_lsn = max(self.highest_source_lsn, int(rec.lsn))
-            if rec.is_data:
+            if rec.is_data and not ignored_source_record:
+                if rec.lsn is not None:
+                    self.highest_source_data_lsn = max(
+                        self.highest_source_data_lsn, int(rec.lsn)
+                    )
                 data_in_batch += 1
             else:
                 self.skipped_count += 1

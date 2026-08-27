@@ -31,6 +31,8 @@ class WitnessInput(StrEnum):
     SLOT_EXISTS = "slot_exists"
     SLOT_ACTIVE = "slot_active"
     PUBLICATION_MEMBERSHIP = "publication_membership"
+    CONFIGURED_PUBLICATION_ROUTE = "configured_publication_route"
+    QUIET_SOURCE_READY = "quiet_source_ready"
     WALSENDER_IDENTITY = "walsender_identity"
     SAMPLER_OBSERVATION_FRESHNESS = "sampler_observation_freshness"
     ENGINE_THREAD_ALIVE = "engine_thread_alive"
@@ -46,6 +48,7 @@ class WitnessInput(StrEnum):
     RECEIVED_HIGH_WATER = "received_high_water"
     RENEWAL_STATUS = "renewal_status"
     RENEWAL_ENGINE_THREAD_ALIVE = "renewal_engine_thread_alive"
+    RENEWAL_QUIET_SOURCE_READY = "renewal_quiet_source_ready"
     RENEWAL_OWN_PROGRESS_PRESENT = "renewal_own_progress_present"
     RENEWAL_OWN_ACK_TIMESTAMP_PRESENT = "renewal_own_ack_timestamp_present"
     RENEWAL_OWN_ACK_LSN_PRESENT = "renewal_own_ack_lsn_present"
@@ -77,6 +80,19 @@ class ServiceWitnessEvidence:
     confirmed_pos: int | None
     received_high_water: int | None
     progress_stale_after: float
+    #: The last successful callback, including a control/heartbeat callback. This
+    #: certifies the generic stock backend for identity bracketing only; it is not
+    #: included in the progress fold.
+    own_identity_at: float | None = None
+    #: A configured relation is both represented by the publication and usable by
+    #: this source user. This is deliberately separate from the weaker
+    #: ``PUBLICATION_MEMBERSHIP`` fact, which only proves that *some* relation is
+    #: published.
+    publication_has_configured_tables: bool = False
+    #: A completed snapshot/streaming hand-off proved a configured route while the
+    #: source had no outstanding received-but-unconfirmed position. This is a
+    #: quiet-source admission, not a progress timestamp and never refreshes one.
+    source_quiet_ready: bool = False
 
 
 @dataclass(frozen=True)
@@ -91,6 +107,10 @@ class RenewalWitnessEvidence:
     own_ack_at: float | None
     own_ack_lsn: int | None
     stale_after: float
+    #: The service fold has already proved a configured, caught-up quiet route. It
+    #: lets renewal retain a genuinely idle source without treating a heartbeat as
+    #: application progress.
+    source_quiet_ready: bool = False
 
 
 ServiceGuard = Callable[[ServiceWitnessEvidence], bool]
@@ -140,6 +160,11 @@ def _service_guard_publication_membership(e: ServiceWitnessEvidence) -> bool:
     return e.publication_has_tables
 
 
+def _service_guard_configured_publication_route(e: ServiceWitnessEvidence) -> bool:
+    """Require the publication to overlap the connector's configured route."""
+    return e.publication_has_configured_tables
+
+
 def _service_guard_identity(e: ServiceWitnessEvidence) -> bool:
     return e.walsender_identity
 
@@ -161,15 +186,15 @@ def _service_guard_durable(e: ServiceWitnessEvidence) -> bool:
 
 
 def _service_guard_progress_present(e: ServiceWitnessEvidence) -> bool:
-    return e.own_progress_at is not None
+    return e.own_progress_at is not None or _service_quiet_mode(e)
 
 
 def _service_guard_ack_timestamp(e: ServiceWitnessEvidence) -> bool:
-    return e.own_ack_at is not None
+    return e.own_ack_at is not None or _service_quiet_mode(e)
 
 
 def _service_guard_ack_lsn(e: ServiceWitnessEvidence) -> bool:
-    return e.own_ack_lsn is not None
+    return e.own_ack_lsn is not None or _service_quiet_mode(e)
 
 
 def _service_guard_confirmed_not_ahead(e: ServiceWitnessEvidence) -> bool:
@@ -188,9 +213,21 @@ def _service_guard_ack_not_ahead(e: ServiceWitnessEvidence) -> bool:
     )
 
 
+def _service_quiet_mode(e: ServiceWitnessEvidence) -> bool:
+    """Return true only for a validated, caught-up quiet-source alternative."""
+    return e.source_quiet_ready and _service_guard_received_high_water(e)
+
+
+def _service_guard_quiet_source_ready(e: ServiceWitnessEvidence) -> bool:
+    """Accept either actual data progress or the explicit quiet-source proof."""
+    return e.own_progress_at is not None or _service_quiet_mode(e)
+
+
 def _service_guard_progress_fresh(e: ServiceWitnessEvidence) -> bool:
     # Presence is a separate registered input. Keeping ``None`` out of this
     # guard makes deletion of either production use site observable.
+    if _service_quiet_mode(e):
+        return True
     return e.own_progress_at is None or e.now - e.own_progress_at <= max(
         e.progress_stale_after, 0.0
     )
@@ -199,6 +236,8 @@ def _service_guard_progress_fresh(e: ServiceWitnessEvidence) -> bool:
 def _service_guard_ack_fresh(e: ServiceWitnessEvidence) -> bool:
     # Presence is a separate registered input. Keeping ``None`` out of this
     # guard makes deletion of either production use site observable.
+    if _service_quiet_mode(e):
+        return True
     return e.own_ack_at is None or e.now - e.own_ack_at <= max(
         e.progress_stale_after, 0.0
     )
@@ -226,16 +265,21 @@ def _renewal_guard_engine_alive(e: RenewalWitnessEvidence) -> bool:
     return e.engine_thread_alive is True
 
 
+def _renewal_guard_quiet_source_ready(e: RenewalWitnessEvidence) -> bool:
+    """Accept a validated quiet route as the renewal liveness mode."""
+    return e.own_progress_at is not None or e.source_quiet_ready
+
+
 def _renewal_guard_progress_present(e: RenewalWitnessEvidence) -> bool:
-    return e.own_progress_at is not None
+    return e.own_progress_at is not None or e.source_quiet_ready
 
 
 def _renewal_guard_ack_timestamp(e: RenewalWitnessEvidence) -> bool:
-    return e.own_ack_at is not None
+    return e.own_ack_at is not None or e.source_quiet_ready
 
 
 def _renewal_guard_ack_lsn(e: RenewalWitnessEvidence) -> bool:
-    return e.own_ack_lsn is not None
+    return e.own_ack_lsn is not None or e.source_quiet_ready
 
 
 def _renewal_guard_source_observation_fresh(e: RenewalWitnessEvidence) -> bool:
@@ -248,6 +292,8 @@ def _renewal_guard_source_observation_fresh(e: RenewalWitnessEvidence) -> bool:
 def _renewal_guard_progress_fresh(e: RenewalWitnessEvidence) -> bool:
     # Presence is a separate registered input. Keeping ``None`` out of this
     # guard makes deletion of either production use site observable.
+    if e.source_quiet_ready:
+        return True
     return e.own_progress_at is None or e.now - e.own_progress_at <= max(
         e.stale_after, 0.0
     )
@@ -256,6 +302,8 @@ def _renewal_guard_progress_fresh(e: RenewalWitnessEvidence) -> bool:
 def _renewal_guard_ack_fresh(e: RenewalWitnessEvidence) -> bool:
     # Presence is a separate registered input. Keeping ``None`` out of this
     # guard makes deletion of either production use site observable.
+    if e.source_quiet_ready:
+        return True
     return e.own_ack_at is None or e.now - e.own_ack_at <= max(
         e.stale_after, 0.0
     )
@@ -304,6 +352,26 @@ WITNESS_INPUTS: tuple[WitnessInputSpec, ...] = (
         _service_negative(lambda e: replace(e, publication_has_tables=False)),
         "unproven",
         service_guard=_service_guard_publication_membership,
+        service_failure=_stalled_or_unproven,
+    ),
+    WitnessInputSpec(
+        WitnessInput.CONFIGURED_PUBLICATION_ROUTE,
+        _SERVICE_CASE,
+        _service_negative(
+            lambda e: replace(e, publication_has_configured_tables=False)
+        ),
+        "unproven",
+        service_guard=_service_guard_configured_publication_route,
+        service_failure=_stalled_or_unproven,
+    ),
+    WitnessInputSpec(
+        WitnessInput.QUIET_SOURCE_READY,
+        _SERVICE_CASE,
+        _service_negative(
+            lambda e: replace(e, own_progress_at=None, source_quiet_ready=False)
+        ),
+        "unproven",
+        service_guard=_service_guard_quiet_source_ready,
         service_failure=_stalled_or_unproven,
     ),
     WitnessInputSpec(
@@ -427,6 +495,15 @@ WITNESS_INPUTS: tuple[WitnessInputSpec, ...] = (
         renewal_guard=_renewal_guard_engine_alive,
     ),
     WitnessInputSpec(
+        WitnessInput.RENEWAL_QUIET_SOURCE_READY,
+        _RENEWAL_CASE,
+        _renewal_negative(
+            lambda e: replace(e, own_progress_at=None, source_quiet_ready=False)
+        ),
+        False,
+        renewal_guard=_renewal_guard_quiet_source_ready,
+    ),
+    WitnessInputSpec(
         WitnessInput.RENEWAL_OWN_PROGRESS_PRESENT,
         _RENEWAL_CASE,
         _renewal_negative(lambda e: replace(e, own_progress_at=None)),
@@ -539,6 +616,7 @@ def canonical_service_evidence(*, now: float = 1_000.0) -> ServiceWitnessEvidenc
         slot_exists=True,
         slot_active=True,
         publication_has_tables=True,
+        publication_has_configured_tables=True,
         walsender_identity=True,
         engine_thread_alive=True,
         stream_recovery_pending=False,

@@ -74,6 +74,14 @@ class ServiceContext:
         self._last_engine_commit: float | None = None
         self._last_engine_ack: float | None = None
         self._last_engine_ack_lsn: int | None = None
+        #: A successful non-data callback can certify the currently sampled stock
+        #: walsender without becoming liveness progress. This is needed for an
+        #: empty-but-valid snapshot: it has no data acknowledgement, but its
+        #: completed callback still brackets the engine's generic stock identity.
+        self._last_engine_identity: float | None = None
+        #: A completed, configured quiet route is an explicit alternate witness.
+        #: It is never advanced by a heartbeat or bookkeeping callback.
+        self._source_quiet_ready = False
         #: A callback owns the destination operation boundary until it returns.
         #: This is intentionally separate from ``_last_progress``: a long,
         #: admitted unit is work in flight, not evidence that the Flight is dead.
@@ -125,6 +133,7 @@ class ServiceContext:
         observed_at: float | None,
         *,
         engine_thread_alive: bool | None = None,
+        quiet_source_ready: bool | None = None,
     ) -> None:
         """Publish the combined source/local witness, never application progress.
 
@@ -145,6 +154,8 @@ class ServiceContext:
             self._source_health_status = str(status)
             if engine_thread_alive is not None:
                 self._engine_thread_alive = bool(engine_thread_alive)
+            if quiet_source_ready is not None:
+                self._source_quiet_ready = bool(quiet_source_ready)
 
     def set_engine_thread_alive(self, alive: bool) -> None:
         """Publish the engine thread's current state as a required witness input."""
@@ -161,6 +172,12 @@ class ServiceContext:
         with self._lock:
             if kind == "callback":
                 self._last_engine_callback = now
+            elif kind == "identity":
+                # Identity certification is deliberately not `_last_progress`.
+                # Heartbeats/bookkeeping may establish which stock backend is
+                # ours, but they must never keep an excluded or inert route alive.
+                self._last_engine_identity = now
+                return
             elif kind == "commit":
                 self._last_engine_commit = now
             elif kind == "ack":
@@ -176,6 +193,10 @@ class ServiceContext:
     def note_engine_callback(self) -> None:
         """Record a successfully returned Debezium callback from this engine."""
         self._note_engine_signal("callback")
+
+    def note_engine_identity(self) -> None:
+        """Certify this callback's stock backend without refreshing liveness."""
+        self._note_engine_signal("identity")
 
     def note_engine_commit(self, durable_lsn: int | None = None) -> None:
         """Record a destination COMMIT performed by this engine."""
@@ -198,6 +219,8 @@ class ServiceContext:
                 "own_progress_at": max((value for value in values if value is not None), default=None),
                 "own_ack_at": self._last_engine_ack,
                 "own_ack_lsn": self._last_engine_ack_lsn,
+                "own_identity_at": self._last_engine_identity,
+                "source_quiet_ready": self._source_quiet_ready,
             }
 
     @property
@@ -222,6 +245,7 @@ class ServiceContext:
             )
             own_ack = self._last_engine_ack
             own_ack_lsn = self._last_engine_ack_lsn
+            source_quiet_ready = self._source_quiet_ready
         return renewal_witness_allows(
             RenewalWitnessEvidence(
                 now=time.monotonic(),
@@ -232,6 +256,7 @@ class ServiceContext:
                 own_ack_at=own_ack,
                 own_ack_lsn=own_ack_lsn,
                 stale_after=self.policy.source_health_stale_seconds,
+                source_quiet_ready=source_quiet_ready,
             )
         )
 
@@ -262,6 +287,7 @@ class ServiceContext:
                 stalled_for = time.monotonic() - self._last_progress
                 already_stalled = self._stall_event.is_set()
                 source_dark = self._source_health_status == "dark"
+                source_quiet_ready = self._source_quiet_ready
                 teardown_started = self._teardown_started
                 operation_started_at = self._operation_started_at
                 operation_active = self._operation_active
@@ -270,7 +296,11 @@ class ServiceContext:
             # that diagnosis and erase the durable alert/summary before the
             # bounded engine teardown can publish it.  Renewal is impossible once
             # drain/source-dark is set; this branch only preserves attribution.
-            if source_dark or teardown_started:
+            # A validated completed/caught-up quiet route is the explicit idle
+            # alternative to a data-progress timestamp. It must suppress this
+            # local no-progress watchdog without touching `_last_progress`; an
+            # excluded or otherwise invalid route never sets this flag.
+            if source_dark or source_quiet_ready or teardown_started:
                 continue
             if operation_active:
                 # Do not apply the idle-progress clock to a callback that has
@@ -457,6 +487,7 @@ class ServiceContext:
                 "last_progress_age_sec": round(time.monotonic() - self._last_progress, 3),
                 "last_heartbeat_age_sec": round(time.monotonic() - self._last_heartbeat, 3),
                 "source_health_status": self._source_health_status,
+                "source_quiet_ready": self._source_quiet_ready,
                 "engine_thread_alive": self._engine_thread_alive,
                 "engine_callback_age_sec": (
                     round(time.monotonic() - self._last_engine_callback, 3)

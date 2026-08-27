@@ -120,6 +120,63 @@ SELECT EXISTS (
 )
 """
 
+# ``pg_publication_tables`` membership is only a coarse publication check. A
+# publication can contain a relation that this connector excludes, a relation the
+# source user cannot read, or a partitioned root with no leaf relation to publish.
+# Resolve the configured relation OIDs in PostgreSQL and require the published
+# relation to be the configured relation or a relation on either side of the same
+# partition tree, a usable SELECT route, and at least one readable leaf when the
+# published relation is partitioned. This is configuration/readiness evidence for
+# a quiet source; it is never used as a substitute for data-delivery progress.
+_PUBLICATION_CONFIGURED_ROUTE_SQL = """
+WITH requested(qualified) AS (
+    SELECT unnest(%s::text[])
+), requested_relations AS (
+    SELECT c.oid AS relid
+    FROM requested r
+    JOIN pg_namespace n
+      ON n.nspname = split_part(r.qualified, '.', 1)
+    JOIN pg_class c
+      ON c.relnamespace = n.oid
+     AND c.relname = split_part(r.qualified, '.', 2)
+)
+SELECT EXISTS (
+    SELECT 1
+    FROM pg_publication_tables published
+    JOIN pg_namespace n
+      ON n.nspname = published.schemaname
+    JOIN pg_class c
+      ON c.relnamespace = n.oid
+     AND c.relname = published.tablename
+    WHERE published.pubname = %s
+      AND EXISTS (
+          SELECT 1
+          FROM requested_relations requested
+          WHERE requested.relid = c.oid
+             OR EXISTS (
+                 SELECT 1
+                 FROM pg_partition_tree(c.oid) tree
+                 WHERE tree.relid = requested.relid
+             )
+             OR EXISTS (
+                 SELECT 1
+                 FROM pg_partition_tree(requested.relid) tree
+                 WHERE tree.relid = c.oid
+             )
+      )
+      AND has_table_privilege(c.oid, 'SELECT')
+      AND (
+          c.relkind <> 'p'
+          OR EXISTS (
+              SELECT 1
+              FROM pg_partition_tree(c.oid) leaf
+              WHERE leaf.isleaf
+                AND has_table_privilege(leaf.relid, 'SELECT')
+          )
+      )
+)
+"""
+
 
 @dataclass
 class SlotSample:
@@ -147,6 +204,10 @@ class SlotSample:
     #: ``None`` means the optional publication contract was not requested (finite
     #: runs); ``False`` is a real empty-publication observation.
     publication_has_tables: bool | None = None
+    #: ``True`` only when the publication overlaps the configured, readable source
+    #: route. ``False`` distinguishes an excluded/unreadable/no-leaf route from a
+    #: correctly configured but empty source.
+    publication_has_configured_tables: bool | None = None
 
     @property
     def streaming(self) -> bool:
@@ -204,6 +265,10 @@ class SourceHealth:
     #: least one source table. Heartbeats and logical messages can advance an empty
     #: publication while delivering no data; that is not a healthy service.
     publication_name: str | None = None
+    #: The final table.include.list used by the stock connector. ``None`` retains
+    #: the unit/fake compatibility path where publication membership is the only
+    #: configured-route fact available; production service callers always pass it.
+    capture_tables: tuple[str, ...] | None = None
     #: A separate write route for the one-shot transactional marker used to make
     #: the post-commit hand-off observable on a quiet source.  It is deliberately
     #: not the Debezium replication connection; in a hot-standby topology this is
@@ -255,6 +320,7 @@ class SourceHealth:
     _service_stalled_since: float | None = field(default=None, repr=False)
     _service_engine_thread_dead: bool = field(default=False, repr=False)
     _service_lag_bytes: int | None = field(default=None, repr=False)
+    _service_quiet_ready: bool = field(default=False, repr=False)
     #: A source callback/ack observed after this exact backend identity was
     #: sampled certifies the PID for this process generation.  The PID alone is
     #: not durable across reconnects; backend_start closes the PID-reuse gap.
@@ -405,6 +471,7 @@ class SourceHealth:
                 sql = _SLOT_SQL if self.identity_required else _SLOT_SQL_FAST
                 row = conn.execute(sql, (self.slot_name,)).fetchone()
                 publication_has_tables = None
+                publication_has_configured_tables = None
                 if self.publication_name is not None:
                     publication_row = conn.execute(
                         _PUBLICATION_HAS_TABLES_SQL, (self.publication_name,)
@@ -412,6 +479,19 @@ class SourceHealth:
                     publication_has_tables = bool(
                         publication_row is not None and publication_row[0]
                     )
+                    if self.capture_tables is None:
+                        # Compatibility for pure fakes that predate the route
+                        # query. Production callers pass the final connector
+                        # include list and take the stricter SQL path below.
+                        publication_has_configured_tables = publication_has_tables
+                    else:
+                        route_row = conn.execute(
+                            _PUBLICATION_CONFIGURED_ROUTE_SQL,
+                            (list(self.capture_tables), self.publication_name),
+                        ).fetchone()
+                        publication_has_configured_tables = bool(
+                            route_row is not None and route_row[0]
+                        )
         except Exception as exc:
             return SlotSample(
                 at=now,
@@ -423,6 +503,7 @@ class SourceHealth:
                 at=now,
                 exists=False,
                 publication_has_tables=publication_has_tables,
+                publication_has_configured_tables=publication_has_configured_tables,
                 observed_at=datetime.now(UTC),
             )
         if not self.identity_required:
@@ -436,6 +517,7 @@ class SourceHealth:
                 restart_pos=(int(restart_pos) if restart_pos is not None else None),
                 lag_bytes=int(lag) if has_confirmed else None,
                 publication_has_tables=publication_has_tables,
+                publication_has_configured_tables=publication_has_configured_tables,
                 observed_at=datetime.now(UTC),
             )
         (
@@ -478,6 +560,7 @@ class SourceHealth:
             restart_pos=(int(restart_pos) if restart_pos is not None else None),
             lag_bytes=int(lag) if has_confirmed else None,
             publication_has_tables=publication_has_tables,
+            publication_has_configured_tables=publication_has_configured_tables,
             observed_at=datetime.now(UTC),
         )
 
@@ -486,6 +569,12 @@ class SourceHealth:
     def last(self) -> SlotSample | None:
         with self._lock:
             return self._last
+
+    @property
+    def service_quiet_ready(self) -> bool:
+        """Whether the latest service fold admitted the explicit quiet route."""
+        with self._lock:
+            return self._service_quiet_ready
 
     @property
     def not_streaming_for(self) -> float:
@@ -737,12 +826,16 @@ class SourceHealth:
         observed_at: float,
         engine_thread_alive: bool,
         lag_bytes: int | None,
+        quiet_source_ready: bool = False,
     ) -> str:
         """Record the service verdict and its fail-closed aging clock."""
         with self._lock:
             self._service_status = status
             self._service_engine_thread_dead = not engine_thread_alive
             self._service_lag_bytes = lag_bytes
+            self._service_quiet_ready = bool(
+                status == "connected_quiet" and quiet_source_ready
+            )
             if status in {"connected_quiet", "connected_busy"}:
                 self._service_stalled_since = None
             elif (
@@ -762,7 +855,7 @@ class SourceHealth:
         self,
         sample: SlotSample | None,
         *,
-        own_ack_at: float | None,
+        own_certification_at: float | None,
     ) -> bool:
         """Require a current PID to be certified by this Flight's own ack.
 
@@ -790,28 +883,28 @@ class SourceHealth:
             )
             previous = self._previous
             newer_ack = (
-                own_ack_at is not None
+                own_certification_at is not None
                 and (
                     self._bound_walsender_ack_at is None
-                    or own_ack_at > self._bound_walsender_ack_at
+                    or own_certification_at > self._bound_walsender_ack_at
                 )
             )
             if current != bound:
                 if (
                     not newer_ack
-                    or own_ack_at is None
-                    or sample.at < own_ack_at
+                    or own_certification_at is None
+                    or sample.at < own_certification_at
                     or previous is None
                     or not previous.streaming
                     or previous.identity_context != "stock_debezium"
                     or previous.active_pid != sample.active_pid
                     or previous.activity_backend_start != sample.activity_backend_start
-                    or previous.at > own_ack_at
+                    or previous.at > own_certification_at
                 ):
                     return False
                 self._bound_walsender_pid = sample.active_pid
                 self._bound_walsender_backend_start = sample.activity_backend_start
-                self._bound_walsender_ack_at = own_ack_at
+                self._bound_walsender_ack_at = own_certification_at
             return (
                 self._bound_walsender_pid == sample.active_pid
                 and self._bound_walsender_backend_start
@@ -828,6 +921,8 @@ class SourceHealth:
         own_ack_lsn: int | None,
         durable_lsn: int | None,
         progress_stale_after: float,
+        quiet_source_ready: bool = False,
+        own_identity_at: float | None = None,
     ) -> str:
         """Classify source evidence for the single-process lease watchdog.
 
@@ -835,8 +930,11 @@ class SourceHealth:
 
         * the sampler observation is fresh and the slot is active;
         * the *admitted* Debezium engine thread is still alive;
-        * this process has recently completed a callback/commit and a
-          ``markBatchFinished`` acknowledgement tied to a durable resume point.
+        * this process has recently delivered source data and completed its
+          durable acknowledgement path, or it has completed a snapshot/streaming
+          hand-off for a configured, readable, caught-up route that is genuinely
+          quiet. The latter is an explicit quiet-source admission, never a
+          heartbeat-derived progress timestamp.
 
         ``connected_quiet`` and ``connected_busy`` are therefore classifications
         of a proven Flight-owned stream.  If that proof goes stale, the source's
@@ -852,6 +950,30 @@ class SourceHealth:
         now = time.monotonic()
         sample = self.last
         sample_age = float("inf") if sample is None else max(0.0, now - sample.at)
+        publication_has_tables = (
+            self.publication_name is None
+            or bool(sample is not None and sample.publication_has_tables)
+        )
+        publication_has_configured_tables = (
+            self.publication_name is None
+            or bool(
+                sample is not None
+                and (
+                    sample.publication_has_configured_tables
+                    if self.capture_tables is not None
+                    else sample.publication_has_tables
+                )
+            )
+        )
+        quiet_ready = bool(
+            quiet_source_ready
+            and publication_has_tables
+            and publication_has_configured_tables
+            and received_high_water is not None
+            and sample is not None
+            and sample.confirmed_pos is not None
+            and received_high_water <= sample.confirmed_pos
+        )
         evidence = ServiceWitnessEvidence(
             now=now,
             sample_present=sample is not None,
@@ -860,10 +982,8 @@ class SourceHealth:
             sample_stale_after=max(self.interval * 3.0, 1.0),
             slot_exists=bool(sample is not None and sample.exists),
             slot_active=bool(sample is not None and sample.active),
-            publication_has_tables=(
-                self.publication_name is None
-                or bool(sample is not None and sample.publication_has_tables)
-            ),
+            publication_has_tables=publication_has_tables,
+            publication_has_configured_tables=publication_has_configured_tables,
             walsender_identity=(
                 (
                     sample is not None
@@ -873,7 +993,14 @@ class SourceHealth:
                 or (
                     self.expected_application_name
                     == STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME
-                    and self._walsender_is_ours(sample, own_ack_at=own_ack_at)
+                    and self._walsender_is_ours(
+                        sample,
+                        own_certification_at=(
+                            own_identity_at
+                            if own_identity_at is not None
+                            else own_ack_at
+                        ),
+                    )
                 )
             ),
             engine_thread_alive=bool(engine_thread_alive),
@@ -889,6 +1016,8 @@ class SourceHealth:
             confirmed_pos=(sample.confirmed_pos if sample is not None else None),
             received_high_water=received_high_water,
             progress_stale_after=max(float(progress_stale_after), 0.0),
+            own_identity_at=own_identity_at,
+            source_quiet_ready=quiet_ready,
         )
         status = evaluate_service_witness(evidence)
         return self._publish_service_status(
@@ -896,6 +1025,7 @@ class SourceHealth:
             observed_at=now,
             engine_thread_alive=engine_thread_alive,
             lag_bytes=sample.lag_bytes if sample is not None else None,
+            quiet_source_ready=quiet_ready,
         )
 
     def outstanding_bytes(self, received_high_water: int | None) -> int | None:
@@ -1083,6 +1213,8 @@ class SourceHealth:
             return {
                 "slot_health": self.state(),
                 "source_publication": self.publication_name,
+                "source_publication_has_configured_tables": None,
+                "service_source_quiet_ready": False,
             }
         if sample.unknown:
             return {
@@ -1100,6 +1232,10 @@ class SourceHealth:
                 "slot_recovered_after_interruption": self.recovered_after_interruption,
                 "source_publication": self.publication_name,
                 "source_publication_has_tables": sample.publication_has_tables,
+                "source_publication_has_configured_tables": (
+                    sample.publication_has_configured_tables
+                ),
+                "service_source_quiet_ready": self.service_quiet_ready,
             }
         return {
             "slot_health": self.state(),
@@ -1135,7 +1271,11 @@ class SourceHealth:
             "slot_recovered_after_interruption": self.recovered_after_interruption,
             "source_publication": self.publication_name,
             "source_publication_has_tables": sample.publication_has_tables,
+            "source_publication_has_configured_tables": (
+                sample.publication_has_configured_tables
+            ),
             "service_liveness_status": self._service_status,
+            "service_source_quiet_ready": self.service_quiet_ready,
             "service_engine_thread_dead": self._service_engine_thread_dead,
             "service_lag_bytes": self._service_lag_bytes,
             "service_stalled_for_sec": round(

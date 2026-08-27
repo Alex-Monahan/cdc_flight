@@ -269,21 +269,28 @@ def run_engine_bounded(
                 # advances any of those local clocks.
                 signal = service_context.engine_liveness_signal()
                 source_status = health.service_status(
-                    getattr(handler, "highest_source_lsn", None),
+                    getattr(
+                        handler,
+                        "highest_source_data_lsn",
+                        getattr(handler, "highest_source_lsn", None),
+                    ),
                     engine_thread_alive=thread.is_alive(),
                     own_progress_at=signal["own_progress_at"],
                     own_ack_at=signal["own_ack_at"],
                     own_ack_lsn=signal["own_ack_lsn"],
+                    own_identity_at=signal["own_identity_at"],
                     durable_lsn=getattr(
                         getattr(handler, "resume_point", None), "last_lsn", None
                     ),
                     progress_stale_after=service_context.policy.source_health_stale_seconds,
+                    quiet_source_ready=getattr(handler, "snapshot_completed", False),
                 )
                 sample = health.last
                 service_context.observe_source_health(
                     source_status,
                     sample.at if sample is not None else None,
                     engine_thread_alive=thread.is_alive(),
+                    quiet_source_ready=health.service_quiet_ready,
                 )
                 if (
                     run.source_dark_seconds > 0
@@ -465,20 +472,27 @@ def run_engine_bounded(
                         signal = service_context.engine_liveness_signal()
                         sample = health.last
                         dead_status = health.service_status(
-                            getattr(handler, "highest_source_lsn", None),
+                            getattr(
+                                handler,
+                                "highest_source_data_lsn",
+                                getattr(handler, "highest_source_lsn", None),
+                            ),
                             engine_thread_alive=False,
                             own_progress_at=signal["own_progress_at"],
                             own_ack_at=signal["own_ack_at"],
                             own_ack_lsn=signal["own_ack_lsn"],
+                            own_identity_at=signal["own_identity_at"],
                             durable_lsn=getattr(
                                 getattr(handler, "resume_point", None), "last_lsn", None
                             ),
                             progress_stale_after=service_context.policy.source_health_stale_seconds,
+                            quiet_source_ready=getattr(handler, "snapshot_completed", False),
                         )
                         service_context.observe_source_health(
                             dead_status,
                             sample.at if sample is not None else None,
                             engine_thread_alive=False,
+                            quiet_source_ready=health.service_quiet_ready,
                         )
                         if dead_status == "engine_thread_dead":
                             service_context.note_source_dark()
@@ -592,20 +606,27 @@ def run_engine_bounded(
                     signal = service_context.engine_liveness_signal()
                     sample = health.last
                     source_status = health.service_status(
-                        getattr(handler, "highest_source_lsn", None),
+                        getattr(
+                            handler,
+                            "highest_source_data_lsn",
+                            getattr(handler, "highest_source_lsn", None),
+                        ),
                         engine_thread_alive=False,
                         own_progress_at=signal["own_progress_at"],
                         own_ack_at=signal["own_ack_at"],
                         own_ack_lsn=signal["own_ack_lsn"],
+                        own_identity_at=signal["own_identity_at"],
                         durable_lsn=getattr(
                             getattr(handler, "resume_point", None), "last_lsn", None
                         ),
                         progress_stale_after=service_context.policy.source_health_stale_seconds,
+                        quiet_source_ready=getattr(handler, "snapshot_completed", False),
                     )
                     service_context.observe_source_health(
                         source_status,
                         sample.at if sample is not None else None,
                         engine_thread_alive=False,
+                        quiet_source_ready=health.service_quiet_ready,
                     )
                     if source_status == "engine_thread_dead":
                         service_context.note_source_dark()

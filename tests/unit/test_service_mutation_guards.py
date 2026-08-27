@@ -614,6 +614,24 @@ def test_service_heartbeat_uses_the_same_admitted_connection():
         context.close()
 
 
+def test_control_callback_certifies_identity_without_refreshing_liveness():
+    context = ServiceContext(
+        service_id="service-a",
+        lease_id="lease-a",
+        worker_generation="service-a:generation",
+        policy=ServiceConfig(),
+    )
+    try:
+        before = context._last_progress
+        context.note_engine_identity()
+        signal = context.engine_liveness_signal()
+        assert signal["own_identity_at"] is not None
+        assert signal["own_progress_at"] is None
+        assert context._last_progress == before
+    finally:
+        context.close()
+
+
 def test_service_dead_engine_cannot_renew_through_a_live_slot_witness():
     class LeaseProbe:
         lease_key = "physical:test"

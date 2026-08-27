@@ -366,6 +366,132 @@ def test_service_quiet_connected_holder_survives_watchdog_and_successors_stand_d
 
 @pytest.mark.slow
 @pytest.mark.motherduck
+def test_service_excluded_capture_route_fails_closed_and_releases_lease(
+    tmp_path_factory, postgres_cluster, motherduck_case
+):
+    """Publication membership must overlap the connector route, not merely exist."""
+    box = Sandbox(
+        "service_excluded_capture_route",
+        tmp_path_factory.mktemp("sbx_service_excluded_capture_route"),
+        postgres_cluster,
+    )
+    process = None
+    case = motherduck_case
+    service_env = {
+        "CDC_MD_DATABASE": case["database"],
+        "CDC_DATASET": case["dataset"],
+        "CDC_CONTROL_SCHEMA": case["control_schema"],
+        "MOTHERDUCK_TOKEN": case["token"],
+        "motherduck_token": case["token"],
+        "CDC_AUTO_DISCOVERY": "0",
+        "CDC_TABLES": "orders",
+        "CDC_SERVICE_ID": "service-excluded-capture-route",
+        "CDC_SERVICE_LEASE_TTL": "30",
+        "CDC_SERVICE_LEASE_RENEW_SECONDS": "5",
+        "CDC_SERVICE_HEARTBEAT_BOUND_SECONDS": "15",
+        "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "10",
+        "CDC_SERVICE_STALL_EXIT_GRACE_SECONDS": "5",
+        "CDC_SERVICE_SOURCE_HEALTH_STALE_SECONDS": "5",
+        "CDC_SERVICE_INVARIANT_CHECK_SECONDS": "1",
+        # Let the source-specific diagnosis win before the local no-progress
+        # watchdog's 10-second symptom path.
+        "CDC_SOURCE_DARK_SECONDS": "5",
+        "CDC_SERVICE_COMMIT_TIMEOUT": "5",
+        "CDC_SERVICE_CLOSE_TIMEOUT": "15",
+        "CDC_CLOSE_TIMEOUT": "15",
+        "CDC_ENGINE_THREAD_TIMEOUT": "15",
+    }
+
+    def md_query(statement: str, params=None) -> list[tuple]:
+        con = motherduck_connect(case["token"], case["database"])
+        try:
+            return con.execute(statement, params or []).fetchall()
+        finally:
+            con.close()
+
+    try:
+        box.reseed()
+        baseline = box.run(
+            reset_state=True,
+            destination="motherduck",
+            extra_env=service_env,
+            max_seconds=180,
+            timeout=300,
+        )
+        assert baseline["ok"] is True, baseline
+
+        # Leave one unrelated table in the publication. The membership witness is
+        # intentionally true; the configured-route witness must be false because
+        # this connector is configured for app.orders only.
+        box.sql(
+            "ALTER PUBLICATION cdc_flight_pub DROP TABLE "
+            "app.orders, app.sensor_readings, app.documents, app.wide_types, "
+            "app.audit_log, app.cdc_flight_signal"
+        )
+        assert box.pg_query(
+            "SELECT schemaname, tablename FROM pg_publication_tables "
+            "WHERE pubname = 'cdc_flight_pub'"
+        ) == [("app", "customers")]
+
+        process = box.spawn_service(
+            destination="motherduck",
+            capture=True,
+            extra_env=service_env,
+        )
+        box.wait_for_slot_active(process=process, timeout=45)
+        # This row is real source activity, but is outside table.include.list and
+        # therefore must not be mistaken for delivery to this Flight.
+        box.sql(
+            "INSERT INTO app.customers (name, email) VALUES "
+            "('service-excluded-route', 'service-excluded-route@example.com')"
+        )
+        returncode = process.wait(timeout=45)
+        output = _service_process_output(process)
+        summary = box.last_summary()
+
+        assert returncode != 0, output
+        assert summary.get("stop_reason") == "source_dark", (summary, output)
+        assert summary.get("source_publication_has_tables") is True, (summary, output)
+        assert summary.get("source_publication_has_configured_tables") is False, (
+            summary,
+            output,
+        )
+        assert summary.get("data_batches") == 0, (summary, output)
+        assert summary.get("data_commit_groups") == 0, (summary, output)
+        heartbeat = summary.get("service_heartbeat", {})
+        assert heartbeat.get("engine_callback_age_sec") is None, (summary, output)
+        assert heartbeat.get("engine_commit_age_sec") is None, (summary, output)
+        assert heartbeat.get("engine_ack_age_sec") is None, (summary, output)
+        assert summary.get("source_dark_detected_after_sec") is not None, (
+            summary,
+            output,
+        )
+        assert summary["source_dark_detected_after_sec"] < 25, (summary, output)
+        assert md_query(
+            f'SELECT state, fencing_epoch, service_id FROM "{case["control_schema"]}"."lease"'
+        ) == [("released", 1, "service-excluded-capture-route")]
+        assert md_query(
+            "SELECT count(*) FROM information_schema.tables "
+            "WHERE table_schema = ? AND table_name = ?",
+            [case["dataset"], "cdcflight_app_customers"],
+        ) == [(0,)]
+        assert md_query(
+            f'SELECT severity, code FROM "{case["control_schema"]}"."alerts" '
+            "WHERE pipeline = ? AND code = 'source_dark'",
+            [box.env["CDC_PIPELINE_NAME"]],
+        ) == [("critical", "source_dark")]
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=30)
+        if process is not None:
+            process.communicate(timeout=5)
+        box.cleanup()
+        box.reseed()
+
+
+@pytest.mark.slow
+@pytest.mark.motherduck
 def test_service_stock_walsender_retry_backoff_fails_closed_alerts_and_successor_takes_over(
     tmp_path_factory, postgres_cluster, motherduck_case
 ):

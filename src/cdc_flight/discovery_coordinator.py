@@ -98,6 +98,18 @@ class LiveDiscoveryCoordinator:
         self.descriptor_provider = descriptor_provider
         self.catalog_flush_exclude = set(catalog_flush_exclude or ())
         self.service_context = service_context
+        configured_capture = str(self.props.get("table.include.list", ""))
+        capture_tables = tuple(
+            table.strip()
+            for table in configured_capture.split(",")
+            if table.strip()
+        )
+        if not capture_tables:
+            capture_tables = tuple(self.source.tables)
+        signal_collection = self.props.get("signal.data.collection")
+        self.capture_tables = tuple(
+            table for table in capture_tables if table != signal_collection
+        )
 
         self.applier = None
         self.health = None
@@ -179,6 +191,9 @@ class LiveDiscoveryCoordinator:
                         self.props.get("publication.name")
                         if self.service_context is not None
                         else None
+                    ),
+                    capture_tables=(
+                        self.capture_tables if self.service_context is not None else None
                     ),
                     primary_dsn=self.source.primary_dsn,
                     source_marker=(
