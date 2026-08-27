@@ -265,9 +265,16 @@ def run_engine_bounded(
                 service_context.rearm_process_signals()
                 service_context.set_engine_thread_alive(thread.is_alive())
             elapsed = time.monotonic() - started
-            if live_queue_probe is not None and live_queue_metrics is None:
+            if live_queue_probe is not None:
                 try:
-                    live_queue_metrics = live_queue_probe()
+                    observed_queue = live_queue_probe()
+                    # Keep polling after startup: the queue object exposes a
+                    # transient occupancy, and the engine retains its
+                    # high-water mark for the final evidence.  A None result
+                    # after a successful proof means the stock task is already
+                    # tearing down; retain the last verified measurement.
+                    if observed_queue is not None:
+                        live_queue_metrics = observed_queue
                 except BaseException as exc:
                     # A queue that cannot be inspected is a startup/configuration
                     # failure, not a reason to continue with an unbounded count-only
@@ -276,10 +283,7 @@ def run_engine_bounded(
                     error_box.append(exc)
                     outcome.record("engine_error")
                     break
-                if (
-                    live_queue_metrics is None
-                    and time.monotonic() >= live_queue_probe_deadline
-                ):
+                if live_queue_metrics is None and time.monotonic() >= live_queue_probe_deadline:
                     error_box.append(
                         EngineFailure(
                             "stock Debezium source-task queue was not initialized "
