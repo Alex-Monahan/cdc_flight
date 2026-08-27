@@ -15,6 +15,7 @@ import threading
 import time
 from contextlib import suppress
 
+import psycopg
 import pytest
 from support.fixtures import TEST_SLOT_PREFIX, _drop_slot
 
@@ -30,6 +31,32 @@ class _AcknowledgingHandler:
     """Keep any incidental heartbeat callback fully acknowledged."""
 
     def handle_batch(self, records, committer):
+        for record in records:
+            committer.markProcessed(record)
+        if records:
+            committer.markBatchFinished()
+
+
+class _GatedAcknowledgingHandler:
+    """Hold the first callback so the stock source queue has to fill behind it."""
+
+    def __init__(self):
+        self.first_callback = threading.Event()
+        self.release = threading.Event()
+        self._lock = threading.Lock()
+        self.records = 0
+        self.batches = 0
+        self.error = None
+
+    def handle_batch(self, records, committer):
+        with self._lock:
+            self.records += len(records)
+            self.batches += 1
+            first = self.batches == 1
+        if first:
+            self.first_callback.set()
+            if not self.release.wait(timeout=90):
+                raise AssertionError("queue gate was not released within 90s")
         for record in records:
             committer.markProcessed(record)
         if records:
@@ -178,3 +205,120 @@ def test_toast_burst_spills_and_finishes_as_one_exact_commit_group(sandbox):
         "confirmed_flush_lsn": confirmed,
         "durable_lsn": durable,
     }
+
+
+@pytest.mark.slow
+def test_stock_queue_applies_byte_backpressure_before_acknowledgement(
+    tmp_path, postgres_cluster
+):
+    """A blocked callback fills, but cannot overrun, the stock byte-bounded queue."""
+    slot = f"{TEST_SLOT_PREFIX}p5_gate_{os.getpid()}"[:63]
+    _drop_slot(postgres_cluster, slot)
+    replication = ReplicationConfig(slot_name=slot, state_dir=tmp_path / "queue_gate")
+    properties = build_properties(
+        postgres_cluster,
+        replication,
+        snapshot_mode="no_data",
+        max_batch_size=8,
+        overrides={"max.queue.size": "8192"},
+    )
+    properties["table.include.list"] = "app.documents"
+    handler = _GatedAcknowledgingHandler()
+    engine = SupervisedDebeziumEngine(properties, handler)
+    runner = threading.Thread(target=engine.run, name="p5-queue-gate", daemon=True)
+    source_error = []
+    source_started = threading.Event()
+    source_finished = threading.Event()
+    tag = f"p5gate-{os.getpid()}"
+
+    def write_source_burst():
+        source_started.set()
+        try:
+            with psycopg.connect(postgres_cluster.dsn) as conn:
+                conn.execute(
+                    "INSERT INTO app.documents (title, body, body_bytes, revision) "
+                    "SELECT %s || i, "
+                    "(SELECT string_agg(md5(i::text || ':' || g::text), '' ORDER BY g) "
+                    "FROM generate_series(1, 2048) AS g), "
+                    "65536, 1 FROM generate_series(1, 2048) AS rows(i)",
+                    (f"{tag}-",),
+                )
+                conn.commit()
+        except BaseException as exc:  # surfaced by the test thread below
+            source_error.append(exc)
+        finally:
+            source_finished.set()
+
+    source_writer = threading.Thread(target=write_source_burst, name="p5-source-burst")
+    try:
+        runner.start()
+        deadline = time.monotonic() + 30
+        live = None
+        while live is None and time.monotonic() < deadline:
+            live = engine.probe_live_queue()
+            if engine.failure is not None:
+                pytest.fail(f"stock Debezium failed before queue gate: {engine.failure}")
+            if live is None:
+                time.sleep(0.1)
+        assert live is not None, "stock queue did not initialize before the burst"
+
+        source_writer.start()
+        assert source_started.wait(timeout=5)
+        assert handler.first_callback.wait(timeout=60), (
+            "the large source transaction never reached the gated callback"
+        )
+        samples = []
+        capacity = int(live["queue_max_queue_size_in_bytes"])
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            current = engine.probe_live_queue()
+            if current is not None:
+                samples.append(current)
+                if current["queue_current_size_in_bytes"] >= capacity * 0.85:
+                    break
+            if engine.failure is not None:
+                pytest.fail(f"stock Debezium failed while queue was gated: {engine.failure}")
+            time.sleep(0.1)
+
+        assert samples, "the gated source produced no live queue samples"
+        peak = max(samples, key=lambda item: item["queue_current_size_in_bytes"])
+        assert peak["queue_current_size_in_bytes"] >= capacity * 0.85, peak
+        assert peak["queue_current_size_in_bytes"] <= capacity
+        assert peak["queue_current_size"] <= peak["queue_total_capacity"]
+        assert not source_finished.is_set() or not source_error, source_error
+
+        handler.release.set()
+        source_writer.join(timeout=90)
+        assert not source_writer.is_alive(), "source burst thread did not finish"
+        assert source_error == [], source_error
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            with handler._lock:
+                received = handler.records
+            if received >= 2048:
+                break
+            if engine.failure is not None:
+                pytest.fail(f"stock Debezium failed while draining queue: {engine.failure}")
+            time.sleep(0.1)
+        with handler._lock:
+            received = handler.records
+        assert received >= 2048, received
+    finally:
+        handler.release.set()
+        if runner.is_alive():
+            closer = threading.Thread(
+                target=lambda: engine.close(intentional=True),
+                name="p5-queue-gate-close",
+                daemon=True,
+            )
+            closer.start()
+            closer.join(timeout=30)
+            if closer.is_alive():
+                pytest.fail("stock Debezium close hung after queue gate")
+        runner.join(timeout=30)
+        if runner.is_alive():
+            pytest.fail("stock Debezium runner hung after queue gate")
+        if source_writer.is_alive():
+            source_writer.join(timeout=30)
+        with suppress(Exception):
+            _drop_slot(postgres_cluster, slot)
