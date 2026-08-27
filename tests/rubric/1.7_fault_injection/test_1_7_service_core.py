@@ -682,15 +682,18 @@ def test_service_excluded_capture_route_fails_closed_and_releases_lease(
         "CDC_AUTO_DISCOVERY": "0",
         "CDC_TABLES": "orders",
         "CDC_SERVICE_ID": "service-excluded-capture-route",
-        "CDC_SERVICE_LEASE_TTL": "30",
+        "CDC_SERVICE_LEASE_TTL": "60",
         "CDC_SERVICE_LEASE_RENEW_SECONDS": "5",
         "CDC_SERVICE_HEARTBEAT_BOUND_SECONDS": "15",
-        "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "10",
+        # Give the invalid-route engine enough bounded time to publish its
+        # source-specific diagnosis before the local no-progress watchdog can
+        # compete for the failure path and its alert sink.
+        "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "30",
         "CDC_SERVICE_STALL_EXIT_GRACE_SECONDS": "5",
         "CDC_SERVICE_SOURCE_HEALTH_STALE_SECONDS": "5",
         "CDC_SERVICE_INVARIANT_CHECK_SECONDS": "1",
         # Let the source-specific diagnosis win before the local no-progress
-        # watchdog's 10-second symptom path.
+        # watchdog's 30-second symptom path.
         "CDC_SOURCE_DARK_SECONDS": "5",
         "CDC_SERVICE_COMMIT_TIMEOUT": "5",
         "CDC_SERVICE_CLOSE_TIMEOUT": "15",
@@ -745,15 +748,37 @@ def test_service_excluded_capture_route_fails_closed_and_releases_lease(
         output = _service_process_output(process)
         summary = box.last_summary()
 
+        lease = md_query(
+            f'SELECT state, fencing_epoch, service_id FROM "{case["control_schema"]}"."lease"'
+        )
+        destination_customers = md_query(
+            "SELECT count(*) FROM information_schema.tables "
+            "WHERE table_schema = ? AND table_name = ?",
+            [case["dataset"], "cdcflight_app_customers"],
+        )
+        source_dark_alerts = md_query(
+            f'SELECT severity, code FROM "{case["control_schema"]}"."alerts" '
+            "WHERE pipeline = ? AND code = 'source_dark'",
+            [box.env["CDC_PIPELINE_NAME"]],
+        )
+
+        # Safety is independent of the operator classification: this route must
+        # fail closed and release ownership even if a future diagnosis assertion
+        # regresses.
         assert returncode != 0, output
+        assert lease == [("released", 1, "service-excluded-capture-route")]
+        assert destination_customers == [(0,)]
+        assert summary.get("data_batches") == 0, (summary, output)
+        assert summary.get("data_commit_groups") == 0, (summary, output)
+
+        # Diagnosis remains exact. `source_dark` and `engine_error` describe
+        # different operator situations and are never accepted interchangeably.
         assert summary.get("stop_reason") == "source_dark", (summary, output)
         assert summary.get("source_publication_has_tables") is True, (summary, output)
         assert summary.get("source_publication_has_configured_tables") is False, (
             summary,
             output,
         )
-        assert summary.get("data_batches") == 0, (summary, output)
-        assert summary.get("data_commit_groups") == 0, (summary, output)
         heartbeat = summary.get("service_heartbeat", {})
         assert heartbeat.get("engine_callback_age_sec") is None, (summary, output)
         assert heartbeat.get("engine_commit_age_sec") is None, (summary, output)
@@ -763,19 +788,7 @@ def test_service_excluded_capture_route_fails_closed_and_releases_lease(
             output,
         )
         assert summary["source_dark_detected_after_sec"] < 25, (summary, output)
-        assert md_query(
-            f'SELECT state, fencing_epoch, service_id FROM "{case["control_schema"]}"."lease"'
-        ) == [("released", 1, "service-excluded-capture-route")]
-        assert md_query(
-            "SELECT count(*) FROM information_schema.tables "
-            "WHERE table_schema = ? AND table_name = ?",
-            [case["dataset"], "cdcflight_app_customers"],
-        ) == [(0,)]
-        assert md_query(
-            f'SELECT severity, code FROM "{case["control_schema"]}"."alerts" '
-            "WHERE pipeline = ? AND code = 'source_dark'",
-            [box.env["CDC_PIPELINE_NAME"]],
-        ) == [("critical", "source_dark")]
+        assert source_dark_alerts == [("critical", "source_dark")]
     finally:
         if process is not None and process.poll() is None:
             process.kill()
