@@ -67,7 +67,23 @@ def _wait_for_live_queue(engine, runner, timeout: float = 90.0) -> dict:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         metrics = engine.probe_live_queue()
-        if metrics is not None:
+        # Debezium publishes its private task/queue object while the task can
+        # still be in STARTING_TASKS.  Stock close() deliberately refuses that
+        # state because closing there can leak resources.  Require the same
+        # live task to reach its normal polling state before the proof returns;
+        # otherwise a successful reflection can leave a real runner behind.
+        state = None
+        try:
+            # Never read the cached property here: the runner thread owns engine
+            # construction, and touching ``engine.engine`` from this polling
+            # thread could construct a second stock JVM engine during the race.
+            java_engine = engine.__dict__.get("engine")
+            if java_engine is not None:
+                state_ref = engine._java_field(java_engine, "state")
+                state = str(state_ref.get())
+        except Exception:
+            pass
+        if metrics is not None and state == "POLLING_TASKS":
             return metrics
         if engine.failure is not None:
             pytest.fail(f"stock Debezium failed before queue proof: {engine.failure}")
@@ -98,6 +114,13 @@ def test_stock_queue_byte_bound_is_effective_in_the_live_task(
         snapshot_mode="no_data",
         overrides=overrides,
     )
+    # Debezium registers connector metrics under the topic prefix.  Keep the two
+    # proof cases independent inside a reused worker JVM: stock teardown can
+    # unregister an earlier MBean asynchronously, and a stale registration must
+    # not turn the second runtime proof into a false startup timeout.
+    identity = f"p5_queue_{label}_{os.getpid()}"
+    properties["name"] = f"cdc-flight-{identity}"
+    properties["topic.prefix"] = f"cdcflight_{identity}"
     engine = SupervisedDebeziumEngine(properties, _AcknowledgingHandler())
     runner = threading.Thread(target=engine.run, name=f"p5-queue-{label}", daemon=True)
     close_thread = None
