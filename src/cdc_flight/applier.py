@@ -651,15 +651,6 @@ class Applier:
 
             source_records += 1
             rec = decode(raw, topic_prefix=self.topic_prefix)
-            ignored_source_record = rec.qualified_table in self.ignored_source_tables
-            if ignored_source_record:
-                # The source signal row is a control-plane request.  It still
-                # participates in the source transaction/offset proof as a
-                # counted data event, but GroupPlan ignores the relation before
-                # destination materialisation.  Relabelling it as a heartbeat
-                # here would make the transaction assembler count zero events
-                # against Debezium's END event_count=1.
-                pass
             if rec.incremental:
                 run = self.backfill.incremental_owner(rec.schema or "", rec.table or "")
                 rec = decode_incremental_record(
@@ -684,6 +675,17 @@ class Applier:
                     # BEGIN, while a committed STARTED notification has already
                     # installed the route.
                     self._ensure_backfill_route(rec.schema, rec.table, run, create=False)
+            ignored_source_record = rec.qualified_table in self.ignored_source_tables
+            if ignored_source_record:
+                # The source signal row is a control-plane request. It still
+                # participates in the source transaction/offset proof as a
+                # counted data event, but GroupPlan ignores the relation before
+                # destination materialisation. Relabeling it as a heartbeat here
+                # would make the transaction assembler count zero events against
+                # Debezium's END event_count=1. The explicit record flag instead
+                # lets the assembler keep proof and service liveness separate.
+                pass
+            rec.ignored_source_record = ignored_source_record
             self.source_marker_records_received += self._source_marker_receipts.observe(rec)
             if rec.lsn is not None:
                 self.highest_source_lsn = max(self.highest_source_lsn, int(rec.lsn))

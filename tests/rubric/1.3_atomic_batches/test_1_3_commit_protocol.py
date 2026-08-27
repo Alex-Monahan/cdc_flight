@@ -105,6 +105,34 @@ def test_shutdown_seals_callback_admission_and_records_late_batches(lab, monkeyp
     assert stats["callback_records_rejected"] == 2
 
 
+def test_ignored_signal_event_is_counted_but_not_a_data_commit_group(lab, monkeypatch):
+    """Offset proof and service-delivery accounting are separate notions."""
+    box = lab()
+    _patch_production_handle_for_pending_records(monkeypatch)
+    box.applier.ignored_source_tables.add("app.cdc_flight_signal")
+    signal = data(
+        "signal-only",
+        1,
+        101,
+        table="cdc_flight_signal",
+        after={"id": 1, "name": "control"},
+    )
+    box.applier._handle(
+        [
+            begin("signal-only", 100),
+            signal,
+            end("signal-only", 1, 102, {"app.cdc_flight_signal": 1}),
+        ],
+        box.committer,
+    )
+
+    assert box.applier.applied_events == 1
+    assert box.applier.data_commit_groups == 0
+    assert box.q(
+        "SELECT event_count FROM _cdc_flight.commit_log ORDER BY commit_id"
+    ) == [(1,)]
+
+
 class _SnapshotNotification:
     """Minimal ordered notification with a real Connect offset shape."""
 

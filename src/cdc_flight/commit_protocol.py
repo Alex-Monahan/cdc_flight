@@ -24,6 +24,26 @@ from .run_state import COMMIT_ACK
 OWNER = "commit-durability"
 
 
+def _unit_has_delivery_data(unit) -> bool:
+    """Return delivery evidence without changing the source event count.
+
+    ``CompleteUnit.event_count`` is the Debezium whole-transaction proof and must
+    include the Flight's ignored signal-table row. ``delivery_events`` is the
+    deliberately separate liveness count produced by the assembler. The fallback
+    keeps hand-built units in the test/embedding seam honest while production units
+    always carry the explicit count, including spilled prefixes.
+    """
+    delivery_events = getattr(unit, "delivery_events", None)
+    if delivery_events is not None:
+        return delivery_events > 0
+    if not (unit.events or unit.spilled_events):
+        return False
+    return any(
+        getattr(event, "is_delivery_data", getattr(event, "is_data", False))
+        for event in unit.events
+    )
+
+
 def _bounded_service_destination_operation(function):
     """Bound service destination work before the commit/ack hand-off."""
     @functools.wraps(function)
@@ -111,7 +131,7 @@ def commit_group(self, trigger: str) -> CommitResult:
         # same-group replacement unit cannot make a fenced-only group look like
         # data merely because it arrived before catalog planning.
         has_data = any(
-            not u.fenced and (u.events or u.spilled_events) for u in group
+            not u.fenced and _unit_has_delivery_data(u) for u in group
         )
         fault_enabled = has_data
         if has_data:

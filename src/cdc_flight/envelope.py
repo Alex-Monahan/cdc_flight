@@ -147,6 +147,11 @@ class PendingRecord:
     incremental_signal_id: str | None = None
     snapshot_identity: str | None = None
     incremental_chunk_id: str | None = None
+    #: True when the applier identifies this data record as the Flight's own
+    #: control-plane relation.  It remains a normal data event for transaction
+    #: assembly and offset proof; this separate fact only prevents it from
+    #: refreshing service delivery liveness.
+    ignored_source_record: bool = False
     #: Stock's TABLE_SCAN_COMPLETED notification may overtake READ records on the
     #: embedded-engine callback stream.  Preserve its declared row total so the
     #: destination can defer the atomic swap until the shadow has received them.
@@ -155,6 +160,16 @@ class PendingRecord:
     @property
     def is_data(self) -> bool:
         return self.kind in (KIND_DATA, KIND_SNAPSHOT, KIND_TRUNCATE)
+
+    @property
+    def is_delivery_data(self) -> bool:
+        """Whether this data event is evidence of this Flight's delivery.
+
+        The signal relation is deliberately excluded only from this liveness view.
+        It remains ``is_data`` and therefore remains counted by the transaction
+        assembler's Debezium END/event_count reconciliation.
+        """
+        return self.is_data and not self.ignored_source_record
 
     @property
     def qualified_table(self) -> str | None:
