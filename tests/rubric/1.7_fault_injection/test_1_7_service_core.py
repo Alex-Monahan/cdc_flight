@@ -366,6 +366,302 @@ def test_service_quiet_connected_holder_survives_watchdog_and_successors_stand_d
 
 @pytest.mark.slow
 @pytest.mark.motherduck
+def test_service_ignored_signal_does_not_refresh_liveness(
+    tmp_path_factory, postgres_cluster, motherduck_case
+):
+    """A signal row proves source ordering, not Flight delivery progress."""
+    box = Sandbox(
+        "service_ignored_signal_liveness",
+        tmp_path_factory.mktemp("sbx_service_ignored_signal_liveness"),
+        postgres_cluster,
+    )
+    process = None
+    case = motherduck_case
+    service_env = {
+        "CDC_MD_DATABASE": case["database"],
+        "CDC_DATASET": case["dataset"],
+        "CDC_CONTROL_SCHEMA": case["control_schema"],
+        "MOTHERDUCK_TOKEN": case["token"],
+        "motherduck_token": case["token"],
+        "CDC_SERVICE_ID": "service-ignored-signal-liveness",
+        "CDC_SERVICE_LEASE_TTL": "60",
+        "CDC_SERVICE_LEASE_RENEW_SECONDS": "5",
+        "CDC_SERVICE_HEARTBEAT_BOUND_SECONDS": "15",
+        "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "25",
+        "CDC_SERVICE_STALL_EXIT_GRACE_SECONDS": "5",
+        "CDC_SERVICE_SOURCE_HEALTH_STALE_SECONDS": "8",
+        "CDC_SERVICE_INVARIANT_CHECK_SECONDS": "1",
+        "CDC_SOURCE_DARK_SECONDS": "8",
+        "CDC_SERVICE_COMMIT_TIMEOUT": "10",
+        "CDC_SERVICE_CLOSE_TIMEOUT": "15",
+        "CDC_CLOSE_TIMEOUT": "15",
+        "CDC_ENGINE_THREAD_TIMEOUT": "15",
+    }
+
+    def md_query(statement: str, params=None) -> list[tuple]:
+        con = motherduck_connect(case["token"], case["database"])
+        try:
+            return con.execute(statement, params or []).fetchall()
+        finally:
+            con.close()
+
+    try:
+        box.reseed()
+        baseline = box.run(
+            reset_state=True,
+            destination="motherduck",
+            extra_env=service_env,
+            max_seconds=180,
+            timeout=300,
+        )
+        assert baseline["ok"] is True, baseline
+
+        process = box.spawn_service(
+            destination="motherduck",
+            capture=True,
+            extra_env=service_env,
+        )
+        try:
+            box.wait_for_slot_active(process=process, timeout=45)
+        except AssertionError:
+            print("ignored-signal startup output:", _service_process_output(process))
+            raise
+        box.sql(
+            "INSERT INTO app.cdc_flight_signal (id, type, data) VALUES "
+            "('service-ignored-signal', 'execute-snapshot', "
+            "'{\"data-collections\":[],\"type\":\"incremental\"}')"
+        )
+        returncode = process.wait(timeout=45)
+        output = _service_process_output(process)
+        summary = box.last_summary()
+        lease = md_query(
+            f'SELECT state, fencing_epoch, service_id FROM "{case["control_schema"]}"."lease"'
+        )
+        alerts = md_query(
+            f'SELECT severity, code FROM "{case["control_schema"]}"."alerts" '
+            "WHERE pipeline = ? ORDER BY raised_at",
+            [box.env["CDC_PIPELINE_NAME"]],
+        )
+        commit_log = md_query(
+            f'SELECT commit_id, event_count, unit_count, last_lsn '
+            f'FROM "{case["control_schema"]}"."commit_log" '
+            "WHERE pipeline = ? ORDER BY commit_id",
+            [box.env["CDC_PIPELINE_NAME"]],
+        )
+        print(
+            "ignored-signal probe:",
+            {
+                "returncode": returncode,
+                "summary": summary,
+                "lease": lease,
+                "alerts": alerts,
+                "commit_log": commit_log,
+            },
+        )
+
+        assert returncode != 0, output
+        assert summary.get("stop_reason") == "source_dark", (summary, output)
+        assert summary.get("records", 0) >= 1, (summary, output)
+        assert summary.get("skipped", 0) >= 1, (summary, output)
+        assert summary.get("data_batches") == 0, (summary, output)
+        assert summary.get("data_commit_groups") == 0, (summary, output)
+        assert summary.get("applied_events") >= 1, (summary, output)
+        signal_commits = [
+            row for row in commit_log if row[1] == 1 and row[3] is not None
+        ]
+        assert signal_commits, commit_log
+        heartbeat = summary.get("service_heartbeat", {})
+        assert heartbeat.get("engine_callback_age_sec") is None, summary
+        assert heartbeat.get("engine_commit_age_sec") is None, summary
+        assert heartbeat.get("engine_ack_age_sec") is None, summary
+        assert heartbeat.get("engine_progress_age_sec") is None, summary
+        assert lease == [("released", 1, "service-ignored-signal-liveness")]
+        assert any(
+            severity == "critical" and code == "source_dark"
+            for severity, code in alerts
+        ), alerts
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=30)
+        if process is not None:
+            process.communicate(timeout=5)
+        box.cleanup()
+        box.reseed()
+
+
+@pytest.mark.slow
+@pytest.mark.motherduck
+def test_service_quarantined_table_activity_keeps_lease_alive(
+    tmp_path_factory, postgres_cluster, motherduck_case
+):
+    """A quarantined application row is data evidence, unlike a signal row."""
+    box = Sandbox(
+        "service_quarantined_table_liveness",
+        tmp_path_factory.mktemp("sbx_service_quarantined_table_liveness"),
+        postgres_cluster,
+    )
+    process = None
+    case = motherduck_case
+    service_env = {
+        "CDC_MD_DATABASE": case["database"],
+        "CDC_DATASET": case["dataset"],
+        "CDC_CONTROL_SCHEMA": case["control_schema"],
+        "MOTHERDUCK_TOKEN": case["token"],
+        "motherduck_token": case["token"],
+        "CDC_TABLES": "service_quarantined",
+        "CDC_AUTO_DISCOVERY": "0",
+        "CDC_CATALOG_POLL_SECONDS": "1",
+        "CDC_SERVICE_ID": "service-quarantined-table-liveness",
+        "CDC_SERVICE_LEASE_TTL": "60",
+        "CDC_SERVICE_LEASE_RENEW_SECONDS": "5",
+        "CDC_SERVICE_HEARTBEAT_BOUND_SECONDS": "15",
+        "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "15",
+        "CDC_SERVICE_STALL_EXIT_GRACE_SECONDS": "5",
+        "CDC_SERVICE_SOURCE_HEALTH_STALE_SECONDS": "8",
+        "CDC_SERVICE_INVARIANT_CHECK_SECONDS": "1",
+        "CDC_SOURCE_DARK_SECONDS": "8",
+        "CDC_SERVICE_COMMIT_TIMEOUT": "10",
+        "CDC_SERVICE_CLOSE_TIMEOUT": "15",
+        "CDC_CLOSE_TIMEOUT": "15",
+        "CDC_ENGINE_THREAD_TIMEOUT": "15",
+    }
+
+    def md_query(statement: str, params=None) -> list[tuple]:
+        con = motherduck_connect(case["token"], case["database"])
+        try:
+            return con.execute(statement, params or []).fetchall()
+        finally:
+            con.close()
+
+    try:
+        box.reseed()
+        box.sql(
+            [
+                "CREATE TABLE app.service_quarantined "
+                "(id integer PRIMARY KEY, name text)",
+                "ALTER PUBLICATION cdc_flight_pub ADD TABLE app.service_quarantined",
+            ],
+            one_transaction=True,
+        )
+        baseline = box.run(
+            reset_state=True,
+            destination="motherduck",
+            extra_env=service_env,
+            max_seconds=180,
+            timeout=300,
+        )
+        assert baseline["ok"] is True, baseline
+
+        box.sql(
+            [
+                "ALTER TABLE app.service_quarantined ADD COLUMN v_box box "
+                "DEFAULT '((0,0),(1,1))'::box",
+                "INSERT INTO app.service_quarantined (id, name) "
+                "VALUES (1, 'quarantined-row')",
+            ],
+            one_transaction=True,
+        )
+        quarantine_runs = []
+        for iteration in range(4):
+            quarantine_runs.append(
+                box.run(
+                    destination="motherduck",
+                    extra_env=service_env,
+                    max_seconds=20,
+                    timeout=60,
+                    expect_success=False,
+                    min_records=1 if iteration == 0 else 0,
+                )
+            )
+        assert all(run["ok"] is False for run in quarantine_runs), quarantine_runs
+        assert md_query(
+            f'SELECT state FROM "{case["control_schema"]}"."schema_refusals" '
+            "WHERE source_table = 'service_quarantined'"
+        ) == [("quarantined",)]
+
+        process = box.spawn_service(
+            destination="motherduck",
+            capture=True,
+            extra_env=service_env,
+        )
+        box.wait_for_slot_active(process=process, timeout=45)
+        box.sql(
+            "INSERT INTO app.service_quarantined (id, name) "
+            "VALUES (2, 'quarantined-row-2')"
+        )
+
+        deadline = time.monotonic() + 35
+        while time.monotonic() < deadline:
+            assert process.poll() is None, _service_process_output(process)
+            if md_query(
+                f'SELECT state FROM "{case["control_schema"]}"."schema_refusals" '
+                "WHERE source_table = 'service_quarantined'"
+            ) == [("quarantined",)]:
+                break
+            time.sleep(0.5)
+        else:
+            raise AssertionError("the live row never reached durable quarantine")
+
+        time.sleep(12)
+        assert process.poll() is None, _service_process_output(process)
+        lease = md_query(
+            f'SELECT state, fencing_epoch, service_id FROM "{case["control_schema"]}"."lease"'
+        )
+        # Service leases use ``held`` while an admitted process owns the epoch;
+        # ``active`` is the finite-run state and would misread a healthy holder.
+        assert lease == [("held", 1, "service-quarantined-table-liveness")]
+        process.send_signal(signal.SIGTERM)
+        returncode = process.wait(timeout=60)
+        output = _service_process_output(process)
+        summary = box.last_summary()
+        alerts = md_query(
+            f'SELECT severity, code FROM "{case["control_schema"]}"."alerts" '
+            "WHERE pipeline = ? ORDER BY raised_at",
+            [box.env["CDC_PIPELINE_NAME"]],
+        )
+        lease_after = md_query(
+            f'SELECT state, fencing_epoch, service_id FROM "{case["control_schema"]}"."lease"'
+        )
+        print(
+            "quarantined-table probe:",
+            {
+                "returncode": returncode,
+                "summary": summary,
+                "lease_while_running": lease,
+                "lease_after": lease_after,
+                "alerts": alerts,
+            },
+        )
+
+        # The controlled SIGTERM is not a success claim: the intentionally
+        # unsupported shape remains an engine-error condition. The liveness
+        # property is that the service was still running with its lease held
+        # after the quarantined row, rather than being killed by source-dark or
+        # the no-progress watchdog.
+        assert returncode != -9, (summary, output)
+        assert summary.get("stop_reason") == "engine_error", (summary, output)
+        assert summary.get("error_cause_type") == "SchemaEvolutionRefused", (
+            summary,
+            output,
+        )
+        assert summary.get("service_heartbeat", {}).get("stalled") is False, summary
+        assert summary.get("quarantined_events", 0) > 0, (summary, output)
+        assert summary.get("data_batches", 0) >= 1, (summary, output)
+        assert lease_after == [("released", 1, "service-quarantined-table-liveness")]
+        assert any(code == "schema_table_quarantined" for _, code in alerts), alerts
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=30)
+        if process is not None:
+            process.communicate(timeout=5)
+        box.cleanup()
+        box.reseed()
+
+
+@pytest.mark.slow
+@pytest.mark.motherduck
 def test_service_excluded_capture_route_fails_closed_and_releases_lease(
     tmp_path_factory, postgres_cluster, motherduck_case
 ):

@@ -320,6 +320,12 @@ class Applier:
         # read-only fallback can wait forever on a quiet source that heartbeats every
         # five seconds.
         self._last_callback_had_data = False
+        #: A Flight signal row is source activity outside the configured delivery
+        #: route. It keeps the transaction/event-count proof, but it disqualifies the
+        #: quiet-source alternative until a real capture-table record arrives. A
+        #: correctly configured source that is genuinely quiet has no such activity;
+        #: a quarantined application row is real delivery evidence and clears it.
+        self._ignored_source_activity = False
 
         # -- counters surfaced in the run summary (rubric 6.1) --------------- #
         self.record_count = 0
@@ -406,6 +412,13 @@ class Applier:
     @property
     def snapshot_completed(self) -> bool:
         return self.snapshot_completion.completed
+
+    @property
+    def source_quiet_ready(self) -> bool:
+        """Whether control-plane activity has not invalidated quiet admission."""
+        with self._lock:
+            ignored_source_activity = self._ignored_source_activity
+        return self.snapshot_completed and not ignored_source_activity
 
     @property
     def snapshot_final_seen(self) -> bool:
@@ -684,12 +697,15 @@ class Applier:
                 # would make the transaction assembler count zero events against
                 # Debezium's END event_count=1. The explicit record flag instead
                 # lets the assembler keep proof and service liveness separate.
-                pass
+                with self._lock:
+                    self._ignored_source_activity = True
             rec.ignored_source_record = ignored_source_record
             self.source_marker_records_received += self._source_marker_receipts.observe(rec)
             if rec.lsn is not None:
                 self.highest_source_lsn = max(self.highest_source_lsn, int(rec.lsn))
             if rec.is_data and not ignored_source_record:
+                with self._lock:
+                    self._ignored_source_activity = False
                 if rec.lsn is not None:
                     self.highest_source_data_lsn = max(
                         self.highest_source_data_lsn, int(rec.lsn)

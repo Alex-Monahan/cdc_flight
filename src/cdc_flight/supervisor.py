@@ -283,7 +283,11 @@ def run_engine_bounded(
                         getattr(handler, "resume_point", None), "last_lsn", None
                     ),
                     progress_stale_after=service_context.policy.source_health_stale_seconds,
-                    quiet_source_ready=getattr(handler, "snapshot_completed", False),
+                    quiet_source_ready=getattr(
+                        handler,
+                        "source_quiet_ready",
+                        getattr(handler, "snapshot_completed", False),
+                    ),
                 )
                 sample = health.last
                 service_context.observe_source_health(
@@ -486,7 +490,11 @@ def run_engine_bounded(
                                 getattr(handler, "resume_point", None), "last_lsn", None
                             ),
                             progress_stale_after=service_context.policy.source_health_stale_seconds,
-                            quiet_source_ready=getattr(handler, "snapshot_completed", False),
+                            quiet_source_ready=getattr(
+                                handler,
+                                "source_quiet_ready",
+                                getattr(handler, "snapshot_completed", False),
+                            ),
                         )
                         service_context.observe_source_health(
                             dead_status,
@@ -620,7 +628,11 @@ def run_engine_bounded(
                             getattr(handler, "resume_point", None), "last_lsn", None
                         ),
                         progress_stale_after=service_context.policy.source_health_stale_seconds,
-                        quiet_source_ready=getattr(handler, "snapshot_completed", False),
+                        quiet_source_ready=getattr(
+                            handler,
+                            "source_quiet_ready",
+                            getattr(handler, "snapshot_completed", False),
+                        ),
                     )
                     service_context.observe_source_health(
                         source_status,
