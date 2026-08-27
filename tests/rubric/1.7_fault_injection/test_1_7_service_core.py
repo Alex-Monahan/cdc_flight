@@ -1817,6 +1817,11 @@ def test_service_sigkill_edges_leave_one_durable_owner(
         if cut in {
             "service_callback_midstream",
             "service_after_md_commit_before_ack",
+            # The renewal cut needs a live own-progress witness; without one a
+            # quiet service can correctly remain outside the renewal fold after
+            # an ignored control-plane signal, so there is no renewal edge to
+            # inject.
+            "service_lease_renewal",
         }:
             box.sql(
                 f"INSERT INTO app.customers (name, email) VALUES "
