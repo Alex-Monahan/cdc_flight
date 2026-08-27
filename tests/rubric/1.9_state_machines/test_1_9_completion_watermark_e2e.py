@@ -24,12 +24,13 @@ pytestmark = [pytest.mark.e2e]
 #: Long enough that no run below could plausibly have waited it out.
 IDLE_SECONDS = 15.0
 
-# Measured on this loaded host from 20 real watermark runs: the empirical p99
-# (the maximum of this 20-sample set) for stop-decision -> summary emission was
-# 2.119 s.  The bound is that measured p99 with 20% operational headroom, not a
-# round timeout: 2.119 * 1.2 = 2.5428, represented at the summary's millisecond
-# precision.
-POST_ACCEPTANCE_EXIT_BOUND_SECONDS = 2.543
+# This assertion is about the property, not teardown speed: after the supervisor
+# accepts the completion predicate it must not consume another quiet window. The
+# teardown may include network I/O (including MotherDuck lease release), so an
+# absolute p99-derived bound would turn host load into a verdict. ``IDLE_SECONDS``
+# is the natural scale: the two known whole-window mutations are caught while a
+# loaded teardown that takes a few seconds is still allowed.
+POST_ACCEPTANCE_EXIT_BOUND_SECONDS = IDLE_SECONDS
 
 
 @pytest.fixture(scope="module")
