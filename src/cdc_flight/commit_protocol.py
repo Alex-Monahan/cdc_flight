@@ -24,6 +24,26 @@ from .run_state import COMMIT_ACK
 OWNER = "commit-durability"
 
 
+def _unit_has_delivery_data(unit) -> bool:
+    """Return delivery evidence without changing the source event count.
+
+    ``CompleteUnit.event_count`` is the Debezium whole-transaction proof and must
+    include the Flight's ignored signal-table row. ``delivery_events`` is the
+    deliberately separate liveness count produced by the assembler. The fallback
+    keeps hand-built units in the test/embedding seam honest while production units
+    always carry the explicit count, including spilled prefixes.
+    """
+    delivery_events = getattr(unit, "delivery_events", None)
+    if delivery_events is not None:
+        return delivery_events > 0
+    if not (unit.events or unit.spilled_events):
+        return False
+    return any(
+        getattr(event, "is_delivery_data", getattr(event, "is_data", False))
+        for event in unit.events
+    )
+
+
 def _bounded_service_destination_operation(function):
     """Bound service destination work before the commit/ack hand-off."""
     @functools.wraps(function)
@@ -79,10 +99,10 @@ def commit_group(self, trigger: str) -> CommitResult:
     has_incremental = any(getattr(unit, "incremental", False) for unit in group)
     has_snapshot_unit = any(unit.kind == "snapshot_chunk" for unit in group)
     if self.service_context is not None:
-        # Admission is a worker/parent protocol check, not a best-effort
-        # observation.  A worker that has lost its parent must fail before it
-        # can open a destination transaction, and the lease identity is checked
-        # once more on the same connection immediately before BEGIN.
+        # Admission is a lease/fence check, not a best-effort observation.  A
+        # Flight that has lost its lease must fail before it can open a
+        # destination transaction, and the identity is checked once more on the
+        # same connection immediately before BEGIN.
         self.service_context.assert_writable()
         self.lease.assert_current(self.con)
     if not self.group.txn_open:
@@ -111,7 +131,7 @@ def commit_group(self, trigger: str) -> CommitResult:
         # same-group replacement unit cannot make a fenced-only group look like
         # data merely because it arrived before catalog planning.
         has_data = any(
-            not u.fenced and (u.events or u.spilled_events) for u in group
+            not u.fenced and _unit_has_delivery_data(u) for u in group
         )
         fault_enabled = has_data
         if has_data:
@@ -182,9 +202,9 @@ def commit_group(self, trigger: str) -> CommitResult:
             self, "_destination_operation_deadline_stop", None
         )
         if stop_destination_deadline is not None:
-            # From this point the commit watchdog and the IPC deadline own the
-            # minimal COMMIT -> source acknowledgement interval.  The broader
-            # destination deadline does not add a second timer to that window.
+            # From this point the commit watchdog owns the minimal COMMIT -> source
+            # acknowledgement interval.  The broader destination deadline does not
+            # add a second timer to that window.
             stop_destination_deadline()
         if self.service_context is not None:
             matrix_crash("service_before_md_commit")
@@ -206,11 +226,6 @@ def commit_group(self, trigger: str) -> CommitResult:
         # callback is deliberately I/O-free: if it fires, it may be running inside
         # COMMIT_ACK and may only terminate the process.
         self._arm_commit_timeout_alert(commit_id)
-        if self.service_context is not None:
-            # The parent marks the physical lease gate before acknowledging this
-            # request.  It must defer its renewal until commit_complete arrives.
-            # No database or alert operation is performed by this handshake.
-            self.service_context.before_commit_ack(timeout=self.cfg.commit_timeout)
         ack_entered = False
         with self_heal.commit_watchdog(self.cfg.commit_timeout, commit_id):
             # INSIDE the watchdog (Codex r3 MAJOR-2). `enter()` waits, without a
@@ -221,17 +236,21 @@ def commit_group(self, trigger: str) -> CommitResult:
             ack_entered = True
             try:
                 if self.service_context is not None:
-                    # Recheck the IPC write barrier immediately before COMMIT.
-                    # This is an in-process event read only; control-plane and
-                    # observability statements remain structurally absent here.
+                    # Recheck the local lease write barrier immediately before
+                    # COMMIT; the commit/ack window itself contains no lease or
+                    # observability I/O.
                     self.service_context.assert_writable()
                 self.con.execute("COMMIT")
                 self.group.txn_open = False
-                if self.service_context is not None:
+                if self.service_context is not None and has_data:
+                    # A durable destination commit is real forward motion.  A
+                    # lease heartbeat, bookkeeping-only group, or supervisor loop
+                    # iteration is not source-data progress.
+                    self.service_context.note_engine_commit(new_point.last_lsn)
                     matrix_crash("service_after_md_commit_before_ack")
-                    # A parent loss after the destination commit is still a
+                    # A lease loss after the destination commit is still a
                     # no-ack path.  The durable destination wins and the source
-                    # record replays on the next generation.
+                    # record replays on the next Flight generation.
                     self.service_context.assert_writable()
                 if has_incremental:
                     maybe_crash("after_md_commit_before_markProcessed", fault_group)
@@ -278,11 +297,6 @@ def commit_group(self, trigger: str) -> CommitResult:
                 # last acknowledgement in all cases.
                 if ack_entered:
                     COMMIT_ACK.leave()
-                if self.service_context is not None:
-                    # This is intentionally after COMMIT_ACK.leave(): the parent
-                    # may resume lease renewal only after the acknowledgement
-                    # window has completely closed.
-                    self.service_context.after_commit_ack()
             if has_incremental:
                 maybe_crash("after_ack_before_next_poll", fault_group)
             self._pending_backfill_notifications.clear()
@@ -371,6 +385,11 @@ def commit_group(self, trigger: str) -> CommitResult:
     self.last_commit_id = commit_id
     self.resume_point = new_point
     self._next_commit_id = max(self._next_commit_id, commit_id + 1)
+    if self.service_context is not None and has_data:
+        # This is deliberately after markBatchFinished() and after the durable
+        # resume point has been installed. Another client's slot activity or a
+        # control-only heartbeat group cannot manufacture this own-ack edge.
+        self.service_context.note_engine_ack(new_point.last_lsn)
     # A throwaway re-snapshot has its own Debezium offset file, which may already
     # include acknowledged duplicate streaming records that arrived after the
     # snapshot image's point. It is disposable handoff evidence, not the main

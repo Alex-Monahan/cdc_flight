@@ -1,6 +1,6 @@
 # ADR 0001 — The transactional applier
 
-* **Status:** accepted (revision 22, 2026-08-02 — schema evolution and live catalog discovery)
+* **Status:** accepted (revision 23, 2026-08-23 — single-process service liveness and fencing)
 * **Date:** 2026-07-30
 * **Task:** TODO 1.0(a); revised under TODO 1.0(feedback)
 * **Decides rubric items:** 1.1, 1.2, 1.3, 1.7 (directly), and 1.4, 1.6, 1.8, 3.2,
@@ -31,6 +31,7 @@
 | 20 | 2026-08-01 | **Round-11 fail-closed publication and recovery boundary.** The supervisor now publishes one typed quiescence proof from inside its `finally`, so a pending `KeyboardInterrupt`, `SystemExit`, or other `BaseException` cannot bypass `active -> callback_owned` by skipping later summary construction. Ownership retirement independently transfers any unretired active callback fail-closed. Marker retirement declares `consumed -> absent`, removes the sibling offset directory, and lives with restart discharge and slot cleanup in `resnapshot_recovery.py`; the summaryless interrupt composition and process-terminal outer teardown are pinned (A69). |
 | 21 | 2026-08-01 | **Round-12 recovery preparation guard.** `InterruptionRecovery.prepare()` now reads the durable marker before cleanup, refuses and preserves `armed`, retires `consumed` only through the declared `consumed -> absent` edge, and directly removes sibling state only when the logical marker is `absent`. Required cleanup errors propagate. Regressions pin the old cleanup-to-arm interruption cut and byte-for-byte preservation of armed marker/offset state (A70). |
 | 22 | 2026-08-02 | **Rubric 2.1–2.3 schema evolution and discovery.** `pg_attribute.attnum`/type identity drives transactional add/drop/rename actions; added values are backfilled behind the catalog fence, dropped destination columns are physically removed, and late renames merge the two names atomically. The watcher polls all non-system schemas by default, admits new relations to table-scoped publications, and performs an in-process main-slot-preserving single-table re-snapshot hand-off for existing rows without restart. The live discovery hand-off adds `streaming -> snapshotting -> streaming` to `run_phase` (A71). |
+| 23 | 2026-08-23 | **Single-process service liveness and fencing.** The service-control machine is declared in `cdc_flight.machines` and its ten reachable transitions are the generated A51 inventory. A fresh source-health observation, rather than supervisor polling, is the only idle lease witness; the service destination handle fences every mutation immediately before its write, while the pre-epoch bootstrap is limited to the admission lease table. The packaged Flight entrypoint requires `max_runtime_sec=0`. |
 
 ---
 

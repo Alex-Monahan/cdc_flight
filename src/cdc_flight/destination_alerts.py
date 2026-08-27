@@ -199,8 +199,17 @@ def _validate_occurrence_binding(
         _alert_pipeline = binding[1]
         physical_pipeline = binding[2]
         owner_id = binding[3]
-        _operation = binding[4]
+        operation = binding[4]
         acquired_at = binding[5]
+        # A service takeover deliberately reports the predecessor after the CAS
+        # has replaced the lease row.  The opaque LeaseReceipt was issued from
+        # that committed predecessor row before the CAS, and its operation is the
+        # explicit historical-proof marker.  Requiring the lease id and epoch
+        # keeps a legacy/undifferentiated receipt from using this exception.
+        if operation == "service_holder_reclaimed":
+            if binding[6] is None or binding[7] is None:
+                raise ValueError("reclaimed service receipt has no lease identity")
+            return
         row = _independent_fetchone(
             con,
             f"SELECT owner_id, acquired_at FROM {_control_table(control_schema, 'lease')} "

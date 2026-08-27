@@ -27,7 +27,11 @@ The source can: while the connector holds the replication stream, its slot is
 
 This module samples `pg_replication_slots` on its own short-timeout connection
 (which is also the 4.6 silently-dead-node detector) and answers one question:
-**is it safe to call this stream idle?**
+**is it safe to call this stream idle?**  In service mode, a slot sample is only
+corroboration.  The service witness also requires the admitted engine thread to
+be alive and a recent callback/commit/ack from this Flight.  A different client
+can keep a slot active, and an attached walsender can hold WAL without delivering
+anything; neither can satisfy that local proof.
 """
 
 from __future__ import annotations
@@ -35,12 +39,18 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from . import faults
 from .machines import SOURCE_HEALTH_STATES
 from .source_marker import IDLE_HEARTBEAT, SourceMarker
+from .witness_contract import (
+    STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+    ServiceWitnessEvidence,
+    evaluate_service_witness,
+)
 
 log = logging.getLogger("cdc_flight.source_health")
 
@@ -61,8 +71,13 @@ log = logging.getLogger("cdc_flight.source_health")
 #: consumer has durably taken.
 DEFAULT_MAX_IDLE_LAG_BYTES = 64 * 1024
 
-_SLOT_SQL = """
+# The finite-run sampler only needs the slot liveness and confirmed position. The
+# service watchdog opts into the identity join below; keeping that expensive,
+# cluster-wide statistics lookup off the ordinary watermark path matters because
+# xdist workers create/drop databases while their bounded runs are sampling.
+_SLOT_SQL_FAST = """
 SELECT s.active,
+       s.active_pid,
        s.confirmed_flush_lsn IS NOT NULL AS has_confirmed,
        CASE WHEN s.confirmed_flush_lsn IS NULL THEN NULL
             ELSE (s.confirmed_flush_lsn - '0/0')::BIGINT END AS confirmed_pos,
@@ -73,6 +88,95 @@ FROM pg_replication_slots s
 WHERE s.slot_name = %s
 """
 
+_SLOT_SQL = """
+SELECT (s.slot_name IS NOT NULL) AS slot_exists,
+       -- Keep activity independent from existence.  A missing row must not
+       -- accidentally satisfy a future ``active``-only witness mutation.
+       COALESCE(s.active, TRUE) AS active,
+       s.active_pid,
+       a.pid AS activity_pid,
+       a.application_name AS activity_application_name,
+       a.backend_type AS activity_backend_type,
+       a.backend_start AS activity_backend_start,
+       r.pid AS replication_pid,
+       r.application_name AS replication_application_name,
+       s.confirmed_flush_lsn IS NOT NULL AS has_confirmed,
+       CASE WHEN s.confirmed_flush_lsn IS NULL THEN NULL
+            ELSE (s.confirmed_flush_lsn - '0/0')::BIGINT END AS confirmed_pos,
+       CASE WHEN s.restart_lsn IS NULL THEN NULL
+            ELSE (s.restart_lsn - '0/0')::BIGINT END AS restart_pos,
+       COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), s.confirmed_flush_lsn), 0)::BIGINT
+FROM (SELECT %s::name AS slot_name) requested
+LEFT JOIN pg_replication_slots s ON s.slot_name = requested.slot_name
+LEFT JOIN pg_stat_activity a ON a.pid = s.active_pid
+LEFT JOIN pg_stat_replication r ON r.pid = s.active_pid
+"""
+
+_PUBLICATION_HAS_TABLES_SQL = """
+SELECT EXISTS (
+    SELECT 1
+    FROM pg_publication_tables
+    WHERE pubname = %s
+)
+"""
+
+# ``pg_publication_tables`` membership is only a coarse publication check. A
+# publication can contain a relation that this connector excludes, a relation the
+# source user cannot read, or a partitioned root with no leaf relation to publish.
+# Resolve the configured relation OIDs in PostgreSQL and require the published
+# relation to be the configured relation or a relation on either side of the same
+# partition tree, a usable SELECT route, and at least one readable leaf when the
+# published relation is partitioned. This is configuration/readiness evidence for
+# a quiet source; it is never used as a substitute for data-delivery progress.
+_PUBLICATION_CONFIGURED_ROUTE_SQL = """
+WITH requested(qualified) AS (
+    SELECT unnest(%s::text[])
+), requested_relations AS (
+    SELECT c.oid AS relid
+    FROM requested r
+    JOIN pg_namespace n
+      ON n.nspname = split_part(r.qualified, '.', 1)
+    JOIN pg_class c
+      ON c.relnamespace = n.oid
+     AND c.relname = split_part(r.qualified, '.', 2)
+)
+SELECT EXISTS (
+    SELECT 1
+    FROM pg_publication_tables published
+    JOIN pg_namespace n
+      ON n.nspname = published.schemaname
+    JOIN pg_class c
+      ON c.relnamespace = n.oid
+     AND c.relname = published.tablename
+    WHERE published.pubname = %s
+      AND EXISTS (
+          SELECT 1
+          FROM requested_relations requested
+          WHERE requested.relid = c.oid
+             OR EXISTS (
+                 SELECT 1
+                 FROM pg_partition_tree(c.oid) tree
+                 WHERE tree.relid = requested.relid
+             )
+             OR EXISTS (
+                 SELECT 1
+                 FROM pg_partition_tree(requested.relid) tree
+                 WHERE tree.relid = c.oid
+             )
+      )
+      AND has_table_privilege(c.oid, 'SELECT')
+      AND (
+          c.relkind <> 'p'
+          OR EXISTS (
+              SELECT 1
+              FROM pg_partition_tree(c.oid) leaf
+              WHERE leaf.isleaf
+                AND has_table_privilege(leaf.relid, 'SELECT')
+          )
+      )
+)
+"""
+
 
 @dataclass
 class SlotSample:
@@ -81,6 +185,15 @@ class SlotSample:
     at: float
     exists: bool = False
     active: bool = False
+    #: PostgreSQL's current walsender PID.  The PID is joined to both server-side
+    #: activity views below; it is not persisted across reconnects.
+    active_pid: int | None = None
+    activity_pid: int | None = None
+    activity_application_name: str | None = None
+    activity_backend_type: str | None = None
+    activity_backend_start: datetime | None = None
+    replication_pid: int | None = None
+    replication_application_name: str | None = None
     lag_bytes: int | None = None
     confirmed_pos: int | None = None
     restart_pos: int | None = None
@@ -88,11 +201,39 @@ class SlotSample:
     #: Wall-clock time near the SQL result. ``at`` remains monotonic for duration
     #: clocks; this value makes the persisted operator sample attributable to a time.
     observed_at: datetime | None = None
+    #: ``None`` means the optional publication contract was not requested (finite
+    #: runs); ``False`` is a real empty-publication observation.
+    publication_has_tables: bool | None = None
+    #: ``True`` only when the publication overlaps the configured, readable source
+    #: route. ``False`` distinguishes an excluded/unreadable/no-leaf route from a
+    #: correctly configured but empty source.
+    publication_has_configured_tables: bool | None = None
 
     @property
     def streaming(self) -> bool:
         """True when a walsender is attached to our slot right now."""
         return self.exists and self.active
+
+    @property
+    def identity_context(self) -> str:
+        """Classify the slot PID's server-side identity evidence."""
+        if not self.streaming:
+            return "not_streaming"
+        if (
+            self.active_pid is None
+            or self.activity_pid != self.active_pid
+            or self.replication_pid != self.active_pid
+        ):
+            return "unproven"
+        if (
+            self.activity_backend_type != "walsender"
+            or self.activity_application_name
+            != STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME
+            or self.replication_application_name
+            != STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME
+        ):
+            return "foreign_walsender"
+        return "stock_debezium"
 
     @property
     def unknown(self) -> bool:
@@ -111,6 +252,23 @@ class SourceHealth:
 
     dsn: str
     slot_name: str
+    #: Stock Debezium 3.6 hard-codes this value on its replication JDBC
+    #: connection.  ``None`` is retained for pure unit fakes; service-mode
+    #: SourceHealth instances require the joined server-side identity proof.
+    expected_application_name: str | None = None
+    #: The identity join is a service watchdog witness. Finite runs still use
+    #: source-health corroboration and the completion watermark, but must not make
+    #: every ordinary slot sample scan the cluster-wide activity views while the
+    #: 12-worker harness is creating and dropping databases.
+    identity_required: bool = False
+    #: Service mode must prove that Debezium's configured publication contains at
+    #: least one source table. Heartbeats and logical messages can advance an empty
+    #: publication while delivering no data; that is not a healthy service.
+    publication_name: str | None = None
+    #: The final table.include.list used by the stock connector. ``None`` retains
+    #: the unit/fake compatibility path where publication membership is the only
+    #: configured-route fact available; production service callers always pass it.
+    capture_tables: tuple[str, ...] | None = None
     #: A separate write route for the one-shot transactional marker used to make
     #: the post-commit hand-off observable on a quiet source.  It is deliberately
     #: not the Debezium replication connection; in a hot-standby topology this is
@@ -125,15 +283,28 @@ class SourceHealth:
     #: sampler blocked for ever, which is how "the source is dark" stopped being
     #: observable at all (Codex r2 MAJOR-4).
     query_timeout_ms: int = 4000
+    #: Optional in-process liveness projection. It is called by the sampler thread
+    #: itself so a slow destination run-log write cannot make a fresh source witness
+    #: look stale to the service watchdog.
+    observation_callback: Callable[[SourceHealth], None] | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _stop: threading.Event = field(default_factory=threading.Event, repr=False)
     _thread: threading.Thread | None = field(default=None, repr=False)
+    #: The immediately preceding observation is needed to bracket an own ack.
+    #: A post-ack sample alone cannot prove that a newly attached, generic-stock-
+    #: labelled backend was the connector that produced the ack.
+    _previous: SlotSample | None = field(default=None, repr=False)
     _last: SlotSample | None = field(default=None, repr=False)
     _not_streaming_since: float | None = field(default=None, repr=False)
     _streaming_since: float | None = field(default=None, repr=False)
     _stream_interruptions: int = field(default=0, repr=False)
     _interruption_confirmed_pos: int | None = field(default=None, repr=False)
     _recovered_after_interruption: bool = field(default=False, repr=False)
+    #: A walsender that repeatedly reattaches without advancing confirmed WAL is
+    #: still in retry/backoff, even though point samples occasionally say active.
+    #: The clock clears after stable streaming or confirmed-LSN movement; a single
+    #: brief network blip therefore does not turn a quiet connected source dark.
+    _retrying_since: float | None = field(default=None, repr=False)
     _lag_stable_since: float | None = field(default=None, repr=False)
     _prev_lag: int | None = field(default=None, repr=False)
     #: when the sampler last started failing outright, and whether it ever worked
@@ -142,6 +313,20 @@ class SourceHealth:
     _ever_streamed: bool = field(default=False, repr=False)
     _unknown_samples: int = field(default=0, repr=False)
     _last_idle_marker_lsn: int | None = field(default=None, repr=False)
+    #: Service-mode evidence is kept separately from the generic slot fold.  A
+    #: sampler can say "active" while our engine is dead or while no callback has
+    #: completed; those observations must age into source_dark instead of renewing.
+    _service_status: str | None = field(default=None, repr=False)
+    _service_stalled_since: float | None = field(default=None, repr=False)
+    _service_engine_thread_dead: bool = field(default=False, repr=False)
+    _service_lag_bytes: int | None = field(default=None, repr=False)
+    _service_quiet_ready: bool = field(default=False, repr=False)
+    #: A source callback/ack observed after this exact backend identity was
+    #: sampled certifies the PID for this process generation.  The PID alone is
+    #: not durable across reconnects; backend_start closes the PID-reuse gap.
+    _bound_walsender_pid: int | None = field(default=None, repr=False)
+    _bound_walsender_backend_start: datetime | None = field(default=None, repr=False)
+    _bound_walsender_ack_at: float | None = field(default=None, repr=False)
 
     # -- lifecycle ---------------------------------------------------------- #
     def start(self) -> SourceHealth:
@@ -194,6 +379,8 @@ class SourceHealth:
                 self._stream_interruptions += 1
                 self._interruption_confirmed_pos = self._last.confirmed_pos
                 self._recovered_after_interruption = False
+                if self._retrying_since is None:
+                    self._retrying_since = sample.at
             elif (
                 self._interruption_confirmed_pos is not None
                 and sample.streaming
@@ -201,6 +388,8 @@ class SourceHealth:
                 and sample.confirmed_pos > self._interruption_confirmed_pos
             ):
                 self._recovered_after_interruption = True
+                self._retrying_since = None
+            self._previous = self._last
             self._last = sample
             if sample.streaming:
                 self._ever_streamed = True
@@ -225,6 +414,11 @@ class SourceHealth:
             if sample.streaming:
                 if self._streaming_since is None:
                     self._streaming_since = sample.at
+                elif (
+                    self._retrying_since is not None
+                    and sample.at - self._streaming_since >= max(self.interval * 10, 5.0)
+                ):
+                    self._retrying_since = None
             else:
                 self._streaming_since = None
 
@@ -238,6 +432,9 @@ class SourceHealth:
                 if self._prev_lag is None or lag != self._prev_lag:
                     self._lag_stable_since = sample.at
                 self._prev_lag = lag
+        callback = self.observation_callback
+        if callback is not None:
+            callback(self)
 
     # -- sampling ----------------------------------------------------------- #
     def sample_once(self) -> SlotSample:
@@ -271,23 +468,99 @@ class SourceHealth:
                 keepalives_count=2,
                 tcp_user_timeout=self.query_timeout_ms,
             ) as conn:
-                row = conn.execute(_SLOT_SQL, (self.slot_name,)).fetchone()
+                sql = _SLOT_SQL if self.identity_required else _SLOT_SQL_FAST
+                row = conn.execute(sql, (self.slot_name,)).fetchone()
+                publication_has_tables = None
+                publication_has_configured_tables = None
+                if self.publication_name is not None:
+                    publication_row = conn.execute(
+                        _PUBLICATION_HAS_TABLES_SQL, (self.publication_name,)
+                    ).fetchone()
+                    publication_has_tables = bool(
+                        publication_row is not None and publication_row[0]
+                    )
+                    if self.capture_tables is None:
+                        # Compatibility for pure fakes that predate the route
+                        # query. Production callers pass the final connector
+                        # include list and take the stricter SQL path below.
+                        publication_has_configured_tables = publication_has_tables
+                    else:
+                        route_row = conn.execute(
+                            _PUBLICATION_CONFIGURED_ROUTE_SQL,
+                            (list(self.capture_tables), self.publication_name),
+                        ).fetchone()
+                        publication_has_configured_tables = bool(
+                            route_row is not None and route_row[0]
+                        )
         except Exception as exc:
             return SlotSample(
                 at=now,
                 error=f"{type(exc).__name__}: {exc}",
                 observed_at=datetime.now(UTC),
             )
-        if row is None:
-            return SlotSample(at=now, exists=False, observed_at=datetime.now(UTC))
-        active, has_confirmed, confirmed_pos, restart_pos, lag = row
+        if row is None:  # pragma: no cover - the requested-row query always returns one
+            return SlotSample(
+                at=now,
+                exists=False,
+                publication_has_tables=publication_has_tables,
+                publication_has_configured_tables=publication_has_configured_tables,
+                observed_at=datetime.now(UTC),
+            )
+        if not self.identity_required:
+            active, active_pid, has_confirmed, confirmed_pos, restart_pos, lag = row
+            return SlotSample(
+                at=time.monotonic(),
+                exists=True,
+                active=bool(active),
+                active_pid=(int(active_pid) if active_pid is not None else None),
+                confirmed_pos=(int(confirmed_pos) if has_confirmed else None),
+                restart_pos=(int(restart_pos) if restart_pos is not None else None),
+                lag_bytes=int(lag) if has_confirmed else None,
+                publication_has_tables=publication_has_tables,
+                publication_has_configured_tables=publication_has_configured_tables,
+                observed_at=datetime.now(UTC),
+            )
+        (
+            exists,
+            active,
+            active_pid,
+            activity_pid,
+            activity_application_name,
+            activity_backend_type,
+            activity_backend_start,
+            replication_pid,
+            replication_application_name,
+            has_confirmed,
+            confirmed_pos,
+            restart_pos,
+            lag,
+        ) = row
         return SlotSample(
-            at=now,
-            exists=True,
+            at=time.monotonic(),
+            exists=bool(exists),
             active=bool(active),
+            active_pid=(int(active_pid) if active_pid is not None else None),
+            activity_pid=(int(activity_pid) if activity_pid is not None else None),
+            activity_application_name=(
+                str(activity_application_name)
+                if activity_application_name is not None
+                else None
+            ),
+            activity_backend_type=(
+                str(activity_backend_type) if activity_backend_type is not None else None
+            ),
+            activity_backend_start=activity_backend_start,
+            replication_pid=(int(replication_pid) if replication_pid is not None else None),
+            replication_application_name=(
+                str(replication_application_name)
+                if replication_application_name is not None
+                else None
+            ),
             confirmed_pos=(int(confirmed_pos) if has_confirmed else None),
             restart_pos=(int(restart_pos) if restart_pos is not None else None),
             lag_bytes=int(lag) if has_confirmed else None,
+            publication_has_tables=publication_has_tables,
+            publication_has_configured_tables=publication_has_configured_tables,
             observed_at=datetime.now(UTC),
         )
 
@@ -296,6 +569,12 @@ class SourceHealth:
     def last(self) -> SlotSample | None:
         with self._lock:
             return self._last
+
+    @property
+    def service_quiet_ready(self) -> bool:
+        """Whether the latest service fold admitted the explicit quiet route."""
+        with self._lock:
+            return self._service_quiet_ready
 
     @property
     def not_streaming_for(self) -> float:
@@ -336,6 +615,26 @@ class SourceHealth:
             if self._unknown_since is None:
                 return 0.0
             return time.monotonic() - self._unknown_since
+
+    @property
+    def retrying_for(self) -> float:
+        """Seconds since an interrupted stream last proved stable recovery."""
+        with self._lock:
+            if self._retrying_since is None:
+                return 0.0
+            return time.monotonic() - self._retrying_since
+
+    @property
+    def dark_for(self) -> float:
+        """Seconds the last successful source has been dark or unaskable."""
+        with self._lock:
+            service_since = self._service_stalled_since
+        service_for = (
+            max(0.0, time.monotonic() - service_since)
+            if service_since is not None
+            else 0.0
+        )
+        return max(self.not_streaming_for, self.unknown_for, self.retrying_for, service_for)
 
     @property
     def ever_sampled(self) -> bool:
@@ -502,8 +801,231 @@ class SourceHealth:
             if dark_after > 0 and self.unknown_for >= dark_after:
                 return SOURCE_HEALTH_STATES.parse("dark")
             return SOURCE_HEALTH_STATES.parse("unknown")
+        if (
+            dark_after > 0
+            and self.ever_sampled
+            and not sample.streaming
+            and self.dark_for >= dark_after
+        ):
+            return SOURCE_HEALTH_STATES.parse("dark")
+        if (
+            dark_after > 0
+            and self.ever_sampled
+            and sample.streaming
+            and self.retrying_for >= dark_after
+        ):
+            return SOURCE_HEALTH_STATES.parse("dark")
         return SOURCE_HEALTH_STATES.parse(
             "streaming" if sample.streaming else "not_streaming"
+        )
+
+    def _publish_service_status(
+        self,
+        status: str,
+        *,
+        observed_at: float,
+        engine_thread_alive: bool,
+        lag_bytes: int | None,
+        quiet_source_ready: bool = False,
+    ) -> str:
+        """Record the service verdict and its fail-closed aging clock."""
+        with self._lock:
+            self._service_status = status
+            self._service_engine_thread_dead = not engine_thread_alive
+            self._service_lag_bytes = lag_bytes
+            self._service_quiet_ready = bool(
+                status == "connected_quiet" and quiet_source_ready
+            )
+            if status in {"connected_quiet", "connected_busy"}:
+                self._service_stalled_since = None
+            elif (
+                status
+                in {
+                    "stalled",
+                    "unproven",
+                    "foreign_walsender",
+                    "engine_thread_dead",
+                }
+                and self._service_stalled_since is None
+            ):
+                self._service_stalled_since = observed_at
+        return status
+
+    def _walsender_is_ours(
+        self,
+        sample: SlotSample | None,
+        *,
+        own_certification_at: float | None,
+    ) -> bool:
+        """Require a current PID to be certified by this Flight's own ack.
+
+        Stock Debezium 3.6 hard-codes ``Debezium Streaming`` for its logical
+        replication connection, so that application name is a class marker, not
+        a process-unique name.  The sampler therefore binds the slot PID and
+        PostgreSQL ``backend_start`` only when two adjacent stock-labelled samples
+        bracket this Flight's acknowledgement.  A post-ack sample alone is not
+        enough: a foreign client could take the slot immediately after our ack and
+        present the same generic application name.  A legitimate reconnect is
+        admitted only after the restarted stock engine is observed before and after
+        its new acknowledgement.
+        """
+        if self.expected_application_name is None or sample is None:
+            return False
+        if sample.identity_context != "stock_debezium":
+            return False
+        if sample.active_pid is None or sample.activity_backend_start is None:
+            return False
+        current = (sample.active_pid, sample.activity_backend_start)
+        with self._lock:
+            bound = (
+                self._bound_walsender_pid,
+                self._bound_walsender_backend_start,
+            )
+            previous = self._previous
+            newer_ack = (
+                own_certification_at is not None
+                and (
+                    self._bound_walsender_ack_at is None
+                    or own_certification_at > self._bound_walsender_ack_at
+                )
+            )
+            if current != bound:
+                if (
+                    not newer_ack
+                    or own_certification_at is None
+                    or sample.at < own_certification_at
+                    or previous is None
+                    or not previous.streaming
+                    or previous.identity_context != "stock_debezium"
+                    or previous.active_pid != sample.active_pid
+                    or previous.activity_backend_start != sample.activity_backend_start
+                    or previous.at > own_certification_at
+                ):
+                    return False
+                self._bound_walsender_pid = sample.active_pid
+                self._bound_walsender_backend_start = sample.activity_backend_start
+                self._bound_walsender_ack_at = own_certification_at
+            return (
+                self._bound_walsender_pid == sample.active_pid
+                and self._bound_walsender_backend_start
+                == sample.activity_backend_start
+            )
+
+    def service_status(
+        self,
+        received_high_water: int | None = None,
+        *,
+        engine_thread_alive: bool,
+        own_progress_at: float | None,
+        own_ack_at: float | None,
+        own_ack_lsn: int | None,
+        durable_lsn: int | None,
+        progress_stale_after: float,
+        quiet_source_ready: bool = False,
+        own_identity_at: float | None = None,
+    ) -> str:
+        """Classify source evidence for the single-process lease watchdog.
+
+        The service witness is deliberately conjunctive:
+
+        * the sampler observation is fresh and the slot is active;
+        * the *admitted* Debezium engine thread is still alive;
+        * this process has recently delivered source data and completed its
+          durable acknowledgement path, or it has completed a snapshot/streaming
+          hand-off for a configured, readable, caught-up route that is genuinely
+          quiet. The latter is an explicit quiet-source admission, never a
+          heartbeat-derived progress timestamp.
+
+        ``connected_quiet`` and ``connected_busy`` are therefore classifications
+        of a proven Flight-owned stream.  If that proof goes stale, the source's
+        retained-WAL lag is used as the discriminator: pending source WAL with no
+        Flight progress is ``stalled``.  The cluster-side lag is not used as a
+        stand-alone heartbeat and no slot activity can bypass these checks.
+
+        ``max_lag_bytes`` is intentionally not part of this service decision.  The
+        exact source-position relation (zero versus pending WAL) and our own
+        progress are the signal; a size cutoff would turn an outage into a tuning
+        exercise and would recreate the gate's false-green shape.
+        """
+        now = time.monotonic()
+        sample = self.last
+        sample_age = float("inf") if sample is None else max(0.0, now - sample.at)
+        publication_has_tables = (
+            self.publication_name is None
+            or bool(sample is not None and sample.publication_has_tables)
+        )
+        publication_has_configured_tables = (
+            self.publication_name is None
+            or bool(
+                sample is not None
+                and (
+                    sample.publication_has_configured_tables
+                    if self.capture_tables is not None
+                    else sample.publication_has_tables
+                )
+            )
+        )
+        quiet_ready = bool(
+            quiet_source_ready
+            and publication_has_tables
+            and publication_has_configured_tables
+            and received_high_water is not None
+            and sample is not None
+            and sample.confirmed_pos is not None
+            and received_high_water <= sample.confirmed_pos
+        )
+        evidence = ServiceWitnessEvidence(
+            now=now,
+            sample_present=sample is not None,
+            sample_error=bool(sample is not None and sample.unknown),
+            sample_age=sample_age,
+            sample_stale_after=max(self.interval * 3.0, 1.0),
+            slot_exists=bool(sample is not None and sample.exists),
+            slot_active=bool(sample is not None and sample.active),
+            publication_has_tables=publication_has_tables,
+            publication_has_configured_tables=publication_has_configured_tables,
+            walsender_identity=(
+                (
+                    sample is not None
+                    and sample.streaming
+                    and self.expected_application_name is None
+                )
+                or (
+                    self.expected_application_name
+                    == STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME
+                    and self._walsender_is_ours(
+                        sample,
+                        own_certification_at=(
+                            own_identity_at
+                            if own_identity_at is not None
+                            else own_ack_at
+                        ),
+                    )
+                )
+            ),
+            engine_thread_alive=bool(engine_thread_alive),
+            stream_recovery_pending=bool(
+                self.stream_interruptions
+                and not self.recovered_after_interruption
+            ),
+            retained_lag_bytes=sample.lag_bytes if sample is not None else None,
+            own_progress_at=own_progress_at,
+            own_ack_at=own_ack_at,
+            own_ack_lsn=own_ack_lsn,
+            durable_lsn=durable_lsn,
+            confirmed_pos=(sample.confirmed_pos if sample is not None else None),
+            received_high_water=received_high_water,
+            progress_stale_after=max(float(progress_stale_after), 0.0),
+            own_identity_at=own_identity_at,
+            source_quiet_ready=quiet_ready,
+        )
+        status = evaluate_service_witness(evidence)
+        return self._publish_service_status(
+            status,
+            observed_at=now,
+            engine_thread_alive=engine_thread_alive,
+            lag_bytes=sample.lag_bytes if sample is not None else None,
+            quiet_source_ready=quiet_ready,
         )
 
     def outstanding_bytes(self, received_high_water: int | None) -> int | None:
@@ -634,6 +1156,16 @@ class SourceHealth:
         # on its next bounded poll instead of allowing stale state to become success.
         if time.monotonic() - sample.at > max(self.interval * 3.0, 1.0):
             return False
+        # A foreign client can keep the slot active while this Flight is idle.
+        # In production the stock connector identity is mandatory; pure unit
+        # fakes leave ``expected_application_name`` unset and retain the older
+        # generic source-health semantics.
+        if (
+            self.identity_required
+            and self.expected_application_name is not None
+            and sample.identity_context != "stock_debezium"
+        ):
+            return False
         # (1) A walsender must have been attached to our slot for the whole quiet
         #     window. This is the signal that catches the B5 failure: during a
         #     retriable restart the slot is released, and the connector briefly
@@ -678,7 +1210,12 @@ class SourceHealth:
     def summary(self) -> dict:
         sample = self.last
         if sample is None:
-            return {"slot_health": self.state()}
+            return {
+                "slot_health": self.state(),
+                "source_publication": self.publication_name,
+                "source_publication_has_configured_tables": None,
+                "service_source_quiet_ready": False,
+            }
         if sample.unknown:
             return {
                 # The declared classification, so `unknown_never_sampled` - the
@@ -690,13 +1227,34 @@ class SourceHealth:
                 "slot_ever_sampled": self.ever_sampled,
                 "slot_ever_streamed": self.ever_streamed,
                 "slot_not_streaming_for_sec": round(self.not_streaming_for, 1),
+                "slot_retrying_for_sec": round(self.retrying_for, 1),
                 "slot_stream_interruptions": self.stream_interruptions,
                 "slot_recovered_after_interruption": self.recovered_after_interruption,
+                "source_publication": self.publication_name,
+                "source_publication_has_tables": sample.publication_has_tables,
+                "source_publication_has_configured_tables": (
+                    sample.publication_has_configured_tables
+                ),
+                "service_source_quiet_ready": self.service_quiet_ready,
             }
         return {
             "slot_health": self.state(),
             "slot_exists": sample.exists,
             "slot_active": sample.active,
+            "slot_attached": sample.streaming,
+            "slot_active_pid": sample.active_pid,
+            "slot_active_activity_pid": sample.activity_pid,
+            "slot_active_application_name": sample.activity_application_name,
+            "slot_active_backend_type": sample.activity_backend_type,
+            "slot_active_backend_start": (
+                sample.activity_backend_start.isoformat()
+                if sample.activity_backend_start is not None
+                else None
+            ),
+            "slot_replication_pid": sample.replication_pid,
+            "slot_replication_application_name": sample.replication_application_name,
+            "slot_walsender_identity": sample.identity_context,
+            "slot_expected_application_name": self.expected_application_name,
             "slot_confirmed_pos": sample.confirmed_pos,
             "slot_restart_pos": sample.restart_pos,
             "slot_lag_bytes": sample.lag_bytes,
@@ -706,10 +1264,26 @@ class SourceHealth:
                 else None
             ),
             "slot_streaming_for_sec": round(self.streaming_for, 1),
+            "slot_retrying_for_sec": round(self.retrying_for, 1),
             "slot_ever_streamed": self.ever_streamed,
             "slot_lag_steady_for_sec": round(self.lag_steady_for, 1),
             "slot_stream_interruptions": self.stream_interruptions,
             "slot_recovered_after_interruption": self.recovered_after_interruption,
+            "source_publication": self.publication_name,
+            "source_publication_has_tables": sample.publication_has_tables,
+            "source_publication_has_configured_tables": (
+                sample.publication_has_configured_tables
+            ),
+            "service_liveness_status": self._service_status,
+            "service_source_quiet_ready": self.service_quiet_ready,
+            "service_engine_thread_dead": self._service_engine_thread_dead,
+            "service_lag_bytes": self._service_lag_bytes,
+            "service_stalled_for_sec": round(
+                max(0.0, time.monotonic() - self._service_stalled_since)
+                if self._service_stalled_since is not None
+                else 0.0,
+                1,
+            ),
             **(
                 {
                     "source_marker": self.source_marker.summary()

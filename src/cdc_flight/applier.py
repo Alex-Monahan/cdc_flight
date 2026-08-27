@@ -168,6 +168,10 @@ class Applier:
         #: a co-tenant made every bounded run burn its whole `--max-seconds`).
         #: `highest_source_lsn - confirmed_flush_lsn` is ours and only ours.
         self.highest_source_lsn: int = int(resume_point.last_lsn or 0)
+        #: The highest LSN of an application-data record delivered to this Flight.
+        #: Heartbeats, logical messages, and the Flight's signal table advance the
+        #: ordinary source offset above, but never this liveness high-water mark.
+        self.highest_source_data_lsn: int = int(resume_point.last_lsn or 0)
 
         self.registry = apply_sql.SchemaRegistry(
             con, dataset, constraints=config.destination_constraints
@@ -316,6 +320,12 @@ class Applier:
         # read-only fallback can wait forever on a quiet source that heartbeats every
         # five seconds.
         self._last_callback_had_data = False
+        #: A Flight signal row is source activity outside the configured delivery
+        #: route. It keeps the transaction/event-count proof, but it disqualifies the
+        #: quiet-source alternative until a real capture-table record arrives. A
+        #: correctly configured source that is genuinely quiet has no such activity;
+        #: a quarantined application row is real delivery evidence and clears it.
+        self._ignored_source_activity = False
 
         # -- counters surfaced in the run summary (rubric 6.1) --------------- #
         self.record_count = 0
@@ -402,6 +412,13 @@ class Applier:
     @property
     def snapshot_completed(self) -> bool:
         return self.snapshot_completion.completed
+
+    @property
+    def source_quiet_ready(self) -> bool:
+        """Whether control-plane activity has not invalidated quiet admission."""
+        with self._lock:
+            ignored_source_activity = self._ignored_source_activity
+        return self.snapshot_completed and not ignored_source_activity
 
     @property
     def snapshot_final_seen(self) -> bool:
@@ -543,12 +560,36 @@ class Applier:
                     )
                     return
                 self._in_flight += 1
+            if self.service_context is not None:
+                self.service_context.operation_started()
+            callback_progressed = False
             try:
                 self._handle(records, committer)
+                # A callback is Flight-owned evidence only after the handler has
+                # returned successfully.  A sampler observation or a callback that
+                # is still wedged in decode/commit is not forward progress.
+                # Only source-data records are liveness progress. Debezium
+                # heartbeats, transaction metadata, and Flight bookkeeping can
+                # make a non-empty callback without delivering any application
+                # data; counting that callback kept an excluded route alive.
+                callback_progressed = self._last_callback_had_data
+                if self.service_context is not None:
+                    if records:
+                        # A callback can certify the admitted stock walsender even
+                        # when it carries only a heartbeat. This is identity
+                        # evidence, not liveness progress, and the context keeps
+                        # those clocks separate.
+                        self.service_context.note_engine_identity()
+                    if callback_progressed:
+                        self.service_context.note_engine_callback()
             except BaseException as exc:
                 self.error = exc
                 raise
             finally:
+                if self.service_context is not None:
+                    self.service_context.operation_finished(
+                        progressed=callback_progressed
+                    )
                 with self._quiescence:
                     self._in_flight -= 1
                     if self._last_callback_had_data:
@@ -557,7 +598,7 @@ class Applier:
                         self._quiescence.notify_all()
 
     def renew_service_lease(self) -> bool:
-        """Apply one parent-authorized renewal when the callback is quiescent."""
+        """Apply one serialized service renewal when the callback is quiescent."""
         if self.service_context is None or not self.service_context.renew_requested:
             return False
         with self._destination_operation_lock:
@@ -623,14 +664,6 @@ class Applier:
 
             source_records += 1
             rec = decode(raw, topic_prefix=self.topic_prefix)
-            if rec.qualified_table in self.ignored_source_tables:
-                # The source signal row is a control-plane request.  It still
-                # participates in the source transaction/offset proof as a
-                # counted data event, but GroupPlan ignores the relation before
-                # destination materialisation.  Relabelling it as a heartbeat
-                # here would make the transaction assembler count zero events
-                # against Debezium's END event_count=1.
-                pass
             if rec.incremental:
                 run = self.backfill.incremental_owner(rec.schema or "", rec.table or "")
                 rec = decode_incremental_record(
@@ -655,16 +688,33 @@ class Applier:
                     # BEGIN, while a committed STARTED notification has already
                     # installed the route.
                     self._ensure_backfill_route(rec.schema, rec.table, run, create=False)
+            ignored_source_record = rec.qualified_table in self.ignored_source_tables
+            if ignored_source_record:
+                # The source signal row is a control-plane request. It still
+                # participates in the source transaction/offset proof as a
+                # counted data event, but GroupPlan ignores the relation before
+                # destination materialisation. Relabeling it as a heartbeat here
+                # would make the transaction assembler count zero events against
+                # Debezium's END event_count=1. The explicit record flag instead
+                # lets the assembler keep proof and service liveness separate.
+                with self._lock:
+                    self._ignored_source_activity = True
+            rec.ignored_source_record = ignored_source_record
             self.source_marker_records_received += self._source_marker_receipts.observe(rec)
             if rec.lsn is not None:
                 self.highest_source_lsn = max(self.highest_source_lsn, int(rec.lsn))
-            if rec.is_data:
+            if rec.is_data and not ignored_source_record:
+                with self._lock:
+                    self._ignored_source_activity = False
+                if rec.lsn is not None:
+                    self.highest_source_data_lsn = max(
+                        self.highest_source_data_lsn, int(rec.lsn)
+                    )
                 data_in_batch += 1
             else:
                 self.skipped_count += 1
             for unit in self.assembler.feed(rec):
                 self._add_unit(unit)
-
         with self._lock:
             self.batch_count += 1
             self.record_count += source_records

@@ -169,7 +169,7 @@ test-slow: ## run only the slow fault-injection tests (real SIGKILL, big loads)
 
 .PHONY: lint
 lint: ## ruff
-	$(UV) run ruff check src tests scripts/runtime_state*.py scripts/slow_lane.py
+	$(UV) run ruff check main.py src tests scripts/runtime_state*.py scripts/slow_lane.py
 
 ## ---------------------------------------------------------------------------
 ## housekeeping

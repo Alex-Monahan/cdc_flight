@@ -54,7 +54,7 @@ inside the Python process via JPype; Postgres is a project-local Homebrew cluste
 | Debezium | **3.6.0.Final** | bundled inside `pydbzengine` 3.6.0.0 |
 | pydbzengine | **3.6.0.0** | installed from GitHub (not on PyPI any more) |
 | dlt | **1.19.x** | `dlt[duckdb,motherduck]` |
-| DuckDB | **1.4.x** | |
+| DuckDB | **1.5.4** | pinned to the MotherDuck-supported runtime |
 | Python | **3.13** | managed by `uv` |
 
 ```bash
@@ -138,6 +138,15 @@ make pipeline-md        # loads into MotherDuck database `cdc_flight_dev`, datas
 
 The database is created on first connect by MotherDuck. Keep this light — the local DuckDB
 path is the fast dev loop; MotherDuck is a smoke test that the same code path works.
+
+### Continuous Flight deployment
+
+The single-process service is packaged as `cdc-flight-service`, whose entrypoint is
+`cdc_flight.flight_entrypoint:main` (the source-tree wrapper is `main.py`). It requires the
+Flight deployment setting `max_runtime_sec=0` at startup. A missing, malformed, or non-zero
+value fails closed with an explicit message because a finite scheduler cap can terminate a
+healthy lease holder. The external scheduler may still start a new instance each minute;
+lease admission makes healthy successors stand down and expired-lease successors take over.
 
 ## Destination shape
 

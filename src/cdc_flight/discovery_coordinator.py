@@ -28,6 +28,7 @@ from .snapshot_completion import SnapshotCompletion
 from .source_health import SourceHealth
 from .source_marker import SourceMarker
 from .supervisor import run_engine_bounded
+from .witness_contract import STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME
 
 log = logging.getLogger("cdc_flight.discovery_coordinator")
 
@@ -97,6 +98,18 @@ class LiveDiscoveryCoordinator:
         self.descriptor_provider = descriptor_provider
         self.catalog_flush_exclude = set(catalog_flush_exclude or ())
         self.service_context = service_context
+        configured_capture = str(self.props.get("table.include.list", ""))
+        capture_tables = tuple(
+            table.strip()
+            for table in configured_capture.split(",")
+            if table.strip()
+        )
+        if not capture_tables:
+            capture_tables = tuple(self.source.tables)
+        signal_collection = self.props.get("signal.data.collection")
+        self.capture_tables = tuple(
+            table for table in capture_tables if table != signal_collection
+        )
 
         self.applier = None
         self.health = None
@@ -158,10 +171,30 @@ class LiveDiscoveryCoordinator:
                     offset_file=self.replication.offset_file,
                     always_commit_offsets=engine_props.get("offset.flush.interval.ms") == "0",
                 )
+                if self.service_context is not None:
+                    # JPype/JVM startup installs native SIGTERM/SIGINT handlers.
+                    # Reapply the Flight's drain handler after that point so an
+                    # operator signal requests a bounded drain instead of making
+                    # the JVM call System.exit underneath the lease owner.
+                    self.service_context.rearm_process_signals()
                 self._wire_consumer(engine, self.applier)
                 self.health = SourceHealth(
                     dsn=self.source.dsn,
                     slot_name=self.replication.slot_name,
+                    expected_application_name=(
+                        STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME
+                        if self.service_context is not None
+                        else None
+                    ),
+                    identity_required=self.service_context is not None,
+                    publication_name=(
+                        self.props.get("publication.name")
+                        if self.service_context is not None
+                        else None
+                    ),
+                    capture_tables=(
+                        self.capture_tables if self.service_context is not None else None
+                    ),
                     primary_dsn=self.source.primary_dsn,
                     source_marker=(
                         getattr(self.watcher, "marker", None)
@@ -180,6 +213,10 @@ class LiveDiscoveryCoordinator:
                             int(self.run_cfg.jdbc_socket_timeout_seconds * 1000),
                         ),
                     ),
+                    # SourceHealth samples are folded by the supervisor together
+                    # with the live engine thread and Flight-owned callback/commit/
+                    # acknowledgement facts.  The sampler thread must not publish
+                    # ``connected_quiet`` on slot activity alone.
                 ).start()
                 if self.phases.phase != PHASE_STREAMING:
                     self.phases.to(PHASE_STREAMING)

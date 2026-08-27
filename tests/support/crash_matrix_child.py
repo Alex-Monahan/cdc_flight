@@ -24,12 +24,7 @@ except faults.FaultSpecError as exc:
     raise SystemExit(2) from exc
 
 if __name__ == "__main__":
-    if "--service-worker" in sys.argv:
-        from cdc_flight.service import worker_main
-
-        raise SystemExit(worker_main())
     if "--service" in sys.argv:
-        os.environ["CDC_SERVICE_WORKER_SCRIPT"] = str(Path(__file__).resolve())
         sys.argv.remove("--service")
         from cdc_flight.service import main as service_main
 

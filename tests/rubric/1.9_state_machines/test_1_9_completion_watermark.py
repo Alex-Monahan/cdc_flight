@@ -378,7 +378,11 @@ def test_a_source_that_cannot_be_marked_falls_back_to_the_idle_window():
     time.sleep(1.1)
     source.last = FakeSample()
     assert gate.reached(handler, elapsed=3.5) is True
-    assert gate.as_dict()["completion_watermark"] == WATERMARK_UNAVAILABLE
+    gate.record_stop_decision(handler)
+    details = gate.as_dict()
+    assert details["completion_watermark"] == WATERMARK_UNAVAILABLE
+    assert details["completion_stop_condition"] == "idle_window"
+    assert details["completion_idle_window_sec"] >= 1.0
 
 
 def test_the_fallback_still_refuses_a_source_that_disagrees_it_is_idle():
@@ -421,6 +425,12 @@ def test_a_run_stops_on_the_watermark_and_not_on_the_clock():
     assert summary["stop_reason"] == "idle"
     assert summary["completion_watermark"] == WATERMARK_REACHED
     assert summary["completion_watermark_lsn"] == 5000
+    assert summary["completion_stop_condition"] == "watermark"
+    assert summary["completion_watermark_reached_at_sec"] <= summary[
+        "completion_stop_at_sec"
+    ]
+    assert summary["completion_watermark_to_stop_sec"] < _run_cfg().idle_seconds
+    assert summary["completion_idle_window_sec"] is None
     assert elapsed < 5.0, "the run waited on something; idle_seconds is 30"
 
 

@@ -459,7 +459,7 @@ class RunConfig:
     #: this bounded grace the run fails closed instead of taking the old timer-only
     #: success path (A51 row 50).
     source_probe_startup_seconds: float = field(
-        default_factory=lambda: float(_env("CDC_SOURCE_PROBE_STARTUP_SECONDS", "8"))
+        default_factory=lambda: float(_env("CDC_SOURCE_PROBE_STARTUP_SECONDS", "15"))
     )
     #: Bound for the final join of the Debezium engine thread after ``close``.  The old
     #: hard-coded 60 s was a wait with no operator-configured budget.
@@ -682,13 +682,34 @@ def lease_ttl_seconds() -> float:
     return float(_env("CDC_LEASE_TTL", "60"))
 
 
+def finite_run_lease_ttl(run: RunConfig) -> float:
+    """Keep a finite run's destination admission through its explicit budget.
+
+    The source snapshot is allowed to be a long, legitimate callback.  A fixed
+    60-second destination lease expired while that callback was still writing and
+    made the next fence report ``LeaseLost``.  The finite adapter already has a
+    process-local crash-recovery rule, so its lease can cover the declared run,
+    close, and engine-thread budgets without changing the service watchdog or its
+    freshness proof.
+    """
+    configured = lease_ttl_seconds()
+    if not math.isfinite(run.max_seconds):
+        return configured
+    return max(
+        configured,
+        float(run.max_seconds) + run.close_timeout + run.engine_thread_timeout,
+    )
+
+
 @dataclass(frozen=True)
 class ServiceConfig:
-    """Bounded control-plane policy for the explicit long-running adapter.
+    """Lease and liveness policy for the one-process Flight runtime.
 
-    The service process is intentionally unbounded; these values bound every
-    operation around it.  Keeping this policy separate from :class:`RunConfig`
-    prevents the finite CLI's max/idle semantics from leaking into service mode.
+    A service run has no parent that can restart or police it.  The destination
+    lease is therefore the admission record, ``renewed_at`` is its heartbeat,
+    and the local watchdog is only a last-resort process-death detector.  The
+    default cadence gives a holder two missed renewals before it stops being
+    healthy, while the lease expiry remains the only reclaim point.
     """
 
     service_id: str = field(
@@ -698,44 +719,54 @@ class ServiceConfig:
         default_factory=lambda: float(_env("CDC_SERVICE_LEASE_TTL", "60"))
     )
     lease_renew_seconds: float = field(
-        default_factory=lambda: float(_env("CDC_SERVICE_LEASE_RENEW_SECONDS", "15"))
+        default_factory=lambda: float(_env("CDC_SERVICE_LEASE_RENEW_SECONDS", "10"))
     )
-    parent_heartbeat_seconds: float = field(
-        default_factory=lambda: float(_env("CDC_SERVICE_PARENT_HEARTBEAT_SECONDS", "1"))
+    heartbeat_bound_seconds: float = field(
+        default_factory=lambda: float(_env("CDC_SERVICE_HEARTBEAT_BOUND_SECONDS", "30"))
     )
-    parent_loss_seconds: float = field(
-        default_factory=lambda: float(_env("CDC_SERVICE_PARENT_LOSS_SECONDS", "5"))
+    stall_timeout_seconds: float = field(
+        default_factory=lambda: float(_env("CDC_SERVICE_STALL_TIMEOUT_SECONDS", "45"))
     )
-    worker_start_timeout: float = field(
-        default_factory=lambda: float(_env("CDC_SERVICE_WORKER_START_TIMEOUT", "20"))
+    stall_exit_grace_seconds: float = field(
+        default_factory=lambda: float(_env("CDC_SERVICE_STALL_EXIT_GRACE_SECONDS", "5"))
     )
-    worker_heartbeat_timeout: float = field(
-        default_factory=lambda: float(_env("CDC_SERVICE_WORKER_HEARTBEAT_TIMEOUT", "10"))
+    watchdog_poll_seconds: float = field(
+        default_factory=lambda: float(_env("CDC_SERVICE_WATCHDOG_POLL_SECONDS", "0.25"))
     )
-    drain_deadline_seconds: float = field(
-        default_factory=lambda: float(_env("CDC_SERVICE_DRAIN_DEADLINE_SECONDS", "30"))
+    commit_timeout_seconds: float = field(
+        default_factory=lambda: float(
+            _env("CDC_SERVICE_COMMIT_TIMEOUT", _env("CDC_COMMIT_TIMEOUT", "30"))
+        )
     )
-    operation_timeout_seconds: float = field(
-        default_factory=lambda: float(_env("CDC_SERVICE_OPERATION_TIMEOUT_SECONDS", "60"))
+    close_timeout_seconds: float = field(
+        default_factory=lambda: float(
+            _env("CDC_SERVICE_CLOSE_TIMEOUT", _env("CDC_CLOSE_TIMEOUT", "30"))
+        )
     )
     invariant_check_seconds: float = field(
         default_factory=lambda: float(_env("CDC_SERVICE_INVARIANT_CHECK_SECONDS", "30"))
     )
-    max_worker_restarts: int = field(
-        default_factory=lambda: int(_env("CDC_SERVICE_MAX_WORKER_RESTARTS", "5"))
+    #: A source-health observation is a liveness witness only while it is fresh.
+    #: The watchdog may preserve a genuinely quiet connected source on that witness,
+    #: but never on the fact that its Python loop is still iterating.
+    source_health_stale_seconds: float = field(
+        default_factory=lambda: float(
+            _env("CDC_SERVICE_SOURCE_HEALTH_STALE_SECONDS", "15")
+        )
     )
 
     def __post_init__(self) -> None:
         values = (
             ("lease_ttl_seconds", self.lease_ttl_seconds),
             ("lease_renew_seconds", self.lease_renew_seconds),
-            ("parent_heartbeat_seconds", self.parent_heartbeat_seconds),
-            ("parent_loss_seconds", self.parent_loss_seconds),
-            ("worker_start_timeout", self.worker_start_timeout),
-            ("worker_heartbeat_timeout", self.worker_heartbeat_timeout),
-            ("drain_deadline_seconds", self.drain_deadline_seconds),
-            ("operation_timeout_seconds", self.operation_timeout_seconds),
+            ("heartbeat_bound_seconds", self.heartbeat_bound_seconds),
+            ("stall_timeout_seconds", self.stall_timeout_seconds),
+            ("stall_exit_grace_seconds", self.stall_exit_grace_seconds),
+            ("watchdog_poll_seconds", self.watchdog_poll_seconds),
+            ("commit_timeout_seconds", self.commit_timeout_seconds),
+            ("close_timeout_seconds", self.close_timeout_seconds),
             ("invariant_check_seconds", self.invariant_check_seconds),
+            ("source_health_stale_seconds", self.source_health_stale_seconds),
         )
         for name, value in values:
             if not math.isfinite(value) or value <= 0:
@@ -745,12 +776,45 @@ class ServiceConfig:
                 "CDC_SERVICE_LEASE_RENEW_SECONDS must be no greater than one third "
                 "of CDC_SERVICE_LEASE_TTL"
             )
-        if self.parent_loss_seconds >= self.lease_ttl_seconds:
+        if self.heartbeat_bound_seconds >= self.lease_ttl_seconds:
             raise ValueError(
-                "CDC_SERVICE_PARENT_LOSS_SECONDS must be less than the lease TTL"
+                "CDC_SERVICE_HEARTBEAT_BOUND_SECONDS must be less than the lease TTL"
             )
-        if self.max_worker_restarts < 0:
-            raise ValueError("CDC_SERVICE_MAX_WORKER_RESTARTS must be non-negative")
+        if self.heartbeat_bound_seconds < self.lease_renew_seconds * 2:
+            raise ValueError(
+                "CDC_SERVICE_HEARTBEAT_BOUND_SECONDS must cover two lease renewals"
+            )
+        if self.stall_timeout_seconds >= self.lease_ttl_seconds:
+            raise ValueError(
+                "CDC_SERVICE_STALL_TIMEOUT_SECONDS must be less than the lease TTL"
+            )
+        if self.stall_timeout_seconds + self.stall_exit_grace_seconds >= self.lease_ttl_seconds:
+            raise ValueError(
+                "service stall detection plus its exit grace must be less than the lease TTL"
+            )
+        if self.commit_timeout_seconds >= self.lease_ttl_seconds:
+            raise ValueError(
+                "service commit timeout must be less than the lease TTL so a stalled "
+                "data transaction cannot outlive its fencing lease"
+            )
+
+    @property
+    def operation_timeout_seconds(self) -> float:
+        """Bound one admitted callback without using the idle-progress clock.
+
+        A callback that is actively processing a legitimate source unit is not a
+        stalled Flight.  Its independent operation budget ends before the lease
+        expires, so an actually wedged callback still cannot renew indefinitely;
+        the ordinary stall clock remains available immediately after the callback
+        boundary.
+        """
+        return min(
+            self.lease_ttl_seconds - self.stall_exit_grace_seconds,
+            max(
+                self.stall_timeout_seconds + self.stall_exit_grace_seconds,
+                self.commit_timeout_seconds,
+            ),
+        )
 
 
 def motherduck_token() -> str | None:

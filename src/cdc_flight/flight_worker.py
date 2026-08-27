@@ -45,9 +45,9 @@ class FlightWorker:
         return self._run()
 
     def run_service(self, service_context) -> dict:
-        """Unbounded adapter: stops only on drain, failure, or parent loss."""
+        """Unbounded adapter: stops only on drain, failure, or lease loss."""
         if service_context is None:
-            raise ValueError("service mode requires a ServiceWorkerContext")
+            raise ValueError("service mode requires a ServiceContext")
         return self._run(service_context=service_context)
 
 

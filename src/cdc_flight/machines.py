@@ -342,51 +342,44 @@ SHUTDOWN_SEQUENCE = Machine(
     purpose="Which shutdown boundary has been proved before stock engine close?",
 )
 
-
-# SM-B(vi) · ServiceControl — memory only, per authenticated worker generation
-# --------------------------------------------------------------------------- #
-# A renewal is a control-plane action with a real in-flight interval.  Drain must
-# therefore be a state transition, not a second boolean that happens to be checked
-# beside the renewal timer.  In particular, there is deliberately no
-# ``draining -> renewing`` edge: once the worker generation has entered drain, a
-# renewal request is a protocol error.  ``draining_with_renewal`` names the one
-# honest converse: a request was already dispatched and must receive a bounded
-# response or an explicit fence before the generation closes.
-SERVICE_CONTROL_ACTIVE = "active"
-SERVICE_CONTROL_RENEWING = "renewing"
-SERVICE_CONTROL_DRAINING_WITH_RENEWAL = "draining_with_renewal"
-SERVICE_CONTROL_DRAINING = "draining"
-SERVICE_CONTROL_CLOSED = "closed"
-
+# SM-B(vi) · ServiceControl — memory only, the service loop's authenticated owner.
+# These transitions are reachable in the single-process runtime and are documented
+# in ADR §A51.1. Declaring them here keeps that inventory generated from code.
+SERVICE_ACTIVE = "active"
+SERVICE_CLOSED = "closed"
+SERVICE_DRAINING = "draining"
+SERVICE_RENEWING = "renewing"
+SERVICE_DRAINING_WITH_RENEWAL = "draining_with_renewal"
 SERVICE_CONTROL = Machine(
     "service_control",
     states=(
-        SERVICE_CONTROL_ACTIVE,
-        SERVICE_CONTROL_RENEWING,
-        SERVICE_CONTROL_DRAINING_WITH_RENEWAL,
-        SERVICE_CONTROL_DRAINING,
-        SERVICE_CONTROL_CLOSED,
+        SERVICE_ACTIVE,
+        SERVICE_CLOSED,
+        SERVICE_DRAINING,
+        SERVICE_RENEWING,
+        SERVICE_DRAINING_WITH_RENEWAL,
     ),
     edges=(
-        (SERVICE_CONTROL_ACTIVE, SERVICE_CONTROL_RENEWING),
-        (SERVICE_CONTROL_ACTIVE, SERVICE_CONTROL_DRAINING),
-        (SERVICE_CONTROL_ACTIVE, SERVICE_CONTROL_CLOSED),
-        (SERVICE_CONTROL_RENEWING, SERVICE_CONTROL_ACTIVE),
-        (SERVICE_CONTROL_RENEWING, SERVICE_CONTROL_DRAINING_WITH_RENEWAL),
-        (SERVICE_CONTROL_DRAINING_WITH_RENEWAL, SERVICE_CONTROL_DRAINING),
-        (SERVICE_CONTROL_DRAINING_WITH_RENEWAL, SERVICE_CONTROL_DRAINING_WITH_RENEWAL),
-        (SERVICE_CONTROL_DRAINING, SERVICE_CONTROL_DRAINING),
-        (SERVICE_CONTROL_DRAINING, SERVICE_CONTROL_CLOSED),
-        (SERVICE_CONTROL_CLOSED, SERVICE_CONTROL_CLOSED),
+        (SERVICE_ACTIVE, SERVICE_CLOSED),
+        (SERVICE_ACTIVE, SERVICE_DRAINING),
+        (SERVICE_ACTIVE, SERVICE_RENEWING),
+        (SERVICE_CLOSED, SERVICE_CLOSED),
+        (SERVICE_DRAINING, SERVICE_CLOSED),
+        (SERVICE_DRAINING, SERVICE_DRAINING),
+        (SERVICE_DRAINING_WITH_RENEWAL, SERVICE_DRAINING),
+        (SERVICE_DRAINING_WITH_RENEWAL, SERVICE_DRAINING_WITH_RENEWAL),
+        (SERVICE_RENEWING, SERVICE_ACTIVE),
+        (SERVICE_RENEWING, SERVICE_DRAINING_WITH_RENEWAL),
     ),
-    terminal=(SERVICE_CONTROL_CLOSED,),
-    initial=SERVICE_CONTROL_ACTIVE,
+    terminal=(SERVICE_CLOSED,),
+    initial=SERVICE_ACTIVE,
     durable=None,
     purpose=(
         "Which authenticated service-control phase owns renewal dispatch and drain, "
-        "including the bounded resolution of a renewal already in flight?"
+        "including an in-flight renewal's bounded resolution?"
     ),
 )
+
 
 SNAPSHOT_CALLBACK_OBSERVATIONS = Domain(
     "snapshot_callback_observations",

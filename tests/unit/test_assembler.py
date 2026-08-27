@@ -85,6 +85,21 @@ def test_a_transaction_is_emitted_only_on_a_verified_end():
     assert unit.last_lsn == 103
 
 
+def test_ignored_signal_event_stays_in_event_count_but_not_delivery_count():
+    """Control-plane rows cannot be relabeled away from Debezium's proof."""
+    a = TransactionAssembler()
+    signal = data("7", 1, 101, table="cdc_flight_signal")
+    signal.ignored_source_record = True
+    feed_all(a, [begin("7"), signal])
+
+    units = a.feed(end("7", 1, lsn=102, per_table={"app.cdc_flight_signal": 1}))
+
+    assert len(units) == 1
+    assert units[0].event_count == 1
+    assert units[0].delivery_events == 0
+    assert len(units[0].events) == 1
+
+
 def test_an_event_count_mismatch_is_fatal():
     """A commit group may contain only transactions we can *prove* whole."""
     a = TransactionAssembler()

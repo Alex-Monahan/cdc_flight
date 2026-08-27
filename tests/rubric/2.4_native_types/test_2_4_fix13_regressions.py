@@ -89,10 +89,6 @@ NON_ADMISSION_EXCEPTIONS: dict[str, str] = {
         "a configuration refusal raised before any data exists; there is no "
         "relation to contain it to and the run must not start"
     ),
-    "_RemoteOperationError": (
-        "a supervisor control child returned a serialised failure; it is a "
-        "control-plane transport wrapper, not a source-value admission refusal"
-    ),
     "EnvelopeDecodeError": (
         "an unknown Debezium control message; the transaction boundary itself is "
         "unreadable, so no per-relation disposition is meaningful"
@@ -204,6 +200,7 @@ ADMISSION_BOUNDARY_MODULES = frozenset(
         "schema_evolution.py",
         "schema_registry.py",
         "schema_shadow.py",
+        "service.py",
         "spill_protocol.py",
         "table_work.py",
         "table_writer.py",
@@ -232,6 +229,7 @@ ADMISSION_BOUNDARY_HANDLERS = frozenset(
         ("schema_evolution.py", "apply_column_changes"),
         ("schema_registry.py", "ensure_typed"),
         ("schema_shadow.py", "convert_column_to_union"),
+        ("service.py", "run"),
         ("spill_protocol.py", "_enrich_descriptors"),
         ("table_work.py", "_key_token"),
         ("table_writer.py", "write"),

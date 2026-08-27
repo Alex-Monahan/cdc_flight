@@ -16,9 +16,12 @@ import pytest
 #: detection/alerting proofs. These are collection counts, not a module-size rule.
 #: The expected values below subtract only this guard module.
 _BASELINE_SELECTED = {
-    "not motherduck and not slow": 2218,
-    "slow and not motherduck": 237,
-    "motherduck": 51,
+    "not motherduck and not slow": 2267,
+    "slow and not motherduck": 236,
+    # The quiet-holder and stock-walsender retry proofs are MotherDuck-only real
+    # process nodes; a local DuckDB file lock cannot exercise cloud takeover while
+    # the old process retains its handle.
+    "motherduck": 58,
 }
 
 

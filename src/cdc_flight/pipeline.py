@@ -27,6 +27,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 # Runtime compatibility, not a test workaround. This must run before any project import
@@ -53,10 +54,9 @@ from .config import (
     DestinationConfig,
     ReplicationConfig,
     RunConfig,
-    ServiceConfig,
     SourceConfig,
     applier_settings,
-    lease_ttl_seconds,
+    finite_run_lease_ttl,
 )
 from .debezium_props import assert_no_internal_topic_collision, build_properties
 from .destination import (
@@ -65,6 +65,7 @@ from .destination import (
     OccurrenceKey,
     RunState,
 )
+from .destination_fence import EpochFencedConnection
 from .errors import (
     AlertPersistenceFailure,
     EngineFailure,
@@ -109,26 +110,16 @@ def run(
     to an in-process caller, because the callback owns resources which must not outlive
     the lease and overlap another invocation in the same interpreter.
     """
-    if service_context is None and os.environ.get("CDC_SERVICE_WORKER") == "1":
-        from .service_protocol import ServiceWorkerContext
-
-        service_context = ServiceWorkerContext.from_environment()
     service_mode = service_context is not None
-    service_policy = ServiceConfig() if service_mode else None
+    service_policy = service_context.policy if service_mode else None
     if service_context is not None:
-        # The hello/heartbeat channel starts before destination acquisition.  A
-        # supervisor can therefore distinguish a child that never started from one
-        # that failed while opening the destination, and parent loss is visible to
-        # the worker before it can enter a data transaction.
-        service_context.start()
-        service_context.wait_for_start(
-            float(os.environ.get("CDC_SERVICE_WORKER_START_TIMEOUT", "20"))
-        )
-        # This is the authenticated worker-start cut: the lease epoch is bound,
-        # the parent has released the start gate, and the child is still before
-        # destination acquisition.  A matrix arm here must kill only this child;
-        # it cannot manufacture a second owner or advance an offset.
-        faults_mod.matrix_crash("service_worker_startup")
+        service_context.assert_writable()
+        # Admission/reconciliation/engine construction is one bounded startup
+        # operation.  MotherDuck and source catalog work can legitimately take
+        # longer than the ordinary idle-progress clock on a contended Flight;
+        # the service watchdog must use its separate operation budget until the
+        # Debezium thread is actually running.
+        service_context.operation_started()
 
     # Parse CDC_FAULT_INJECT once, here, so a typo fails the run instead of
     # leaving a fault test vacuously green (Codex 9).
@@ -150,9 +141,20 @@ def run(
         if v is not None
     }
     if service_mode:
-        # Service lifetime is unbounded.  The operation-level bounds remain the
-        # RunConfig values used by commit/close/source helpers.
+        # Service lifetime is unbounded.  Keep the finite adapter's defaults
+        # intact, but give the service a commit/close budget that fits inside
+        # its lease unless the operator explicitly supplied a different value.
         run_values["max_seconds"] = float("inf")
+        if "CDC_COMMIT_TIMEOUT" not in os.environ:
+            run_values["commit_timeout"] = min(
+                service_policy.commit_timeout_seconds,
+                service_policy.lease_ttl_seconds / 2,
+            )
+        if "CDC_CLOSE_TIMEOUT" not in os.environ:
+            run_values["close_timeout"] = min(
+                service_policy.close_timeout_seconds,
+                service_policy.lease_ttl_seconds / 2,
+            )
     run_cfg = RunConfig(**run_values)
 
     replication.state_dir.mkdir(parents=True, exist_ok=True)
@@ -206,9 +208,10 @@ def run(
     # purpose - see `faults.FaultyConnection`.
     con = None
     try:
-        con = faults_mod.wrap_destination(
-            dest_mod.connect(dest), control_schema=control_schema
-        )
+        # A service bootstrap must not create a MotherDuck database before it owns
+        # an epoch.  The admission step has already proved the physical destination
+        # exists; the pipeline attaches the epoch before exposing a writable handle.
+        con = dest_mod.connect(dest, create_database=not service_mode)
     except BaseException as exc:
         # DuckDB's file lock is acquired by `connect()` before the pipeline has a
         # destination handle. Keep this failure on a durable local sidecar so a
@@ -260,6 +263,30 @@ def run(
     #: while the run was still `draining`.
     reported: dict | None = None
     try:
+        if service_context is not None:
+            destination_lease_key = dest.resolve_physical_lease_key(con)
+            lease = service_context.lease or Lease(
+                destination_lease_key,
+                owner_id=service_context.service_id,
+                ttl_seconds=service_policy.lease_ttl_seconds,
+                control_schema=control_schema,
+                label=dest.pipeline_name,
+                lease_id=service_context.lease_id,
+                fencing_epoch=service_context.fencing_epoch,
+                service_id=service_context.service_id,
+                worker_generation=service_context.worker_generation,
+            )
+            lease.attach(con)
+            con = EpochFencedConnection(con, lease, service_context)
+            con = faults_mod.wrap_destination(
+                con, control_schema=control_schema
+            )
+            service_context.bind(lease, con)
+            lease_held = True
+        else:
+            con = faults_mod.wrap_destination(
+                con, control_schema=control_schema
+            )
         dest_mod.ensure_control_schema(con, control_schema)
         dest_mod.ensure_dataset(con, dest.dataset_name)
         summary_extra["fallback_alerts_replayed"] = dest_mod.replay_fallback_alerts(
@@ -298,30 +325,47 @@ def run(
         if service_context is not None:
             if service_context.lease_key != destination_lease_key:
                 raise LeaseLost(
-                    "the worker was handed a lease for a different physical destination"
+                    "the service was admitted for a different physical destination"
                 )
-            lease = Lease(
-                destination_lease_key,
-                owner_id=service_context.service_id,
-                ttl_seconds=service_policy.lease_ttl_seconds,
-                control_schema=control_schema,
-                label=dest.pipeline_name,
-                lease_id=service_context.lease_id,
-                fencing_epoch=service_context.fencing_epoch,
-                service_id=service_context.service_id,
-                worker_generation=service_context.worker_generation,
-                process_start_token=service_context.parent_start_token,
-                worker_pid=os.getpid(),
-                worker_start_token=service_context.worker_start_token,
-            )
-            # The supervisor acquired and assigned this epoch.  The worker only
-            # attaches; it can never reacquire or silently replace the parent.
-            lease.attach(con)
+            # Admission happened before the engine was constructed.  The same
+            # process now attaches its one data connection to that exact epoch;
+            # it never reacquires or starts a second process generation.
+            if lease is None:
+                raise LeaseLost("service pipeline has no admitted lease")
+            reclaimed = getattr(lease, "reclaimed_receipt", None)
+            if reclaimed is not None:
+                # The predecessor may have been SIGKILLed or hard-exited by its
+                # stall watchdog, so it could not safely write an alert itself.
+                # Emit the successor-owned, once-per-old-lease recovery alert
+                # before any engine work begins. A clean release never carries a
+                # reclaimed receipt and therefore remains silent.
+                reclaim_summary = {
+                    "stop_reason": "service_holder_reclaimed",
+                    "reclaimed_service_holder": True,
+                }
+                reclaim_failure = LeaseLost(
+                    "the previous service holder expired before this Flight took over",
+                    lease_state=reclaimed,
+                )
+                _record_run_failure_alert(
+                    con,
+                    dest=dest,
+                    run_state=run_state,
+                    exc=reclaim_failure,
+                    summary=reclaim_summary,
+                )
+                summary_extra.update(
+                    {
+                        "reclaimed_service_holder": True,
+                        "recovery_alert_code": "service_holder_reclaimed",
+                    }
+                )
+                lease.reclaimed_receipt = None
         else:
             lease = Lease(
                 destination_lease_key,
                 owner_id=runner_id,
-                ttl_seconds=lease_ttl_seconds(),
+                ttl_seconds=finite_run_lease_ttl(run_cfg),
                 control_schema=control_schema,
                 label=dest.pipeline_name,
             )
@@ -1091,6 +1135,8 @@ def run(
                 lease=lease,
                 lease_held=lease_held,
                 run_ok=run_ok,
+                service_mode=service_context is not None,
+                service_context=service_context,
                 hard_exit_on_transfer=True,
             )
         finally:
@@ -1173,7 +1219,18 @@ def _record_run_failure_alert(
     if isinstance(exc, SlotAheadOfDestination):
         return
     source_health_episode = None
-    if isinstance(exc, LeaseLost) or "lease" in str(exc).lower():
+    if (
+        summary.get("stop_reason") == "service_holder_reclaimed"
+        and isinstance(exc, LeaseLost)
+        and exc.lease_state is not None
+    ):
+        code = "service_holder_reclaimed"
+        severity = "critical"
+        condition_key = code
+        occurrence_key = OccurrenceKey.from_lease(
+            exc.lease_state, pipeline=dest.pipeline_name
+        )
+    elif isinstance(exc, LeaseLost) or "lease" in str(exc).lower():
         code = "concurrent_destination_run"
         severity = "critical"
         # The runner id identifies the attempt, not the occurrence. LeaseLost carries
@@ -1272,10 +1329,17 @@ def _record_run_failure_alert(
         occurrence_key = OccurrenceKey.from_run(
             run_state, pipeline=dest.pipeline_name
         )
-    message = (
-        f"cdc_flight run for pipeline {dest.pipeline_name!r} failed before it could "
-        f"claim success: {type(exc).__name__}: {exc}"
-    )
+    if code == "service_holder_reclaimed":
+        message = (
+            f"cdc_flight reclaimed an expired or stalled service holder for pipeline "
+            f"{dest.pipeline_name!r}; the successor is now the fenced writer. "
+            f"Evidence: {type(exc).__name__}: {exc}"
+        )
+    else:
+        message = (
+            f"cdc_flight run for pipeline {dest.pipeline_name!r} failed before it could "
+            f"claim success: {type(exc).__name__}: {exc}"
+        )
     try:
         # A failed lease acquisition can leave the destination connection inside the
         # implicit transaction opened by its probe (MotherDuck reports this as a
@@ -1334,6 +1398,8 @@ def _record_run_failure_alert(
 def _teardown_destination(
     *, con, ownership: DestinationOwnership, reported: dict | None,
     phases: RunPhaseWriter | None, lease: Lease | None, lease_held: bool, run_ok: bool,
+    service_mode: bool = False,
+    service_context=None,
     hard_exit_on_transfer: bool = False,
 ) -> None:
     """Make the one terminal ownership decision for every destination handle."""
@@ -1378,7 +1444,20 @@ def _teardown_destination(
         except Exception:  # pragma: no cover - every phase declares `-> stopping`
             log.error("could not record the stopping phase", exc_info=True)
     if lease_held and lease is not None:
-        lease.release(con)
+        # Service rows are retained as ``released`` so the next scheduled
+        # admission can advance the fencing epoch visibly.  Batch leases keep
+        # their established delete-on-release behavior.
+        if service_mode:
+            # This is the production release edge, rather than the admission
+            # fallback below.  Keeping the matrix point on the actual write
+            # path preserves the hard-death proof after the single-process
+            # teardown has already attempted the fenced release.
+            faults_mod.matrix_crash("service_lease_release")
+            lease.release(con, retain=True)
+            if service_context is not None:
+                service_context.note_lease_release_attempted()
+        else:
+            lease.release(con)
     if phases is not None:
         try:
             phases.finish(ok=run_ok)
@@ -1404,12 +1483,18 @@ def shutdown_and_exit(code: int = 0, timeout: float = 15.0) -> None:
     Debezium leaves non-daemon JVM threads behind, so a plain `return` from
     `main()` leaves the interpreter hanging forever after the work is done.
     """
-    sys.stdout.flush()
-    sys.stderr.flush()
+    # Arm the hard-exit bound BEFORE touching output.  A subprocess whose parent
+    # is waiting for its exit can fill the stdout pipe with stock Debezium/JVM
+    # diagnostics; flushing that pipe is I/O, not a safe precondition for the
+    # watchdog.  Previously the watchdog was created after these flushes, so a
+    # source-dark close could write its accurate summary and then remain alive
+    # forever in ``flush()`` while the scheduled successor waited.
     watchdog = threading.Timer(timeout, lambda: os._exit(code))
     watchdog.daemon = True
     watchdog.start()
     try:
+        sys.stdout.flush()
+        sys.stderr.flush()
         import jpype
         if jpype.isJVMStarted():
             jpype.shutdownJVM()
@@ -1497,6 +1582,16 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _write_summary(summary: dict) -> None:
+    # This is the last observable point before ``shutdown_and_exit``.  Keeping
+    # the interval keyed to the accepted completion decision, rather than to
+    # process start, makes the assertion insensitive to JVM startup and other
+    # unrelated host load while still covering destination drain, engine close,
+    # lease release, and the outer pipeline teardown.
+    stop_at = summary.pop("_completion_stop_at_monotonic", None)
+    if stop_at is not None:
+        summary["completion_stop_to_summary_sec"] = round(
+            max(0.0, time.monotonic() - float(stop_at)), 3
+        )
     payload = json.dumps(summary, indent=2, sort_keys=True, default=str)
     print(payload)
     try:

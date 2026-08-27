@@ -112,6 +112,12 @@ class CompleteUnit:
     #: events counted and validated for a discard-only re-snapshot stream unit.
     #: They are intentionally never retained or sent to the destination spill table.
     discarded_events: int = 0
+    #: Subset of ``event_count`` that is genuine delivery evidence for the service
+    #: liveness clocks.  The applier marks its own signal-table row separately so it
+    #: remains in the whole-transaction/offset proof without becoming progress.
+    #: ``None`` preserves compatibility for hand-built units; production assembler
+    #: units always carry the explicit count.
+    delivery_events: int | None = None
     #: True for stock incremental snapshot chunks.  These chunks are bounded
     #: units but are not initial-snapshot terminal evidence.
     incremental: bool = False
@@ -138,7 +144,7 @@ class CompleteUnit:
 
 class _OpenTxn:
     __slots__ = (
-        "begin_seen", "count", "events", "last_lsn", "mem_bytes", "message_count",
+        "begin_seen", "count", "delivery_events", "events", "last_lsn", "mem_bytes", "message_count",
         "nbytes", "orders", "per_table", "records", "spill_unit_seq", "spilled",
         "touched_tables", "txn_id",
     )
@@ -158,6 +164,10 @@ class _OpenTxn:
         #: spilling changes the storage representation and never the proof
         #: (Codex 2). `len(events)` is not a count of the transaction.
         self.count = 0
+        #: Count of data records that are delivery evidence. This deliberately differs
+        #: from ``count``: the Flight's signal-table rows stay in the transaction proof
+        #: but do not refresh service liveness.
+        self.delivery_events = 0
         self.per_table: dict[str, int] = {}
         #: relation names are retained independently of the event payloads so admission
         #: remains correct after the payload prefix is moved to `spill_events`
@@ -177,6 +187,7 @@ class _OpenTxn:
 class _OpenChunk:
     __slots__ = (
         "count",
+        "delivery_events",
         "events",
         "incremental",
         "mem_bytes",
@@ -198,6 +209,7 @@ class _OpenChunk:
         self.nbytes = 0
         self.mem_bytes = 0
         self.count = 0
+        self.delivery_events = 0
         self.spilled = 0
         self.spill_unit_seq: int | None = None
         self.touched_tables: set[str] = set()
@@ -445,6 +457,8 @@ class TransactionAssembler:
         self._txn.orders.add(order)
         rec.total_order = order
         self._txn.count += 1
+        if rec.is_delivery_data:
+            self._txn.delivery_events += 1
         self._retain(self._txn, rec)
         self._txn.nbytes += rec.nbytes
         self._txn.last_lsn = max(self._txn.last_lsn, rec.lsn or 0)
@@ -491,6 +505,7 @@ class TransactionAssembler:
             spilled_events=spilled,
             spill_unit_seq=txn.spill_unit_seq,
             discarded_events=txn.count - len(txn.events) - spilled,
+            delivery_events=txn.delivery_events,
         )
         return [unit]
 
@@ -648,6 +663,8 @@ class TransactionAssembler:
 
         self._chunk.events.append(rec)
         self._chunk.count += 1
+        if rec.is_delivery_data:
+            self._chunk.delivery_events += 1
         if rec.snapshot == SNAPSHOT_LAST:
             self._chunk.saw_last = True
         self._retain(self._chunk, rec)
@@ -688,6 +705,7 @@ class TransactionAssembler:
             spilled_events=chunk.spilled,
             spill_unit_seq=chunk.spill_unit_seq,
             incremental=chunk.incremental,
+            delivery_events=chunk.delivery_events,
         )
         return [unit]
 
