@@ -46,7 +46,11 @@ def watermark_runs(sandbox) -> dict:
     )
     before = _wal_lsn(sandbox)
     started = time.monotonic()
-    watermarked = sandbox.run(max_seconds=120, idle_seconds=IDLE_SECONDS)
+    watermarked = sandbox.run(
+        max_seconds=120,
+        idle_seconds=IDLE_SECONDS,
+        observe_exit_phase=True,
+    )
     watermarked["wall"] = time.monotonic() - started
     watermarked["slot"] = _slot(sandbox)
     watermarked["source_lsn_before"] = before
@@ -62,6 +66,7 @@ def watermark_runs(sandbox) -> dict:
         max_seconds=120,
         idle_seconds=IDLE_SECONDS,
         extra_env={"CDC_COMPLETION_WATERMARK": "0"},
+        observe_exit_phase=True,
     )
     unmarkable["wall"] = time.monotonic() - started
     unmarkable["slot"] = _slot(sandbox)
@@ -111,6 +116,11 @@ def test_a_quiet_run_ends_on_the_watermark_not_on_the_idle_timer(watermark_runs)
         "the process consumed the idle window after accepting the watermark: "
         f"{run['completion_stop_to_summary_sec']}s after stop decision; "
         f"bound={POST_ACCEPTANCE_EXIT_BOUND_SECONDS}s"
+    )
+    assert 0 <= run["process_exit_after_summary_sec"] < IDLE_SECONDS, (
+        "the process stalled after publishing a healthy summary: "
+        f"{run['process_exit_after_summary_sec']}s until actual process exit; "
+        f"bound={IDLE_SECONDS}s"
     )
 
 

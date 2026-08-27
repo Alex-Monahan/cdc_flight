@@ -261,6 +261,7 @@ def _invoke_pipeline(
     expect_success: bool = True,
     accept_orphan_offsets: bool = False,
     matrix_arm: bool = False,
+    observe_exit_phase: bool = False,
 ) -> dict:
     """Run the `cdc-flight` CLI once and return its summary plus process outcome.
 
@@ -296,6 +297,16 @@ def _invoke_pipeline(
     summary_path = Path(env["CDC_STATE_DIR"]) / "last_run.json"
     summary_path.unlink(missing_ok=True)
 
+    if observe_exit_phase:
+        return _invoke_pipeline_observing_exit(
+            cmd,
+            env=env,
+            cwd=PROJECT_DIR,
+            summary_path=summary_path,
+            timeout=timeout,
+            expect_success=expect_success,
+        )
+
     proc = subprocess.run(
         cmd,
         capture_output=True,
@@ -320,6 +331,77 @@ def _invoke_pipeline(
     summary["returncode"] = proc.returncode
     # Kept short on purpose: this dict is printed verbatim in assertion messages.
     summary["output"] = (proc.stdout + proc.stderr)[-6000:]
+    return summary
+
+
+def _invoke_pipeline_observing_exit(
+    cmd: list[str],
+    *,
+    env: dict[str, str],
+    cwd: Path,
+    summary_path: Path,
+    timeout: float,
+    expect_success: bool,
+) -> dict:
+    """Observe summary publication and actual child exit from the parent process.
+
+    The production process writes ``last_run.json`` before entering its final JVM
+    shutdown. Polling that file and then waiting on ``Popen`` measures the phase
+    *after* summary publication without relying on an in-process timestamp that a
+    post-summary stall could never update. The child uses DEVNULL here so a noisy
+    JVM cannot block the observer on a full pipe.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+        cwd=cwd,
+        text=True,
+    )
+    deadline = time.monotonic() + timeout
+    summary: dict[str, Any] = {}
+    summary_seen_at: float | None = None
+    while proc.poll() is None:
+        if summary_seen_at is None and summary_path.exists():
+            try:
+                candidate = json.loads(summary_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                candidate = {}
+            if candidate:
+                summary = candidate
+                summary_seen_at = time.monotonic()
+        if time.monotonic() >= deadline:
+            proc.kill()
+            proc.wait(timeout=30)
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        time.sleep(0.01)
+
+    returncode = proc.returncode
+    if summary_seen_at is None and summary_path.exists():
+        # A normally terminating child can publish and exit between two observer
+        # polls. This is a fast phase, so treating the post-exit read as zero is a
+        # safe upper-bound result; a real stall leaves the child alive long enough
+        # for the parent to observe the published file before wait() returns.
+        try:
+            summary = json.loads(summary_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            summary = {}
+        summary_seen_at = time.monotonic()
+    if expect_success and returncode != 0:
+        raise AssertionError(
+            f"pipeline exited {returncode} without a successful observed run; "
+            f"summary={summary}"
+        )
+    if expect_success:
+        assert summary, f"no run summary at {summary_path}"
+    summary["returncode"] = returncode
+    summary["process_exit_after_summary_sec"] = (
+        round(max(0.0, time.monotonic() - summary_seen_at), 3)
+        if summary_seen_at is not None
+        else None
+    )
+    summary["output"] = ""
     return summary
 
 
@@ -567,9 +649,14 @@ class Sandbox:
 
     # -- pipeline ----------------------------------------------------------- #
     def run(self, *, extra_env: dict[str, str] | None = None, **kwargs) -> dict:
+        observe_exit_phase = bool(kwargs.pop("observe_exit_phase", False))
         kwargs.setdefault("max_seconds", 120)
         kwargs.setdefault("idle_seconds", SANDBOX_IDLE_SECONDS)
-        return _invoke_pipeline({**self.env, **(extra_env or {})}, **kwargs)
+        return _invoke_pipeline(
+            {**self.env, **(extra_env or {})},
+            observe_exit_phase=observe_exit_phase,
+            **kwargs,
+        )
 
     def spawn(
         self,
