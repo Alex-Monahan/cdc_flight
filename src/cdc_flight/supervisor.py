@@ -246,6 +246,9 @@ def run_engine_bounded(
     source_dark_after: float | None = None
     engine_thread_alive_at_source_dark = False
     source_unobservable_after: float | None = None
+    live_queue_probe = getattr(engine, "probe_live_queue", None)
+    live_queue_metrics: dict | None = None
+    live_queue_probe_deadline = started + run.engine_start_timeout
     drain_started_at: float | None = None
     source_probe_bound = min(
         run.source_probe_startup_seconds,
@@ -262,6 +265,30 @@ def run_engine_bounded(
                 service_context.rearm_process_signals()
                 service_context.set_engine_thread_alive(thread.is_alive())
             elapsed = time.monotonic() - started
+            if live_queue_probe is not None and live_queue_metrics is None:
+                try:
+                    live_queue_metrics = live_queue_probe()
+                except BaseException as exc:
+                    # A queue that cannot be inspected is a startup/configuration
+                    # failure, not a reason to continue with an unbounded count-only
+                    # admission path.  The common teardown below preserves the
+                    # engine's own completion message as a consequence of this cause.
+                    error_box.append(exc)
+                    outcome.record("engine_error")
+                    break
+                if (
+                    live_queue_metrics is None
+                    and time.monotonic() >= live_queue_probe_deadline
+                ):
+                    error_box.append(
+                        EngineFailure(
+                            "stock Debezium source-task queue was not initialized "
+                            f"within {run.engine_start_timeout:.1f}s; refusing to run "
+                            "without a runtime byte-bound proof"
+                        )
+                    )
+                    outcome.record("engine_error")
+                    break
             if service_mode and health is not None:
                 # The sampler is independent corroboration.  The service verdict
                 # also receives the live engine thread and the callback/commit/ack
@@ -598,6 +625,13 @@ def run_engine_bounded(
             # is polled at the ordinary granularity.
             time.sleep(0.05 if watermark.state == WATERMARK_ARMED else 0.25)
         else:
+            if live_queue_probe is not None and live_queue_metrics is None:
+                error_box.append(
+                    EngineFailure(
+                        "stock Debezium engine stopped before its source-task queue "
+                        "could be inspected; refusing an unproven queue configuration"
+                    )
+                )
             if service_mode:
                 # A service engine has no legitimate self-terminating success path.
                 # Evaluate the final sample with the thread explicitly dead before
@@ -901,6 +935,8 @@ def run_engine_bounded(
     }
     if service_mode:
         summary["engine_thread_dead"] = not thread.is_alive()
+    if live_queue_metrics is not None:
+        summary["live_queue"] = live_queue_metrics
     summary.update(completion.as_dict())
     if watermark is None:
         summary.update(
