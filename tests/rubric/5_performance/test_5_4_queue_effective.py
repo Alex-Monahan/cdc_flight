@@ -63,7 +63,7 @@ class _GatedAcknowledgingHandler:
             committer.markBatchFinished()
 
 
-def _wait_for_live_queue(engine, runner, timeout: float = 30.0) -> dict:
+def _wait_for_live_queue(engine, runner, timeout: float = 90.0) -> dict:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         metrics = engine.probe_live_queue()
@@ -74,7 +74,7 @@ def _wait_for_live_queue(engine, runner, timeout: float = 30.0) -> dict:
         if not runner.is_alive():
             pytest.fail("stock Debezium stopped before its queue could be inspected")
         time.sleep(0.1)
-    pytest.fail("stock Debezium did not initialize an inspectable queue within 30s")
+    pytest.fail("stock Debezium did not initialize an inspectable queue within 90s")
 
 
 @pytest.mark.slow

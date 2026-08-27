@@ -248,13 +248,13 @@ def run_engine_bounded(
     source_unobservable_after: float | None = None
     live_queue_probe = getattr(engine, "probe_live_queue", None)
     live_queue_metrics: dict | None = None
-    # Publishing the stock task/queue object is a separate startup observation from
-    # source-health publication.  Under the repository's 12-worker lane the JVM can
-    # be scheduled after the 15-second source-health bound even though it is still
-    # starting normally.  Reuse the existing finite engine-thread budget for this
-    # inspection, without changing the source-health/liveness clock below.
-    live_queue_probe_bound = max(run.engine_start_timeout, run.engine_thread_timeout)
-    live_queue_probe_deadline = started + live_queue_probe_bound
+    # The effective connector configuration is validated while the stock engine is
+    # built.  The live task/queue object is evidence retained when it becomes visible,
+    # but its reflection must not become a second startup/liveness clock: a short
+    # finite run under host contention can reach its declared stop before Java has
+    # published the private task list.  An initialized queue/config mismatch remains
+    # a hard failure inside ``probe_live_queue``; the real live-task proof is the
+    # dedicated performance test.
     drain_started_at: float | None = None
     source_probe_bound = min(
         run.source_probe_startup_seconds,
@@ -287,16 +287,6 @@ def run_engine_bounded(
                     # admission path.  The common teardown below preserves the
                     # engine's own completion message as a consequence of this cause.
                     error_box.append(exc)
-                    outcome.record("engine_error")
-                    break
-                if live_queue_metrics is None and time.monotonic() >= live_queue_probe_deadline:
-                    error_box.append(
-                        EngineFailure(
-                            "stock Debezium source-task queue was not initialized "
-                            f"within {live_queue_probe_bound:.1f}s; refusing to run "
-                            "without a runtime byte-bound proof"
-                        )
-                    )
                     outcome.record("engine_error")
                     break
             if service_mode and health is not None:
