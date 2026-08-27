@@ -107,3 +107,74 @@ def test_stock_queue_byte_bound_is_effective_in_the_live_task(
             pytest.fail(f"stock Debezium runner hung for {label} queue proof")
         with suppress(Exception):
             _drop_slot(postgres_cluster, slot)
+
+
+@pytest.mark.slow
+def test_toast_burst_spills_and_finishes_as_one_exact_commit_group(sandbox):
+    """Exercise the production byte bound alongside the transactional spill path."""
+    sandbox.reseed()
+    capture = {"CDC_TABLES": "documents"}
+    baseline = sandbox.run(
+        reset_state=True,
+        max_seconds=180,
+        timeout=300,
+        extra_env=capture,
+    )
+    assert baseline["returncode"] == 0, baseline
+
+    tag = f"p5doc-{os.getpid()}"
+    sandbox.sql(
+        "INSERT INTO app.documents (title, body, body_bytes, revision) "
+        "SELECT %s || i, "
+        "(SELECT string_agg(md5(i::text || ':' || g::text), '' ORDER BY g) "
+        "FROM generate_series(1, 2048) AS g), "
+        "65536, 1 FROM generate_series(1, 2048) AS rows(i)".replace(
+            "%s", f"'{tag}-'"
+        ),
+        one_transaction=True,
+    )
+    source_rows = sandbox.pg_query(
+        "SELECT count(*) FROM app.documents WHERE title LIKE %s", (f"{tag}-%",)
+    )[0][0]
+    assert source_rows == 2048
+
+    run = sandbox.run(
+        max_seconds=600,
+        idle_seconds=5,
+        timeout=720,
+        extra_env=capture,
+    )
+    assert run["returncode"] == 0, run
+    assert run["ok"] is True, run
+    assert run["data_commit_groups"] == 1, run
+    assert run["spilled_events"] > 0, run
+
+    destination = sandbox.table("cdcflight_app_documents")
+    landed, identities = sandbox.duck_query(
+        f"SELECT count(*), count(DISTINCT cdcf_event_id) FROM {destination} "
+        "WHERE title LIKE ?",
+        [f"{tag}-%"],
+    )[0]
+    assert (landed, identities) == (source_rows, source_rows), run
+
+    live_queue = run["engine_effective_configuration"]["live_queue"]
+    assert live_queue["effective_task_config_max_queue_size_in_bytes"] == int(
+        MAX_QUEUE_SIZE_IN_BYTES
+    )
+    assert live_queue["queue_max_queue_size_in_bytes"] == int(MAX_QUEUE_SIZE_IN_BYTES)
+    assert live_queue["queue_peak_size_in_bytes"] <= int(MAX_QUEUE_SIZE_IN_BYTES)
+    assert live_queue["queue_peak_size"] <= live_queue["queue_total_capacity"]
+
+    durable = int(run["durable_lsn"])
+    confirmed = int(
+        sandbox.pg_query(
+            "SELECT confirmed_flush_lsn - '0/0' FROM pg_replication_slots "
+            "WHERE slot_name = %s",
+            (sandbox.slot,),
+        )[0][0]
+    )
+    assert confirmed <= durable, {
+        "run": run,
+        "confirmed_flush_lsn": confirmed,
+        "durable_lsn": durable,
+    }
