@@ -308,6 +308,24 @@ def commit_group(self, trigger: str) -> CommitResult:
         # This DELETE is observability I/O, so it is intentionally after
         # COMMIT_ACK.leave() and outside the watchdog's guarded window.
         self._clear_commit_timeout_alert(commit_id)
+    # SCD2 refusals are admission-classified for the package-wide containment
+    # closure, but retain AmbiguousDelete's history-aware resnapshot route.  The
+    # specialized handler must therefore precede the common admission handler.
+    except (AmbiguousDelete, DestinationIdentityCollision) as ambiguous:
+        # Rubric 4.7. The group still rolls back - a fold that cannot be decided is
+        # never committed - but a bare rollback here is a *permanent* failure: the
+        # transaction replays on the next run and hits the same ambiguity, for ever,
+        # which is a manual-intervention case. So the table is marked for a
+        # re-snapshot on the independent connection, where the request survives this
+        # rollback, and the next run rebuilds it. The re-snapshot's consistent point
+        # is necessarily after this transaction (we already received it, so it is
+        # already in WAL), so the per-table watermark fences the transaction that
+        # cannot be folded and the loop terminates after exactly one re-snapshot
+        # (ADR 0001 §19/A47).
+        COMMIT_ACK.leave()
+        self._request_resnapshot_for(ambiguous)
+        self._rollback_quietly()
+        raise
     except AdmissionError as error:
         refused = as_schema_refusal(error, refusal_origin="typed_planner")
         self._contextualize_schema_refusal(refused)
@@ -341,21 +359,6 @@ def commit_group(self, trigger: str) -> CommitResult:
             return commit_group(self, trigger)
         finally:
             self._excluded_destination_tables.clear()
-    except (AmbiguousDelete, DestinationIdentityCollision) as ambiguous:
-        # Rubric 4.7. The group still rolls back - a fold that cannot be decided is
-        # never committed - but a bare rollback here is a *permanent* failure: the
-        # transaction replays on the next run and hits the same ambiguity, for ever,
-        # which is a manual-intervention case. So the table is marked for a
-        # re-snapshot on the independent connection, where the request survives this
-        # rollback, and the next run rebuilds it. The re-snapshot's consistent point
-        # is necessarily after this transaction (we already received it, so it is
-        # already in WAL), so the per-table watermark fences the transaction that
-        # cannot be folded and the loop terminates after exactly one re-snapshot
-        # (ADR 0001 §19/A47).
-        COMMIT_ACK.leave()
-        self._request_resnapshot_for(ambiguous)
-        self._rollback_quietly()
-        raise
     except BaseException:
         self._rollback_quietly()
         raise

@@ -18,13 +18,14 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from .config import source_connection_kwargs
+from .errors import AdmissionError
 
 MINIMUM_SERVER_VERSION_NUM = 160000
 REQUIRED_PLUGIN = "pgoutput"
 UNHEALTHY_WAL_STATUS = frozenset({"lost", "unreserved"})
 
 
-class StandbyCapabilityError(RuntimeError):
+class StandbyCapabilityError(AdmissionError):
     """The configured standby cannot safely host the stock logical decoder."""
 
 

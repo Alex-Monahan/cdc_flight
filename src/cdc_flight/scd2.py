@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from . import destination, event_ledger, naming
-from .errors import AmbiguousDelete
+from .errors import AdmissionError, AmbiguousDelete
 from .typed_types import SourceTypeDescriptor, encode_value, native_type
 
 HISTORY_META = {
@@ -45,12 +45,47 @@ _IMAGE_COLUMN = "__cdcf_scd2_image_json"
 _KEY_COLUMN = "__cdcf_scd2_key_json"
 
 
-class SCD2IdentityRefused(AmbiguousDelete):
+class SCD2IdentityRefused(AdmissionError, AmbiguousDelete):
     """An SCD2 event has no source identity or no safe predecessor."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        source_schema: str | None = None,
+        source_table: str | None = None,
+        target: str | None = None,
+    ):
+        # Keep the richer AmbiguousDelete payload so the commit protocol can
+        # request a history-aware resnapshot, while AdmissionError remains the
+        # package-wide classification root.
+        AmbiguousDelete.__init__(
+            self,
+            message,
+            source_schema=source_schema,
+            source_table=source_table,
+            target=target,
+        )
 
-class HistoryRefreshRefused(AmbiguousDelete):
+
+class HistoryRefreshRefused(AdmissionError, AmbiguousDelete):
     """A current-only image cannot reconstruct history before its boundary."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        source_schema: str | None = None,
+        source_table: str | None = None,
+        target: str | None = None,
+    ):
+        AmbiguousDelete.__init__(
+            self,
+            message,
+            source_schema=source_schema,
+            source_table=source_table,
+            target=target,
+        )
 
 
 @dataclass(frozen=True)

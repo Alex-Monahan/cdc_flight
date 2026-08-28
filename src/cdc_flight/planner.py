@@ -311,18 +311,24 @@ class GroupPlan:
 
     def _history_mode_for(self, qualified: str) -> str:
         """Read the durable per-relation history policy once per group."""
-        if qualified in self.history_modes:
-            return self.history_modes[qualified]
-        if qualified in self._history_mode_cache:
-            return self._history_mode_cache[qualified]
+        history_modes = getattr(self, "history_modes", {})
+        if qualified in history_modes:
+            return history_modes[qualified]
+        history_mode_cache = getattr(self, "_history_mode_cache", None)
+        if history_mode_cache is None:
+            history_mode_cache = {}
+            self._history_mode_cache = history_mode_cache
+        if qualified in history_mode_cache:
+            return history_mode_cache[qualified]
         mode = "none"
-        if self.pipeline:
+        pipeline = getattr(self, "pipeline", "")
+        if pipeline:
             try:
                 schema, table = qualified.split(".", 1)
                 row = self.con.execute(
                     f"SELECT history_mode FROM {destination._control_table(self._control_schema, 'table_state')} "
                     "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
-                    [self.pipeline, schema, table],
+                    [pipeline, schema, table],
                 ).fetchone()
                 if row and row[0] is not None:
                     mode = str(row[0]).lower()
@@ -331,7 +337,7 @@ class GroupPlan:
                 # to retain the existing current-row path in that case; explicitly
                 # requested SCD2 modes still arrive through ``history_modes``.
                 mode = "none"
-        self._history_mode_cache[qualified] = mode
+        history_mode_cache[qualified] = mode
         return mode
 
     def _collect(
@@ -401,26 +407,27 @@ class GroupPlan:
             self._truncate(event, target, snapshot=snapshot)
             return
         self._enrich_descriptors(event)
+        descriptor_provider = getattr(self, "descriptor_provider", None)
+        connection = getattr(self, "con", None)
+        pipeline = getattr(self, "pipeline", "")
+        control_schema = getattr(self, "_control_schema", None)
+        source_cluster_id = getattr(self, "source_cluster_id", None)
+        source_timeline = getattr(self, "source_timeline", None)
+        active_commit_lsn = getattr(self, "_active_commit_lsn", None)
+        strict_event_identity = bool(getattr(self, "strict_event_identity", False))
         relation_generation = event_ledger.relation_generation_for(
             event.qualified_table,
             event=event,
-            provider=self.descriptor_provider,
-            con=self.con,
-            pipeline=self.pipeline,
-            control_schema=self._control_schema,
+            provider=descriptor_provider,
+            con=connection,
+            pipeline=pipeline,
+            control_schema=control_schema,
         )
         if event_id is None:
             event_id = (
                 self.snapshots.event_id(event)
                 if snapshot is not None
-                else stream_event_id(
-                    event,
-                    source_cluster_id=self.source_cluster_id,
-                    source_timeline=self.source_timeline,
-                    relation_generation=relation_generation,
-                    commit_lsn=self._active_commit_lsn,
-                    require_strong=self.strict_event_identity,
-                )
+                else stream_event_id(event)
             )
         if snapshot is None and not event.incremental and (
             self.toast_admission_provider is not None or self.toast_policy_provider is not None
@@ -483,12 +490,12 @@ class GroupPlan:
                 scd2.SCD2Event.from_pending(
                     event,
                     event_id=event_id,
-                    pipeline=self.pipeline,
+                    pipeline=pipeline,
                     target_table=bundle_target,
-                    source_cluster_id=self.source_cluster_id,
-                    source_timeline=self.source_timeline,
+                    source_cluster_id=source_cluster_id,
+                    source_timeline=source_timeline,
                     relation_generation=relation_generation,
-                    commit_lsn=self._active_commit_lsn,
+                    commit_lsn=active_commit_lsn,
                     policy_epoch=event.policy_epoch,
                 )
             )
@@ -527,23 +534,26 @@ class GroupPlan:
             ) from exc
         identity = event_ledger.identity_for(
             event,
-            event_id=event_id,
-            source_cluster_id=self.source_cluster_id,
-            source_timeline=self.source_timeline,
+            # The row's cdcf_event_id is a compatibility/replay column.  The
+            # shared ledger gets the full source identity independently so a
+            # strict production event never relies on that legacy spelling.
+            event_id=(event_id if snapshot is not None or event.incremental else None),
+            source_cluster_id=source_cluster_id,
+            source_timeline=source_timeline,
             relation_generation=relation_generation,
-            commit_lsn=self._active_commit_lsn,
+            commit_lsn=active_commit_lsn,
             policy_epoch=event.policy_epoch,
             target_table=target,
-            require_strong=self.strict_event_identity,
+            require_strong=strict_event_identity,
             digest=patch.digest,
         )
-        if self.pipeline and identity.ledger_eligible and destination.claim_event_ledger(
-                self.con,
+        if pipeline and identity.ledger_eligible and destination.claim_event_ledger(
+                connection,
                 identity,
-                pipeline=self.pipeline,
+                pipeline=pipeline,
                 target_table=target,
                 source_lsn=event.lsn,
-                control_schema=self._control_schema,
+                control_schema=control_schema,
         ):
             self.source_tables.add(f"{event.schema}.{event.table}")
             return
