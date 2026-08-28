@@ -150,10 +150,13 @@ def _slot_creation_finished(env: dict[str, str], slot: str) -> bool:
     a long time to become usable before Debezium opens its source connection; the
     caller must not hold every other worker behind that unrelated destination work.
 
-    PostgreSQL exposes a logical slot row before a blocked
-    ``CREATE_REPLICATION_SLOT`` statement returns.  The row alone is therefore not
-    the completion predicate: release only after the row exists *and* the active
-    backend is no longer executing that slot's create statement.
+    PostgreSQL exposes a logical slot row before a blocked slot-creation command
+    returns.  The row alone is therefore not the completion predicate: release
+    only after the row exists *and* no active backend is still executing either
+    the replication-protocol command or its SQL-function equivalent.  The
+    activity text is parameterized for SQL-function callers, so it cannot be
+    matched to the slot name; the physical startup lock already scopes the
+    check to this test cluster.
     """
     try:
         source = _source_from_environment(env)
@@ -170,10 +173,12 @@ def _slot_creation_finished(env: dict[str, str], slot: str) -> bool:
                 "  SELECT 1 FROM pg_stat_activity "
                 "  WHERE datname = current_database() "
                 "    AND state = 'active' "
-                "    AND query ILIKE '%CREATE_REPLICATION_SLOT%' "
-                "    AND strpos(query, %s) > 0"
+                "    AND ("
+                "      query ILIKE '%CREATE_REPLICATION_SLOT%' "
+                "      OR query ILIKE '%PG_CREATE_LOGICAL_REPLICATION_SLOT%'"
+                "    )"
                 ")",
-                (slot, slot),
+                (slot,),
             ).fetchone()
             return bool(row and row[0] and row[1])
     except Exception:
