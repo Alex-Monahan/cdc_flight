@@ -318,6 +318,10 @@ class SourceHealth:
     #: completed; those observations must age into source_dark instead of renewing.
     _service_status: str | None = field(default=None, repr=False)
     _service_stalled_since: float | None = field(default=None, repr=False)
+    #: Whether the current service clock was started by a known publication-route
+    #: mismatch.  That observation is actionable even before the slot attaches;
+    #: it must not inherit an earlier mismatch clock after the route is repaired.
+    _service_route_mismatch: bool = field(default=False, repr=False)
     _service_engine_thread_dead: bool = field(default=False, repr=False)
     _service_lag_bytes: int | None = field(default=None, repr=False)
     _service_quiet_ready: bool = field(default=False, repr=False)
@@ -827,6 +831,8 @@ class SourceHealth:
         engine_thread_alive: bool,
         lag_bytes: int | None,
         quiet_source_ready: bool = False,
+        route_mismatch: bool = False,
+        route_mismatch_observed_at: float | None = None,
     ) -> str:
         """Record the service verdict and its fail-closed aging clock."""
         with self._lock:
@@ -838,6 +844,21 @@ class SourceHealth:
             )
             if status in {"connected_quiet", "connected_busy"}:
                 self._service_stalled_since = None
+            elif route_mismatch:
+                # A successful publication/catalog sample already proves that the
+                # configured route cannot deliver.  Start the bounded source-dark
+                # clock at that observation, even if slot attachment is still in
+                # progress and the witness fold currently says ``disconnected``.
+                if self._service_stalled_since is None or not self._service_route_mismatch:
+                    self._service_stalled_since = (
+                        route_mismatch_observed_at
+                        if route_mismatch_observed_at is not None
+                        else observed_at
+                    )
+            elif self._service_route_mismatch:
+                # The known route failure ended, but the service is not healthy yet;
+                # begin a fresh clock for whatever current witness is missing.
+                self._service_stalled_since = observed_at
             elif (
                 status
                 in {
@@ -849,6 +870,7 @@ class SourceHealth:
                 and self._service_stalled_since is None
             ):
                 self._service_stalled_since = observed_at
+            self._service_route_mismatch = route_mismatch
         return status
 
     def _walsender_is_ours(
@@ -965,6 +987,12 @@ class SourceHealth:
                 )
             )
         )
+        route_mismatch = bool(
+            self.publication_name is not None
+            and sample is not None
+            and sample.publication_has_tables is True
+            and sample.publication_has_configured_tables is False
+        )
         quiet_ready = bool(
             quiet_source_ready
             and publication_has_tables
@@ -1026,6 +1054,8 @@ class SourceHealth:
             engine_thread_alive=engine_thread_alive,
             lag_bytes=sample.lag_bytes if sample is not None else None,
             quiet_source_ready=quiet_ready,
+            route_mismatch=route_mismatch,
+            route_mismatch_observed_at=sample.at if route_mismatch else None,
         )
 
     def outstanding_bytes(self, received_high_water: int | None) -> int | None:

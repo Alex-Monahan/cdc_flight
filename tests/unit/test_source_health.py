@@ -179,6 +179,44 @@ def test_service_witness_rejects_membership_without_configured_route():
     assert summary["source_publication_has_configured_tables"] is False
 
 
+def test_excluded_route_starts_the_service_dark_clock_at_the_route_observation():
+    health = SourceHealth(
+        dsn="postgresql://unused",
+        slot_name="slot",
+        publication_name="cdc_flight_pub",
+        capture_tables=("app.orders",),
+    )
+    observed_at = time.monotonic() - 3.0
+    health._ingest(
+        SlotSample(
+            at=observed_at,
+            exists=True,
+            active=True,
+            confirmed_pos=100,
+            lag_bytes=0,
+            publication_has_tables=True,
+            publication_has_configured_tables=False,
+        )
+    )
+
+    assert _service_status(health) == "unproven"
+    assert health.dark_for >= 2.5
+
+    health._ingest(
+        SlotSample(
+            at=time.monotonic(),
+            exists=True,
+            active=True,
+            confirmed_pos=100,
+            lag_bytes=0,
+            publication_has_tables=True,
+            publication_has_configured_tables=True,
+        )
+    )
+    assert _service_status(health) == "connected_quiet"
+    assert health.dark_for < 1.0
+
+
 def test_service_witness_accepts_a_completed_caught_up_quiet_route_without_data_ack():
     """An empty but valid configured source is quiet, not inert or stalled."""
     health = _active_health(lag_bytes=3_315_744)
