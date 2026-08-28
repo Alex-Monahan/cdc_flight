@@ -142,8 +142,15 @@ def _source_from_environment(env: dict[str, str]) -> SourceConfig:
     )
 
 
-def _slot_exists(env: dict[str, str], slot: str) -> bool:
-    """Return whether PostgreSQL finished creating this child's slot."""
+def _slot_is_active(env: dict[str, str], slot: str) -> bool:
+    """Return whether this child finished source startup and owns its slot.
+
+    A row in ``pg_replication_slots`` is not the end of logical startup.  During
+    an initial snapshot PostgreSQL has already created the slot, but the snapshot
+    transaction can still block another ``CREATE_REPLICATION_SLOT`` from reaching
+    its consistent point.  Keep the physical-cluster gate until this child's
+    walsender is active; a child that dies before then releases it via ``poll()``.
+    """
     try:
         source = _source_from_environment(env)
         with psycopg.connect(
@@ -154,7 +161,8 @@ def _slot_exists(env: dict[str, str], slot: str) -> bool:
         ) as conn:
             return bool(
                 conn.execute(
-                    "SELECT 1 FROM pg_replication_slots WHERE slot_name = %s",
+                    "SELECT 1 FROM pg_replication_slots "
+                    "WHERE slot_name = %s AND active",
                     (slot,),
                 ).fetchone()
             )
@@ -190,7 +198,7 @@ def _release_slot_startup_lock_when_ready(
     deadline = time.monotonic() + SLOT_STARTUP_LOCK_TIMEOUT_SECONDS
     try:
         while process.poll() is None:
-            if _slot_exists(env, slot):
+            if _slot_is_active(env, slot):
                 return
             if time.monotonic() >= deadline:
                 # The child has its own bounded startup/pytest timeout.  Do not
