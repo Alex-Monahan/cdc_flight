@@ -78,6 +78,9 @@ def apply_units(
         ignored_tables=applier.ignored_source_tables,
         excluded_tables=excluded_tables,
         contain_table_failure=applier._contain_table_failure,
+        source_cluster_id=applier.source_cluster_id,
+        source_timeline=applier.source_timeline,
+        strict_event_identity=applier.strict_event_identity,
     )
     for unit in group:
         if unit.fenced:

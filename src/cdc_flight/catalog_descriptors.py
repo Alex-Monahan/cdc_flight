@@ -172,6 +172,7 @@ class RelationDescriptorProvider:
 
     relations: dict[str, dict[str, SourceTypeDescriptor]]
     source_dsn: str | None = None
+    relation_generations: dict[str, str] = field(default_factory=dict)
     _event_read_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
     )
@@ -242,6 +243,25 @@ class RelationDescriptorProvider:
                     for schema, table, target in requested
                 ),
             )
+        generations: dict[str, str] = {}
+        try:
+            generation_rows = con.execute(
+                "SELECT n.nspname, c.relname, c.oid::bigint, "
+                "c.relfilenode::bigint, c.reltype::bigint "
+                "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                f"WHERE ({' OR '.join('(n.nspname = %s AND c.relname = %s)' for _ in requested)})",
+                params,
+            ).fetchall()
+        except Exception:
+            generation_rows = ()
+        for row in generation_rows:
+            if len(row) != 5:
+                continue
+            schema, table, oid, filenode, type_oid = row
+            generations[f"{schema}.{table}"] = (
+                f"{int(oid)}:{'' if filenode is None else int(filenode)}:"
+                f"{'' if type_oid is None else int(type_oid)}"
+            )
         result: dict[str, dict[str, SourceTypeDescriptor]] = {}
         for schema, table, name, oid, typmod, formatted in rows:
             oid = int(oid)
@@ -261,10 +281,17 @@ class RelationDescriptorProvider:
                     refusal_origin="catalog_descriptor",
                 ) from exc
             result.setdefault(f"{schema}.{table}", {})[normalize(str(name))] = descriptor
-        return cls(result, source_dsn=source_dsn)
+        return cls(
+            result,
+            source_dsn=source_dsn,
+            relation_generations=generations,
+        )
 
     def descriptors_for(self, qualified: str) -> dict[str, SourceTypeDescriptor]:
         return dict(self.relations.get(str(qualified), {}))
+
+    def relation_generation_for(self, qualified: str) -> str | None:
+        return self.relation_generations.get(str(qualified))
 
     def read_event_columns(self, event, value_columns):
         """Recover omitted opaque-array fields through one bounded source session."""

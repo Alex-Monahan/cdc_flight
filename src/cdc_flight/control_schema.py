@@ -195,7 +195,12 @@ CONTROL_DDL = [
             source_ts_ms   BIGINT,
             before_json    VARCHAR,
             after_json     VARCHAR,
-            key_json       VARCHAR
+            key_json       VARCHAR,
+            source_cluster_id VARCHAR,
+            source_timeline BIGINT,
+            relation_generation VARCHAR,
+            commit_lsn     BIGINT,
+            policy_epoch   BIGINT
         )""",
     # rubric 1.5. The audit trail for everything that happens to a table rather than
     # to a row: TRUNCATE, DROP, a drop-and-recreate, leaving or joining the
@@ -273,6 +278,48 @@ CONTROL_DDL = [
             image_digest    VARCHAR,
             applied_at      TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (pipeline, target_table, event_id)
+        )""",
+    # One ledger for every source event shape, not only keyless rows.  The row is
+    # inserted by the applier before physical DML and in the same destination
+    # transaction.  Source table/key are collision guards; neither is allowed to
+    # become the identity of an arbitrary keyless row.
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.event_ledger (
+            pipeline             VARCHAR NOT NULL,
+            target_table         VARCHAR NOT NULL,
+            event_id             VARCHAR NOT NULL,
+            operation            VARCHAR,
+            payload_digest       VARCHAR NOT NULL,
+            state                VARCHAR NOT NULL,
+            source_schema        VARCHAR,
+            source_table         VARCHAR,
+            source_cluster_id    VARCHAR,
+            source_timeline      BIGINT,
+            relation_generation  VARCHAR,
+            source_lsn           BIGINT,
+            commit_lsn           BIGINT,
+            txn_id               VARCHAR,
+            total_order          BIGINT,
+            key_guard_digest     VARCHAR,
+            policy_epoch         BIGINT NOT NULL DEFAULT 0,
+            snapshot_epoch       BIGINT,
+            applied_at           TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (pipeline, target_table, event_id)
+        )""",
+    # The SCD2 relation metadata is control-plane state, while history rows are
+    # destination data.  Both are written by one commit-group transaction.
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.scd2_bundles (
+            pipeline             VARCHAR NOT NULL,
+            source_schema        VARCHAR NOT NULL,
+            source_table         VARCHAR NOT NULL,
+            target_table         VARCHAR NOT NULL,
+            history_table        VARCHAR NOT NULL,
+            current_view         VARCHAR NOT NULL,
+            relation_generation  VARCHAR NOT NULL,
+            key_columns          VARCHAR[] NOT NULL,
+            policy_epoch         BIGINT NOT NULL DEFAULT 0,
+            state                VARCHAR NOT NULL DEFAULT 'active',
+            updated_at           TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (pipeline, source_schema, source_table)
         )""",
     # A schema fold can be safely refused but must not become an infinite invisible
     # retry.  This row is written after the failed data transaction rolls back and
@@ -539,6 +586,36 @@ def _migrate_legacy_lease(con, control_schema: str | None = None) -> None:
     )
 
 
+def _migrate_spill_events(con, control_schema: str | None = None) -> None:
+    """Add source-lineage columns to a pre-§7 spill table.
+
+    Spill rows are only an in-transaction staging representation, but an existing
+    destination can contain one when a process is restarted.  The migration is
+    additive and keeps the old rows readable by the compatibility identity path.
+    """
+    schema = resolve_control_schema(control_schema)
+    table = quote(schema) + ".spill_events"
+    existing = {
+        str(row[0])
+        for row in con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = ? AND table_name = 'spill_events'",
+            [schema],
+        ).fetchall()
+    }
+    for name, type_name in (
+        ("source_cluster_id", "VARCHAR"),
+        ("source_timeline", "BIGINT"),
+        ("relation_generation", "VARCHAR"),
+        ("commit_lsn", "BIGINT"),
+        ("policy_epoch", "BIGINT"),
+    ):
+        if name not in existing:
+            con.execute(
+                f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {quote(name)} {type_name}"
+            )
+
+
 def ensure_control_schema(con, control_schema: str | None = None) -> None:
     """Create the current control schema and apply its additive lease migration."""
     con.execute("BEGIN TRANSACTION")
@@ -546,6 +623,7 @@ def ensure_control_schema(con, control_schema: str | None = None) -> None:
         for statement in control_ddl(control_schema):
             con.execute(statement)
         _migrate_legacy_lease(con, control_schema)
+        _migrate_spill_events(con, control_schema)
         con.execute("COMMIT")
     except BaseException:
         with contextlib.suppress(Exception):

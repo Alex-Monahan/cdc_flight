@@ -110,6 +110,15 @@ class PendingRecord:
     lsn: int | None = None
     txn_id: str | None = None
     total_order: int | None = None
+    #: Source lineage facts are optional on the stock envelope.  The applier fills
+    #: the cluster/timeline from the durable slot observation and the relation
+    #: generation from the catalog when the converter does not carry them.
+    source_cluster_id: str | None = None
+    source_timeline: int | None = None
+    relation_generation: str | None = None
+    #: PostgreSQL transaction commit LSN, distinct from the event's own WAL LSN.
+    commit_lsn: int | None = None
+    policy_epoch: int = 0
     data_collection_order: int | None = None
     source_ts_ms: int | None = None
     snapshot: str | None = None
@@ -361,6 +370,16 @@ def decode(raw: Any, *, topic_prefix: str, want_offsets: bool = False) -> Pendin
     rec.schema = source.get("schema")
     rec.table = source.get("table")
     rec.lsn = source.get("lsn") or _offset_lsn(rec.source_offset)
+    rec.source_cluster_id = _as_str(
+        source.get("system_identifier", source.get("system_id", source.get("cluster_id")))
+    )
+    rec.source_timeline = _as_int(
+        source.get("timeline_id", source.get("timeline"))
+    )
+    rec.relation_generation = _as_str(
+        source.get("relation_generation", source.get("relation_gen"))
+    )
+    rec.commit_lsn = _as_int(source.get("commit_lsn"))
     rec.source_ts_ms = source.get("ts_ms")
     rec.snapshot = _as_str(source.get("snapshot"))
     rec.value_schema = value_schema
@@ -452,6 +471,15 @@ def _offset_lsn(offset: dict[str, Any] | None) -> int | None:
         if isinstance(value, int):
             return value
     return None
+
+
+def _as_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _unwrap_schema_payload(payload: Any) -> tuple[dict[str, Any] | None, Any]:

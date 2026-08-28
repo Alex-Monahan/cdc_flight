@@ -18,7 +18,11 @@ from typing import Any
 from . import faults, table_lifecycle
 from .config import resolve_control_schema, resolve_motherduck_database
 from .control_schema import CONTROL_DDL, ensure_control_schema
-from .errors import CANONICAL_REFUSAL_CLASS, OffsetUnusable  # noqa: F401
+from .errors import (  # noqa: F401
+    CANONICAL_REFUSAL_CLASS,
+    DestinationIdentityCollision,
+    OffsetUnusable,
+)
 from .machines import (
     KEYLESS_EVENT,
     KEYLESS_EVENT_APPLIED,
@@ -599,6 +603,106 @@ def write_keyless_events(
         normalized,
         [VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, "TIMESTAMPTZ"],
     )
+
+
+def read_event_ledger(
+    con,
+    *,
+    pipeline: str,
+    target_table: str,
+    event_id: str,
+    control_schema: str | None = None,
+) -> dict[str, Any] | None:
+    """Read one shared event-ledger row from the caller's open transaction."""
+    columns = (
+        "operation, payload_digest, state, source_schema, source_table, "
+        "source_cluster_id, source_timeline, relation_generation, source_lsn, "
+        "commit_lsn, txn_id, total_order, key_guard_digest, policy_epoch, "
+        "snapshot_epoch, applied_at"
+    )
+    row = con.execute(
+        f"SELECT {columns} FROM {_control_table(control_schema, 'event_ledger')} "
+        "WHERE pipeline = ? AND target_table = ? AND event_id = ?",
+        [pipeline, target_table, event_id],
+    ).fetchone()
+    if row is None:
+        return None
+    names = (
+        "operation", "payload_digest", "state", "source_schema", "source_table",
+        "source_cluster_id", "source_timeline", "relation_generation", "source_lsn",
+        "commit_lsn", "txn_id", "total_order", "key_guard_digest", "policy_epoch",
+        "snapshot_epoch", "applied_at",
+    )
+    return {
+        "pipeline": pipeline,
+        "target_table": target_table,
+        "event_id": event_id,
+        **dict(zip(names, row, strict=True)),
+    }
+
+
+def claim_event_ledger(
+    con,
+    identity,
+    *,
+    pipeline: str,
+    target_table: str,
+    source_lsn: int | None = None,
+    control_schema: str | None = None,
+) -> bool:
+    """Claim an event in the current data transaction.
+
+    Returns ``True`` when the exact event was already applied.  It is important
+    that the existing-row read and a new-row insert happen on ``con``: this is
+    deliberately not a receipt connection and deliberately not a second commit.
+    """
+    from .event_ledger import assert_same_identity
+
+    existing = read_event_ledger(
+        con,
+        pipeline=pipeline,
+        target_table=target_table,
+        event_id=identity.event_id,
+        control_schema=control_schema,
+    )
+    if existing is not None:
+        try:
+            assert_same_identity(existing, identity)
+        except DestinationIdentityCollision as collision:
+            collision.target = target_table
+            raise
+        return str(existing["state"]) == "applied"
+
+    con.execute(
+        f"INSERT INTO {_control_table(control_schema, 'event_ledger')} "
+        "(pipeline, target_table, event_id, operation, payload_digest, state, "
+        " source_schema, source_table, source_cluster_id, source_timeline, "
+        " relation_generation, source_lsn, commit_lsn, txn_id, total_order, "
+        " key_guard_digest, policy_epoch, snapshot_epoch, applied_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            pipeline,
+            target_table,
+            identity.event_id,
+            identity.operation,
+            identity.payload_digest,
+            "applied",
+            identity.source_schema,
+            identity.source_table,
+            identity.source_cluster_id,
+            identity.source_timeline,
+            identity.relation_generation,
+            source_lsn,
+            identity.commit_lsn,
+            identity.txn_id,
+            identity.total_order,
+            identity.key_guard_digest,
+            identity.policy_epoch,
+            identity.snapshot_epoch,
+            now(),
+        ],
+    )
+    return False
 
 
 # The destination coordinator keeps the stable public module surface while the
