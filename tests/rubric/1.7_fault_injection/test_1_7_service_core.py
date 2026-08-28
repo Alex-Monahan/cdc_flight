@@ -1594,7 +1594,17 @@ def _run_one_service_cut(box: Sandbox, cut: str) -> dict:
     assert baseline_resume, "service matrix baseline has no durable resume point"
     baseline_lsn = int(baseline_resume[0][0])
     tag = f"service-cut-row-{cut}"
-    if cut in {*INHERITED_SERVICE_CUTS, "service_callback_midstream"}:
+    if cut in {
+        *INHERITED_SERVICE_CUTS,
+        "service_callback_midstream",
+        # Renewal and the heartbeat write are reached only after the service has
+        # observed a real delivered-data witness.  The matrix must create that
+        # witness; a quiet service correctly refuses renewal and leaves the cut
+        # unreachable, which would make this a fixture failure rather than a
+        # proof of the named production boundary.
+        "service_lease_renewal",
+        "service_heartbeat_write",
+    }:
         # The matrix arm is in the service callback, not in this test process.
         box.sql(
             [
