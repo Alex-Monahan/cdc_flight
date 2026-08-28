@@ -144,6 +144,13 @@ class GroupPlan:
         self._keyless_event_states: dict[tuple[str, str], str | None] = {}
         self._history_mode_cache: dict[str, str] = {}
         self._active_commit_lsn: int | None = None
+        # Event claims are collected while the source callback is admitted, then
+        # written in one batch immediately before physical materialization.  This
+        # keeps the ledger in this transaction without turning a large snapshot
+        # callback into one destination round trip per row.
+        self._event_ledger = destination.EventLedgerBatch(
+            con, pipeline=self.pipeline, control_schema=self._control_schema
+        ) if self.pipeline else None
         self.scd2_events: list[scd2.SCD2Event] = []
         self.scd2_bundles: dict[str, scd2.SCD2RelationBundle] = {}
 
@@ -554,6 +561,8 @@ class GroupPlan:
                 target_table=target,
                 source_lsn=event.lsn,
                 control_schema=control_schema,
+                ledger=self._event_ledger,
+                snapshot=snapshot is not None or event.incremental,
         ):
             self.source_tables.add(f"{event.schema}.{event.table}")
             return
@@ -945,6 +954,11 @@ class GroupPlan:
         fire *between* two `table_writer.write()` calls (Codex 6).
         """
         anchor_called = False
+        # Claims are part of the same open destination transaction and must precede
+        # both SCD2 history DML and current-table materialization.  A rollback
+        # discards this batch together with the data/state transaction.
+        if self._event_ledger is not None:
+            self._event_ledger.flush()
         for event in self.scd2_events:
             result = scd2.apply_event(
                 self.con,

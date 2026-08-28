@@ -236,6 +236,62 @@ def test_shared_ledger_rejects_same_id_with_conflicting_payload():
         con.close()
 
 
+def test_snapshot_ledger_batch_claims_before_dml_and_replays_as_noop():
+    con = _con()
+    try:
+        first = _event("r", 100, key=None, after={"value": "one"})
+        second = _event("r", 101, key=None, after={"value": "two"}, total_order=2)
+        first_identity = _identity(first, event_id="snap:8:app.rows:1")
+        second_identity = _identity(second, event_id="snap:8:app.rows:2")
+        batch = destination.EventLedgerBatch(con, pipeline="p78")
+
+        con.execute("BEGIN")
+        assert not destination.claim_event_ledger(
+            con,
+            first_identity,
+            pipeline="p78",
+            target_table="target",
+            source_lsn=first_identity.source_lsn,
+            ledger=batch,
+            snapshot=True,
+        )
+        assert not destination.claim_event_ledger(
+            con,
+            second_identity,
+            pipeline="p78",
+            target_table="target",
+            source_lsn=second_identity.source_lsn,
+            ledger=batch,
+            snapshot=True,
+        )
+        batch.flush()
+        con.execute("COMMIT")
+
+        replay = destination.EventLedgerBatch(con, pipeline="p78")
+        con.execute("BEGIN")
+        assert destination.claim_event_ledger(
+            con,
+            first_identity,
+            pipeline="p78",
+            target_table="target",
+            source_lsn=first_identity.source_lsn,
+            ledger=replay,
+            snapshot=True,
+        )
+        assert destination.claim_event_ledger(
+            con,
+            second_identity,
+            pipeline="p78",
+            target_table="target",
+            source_lsn=second_identity.source_lsn,
+            ledger=replay,
+            snapshot=True,
+        )
+        con.execute("ROLLBACK")
+    finally:
+        con.close()
+
+
 def test_scd2_close_insert_tombstone_and_duplicate_replay():
     con = _con()
     try:
