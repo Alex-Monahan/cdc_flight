@@ -7,6 +7,7 @@ from cdc_flight import destination, event_ledger, scd2
 from cdc_flight.control_schema import ensure_control_schema
 from cdc_flight.envelope import KIND_DATA, PendingRecord
 from cdc_flight.errors import AmbiguousDelete, DestinationIdentityCollision
+from cdc_flight.snapshot import SnapshotCoordinator
 
 
 def _event(
@@ -155,6 +156,37 @@ def test_snapshot_and_incremental_identities_are_ledger_eligible():
     inc_identity = _identity(incremental)
     assert initial.ledger_eligible and initial.snapshot_epoch == 7
     assert inc_identity.ledger_eligible and inc_identity.snapshot_epoch == 0
+
+
+def test_snapshot_epoch_comes_from_durable_ledger_and_ignores_unscoped_rows():
+    con = _con()
+    try:
+        con.execute(
+            "INSERT INTO _cdc_flight.event_ledger "
+            "(pipeline, target_table, event_id, payload_digest, state, "
+            "applied_at, snapshot_epoch) VALUES (?, ?, ?, ?, ?, current_timestamp, ?)",
+            ["p78", "target", "snap:7:app.rows:1", "digest", "applied", 7],
+        )
+        con.execute(
+            "INSERT INTO _cdc_flight.event_ledger "
+            "(pipeline, target_table, event_id, payload_digest, state, applied_at) "
+            "VALUES (?, ?, ?, ?, ?, current_timestamp)",
+            ["p78", "target", "v2:stream", "digest", "applied"],
+        )
+        coordinator = SnapshotCoordinator(
+            con,
+            dataset="cdc_raw",
+            pipeline="p78",
+            topic_prefix="cdcflight",
+            created_in_txn=lambda: set(),
+            get_registry=lambda: None,
+            epoch=1,
+            transactional_ddl=True,
+        )
+        assert coordinator.epoch == 7
+        assert event_ledger.latest_snapshot_epoch(con, pipeline="missing") == 0
+    finally:
+        con.close()
 
 
 def test_shared_ledger_rolls_back_with_keyless_data_and_replays_after_commit():

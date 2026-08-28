@@ -145,6 +145,32 @@ def relation_generation_for(
     return None
 
 
+def latest_snapshot_epoch(
+    con, *, pipeline: str, control_schema: str | None = None
+) -> int:
+    """Return the highest committed initial-snapshot epoch for ``pipeline``.
+
+    A process-local snapshot counter is not enough after a crash: a recovery run
+    can have no durable resume row while the earlier snapshot's ledger rows are
+    still committed.  Reading the durable ledger before opening the next snapshot
+    keeps its ``snap:`` identities disjoint without adding a second destination
+    transaction.  Older destinations may not have the additive ledger table yet;
+    the caller's resume epoch remains authoritative in that compatibility case.
+    """
+    try:
+        from .naming import control_table
+
+        row = con.execute(
+            f"SELECT max(snapshot_epoch) FROM "
+            f"{control_table(resolve_control_schema(control_schema), 'event_ledger')} "
+            "WHERE pipeline = ? AND snapshot_epoch IS NOT NULL",
+            [pipeline],
+        ).fetchone()
+    except Exception:
+        return 0
+    return int(row[0] or 0) if row is not None else 0
+
+
 def _component(value: Any) -> str:
     raw = str(value).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=") or "_"
@@ -357,6 +383,7 @@ __all__ = [
     "canonical_json",
     "identity_for",
     "key_guard_digest",
+    "latest_snapshot_epoch",
     "payload_digest",
     "relation_generation_for",
     "relation_generation_from_relation",

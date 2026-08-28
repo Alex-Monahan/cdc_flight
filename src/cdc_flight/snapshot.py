@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from . import naming, table_lifecycle
+from . import event_ledger, naming, table_lifecycle
 from .envelope import PendingRecord
 from .errors import ResumePointDrift
 from .faults import maybe_crash
@@ -87,7 +87,16 @@ class SnapshotCoordinator:
         #: a callable, because `_rollback_quietly` rebuilds the registry (a
         #: rolled-back CREATE would otherwise leave the cached shape lying).
         self._get_registry = get_registry
-        self.epoch = epoch
+        # The resume row can disappear during a journalled recovery while the
+        # earlier snapshot's data and ledger rows remain committed.  Start from the
+        # durable ledger as well as the resume point, so a new process never reuses
+        # a prior ``snap:<epoch>:...`` identity for a different snapshot image.
+        self.epoch = max(
+            int(epoch or 0),
+            event_ledger.latest_snapshot_epoch(
+                con, pipeline=pipeline, control_schema=control_schema
+            ),
+        )
         self.transactional_ddl = transactional_ddl
         self.control_schema = control_schema
         #: Optional callback owned by a bounded re-snapshot.  It runs after the
