@@ -79,8 +79,13 @@ def boundary(tmp_path_factory, postgres_cluster):
     writer = Writer(postgres_cluster.dsn)
     try:
         box.reseed()
-        proc = box.spawn(max_seconds=180, idle_seconds=8)
+        # Start the workload before the engine can reach its completion watermark.
+        # Under a loaded xdist worker, starting the writer after ``spawn`` can let a
+        # fast initial snapshot finish and arm the watermark before the writer has
+        # committed its first batch; those later rows are then correctly outside this
+        # run, but no longer exercise the snapshot/stream boundary this fixture names.
         writer.start()
+        proc = box.spawn(max_seconds=180, idle_seconds=8)
         time.sleep(WRITER_SECONDS)
         writer.stop()
         returncode = proc.wait(timeout=240)
