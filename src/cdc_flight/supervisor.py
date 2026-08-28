@@ -246,6 +246,15 @@ def run_engine_bounded(
     source_dark_after: float | None = None
     engine_thread_alive_at_source_dark = False
     source_unobservable_after: float | None = None
+    live_queue_probe = getattr(engine, "probe_live_queue", None)
+    live_queue_metrics: dict | None = None
+    # The effective connector configuration is validated while the stock engine is
+    # built.  The live task/queue object is evidence retained when it becomes visible,
+    # but its reflection must not become a second startup/liveness clock: a short
+    # finite run under host contention can reach its declared stop before Java has
+    # published the private task list.  An initialized queue/config mismatch remains
+    # a hard failure inside ``probe_live_queue``; the real live-task proof is the
+    # dedicated performance test.
     drain_started_at: float | None = None
     source_probe_bound = min(
         run.source_probe_startup_seconds,
@@ -262,6 +271,24 @@ def run_engine_bounded(
                 service_context.rearm_process_signals()
                 service_context.set_engine_thread_alive(thread.is_alive())
             elapsed = time.monotonic() - started
+            if live_queue_probe is not None:
+                try:
+                    observed_queue = live_queue_probe()
+                    # Keep polling after startup: the queue object exposes a
+                    # transient occupancy, and the engine retains its
+                    # high-water mark for the final evidence.  A None result
+                    # after a successful proof means the stock task is already
+                    # tearing down; retain the last verified measurement.
+                    if observed_queue is not None:
+                        live_queue_metrics = observed_queue
+                except BaseException as exc:
+                    # A queue that cannot be inspected is a startup/configuration
+                    # failure, not a reason to continue with an unbounded count-only
+                    # admission path.  The common teardown below preserves the
+                    # engine's own completion message as a consequence of this cause.
+                    error_box.append(exc)
+                    outcome.record("engine_error")
+                    break
             if service_mode and health is not None:
                 # The sampler is independent corroboration.  The service verdict
                 # also receives the live engine thread and the callback/commit/ack
@@ -598,6 +625,13 @@ def run_engine_bounded(
             # is polled at the ordinary granularity.
             time.sleep(0.05 if watermark.state == WATERMARK_ARMED else 0.25)
         else:
+            if live_queue_probe is not None and live_queue_metrics is None:
+                error_box.append(
+                    EngineFailure(
+                        "stock Debezium engine stopped before its source-task queue "
+                        "could be inspected; refusing an unproven queue configuration"
+                    )
+                )
             if service_mode:
                 # A service engine has no legitimate self-terminating success path.
                 # Evaluate the final sample with the thread explicitly dead before
@@ -901,6 +935,8 @@ def run_engine_bounded(
     }
     if service_mode:
         summary["engine_thread_dead"] = not thread.is_alive()
+    if live_queue_metrics is not None:
+        summary["live_queue"] = live_queue_metrics
     summary.update(completion.as_dict())
     if watermark is None:
         summary.update(

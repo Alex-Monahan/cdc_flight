@@ -88,6 +88,13 @@ def test_properties_configure_the_full_envelope(tmp_path):
     assert props["offset.flush.interval.ms"] == "0"
 
 
+def test_properties_install_the_stock_queue_byte_bound(tmp_path):
+    props = build_properties(SourceConfig(), ReplicationConfig(state_dir=tmp_path))
+
+    assert props["max.queue.size.in.bytes"] == "134217728"
+    assert props["max.queue.size"] == "8192"
+
+
 def test_the_lsn_flush_mode_is_pinned_to_connector(tmp_path):
     """Invariant O depends on it, and the safe value is only a Debezium *default*.
 
