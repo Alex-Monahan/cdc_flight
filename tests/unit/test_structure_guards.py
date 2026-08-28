@@ -17,7 +17,7 @@ import pytest
 #: The expected values below subtract only this guard module.
 _BASELINE_SELECTED = {
     "not motherduck and not slow": 2298,
-    "slow and not motherduck": 236,
+    "slow and not motherduck": 240,
     # The quiet-holder and stock-walsender retry proofs are MotherDuck-only real
     # process nodes; a local DuckDB file lock cannot exercise cloud takeover while
     # the old process retains its handle.
