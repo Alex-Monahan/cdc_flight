@@ -7,6 +7,7 @@ from BEGIN through the guarded COMMIT/ack boundary and post-commit bookkeeping.
 from __future__ import annotations
 
 import functools
+import time
 
 from . import commit_metadata, destination, offsets, self_heal, table_writer
 from .commit_group import CommitResult, OpenGroup
@@ -242,6 +243,10 @@ def commit_group(self, trigger: str) -> CommitResult:
                     self.service_context.assert_writable()
                 self.con.execute("COMMIT")
                 self.group.txn_open = False
+                # The supervisor uses this exact post-COMMIT instant to measure
+                # the source-slot confirmation hand-off.  It is diagnostic only
+                # and is not read from the COMMIT_ACK critical section.
+                self.last_commit_monotonic = time.monotonic()
                 if self.service_context is not None and has_data:
                     # A durable destination commit is real forward motion.  A
                     # lease heartbeat, bookkeeping-only group, or supervisor loop

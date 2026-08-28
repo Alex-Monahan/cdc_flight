@@ -375,6 +375,9 @@ class Applier:
         self.watermark_fenced_events = 0
         self.table_counts: dict[str, int] = {}
         self.last_commit_id = resume_point.commit_id
+        #: Set immediately after the destination COMMIT for supervisor timing
+        #: evidence; it is never used to authorize an acknowledgement.
+        self.last_commit_monotonic: float | None = None
         self.error: BaseException | None = None
         self._next_commit_id = destination.next_commit_id(
             con, pipeline, control_schema=self.control_schema
