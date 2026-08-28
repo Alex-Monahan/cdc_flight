@@ -486,6 +486,24 @@ def run(
             summary_extra["recovery_journal"] = journal.as_dict()
             faults_mod.runtime_state(recovery_phase=journal.phase)
 
+        if source.role == "standby":
+            # Acquisition may deliberately drop a slot whose position outruns an
+            # untrusted destination.  Do not let stock Debezium silently turn that
+            # state into a slow CREATE_REPLICATION_SLOT attempt on a hot standby:
+            # the supported standby contract requires an operator/local-slot
+            # administration step before the engine starts.  This second read-only
+            # check names the missing fact and fails before the callback lifecycle
+            # exists, rather than treating a JDBC timeout as a standby proof.
+            standby = standby_mod.inspect(
+                source.dsn,
+                replication.slot_name,
+                primary_dsn=source.primary_dsn,
+                physical_slot_name=source.physical_slot_name,
+                connect_timeout=run_cfg.jdbc_connect_timeout_seconds,
+                statement_timeout_ms=run_cfg.jdbc_socket_timeout_seconds * 1000,
+            )
+            summary_extra["standby_capability_after_acquisition"] = standby.as_dict()
+
         phases.ensure(PHASE_RECONCILING)
         reconciliation = reconcile_mod.reconcile(
             con,
