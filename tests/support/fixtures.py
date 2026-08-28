@@ -10,6 +10,7 @@ names databases, slots, and other non-authority resources.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from collections.abc import Iterator
@@ -36,6 +38,8 @@ PROJECT_DIR = Path(__file__).resolve().parents[2]
 VENV_BIN = PROJECT_DIR / ".venv" / "bin"
 MATRIX_CHILD = PROJECT_DIR / "tests" / "support" / "crash_matrix_child.py"
 SANDBOX_IDLE_SECONDS = 6
+SLOT_STARTUP_LOCK_TIMEOUT_SECONDS = 180.0
+SLOT_STARTUP_POLL_SECONDS = 0.1
 
 #: Debezium delivers a transactional logical message exactly like any other source
 #: transaction: BEGIN, the message, END. `cdc_flight` writes two kinds, and they
@@ -125,6 +129,128 @@ def _executable(name: str) -> str:
     """Prefer the project venv's console scripts, fall back to PATH."""
     candidate = VENV_BIN / name
     return str(candidate) if candidate.exists() else name
+
+
+def _source_from_environment(env: dict[str, str]) -> SourceConfig:
+    """Build the already-validated local source used by a child process."""
+    return SourceConfig(
+        host=env.get("PGHOST", "127.0.0.1"),
+        port=int(env.get("PGPORT", env.get("CDC_TEST_PGPORT", "15432"))),
+        user=env.get("PGUSER", "postgres"),
+        password=env.get("PGPASSWORD", "postgres"),
+        dbname=env.get("PGDATABASE", env.get("CDC_TEST_PGDATABASE", "cdc_source")),
+    )
+
+
+def _slot_exists(env: dict[str, str], slot: str) -> bool:
+    """Return whether PostgreSQL finished creating this child's slot."""
+    try:
+        source = _source_from_environment(env)
+        with psycopg.connect(
+            source.dsn,
+            autocommit=True,
+            connect_timeout=2,
+            options="-c statement_timeout=1000",
+        ) as conn:
+            return bool(
+                conn.execute(
+                    "SELECT 1 FROM pg_replication_slots WHERE slot_name = %s",
+                    (slot,),
+                ).fetchone()
+            )
+    except Exception:
+        # A busy cluster can reject one probe while the child is still making
+        # progress.  Keep the gate until the next bounded probe or child exit.
+        return False
+
+
+def _acquire_slot_startup_lock(path: Path) -> Any:
+    """Acquire the physical-cluster startup gate with a finite wait."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+")
+    deadline = time.monotonic() + SLOT_STARTUP_LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                handle.close()
+                raise TimeoutError(
+                    "timed out waiting for the physical-cluster logical-slot "
+                    f"startup gate {path}"
+                ) from None
+            time.sleep(SLOT_STARTUP_POLL_SECONDS)
+
+
+def _release_slot_startup_lock_when_ready(
+    handle: Any, process: subprocess.Popen, env: dict[str, str], slot: str
+) -> None:
+    """Release the gate once slot creation completes, never after the whole run."""
+    deadline = time.monotonic() + SLOT_STARTUP_LOCK_TIMEOUT_SECONDS
+    try:
+        while process.poll() is None:
+            if _slot_exists(env, slot):
+                return
+            if time.monotonic() >= deadline:
+                # The child has its own bounded startup/pytest timeout.  Do not
+                # let one unobservable child strand every xdist worker behind a
+                # kernel lock; a later child will still report its own setup state.
+                return
+            time.sleep(SLOT_STARTUP_POLL_SECONDS)
+    finally:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
+
+
+def _popen_with_slot_startup_gate(
+    command: list[str],
+    *,
+    env: dict[str, str],
+    cwd: Path,
+    stdout,
+    stderr,
+    text: bool,
+) -> subprocess.Popen:
+    """Start one child while serializing only its logical-slot creation."""
+    lock_name = env.get("CDC_TEST_SLOT_STARTUP_LOCK")
+    if not lock_name:
+        return subprocess.Popen(
+            command,
+            env=env,
+            cwd=cwd,
+            stdout=stdout,
+            stderr=stderr,
+            text=text,
+        )
+
+    handle = _acquire_slot_startup_lock(Path(lock_name))
+    try:
+        process = subprocess.Popen(
+            command,
+            env=env,
+            cwd=cwd,
+            stdout=stdout,
+            stderr=stderr,
+            text=text,
+        )
+    except BaseException:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
+        raise
+
+    slot = env.get("CDC_SLOT_NAME")
+    if not slot:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
+        return process
+    threading.Thread(
+        target=_release_slot_startup_lock_when_ready,
+        args=(handle, process, env, slot),
+        name=f"slot-startup-gate-{slot[:24]}",
+        daemon=True,
+    ).start()
+    return process
 
 
 @pytest.fixture(autouse=True)
@@ -307,18 +433,24 @@ def _invoke_pipeline(
             expect_success=expect_success,
         )
 
-    proc = subprocess.run(
+    proc = _popen_with_slot_startup_gate(
         cmd,
-        capture_output=True,
-        text=True,
         env=env,
         cwd=PROJECT_DIR,
-        timeout=timeout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout, stderr = proc.communicate()
+        raise
     if expect_success and proc.returncode != 0:
         raise AssertionError(
-            f"pipeline exited {proc.returncode}\n--- stdout ---\n{proc.stdout[-4000:]}"
-            f"\n--- stderr ---\n{proc.stderr[-4000:]}"
+            f"pipeline exited {proc.returncode}\n--- stdout ---\n{stdout[-4000:]}"
+            f"\n--- stderr ---\n{stderr[-4000:]}"
         )
 
     # Debezium logs to stdout as well, so read the machine-readable summary the
@@ -327,10 +459,10 @@ def _invoke_pipeline(
     if summary_path.exists():
         summary = json.loads(summary_path.read_text())
     if expect_success:
-        assert summary, f"no run summary at {summary_path}\n{proc.stdout[-4000:]}"
+        assert summary, f"no run summary at {summary_path}\n{stdout[-4000:]}"
     summary["returncode"] = proc.returncode
     # Kept short on purpose: this dict is printed verbatim in assertion messages.
-    summary["output"] = (proc.stdout + proc.stderr)[-6000:]
+    summary["output"] = (stdout + stderr)[-6000:]
     return summary
 
 
@@ -351,12 +483,12 @@ def _invoke_pipeline_observing_exit(
     post-summary stall could never update. The child uses DEVNULL here so a noisy
     JVM cannot block the observer on a full pipe.
     """
-    proc = subprocess.Popen(
+    proc = _popen_with_slot_startup_gate(
         cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
         env=env,
         cwd=cwd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         text=True,
     )
     deadline = time.monotonic() + timeout
@@ -688,7 +820,7 @@ class Sandbox:
         ]
         if snapshot_mode:
             command += ["--snapshot-mode", snapshot_mode]
-        return subprocess.Popen(
+        return _popen_with_slot_startup_gate(
             command,
             env=env,
             cwd=PROJECT_DIR,
@@ -720,7 +852,7 @@ class Sandbox:
             else [_executable("cdc-flight-service")]
         )
         command = [*executable, "--destination", destination]
-        return subprocess.Popen(
+        return _popen_with_slot_startup_gate(
             command,
             env=env,
             cwd=PROJECT_DIR,
