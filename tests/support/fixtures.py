@@ -142,13 +142,18 @@ def _source_from_environment(env: dict[str, str]) -> SourceConfig:
     )
 
 
-def _slot_exists(env: dict[str, str], slot: str) -> bool:
+def _slot_creation_finished(env: dict[str, str], slot: str) -> bool:
     """Return whether PostgreSQL finished this child's slot-creation command.
 
     The gate protects the cluster-wide ``CREATE_REPLICATION_SLOT`` interval, not
     the rest of a Flight run.  In particular, a MotherDuck destination can take
     a long time to become usable before Debezium opens its source connection; the
     caller must not hold every other worker behind that unrelated destination work.
+
+    PostgreSQL exposes a logical slot row before a blocked
+    ``CREATE_REPLICATION_SLOT`` statement returns.  The row alone is therefore not
+    the completion predicate: release only after the row exists *and* the active
+    backend is no longer executing that slot's create statement.
     """
     try:
         source = _source_from_environment(env)
@@ -158,13 +163,19 @@ def _slot_exists(env: dict[str, str], slot: str) -> bool:
             connect_timeout=2,
             options="-c statement_timeout=1000",
         ) as conn:
-            return bool(
-                conn.execute(
-                    "SELECT 1 FROM pg_replication_slots "
-                    "WHERE slot_name = %s",
-                    (slot,),
-                ).fetchone()
-            )
+            row = conn.execute(
+                "SELECT EXISTS ("
+                "  SELECT 1 FROM pg_replication_slots WHERE slot_name = %s"
+                "), NOT EXISTS ("
+                "  SELECT 1 FROM pg_stat_activity "
+                "  WHERE datname = current_database() "
+                "    AND state = 'active' "
+                "    AND query ILIKE '%CREATE_REPLICATION_SLOT%' "
+                "    AND strpos(query, %s) > 0"
+                ")",
+                (slot, slot),
+            ).fetchone()
+            return bool(row and row[0] and row[1])
     except Exception:
         # A busy cluster can reject one probe while the child is still making
         # progress. Keep the gate until the next bounded probe or child exit.
@@ -205,7 +216,7 @@ def _release_slot_startup_lock_when_ready(
 
     try:
         while running():
-            if _slot_exists(env, slot):
+            if _slot_creation_finished(env, slot):
                 return
             if time.monotonic() >= deadline:
                 # The child has its own bounded startup/pytest timeout.  Do not
