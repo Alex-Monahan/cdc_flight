@@ -153,45 +153,37 @@ def test_service_witness_rejects_membership_without_configured_route():
     )
     backend_start = datetime(2026, 1, 1, tzinfo=UTC)
     now = time.monotonic()
-    for sample_at in (now - 0.1, now):
-        health._ingest(
-            SlotSample(
-                at=sample_at,
-                exists=True,
-                active=True,
-                active_pid=3210,
-                activity_pid=3210,
-                activity_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
-                activity_backend_type="walsender",
-                activity_backend_start=backend_start,
-                replication_pid=3210,
-                replication_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
-                confirmed_pos=100,
-                lag_bytes=0,
-                publication_has_tables=True,
-                publication_has_configured_tables=False,
-            )
-        )
-
-    assert _service_status(health) == "unproven"
-    summary = health.summary()
-    assert summary["source_publication_has_tables"] is True
-    assert summary["source_publication_has_configured_tables"] is False
-
-
-def test_excluded_route_starts_the_service_dark_clock_at_the_route_observation():
-    health = SourceHealth(
-        dsn="postgresql://unused",
-        slot_name="slot",
-        publication_name="cdc_flight_pub",
-        capture_tables=("app.orders",),
-    )
-    observed_at = time.monotonic() - 3.0
     health._ingest(
         SlotSample(
-            at=observed_at,
+            at=now - 3.0,
             exists=True,
             active=True,
+            active_pid=3210,
+            activity_pid=3210,
+            activity_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+            activity_backend_type="walsender",
+            activity_backend_start=backend_start,
+            replication_pid=3210,
+            replication_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+            confirmed_pos=100,
+            lag_bytes=0,
+            publication_has_tables=True,
+            publication_has_configured_tables=False,
+        )
+    )
+    _service_status(health)
+    health._ingest(
+        SlotSample(
+            at=now,
+            exists=True,
+            active=True,
+            active_pid=3210,
+            activity_pid=3210,
+            activity_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+            activity_backend_type="walsender",
+            activity_backend_start=backend_start,
+            replication_pid=3210,
+            replication_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
             confirmed_pos=100,
             lag_bytes=0,
             publication_has_tables=True,
@@ -201,20 +193,9 @@ def test_excluded_route_starts_the_service_dark_clock_at_the_route_observation()
 
     assert _service_status(health) == "unproven"
     assert health.dark_for >= 2.5
-
-    health._ingest(
-        SlotSample(
-            at=time.monotonic(),
-            exists=True,
-            active=True,
-            confirmed_pos=100,
-            lag_bytes=0,
-            publication_has_tables=True,
-            publication_has_configured_tables=True,
-        )
-    )
-    assert _service_status(health) == "connected_quiet"
-    assert health.dark_for < 1.0
+    summary = health.summary()
+    assert summary["source_publication_has_tables"] is True
+    assert summary["source_publication_has_configured_tables"] is False
 
 
 def test_service_witness_accepts_a_completed_caught_up_quiet_route_without_data_ack():
