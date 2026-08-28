@@ -26,14 +26,21 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import threading
 import time
 from contextlib import suppress
 
 import duckdb
 import psycopg
 import pytest
-from support.fixtures import PROJECT_DIR, TEST_INSTANCE_ID, TEST_SLOT_PREFIX, _executable
+from support.fixtures import (
+    POSTGRES_TEST_INSTANCE,
+    PROJECT_DIR,
+    TEST_INSTANCE_ID,
+    TEST_SLOT_PREFIX,
+    _executable,
+    _popen_with_slot_startup_gate,
+    _start_thread_with_slot_startup_gate,
+)
 from support.tcp_relay import TcpRelay
 
 
@@ -74,13 +81,16 @@ def test_a_blackholed_source_never_reports_ok(tmp_path, postgres_cluster, relay)
         "CDC_DUCKDB_PATH": str(tmp_path / "cdc_flight.duckdb"),
         "CDC_SLOT_NAME": slot,
         "CDC_PIPELINE_NAME": f"cdc_flight_blackhole_{TEST_INSTANCE_ID}",
+        "CDC_TEST_SLOT_STARTUP_LOCK": str(
+            POSTGRES_TEST_INSTANCE.slot_startup_lock_path
+        ),
         "CDC_IDLE_SECONDS": "6",
         "RUNTIME__DLTHUB_TELEMETRY": "false",
     }
     _drop(postgres_cluster.dsn, slot)
     try:
         started_at = time.monotonic()
-        proc = subprocess.Popen(
+        proc = _popen_with_slot_startup_gate(
             [
                 _executable("cdc-flight"),
                 "--destination", "duckdb",
@@ -88,10 +98,11 @@ def test_a_blackholed_source_never_reports_ok(tmp_path, postgres_cluster, relay)
                 "--idle-seconds", "6",
             ],
             env=env,
-            cwd=PROJECT_DIR,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+                cwd=PROJECT_DIR,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=False,
+            )
         # Let the snapshot get going, so the sampler has succeeded at least once
         # and the run has real work in flight when the source disappears.
         assert _wait_for(lambda: relay.bytes_relayed > 200_000, timeout=90), (
@@ -214,11 +225,25 @@ def test_stock_jdbc_blackhole_times_out_without_the_python_sampler(
         offset_file=replication.offset_file,
         always_commit_offsets=True,
     )
-    runner = threading.Thread(target=engine.run, name="jdbc-only-blackhole", daemon=True)
+    startup_gate_env = {
+        "PGHOST": postgres_cluster.host,
+        "PGPORT": str(postgres_cluster.port),
+        "PGUSER": postgres_cluster.user,
+        "PGPASSWORD": postgres_cluster.password,
+        "PGDATABASE": postgres_cluster.dbname,
+        "CDC_TEST_SLOT_STARTUP_LOCK": str(
+            POSTGRES_TEST_INSTANCE.slot_startup_lock_path
+        ),
+    }
+    runner = _start_thread_with_slot_startup_gate(
+        engine.run,
+        env=startup_gate_env,
+        slot=slot,
+        name="jdbc-only-blackhole",
+    )
     direct_successes = 0
     blackholed_at = None
     try:
-        runner.start()
         assert _wait_for(lambda: relay.connections > 0, timeout=30), (
             "stock Debezium never opened the relay connection"
         )

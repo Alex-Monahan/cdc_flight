@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -192,12 +192,20 @@ def _acquire_slot_startup_lock(path: Path) -> Any:
 
 
 def _release_slot_startup_lock_when_ready(
-    handle: Any, process: subprocess.Popen, env: dict[str, str], slot: str
+    handle: Any, process: Any, env: dict[str, str], slot: str
 ) -> None:
     """Release the gate once slot creation completes, never after the whole run."""
     deadline = time.monotonic() + SLOT_STARTUP_LOCK_TIMEOUT_SECONDS
+
+    def running() -> bool:
+        poll = getattr(process, "poll", None)
+        if poll is not None:
+            return poll() is None
+        is_alive = getattr(process, "is_alive", None)
+        return bool(is_alive is not None and is_alive())
+
     try:
-        while process.poll() is None:
+        while running():
             if _slot_is_active(env, slot):
                 return
             if time.monotonic() >= deadline:
@@ -259,6 +267,36 @@ def _popen_with_slot_startup_gate(
         daemon=True,
     ).start()
     return process
+
+
+def _start_thread_with_slot_startup_gate(
+    target: Callable[[], Any],
+    *,
+    env: dict[str, str],
+    slot: str,
+    name: str,
+) -> threading.Thread:
+    """Start a direct stock-engine thread behind the same slot-start gate."""
+    lock_name = env.get("CDC_TEST_SLOT_STARTUP_LOCK")
+    thread = threading.Thread(target=target, name=name, daemon=True)
+    if not lock_name:
+        thread.start()
+        return thread
+
+    handle = _acquire_slot_startup_lock(Path(lock_name))
+    try:
+        thread.start()
+    except BaseException:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
+        raise
+    threading.Thread(
+        target=_release_slot_startup_lock_when_ready,
+        args=(handle, thread, env, slot),
+        name=f"slot-startup-gate-{slot[:24]}",
+        daemon=True,
+    ).start()
+    return thread
 
 
 @pytest.fixture(autouse=True)
