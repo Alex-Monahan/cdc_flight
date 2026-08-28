@@ -142,14 +142,13 @@ def _source_from_environment(env: dict[str, str]) -> SourceConfig:
     )
 
 
-def _slot_is_active(env: dict[str, str], slot: str) -> bool:
-    """Return whether this child finished source startup and owns its slot.
+def _slot_exists(env: dict[str, str], slot: str) -> bool:
+    """Return whether PostgreSQL finished this child's slot-creation command.
 
-    A row in ``pg_replication_slots`` is not the end of logical startup.  During
-    an initial snapshot PostgreSQL has already created the slot, but the snapshot
-    transaction can still block another ``CREATE_REPLICATION_SLOT`` from reaching
-    its consistent point.  Keep the physical-cluster gate until this child's
-    walsender is active; a child that dies before then releases it via ``poll()``.
+    The gate protects the cluster-wide ``CREATE_REPLICATION_SLOT`` interval, not
+    the rest of a Flight run.  In particular, a MotherDuck destination can take
+    a long time to become usable before Debezium opens its source connection; the
+    caller must not hold every other worker behind that unrelated destination work.
     """
     try:
         source = _source_from_environment(env)
@@ -162,13 +161,13 @@ def _slot_is_active(env: dict[str, str], slot: str) -> bool:
             return bool(
                 conn.execute(
                     "SELECT 1 FROM pg_replication_slots "
-                    "WHERE slot_name = %s AND active",
+                    "WHERE slot_name = %s",
                     (slot,),
                 ).fetchone()
             )
     except Exception:
         # A busy cluster can reject one probe while the child is still making
-        # progress.  Keep the gate until the next bounded probe or child exit.
+        # progress. Keep the gate until the next bounded probe or child exit.
         return False
 
 
@@ -206,7 +205,7 @@ def _release_slot_startup_lock_when_ready(
 
     try:
         while running():
-            if _slot_is_active(env, slot):
+            if _slot_exists(env, slot):
                 return
             if time.monotonic() >= deadline:
                 # The child has its own bounded startup/pytest timeout.  Do not
