@@ -53,6 +53,13 @@ _SHUTDOWN_NOISE = (
 #: `internal.task.management.timeout.ms`, so anything later is a real failure.
 SHUTDOWN_NOISE_WINDOW_SEC = 60.0
 
+# This is a stock Debezium ``ChangeEventQueue`` setting.  Keep the spelling in one
+# place because the proof below compares the connector task's effective
+# configuration with the queue object that actually admits records.
+QUEUE_SIZE_IN_BYTES_PROPERTY = "max.queue.size.in.bytes"
+
+_JAVA_FIELD_MISSING = object()
+
 
 def _describe(message: str | None, error) -> str:
     """Render the Debezium message plus the root of its cause chain."""
@@ -127,6 +134,7 @@ class SupervisedDebeziumEngine(DebeziumJsonEngine):
         self._always_commit_offsets = always_commit_offsets
         self._verifier: OffsetFlushVerifier | None = None
         self._effective_configuration: dict[str, object] = {}
+        self._live_queue_metrics: dict[str, object] | None = None
 
     # -- completion bookkeeping --------------------------------------------- #
     def _on_completion(self, success: bool, message, error) -> None:
@@ -188,6 +196,13 @@ class SupervisedDebeziumEngine(DebeziumJsonEngine):
     def effective_configuration(self) -> dict[str, object]:
         """The stock Debezium/pgjdbc values observed while building the engine."""
         return dict(self._effective_configuration)
+
+    @property
+    def live_queue_metrics(self) -> dict[str, object] | None:
+        """The last verified stock ``ChangeEventQueue`` measurement, if ready."""
+        if self._live_queue_metrics is None:
+            return None
+        return dict(self._live_queue_metrics)
 
     # -- engine construction ------------------------------------------------ #
     @cached_property
@@ -281,11 +296,215 @@ class SupervisedDebeziumEngine(DebeziumJsonEngine):
                 pg_property.forName("tcpKeepAlive").get(jdbc_props)
             ),
         }
+        byte_bound_raw = config.getString(QUEUE_SIZE_IN_BYTES_PROPERTY)
+        if byte_bound_raw is None or not str(byte_bound_raw).strip():
+            raise EngineFailure(
+                "stock Debezium configuration did not expose the required "
+                f"{QUEUE_SIZE_IN_BYTES_PROPERTY} property"
+            )
+        try:
+            byte_bound = int(str(byte_bound_raw).strip())
+        except (TypeError, ValueError) as exc:
+            raise EngineFailure(
+                f"stock Debezium configuration exposed a non-integer "
+                f"{QUEUE_SIZE_IN_BYTES_PROPERTY}={byte_bound_raw!r}"
+            ) from exc
+        if byte_bound <= 0:
+            raise EngineFailure(
+                f"stock Debezium configuration disabled the required positive "
+                f"{QUEUE_SIZE_IN_BYTES_PROPERTY}: {byte_bound}"
+            )
+        effective[QUEUE_SIZE_IN_BYTES_PROPERTY] = byte_bound
         if interval_ms <= 0 or not action_query:
             raise EngineFailure(
                 "stock Debezium accepted no effective idle heartbeat interval/action query"
             )
         return effective
+
+    @staticmethod
+    def _java_field(value, name: str):
+        """Read a private Java field, including fields declared by a superclass.
+
+        Debezium does not publish the connector task or its queue as a public Python
+        API.  This deliberately narrow reflection helper is the runtime proof: it
+        reads the stock engine's own task configuration and ``ChangeEventQueue``
+        rather than trusting the Python property dictionary.  ``_JAVA_FIELD_MISSING``
+        distinguishes a field that is not part of the stock object graph from a field
+        that exists but has not been initialized yet.
+        """
+        if value is None:
+            return None
+        java_class = value.getClass()
+        while java_class is not None:
+            try:
+                field = java_class.getDeclaredField(name)
+            except Exception:
+                java_class = java_class.getSuperclass()
+                continue
+            field.setAccessible(True)
+            return field.get(value)
+        return _JAVA_FIELD_MISSING
+
+    def probe_live_queue(self) -> dict[str, object] | None:
+        """Verify the effective byte bound on every live stock source-task queue.
+
+        ``None`` means the engine is still starting: the task list or one of its
+        fields exists but has not been populated yet.  A missing field or an
+        inconsistent initialized value is a hard engine failure, because accepting
+        that shape would turn a configuration proof into a best-effort log line.
+        """
+        if "engine" not in self.__dict__:
+            return None
+        java_engine = self.__dict__["engine"]
+        tasks = self._java_field(java_engine, "tasks")
+        if tasks is _JAVA_FIELD_MISSING:
+            raise EngineFailure(
+                "stock Debezium engine has no inspectable source-task list; "
+                "cannot prove the queue byte bound"
+            )
+        if tasks is None:
+            return None
+        task_count = int(tasks.size())
+        if task_count == 0:
+            return None
+
+        queues: list[dict[str, int]] = []
+        for task_index in range(task_count):
+            task = tasks.get(task_index)
+            if task is None:
+                return None
+            connect_task = self._java_field(task, "connectTask")
+            if connect_task is _JAVA_FIELD_MISSING:
+                raise EngineFailure(
+                    "stock Debezium engine task has no inspectable connectTask; "
+                    "cannot prove the queue byte bound"
+                )
+            if connect_task is None:
+                return None
+            task_config = self._java_field(connect_task, "config")
+            if task_config is _JAVA_FIELD_MISSING:
+                raise EngineFailure(
+                    "stock Debezium connector task has no inspectable effective "
+                    "configuration; cannot prove the queue byte bound"
+                )
+            if task_config is None:
+                return None
+            configured_raw = task_config.getString(QUEUE_SIZE_IN_BYTES_PROPERTY)
+            if configured_raw is None or not str(configured_raw).strip():
+                raise EngineFailure(
+                    "stock Debezium connector task omitted the effective "
+                    f"{QUEUE_SIZE_IN_BYTES_PROPERTY} property"
+                )
+            try:
+                configured_bytes = int(str(configured_raw).strip())
+            except (TypeError, ValueError) as exc:
+                raise EngineFailure(
+                    "stock Debezium connector task has a non-integer effective "
+                    f"{QUEUE_SIZE_IN_BYTES_PROPERTY}={configured_raw!r}"
+                ) from exc
+            if configured_bytes <= 0:
+                raise EngineFailure(
+                    "stock Debezium connector task disabled the required positive "
+                    f"{QUEUE_SIZE_IN_BYTES_PROPERTY}: {configured_bytes}"
+                )
+
+            queue = self._java_field(connect_task, "queue")
+            if queue is _JAVA_FIELD_MISSING:
+                raise EngineFailure(
+                    "stock Debezium connector task has no inspectable ChangeEventQueue"
+                )
+            if queue is None:
+                return None
+            observed_bytes = int(queue.maxQueueSizeInBytes())
+            current_bytes = int(queue.currentQueueSizeInBytes())
+            total_capacity = int(queue.totalCapacity())
+            remaining_capacity = int(queue.remainingCapacity())
+            current_count = total_capacity - remaining_capacity
+            if observed_bytes != configured_bytes:
+                raise EngineFailure(
+                    "stock Debezium queue byte bound does not match its effective "
+                    f"task configuration: config={configured_bytes}, "
+                    f"queue={observed_bytes}"
+                )
+            # ChangeEventQueue checks the byte watermark before admitting a
+            # record, then adds that record's objectSize().  Consequently the
+            # instantaneous counter may be above the nominal watermark by the
+            # one record that crossed it.  The queue's configured capacity is
+            # the value above; do not turn this documented producer-side
+            # admission behavior into a false engine failure.
+            if current_bytes < 0:
+                raise EngineFailure(
+                    "stock Debezium queue reported an invalid byte occupancy: "
+                    f"current={current_bytes}"
+                )
+            if current_count < 0 or current_count > total_capacity:
+                raise EngineFailure(
+                    "stock Debezium queue reported an invalid record occupancy: "
+                    f"current={current_count}, capacity={total_capacity}"
+                )
+            over_capacity = max(0, current_bytes - observed_bytes)
+            queues.append(
+                {
+                    "task_index": task_index,
+                    "effective_task_config_max_queue_size_in_bytes": configured_bytes,
+                    "queue_max_queue_size_in_bytes": observed_bytes,
+                    "queue_current_size_in_bytes": current_bytes,
+                    "queue_over_capacity_bytes": over_capacity,
+                    "queue_current_size": current_count,
+                    "queue_total_capacity": total_capacity,
+                    "queue_remaining_capacity": remaining_capacity,
+                }
+            )
+
+        if not queues:
+            return None
+        configured_values = {
+            item["effective_task_config_max_queue_size_in_bytes"] for item in queues
+        }
+        if len(configured_values) != 1:
+            raise EngineFailure(
+                "stock Debezium source tasks disagree about the effective queue "
+                f"byte bound: {sorted(configured_values)}"
+            )
+        previous = self._live_queue_metrics or {}
+        current_bytes = sum(
+            item["queue_current_size_in_bytes"] for item in queues
+        )
+        over_capacity_bytes = sum(item["queue_over_capacity_bytes"] for item in queues)
+        current_count = sum(item["queue_current_size"] for item in queues)
+        metrics: dict[str, object] = {
+            "task_count": task_count,
+            "queues": queues,
+            "effective_task_config_max_queue_size_in_bytes": queues[0][
+                "effective_task_config_max_queue_size_in_bytes"
+            ],
+            "queue_max_queue_size_in_bytes": sum(
+                item["queue_max_queue_size_in_bytes"] for item in queues
+            ),
+            "queue_current_size_in_bytes": current_bytes,
+            "queue_over_capacity_bytes": over_capacity_bytes,
+            "queue_current_size": current_count,
+            "queue_total_capacity": sum(item["queue_total_capacity"] for item in queues),
+            "queue_remaining_capacity": sum(
+                item["queue_remaining_capacity"] for item in queues
+            ),
+            # The supervisor polls this object while the engine is alive.  Preserve
+            # high-water marks so the final run summary retains a transient queue
+            # peak even after the callback drains it.
+            "queue_peak_size_in_bytes": max(
+                current_bytes, int(previous.get("queue_peak_size_in_bytes", 0))
+            ),
+            "queue_peak_over_capacity_bytes": max(
+                over_capacity_bytes,
+                int(previous.get("queue_peak_over_capacity_bytes", 0)),
+            ),
+            "queue_peak_size": max(
+                current_count, int(previous.get("queue_peak_size", 0))
+            ),
+        }
+        self._live_queue_metrics = metrics
+        self._effective_configuration["live_queue"] = metrics
+        return dict(metrics)
 
     def close(self, *, intentional: bool = True) -> None:
         """Stop the engine.

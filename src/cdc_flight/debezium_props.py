@@ -173,6 +173,13 @@ PRODUCTION_SNAPSHOT_MAX_THREADS = "1"
 # 74 s is the measured 61.604 s p99/max plus 20% headroom.
 SOURCE_TASK_MANAGEMENT_TIMEOUT_MS = "74000"
 
+# A positive stock ChangeEventQueue byte bound makes source admission
+# backpressure rather than count-only admission.  This is deliberately a queue
+# bound, not a process-memory claim: the callback, assembler, destination, JVM,
+# and Arrow have separate working sets.  The live engine probe in ``engine.py``
+# verifies that Debezium 3.6 actually installs this value in the task queue.
+MAX_QUEUE_SIZE_IN_BYTES = "134217728"
+
 # Idle-slot liveness.  The action is a transactional logical message, not a table
 # write: it advances the slot without changing application data and Debezium's stock
 # pgoutput decoder carries it as a complete BEGIN/message/END unit.  ``true`` is
@@ -373,6 +380,7 @@ def build_properties(
         # --- batching / latency ----------------------------------------------
         "max.batch.size": str(max_batch_size),
         "max.queue.size": str(max_batch_size * 4),
+        "max.queue.size.in.bytes": MAX_QUEUE_SIZE_IN_BYTES,
         "poll.interval.ms": str(poll_interval_ms),
         # --- payload shape (ADR 0001 D5) --------------------------------------
         # `ExtractNewRecordState` is GONE. The applier consumes the full Debezium
