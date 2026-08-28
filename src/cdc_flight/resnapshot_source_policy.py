@@ -14,6 +14,16 @@ from .resnapshot_projection import ProjectionEvent
 
 log = logging.getLogger("cdc_flight.resnapshot")
 
+# A hot standby rejects ``pg_current_wal_lsn()`` while it is in recovery.  The
+# receive position is the read-side upper bound used for the empty-table fence;
+# the primary branch preserves the old primary behavior without making the query
+# itself a recovery failure.
+SOURCE_WAL_LSN_SQL = (
+    "SELECT ((CASE WHEN pg_is_in_recovery() "
+    "THEN pg_last_wal_receive_lsn() ELSE pg_current_wal_lsn() END) "
+    "- '0/0')::bigint"
+)
+
 
 @dataclass
 class EmptinessEvidence:
@@ -67,9 +77,7 @@ def gather_emptiness_evidence(
         with psycopg.connect(
             dsn, autocommit=True, **source_connection_kwargs()
         ) as conn:
-            row = conn.execute(
-                "SELECT (pg_current_wal_lsn() - '0/0')::bigint"
-            ).fetchone()
+            row = conn.execute(SOURCE_WAL_LSN_SQL).fetchone()
             wal_lsn = int(row[0]) if row and row[0] is not None else None
         with psycopg.connect(dsn, **source_connection_kwargs()) as conn:
             conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")

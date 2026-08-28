@@ -403,7 +403,7 @@ def run(
         # Swept unconditionally, by the one name this pipeline derives from its own slot
         # (Opus MAJOR-2, observed leaking twice on the shared cluster in one day).
         summary_extra["stale_resnapshot_slot"] = resnapshot_mod.sweep_stale_slot(
-            source.dsn, replication.slot_name
+            source.primary_dsn, replication.slot_name
         )
 
         captured_tables = acquisition.captured_tables(
@@ -572,7 +572,7 @@ def run(
                 pipeline=dest.pipeline_name,
                 namespace=namespace,
                 record=journal,
-                dsn=source.dsn,
+                dsn=source.primary_dsn,
                 control_schema=control_schema,
             )
         if (

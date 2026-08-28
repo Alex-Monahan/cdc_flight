@@ -170,10 +170,11 @@ class SourceConfig:
         )
     )
     schema: str = field(default_factory=lambda: _env("CDC_SCHEMA", "app"))
-    #: Optional write route for catalog admission and transactional markers when
-    #: ``dsn`` points at a hot standby.  An unset value deliberately falls back to
-    #: the ordinary source DSN, so existing primary-only deployments keep one
-    #: configuration surface.
+    #: Explicit write route for catalog admission and transactional markers when
+    #: ``dsn`` points at a hot standby.  The property below fails closed when the
+    #: standby role is selected without this route; silently writing through a
+    #: read-only recovery endpoint would turn an administrative failure into an
+    #: incomplete recovery.
     primary_dsn_override: str | None = field(
         default_factory=lambda: os.environ.get("CDC_PRIMARY_DSN"), repr=False
     )
@@ -208,8 +209,16 @@ class SourceConfig:
 
     @property
     def primary_dsn(self) -> str:
-        """DSN used for source writes; defaults to the source/read endpoint."""
-        return self.primary_dsn_override or self.dsn
+        """Return the only DSN permitted for source-side writes and administration."""
+        override = (self.primary_dsn_override or "").strip()
+        if override:
+            return override
+        if self.role == "standby":
+            raise ValueError(
+                "CDC_PRIMARY_DSN is required when CDC_SOURCE_ROLE=standby; "
+                "refusing to use the read-only source DSN for administration or writes"
+            )
+        return self.dsn
 
     @property
     def tables(self) -> list[str]:

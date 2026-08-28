@@ -82,8 +82,30 @@ def test_source_config_requires_explicit_standby_opt_in(monkeypatch):
         _ = SourceConfig().role
 
 
+def test_standby_source_fails_closed_without_a_primary_write_route(monkeypatch):
+    monkeypatch.setenv("CDC_SOURCE_ROLE", "standby")
+    monkeypatch.delenv("CDC_PRIMARY_DSN", raising=False)
+    with pytest.raises(ValueError, match="CDC_PRIMARY_DSN"):
+        _ = SourceConfig().primary_dsn
+
+
+def test_standby_source_uses_only_the_explicit_primary_write_route(monkeypatch):
+    monkeypatch.setenv("CDC_SOURCE_ROLE", "standby")
+    monkeypatch.setenv("CDC_PRIMARY_DSN", "postgresql://writer:pw@primary:15432/db")
+    source = SourceConfig()
+    assert source.primary_dsn == "postgresql://writer:pw@primary:15432/db"
+
+
 def test_source_health_wal_position_is_recovery_safe():
     for sql in (_SLOT_SQL, _SLOT_SQL_FAST):
         assert "pg_is_in_recovery()" in sql
         assert "pg_last_wal_receive_lsn()" in sql
         assert "pg_current_wal_lsn()" in sql
+
+
+def test_resnapshot_empty_fence_wal_position_is_recovery_safe():
+    from cdc_flight.resnapshot_source_policy import SOURCE_WAL_LSN_SQL
+
+    assert "pg_is_in_recovery()" in SOURCE_WAL_LSN_SQL
+    assert "pg_last_wal_receive_lsn()" in SOURCE_WAL_LSN_SQL
+    assert "CASE WHEN" in SOURCE_WAL_LSN_SQL
