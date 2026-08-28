@@ -54,8 +54,10 @@ from .witness_contract import (
 
 log = logging.getLogger("cdc_flight.source_health")
 
-#: How far `confirmed_flush_lsn` may trail `pg_current_wal_lsn()` and still count
-#: as "caught up".
+#: How far `confirmed_flush_lsn` may trail the source's available WAL position and
+#: still count as "caught up".  On a hot standby the primary-only
+#: ``pg_current_wal_lsn()`` function raises ``recovery is in progress``; the
+#: recovery-safe expression below uses the receive position instead.
 #:
 #: MEASURED (2026-07-30, 60 000-row stream into local DuckDB, per-batch offset
 #: flush). A healthy run settles at **328-384 bytes** of lag within a second of
@@ -71,11 +73,24 @@ log = logging.getLogger("cdc_flight.source_health")
 #: consumer has durably taken.
 DEFAULT_MAX_IDLE_LAG_BYTES = 64 * 1024
 
+# PostgreSQL deliberately exposes different WAL position functions while a server
+# is in recovery.  Keep the branch in SQL so the sampler remains one bounded query
+# on the same source endpoint that owns the logical slot.  ``receive_lsn`` is the
+# relevant upper bound for a standby: it includes WAL already present locally even
+# when replay is briefly behind it.  The replay fallback keeps a newly-started
+# receiver observable before it has reported a receive position.
+_SOURCE_WAL_POSITION_SQL = """
+CASE WHEN pg_is_in_recovery()
+     THEN COALESCE(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn(), '0/0'::pg_lsn)
+     ELSE pg_current_wal_lsn()
+END
+"""
+
 # The finite-run sampler only needs the slot liveness and confirmed position. The
 # service watchdog opts into the identity join below; keeping that expensive,
 # cluster-wide statistics lookup off the ordinary watermark path matters because
 # xdist workers create/drop databases while their bounded runs are sampling.
-_SLOT_SQL_FAST = """
+_SLOT_SQL_FAST = f"""
 SELECT s.active,
        s.active_pid,
        s.confirmed_flush_lsn IS NOT NULL AS has_confirmed,
@@ -83,12 +98,14 @@ SELECT s.active,
             ELSE (s.confirmed_flush_lsn - '0/0')::BIGINT END AS confirmed_pos,
        CASE WHEN s.restart_lsn IS NULL THEN NULL
             ELSE (s.restart_lsn - '0/0')::BIGINT END AS restart_pos,
-       COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), s.confirmed_flush_lsn), 0)::BIGINT
+       COALESCE(pg_wal_lsn_diff(
+           {_SOURCE_WAL_POSITION_SQL}, s.confirmed_flush_lsn
+       ), 0)::BIGINT
 FROM pg_replication_slots s
 WHERE s.slot_name = %s
 """
 
-_SLOT_SQL = """
+_SLOT_SQL = f"""
 SELECT (s.slot_name IS NOT NULL) AS slot_exists,
        -- Keep activity independent from existence.  A missing row must not
        -- accidentally satisfy a future ``active``-only witness mutation.
@@ -105,7 +122,9 @@ SELECT (s.slot_name IS NOT NULL) AS slot_exists,
             ELSE (s.confirmed_flush_lsn - '0/0')::BIGINT END AS confirmed_pos,
        CASE WHEN s.restart_lsn IS NULL THEN NULL
             ELSE (s.restart_lsn - '0/0')::BIGINT END AS restart_pos,
-       COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), s.confirmed_flush_lsn), 0)::BIGINT
+       COALESCE(pg_wal_lsn_diff(
+           {_SOURCE_WAL_POSITION_SQL}, s.confirmed_flush_lsn
+       ), 0)::BIGINT
 FROM (SELECT %s::name AS slot_name) requested
 LEFT JOIN pg_replication_slots s ON s.slot_name = requested.slot_name
 LEFT JOIN pg_stat_activity a ON a.pid = s.active_pid

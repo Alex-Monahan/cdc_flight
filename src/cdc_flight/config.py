@@ -179,6 +179,28 @@ class SourceConfig:
     )
 
     @property
+    def role(self) -> str:
+        """Return the explicitly selected source topology.
+
+        ``primary`` is the compatibility default.  ``standby`` is deliberately an
+        opt-in because a hot standby is not automatically a logical-decoding source:
+        the pipeline must prove its local slot, physical receiver, feedback and
+        primary WAL configuration before stock Debezium is constructed.
+        """
+        value = _env("CDC_SOURCE_ROLE", "primary").strip().lower()
+        if value not in {"primary", "standby"}:
+            raise ValueError(
+                "CDC_SOURCE_ROLE must be 'primary' or 'standby', got " f"{value!r}"
+            )
+        return value
+
+    @property
+    def physical_slot_name(self) -> str | None:
+        """The primary physical slot feeding an opted-in standby, if declared."""
+        value = os.environ.get("CDC_PRIMARY_PHYSICAL_SLOT")
+        return value.strip() if value and value.strip() else None
+
+    @property
     def dsn(self) -> str:
         return (
             f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.dbname}"
