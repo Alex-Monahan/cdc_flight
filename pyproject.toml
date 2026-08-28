@@ -58,6 +58,7 @@ markers = [
     "motherduck: test talks to MotherDuck cloud (needs `motherduck_token`); deselected by default",
     "e2e: full debezium + dlt end-to-end test",
     "slow: long fault-injection test (real SIGKILL, big loads); deselected by `make test`",
+    "xdist_group: keep an explicitly grouped scenario together when xdist is enabled",
 ]
 timeout = 600
 log_cli_level = "INFO"
