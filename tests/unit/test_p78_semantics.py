@@ -382,5 +382,10 @@ def test_real_applier_routes_a_history_mode_relation_through_the_shared_scd2_bun
             'WHERE pipeline = ? AND target_table = ?',
             ["lab", "cdc_raw.cdcflight_app_scd_rows"],
         ).fetchone()[0] == 1
+        assert box.con.execute(
+            'SELECT event_id FROM "_cdc_flight"."event_ledger" '
+            'WHERE pipeline = ? AND target_table = ?',
+            ["lab", "cdc_raw.cdcflight_app_scd_rows"],
+        ).fetchone()[0].startswith("v2.")
     finally:
         box.close()

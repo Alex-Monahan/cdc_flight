@@ -151,9 +151,22 @@ class SCD2Event:
         commit_lsn: int | None,
         policy_epoch: int = 0,
     ) -> SCD2Event:
+        # A staged event may carry the compatibility ``cdcf_event_id`` used by
+        # the current-row materializer.  SCD2 metadata and its shared ledger must
+        # never inherit that abbreviated value: recompute the source identity for
+        # ordinary streaming rows from the immutable source facts.  Snapshot and
+        # incremental identities are already durable backfill identities and are
+        # retained as supplied.
+        supplied_identity = event_id
+        if not (
+            getattr(event, "snapshot_identity", None)
+            or getattr(event, "incremental", False)
+            or str(event_id).startswith("snap:")
+        ):
+            supplied_identity = None
         identity = event_ledger.identity_for(
             event,
-            event_id=event_id,
+            event_id=supplied_identity,
             source_cluster_id=source_cluster_id,
             source_timeline=source_timeline,
             relation_generation=relation_generation,
