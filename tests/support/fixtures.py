@@ -40,6 +40,13 @@ MATRIX_CHILD = PROJECT_DIR / "tests" / "support" / "crash_matrix_child.py"
 SANDBOX_IDLE_SECONDS = 6
 SLOT_STARTUP_LOCK_TIMEOUT_SECONDS = 180.0
 SLOT_STARTUP_POLL_SECONDS = 0.1
+RESNAPSHOT_SLOT_SUFFIX = "_rs"
+# PostgreSQL can keep a logical-slot creation command waiting behind an older
+# transaction from another worker.  Stock pgjdbc's protected 60-second socket
+# timeout then closes that *startup* attempt; retry only that setup failure after
+# the abandoned backend has drained.  This is not a test timeout or a production
+# connector setting, and expected-failure runs are never retried.
+SLOT_CREATION_RETRY_DELAYS_SECONDS = (1.0, 3.0)
 
 #: Debezium delivers a transactional logical message exactly like any other source
 #: transaction: BEGIN, the message, END. `cdc_flight` writes two kinds, and they
@@ -143,7 +150,7 @@ def _source_from_environment(env: dict[str, str]) -> SourceConfig:
 
 
 def _slot_creation_state(env: dict[str, str], slot: str) -> tuple[bool, bool]:
-    """Return ``(slot_exists, this_slot_is_being_created)`` for this cluster.
+    """Return ``(slot_exists, this_run_slot_is_being_created)`` for this cluster.
 
     The gate protects the cluster-wide ``CREATE_REPLICATION_SLOT`` interval, not
     the rest of a Flight run.  In particular, a MotherDuck destination can take
@@ -153,8 +160,10 @@ def _slot_creation_state(env: dict[str, str], slot: str) -> tuple[bool, bool]:
     PostgreSQL exposes a logical slot row before a blocked slot-creation command
     returns.  The row alone is therefore not the completion predicate: release
     only after this slot exists *and* its active replication-protocol command has
-    returned.  The direct SQL-function callers are synchronous and hold the same
-    fcntl gate around the function call, so they do not need an asynchronous probe.
+    returned.  A recovery run can also create the derived throwaway ``_rs`` slot;
+    that name is included without treating an unrelated worker's slot as ours.
+    The direct SQL-function callers are synchronous and hold the same fcntl gate
+    around the function call, so they do not need an asynchronous probe.
     """
     try:
         source = _source_from_environment(env)
@@ -165,6 +174,9 @@ def _slot_creation_state(env: dict[str, str], slot: str) -> tuple[bool, bool]:
             options="-c statement_timeout=1000",
             application_name="cdc_flight_slot_probe",
         ) as conn:
+            resnapshot_slot = (
+                f"{slot[: 63 - len(RESNAPSHOT_SLOT_SUFFIX)]}{RESNAPSHOT_SLOT_SUFFIX}"
+            )
             row = conn.execute(
                 "SELECT EXISTS ("
                 "  SELECT 1 FROM pg_replication_slots WHERE slot_name = %s"
@@ -174,9 +186,9 @@ def _slot_creation_state(env: dict[str, str], slot: str) -> tuple[bool, bool]:
                 "    AND application_name IS DISTINCT FROM 'cdc_flight_slot_probe' "
                 "    AND state = 'active' "
                 "    AND query ILIKE '%%CREATE_REPLICATION_SLOT%%' "
-                "    AND strpos(query, %s) > 0"
+                "    AND (strpos(query, %s) > 0 OR strpos(query, %s) > 0)"
                 ")",
-                (slot, slot),
+                (slot, slot, resnapshot_slot),
             ).fetchone()
             if not row:
                 return False, True
@@ -191,6 +203,14 @@ def _slot_creation_finished(env: dict[str, str], slot: str) -> bool:
     """Return whether PostgreSQL finished this child's slot-creation command."""
     slot_exists, active_creation = _slot_creation_state(env, slot)
     return slot_exists and not active_creation
+
+
+def _is_slot_creation_read_timeout(output: str) -> bool:
+    """Recognize stock pgjdbc's bounded failure while creating a logical slot."""
+    return (
+        "Creation of replication slot failed" in output
+        and "Read timed out" in output
+    )
 
 
 def _acquire_slot_startup_lock(path: Path) -> Any:
@@ -518,25 +538,33 @@ def _invoke_pipeline(
             expect_success=expect_success,
         )
 
-    proc = _popen_with_slot_startup_gate(
-        cmd,
-        env=env,
-        cwd=PROJECT_DIR,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        stdout, stderr = proc.communicate()
-        raise
-    if expect_success and proc.returncode != 0:
-        raise AssertionError(
-            f"pipeline exited {proc.returncode}\n--- stdout ---\n{stdout[-4000:]}"
-            f"\n--- stderr ---\n{stderr[-4000:]}"
+    retry_delays = SLOT_CREATION_RETRY_DELAYS_SECONDS if expect_success else ()
+    for delay in (*retry_delays, None):
+        summary_path.unlink(missing_ok=True)
+        proc = _popen_with_slot_startup_gate(
+            cmd,
+            env=env,
+            cwd=PROJECT_DIR,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            raise
+        output = stdout + stderr
+        if expect_success and proc.returncode != 0:
+            if delay is not None and _is_slot_creation_read_timeout(output):
+                time.sleep(delay)
+                continue
+            raise AssertionError(
+                f"pipeline exited {proc.returncode}\n--- stdout ---\n{stdout[-4000:]}"
+                f"\n--- stderr ---\n{stderr[-4000:]}"
+            )
+        break
 
     # Debezium logs to stdout as well, so read the machine-readable summary the
     # CLI writes rather than trying to carve JSON out of the log stream.
