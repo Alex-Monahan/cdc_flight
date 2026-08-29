@@ -425,8 +425,6 @@ def _probe_survivor(
             destination.env["MOTHERDUCK_TOKEN"], destination.env["CDC_MD_DATABASE"]
         )
     try:
-        if not owned:
-            connection.execute("FORCE CHECKPOINT")
         return _probe_survivor_details(
             box, tag, destination, connection, source_connection
         )
