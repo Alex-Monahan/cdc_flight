@@ -1007,15 +1007,21 @@ def _run_cells(
             _state_path(box).unlink(missing_ok=True)
             _add_rows(box, tag)
             if cell.recovery:
-                recovery_connection = connect_motherduck(
-                    destination.env["MOTHERDUCK_TOKEN"], destination.env["CDC_MD_DATABASE"]
-                )
-                try:
+                if destination is None:
                     _advance_slot_past_new_rows(
-                        box, destination, recovery_connection, source_connection
+                        box, destination, source_connection=source_connection
                     )
-                finally:
-                    recovery_connection.close()
+                else:
+                    recovery_connection = connect_motherduck(
+                        destination.env["MOTHERDUCK_TOKEN"],
+                        destination.env["CDC_MD_DATABASE"],
+                    )
+                    try:
+                        _advance_slot_past_new_rows(
+                            box, destination, recovery_connection, source_connection
+                        )
+                    finally:
+                        recovery_connection.close()
             try:
                 killed = _run_with_cut(box, cell, destination)
                 destination_connection = (
