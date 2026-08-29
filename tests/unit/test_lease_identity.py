@@ -51,14 +51,58 @@ try:
     try:
         Lease(key, owner_id=role, ttl_seconds=30, control_schema=dest.control_schema).acquire(con)
     except LeaseLost:
-        print("LEASE_LOST " + key, flush=True)
+        print("CDC_LEASE_RESULT LEASE_LOST " + key, flush=True)
     else:
-        print("ACQUIRED " + key, flush=True)
+        print("CDC_LEASE_RESULT ACQUIRED " + key, flush=True)
         if role == "holder":
             time.sleep(6)
 finally:
     con.close()
 '''
+
+_LEASE_RESULT_PREFIX = "CDC_LEASE_RESULT "
+
+
+def _find_lease_result(output: str) -> tuple[str, str] | None:
+    """Find the child's sentinel anywhere in merged client output."""
+    for line in output.splitlines():
+        marker = line.find(_LEASE_RESULT_PREFIX)
+        if marker < 0:
+            continue
+        payload = line[marker + len(_LEASE_RESULT_PREFIX) :].strip()
+        kind, separator, key = payload.partition(" ")
+        if separator and kind in {"ACQUIRED", "LEASE_LOST"} and key:
+            return kind, key
+    return None
+
+
+def _parse_lease_result(output: str, *, label: str) -> tuple[str, str]:
+    """Parse the child's sentinel without assuming it is the first output line.
+
+    MotherDuck may write a progress display before the child can publish its
+    result.  The sentinel is the output contract; line position is not.
+    """
+    result = _find_lease_result(output)
+    if result is not None:
+        return result
+    pytest.fail(f"{label} did not publish a lease result sentinel: output={output!r}")
+
+
+def _read_lease_result(process: subprocess.Popen, *, label: str) -> tuple[str, str]:
+    """Read until the sentinel, without assuming it is the first output line."""
+    assert process.stdout is not None
+    output: list[str] = []
+    while True:
+        line = process.stdout.readline()
+        if not line:
+            pytest.fail(
+                f"{label} exited before publishing its lease: rc={process.poll()} "
+                f"output={''.join(output)!r}"
+            )
+        output.append(line)
+        parsed = _find_lease_result("".join(output))
+        if parsed is not None:
+            return parsed
 
 
 def _child_env() -> dict[str, str]:
@@ -129,14 +173,9 @@ def test_motherduck_aliases_share_one_lease_and_duplicate_is_refused():
             env=env,
         )
         assert holder.stdout is not None
-        holder_line = holder.stdout.readline().strip()
-        if not holder_line:
-            remaining = holder.stdout.read()
-            pytest.fail(
-                f"holder exited before publishing its lease: rc={holder.poll()} "
-                f"output={remaining!r}"
-            )
-        assert holder_line.startswith("ACQUIRED destination:"), holder_line
+        holder_kind, holder_key = _read_lease_result(holder, label="holder")
+        assert holder_kind == "ACQUIRED", holder_kind
+        assert holder_key.startswith("destination:"), holder_key
 
         contender = subprocess.run(
             [
@@ -154,8 +193,11 @@ def test_motherduck_aliases_share_one_lease_and_duplicate_is_refused():
             timeout=60,
         )
         assert contender.returncode == 0, contender.stderr
-        assert contender.stdout.startswith("LEASE_LOST destination:"), contender.stdout
-        assert contender.stdout.strip().split(" ", 1)[1] == holder_line.split(" ", 1)[1]
+        contender_kind, contender_key = _parse_lease_result(
+            contender.stdout, label="contender"
+        )
+        assert contender_kind == "LEASE_LOST", contender.stdout
+        assert contender_key == holder_key
     finally:
         if holder is not None and holder.poll() is None:
             holder.terminate()
