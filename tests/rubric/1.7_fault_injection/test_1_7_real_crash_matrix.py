@@ -309,16 +309,20 @@ def _destination_query(
     destination: Destination | None,
     statement: str,
     params: list | None = None,
+    connection=None,
 ) -> list[tuple]:
     if destination is None:
         return box.duck_query(statement, params)
-    con = connect_motherduck(
-        destination.env["MOTHERDUCK_TOKEN"], destination.env["CDC_MD_DATABASE"]
-    )
+    owned = connection is None
+    if owned:
+        connection = connect_motherduck(
+            destination.env["MOTHERDUCK_TOKEN"], destination.env["CDC_MD_DATABASE"]
+        )
     try:
-        return con.execute(statement, params or []).fetchall()
+        return connection.execute(statement, params or []).fetchall()
     finally:
-        con.close()
+        if owned:
+            connection.close()
 
 
 def _destination_table(box: Sandbox, destination: Destination | None, name: str) -> str:
@@ -380,6 +384,20 @@ def _run_with_cut(
 def _probe_survivor(
     box: Sandbox, tag: str, destination: Destination | None = None
 ) -> dict:
+    if destination is None:
+        return _probe_survivor_details(box, tag, destination, None)
+    connection = connect_motherduck(
+        destination.env["MOTHERDUCK_TOKEN"], destination.env["CDC_MD_DATABASE"]
+    )
+    try:
+        return _probe_survivor_details(box, tag, destination, connection)
+    finally:
+        connection.close()
+
+
+def _probe_survivor_details(
+    box: Sandbox, tag: str, destination: Destination | None, connection
+) -> dict:
     state = {}
     path = _state_path(box)
     if path.exists():
@@ -390,6 +408,7 @@ def _probe_survivor(
         "WHERE pipeline = ? AND namespace = ? "
         "ORDER BY updated_at DESC LIMIT 1",
         [box.env["CDC_PIPELINE_NAME"], NAMESPACE],
+        connection=connection,
     )
     durable = _destination_query(
         box, destination,
@@ -397,6 +416,7 @@ def _probe_survivor(
         "WHERE pipeline = ? AND namespace = ? "
         "ORDER BY updated_at DESC LIMIT 1",
         [box.env["CDC_PIPELINE_NAME"], NAMESPACE],
+        connection=connection,
     )
     pipeline = box.env["CDC_PIPELINE_NAME"]
     control_rows = {}
@@ -412,6 +432,7 @@ def _probe_survivor(
             f"SELECT count(*) FROM {_control_table(destination, table)} "
             f"WHERE {scope}",
             params,
+            connection=connection,
         )[0][0]
     slot = box.pg_query(
         "SELECT (restart_lsn - '0/0')::bigint, "
@@ -427,6 +448,7 @@ def _probe_survivor(
         f"SELECT count(*) FROM {_destination_table(box, destination, 'cdcflight_app_customers')} "
         "WHERE name LIKE ?",
         [f"{tag}-c-%"],
+        connection=connection,
     )[0][0]
     source_readings = box.pg_query(
         "SELECT count(*) FROM app.sensor_readings WHERE sensor_id = %s", (tag.upper(),)
@@ -437,6 +459,7 @@ def _probe_survivor(
         f"{_destination_table(box, destination, 'cdcflight_app_sensor_readings')} "
         "WHERE sensor_id = ?",
         [tag.upper()],
+        connection=connection,
     )[0][0]
     source_customer_values = box.pg_query(
         "SELECT id, name, email FROM app.customers WHERE name LIKE %s ORDER BY id",
@@ -449,6 +472,7 @@ def _probe_survivor(
         f"{_destination_table(box, destination, 'cdcflight_app_customers')} "
         "WHERE name LIKE ? ORDER BY id",
         [f"{tag}-c-%"],
+        connection=connection,
     )
     source_reading_values = box.pg_query(
         "SELECT sensor_id, value::double precision, unit "
@@ -463,6 +487,7 @@ def _probe_survivor(
         f"{_destination_table(box, destination, 'cdcflight_app_sensor_readings')} "
         "WHERE sensor_id = ? ORDER BY sensor_id, value, unit",
         [tag.upper()],
+        connection=connection,
     )
     event_ids = _destination_query(
         box, destination,
@@ -470,6 +495,7 @@ def _probe_survivor(
         f"{_destination_table(box, destination, 'cdcflight_app_sensor_readings')} "
         "WHERE sensor_id = ?",
         [tag.upper()],
+        connection=connection,
     )[0]
     return {
         "state": state,
