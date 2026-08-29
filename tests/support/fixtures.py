@@ -143,7 +143,7 @@ def _source_from_environment(env: dict[str, str]) -> SourceConfig:
 
 
 def _slot_creation_state(env: dict[str, str], slot: str) -> tuple[bool, bool]:
-    """Return ``(slot_exists, any_active_slot_creation)`` for this cluster.
+    """Return ``(slot_exists, this_slot_is_being_created)`` for this cluster.
 
     The gate protects the cluster-wide ``CREATE_REPLICATION_SLOT`` interval, not
     the rest of a Flight run.  In particular, a MotherDuck destination can take
@@ -152,11 +152,9 @@ def _slot_creation_state(env: dict[str, str], slot: str) -> tuple[bool, bool]:
 
     PostgreSQL exposes a logical slot row before a blocked slot-creation command
     returns.  The row alone is therefore not the completion predicate: release
-    only after the row exists *and* no active backend is still executing either
-    the replication-protocol command or its SQL-function equivalent.  The
-    activity text is parameterized for SQL-function callers, so it cannot be
-    matched to the slot name; the physical startup lock already scopes the
-    check to this test cluster.
+    only after this slot exists *and* its active replication-protocol command has
+    returned.  The direct SQL-function callers are synchronous and hold the same
+    fcntl gate around the function call, so they do not need an asynchronous probe.
     """
     try:
         source = _source_from_environment(env)
@@ -175,12 +173,10 @@ def _slot_creation_state(env: dict[str, str], slot: str) -> tuple[bool, bool]:
                 "  WHERE pid <> pg_backend_pid() "
                 "    AND application_name IS DISTINCT FROM 'cdc_flight_slot_probe' "
                 "    AND state = 'active' "
-                "    AND ("
-                "      query ILIKE '%%CREATE_REPLICATION_SLOT%%' "
-                "      OR query ILIKE '%%PG_CREATE_LOGICAL_REPLICATION_SLOT%%'"
-                "    )"
+                "    AND query ILIKE '%%CREATE_REPLICATION_SLOT%%' "
+                "    AND strpos(query, %s) > 0"
                 ")",
-                (slot,),
+                (slot, slot),
             ).fetchone()
             if not row:
                 return False, True
