@@ -172,10 +172,11 @@ def _slot_creation_finished(env: dict[str, str], slot: str) -> bool:
                 "), NOT EXISTS ("
                 "  SELECT 1 FROM pg_stat_activity "
                 "  WHERE datname = current_database() "
+                "    AND pid <> pg_backend_pid() "
                 "    AND state = 'active' "
                 "    AND ("
-                "      query ILIKE '%CREATE_REPLICATION_SLOT%' "
-                "      OR query ILIKE '%PG_CREATE_LOGICAL_REPLICATION_SLOT%'"
+                "      query ILIKE '%%CREATE_REPLICATION_SLOT%%' "
+                "      OR query ILIKE '%%PG_CREATE_LOGICAL_REPLICATION_SLOT%%'"
                 "    )"
                 ")",
                 (slot,),
