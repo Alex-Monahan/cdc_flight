@@ -988,7 +988,6 @@ def _run_cells(
         postgres_cluster,
     )
     results: dict[str, dict] = {}
-    destination_connection = None
     source_connection = None
     try:
         box.reseed()
@@ -1001,9 +1000,6 @@ def _run_cells(
         )
         results["baseline"] = baseline
         if destination is not None:
-            destination_connection = connect_motherduck(
-                destination.env["MOTHERDUCK_TOKEN"], destination.env["CDC_MD_DATABASE"]
-            )
             source_connection = psycopg.connect(box.source.dsn, autocommit=True)
         for cell in CELLS:
             tag = f"r17_{cell.name}"
@@ -1011,28 +1007,43 @@ def _run_cells(
             _state_path(box).unlink(missing_ok=True)
             _add_rows(box, tag)
             if cell.recovery:
-                _advance_slot_past_new_rows(
-                    box,
-                    destination,
-                    destination_connection,
-                    source_connection,
+                recovery_connection = connect_motherduck(
+                    destination.env["MOTHERDUCK_TOKEN"], destination.env["CDC_MD_DATABASE"]
                 )
+                try:
+                    _advance_slot_past_new_rows(
+                        box, destination, recovery_connection, source_connection
+                    )
+                finally:
+                    recovery_connection.close()
             try:
                 killed = _run_with_cut(box, cell, destination)
-                survivor = _probe_survivor(
-                    box,
-                    tag,
-                    destination,
-                    destination_connection,
-                    source_connection,
+                destination_connection = (
+                    connect_motherduck(
+                        destination.env["MOTHERDUCK_TOKEN"],
+                        destination.env["CDC_MD_DATABASE"],
+                    )
+                    if destination is not None
+                    else None
                 )
-                resumed = _recover_and_probe(
-                    box,
-                    tag,
-                    destination,
-                    destination_connection,
-                    source_connection,
-                )
+                try:
+                    survivor = _probe_survivor(
+                        box,
+                        tag,
+                        destination,
+                        destination_connection,
+                        source_connection,
+                    )
+                    resumed = _recover_and_probe(
+                        box,
+                        tag,
+                        destination,
+                        destination_connection,
+                        source_connection,
+                    )
+                finally:
+                    if destination_connection is not None:
+                        destination_connection.close()
                 results[cell.name] = {
                     "cell": cell,
                     "tag": tag,
@@ -1051,8 +1062,6 @@ def _run_cells(
     finally:
         if source_connection is not None:
             source_connection.close()
-        if destination_connection is not None:
-            destination_connection.close()
         box.cleanup()
         box.reseed()
 
