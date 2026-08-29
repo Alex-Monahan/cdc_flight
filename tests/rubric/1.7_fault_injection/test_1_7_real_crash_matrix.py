@@ -22,6 +22,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+import psycopg
 import pytest
 from support.fixtures import Sandbox
 from support.motherduck_probe import connect as connect_motherduck
@@ -325,6 +326,22 @@ def _destination_query(
             connection.close()
 
 
+def _source_query(
+    box: Sandbox,
+    statement: str,
+    params: tuple | None = None,
+    connection=None,
+) -> list[tuple]:
+    owned = connection is None
+    if owned:
+        connection = psycopg.connect(box.source.dsn, autocommit=True)
+    try:
+        return connection.execute(statement, params).fetchall()
+    finally:
+        if owned:
+            connection.close()
+
+
 def _destination_table(box: Sandbox, destination: Destination | None, name: str) -> str:
     if destination is None:
         return box.table(name)
@@ -337,7 +354,10 @@ def _control_table(destination: Destination | None, name: str) -> str:
 
 
 def _advance_slot_past_new_rows(
-    box: Sandbox, destination: Destination | None = None, connection=None
+    box: Sandbox,
+    destination: Destination | None = None,
+    connection=None,
+    source_connection=None,
 ) -> None:
     durable_rows = _destination_query(
         box, destination,
@@ -347,14 +367,18 @@ def _advance_slot_past_new_rows(
         connection=connection,
     )
     durable = int(durable_rows[0][0])
-    box.pg_query(
+    _source_query(
+        box,
         "SELECT end_lsn::text FROM pg_replication_slot_advance(%s, pg_current_wal_lsn())",
         (box.slot,),
+        source_connection,
     )
-    confirmed = box.pg_query(
+    confirmed = _source_query(
+        box,
         "SELECT (confirmed_flush_lsn - '0/0')::bigint "
         "FROM pg_replication_slots WHERE slot_name = %s",
         (box.slot,),
+        source_connection,
     )
     assert confirmed and int(confirmed[0][0]) > durable, (
         "the recovery cell did not create a real slot-ahead-of-destination state: "
@@ -389,9 +413,12 @@ def _probe_survivor(
     tag: str,
     destination: Destination | None = None,
     connection=None,
+    source_connection=None,
 ) -> dict:
     if destination is None:
-        return _probe_survivor_details(box, tag, destination, None)
+        return _probe_survivor_details(
+            box, tag, destination, None, source_connection
+        )
     owned = connection is None
     if owned:
         connection = connect_motherduck(
@@ -400,7 +427,9 @@ def _probe_survivor(
     try:
         if not owned:
             connection.execute("FORCE CHECKPOINT")
-        return _probe_survivor_details(box, tag, destination, connection)
+        return _probe_survivor_details(
+            box, tag, destination, connection, source_connection
+        )
     finally:
         if owned:
             connection.close()
@@ -496,7 +525,11 @@ def _motherduck_probe_snapshot(
 
 
 def _probe_survivor_details(
-    box: Sandbox, tag: str, destination: Destination | None, connection
+    box: Sandbox,
+    tag: str,
+    destination: Destination | None,
+    connection,
+    source_connection=None,
 ) -> dict:
     state = {}
     path = _state_path(box)
@@ -545,14 +578,19 @@ def _probe_survivor_details(
                 params,
                 connection=connection,
             )[0][0]
-    slot = box.pg_query(
+    slot = _source_query(
+        box,
         "SELECT (restart_lsn - '0/0')::bigint, "
         "(confirmed_flush_lsn - '0/0')::bigint, active "
         "FROM pg_replication_slots WHERE slot_name = %s",
         (box.slot,),
+        source_connection,
     )
-    source_customers = box.pg_query(
-        "SELECT count(*) FROM app.customers WHERE name LIKE %s", (f"{tag}-c-%",)
+    source_customers = _source_query(
+        box,
+        "SELECT count(*) FROM app.customers WHERE name LIKE %s",
+        (f"{tag}-c-%",),
+        source_connection,
     )[0][0]
     if destination_snapshot is not None:
         destination_customers = destination_snapshot["destination_customers"]
@@ -564,8 +602,11 @@ def _probe_survivor_details(
             [f"{tag}-c-%"],
             connection=connection,
         )[0][0]
-    source_readings = box.pg_query(
-        "SELECT count(*) FROM app.sensor_readings WHERE sensor_id = %s", (tag.upper(),)
+    source_readings = _source_query(
+        box,
+        "SELECT count(*) FROM app.sensor_readings WHERE sensor_id = %s",
+        (tag.upper(),),
+        source_connection,
     )[0][0]
     if destination_snapshot is not None:
         destination_readings = destination_snapshot["destination_readings"]
@@ -578,9 +619,11 @@ def _probe_survivor_details(
             [tag.upper()],
             connection=connection,
         )[0][0]
-    source_customer_values = box.pg_query(
+    source_customer_values = _source_query(
+        box,
         "SELECT id, name, email FROM app.customers WHERE name LIKE %s ORDER BY id",
         (f"{tag}-c-%",),
+        source_connection,
     )
     if destination_snapshot is not None:
         destination_customer_values = destination_snapshot[
@@ -596,11 +639,13 @@ def _probe_survivor_details(
             [f"{tag}-c-%"],
             connection=connection,
         )
-    source_reading_values = box.pg_query(
+    source_reading_values = _source_query(
+        box,
         "SELECT sensor_id, value::double precision, unit "
         "FROM app.sensor_readings WHERE sensor_id = %s "
         "ORDER BY sensor_id, value, unit",
         (tag.upper(),),
+        source_connection,
     )
     if destination_snapshot is not None:
         destination_reading_values = destination_snapshot[
@@ -668,6 +713,7 @@ def _recover_and_probe(
     tag: str,
     destination: Destination | None = None,
     connection=None,
+    source_connection=None,
 ) -> dict:
     recovered = box.run(
         destination=destination.kind if destination is not None else "duckdb",
@@ -676,7 +722,9 @@ def _recover_and_probe(
         expect_success=False,
         extra_env=destination.env if destination is not None else None,
     )
-    after = _probe_survivor(box, tag, destination, connection)
+    after = _probe_survivor(
+        box, tag, destination, connection, source_connection
+    )
     return {"run": recovered, "after": after}
 
 
@@ -943,6 +991,7 @@ def _run_cells(
     )
     results: dict[str, dict] = {}
     destination_connection = None
+    source_connection = None
     try:
         box.reseed()
         baseline = box.run(
@@ -957,6 +1006,7 @@ def _run_cells(
             destination_connection = connect_motherduck(
                 destination.env["MOTHERDUCK_TOKEN"], destination.env["CDC_MD_DATABASE"]
             )
+            source_connection = psycopg.connect(box.source.dsn, autocommit=True)
         for cell in CELLS:
             tag = f"r17_{cell.name}"
             box.clear_fired_fault()
@@ -964,15 +1014,26 @@ def _run_cells(
             _add_rows(box, tag)
             if cell.recovery:
                 _advance_slot_past_new_rows(
-                    box, destination, destination_connection
+                    box,
+                    destination,
+                    destination_connection,
+                    source_connection,
                 )
             try:
                 killed = _run_with_cut(box, cell, destination)
                 survivor = _probe_survivor(
-                    box, tag, destination, destination_connection
+                    box,
+                    tag,
+                    destination,
+                    destination_connection,
+                    source_connection,
                 )
                 resumed = _recover_and_probe(
-                    box, tag, destination, destination_connection
+                    box,
+                    tag,
+                    destination,
+                    destination_connection,
+                    source_connection,
                 )
                 results[cell.name] = {
                     "cell": cell,
@@ -990,6 +1051,8 @@ def _run_cells(
                 }
         return results
     finally:
+        if source_connection is not None:
+            source_connection.close()
         if destination_connection is not None:
             destination_connection.close()
         box.cleanup()
