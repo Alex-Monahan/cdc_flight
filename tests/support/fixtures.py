@@ -165,6 +165,7 @@ def _slot_creation_finished(env: dict[str, str], slot: str) -> bool:
             autocommit=True,
             connect_timeout=2,
             options="-c statement_timeout=1000",
+            application_name="cdc_flight_slot_probe",
         ) as conn:
             row = conn.execute(
                 "SELECT EXISTS ("
@@ -172,6 +173,7 @@ def _slot_creation_finished(env: dict[str, str], slot: str) -> bool:
                 "), NOT EXISTS ("
                 "  SELECT 1 FROM pg_stat_activity "
                 "  WHERE pid <> pg_backend_pid() "
+                "    AND application_name IS DISTINCT FROM 'cdc_flight_slot_probe' "
                 "    AND state = 'active' "
                 "    AND ("
                 "      query ILIKE '%%CREATE_REPLICATION_SLOT%%' "
