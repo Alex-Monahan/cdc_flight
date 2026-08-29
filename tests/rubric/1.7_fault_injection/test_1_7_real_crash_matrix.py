@@ -336,12 +336,15 @@ def _control_table(destination: Destination | None, name: str) -> str:
     return f'"{schema}"."{name}"'
 
 
-def _advance_slot_past_new_rows(box: Sandbox, destination: Destination | None = None) -> None:
+def _advance_slot_past_new_rows(
+    box: Sandbox, destination: Destination | None = None, connection=None
+) -> None:
     durable_rows = _destination_query(
         box, destination,
         f"SELECT last_lsn FROM {_control_table(destination, 'debezium_offsets')} "
         "WHERE pipeline = ? AND namespace = ?",
         [box.env["CDC_PIPELINE_NAME"], NAMESPACE],
+        connection=connection,
     )
     durable = int(durable_rows[0][0])
     box.pg_query(
@@ -382,17 +385,25 @@ def _run_with_cut(
 
 
 def _probe_survivor(
-    box: Sandbox, tag: str, destination: Destination | None = None
+    box: Sandbox,
+    tag: str,
+    destination: Destination | None = None,
+    connection=None,
 ) -> dict:
     if destination is None:
         return _probe_survivor_details(box, tag, destination, None)
-    connection = connect_motherduck(
-        destination.env["MOTHERDUCK_TOKEN"], destination.env["CDC_MD_DATABASE"]
-    )
+    owned = connection is None
+    if owned:
+        connection = connect_motherduck(
+            destination.env["MOTHERDUCK_TOKEN"], destination.env["CDC_MD_DATABASE"]
+        )
     try:
+        if not owned:
+            connection.execute("FORCE CHECKPOINT")
         return _probe_survivor_details(box, tag, destination, connection)
     finally:
-        connection.close()
+        if owned:
+            connection.close()
 
 
 def _probe_survivor_details(
@@ -536,7 +547,10 @@ def _probe_survivor_details(
 
 
 def _recover_and_probe(
-    box: Sandbox, tag: str, destination: Destination | None = None
+    box: Sandbox,
+    tag: str,
+    destination: Destination | None = None,
+    connection=None,
 ) -> dict:
     recovered = box.run(
         destination=destination.kind if destination is not None else "duckdb",
@@ -545,7 +559,7 @@ def _recover_and_probe(
         expect_success=False,
         extra_env=destination.env if destination is not None else None,
     )
-    after = _probe_survivor(box, tag, destination)
+    after = _probe_survivor(box, tag, destination, connection)
     return {"run": recovered, "after": after}
 
 
@@ -811,6 +825,7 @@ def _run_cells(
         postgres_cluster,
     )
     results: dict[str, dict] = {}
+    destination_connection = None
     try:
         box.reseed()
         baseline = box.run(
@@ -821,17 +836,27 @@ def _run_cells(
             extra_env=destination.env if destination is not None else None,
         )
         results["baseline"] = baseline
+        if destination is not None:
+            destination_connection = connect_motherduck(
+                destination.env["MOTHERDUCK_TOKEN"], destination.env["CDC_MD_DATABASE"]
+            )
         for cell in CELLS:
             tag = f"r17_{cell.name}"
             box.clear_fired_fault()
             _state_path(box).unlink(missing_ok=True)
             _add_rows(box, tag)
             if cell.recovery:
-                _advance_slot_past_new_rows(box, destination)
+                _advance_slot_past_new_rows(
+                    box, destination, destination_connection
+                )
             try:
                 killed = _run_with_cut(box, cell, destination)
-                survivor = _probe_survivor(box, tag, destination)
-                resumed = _recover_and_probe(box, tag, destination)
+                survivor = _probe_survivor(
+                    box, tag, destination, destination_connection
+                )
+                resumed = _recover_and_probe(
+                    box, tag, destination, destination_connection
+                )
                 results[cell.name] = {
                     "cell": cell,
                     "tag": tag,
@@ -848,6 +873,8 @@ def _run_cells(
                 }
         return results
     finally:
+        if destination_connection is not None:
+            destination_connection.close()
         box.cleanup()
         box.reseed()
 
