@@ -142,8 +142,8 @@ def _source_from_environment(env: dict[str, str]) -> SourceConfig:
     )
 
 
-def _slot_creation_finished(env: dict[str, str], slot: str) -> bool:
-    """Return whether PostgreSQL finished this child's slot-creation command.
+def _slot_creation_state(env: dict[str, str], slot: str) -> tuple[bool, bool]:
+    """Return ``(slot_exists, any_active_slot_creation)`` for this cluster.
 
     The gate protects the cluster-wide ``CREATE_REPLICATION_SLOT`` interval, not
     the rest of a Flight run.  In particular, a MotherDuck destination can take
@@ -182,11 +182,19 @@ def _slot_creation_finished(env: dict[str, str], slot: str) -> bool:
                 ")",
                 (slot,),
             ).fetchone()
-            return bool(row and row[0] and row[1])
+            if not row:
+                return False, True
+            return bool(row[0]), not bool(row[1])
     except Exception:
         # A busy cluster can reject one probe while the child is still making
         # progress. Keep the gate until the next bounded probe or child exit.
-        return False
+        return False, True
+
+
+def _slot_creation_finished(env: dict[str, str], slot: str) -> bool:
+    """Return whether PostgreSQL finished this child's slot-creation command."""
+    slot_exists, active_creation = _slot_creation_state(env, slot)
+    return slot_exists and not active_creation
 
 
 def _acquire_slot_startup_lock(path: Path) -> Any:
@@ -233,8 +241,15 @@ def _release_slot_startup_lock_when_ready(
         return bool(is_alive is not None and is_alive())
 
     try:
-        while running():
-            if _slot_creation_finished(env, slot):
+        while True:
+            slot_exists, active_creation = _slot_creation_state(env, slot)
+            if slot_exists and not active_creation:
+                return
+            # A crash can close the Flight process before PostgreSQL has noticed
+            # the abandoned connection.  Do not release the physical gate while
+            # that backend is still inside CREATE_REPLICATION_SLOT; a successor
+            # would then reproduce the same transaction-id contention.
+            if not running() and not active_creation:
                 return
             if time.monotonic() >= deadline:
                 # The child has its own bounded startup/pytest timeout.  Do not
