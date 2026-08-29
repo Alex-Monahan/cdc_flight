@@ -206,6 +206,17 @@ def _acquire_slot_startup_lock(path: Path) -> Any:
             time.sleep(SLOT_STARTUP_POLL_SECONDS)
 
 
+@contextlib.contextmanager
+def _slot_startup_guard(path: Path) -> Iterator[None]:
+    """Hold the physical startup gate around a synchronous slot creation call."""
+    handle = _acquire_slot_startup_lock(path)
+    try:
+        yield
+    finally:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
+
+
 def _release_slot_startup_lock_when_ready(
     handle: Any, process: Any, env: dict[str, str], slot: str
 ) -> None:

@@ -16,7 +16,7 @@ fields the decision table compares are really the ones Postgres reports, so a si
 from __future__ import annotations
 
 import pytest
-from support.fixtures import Sandbox
+from support.fixtures import POSTGRES_TEST_INSTANCE, Sandbox, _slot_startup_guard
 
 from cdc_flight.reconcile import observe_slot
 
@@ -26,13 +26,14 @@ def test_the_observation_reads_the_real_cluster(postgres_cluster, cdc_env):
     slot = cdc_env["CDC_SLOT_NAME"]
     import psycopg
 
-    with psycopg.connect(postgres_cluster.dsn, autocommit=True) as conn:
-        conn.execute(
-            "SELECT pg_create_logical_replication_slot(%s, 'pgoutput')", (slot,)
-        )
-        expected_system_id = str(
-            conn.execute("SELECT system_identifier::text FROM pg_control_system()").fetchone()[0]
-        )
+    with _slot_startup_guard(POSTGRES_TEST_INSTANCE.slot_startup_lock_path):
+        with psycopg.connect(postgres_cluster.dsn, autocommit=True) as conn:
+            conn.execute(
+                "SELECT pg_create_logical_replication_slot(%s, 'pgoutput')", (slot,)
+            )
+            expected_system_id = str(
+                conn.execute("SELECT system_identifier::text FROM pg_control_system()").fetchone()[0]
+            )
     try:
         observation = observe_slot(postgres_cluster.dsn, slot)
     finally:
