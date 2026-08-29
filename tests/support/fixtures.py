@@ -180,7 +180,7 @@ def _slot_creation_state(env: dict[str, str], slot: str) -> tuple[bool, bool]:
             row = conn.execute(
                 "SELECT EXISTS ("
                 "  SELECT 1 FROM pg_replication_slots WHERE slot_name = %s"
-                "), NOT EXISTS ("
+                "), EXISTS ("
                 "  SELECT 1 FROM pg_stat_activity "
                 "  WHERE pid <> pg_backend_pid() "
                 "    AND application_name IS DISTINCT FROM 'cdc_flight_slot_probe' "
@@ -192,7 +192,7 @@ def _slot_creation_state(env: dict[str, str], slot: str) -> tuple[bool, bool]:
             ).fetchone()
             if not row:
                 return False, True
-            return bool(row[0]), not bool(row[1])
+            return bool(row[0]), bool(row[1])
     except Exception:
         # A busy cluster can reject one probe while the child is still making
         # progress. Keep the gate until the next bounded probe or child exit.
