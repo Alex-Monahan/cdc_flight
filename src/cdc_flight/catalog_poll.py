@@ -84,23 +84,14 @@ def _source_column(
     has_missing_default = bool(raw.get("has_missing_default", False))
     missing_value = None
     if has_missing_default:
-        try:
-            missing_value = observation_mod.missing_value_from_output(
-                raw.get("missing_value_output"), descriptor
-            )
-        except AdmissionError as exc:
-            raise SchemaEvolutionRefused(
-                f"source catalog default for {source_schema}.{source_table}."
-                f"{raw.get('name', '<unknown>')} is not proven by a PostgreSQL "
-                f"OUTPUT function: {exc}",
-                source_schema=source_schema,
-                source_table=source_table,
-                target=f"{source_schema}.{source_table}",
-                detected_lsn=detected_lsn,
-                refusal_origin=(
-                    getattr(exc, "refusal_origin", None) or "catalog_poll"
-                ),
-            ) from exc
+        missing_value = observation_mod.missing_value_from_output(
+            raw.get("missing_value_output"),
+            descriptor,
+            source_schema=source_schema,
+            source_table=source_table,
+            target=f"{source_schema}.{source_table}",
+            detected_lsn=detected_lsn,
+        )
     return SourceColumn(
         attnum=int(raw["attnum"]),
         name=str(raw["name"]),
