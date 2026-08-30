@@ -7,12 +7,15 @@ import hmac
 
 import pytest
 
+from cdc_flight.errors import SchemaEvolutionRefused
 from cdc_flight.policy import (
+    AcknowledgementHandle,
     PIIPolicy,
     PolicyValueRefused,
     PostgreSQLOutputText,
 )
 from cdc_flight.typed_types import SourceTypeDescriptor
+from support.applier_lab import Lab, data
 
 
 def _descriptor(kind, oid, *, child=None, fields=()):
@@ -148,3 +151,60 @@ def test_null_does_not_fabricate_policy_text(tmp_path):
     assert policy.sanitize_mapping(
         "app.pii", {"notes": None}, {"notes": TEXT}
     ) == {"notes": None}
+
+
+@pytest.mark.parametrize("action", ["exclude", "mask", "hash", "truncate"])
+def test_policy_refusal_seals_key_and_after_before_the_seam_returns(tmp_path, action):
+    """A policy refusal from the post-decode gate cannot retain source images."""
+    salt_path = tmp_path / "salt"
+    salt_path.write_bytes(b"unit-salt")
+    salt_path.chmod(0o600)
+    raw_rule = {
+        "column_regex": r"^app\.pii_refusal\.secret$",
+        "action": action,
+    }
+    if action == "hash":
+        raw_rule.update({"algorithm": "HMAC-SHA-256", "salt_id": "test-v1"})
+    if action == "mask":
+        raw_rule["replacement"] = "[MASKED]"
+    if action == "truncate":
+        raw_rule["max_chars"] = 4
+    policy = PIIPolicy.from_manifest(
+        [raw_rule], unmatched="replicate", salt_file=salt_path
+    )
+    box = Lab(tmp_path / f"{action}.duckdb", pii_policy=policy)
+    try:
+        record = data(
+            "refusal-txn",
+            1,
+            101,
+            table="pii_refusal",
+            key={"secret": "KEY_SOURCE_SENTINEL"},
+            after={"secret": "AFTER_SOURCE_SENTINEL"},
+        )
+        descriptor = SourceTypeDescriptor(
+            25,
+            "pg_catalog.text",
+            "text",
+            output_function_oid=1009,
+        )
+        box._fixture_descriptor_map[record.qualified_table] = {"secret": descriptor}
+
+        # Before this regression fix, sanitize() raises out of _sanitize_record and
+        # these assertions are never reached.  The seam must return a sealed record.
+        returned = box.applier._sanitize_record(record)
+        assert returned is record
+        assert isinstance(record.admission_refusal, SchemaEvolutionRefused)
+        assert record.key is None
+        assert record.before is None
+        assert record.after is None
+        assert record.typed_key is None
+        assert record.typed_before is None
+        assert record.typed_after is None
+        assert record.output_texts == {}
+        assert record.sanitized is True
+        assert isinstance(record.raw, AcknowledgementHandle)
+        assert "KEY_SOURCE_SENTINEL" not in repr(record)
+        assert "AFTER_SOURCE_SENTINEL" not in repr(record)
+    finally:
+        box.close()

@@ -40,8 +40,8 @@ second path had grown alongside the first.
 
 from __future__ import annotations
 
-import contextlib
 import logging
+import contextlib
 import threading
 import time
 from typing import Any
@@ -306,15 +306,9 @@ class Applier:
             # as streaming records. This is an instance attribute so compatibility
             # watcher implementations remain usable without a new constructor API.
             with contextlib.suppress(AttributeError, TypeError):
-                # A few embedders pass a bound descriptor method as ``catalog``
-                # rather than the watcher object. The callable itself is
-                # immutable; its owner is still configured above when available.
                 self.catalog.policy_gate = self.policy_gate
         if self.descriptor_provider is not None:
             with contextlib.suppress(AttributeError, TypeError):
-                # Bound methods and other immutable callables can still be used by
-                # the normal source-read path. They receive the gate through their
-                # owner (the watcher) or through explicit method arguments.
                 self.descriptor_provider.policy_gate = self.policy_gate
         self._schema_epochs = schema_epoch.SchemaEpochCoordinator(
             spill=self.spill,
@@ -911,23 +905,26 @@ class Applier:
         try:
             if provider is not None and record.qualified_table:
                 context = provider(record.qualified_table)
+            self.policy_gate.sanitize(record, context)
         except AdmissionError as error:
-            refused = as_schema_refusal(
-                error,
-                refusal_origin=(
-                    getattr(error, "refusal_origin", None) or "policy"
-                ),
-            )
-            if not refused.source_schema or not refused.source_table:
-                refused.source_schema = record.schema
-                refused.source_table = record.table
-                refused.target = record.qualified_table
-            if refused.detected_lsn is None:
-                refused.detected_lsn = record.lsn
-            self.policy_gate.seal_refusal(record, refused)
-            return record
-        self.policy_gate.sanitize(record, context)
+            self._seal_policy_refusal(record, error)
         return record
+
+    def _seal_policy_refusal(
+        self, record: PendingRecord, error: AdmissionError
+    ) -> None:
+        """Seal every policy/admission refusal before the seam can return."""
+        refused = as_schema_refusal(
+            error,
+            refusal_origin=(getattr(error, "refusal_origin", None) or "policy"),
+        )
+        if not refused.source_schema or not refused.source_table:
+            refused.source_schema = record.schema
+            refused.source_table = record.table
+            refused.target = record.qualified_table
+        if refused.detected_lsn is None:
+            refused.detected_lsn = record.lsn
+        self.policy_gate.seal_refusal(record, refused)
 
     def request_delete_policy(self, policy: DeleteModeResolver) -> None:
         """Stage a delete-policy change for the next PostgreSQL transaction.
