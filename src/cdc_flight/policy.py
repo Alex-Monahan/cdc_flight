@@ -734,7 +734,12 @@ class PolicyGate:
 
         # A keyless DELETE is only safe when its full source before-image survived the
         # gate.  An excluded comparison field would make the physical match guesswork.
-        if event.op == "d" and event.key is None and event.before is not None:
+        if (
+            self.policy.enabled
+            and event.op == "d"
+            and event.key is None
+            and event.before is not None
+        ):
             catalog_names = set(descriptors)
             if catalog_names and not catalog_names.issubset(set(event.before)):
                 raise self._refusal(event, "<row>", self.policy.rule_for(table, "row"), "keyless DELETE lacks a complete sanitized before-image")
