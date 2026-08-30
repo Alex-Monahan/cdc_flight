@@ -125,6 +125,11 @@ class PostgresTestInstance:
     def physical_identity(self) -> tuple[str, int, Path]:
         return (self.host, self.port, self.data_dir)
 
+    @property
+    def slot_startup_lock_path(self) -> Path:
+        """One lock for logical-slot creation on this physical test cluster."""
+        return self.lock_dir / f"postgres-{self.physical_key}-slot-startup.lock"
+
     def pg(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         env = {
             **os.environ,
@@ -370,6 +375,10 @@ class PostgresTestInstance:
             "PGPASSWORD": source.password,
             "PGDATABASE": source.dbname,
             "CDC_TEST_PGDATABASE": source.dbname,
+            # The test harness serializes only the startup interval in which
+            # Debezium asks PostgreSQL to create its logical slot.  The lock is
+            # scoped by physical PGDATA, not by a worker's logical names.
+            "CDC_TEST_SLOT_STARTUP_LOCK": str(self.slot_startup_lock_path),
         }
 
     def sweep_stale_test_slots(self, source: SourceConfig) -> None:

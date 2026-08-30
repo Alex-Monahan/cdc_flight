@@ -22,6 +22,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+import psycopg
 import pytest
 from support.fixtures import Sandbox
 from support.motherduck_probe import connect as connect_motherduck
@@ -309,16 +310,36 @@ def _destination_query(
     destination: Destination | None,
     statement: str,
     params: list | None = None,
+    connection=None,
 ) -> list[tuple]:
     if destination is None:
         return box.duck_query(statement, params)
-    con = connect_motherduck(
-        destination.env["MOTHERDUCK_TOKEN"], destination.env["CDC_MD_DATABASE"]
-    )
+    owned = connection is None
+    if owned:
+        connection = connect_motherduck(
+            destination.env["MOTHERDUCK_TOKEN"], destination.env["CDC_MD_DATABASE"]
+        )
     try:
-        return con.execute(statement, params or []).fetchall()
+        return connection.execute(statement, params or []).fetchall()
     finally:
-        con.close()
+        if owned:
+            connection.close()
+
+
+def _source_query(
+    box: Sandbox,
+    statement: str,
+    params: tuple | None = None,
+    connection=None,
+) -> list[tuple]:
+    owned = connection is None
+    if owned:
+        connection = psycopg.connect(box.source.dsn, autocommit=True)
+    try:
+        return connection.execute(statement, params).fetchall()
+    finally:
+        if owned:
+            connection.close()
 
 
 def _destination_table(box: Sandbox, destination: Destination | None, name: str) -> str:
@@ -332,22 +353,32 @@ def _control_table(destination: Destination | None, name: str) -> str:
     return f'"{schema}"."{name}"'
 
 
-def _advance_slot_past_new_rows(box: Sandbox, destination: Destination | None = None) -> None:
+def _advance_slot_past_new_rows(
+    box: Sandbox,
+    destination: Destination | None = None,
+    connection=None,
+    source_connection=None,
+) -> None:
     durable_rows = _destination_query(
         box, destination,
         f"SELECT last_lsn FROM {_control_table(destination, 'debezium_offsets')} "
         "WHERE pipeline = ? AND namespace = ?",
         [box.env["CDC_PIPELINE_NAME"], NAMESPACE],
+        connection=connection,
     )
     durable = int(durable_rows[0][0])
-    box.pg_query(
+    _source_query(
+        box,
         "SELECT end_lsn::text FROM pg_replication_slot_advance(%s, pg_current_wal_lsn())",
         (box.slot,),
+        source_connection,
     )
-    confirmed = box.pg_query(
+    confirmed = _source_query(
+        box,
         "SELECT (confirmed_flush_lsn - '0/0')::bigint "
         "FROM pg_replication_slots WHERE slot_name = %s",
         (box.slot,),
+        source_connection,
     )
     assert confirmed and int(confirmed[0][0]) > durable, (
         "the recovery cell did not create a real slot-ahead-of-destination state: "
@@ -378,99 +409,265 @@ def _run_with_cut(
 
 
 def _probe_survivor(
-    box: Sandbox, tag: str, destination: Destination | None = None
+    box: Sandbox,
+    tag: str,
+    destination: Destination | None = None,
+    connection=None,
+    source_connection=None,
+) -> dict:
+    if destination is None:
+        return _probe_survivor_details(
+            box, tag, destination, None, source_connection
+        )
+    owned = connection is None
+    if owned:
+        connection = connect_motherduck(
+            destination.env["MOTHERDUCK_TOKEN"], destination.env["CDC_MD_DATABASE"]
+        )
+    try:
+        return _probe_survivor_details(
+            box, tag, destination, connection, source_connection
+        )
+    finally:
+        if owned:
+            connection.close()
+
+
+def _motherduck_probe_snapshot(
+    box: Sandbox, tag: str, destination: Destination, connection
+) -> dict:
+    """Collect one cloud snapshot instead of paying one round trip per field."""
+    pipeline = box.env["CDC_PIPELINE_NAME"]
+    recovery_table = _control_table(destination, "recovery_state")
+    offsets_table = _control_table(destination, "debezium_offsets")
+    lease_table = _control_table(destination, "lease")
+    customers_table = _destination_table(
+        box, destination, "cdcflight_app_customers"
+    )
+    readings_table = _destination_table(
+        box, destination, "cdcflight_app_sensor_readings"
+    )
+    statement = f"""
+        SELECT
+            (SELECT phase FROM {recovery_table}
+             WHERE pipeline = ? AND namespace = ?
+             ORDER BY updated_at DESC LIMIT 1),
+            (SELECT last_lsn FROM {offsets_table}
+             WHERE pipeline = ? AND namespace = ?
+             ORDER BY updated_at DESC LIMIT 1),
+            (SELECT count(*) FROM {recovery_table}
+             WHERE pipeline = ? AND namespace = ?),
+            (SELECT count(*) FROM {offsets_table}
+             WHERE pipeline = ? AND namespace = ?),
+            (SELECT count(*) FROM {lease_table}
+             WHERE pipeline = ?),
+            (SELECT count(*) FROM {customers_table}
+             WHERE name LIKE ?),
+            (SELECT count(*) FROM {readings_table}
+             WHERE sensor_id = ?),
+            (SELECT list(struct_pack(id := id, name := name, email := email)
+                         ORDER BY id)
+             FROM {customers_table} WHERE name LIKE ?),
+            (SELECT list(struct_pack(
+                         sensor_id := sensor_id,
+                         value := CAST(value AS DOUBLE),
+                         unit := unit) ORDER BY sensor_id, value, unit)
+             FROM {readings_table} WHERE sensor_id = ?),
+            (SELECT count(*) FROM {readings_table}
+             WHERE sensor_id = ?),
+            (SELECT count(DISTINCT cdcf_event_id) FROM {readings_table}
+             WHERE sensor_id = ?)
+    """
+    params = [
+        pipeline,
+        NAMESPACE,
+        pipeline,
+        NAMESPACE,
+        pipeline,
+        NAMESPACE,
+        pipeline,
+        NAMESPACE,
+        pipeline,
+        f"{tag}-c-%",
+        tag.upper(),
+        f"{tag}-c-%",
+        tag.upper(),
+        tag.upper(),
+        tag.upper(),
+    ]
+    row = _destination_query(
+        box, destination, statement, params, connection=connection
+    )[0]
+    customer_values = [
+        (item["id"], item["name"], item["email"])
+        for item in (row[7] or [])
+    ]
+    reading_values = [
+        (item["sensor_id"], item["value"], item["unit"])
+        for item in (row[8] or [])
+    ]
+    return {
+        "recovery": [(row[0],)] if row[0] is not None else [],
+        "durable": [(row[1],)] if row[1] is not None else [],
+        "control_rows": {
+            "recovery_state": row[2],
+            "debezium_offsets": row[3],
+            "lease": row[4],
+        },
+        "destination_customers": row[5],
+        "destination_readings": row[6],
+        "destination_customer_values": customer_values,
+        "destination_reading_values": reading_values,
+        "event_ids": (row[9], row[10]),
+    }
+
+
+def _probe_survivor_details(
+    box: Sandbox,
+    tag: str,
+    destination: Destination | None,
+    connection,
+    source_connection=None,
 ) -> dict:
     state = {}
     path = _state_path(box)
     if path.exists():
         state = json.loads(path.read_text())
-    recovery = _destination_query(
-        box, destination,
-        f"SELECT phase FROM {_control_table(destination, 'recovery_state')} "
-        "WHERE pipeline = ? AND namespace = ? "
-        "ORDER BY updated_at DESC LIMIT 1",
-        [box.env["CDC_PIPELINE_NAME"], NAMESPACE],
+    destination_snapshot = (
+        _motherduck_probe_snapshot(box, tag, destination, connection)
+        if destination is not None
+        else None
     )
-    durable = _destination_query(
-        box, destination,
-        f"SELECT last_lsn FROM {_control_table(destination, 'debezium_offsets')} "
-        "WHERE pipeline = ? AND namespace = ? "
-        "ORDER BY updated_at DESC LIMIT 1",
-        [box.env["CDC_PIPELINE_NAME"], NAMESPACE],
-    )
+    if destination_snapshot is not None:
+        recovery = destination_snapshot["recovery"]
+        durable = destination_snapshot["durable"]
+        control_rows = destination_snapshot["control_rows"]
+    else:
+        recovery = _destination_query(
+            box, destination,
+            f"SELECT phase FROM {_control_table(destination, 'recovery_state')} "
+            "WHERE pipeline = ? AND namespace = ? "
+            "ORDER BY updated_at DESC LIMIT 1",
+            [box.env["CDC_PIPELINE_NAME"], NAMESPACE],
+            connection=connection,
+        )
+        durable = _destination_query(
+            box, destination,
+            f"SELECT last_lsn FROM {_control_table(destination, 'debezium_offsets')} "
+            "WHERE pipeline = ? AND namespace = ? "
+            "ORDER BY updated_at DESC LIMIT 1",
+            [box.env["CDC_PIPELINE_NAME"], NAMESPACE],
+            connection=connection,
+        )
     pipeline = box.env["CDC_PIPELINE_NAME"]
-    control_rows = {}
-    for table in ("recovery_state", "debezium_offsets", "lease"):
-        scope = "pipeline = ?"
-        params = [pipeline]
-        if table != "lease":
-            scope += " AND namespace = ?"
-            params.append(NAMESPACE)
-        control_rows[table] = _destination_query(
-            box,
-            destination,
-            f"SELECT count(*) FROM {_control_table(destination, table)} "
-            f"WHERE {scope}",
-            params,
-        )[0][0]
-    slot = box.pg_query(
+    if destination_snapshot is None:
+        control_rows = {}
+        for table in ("recovery_state", "debezium_offsets", "lease"):
+            scope = "pipeline = ?"
+            params = [pipeline]
+            if table != "lease":
+                scope += " AND namespace = ?"
+                params.append(NAMESPACE)
+            control_rows[table] = _destination_query(
+                box,
+                destination,
+                f"SELECT count(*) FROM {_control_table(destination, table)} "
+                f"WHERE {scope}",
+                params,
+                connection=connection,
+            )[0][0]
+    slot = _source_query(
+        box,
         "SELECT (restart_lsn - '0/0')::bigint, "
         "(confirmed_flush_lsn - '0/0')::bigint, active "
         "FROM pg_replication_slots WHERE slot_name = %s",
         (box.slot,),
+        source_connection,
     )
-    source_customers = box.pg_query(
-        "SELECT count(*) FROM app.customers WHERE name LIKE %s", (f"{tag}-c-%",)
+    source_customers = _source_query(
+        box,
+        "SELECT count(*) FROM app.customers WHERE name LIKE %s",
+        (f"{tag}-c-%",),
+        source_connection,
     )[0][0]
-    destination_customers = _destination_query(
-        box, destination,
-        f"SELECT count(*) FROM {_destination_table(box, destination, 'cdcflight_app_customers')} "
-        "WHERE name LIKE ?",
-        [f"{tag}-c-%"],
+    if destination_snapshot is not None:
+        destination_customers = destination_snapshot["destination_customers"]
+    else:
+        destination_customers = _destination_query(
+            box, destination,
+            f"SELECT count(*) FROM {_destination_table(box, destination, 'cdcflight_app_customers')} "
+            "WHERE name LIKE ?",
+            [f"{tag}-c-%"],
+            connection=connection,
+        )[0][0]
+    source_readings = _source_query(
+        box,
+        "SELECT count(*) FROM app.sensor_readings WHERE sensor_id = %s",
+        (tag.upper(),),
+        source_connection,
     )[0][0]
-    source_readings = box.pg_query(
-        "SELECT count(*) FROM app.sensor_readings WHERE sensor_id = %s", (tag.upper(),)
-    )[0][0]
-    destination_readings = _destination_query(
-        box, destination,
-        f"SELECT count(*) FROM "
-        f"{_destination_table(box, destination, 'cdcflight_app_sensor_readings')} "
-        "WHERE sensor_id = ?",
-        [tag.upper()],
-    )[0][0]
-    source_customer_values = box.pg_query(
+    if destination_snapshot is not None:
+        destination_readings = destination_snapshot["destination_readings"]
+    else:
+        destination_readings = _destination_query(
+            box, destination,
+            f"SELECT count(*) FROM "
+            f"{_destination_table(box, destination, 'cdcflight_app_sensor_readings')} "
+            "WHERE sensor_id = ?",
+            [tag.upper()],
+            connection=connection,
+        )[0][0]
+    source_customer_values = _source_query(
+        box,
         "SELECT id, name, email FROM app.customers WHERE name LIKE %s ORDER BY id",
         (f"{tag}-c-%",),
+        source_connection,
     )
-    destination_customer_values = _destination_query(
+    if destination_snapshot is not None:
+        destination_customer_values = destination_snapshot[
+            "destination_customer_values"
+        ]
+    else:
+        destination_customer_values = _destination_query(
+            box,
+            destination,
+            f"SELECT id, name, email FROM "
+            f"{_destination_table(box, destination, 'cdcflight_app_customers')} "
+            "WHERE name LIKE ? ORDER BY id",
+            [f"{tag}-c-%"],
+            connection=connection,
+        )
+    source_reading_values = _source_query(
         box,
-        destination,
-        f"SELECT id, name, email FROM "
-        f"{_destination_table(box, destination, 'cdcflight_app_customers')} "
-        "WHERE name LIKE ? ORDER BY id",
-        [f"{tag}-c-%"],
-    )
-    source_reading_values = box.pg_query(
         "SELECT sensor_id, value::double precision, unit "
         "FROM app.sensor_readings WHERE sensor_id = %s "
         "ORDER BY sensor_id, value, unit",
         (tag.upper(),),
+        source_connection,
     )
-    destination_reading_values = _destination_query(
-        box,
-        destination,
-        f"SELECT sensor_id, CAST(value AS DOUBLE), unit FROM "
-        f"{_destination_table(box, destination, 'cdcflight_app_sensor_readings')} "
-        "WHERE sensor_id = ? ORDER BY sensor_id, value, unit",
-        [tag.upper()],
-    )
-    event_ids = _destination_query(
-        box, destination,
-        f"SELECT count(*), count(DISTINCT cdcf_event_id) FROM "
-        f"{_destination_table(box, destination, 'cdcflight_app_sensor_readings')} "
-        "WHERE sensor_id = ?",
-        [tag.upper()],
-    )[0]
+    if destination_snapshot is not None:
+        destination_reading_values = destination_snapshot[
+            "destination_reading_values"
+        ]
+        event_ids = destination_snapshot["event_ids"]
+    else:
+        destination_reading_values = _destination_query(
+            box,
+            destination,
+            f"SELECT sensor_id, CAST(value AS DOUBLE), unit FROM "
+            f"{_destination_table(box, destination, 'cdcflight_app_sensor_readings')} "
+            "WHERE sensor_id = ? ORDER BY sensor_id, value, unit",
+            [tag.upper()],
+            connection=connection,
+        )
+        event_ids = _destination_query(
+            box, destination,
+            f"SELECT count(*), count(DISTINCT cdcf_event_id) FROM "
+            f"{_destination_table(box, destination, 'cdcflight_app_sensor_readings')} "
+            "WHERE sensor_id = ?",
+            [tag.upper()],
+            connection=connection,
+        )[0]
     return {
         "state": state,
         "recovery_phase": recovery[0][0] if recovery else "absent",
@@ -510,7 +707,11 @@ def _probe_survivor(
 
 
 def _recover_and_probe(
-    box: Sandbox, tag: str, destination: Destination | None = None
+    box: Sandbox,
+    tag: str,
+    destination: Destination | None = None,
+    connection=None,
+    source_connection=None,
 ) -> dict:
     recovered = box.run(
         destination=destination.kind if destination is not None else "duckdb",
@@ -519,7 +720,9 @@ def _recover_and_probe(
         expect_success=False,
         extra_env=destination.env if destination is not None else None,
     )
-    after = _probe_survivor(box, tag, destination)
+    after = _probe_survivor(
+        box, tag, destination, connection, source_connection
+    )
     return {"run": recovered, "after": after}
 
 
@@ -785,6 +988,7 @@ def _run_cells(
         postgres_cluster,
     )
     results: dict[str, dict] = {}
+    source_connection = None
     try:
         box.reseed()
         baseline = box.run(
@@ -795,17 +999,57 @@ def _run_cells(
             extra_env=destination.env if destination is not None else None,
         )
         results["baseline"] = baseline
+        if destination is not None:
+            source_connection = psycopg.connect(box.source.dsn, autocommit=True)
         for cell in CELLS:
             tag = f"r17_{cell.name}"
             box.clear_fired_fault()
             _state_path(box).unlink(missing_ok=True)
             _add_rows(box, tag)
             if cell.recovery:
-                _advance_slot_past_new_rows(box, destination)
+                if destination is None:
+                    _advance_slot_past_new_rows(
+                        box, destination, source_connection=source_connection
+                    )
+                else:
+                    recovery_connection = connect_motherduck(
+                        destination.env["MOTHERDUCK_TOKEN"],
+                        destination.env["CDC_MD_DATABASE"],
+                    )
+                    try:
+                        _advance_slot_past_new_rows(
+                            box, destination, recovery_connection, source_connection
+                        )
+                    finally:
+                        recovery_connection.close()
             try:
                 killed = _run_with_cut(box, cell, destination)
-                survivor = _probe_survivor(box, tag, destination)
-                resumed = _recover_and_probe(box, tag, destination)
+                destination_connection = (
+                    connect_motherduck(
+                        destination.env["MOTHERDUCK_TOKEN"],
+                        destination.env["CDC_MD_DATABASE"],
+                    )
+                    if destination is not None
+                    else None
+                )
+                try:
+                    survivor = _probe_survivor(
+                        box,
+                        tag,
+                        destination,
+                        destination_connection,
+                        source_connection,
+                    )
+                    resumed = _recover_and_probe(
+                        box,
+                        tag,
+                        destination,
+                        destination_connection,
+                        source_connection,
+                    )
+                finally:
+                    if destination_connection is not None:
+                        destination_connection.close()
                 results[cell.name] = {
                     "cell": cell,
                     "tag": tag,
@@ -822,6 +1066,8 @@ def _run_cells(
                 }
         return results
     finally:
+        if source_connection is not None:
+            source_connection.close()
         box.cleanup()
         box.reseed()
 

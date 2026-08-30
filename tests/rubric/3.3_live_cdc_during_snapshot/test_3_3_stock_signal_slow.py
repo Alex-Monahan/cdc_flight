@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from decimal import Decimal
 
 import duckdb
@@ -17,17 +19,28 @@ pytestmark = pytest.mark.slow
 
 def test_stock_signal_runs_arbitrary_set_while_streaming(sandbox):
     """A durable request and stock signal keep selected and unselected CDC live."""
+    raw_worker = os.environ.get("PYTEST_XDIST_WORKER", "serial")
+    worker = re.sub(r"[^a-z0-9_]", "_", raw_worker.lower()).strip("_") or "serial"
+    control_schema = f"_cdc_flight_{worker}"
+    dataset = f"cdc_raw_{worker}"
+    sandbox.env.update(
+        {
+            "CDC_PIPELINE_NAME": f"{sandbox.env['CDC_PIPELINE_NAME']}_{worker}",
+            "CDC_CONTROL_SCHEMA": control_schema,
+            "CDC_DATASET": dataset,
+        }
+    )
     sandbox.reseed()
     baseline = sandbox.run(reset_state=True, max_seconds=150, idle_seconds=6)
     assert baseline["stop_reason"] in {"idle", "engine_finished"}, baseline
 
     with duckdb.connect(str(sandbox.duckdb_path)) as con:
-        destination.ensure_control_schema(con, "_cdc_flight")
-        destination.ensure_dataset(con, sandbox.DATASET)
+        destination.ensure_control_schema(con, control_schema)
+        destination.ensure_dataset(con, dataset)
         coordinator = BackfillCoordinator(
             con,
             pipeline=sandbox.env["CDC_PIPELINE_NAME"],
-            control_schema="_cdc_flight",
+            control_schema=control_schema,
             topic_prefix="cdcflight",
         )
         signal, runs = coordinator.request_tables(
@@ -78,16 +91,16 @@ def test_stock_signal_runs_arbitrary_set_while_streaming(sandbox):
     assert summary["stop_reason"] in {"idle", "engine_finished"}, summary
 
     runs = sandbox.duck_query(
-        "SELECT source_table, state, signal_id FROM _cdc_flight.backfill_runs "
+        f"SELECT source_table, state, signal_id FROM {control_schema}.backfill_runs "
         "ORDER BY source_table"
     )
     assert runs == [("customers", "complete", "p3-stock-signal"), ("orders", "complete", "p3-stock-signal")]
 
     customers = sandbox.duck_query(
-        'SELECT id, name FROM "cdc_raw"."cdcflight_app_customers" WHERE id = 1'
+        f'SELECT id, name FROM "{dataset}"."cdcflight_app_customers" WHERE id = 1'
     )
     orders = sandbox.duck_query(
-        'SELECT total_amount FROM "cdc_raw"."cdcflight_app_orders" '
+        f'SELECT total_amount FROM "{dataset}"."cdcflight_app_orders" '
         "WHERE total_amount = 777.77"
     )
     assert customers == [(1, "p3-stock-live")]
@@ -105,12 +118,12 @@ def test_stock_signal_runs_arbitrary_set_while_streaming(sandbox):
             "FROM app.orders ORDER BY id"
         ).fetchall()
     destination_customers = sandbox.duck_query(
-        'SELECT id, name, email, lifetime_value, is_active '
-        'FROM "cdc_raw"."cdcflight_app_customers" ORDER BY id'
+        f'SELECT id, name, email, lifetime_value, is_active '
+        f'FROM "{dataset}"."cdcflight_app_customers" ORDER BY id'
     )
     destination_orders = sandbox.duck_query(
-        'SELECT id, customer_id, status, total_amount, currency, note '
-        'FROM "cdc_raw"."cdcflight_app_orders" ORDER BY id'
+        f'SELECT id, customer_id, status, total_amount, currency, note '
+        f'FROM "{dataset}"."cdcflight_app_orders" ORDER BY id'
     )
     assert identity_set(destination_customers) == identity_set(source_customers)
     assert value_multiset(destination_customers) == value_multiset(source_customers)
