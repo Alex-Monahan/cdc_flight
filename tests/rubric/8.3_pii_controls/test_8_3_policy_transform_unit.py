@@ -8,6 +8,7 @@ import hmac
 import pytest
 from support.applier_lab import Lab, data
 
+import cdc_flight.applier as applier_module
 from cdc_flight.errors import AdmissionError, SchemaEvolutionRefused
 from cdc_flight.policy import (
     AcknowledgementHandle,
@@ -238,6 +239,10 @@ def _boundary_failure_record(box):
             "secret": PostgreSQLOutputText("OUTPUT_SOURCE_SENTINEL", 1009),
         }
     }
+    record.value_schema = {"source": "VALUE_SCHEMA_SENTINEL"}
+    record.key_schema = {"source": "KEY_SCHEMA_SENTINEL"}
+    record.before_schema = {"source": "BEFORE_SCHEMA_SENTINEL"}
+    record.after_schema = {"source": "AFTER_SCHEMA_SENTINEL"}
     return record
 
 
@@ -253,7 +258,11 @@ def _boundary_refusal_policy():
     )
 
 
-def _assert_boundary_payload_is_stripped(record, original_raw):
+def _raise_original_boundary_failure():
+    raise RuntimeError("original boundary failure")
+
+
+def _assert_boundary_payload_is_stripped(record, original_raw, *, schemas=True):
     assert record.key is None
     assert record.before is None
     assert record.after is None
@@ -263,6 +272,11 @@ def _assert_boundary_payload_is_stripped(record, original_raw):
     assert record.typed_key is None
     assert record.typed_before is None
     assert record.typed_after is None
+    if schemas:
+        assert record.value_schema is None
+        assert record.key_schema is None
+        assert record.before_schema is None
+        assert record.after_schema is None
     assert record.output_texts == {}
     assert isinstance(record.raw, AcknowledgementHandle)
     assert record.raw is not original_raw
@@ -281,6 +295,144 @@ def test_policy_boundary_sealer_failure_strips_payload_and_reraises(tmp_path, mo
             box.applier.policy_gate, "seal_refusal", fail_inside_sealer
         )
         with pytest.raises(RuntimeError, match="injected sealer failure"):
+            box.applier._sanitize_record(record)
+        _assert_boundary_payload_is_stripped(record, original_raw)
+    finally:
+        box.close()
+
+
+def test_policy_boundary_cleanup_setter_failure_preserves_original_and_clears_payload(
+    tmp_path, monkeypatch
+):
+    box = Lab(tmp_path / "cleanup-setter-failure.duckdb")
+    try:
+        record = _boundary_failure_record(box)
+        original_raw = record.raw
+
+        def fail_if_called(*_args, **_kwargs):
+            raise SystemExit("cleanup setter must not be called")
+
+        monkeypatch.setattr(applier_module, "_set_policy_boundary_field", fail_if_called)
+        monkeypatch.setattr(
+            box.applier,
+            "_activate_delete_policy_at_boundary",
+            _raise_original_boundary_failure,
+        )
+        with pytest.raises(RuntimeError, match="original boundary failure"):
+            box.applier._sanitize_record(record)
+        _assert_boundary_payload_is_stripped(record, original_raw)
+    finally:
+        box.close()
+
+
+def test_policy_boundary_ack_constructor_failure_still_replaces_raw_source(
+    tmp_path, monkeypatch
+):
+    box = Lab(tmp_path / "ack-constructor-failure.duckdb")
+    try:
+        record = _boundary_failure_record(box)
+        original_raw = record.raw
+
+        class FailingAcknowledgementHandle(AcknowledgementHandle):
+            def __init__(self, _delegate):
+                raise SystemExit("ack constructor must not be called")
+
+        monkeypatch.setattr(
+            applier_module, "AcknowledgementHandle", FailingAcknowledgementHandle
+        )
+        monkeypatch.setattr(
+            box.applier,
+            "_activate_delete_policy_at_boundary",
+            _raise_original_boundary_failure,
+        )
+        with pytest.raises(RuntimeError, match="original boundary failure"):
+            box.applier._sanitize_record(record)
+        _assert_boundary_payload_is_stripped(record, original_raw)
+    finally:
+        box.close()
+
+
+def _unusual_image_record(box, shape):
+    record = data(
+        "unusual-image",
+        1,
+        301,
+        table="pii_boundary",
+        key=None,
+        before=None,
+        after=None,
+    )
+    descriptor = TEXT
+    if shape == "empty_dict":
+        record.after = {}
+    elif shape == "non_dict":
+        record.after = "NOT_A_MAPPING"
+    record.after_descriptors = {"secret": descriptor}
+    record.typed_after = TypedImage.from_mapping(
+        {"secret": "IMAGE_SOURCE_SENTINEL"}, {"secret": descriptor}
+    )
+    record.output_texts = {
+        "after": {
+            "secret": PostgreSQLOutputText(
+                "OUTPUT_SOURCE_SENTINEL", descriptor.output_function_oid
+            )
+        }
+    }
+    return record
+
+
+@pytest.mark.parametrize("shape", ["none", "empty_dict", "non_dict"])
+def test_policy_boundary_image_shapes_leave_no_typed_source_state(tmp_path, shape):
+    box = Lab(tmp_path / f"image-shape-{shape}.duckdb")
+    try:
+        record = _unusual_image_record(box, shape)
+        original_raw = record.raw
+        if shape == "non_dict":
+            with pytest.raises(AttributeError):
+                box.applier._sanitize_record(record)
+        else:
+            assert box.applier._sanitize_record(record) is record
+        _assert_boundary_payload_is_stripped(record, original_raw)
+    finally:
+        box.close()
+
+
+class _RaisingDescriptor:
+    kind = "text"
+
+    @property
+    def output_function_oid(self):
+        raise KeyboardInterrupt("descriptor output identity access failure")
+
+    @property
+    def metadata(self):
+        return ()
+
+
+def test_policy_boundary_raising_descriptor_leaves_no_typed_source_state(tmp_path):
+    salt_path = tmp_path / "descriptor-salt"
+    salt_path.write_bytes(b"unit-salt")
+    salt_path.chmod(0o600)
+    policy = PIIPolicy.from_manifest(
+        [
+            {
+                "column_regex": r"^app\.pii_boundary\.secret$",
+                "action": "hash",
+                "algorithm": "HMAC-SHA-256",
+                "salt_id": "test-v1",
+            }
+        ],
+        unmatched="replicate",
+        salt_file=salt_path,
+    )
+    box = Lab(tmp_path / "raising-descriptor.duckdb", pii_policy=policy)
+    try:
+        record = _unusual_image_record(box, "empty_dict")
+        descriptor = _RaisingDescriptor()
+        record.after = {"secret": "IMAGE_SOURCE_SENTINEL"}
+        record.after_descriptors = {"secret": descriptor}
+        original_raw = record.raw
+        with pytest.raises(KeyboardInterrupt, match="descriptor output identity"):
             box.applier._sanitize_record(record)
         _assert_boundary_payload_is_stripped(record, original_raw)
     finally:
@@ -322,6 +474,6 @@ def test_policy_boundary_ordinary_refusal_still_returns_sealed_record(tmp_path):
         assert returned is record
         assert isinstance(record.admission_refusal, SchemaEvolutionRefused)
         assert record.sanitized is True
-        _assert_boundary_payload_is_stripped(record, original_raw)
+        _assert_boundary_payload_is_stripped(record, original_raw, schemas=False)
     finally:
         box.close()

@@ -605,6 +605,8 @@ class PolicyGate:
             typed = getattr(event, f"typed_{image_name}", None)
             image = getattr(event, image_name, None)
             if image is None:
+                setattr(event, descriptor_name, {})
+                setattr(event, f"typed_{image_name}", None)
                 continue
             new_image: dict[str, Any] = {}
             new_descriptors: dict[str, SourceTypeDescriptor] = {}
@@ -707,6 +709,11 @@ class PolicyGate:
                     new_typed_fields[name] = FieldValue.explicit_null(descriptor)
                 else:
                     new_typed_fields[name] = field_value(value, descriptor)
+            if not new_image:
+                setattr(event, image_name, None)
+                setattr(event, descriptor_name, {})
+                setattr(event, f"typed_{image_name}", None)
+                continue
             # Preserve typed ABSENT/marker dispositions carried by a schema-enabled
             # envelope even when the legacy image has no corresponding mapping key.
             # They are protocol state, not values, and RowPatch must see them later.

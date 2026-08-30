@@ -98,6 +98,15 @@ from .spill import SpillBuffer
 log = logging.getLogger("cdc_flight.applier")
 OWNER = "applier-lifecycle"
 
+# These are created once, before a boundary failure can be in flight.  The cleanup
+# path must only assign them; it cannot afford to construct a replacement handle or
+# an empty mapping while preserving another exception.
+_POLICY_BOUNDARY_ACK = AcknowledgementHandle(None)
+_POLICY_BOUNDARY_EMPTY_KEY_DESCRIPTORS: dict[str, Any] = {}
+_POLICY_BOUNDARY_EMPTY_BEFORE_DESCRIPTORS: dict[str, Any] = {}
+_POLICY_BOUNDARY_EMPTY_AFTER_DESCRIPTORS: dict[str, Any] = {}
+_POLICY_BOUNDARY_EMPTY_OUTPUT_TEXTS: dict[str, Any] = {}
+
 
 def _set_policy_boundary_field(record: PendingRecord, attribute: str, value) -> bool:
     """Set one fallback field without allowing cleanup to raise."""
@@ -115,44 +124,27 @@ def _set_policy_boundary_field(record: PendingRecord, attribute: str, value) -> 
 def _clear_policy_boundary_payload(record: PendingRecord) -> None:
     """Strip source payload after any pre-assembler boundary escape.
 
-    This is deliberately a last-resort helper rather than another policy operation:
-    it must not call code that can raise while the original boundary error is in
-    flight.  ``PendingRecord`` is a mutable dataclass, so ``object.__setattr__``
-    clears its fields without invoking an adapter's custom ``__setattr__``.  The
-    ``__dict__`` writes are a second, still-local fallback; every operation is
-    guarded so cleanup cannot replace the error that caused it.
+    ``PendingRecord`` is a known mutable dataclass.  Keep this list explicit and use
+    only direct assignments: a failure injected into the old dynamic setter cannot
+    interrupt the list, and no constructor or method dispatch runs while the
+    original boundary error is in flight.  The acknowledgement handle and empty
+    mappings are import-time singletons for the same reason.
     """
-    for attribute in ("key", "before", "after"):
-        _set_policy_boundary_field(record, attribute, None)
-    for attribute in (
-        "key_descriptors",
-        "before_descriptors",
-        "after_descriptors",
-        "output_texts",
-    ):
-        _set_policy_boundary_field(record, attribute, {})
-    for attribute in (
-        "typed_key",
-        "typed_before",
-        "typed_after",
-        "value_schema",
-        "key_schema",
-        "before_schema",
-        "after_schema",
-    ):
-        _set_policy_boundary_field(record, attribute, None)
-
-    try:
-        raw = object.__getattribute__(record, "raw")
-    except BaseException:
-        raw = None
-    if raw is None or isinstance(raw, AcknowledgementHandle):
-        return
-    try:
-        handle = AcknowledgementHandle(raw)
-    except BaseException:
-        return
-    _set_policy_boundary_field(record, "raw", handle)
+    record.key = None
+    record.before = None
+    record.after = None
+    record.key_descriptors = _POLICY_BOUNDARY_EMPTY_KEY_DESCRIPTORS
+    record.before_descriptors = _POLICY_BOUNDARY_EMPTY_BEFORE_DESCRIPTORS
+    record.after_descriptors = _POLICY_BOUNDARY_EMPTY_AFTER_DESCRIPTORS
+    record.typed_key = None
+    record.typed_before = None
+    record.typed_after = None
+    record.value_schema = None
+    record.key_schema = None
+    record.before_schema = None
+    record.after_schema = None
+    record.output_texts = _POLICY_BOUNDARY_EMPTY_OUTPUT_TEXTS
+    record.raw = _POLICY_BOUNDARY_ACK
 
 
 class Applier:
