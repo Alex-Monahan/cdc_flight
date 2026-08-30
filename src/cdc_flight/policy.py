@@ -46,7 +46,7 @@ _TEXT_KINDS = frozenset(
 )
 
 
-class PolicyConfigurationError(ValueError):
+class PolicyConfigurationError(AdmissionError):
     """The PII manifest or secret reference is unsafe or incomplete."""
 
 
@@ -505,7 +505,7 @@ class PIIPolicy:
                         rule,
                         output_text=supplied,
                     )
-                except PolicyValueRefused:
+                except AdmissionError:
                     # money/xml are an explicit VARCHAR transport carve-out.  A
                     # missing source OUTPUT proof may omit that cell, but it may
                     # never turn into a table-wide schema refusal.  A key remains
@@ -665,7 +665,7 @@ class PolicyGate:
                         rule,
                         output_text=_source_output_for(event, image_name, name),
                     ) if rule.action in {"mask", "hash", "truncate"} else (value, descriptor)
-                except PolicyValueRefused as exc:
+                except AdmissionError as exc:
                     # PostgreSQL money and xml are deliberately represented as
                     # VARCHAR downstream.  If the connector did not carry an
                     # authoritative OUTPUT proof, omit that sensitive value and

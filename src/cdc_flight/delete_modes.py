@@ -15,11 +15,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import naming
+from .errors import AdmissionError
 
 DELETE_MODES = ("hard", "soft")
 
 
-class DeleteModeConfigurationError(ValueError):
+class DeleteModeConfigurationError(AdmissionError):
     """The delete-mode manifest cannot be applied safely."""
 
 

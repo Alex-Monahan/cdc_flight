@@ -13,6 +13,7 @@ from .typed_types import (
     JSONB_NULL,
     JsonbNull,
     OpaqueText,
+    PostgresInfinity,
     UnionValue,
     _freeze_pairs,
 )
@@ -44,6 +45,10 @@ def _jsonable(value: Any) -> Any:
         return {"__cdc_jsonb_null__": True}
     if isinstance(value, OpaqueText):
         return {"__opaque_text__": str(value)}
+    if isinstance(value, PostgresInfinity):
+        return {
+            "__postgres_infinity__": "positive" if value.positive else "negative"
+        }
     if isinstance(value, UnionValue):
         return {"__union_member__": value.member, "value": _jsonable(value.value)}
     if isinstance(value, Decimal):
@@ -74,6 +79,8 @@ def _float_marker(value: str) -> float:
 
 def _from_jsonable(value: Any) -> Any:
     if isinstance(value, Mapping):
+        if "__postgres_infinity__" in value and len(value) == 1:
+            return PostgresInfinity(value["__postgres_infinity__"] == "positive")
         if value.get("__cdc_jsonb_null__") is True and len(value) == 1:
             return JSONB_NULL
         if "__opaque_text__" in value and len(value) == 1:
