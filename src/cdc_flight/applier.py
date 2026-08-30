@@ -73,6 +73,7 @@ from .envelope import (
     KIND_SNAPSHOT_BOUNDARY,
     PendingRecord,
     decode,
+    offsets_of,
 )
 from .errors import (
     AdmissionError,
@@ -904,6 +905,12 @@ class Applier:
         context = None
         if provider is not None and record.qualified_table:
             context = provider(record.qualified_table)
+        # The policy gate replaces the connector object with an opaque
+        # acknowledgement handle.  Capture only the non-sensitive Connect offset
+        # facts before that replacement so the durable resume-point builder never
+        # needs to inspect the handle (or retain a decoded source mapping).
+        if record.raw is not None and record.source_offset is None:
+            record.source_partition, record.source_offset = offsets_of(record.raw)
         record.delete_mode = self.delete_policy.resolve(record.qualified_table)
         record.delete_policy_epoch = int(self.delete_policy.epoch)
         record.delete_policy_digest = self.delete_policy.digest
