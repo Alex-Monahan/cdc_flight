@@ -91,6 +91,7 @@ _SAFE_CONTEXT_KEYS = frozenset({
     "marker_ack_lsn", "marker_ack_target", "marker_lsn", "occurrence_key", "ownership",
     "pipeline", "policy_digest", "policy_epoch", "reason_code", "refusal_class",
     "recovery_phase", "relation_attributed", "replication_lag_bytes", "restart_lsn",
+    "received_high_water_lsn", "lag_definition", "lag_sampled_at",
     "run_not_ok", "slot_active", "slot_active_application_name", "slot_active_pid",
     "slot_attached", "slot_exists", "slot_health", "slot_name", "slot_replication_application_name",
     "slot_replication_pid", "slot_restart_lsn", "slot_confirmed_flush_lsn", "slot_state",
