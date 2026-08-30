@@ -59,6 +59,22 @@ def _policy(action: str, salt_path) -> PIIPolicy:
     )
 
 
+def _key_policy(action: str, salt_path) -> PIIPolicy:
+    rule = {
+        "column_regex": r"^app\.p8_resnapshot\.id$",
+        "action": action,
+    }
+    if action == "mask":
+        rule["replacement"] = "[MASKED]"
+    elif action == "truncate":
+        rule["max_chars"] = 7
+    elif action == "hash":
+        rule.update({"algorithm": "HMAC-SHA-256", "salt_id": "resnap-v1"})
+    return PIIPolicy.from_manifest(
+        [rule], unmatched="replicate", salt_file=salt_path
+    )
+
+
 def _provider() -> RelationDescriptorProvider:
     provider = RelationDescriptorProvider(
         {"app.p8_resnapshot": {"id": ID, "x": XML_ARRAY}},
@@ -159,33 +175,29 @@ def test_resnapshot_gate_attachment_rejects_immutable_provider():
         )
 
 
-def test_resnapshot_source_recovery_rejects_a_transformed_key_before_query():
-    policy = PIIPolicy.from_manifest(
-        [
-            {
-                "column_regex": r"^app\.p8_resnapshot\.id$",
-                "action": "mask",
-                "replacement": "[MASKED]",
-            }
-        ],
-        unmatched="replicate",
-    )
-    gate = PolicyGate(policy)
-    event = _event(gate)
-    event.key = {"id": 1}
-    with pytest.raises(PolicyValueRefused, match="source key"):
-        # The fake connection must never be reached: key policy is checked before
-        # any source-row acquisition or hydration assignment.
-        from cdc_flight.catalog_support import _read_event_columns
+def test_resnapshot_source_recovery_rejects_every_transformed_key_before_query(
+    tmp_path,
+):
+    salt_path = tmp_path / "salt"
+    salt_path.write_bytes(b"resnapshot-private-salt")
+    salt_path.chmod(0o600)
+    from cdc_flight.catalog_support import _read_event_columns
 
-        _read_event_columns(
-            object(),
-            event,
-            ("x",),
-            {"id": "id", "x": "x"},
-            policy_gate=gate,
-            descriptors={"x": XML_ARRAY, "id": ID},
-        )
+    for action in ("exclude", "mask", "hash", "truncate"):
+        gate = PolicyGate(_key_policy(action, salt_path))
+        event = _event(gate)
+        event.key = {"id": 1}
+        with pytest.raises(PolicyValueRefused, match="source key"):
+            # The fake connection must never be reached: key policy is checked
+            # before any source-row acquisition or hydration assignment.
+            _read_event_columns(
+                object(),
+                event,
+                ("x",),
+                {"id": "id", "x": "x"},
+                policy_gate=gate,
+                descriptors={"x": XML_ARRAY, "id": ID},
+            )
 
 
 def test_resnapshot_recovery_without_a_gate_is_a_schema_refusal():
@@ -204,3 +216,8 @@ def test_resnapshot_recovery_without_a_gate_is_a_schema_refusal():
     )
     with pytest.raises(SchemaEvolutionRefused, match="policy gate"):
         provider.read_event_columns(event, ("x",))
+
+    from cdc_flight.catalog_support import _read_event_columns
+
+    with pytest.raises(SchemaEvolutionRefused, match="policy gate"):
+        _read_event_columns(object(), event, ("x",), {"x": "x"})
