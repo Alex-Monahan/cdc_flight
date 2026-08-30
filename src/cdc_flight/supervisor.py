@@ -261,6 +261,9 @@ def run_engine_bounded(
         run.engine_start_timeout,
     )
     close_hung = False
+    commit_to_slot_started_at: float | None = None
+    commit_to_slot_observed_at: float | None = None
+    commit_to_slot_confirmed = False
     shutdown_sequence = ShutdownSequence()
     next_service_recheck = started + float(
         getattr(service_context, "invariant_check_seconds", 30.0)
@@ -716,6 +719,8 @@ def run_engine_bounded(
             and outcome.value not in {"source_dark", "hung"}
             and not (service_mode and (service_context.lease_lost or service_context.stalled))
         )
+        if final_ack_required:
+            commit_to_slot_started_at = getattr(handler, "last_commit_monotonic", None)
         if not final_ack_required:
             shutdown_sequence.to(SHUTDOWN_ACK_NOT_REQUIRED)
         elif (
@@ -723,6 +728,8 @@ def run_engine_bounded(
             and not faults.matrix_selected("shutdown_idle_marker_written")
             and not faults.matrix_selected("shutdown_idle_marker_acknowledged")
         ):
+            commit_to_slot_observed_at = time.monotonic()
+            commit_to_slot_confirmed = True
             shutdown_sequence.to(SHUTDOWN_ACK_COMPLETE)
         else:
             shutdown_sequence.to(SHUTDOWN_ACK_PENDING)
@@ -743,6 +750,7 @@ def run_engine_bounded(
                 timeout=wait_seconds,
                 marker_lsn=marker_lsn,
             ):
+                commit_to_slot_observed_at = time.monotonic()
                 shutdown_sequence.to(SHUTDOWN_ACK_FAILED)
                 sample = health.last
                 acknowledgement_timeout = {
@@ -764,6 +772,8 @@ def run_engine_bounded(
                     acknowledgement_timeout["confirmed_pos"],
                 )
             else:
+                commit_to_slot_observed_at = time.monotonic()
+                commit_to_slot_confirmed = True
                 shutdown_sequence.to(SHUTDOWN_ACK_COMPLETE)
 
         # Seal before waiting: an open admission boundary can always admit another
@@ -977,6 +987,18 @@ def run_engine_bounded(
         summary["service_invariant_recheck"] = service_recheck_result
     if acknowledgement_timeout is not None:
         summary["slot_acknowledgement_timeout"] = acknowledgement_timeout
+    if commit_to_slot_started_at is not None and commit_to_slot_observed_at is not None:
+        summary["commit_to_slot_confirmation"] = {
+            "commit_to_confirm_sec": round(
+                max(0.0, commit_to_slot_observed_at - commit_to_slot_started_at), 3
+            ),
+            "confirmed": commit_to_slot_confirmed,
+            "durable_lsn": durable_lsn,
+            "observed_confirmed_pos": (
+                health.last.confirmed_pos if health is not None and health.last is not None else None
+            ),
+            "wait_seconds": min(run.close_timeout, 10.0),
+        }
     if engine.suppressed_message:
         summary["suppressed_engine_message"] = engine.suppressed_message
     effective = getattr(engine, "effective_configuration", None)

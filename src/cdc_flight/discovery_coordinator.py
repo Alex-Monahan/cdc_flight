@@ -585,6 +585,22 @@ class LiveDiscoveryCoordinator:
         return properties
 
     def _build_applier(self, properties: dict, completion) -> Applier:
+        slot_state = dest_mod.read_slot_state(
+            self.con,
+            self.destination.pipeline_name,
+            self.replication.slot_name,
+            control_schema=self.destination.control_schema,
+        )
+        source_cluster_id = (
+            str(slot_state["system_identifier"])
+            if slot_state is not None and slot_state["system_identifier"] is not None
+            else None
+        )
+        source_timeline = (
+            int(slot_state["timeline_id"])
+            if slot_state is not None and slot_state["timeline_id"] is not None
+            else None
+        )
         applier = Applier(
             self.con,
             pipeline=self.destination.pipeline_name,
@@ -611,6 +627,9 @@ class LiveDiscoveryCoordinator:
             hstore_handling_mode=self.props.get("hstore.handling.mode", "map"),
             control_schema=self.destination.control_schema,
             service_context=self.service_context,
+            source_cluster_id=source_cluster_id,
+            source_timeline=source_timeline,
+            strict_event_identity=True,
         )
         self.ownership.attach(applier)
         return applier

@@ -123,6 +123,9 @@ class Applier:
         binary_handling_mode: str = "base64", hstore_handling_mode: str = "map",
         control_schema: str | None = None,
         service_context=None,
+        source_cluster_id: str | None = None,
+        source_timeline: int | None = None,
+        strict_event_identity: bool = False,
     ):
         self.con = con
         self.pipeline = pipeline
@@ -144,6 +147,9 @@ class Applier:
         # Service mode supplies the parent/epoch fence; batch callers leave this
         # unset and retain the finite adapter's exact callback surface.
         self.service_context = service_context
+        self.source_cluster_id = source_cluster_id
+        self.source_timeline = source_timeline
+        self.strict_event_identity = bool(strict_event_identity)
         #: `catalog.CatalogWatcher` or None. The only source of DROP TABLE knowledge
         #: (rubric 1.5): logical decoding does not carry DDL at all.
         self.catalog = catalog
@@ -369,6 +375,9 @@ class Applier:
         self.watermark_fenced_events = 0
         self.table_counts: dict[str, int] = {}
         self.last_commit_id = resume_point.commit_id
+        #: Set immediately after the destination COMMIT for supervisor timing
+        #: evidence; it is never used to authorize an acknowledgement.
+        self.last_commit_monotonic: float | None = None
         self.error: BaseException | None = None
         self._next_commit_id = destination.next_commit_id(
             con, pipeline, control_schema=self.control_schema

@@ -115,7 +115,9 @@ def resume_any_journalled_recovery(
         pipeline=dest.pipeline_name,
         namespace=namespace,
         record=record,
-        dsn=source.dsn,
+        # Recovery.resume() drops the source slot; administrative recovery must
+        # never use a hot-standby read endpoint.
+        dsn=source.primary_dsn,
         control_schema=dest.control_schema,
     )
     return record, result
@@ -262,7 +264,9 @@ def check_the_slot(
             con,
             pipeline=dest.pipeline_name,
             namespace=namespace,
-            dsn=source.dsn,
+            # The recovery journal owns slot deletion, so give it the explicit
+            # primary write route rather than the standby decoder DSN.
+            dsn=source.primary_dsn,
             slot_name=replication.slot_name,
             offset_path=replication.offset_file,
             verdict=verdict,
@@ -365,7 +369,9 @@ def journal_the_reset(
         pipeline=dest.pipeline_name,
         namespace=namespace,
         record=record,
-        dsn=source.dsn,
+        # --reset-state also drops a replication slot and therefore requires the
+        # explicit primary administration route.
+        dsn=source.primary_dsn,
         control_schema=dest.control_schema,
     )
     log.info("--reset-state is journalled and armed: %s", result)

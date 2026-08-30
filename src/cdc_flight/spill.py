@@ -35,13 +35,15 @@ log = logging.getLogger("cdc_flight.spill")
 _COLUMNS = [
     "commit_id", "unit_seq", "event_seq", "target_table", "source_schema",
     "source_table", "lsn", "txn_id", "total_order", "cdcf_event_id", "op",
-    "source_ts_ms", "before_json", "after_json", "key_json",
+    "source_ts_ms", "before_json", "after_json", "key_json", "source_cluster_id",
+    "source_timeline", "relation_generation", "commit_lsn", "policy_epoch",
 ]
 _TYPES = [
     apply_sql.BIGINT, apply_sql.BIGINT, apply_sql.BIGINT, apply_sql.VARCHAR,
     apply_sql.VARCHAR, apply_sql.VARCHAR, apply_sql.BIGINT, apply_sql.VARCHAR,
     apply_sql.BIGINT, apply_sql.VARCHAR, apply_sql.VARCHAR, apply_sql.BIGINT,
-    apply_sql.VARCHAR, apply_sql.VARCHAR, apply_sql.VARCHAR,
+    apply_sql.VARCHAR, apply_sql.VARCHAR, apply_sql.VARCHAR, apply_sql.VARCHAR,
+    apply_sql.BIGINT, apply_sql.VARCHAR, apply_sql.BIGINT, apply_sql.BIGINT,
 ]
 
 
@@ -107,6 +109,11 @@ class SpillBuffer:
                     binary_mode=self.binary_mode,
                     hstore_mode=self.hstore_mode,
                 ),
+                staged.event.source_cluster_id,
+                staged.event.source_timeline,
+                staged.event.relation_generation,
+                staged.event.commit_lsn,
+                staged.event.policy_epoch,
             ]
             for staged in prepared
         ]
@@ -117,7 +124,9 @@ class SpillBuffer:
         self.rows += len(rows)
         return len(rows)
 
-    def load(self, *, commit_id: int, unit_seq: int) -> list[StagedEvent]:
+    def load(
+        self, *, commit_id: int, unit_seq: int, commit_lsn: int | None = None
+    ) -> list[StagedEvent]:
         """One unit's staged rows, in source order.
 
         `ORDER BY event_seq` within a unit is source order, and the caller loads a
@@ -127,7 +136,8 @@ class SpillBuffer:
         staged = self.con.execute(
             f"SELECT target_table, source_schema, source_table, lsn, txn_id, total_order, "
             "       cdcf_event_id, op, source_ts_ms, before_json, after_json, key_json, "
-            "       event_seq "
+            "       source_cluster_id, source_timeline, relation_generation, commit_lsn, "
+            "       policy_epoch, event_seq "
             f"FROM {control_table(self.control_schema, 'spill_events')} "
             "WHERE commit_id = ? AND unit_seq = ? "
             "ORDER BY event_seq",
@@ -137,7 +147,9 @@ class SpillBuffer:
         for row in staged:
             (
                 target, schema, table, lsn, txn_id, total_order, event_id, op,
-                source_ts_ms, before_json, after_json, key_json, event_seq,
+                source_ts_ms, before_json, after_json, key_json, source_cluster_id,
+                source_timeline, relation_generation, stored_commit_lsn, policy_epoch,
+                event_seq,
             ) = row
             before, typed_before = _image_from_json(before_json)
             after, typed_after = _image_from_json(after_json)
@@ -153,6 +165,15 @@ class SpillBuffer:
                         kind=KIND_TRUNCATE if op == OP_TRUNCATE else KIND_DATA,
                         topic="", nbytes=0, op=op, schema=schema,
                         table=table, lsn=lsn, txn_id=txn_id, total_order=total_order,
+                        source_cluster_id=source_cluster_id,
+                        source_timeline=source_timeline,
+                        relation_generation=relation_generation,
+                        commit_lsn=(
+                            stored_commit_lsn
+                            if stored_commit_lsn is not None
+                            else commit_lsn
+                        ),
+                        policy_epoch=int(policy_epoch or 0),
                         source_ts_ms=source_ts_ms,
                         key=key,
                         before=before,

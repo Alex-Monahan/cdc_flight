@@ -429,7 +429,10 @@ def run(
     )
     # A leftover slot from an interrupted re-snapshot would make Debezium take the
     # pre-existing-slot path, which is exactly the path that does not export a snapshot.
-    reconcile_mod.drop_slot(source.dsn, slot)
+    # Slot removal is source administration, not a catalog read.  In standby mode
+    # the local recovery endpoint is read-only, so this must use the explicit
+    # primary route and fail closed when CDC_PRIMARY_DSN is absent.
+    reconcile_mod.drop_slot(source.primary_dsn, slot)
 
     resnap_replication = dataclasses.replace(
         replication, slot_name=slot, state_dir=state_dir
@@ -727,7 +730,8 @@ def run(
             # Named by us, created by Debezium, ours to reclaim only after the callback
             # ownership token proves every destination user has left AND a safe owner
             # has discharged the durable recovery obligation.
-            recovery.retire_terminal_resources(dsn=source.dsn, slot=slot)
+            # Terminal throwaway-slot retirement is also source administration.
+            recovery.retire_terminal_resources(dsn=source.primary_dsn, slot=slot)
 
 
 def reassert_owed(

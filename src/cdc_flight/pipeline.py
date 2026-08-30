@@ -46,6 +46,7 @@ from . import recovery as recovery_mod
 from . import resnapshot as resnapshot_mod
 from . import resnapshot_batches as rbs
 from . import resnapshot_recovery as resnapshot_recovery_mod
+from . import standby as standby_mod
 from .backfill import BackfillCoordinator
 from .completion_stage import PostEngineCompletion
 from .config import (
@@ -289,6 +290,31 @@ def run(
             )
         dest_mod.ensure_control_schema(con, control_schema)
         dest_mod.ensure_dataset(con, dest.dataset_name)
+        summary_extra["source_role"] = source.role
+        if source.role == "standby":
+            # This is a read-only capability gate.  Stock Debezium remains the
+            # decoder, and all source writes (publication admission and the
+            # transactional marker) continue to use ``CDC_PRIMARY_DSN`` through
+            # the existing catalog/health routes.  A standby without these facts
+            # is snapshot-only; do not construct a connector that would appear
+            # healthy while its local logical slot is absent or invalid.
+            standby = standby_mod.inspect(
+                source.dsn,
+                replication.slot_name,
+                primary_dsn=source.primary_dsn,
+                physical_slot_name=source.physical_slot_name,
+                connect_timeout=run_cfg.jdbc_connect_timeout_seconds,
+                statement_timeout_ms=run_cfg.jdbc_socket_timeout_seconds * 1000,
+            )
+            summary_extra["standby_capability"] = standby.as_dict()
+            log.info(
+                "validated recovery-mode standby source: system=%s timeline=%s "
+                "local_slot=%s physical_slot=%s",
+                standby.system_identifier,
+                standby.timeline_id,
+                standby.local_slot_name,
+                standby.receiver_slot_name,
+            )
         summary_extra["fallback_alerts_replayed"] = dest_mod.replay_fallback_alerts(
             con, dest
         )
@@ -377,7 +403,7 @@ def run(
         # Swept unconditionally, by the one name this pipeline derives from its own slot
         # (Opus MAJOR-2, observed leaking twice on the shared cluster in one day).
         summary_extra["stale_resnapshot_slot"] = resnapshot_mod.sweep_stale_slot(
-            source.dsn, replication.slot_name
+            source.primary_dsn, replication.slot_name
         )
 
         captured_tables = acquisition.captured_tables(
@@ -460,6 +486,24 @@ def run(
             summary_extra["recovery_journal"] = journal.as_dict()
             faults_mod.runtime_state(recovery_phase=journal.phase)
 
+        if source.role == "standby":
+            # Acquisition may deliberately drop a slot whose position outruns an
+            # untrusted destination.  Do not let stock Debezium silently turn that
+            # state into a slow CREATE_REPLICATION_SLOT attempt on a hot standby:
+            # the supported standby contract requires an operator/local-slot
+            # administration step before the engine starts.  This second read-only
+            # check names the missing fact and fails before the callback lifecycle
+            # exists, rather than treating a JDBC timeout as a standby proof.
+            standby = standby_mod.inspect(
+                source.dsn,
+                replication.slot_name,
+                primary_dsn=source.primary_dsn,
+                physical_slot_name=source.physical_slot_name,
+                connect_timeout=run_cfg.jdbc_connect_timeout_seconds,
+                statement_timeout_ms=run_cfg.jdbc_socket_timeout_seconds * 1000,
+            )
+            summary_extra["standby_capability_after_acquisition"] = standby.as_dict()
+
         phases.ensure(PHASE_RECONCILING)
         reconciliation = reconcile_mod.reconcile(
             con,
@@ -528,7 +572,7 @@ def run(
                 pipeline=dest.pipeline_name,
                 namespace=namespace,
                 record=journal,
-                dsn=source.dsn,
+                dsn=source.primary_dsn,
                 control_schema=control_schema,
             )
         if (

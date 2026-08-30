@@ -18,7 +18,11 @@ from typing import Any
 from . import faults, table_lifecycle
 from .config import resolve_control_schema, resolve_motherduck_database
 from .control_schema import CONTROL_DDL, ensure_control_schema
-from .errors import CANONICAL_REFUSAL_CLASS, OffsetUnusable  # noqa: F401
+from .errors import (  # noqa: F401
+    CANONICAL_REFUSAL_CLASS,
+    DestinationIdentityCollision,
+    OffsetUnusable,
+)
 from .machines import (
     KEYLESS_EVENT,
     KEYLESS_EVENT_APPLIED,
@@ -599,6 +603,285 @@ def write_keyless_events(
         normalized,
         [VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, "TIMESTAMPTZ"],
     )
+
+
+def read_event_ledger(
+    con,
+    *,
+    pipeline: str,
+    target_table: str,
+    event_id: str,
+    control_schema: str | None = None,
+) -> dict[str, Any] | None:
+    """Read one shared event-ledger row from the caller's open transaction."""
+    columns = (
+        "operation, payload_digest, state, source_schema, source_table, "
+        "source_cluster_id, source_timeline, relation_generation, source_lsn, "
+        "commit_lsn, txn_id, total_order, key_guard_digest, policy_epoch, "
+        "snapshot_epoch, applied_at"
+    )
+    row = con.execute(
+        f"SELECT {columns} FROM {_control_table(control_schema, 'event_ledger')} "
+        "WHERE pipeline = ? AND target_table = ? AND event_id = ?",
+        [pipeline, target_table, event_id],
+    ).fetchone()
+    if row is None:
+        return None
+    names = (
+        "operation", "payload_digest", "state", "source_schema", "source_table",
+        "source_cluster_id", "source_timeline", "relation_generation", "source_lsn",
+        "commit_lsn", "txn_id", "total_order", "key_guard_digest", "policy_epoch",
+        "snapshot_epoch", "applied_at",
+    )
+    return {
+        "pipeline": pipeline,
+        "target_table": target_table,
+        "event_id": event_id,
+        **dict(zip(names, row, strict=True)),
+    }
+
+
+class EventLedgerBatch:
+    """Claim event identities with one read and one bulk insert per plan.
+
+    Snapshot callbacks can contain tens of thousands of rows.  The old claim path
+    issued a destination SELECT and INSERT for every row, which made the callback
+    itself the long-lived owner of the JPype bridge and prevented supervisor
+    shutdown from reaching its quiescence proof.  This cache keeps the exact
+    collision checks in Python for the duration of the open destination
+    transaction, then inserts all newly claimed rows before any table materializer
+    runs.  A concurrent primary-key conflict still fails closed.
+    """
+
+    _COLUMNS = (
+        "pipeline", "target_table", "event_id", "operation", "payload_digest",
+        "state", "source_schema", "source_table", "source_cluster_id",
+        "source_timeline", "relation_generation", "source_lsn", "commit_lsn",
+        "txn_id", "total_order", "key_guard_digest", "policy_epoch",
+        "snapshot_epoch", "applied_at",
+    )
+    _READ_COLUMNS = (
+        "operation, payload_digest, state, source_schema, source_table, "
+        "source_cluster_id, source_timeline, relation_generation, source_lsn, "
+        "commit_lsn, txn_id, total_order, key_guard_digest, policy_epoch, "
+        "snapshot_epoch, applied_at"
+    )
+    _READ_NAMES = (
+        "operation", "payload_digest", "state", "source_schema", "source_table",
+        "source_cluster_id", "source_timeline", "relation_generation", "source_lsn",
+        "commit_lsn", "txn_id", "total_order", "key_guard_digest", "policy_epoch",
+        "snapshot_epoch", "applied_at",
+    )
+
+    def __init__(self, con, *, pipeline: str, control_schema: str | None = None):
+        self.con = con
+        self.pipeline = pipeline
+        self.control_schema = control_schema
+        self._known: dict[tuple[str, str], object] = {}
+        self._loaded_targets: set[str] = set()
+        self._pending: list[list[Any]] = []
+
+    def _row_from_values(self, target_table: str, event_id: str, row) -> dict[str, Any]:
+        return {
+            "pipeline": self.pipeline,
+            "target_table": target_table,
+            "event_id": event_id,
+            **dict(zip(self._READ_NAMES, row, strict=True)),
+        }
+
+    def _load_target(self, target_table: str) -> None:
+        if target_table in self._loaded_targets:
+            return
+        rows = self.con.execute(
+            f"SELECT event_id, {self._READ_COLUMNS} FROM "
+            f"{_control_table(self.control_schema, 'event_ledger')} "
+            "WHERE pipeline = ? AND target_table = ?",
+            [self.pipeline, target_table],
+        ).fetchall()
+        for row in rows:
+            event_id = str(row[0])
+            self._known[(target_table, event_id)] = self._row_from_values(
+                target_table, event_id, row[1:]
+            )
+        self._loaded_targets.add(target_table)
+
+    @staticmethod
+    def _pending_row(identity, *, pipeline: str, target_table: str, source_lsn: int | None):
+        return [
+            pipeline,
+            target_table,
+            identity.event_id,
+            identity.operation,
+            identity.payload_digest,
+            "applied",
+            identity.source_schema,
+            identity.source_table,
+            identity.source_cluster_id,
+            identity.source_timeline,
+            identity.relation_generation,
+            source_lsn,
+            identity.commit_lsn,
+            identity.txn_id,
+            identity.total_order,
+            identity.key_guard_digest,
+            identity.policy_epoch,
+            identity.snapshot_epoch,
+            now(),
+        ]
+
+    def claim(self, identity, *, target_table: str, source_lsn: int | None = None,
+              snapshot: bool = False) -> bool:
+        """Return whether an exact identity was already applied."""
+        from .event_ledger import assert_same_identity
+
+        key = (target_table, identity.event_id)
+        if snapshot:
+            self._load_target(target_table)
+        observed = self._known.get(key)
+        if observed is not None:
+            if isinstance(observed, dict):
+                try:
+                    assert_same_identity(observed, identity)
+                except DestinationIdentityCollision as collision:
+                    collision.target = target_table
+                    raise
+                return str(observed["state"]) == "applied"
+            # An identity already pending in this transaction has the same
+            # semantics as an applied row once the transaction commits.  Check it
+            # before suppressing the duplicate operation.
+            try:
+                assert_same_identity(observed, identity)
+            except DestinationIdentityCollision as collision:
+                collision.target = target_table
+                raise
+            return True
+
+        if not snapshot:
+            existing = read_event_ledger(
+                self.con,
+                pipeline=self.pipeline,
+                target_table=target_table,
+                event_id=identity.event_id,
+                control_schema=self.control_schema,
+            )
+            if existing is not None:
+                self._known[key] = existing
+                try:
+                    assert_same_identity(existing, identity)
+                except DestinationIdentityCollision as collision:
+                    collision.target = target_table
+                    raise
+                return str(existing["state"]) == "applied"
+
+        # Store the identity-shaped mapping as the pending value so a repeated
+        # event in one group receives the same collision validation as a durable
+        # replay.  `as_dict()` contains every field checked by the oracle.
+        pending = identity.as_dict()
+        pending["state"] = "applied"
+        self._known[key] = pending
+        self._pending.append(
+            self._pending_row(
+                identity,
+                pipeline=self.pipeline,
+                target_table=target_table,
+                source_lsn=source_lsn,
+            )
+        )
+        return False
+
+    def flush(self) -> None:
+        """Insert pending claims before the plan's physical materializers run."""
+        if not self._pending:
+            return
+        from .apply_sql import BIGINT, VARCHAR, bulk_insert
+
+        types = [
+            VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR,
+            VARCHAR, BIGINT, VARCHAR, BIGINT, BIGINT, VARCHAR, BIGINT, VARCHAR,
+            BIGINT, BIGINT, "TIMESTAMPTZ",
+        ]
+        bulk_insert(
+            self.con,
+            _control_table(self.control_schema, "event_ledger"),
+            list(self._COLUMNS),
+            self._pending,
+            types,
+        )
+        self._pending.clear()
+
+
+def claim_event_ledger(
+    con,
+    identity,
+    *,
+    pipeline: str,
+    target_table: str,
+    source_lsn: int | None = None,
+    control_schema: str | None = None,
+    ledger: EventLedgerBatch | None = None,
+    snapshot: bool = False,
+) -> bool:
+    """Claim an event in the current data transaction.
+
+    Returns ``True`` when the exact event was already applied.  It is important
+    that the existing-row read and a new-row insert happen on ``con``: this is
+    deliberately not a receipt connection and deliberately not a second commit.
+    """
+    if ledger is not None:
+        return ledger.claim(
+            identity,
+            target_table=target_table,
+            source_lsn=source_lsn,
+            snapshot=snapshot,
+        )
+
+    from .event_ledger import assert_same_identity
+
+    existing = read_event_ledger(
+        con,
+        pipeline=pipeline,
+        target_table=target_table,
+        event_id=identity.event_id,
+        control_schema=control_schema,
+    )
+    if existing is not None:
+        try:
+            assert_same_identity(existing, identity)
+        except DestinationIdentityCollision as collision:
+            collision.target = target_table
+            raise
+        return str(existing["state"]) == "applied"
+
+    con.execute(
+        f"INSERT INTO {_control_table(control_schema, 'event_ledger')} "
+        "(pipeline, target_table, event_id, operation, payload_digest, state, "
+        " source_schema, source_table, source_cluster_id, source_timeline, "
+        " relation_generation, source_lsn, commit_lsn, txn_id, total_order, "
+        " key_guard_digest, policy_epoch, snapshot_epoch, applied_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            pipeline,
+            target_table,
+            identity.event_id,
+            identity.operation,
+            identity.payload_digest,
+            "applied",
+            identity.source_schema,
+            identity.source_table,
+            identity.source_cluster_id,
+            identity.source_timeline,
+            identity.relation_generation,
+            source_lsn,
+            identity.commit_lsn,
+            identity.txn_id,
+            identity.total_order,
+            identity.key_guard_digest,
+            identity.policy_epoch,
+            identity.snapshot_epoch,
+            now(),
+        ],
+    )
+    return False
 
 
 # The destination coordinator keeps the stable public module surface while the

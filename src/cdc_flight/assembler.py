@@ -492,6 +492,12 @@ class TransactionAssembler:
         self._verify_complete(txn, rec)
 
         commit_lsn = rec.lsn or txn.last_lsn
+        # Debezium puts the transaction commit position on END, not on each data
+        # envelope.  Copy that source fact before a unit can spill or be planned;
+        # using an event's own WAL position here would make the identity depend on
+        # the change record rather than the whole PostgreSQL transaction.
+        for event in txn.events:
+            event.commit_lsn = commit_lsn
         unit = CompleteUnit(
             kind=UNIT_TXN,
             events=txn.events,

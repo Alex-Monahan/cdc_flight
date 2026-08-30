@@ -30,8 +30,10 @@ from . import (
     apply_sql,
     catalog_support,
     destination,
+    event_ledger,
     failure_containment,
     naming,
+    scd2,
     table_work,
     table_writer,
 )
@@ -85,6 +87,10 @@ class GroupPlan:
         ignored_tables: set[str] | None = None,
         excluded_tables: set[str] | None = None,
         contain_table_failure=None,
+        source_cluster_id: str | None = None,
+        source_timeline: int | None = None,
+        strict_event_identity: bool = False,
+        history_modes: dict[str, str] | None = None,
     ):
         self.con = con
         self.commit_id = commit_id
@@ -109,6 +115,12 @@ class GroupPlan:
         #: planner owns only the relation boundary and calls it while the commit-group
         #: transaction is still open.
         self._contain_table_failure = contain_table_failure
+        self.source_cluster_id = source_cluster_id
+        self.source_timeline = source_timeline
+        self.strict_event_identity = bool(strict_event_identity)
+        self.history_modes = {
+            str(name): str(mode).lower() for name, mode in (history_modes or {}).items()
+        }
         # The applier snapshots this durable admission set once per run.  A plan never
         # issues a control-plane query per schema epoch/table: all units in this commit
         # group therefore share one refusal decision and healthy co-published tables
@@ -130,6 +142,17 @@ class GroupPlan:
         self._failed_snapshot_targets: set[str] = set()
         self._failure_fingerprints: dict[str, str] = {}
         self._keyless_event_states: dict[tuple[str, str], str | None] = {}
+        self._history_mode_cache: dict[str, str] = {}
+        self._active_commit_lsn: int | None = None
+        # Event claims are collected while the source callback is admitted, then
+        # written in one batch immediately before physical materialization.  This
+        # keeps the ledger in this transaction without turning a large snapshot
+        # callback into one destination round trip per row.
+        self._event_ledger = destination.EventLedgerBatch(
+            con, pipeline=self.pipeline, control_schema=self._control_schema
+        ) if self.pipeline else None
+        self.scd2_events: list[scd2.SCD2Event] = []
+        self.scd2_bundles: dict[str, scd2.SCD2RelationBundle] = {}
 
         self.work: dict[str, TableWork] = {}
         self.stats: dict = {
@@ -204,15 +227,19 @@ class GroupPlan:
         # transaction that was still open when the snapshot was taken is in NO image, and
         # some of its events carry LSNs below C. Fencing those would be silent loss.
         commit_lsn = unit.last_lsn if unit.kind != UNIT_SNAPSHOT_CHUNK else None
+        source_commit_lsn = unit.commit_lsn or commit_lsn
         fence_below = self.watermarks if commit_lsn else {}
         self._active_txn_id = unit.txn_id
+        self._active_commit_lsn = source_commit_lsn
 
         unit_succeeded = False
         try:
             if unit.spill_unit_seq is not None:
                 self.staged_units = True
                 for staged in self.spill.load(
-                    commit_id=self.commit_id, unit_seq=unit.spill_unit_seq
+                    commit_id=self.commit_id,
+                    unit_seq=unit.spill_unit_seq,
+                    commit_lsn=source_commit_lsn,
                 ):
                     if self._below_watermark(staged.event, commit_lsn, fence_below):
                         continue
@@ -272,6 +299,7 @@ class GroupPlan:
             if unit.txn_id and self.toast_admission_end_provider is not None:
                 self.toast_admission_end_provider(unit.txn_id, commit=unit_succeeded)
             self._active_txn_id = None
+            self._active_commit_lsn = None
 
     def _below_watermark(
         self, event: PendingRecord, commit_lsn: int | None, watermarks: dict[str, int]
@@ -287,6 +315,37 @@ class GroupPlan:
         # kind of claim that must be visible in the run summary rather than inferred.
         self.stats["events"] += 1
         return True
+
+    def _history_mode_for(self, qualified: str) -> str:
+        """Read the durable per-relation history policy once per group."""
+        history_modes = getattr(self, "history_modes", {})
+        if qualified in history_modes:
+            return history_modes[qualified]
+        history_mode_cache = getattr(self, "_history_mode_cache", None)
+        if history_mode_cache is None:
+            history_mode_cache = {}
+            self._history_mode_cache = history_mode_cache
+        if qualified in history_mode_cache:
+            return history_mode_cache[qualified]
+        mode = "none"
+        pipeline = getattr(self, "pipeline", "")
+        if pipeline:
+            try:
+                schema, table = qualified.split(".", 1)
+                row = self.con.execute(
+                    f"SELECT history_mode FROM {destination._control_table(self._control_schema, 'table_state')} "
+                    "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+                    [pipeline, schema, table],
+                ).fetchone()
+                if row and row[0] is not None:
+                    mode = str(row[0]).lower()
+            except Exception:
+                # A compatibility adapter may not create table_state.  It is safe
+                # to retain the existing current-row path in that case; explicitly
+                # requested SCD2 modes still arrive through ``history_modes``.
+                mode = "none"
+        history_mode_cache[qualified] = mode
+        return mode
 
     def _collect(
         self,
@@ -354,11 +413,29 @@ class GroupPlan:
         if event.kind == KIND_TRUNCATE:
             self._truncate(event, target, snapshot=snapshot)
             return
+        self._enrich_descriptors(event)
+        descriptor_provider = getattr(self, "descriptor_provider", None)
+        connection = getattr(self, "con", None)
+        pipeline = getattr(self, "pipeline", "")
+        control_schema = getattr(self, "_control_schema", None)
+        source_cluster_id = getattr(self, "source_cluster_id", None)
+        source_timeline = getattr(self, "source_timeline", None)
+        active_commit_lsn = getattr(self, "_active_commit_lsn", None)
+        strict_event_identity = bool(getattr(self, "strict_event_identity", False))
+        relation_generation = event_ledger.relation_generation_for(
+            event.qualified_table,
+            event=event,
+            provider=descriptor_provider,
+            con=connection,
+            pipeline=pipeline,
+            control_schema=control_schema,
+        )
         if event_id is None:
             event_id = (
-                self.snapshots.event_id(event) if snapshot is not None else stream_event_id(event)
+                self.snapshots.event_id(event)
+                if snapshot is not None
+                else stream_event_id(event)
             )
-        self._enrich_descriptors(event)
         if snapshot is None and not event.incremental and (
             self.toast_admission_provider is not None or self.toast_policy_provider is not None
         ):
@@ -399,6 +476,39 @@ class GroupPlan:
                     source_table=event.table,
                     target=target,
                 )
+        history_mode = self._history_mode_for(event.qualified_table)
+        if history_mode == "scd2":
+            bundle = self.scd2_bundles.get(target)
+            bundle_target = f"{self.registry.dataset}.{target}"
+            if bundle is None:
+                bundle = scd2.SCD2RelationBundle(
+                    pipeline=self.pipeline,
+                    source_schema=str(event.schema),
+                    source_table=str(event.table),
+                    target_table=bundle_target,
+                    columns=dict(self._catalog_descriptor_cache[event.qualified_table]),
+                    key_columns=tuple(event.key or ()),
+                    relation_generation=str(relation_generation or ""),
+                    policy_epoch=event.policy_epoch,
+                )
+                self.scd2_bundles[target] = bundle
+                self.scd2_bundles[bundle_target] = bundle
+            self.scd2_events.append(
+                scd2.SCD2Event.from_pending(
+                    event,
+                    event_id=event_id,
+                    pipeline=pipeline,
+                    target_table=bundle_target,
+                    source_cluster_id=source_cluster_id,
+                    source_timeline=source_timeline,
+                    relation_generation=relation_generation,
+                    commit_lsn=active_commit_lsn,
+                    policy_epoch=event.policy_epoch,
+                )
+            )
+            self.stats["tables"].add(target)
+            self.source_tables.add(f"{event.schema}.{event.table}")
+            return
         item = table_work.work_for(
             self.work,
             target,
@@ -429,6 +539,33 @@ class GroupPlan:
                 input_fingerprint=failure_containment.input_fingerprint(event),
                 refusal_origin="typed_planner",
             ) from exc
+        identity = event_ledger.identity_for(
+            event,
+            # The row's cdcf_event_id is a compatibility/replay column.  The
+            # shared ledger gets the full source identity independently so a
+            # strict production event never relies on that legacy spelling.
+            event_id=(event_id if snapshot is not None or event.incremental else None),
+            source_cluster_id=source_cluster_id,
+            source_timeline=source_timeline,
+            relation_generation=relation_generation,
+            commit_lsn=active_commit_lsn,
+            policy_epoch=event.policy_epoch,
+            target_table=target,
+            require_strong=strict_event_identity,
+            digest=patch.digest,
+        )
+        if pipeline and identity.ledger_eligible and destination.claim_event_ledger(
+                connection,
+                identity,
+                pipeline=pipeline,
+                target_table=target,
+                source_lsn=event.lsn,
+                control_schema=control_schema,
+                ledger=self._event_ledger,
+                snapshot=snapshot is not None or event.incremental,
+        ):
+            self.source_tables.add(f"{event.schema}.{event.table}")
+            return
         table_work.collect(item, event, row, event_id, probe=self, patch=patch)
         image = event.after if event.op != "d" else event.before
         # Complete INSERT/snapshot images cannot create the late-rename NULL vs
@@ -816,6 +953,34 @@ class GroupPlan:
         others not", which is the one interleaving rubric 1.3 is about, so it has to
         fire *between* two `table_writer.write()` calls (Codex 6).
         """
+        anchor_called = False
+        # Claims are part of the same open destination transaction and must precede
+        # both SCD2 history DML and current-table materialization.  A rollback
+        # discards this batch together with the data/state transaction.
+        if self._event_ledger is not None:
+            self._event_ledger.flush()
+        for event in self.scd2_events:
+            result = scd2.apply_event(
+                self.con,
+                event,
+                bundle=self.scd2_bundles[event.target_table],
+                control_schema=self._control_schema,
+            )
+            if result.replayed:
+                self.stats["scd2_replayed_events"] = (
+                    self.stats.get("scd2_replayed_events", 0) + 1
+                )
+            else:
+                self.stats["scd2_applied_events"] = (
+                    self.stats.get("scd2_applied_events", 0) + 1
+                )
+            self.table_counts[event.target_table] = (
+                self.table_counts.get(event.target_table, 0) + 1
+            )
+        if self.scd2_events and after_first_table is not None:
+            after_first_table()
+            anchor_called = True
+
         for index, item in enumerate(list(self.work.values())):
             try:
                 table_writer.write(
@@ -852,7 +1017,7 @@ class GroupPlan:
                 # ever existed through streaming DML has no durable `table_state` row
                 # and a DROP while the pipeline is down is never detected.
                 self.created_tables[item.target] = (item.source_schema, item.source_table)
-            if index == 0 and after_first_table is not None:
+            if index == 0 and after_first_table is not None and not anchor_called:
                 after_first_table()
             if item.events:
                 self.stats["tables"].add(item.target)
@@ -905,8 +1070,16 @@ class GroupPlan:
         return out
 
 
-def stream_event_id(event: PendingRecord) -> str:
-    """`"<event lsn>:<source.txId>:<transaction.total_order>"` (ADR §6, §15/A3).
+def stream_event_id(
+    event: PendingRecord,
+    *,
+    source_cluster_id: str | None = None,
+    source_timeline: int | None = None,
+    relation_generation: str | None = None,
+    commit_lsn: int | None = None,
+    require_strong: bool = False,
+) -> str:
+    """Return the lineage identity, retaining the old adapter spelling when unscoped.
 
     The **event's own** LSN, not the transaction's commit LSN (ADR §15/A3 records
     the change; this docstring and `apply_sql`'s used to say "commit lsn" —
@@ -931,4 +1104,11 @@ def stream_event_id(event: PendingRecord) -> str:
                 f"incremental event {event.qualified_table} has no stable identity"
             )
         return event.snapshot_identity
-    return f"{event.lsn}:{event.txn_id}:{event.total_order}"
+    return event_ledger.identity_for(
+        event,
+        source_cluster_id=source_cluster_id,
+        source_timeline=source_timeline,
+        relation_generation=relation_generation,
+        commit_lsn=commit_lsn,
+        require_strong=require_strong,
+    ).event_id
