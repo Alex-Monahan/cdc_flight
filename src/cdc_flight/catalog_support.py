@@ -34,6 +34,7 @@ SELECT n.nspname                                  AS source_schema,
                    'name', a.attname,
                    'type_oid', a.atttypid::bigint,
                    'type_name', format_type(a.atttypid, a.atttypmod),
+                   'type_delimiter', typ.typdelim,
                    'typmod', a.atttypmod,
                    'attstorage', a.attstorage,
                    'type_schema', typ_ns.nspname,
@@ -118,7 +119,9 @@ WHERE parent.relkind IN ('r', 'p')
 """
 
 
-def _first_missing_default_element(output: str) -> str | None:
+def _first_missing_default_element(
+    output: str, delimiter: str = ","
+) -> str | None:
     """Unwrap PostgreSQL's one-element ``attmissingval`` output envelope.
 
     ``pg_attribute.attmissingval`` is declared as the polymorphic ``anyarray``;
@@ -130,6 +133,8 @@ def _first_missing_default_element(output: str) -> str | None:
     """
     if not isinstance(output, str):
         raise ValueError("catalog missing-default output is not text")
+    if not isinstance(delimiter, str) or len(delimiter) != 1:
+        raise ValueError("catalog missing-default output has no valid array delimiter")
     opening = output.find("{")
     if opening < 0:
         raise ValueError("catalog missing-default output has no array envelope")
@@ -191,7 +196,7 @@ def _first_missing_default_element(output: str) -> str | None:
     value = []
     while index < len(output):
         character = output[index]
-        if character in ",}":
+        if character in (delimiter, "}"):
             break
         if character == "\\":
             if index + 1 >= len(output):
@@ -215,6 +220,7 @@ def missing_value_from_output(
     output: object,
     descriptor,
     *,
+    delimiter: str | None = None,
     source_schema: str | None = None,
     source_table: str | None = None,
     target: str | None = None,
@@ -240,7 +246,7 @@ def missing_value_from_output(
     if not output_oid:
         raise refusal("ADD DEFAULT has no catalog-resolved PostgreSQL OUTPUT identity")
     try:
-        value = _first_missing_default_element(output)
+        value = _first_missing_default_element(output, delimiter or ",")
     except ValueError as error:
         raise refusal(
             "ADD DEFAULT cannot be decoded from PostgreSQL OUTPUT text"

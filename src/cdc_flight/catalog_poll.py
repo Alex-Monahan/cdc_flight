@@ -87,6 +87,7 @@ def _source_column(
         missing_value = observation_mod.missing_value_from_output(
             raw.get("missing_value_output"),
             descriptor,
+            delimiter=raw.get("type_delimiter"),
             source_schema=source_schema,
             source_table=source_table,
             target=f"{source_schema}.{source_table}",

@@ -189,6 +189,7 @@ def test_add_default_backfill_and_control_row_are_policy_sanitized(
         (r'{"(1,note)"}', "composite", "(1,note)"),
         (r'{"{\"a\": 1}"}', "jsonb", '{"a": 1}'),
         ("{192.0.2.1}", "inet", "192.0.2.1"),
+        ("{(1,1),(0,0)}", "box", "(1,1),(0,0)"),
     ],
 )
 def test_missing_default_parser_preserves_type_output_text(wire, kind, expected):
@@ -198,7 +199,9 @@ def test_missing_default_parser_preserves_type_output_text(wire, kind, expected)
         kind,
         output_function_oid=9010,
     )
-    value = missing_value_from_output(wire, descriptor)
+    value = missing_value_from_output(
+        wire, descriptor, delimiter=";" if kind == "box" else ","
+    )
     assert isinstance(value, PostgreSQLOutputText)
     assert str(value) == expected
     assert value.output_function_oid == 9010
@@ -213,4 +216,5 @@ def test_missing_default_without_output_identity_is_refused():
 def test_catalog_default_query_uses_output_function_envelope_not_text_cast():
     assert "a.attmissingval::text" not in CATALOG_SQL
     assert "'missing_value_output'" in CATALOG_SQL
+    assert "'type_delimiter'" in CATALOG_SQL
     assert "format(chr(37) || 's', a.attmissingval)" in CATALOG_SQL
