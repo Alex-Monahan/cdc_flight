@@ -118,6 +118,15 @@ def test_add_default_backfill_and_control_row_are_policy_sanitized(
             registry_of=lambda: registry,
             policy_gate=PolicyGate(policy),
         )
+        planned_changes = coordinator._policy_changes(
+            relation.qualified, (change,)
+        )
+        if action == "exclude":
+            assert planned_changes == ()
+        else:
+            assert len(planned_changes) == 1
+            assert planned_changes[0].type_name == "character varying"
+            assert planned_changes[0].new_descriptor.kind == "varchar"
         coordinator.backfill_schema(
             con,
             CatalogPlan(
