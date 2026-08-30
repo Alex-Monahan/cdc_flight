@@ -21,6 +21,13 @@ OWNER = "destination-ddl"
 log = logging.getLogger("cdc_flight.schema_ddl")
 
 
+def _definition_for_column(column: str, type_name: str) -> str:
+    """Give the soft-delete marker its durable non-null live-row default."""
+    if column == "cdcf_deleted" and str(type_name).upper() == "BOOLEAN":
+        return "BOOLEAN NOT NULL DEFAULT false"
+    return type_name
+
+
 def widen(current: str | None, incoming: str | None) -> str | None:
     """Return the least destination type that holds both inputs."""
     if current is None:
@@ -216,7 +223,8 @@ class DDLOwner:
         self, table: Any, columns: dict[str, str], primary_key_columns: tuple[str, ...]
     ) -> None:
         definitions = ", ".join(
-            f"{quote(column)} {ctype}" for column, ctype in columns.items()
+            f"{quote(column)} {_definition_for_column(column, ctype)}"
+            for column, ctype in columns.items()
         )
         constraint = (
             ", PRIMARY KEY ("

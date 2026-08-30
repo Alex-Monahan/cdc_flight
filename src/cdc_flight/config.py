@@ -528,6 +528,12 @@ def applier_settings() -> dict:
     depend on the repair, that would be an ordering argument, and ADR 0001 exists
     because ordering arguments are not good enough.
     """
+    # These are compiled once at configuration admission.  The objects' reprs are
+    # deliberately secret-free; a bad manifest fails before an engine can consume
+    # source records.
+    from .delete_modes import DeleteModeResolver
+    from .policy import PIIPolicy
+
     return {
         "commit_max_age": float(_env("CDC_COMMIT_MAX_AGE", "5")),
         "commit_max_events": int(_env("CDC_COMMIT_MAX_EVENTS", "200000")),
@@ -574,6 +580,8 @@ def applier_settings() -> dict:
         #: or resolves its snapshot obligation; it only lets a deliberately chosen
         #: run report healthy peers without repeating the same run-level error.
         "acknowledged_quarantines": _qualified_csv("CDC_ACKNOWLEDGE_QUARANTINES"),
+        "delete_policy": DeleteModeResolver.from_environment(),
+        "pii_policy": PIIPolicy.from_environment(),
     }
 
 
@@ -646,6 +654,14 @@ class ApplierConfig:
     #: so a streaming event applied here would be delivered a second time by the
     #: real slot. See `cdc_flight.resnapshot`.
     resnapshot: bool = False
+    #: Versioned hard/soft delete policy. ``delete_mode`` remains as the small
+    #: constructor compatibility surface for direct embedders.
+    delete_mode: str = "hard"
+    delete_mode_rules: tuple[tuple[str, str], ...] = ()
+    delete_policy: object | None = None
+    #: Application PII gate. A no-manifest direct caller receives the transparent
+    #: compatibility policy; configured production runs use fail-closed matching.
+    pii_policy: object | None = None
 
     def __post_init__(self) -> None:
         # A typo must not silently restore Debezium's "truncates are skipped" default.
@@ -655,6 +671,16 @@ class ApplierConfig:
             )
         if self.drop_mode not in DROP_MODES:
             raise ValueError(f"CDC_DROP_MODE={self.drop_mode!r} is not one of {DROP_MODES}")
+        from .delete_modes import DeleteModeResolver
+        from .policy import PIIPolicy
+
+        if self.delete_policy is None:
+            self.delete_policy = DeleteModeResolver(
+                global_mode=self.delete_mode,
+                overrides=tuple(self.delete_mode_rules),
+            )
+        if self.pii_policy is None:
+            self.pii_policy = PIIPolicy.disabled()
 
 
 @dataclass(frozen=True)

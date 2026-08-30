@@ -605,6 +605,295 @@ def write_keyless_events(
     )
 
 
+def write_delete_ledger(
+    con,
+    item,
+    *,
+    pipeline: str,
+    commit_id: int,
+    control_schema: str | None = None,
+) -> None:
+    """Persist hard/soft delete effects beside the row mutation transaction."""
+    effects = dict(getattr(item, "delete_effects", {}) or {})
+    if not effects:
+        return
+
+    from .apply_sql import BIGINT, VARCHAR, bulk_insert
+
+    rows = []
+    for event_id, operation in effects.items():
+        identity_digest = delete_identity_digest(operation)
+        effect_digest = delete_effect_digest(operation)
+        rows.append(
+            [
+                pipeline,
+                item.target,
+                event_id,
+                item.source_schema,
+                item.source_table,
+                operation.source_lsn,
+                operation.txn_id,
+                operation.total_order,
+                operation.delete_mode or getattr(item, "delete_mode", "hard"),
+                int(getattr(item, "delete_policy_epoch", 1) or 1),
+                getattr(item, "delete_policy_digest", None),
+                identity_digest,
+                "applied",
+                effect_digest,
+                commit_id,
+                now(),
+            ]
+        )
+    # A replay normally returns before this point through claim_delete_ledger.  The
+    # second read is intentional: it closes the race between an older caller and
+    # this writer and turns a same-ID/different-effect collision into a refusal
+    # instead of an opaque primary-key error.
+    for event_id, operation in effects.items():
+        if claim_delete_ledger(
+            con,
+            pipeline=pipeline,
+            target_table=item.target,
+            event_id=event_id,
+            source_schema=item.source_schema,
+            source_table=item.source_table,
+            source_lsn=operation.source_lsn,
+            txn_id=operation.txn_id,
+            total_order=operation.total_order,
+            delete_mode=operation.delete_mode or getattr(item, "delete_mode", "hard"),
+            policy_epoch=int(getattr(item, "delete_policy_epoch", 1) or 1),
+            policy_digest=getattr(item, "delete_policy_digest", None),
+            identity_digest=delete_identity_digest(operation),
+            effect_digest=delete_effect_digest(operation),
+            control_schema=control_schema,
+        ):
+            rows = [row for row in rows if row[2] != event_id]
+    if not rows:
+        return
+    bulk_insert(
+        con,
+        _control_table(control_schema, "delete_ledger"),
+        [
+            "pipeline", "target_table", "event_id", "source_schema", "source_table",
+            "source_lsn", "txn_id", "total_order", "delete_mode", "policy_epoch",
+            "policy_digest", "identity_digest", "effect_state", "effect_digest",
+            "applied_commit_id", "applied_at",
+        ],
+        rows,
+        [
+            VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, BIGINT, VARCHAR, BIGINT,
+            VARCHAR, BIGINT, VARCHAR, VARCHAR, VARCHAR, VARCHAR, BIGINT, "TIMESTAMPTZ",
+        ],
+    )
+
+
+def delete_identity_digest(operation) -> str:
+    """Return a value-free digest of the sanitized source identity image."""
+    import hashlib
+
+    source_digest = getattr(operation, "image_digest", None) or ""
+    return hashlib.sha256(
+        f"delete-identity\x00{getattr(operation, 'operation', 'd')}\x00{source_digest}".encode()
+    ).hexdigest()
+
+
+def delete_effect_digest(operation) -> str:
+    """Return a value-free digest of the mode-specific delete effect."""
+    import hashlib
+
+    material = "\x00".join(
+        (
+            getattr(operation, "operation", "d"),
+            getattr(operation, "delete_mode", "hard") or "hard",
+            getattr(operation, "image_digest", None) or "",
+        )
+    )
+    return hashlib.sha256(f"delete-effect\x00{material}".encode()).hexdigest()
+
+
+def claim_delete_ledger(
+    con,
+    *,
+    pipeline: str,
+    target_table: str,
+    event_id: str,
+    source_schema: str | None,
+    source_table: str | None,
+    source_lsn: int | None,
+    txn_id: str | None,
+    total_order: int | None,
+    delete_mode: str,
+    policy_epoch: int,
+    policy_digest: str | None,
+    identity_digest: str,
+    effect_digest: str,
+    control_schema: str | None = None,
+) -> bool:
+    """Fence a delete before physical DML when its durable effect already exists."""
+    columns = (
+        "source_schema, source_table, source_lsn, txn_id, total_order, delete_mode, "
+        "policy_epoch, policy_digest, identity_digest, effect_state, effect_digest"
+    )
+    row = con.execute(
+        f"SELECT {columns} FROM {_control_table(control_schema, 'delete_ledger')} "
+        "WHERE pipeline = ? AND target_table = ? AND event_id = ?",
+        [pipeline, target_table, event_id],
+    ).fetchone()
+    if row is None:
+        return False
+    expected = (
+        source_schema,
+        source_table,
+        source_lsn,
+        txn_id,
+        total_order,
+        delete_mode,
+        int(policy_epoch),
+        policy_digest,
+        identity_digest,
+        "applied",
+        effect_digest,
+    )
+    names = (
+        "source_schema", "source_table", "source_lsn", "txn_id", "total_order",
+        "delete_mode", "policy_epoch", "policy_digest", "identity_digest",
+        "effect_state", "effect_digest",
+    )
+    for name, observed, wanted in zip(names, row, expected, strict=True):
+        if observed != wanted:
+            raise DestinationIdentityCollision(
+                f"delete ledger identity collision for event {event_id!r}: {name} differs",
+                source_schema=source_schema,
+                source_table=source_table,
+                target=target_table,
+            )
+    return True
+
+
+def write_table_policy_state(
+    con,
+    item,
+    *,
+    pipeline: str,
+    target_table: str | None = None,
+    control_schema: str | None = None,
+) -> None:
+    """Persist the effective delete/PII policy epoch for a materialized relation."""
+    if not item.source_schema or not item.source_table:
+        return
+    table = _control_table(control_schema, "table_state")
+    values = [
+        target_table or item.target,
+        getattr(item, "delete_mode", "hard"),
+        int(getattr(item, "delete_policy_epoch", 1) or 1),
+        getattr(item, "delete_policy_digest", None),
+        int(getattr(item, "policy_epoch", 0) or 0),
+        getattr(item, "policy_digest", None),
+        getattr(item, "pii_salt_id", None),
+    ]
+    # Do not use INSERT OR REPLACE here: DuckDB implements REPLACE as a delete plus
+    # insert, which would reset refresh/history/snapshot state that belongs to the
+    # catalog and lifecycle owners.  Policy state is an additive update to the
+    # durable relation row, in the same transaction as its data effect.
+    con.execute(
+        f"UPDATE {table} SET target_table = ?, delete_mode = ?, "
+        "delete_policy_epoch = ?, delete_policy_digest = ?, pii_policy_epoch = ?, "
+        "pii_policy_digest = ?, pii_salt_id = ? "
+        "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+        [*values, pipeline, item.source_schema, item.source_table],
+    )
+    present = con.execute(
+        f"SELECT 1 FROM {table} WHERE pipeline = ? AND source_schema = ? "
+        "AND source_table = ?",
+        [pipeline, item.source_schema, item.source_table],
+    ).fetchone()
+    if present is None:
+        con.execute(
+            f"INSERT INTO {table} "
+            "(pipeline, source_schema, source_table, target_table, delete_mode, "
+            "delete_policy_epoch, delete_policy_digest, pii_policy_epoch, "
+            "pii_policy_digest, pii_salt_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            [
+                pipeline,
+                item.source_schema,
+                item.source_table,
+                *values,
+            ],
+        )
+
+
+def read_table_policy_state(
+    con,
+    *,
+    pipeline: str,
+    source_schema: str,
+    source_table: str,
+    control_schema: str | None = None,
+) -> dict[str, Any] | None:
+    """Read the last committed policy state for one source relation."""
+    row = con.execute(
+        f"SELECT target_table, delete_mode, delete_policy_epoch, "
+        f"delete_policy_digest, pii_policy_epoch, pii_policy_digest, pii_salt_id "
+        f"FROM {_control_table(control_schema, 'table_state')} "
+        "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+        [pipeline, source_schema, source_table],
+    ).fetchone()
+    if row is None:
+        return None
+    names = (
+        "target_table", "delete_mode", "delete_policy_epoch", "delete_policy_digest",
+        "pii_policy_epoch", "pii_policy_digest", "pii_salt_id",
+    )
+    return dict(zip(names, row, strict=True))
+
+
+def write_policy_alerts(
+    con,
+    alerts: list[dict],
+    *,
+    pipeline: str,
+    control_schema: str | None = None,
+) -> None:
+    """Write value-free policy governance alerts inside the data transaction."""
+    if not alerts:
+        return
+    from .apply_sql import BIGINT, VARCHAR, bulk_insert
+
+    rows = []
+    for alert in alerts:
+        rows.append(
+            [
+                pipeline,
+                alert.get("source_schema") or "",
+                alert.get("source_table") or "",
+                alert.get("target_table"),
+                alert.get("column") or "",
+                alert.get("action") or "exclude",
+                alert.get("rule_id"),
+                int(alert.get("policy_epoch", 0) or 0),
+                alert.get("policy_digest") or "",
+                alert.get("event_id"),
+                alert.get("source_lsn"),
+                alert.get("code") or "unmatched_column",
+                now(),
+            ]
+        )
+    bulk_insert(
+        con,
+        _control_table(control_schema, "policy_alerts"),
+        [
+            "pipeline", "source_schema", "source_table", "target_table", "column_name",
+            "action", "rule_id", "policy_epoch", "policy_digest", "event_id",
+            "source_lsn", "code", "raised_at",
+        ],
+        rows,
+        [
+            VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, BIGINT,
+            VARCHAR, VARCHAR, BIGINT, VARCHAR, "TIMESTAMPTZ",
+        ],
+        replace=True,
+    )
+
+
 def read_event_ledger(
     con,
     *,
@@ -618,7 +907,7 @@ def read_event_ledger(
         "operation, payload_digest, state, source_schema, source_table, "
         "source_cluster_id, source_timeline, relation_generation, source_lsn, "
         "commit_lsn, txn_id, total_order, key_guard_digest, policy_epoch, "
-        "snapshot_epoch, applied_at"
+        "policy_digest, delete_mode, snapshot_epoch, applied_at"
     )
     row = con.execute(
         f"SELECT {columns} FROM {_control_table(control_schema, 'event_ledger')} "
@@ -631,7 +920,7 @@ def read_event_ledger(
         "operation", "payload_digest", "state", "source_schema", "source_table",
         "source_cluster_id", "source_timeline", "relation_generation", "source_lsn",
         "commit_lsn", "txn_id", "total_order", "key_guard_digest", "policy_epoch",
-        "snapshot_epoch", "applied_at",
+        "policy_digest", "delete_mode", "snapshot_epoch", "applied_at",
     )
     return {
         "pipeline": pipeline,
@@ -658,19 +947,19 @@ class EventLedgerBatch:
         "state", "source_schema", "source_table", "source_cluster_id",
         "source_timeline", "relation_generation", "source_lsn", "commit_lsn",
         "txn_id", "total_order", "key_guard_digest", "policy_epoch",
-        "snapshot_epoch", "applied_at",
+        "policy_digest", "delete_mode", "snapshot_epoch", "applied_at",
     )
     _READ_COLUMNS = (
         "operation, payload_digest, state, source_schema, source_table, "
         "source_cluster_id, source_timeline, relation_generation, source_lsn, "
         "commit_lsn, txn_id, total_order, key_guard_digest, policy_epoch, "
-        "snapshot_epoch, applied_at"
+        "policy_digest, delete_mode, snapshot_epoch, applied_at"
     )
     _READ_NAMES = (
         "operation", "payload_digest", "state", "source_schema", "source_table",
         "source_cluster_id", "source_timeline", "relation_generation", "source_lsn",
         "commit_lsn", "txn_id", "total_order", "key_guard_digest", "policy_epoch",
-        "snapshot_epoch", "applied_at",
+        "policy_digest", "delete_mode", "snapshot_epoch", "applied_at",
     )
 
     def __init__(self, con, *, pipeline: str, control_schema: str | None = None):
@@ -725,6 +1014,8 @@ class EventLedgerBatch:
             identity.total_order,
             identity.key_guard_digest,
             identity.policy_epoch,
+            identity.policy_digest,
+            identity.delete_mode,
             identity.snapshot_epoch,
             now(),
         ]
@@ -798,7 +1089,7 @@ class EventLedgerBatch:
         types = [
             VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR,
             VARCHAR, BIGINT, VARCHAR, BIGINT, BIGINT, VARCHAR, BIGINT, VARCHAR,
-            BIGINT, BIGINT, "TIMESTAMPTZ",
+            BIGINT, VARCHAR, VARCHAR, BIGINT, "TIMESTAMPTZ",
         ]
         bulk_insert(
             self.con,
@@ -857,8 +1148,9 @@ def claim_event_ledger(
         "(pipeline, target_table, event_id, operation, payload_digest, state, "
         " source_schema, source_table, source_cluster_id, source_timeline, "
         " relation_generation, source_lsn, commit_lsn, txn_id, total_order, "
-        " key_guard_digest, policy_epoch, snapshot_epoch, applied_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " key_guard_digest, policy_epoch, policy_digest, delete_mode, "
+        " snapshot_epoch, applied_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         [
             pipeline,
             target_table,
@@ -877,6 +1169,8 @@ def claim_event_ledger(
             identity.total_order,
             identity.key_guard_digest,
             identity.policy_epoch,
+            identity.policy_digest,
+            identity.delete_mode,
             identity.snapshot_epoch,
             now(),
         ],

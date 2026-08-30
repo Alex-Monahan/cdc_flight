@@ -27,7 +27,13 @@ def plan_catalog_changes(applier, durable_lsn: int):
     if applier.catalog is None or not coordinator.enabled:
         return None
     plan = coordinator.plan(durable_lsn)
-    if not plan.actions and not plan.relations and not plan.alerts and not plan.refused:
+    if (
+        not plan.actions
+        and not plan.relations
+        and not plan.alerts
+        and not plan.policy_alerts
+        and not plan.refused
+    ):
         return None
     applier.group.catalog_plan = plan
     return plan
@@ -60,6 +66,7 @@ def apply_catalog_phase(
         catalog_epoch=plan.catalog_epoch,
         refused=plan.refused if not schema_only else (),
         alerts=plan.alerts if not schema_only else [],
+        policy_alerts=plan.policy_alerts if schema_only else (),
     )
     if not phase.actions and not phase.relations and not phase.refused:
         return

@@ -45,6 +45,8 @@ def stage_events(
         if not event.schema or not event.table:
             continue
         _enrich_descriptors(applier, event)
+        if getattr(applier, "policy_gate", None) is not None:
+            applier.policy_gate.revalidate(event)
         if state is not None:
             prepared.append(
                 StagedEvent(
@@ -137,4 +139,17 @@ def _enrich_descriptors(applier, event: PendingRecord) -> None:
             refusal_origin="spill_protocol",
         )
     for attribute in ("key_descriptors", "before_descriptors", "after_descriptors"):
-        getattr(event, attribute).update(descriptors)
+        target_descriptors = getattr(event, attribute)
+        image_name = attribute.removesuffix("_descriptors")
+        present = {
+            str(name)
+            for name in (getattr(event, image_name, {}) or {})
+        }
+        for name, descriptor in descriptors.items():
+            if name in present:
+                target_descriptors.setdefault(name, descriptor)
+    if getattr(applier, "policy_gate", None) is not None:
+        # Descriptor enrichment must never turn a sanitized event back into a
+        # source-shaped event. The second validation is immediately before the
+        # caller hands this record to SpillBuffer.stage().
+        applier.policy_gate.revalidate(event, descriptors)

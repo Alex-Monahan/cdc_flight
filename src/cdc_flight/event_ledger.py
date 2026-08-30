@@ -193,6 +193,8 @@ class EventIdentity:
     key_guard_digest: str | None
     policy_epoch: int
     snapshot_epoch: int | None = None
+    policy_digest: str | None = None
+    delete_mode: str | None = None
     strong: bool = False
 
     @property
@@ -216,6 +218,8 @@ class EventIdentity:
             "key_guard_digest": self.key_guard_digest,
             "policy_epoch": self.policy_epoch,
             "snapshot_epoch": self.snapshot_epoch,
+            "policy_digest": self.policy_digest,
+            "delete_mode": self.delete_mode,
         }
 
 
@@ -340,6 +344,8 @@ def identity_for(
         key_guard_digest=key_guard_digest(getattr(event, "key", None)),
         policy_epoch=epoch,
         snapshot_epoch=snapshot_epoch,
+        policy_digest=getattr(event, "policy_digest", None),
+        delete_mode=getattr(event, "delete_mode", None),
         strong=strong,
     )
 
@@ -365,6 +371,8 @@ def assert_same_identity(existing: Mapping[str, Any], identity: EventIdentity) -
         "key_guard_digest": identity.key_guard_digest,
         "policy_epoch": identity.policy_epoch,
         "snapshot_epoch": identity.snapshot_epoch,
+        "policy_digest": identity.policy_digest,
+        "delete_mode": identity.delete_mode,
     }
     for name, expected in checks.items():
         observed = existing.get(name)

@@ -91,6 +91,8 @@ class GroupPlan:
         source_timeline: int | None = None,
         strict_event_identity: bool = False,
         history_modes: dict[str, str] | None = None,
+        delete_policy=None,
+        policy_gate=None,
     ):
         self.con = con
         self.commit_id = commit_id
@@ -118,6 +120,9 @@ class GroupPlan:
         self.source_cluster_id = source_cluster_id
         self.source_timeline = source_timeline
         self.strict_event_identity = bool(strict_event_identity)
+        self.delete_policy = delete_policy
+        self.policy_gate = policy_gate
+        self.policy_alerts: list[dict] = []
         self.history_modes = {
             str(name): str(mode).lower() for name, mode in (history_modes or {}).items()
         }
@@ -414,6 +419,11 @@ class GroupPlan:
             self._truncate(event, target, snapshot=snapshot)
             return
         self._enrich_descriptors(event)
+        policy_gate = getattr(self, "policy_gate", None)
+        if policy_gate is not None:
+            policy_gate.revalidate(event, self._catalog_descriptor_cache.get(event.qualified_table, {}))
+        if hasattr(self, "policy_alerts"):
+            self.policy_alerts.extend(getattr(event, "policy_alerts", ()) or ())
         descriptor_provider = getattr(self, "descriptor_provider", None)
         connection = getattr(self, "con", None)
         pipeline = getattr(self, "pipeline", "")
@@ -509,13 +519,36 @@ class GroupPlan:
             self.stats["tables"].add(target)
             self.source_tables.add(f"{event.schema}.{event.table}")
             return
+        item_was_new = target not in self.work
         item = table_work.work_for(
             self.work,
             target,
             event,
             snapshot is not None,
             incremental=incremental_target,
+            delete_mode=(
+                self.delete_policy.resolve(event.qualified_table)
+                if getattr(self, "delete_policy", None) is not None
+                else getattr(event, "delete_mode", None)
+            ),
         )
+        if (
+            getattr(self, "pipeline", "")
+            and item.previous_delete_mode is None
+            and event.schema
+            and event.table
+        ):
+            prior_policy = destination.read_table_policy_state(
+                self.con,
+                pipeline=self.pipeline,
+                source_schema=event.schema,
+                source_table=event.table,
+                control_schema=self._control_schema,
+            )
+            if prior_policy is not None and prior_policy.get("delete_mode"):
+                item.previous_delete_mode = str(prior_policy["delete_mode"]).lower()
+        if policy_gate is not None:
+            item.pii_salt_id = getattr(policy_gate.policy, "salt_id", None)
         try:
             patch = table_work.patch_for(
                 event,
@@ -552,7 +585,7 @@ class GroupPlan:
             policy_epoch=event.policy_epoch,
             target_table=target,
             require_strong=strict_event_identity,
-            digest=patch.digest,
+            digest=event_ledger.payload_digest(event),
         )
         if pipeline and identity.ledger_eligible and destination.claim_event_ledger(
                 connection,
@@ -564,8 +597,47 @@ class GroupPlan:
                 ledger=self._event_ledger,
                 snapshot=snapshot is not None or event.incremental,
         ):
+            if item_was_new and not item.events:
+                self.work.pop(target, None)
             self.source_tables.add(f"{event.schema}.{event.table}")
             return
+        if pipeline and event.op == "d" and snapshot is None:
+            # The common delete ledger is also a compatibility fence for events
+            # whose older shared-ledger identity was not strong enough to claim. It
+            # is checked before folding or physical DML, so a crash after the
+            # destination commit cannot replay a hard DELETE or soft tombstone.
+            from .keyless_work import KeylessOperation
+
+            delete_operation = KeylessOperation(
+                event_id=event_id,
+                operation="d",
+                image_digest=event_ledger.payload_digest(event),
+                delete_mode=item.delete_mode,
+                source_lsn=event.lsn,
+                txn_id=event.txn_id,
+                total_order=event.total_order,
+            )
+            if destination.claim_delete_ledger(
+                connection,
+                pipeline=pipeline,
+                target_table=target,
+                event_id=event_id,
+                source_schema=event.schema,
+                source_table=event.table,
+                source_lsn=event.lsn,
+                txn_id=event.txn_id,
+                total_order=event.total_order,
+                delete_mode=item.delete_mode,
+                policy_epoch=item.delete_policy_epoch,
+                policy_digest=item.delete_policy_digest,
+                identity_digest=destination.delete_identity_digest(delete_operation),
+                effect_digest=destination.delete_effect_digest(delete_operation),
+                control_schema=control_schema,
+            ):
+                if item_was_new and not item.events:
+                    self.work.pop(target, None)
+                self.source_tables.add(f"{event.schema}.{event.table}")
+                return
         table_work.collect(item, event, row, event_id, probe=self, patch=patch)
         image = event.after if event.op != "d" else event.before
         # Complete INSERT/snapshot images cannot create the late-rename NULL vs
@@ -651,6 +723,13 @@ class GroupPlan:
                 target=qualified,
                 refusal_origin="typed_planner",
             )
+        required_descriptors = set(catalog_descriptors)
+        if self.policy_gate is not None and self.policy_gate.policy.enabled:
+            required_descriptors = {
+                name
+                for name in required_descriptors
+                if self.policy_gate.policy.rule_for(qualified, name).action != "exclude"
+            }
         for name, descriptor in catalog_descriptors.items():
             try:
                 native_type(descriptor)
@@ -671,7 +750,7 @@ class GroupPlan:
             missing = ()
         else:
             missing = tuple(
-                sorted(set(catalog_descriptors) - catalog_support.delivered_event_fields(event))
+                sorted(required_descriptors - catalog_support.delivered_event_fields(event))
             )
         if missing:
             raise SchemaEvolutionRefused(
@@ -691,6 +770,11 @@ class GroupPlan:
         )
         if recoverable:
             self._hydrate_omitted_xml_arrays(event, recoverable, catalog_descriptors, watcher)
+        present_names = {
+            naming.normalize(str(name))
+            for image_name in ("key", "before", "after")
+            for name in (getattr(event, image_name, {}) or {})
+        }
         for attribute in ("key_descriptors", "before_descriptors", "after_descriptors"):
             descriptors = getattr(event, attribute)
             if len(descriptors) >= len(catalog_descriptors) and all(
@@ -699,6 +783,18 @@ class GroupPlan:
             ):
                 continue
             for name, descriptor in catalog_descriptors.items():
+                if name not in present_names:
+                    continue
+                if self.policy_gate is not None:
+                    rule = self.policy_gate.policy.rule_for(qualified, name)
+                    if rule.action == "exclude":
+                        continue
+                    existing = descriptors.get(name)
+                    existing_meta = dict(getattr(existing, "metadata", ()) or {})
+                    if rule.action in {"mask", "hash", "truncate"} and existing_meta.get(
+                        "policy_action"
+                    ) == rule.action:
+                        continue
                 # The source catalog is authoritative for physical PostgreSQL
                 # identity and typmod.  Connect may intentionally flatten a value
                 # to STRING (decimal/interval) while retaining no logical name.
@@ -1011,6 +1107,20 @@ class GroupPlan:
                     pipeline=self.pipeline,
                     control_schema=self._control_schema,
                 )
+            if not item.snapshot and self.pipeline:
+                destination.write_delete_ledger(
+                    self.con,
+                    item,
+                    pipeline=self.pipeline,
+                    commit_id=self.commit_id,
+                    control_schema=self._control_schema,
+                )
+                destination.write_table_policy_state(
+                    self.con,
+                    item,
+                    pipeline=self.pipeline,
+                    control_schema=self._control_schema,
+                )
             if not item.snapshot and item.source_schema and item.target in self.created_in_txn:
                 # Codex 5: destination ownership has to be persisted by whoever first
                 # materialises the table, snapshot or streaming, or a table that only
@@ -1032,6 +1142,14 @@ class GroupPlan:
             self.con, presence_rows, control_schema=self._control_schema
         )
 
+        if self.policy_alerts and self.pipeline:
+            destination.write_policy_alerts(
+                self.con,
+                self.policy_alerts,
+                pipeline=self.pipeline,
+                control_schema=self._control_schema,
+            )
+
         if self.staged_units and clear_spill:
             self.spill.clear(self.commit_id)
 
@@ -1046,6 +1164,23 @@ class GroupPlan:
             if self.snapshots.swap(
                 state, commit_id=self.commit_id, snapshot_lsn=self.stats.get("last_lsn")
             ):
+                table = self.registry.get(state.target)
+                if table.exists:
+                    # The view name survives a table swap, but DuckDB may retain a
+                    # dependency on the pre-swap table object. Rebind it after the
+                    # shadow is promoted so consumers always see the current image.
+                    table_writer.ensure_live_view(
+                        self.con, table, target=state.target
+                    )
+                snapshot_item = self.work.get(state.shadow) or self.work.get(state.target)
+                if snapshot_item is not None and self.pipeline:
+                    destination.write_table_policy_state(
+                        self.con,
+                        snapshot_item,
+                        pipeline=self.pipeline,
+                        target_table=state.target,
+                        control_schema=self._control_schema,
+                    )
                 self.stats["tables"].add(state.target)
         return self.stats
 

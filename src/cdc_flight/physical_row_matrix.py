@@ -35,6 +35,7 @@ from .errors import (
 )
 from .schema_evolution import COLUMN_TYPE_CHANGED, ColumnChange
 from .spill import SpillBuffer, StagedEvent
+from .policy import PIIPolicy, PolicyGate
 from .typed_types import (
     FieldState,
     FieldValue,
@@ -448,7 +449,15 @@ def _exercise_cell(
 
     con.execute("BEGIN TRANSACTION")
     txn_open = True
-    spill = SpillBuffer(con, binary_mode="base64", hstore_mode="map")
+    policy_gate = PolicyGate(PIIPolicy.disabled())
+    events = [policy_gate.sanitize(event, _descriptor_map(cell.identity)) for event in events]
+    spill = SpillBuffer(
+        con,
+        binary_mode="base64",
+        hstore_mode="map",
+        policy_gate=policy_gate,
+        require_sanitized=True,
+    )
     try:
         if cell.schema_epoch == "mixed":
             if cell.storage == "spill":

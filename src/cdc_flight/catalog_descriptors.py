@@ -35,18 +35,31 @@ class CatalogDescriptorReader:
                 "SELECT t.oid::bigint, n.nspname, t.typname, t.typtype, "
                 "t.typcategory, t.typbasetype::bigint, t.typelem::bigint, "
                 "t.typrelid::bigint, COALESCE(r.rngsubtype, mr.rngsubtype, 0)::bigint, "
-                "COALESCE(r.rngmultitypid, 0)::bigint "
+                "COALESCE(r.rngmultitypid, 0)::bigint, "
+                "p.oid::bigint, pn.nspname, p.proname "
                 "FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace "
                 "LEFT JOIN pg_range r ON r.rngtypid=t.oid "
                 "LEFT JOIN pg_range mr ON mr.rngmultitypid=t.oid "
+                "LEFT JOIN pg_proc p ON p.oid=t.typoutput "
+                "LEFT JOIN pg_namespace pn ON pn.oid=p.pronamespace "
                 "WHERE t.oid = ANY(%s::oid[])",
                 [sorted(pending)],
             ).fetchall()
             for row in rows:
-                (
-                    oid, schema, name, typtype, category, base, element, relid,
-                    subtype, multirange_oid,
-                ) = row
+                if len(row) == 10:
+                    # Compatibility with small catalog fakes and pre-§8 test
+                    # adapters. They do not model pg_proc, so the policy gate will
+                    # require an explicit output-text proof for transforms.
+                    (
+                        oid, schema, name, typtype, category, base, element, relid,
+                        subtype, multirange_oid,
+                    ) = row
+                    output_oid = output_schema = output_name = None
+                else:
+                    (
+                        oid, schema, name, typtype, category, base, element, relid,
+                        subtype, multirange_oid, output_oid, output_schema, output_name,
+                    ) = row
                 facts[int(oid)] = {
                     "oid": int(oid),
                     "schema": str(schema),
@@ -58,6 +71,9 @@ class CatalogDescriptorReader:
                     "relid": int(relid or 0),
                     "subtype": int(subtype or 0),
                     "multirange_oid": int(multirange_oid or 0),
+                    "output_function_oid": int(output_oid or 0),
+                    "output_function_schema": str(output_schema or ""),
+                    "output_function_name": str(output_name or ""),
                 }
             children = set()
             for fact in facts.values():
@@ -124,6 +140,9 @@ class CatalogDescriptorReader:
                 range_subtype=(build(range_subtype) if range_subtype else None),
                 map_key=map_key,
                 map_value=map_value,
+                output_function_oid=(fact["output_function_oid"] or None),
+                output_function_schema=fact["output_function_schema"] or None,
+                output_function_name=fact["output_function_name"] or None,
             )
             building.remove(oid)
             self.cache[oid] = descriptor
@@ -319,7 +338,11 @@ class RelationDescriptorProvider:
                 self._event_read_conn = con
             try:
                 return catalog_support.read_event_columns_from_connection(
-                    con, event, value_columns
+                    con,
+                    event,
+                    value_columns,
+                    policy_gate=getattr(self, "policy_gate", None),
+                    descriptors=self.relations.get(event.qualified_table, {}),
                 )
             except Exception:
                 con.close()

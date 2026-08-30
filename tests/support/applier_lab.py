@@ -390,6 +390,11 @@ class Lab:
                 )
                 for attribute in ("key_descriptors", "before_descriptors", "after_descriptors"):
                     descriptors.update(getattr(rec, attribute))
+            # Keep the lab on the same post-decode/pre-assembler seam as the
+            # production callback. This is a real Applier path, not a second test
+            # sanitizer; the fixture descriptor provider is updated above so the
+            # gate has the same source-type context as a catalog-backed run.
+            rec = self.applier._sanitize_record(rec)
             for unit in self.applier.assembler.feed(rec):
                 self.applier._add_unit(unit)
 

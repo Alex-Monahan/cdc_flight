@@ -101,6 +101,11 @@ CONTROL_DDL = [
             snapshot_epoch  BIGINT      NOT NULL DEFAULT 0,
             snapshot_lsn    BIGINT,
             last_commit_id  BIGINT,
+            delete_policy_epoch BIGINT NOT NULL DEFAULT 1,
+            delete_policy_digest VARCHAR,
+            pii_policy_epoch BIGINT NOT NULL DEFAULT 0,
+            pii_policy_digest VARCHAR,
+            pii_salt_id     VARCHAR,
             PRIMARY KEY (pipeline, source_schema, source_table)
         )""",
     # One durable request per table.  This is the source of truth for resumable
@@ -200,7 +205,8 @@ CONTROL_DDL = [
             source_timeline BIGINT,
             relation_generation VARCHAR,
             commit_lsn     BIGINT,
-            policy_epoch   BIGINT
+            policy_epoch   BIGINT,
+            policy_digest  VARCHAR
         )""",
     # rubric 1.5. The audit trail for everything that happens to a table rather than
     # to a row: TRUNCATE, DROP, a drop-and-recreate, leaving or joining the
@@ -301,9 +307,52 @@ CONTROL_DDL = [
             total_order          BIGINT,
             key_guard_digest     VARCHAR,
             policy_epoch         BIGINT NOT NULL DEFAULT 0,
+            policy_digest        VARCHAR,
+            delete_mode          VARCHAR,
             snapshot_epoch       BIGINT,
             applied_at           TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (pipeline, target_table, event_id)
+        )""",
+    # Delete effects have a distinct ledger because a delete's physical effect is
+    # mode-sensitive while the shared event ledger remains the replay fence for
+    # every operation.  It is written in the same destination transaction as the
+    # hard DELETE or soft tombstone update.
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.delete_ledger (
+            pipeline             VARCHAR NOT NULL,
+            target_table         VARCHAR NOT NULL,
+            event_id             VARCHAR NOT NULL,
+            source_schema        VARCHAR,
+            source_table         VARCHAR,
+            source_lsn           BIGINT,
+            txn_id               VARCHAR,
+            total_order          BIGINT,
+            delete_mode          VARCHAR NOT NULL,
+            policy_epoch         BIGINT NOT NULL DEFAULT 0,
+            policy_digest        VARCHAR,
+            identity_digest      VARCHAR NOT NULL,
+            effect_state         VARCHAR NOT NULL,
+            effect_digest        VARCHAR,
+            applied_commit_id    BIGINT,
+            applied_at           TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (pipeline, target_table, event_id)
+        )""",
+    # Policy alerts are value-free governance records.  They intentionally carry
+    # column metadata and hashes only, never a source image or exception text.
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.policy_alerts (
+            pipeline        VARCHAR NOT NULL,
+            source_schema   VARCHAR NOT NULL,
+            source_table    VARCHAR NOT NULL,
+            target_table    VARCHAR,
+            column_name     VARCHAR NOT NULL,
+            action          VARCHAR NOT NULL,
+            rule_id         VARCHAR,
+            policy_epoch    BIGINT NOT NULL,
+            policy_digest   VARCHAR NOT NULL,
+            event_id        VARCHAR,
+            source_lsn      BIGINT,
+            code            VARCHAR NOT NULL,
+            raised_at       TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (pipeline, source_schema, source_table, column_name, policy_epoch, code)
         )""",
     # The SCD2 relation metadata is control-plane state, while history rows are
     # destination data.  Both are written by one commit-group transaction.
@@ -609,6 +658,52 @@ def _migrate_spill_events(con, control_schema: str | None = None) -> None:
         ("relation_generation", "VARCHAR"),
         ("commit_lsn", "BIGINT"),
         ("policy_epoch", "BIGINT"),
+        ("policy_digest", "VARCHAR"),
+    ):
+        if name not in existing:
+            con.execute(
+                f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {quote(name)} {type_name}"
+            )
+
+
+def _migrate_policy_columns(con, control_schema: str | None = None) -> None:
+    """Add the policy/delete columns to destinations made before rubric §8."""
+    schema = resolve_control_schema(control_schema)
+    table = quote(schema) + ".table_state"
+    existing = {
+        str(row[0])
+        for row in con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = ? AND table_name = 'table_state'",
+            [schema],
+        ).fetchall()
+    }
+    for name, type_name in (
+        ("delete_policy_epoch", "BIGINT DEFAULT 1"),
+        ("delete_policy_digest", "VARCHAR"),
+        ("pii_policy_epoch", "BIGINT DEFAULT 0"),
+        ("pii_policy_digest", "VARCHAR"),
+        ("pii_salt_id", "VARCHAR"),
+    ):
+        if name not in existing:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {quote(name)} {type_name}")
+
+
+def _migrate_event_ledger(con, control_schema: str | None = None) -> None:
+    """Add policy/delete identity facts to a pre-§8 event ledger."""
+    schema = resolve_control_schema(control_schema)
+    table = quote(schema) + ".event_ledger"
+    existing = {
+        str(row[0])
+        for row in con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = ? AND table_name = 'event_ledger'",
+            [schema],
+        ).fetchall()
+    }
+    for name, type_name in (
+        ("policy_digest", "VARCHAR"),
+        ("delete_mode", "VARCHAR"),
     ):
         if name not in existing:
             con.execute(
@@ -624,6 +719,8 @@ def ensure_control_schema(con, control_schema: str | None = None) -> None:
             con.execute(statement)
         _migrate_legacy_lease(con, control_schema)
         _migrate_spill_events(con, control_schema)
+        _migrate_policy_columns(con, control_schema)
+        _migrate_event_ledger(con, control_schema)
         con.execute("COMMIT")
     except BaseException:
         with contextlib.suppress(Exception):

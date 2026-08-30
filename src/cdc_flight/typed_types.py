@@ -121,6 +121,12 @@ class SourceTypeDescriptor:
     connect_parameters: tuple[tuple[str, str], ...] = ()
     nullable: bool = True
     metadata: tuple[tuple[str, str], ...] = ()
+    #: PostgreSQL's catalog-resolved ``typoutput`` identity. Policy transforms
+    #: may use a streamed string only when this authority (or an explicit
+    #: ``PostgreSQLOutputText`` proof) is present.
+    output_function_oid: int | None = None
+    output_function_schema: str | None = None
+    output_function_name: str | None = None
     _fingerprint_cache: str | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -182,6 +188,19 @@ class SourceTypeDescriptor:
             connect_parameters=_pairs(value.get("connect_parameters", value.get("parameters"))),
             nullable=bool(value.get("nullable", True)),
             metadata=_pairs(value.get("metadata")),
+            output_function_oid=_as_int(
+                value.get("output_function_oid", value.get("typoutput"))
+            ),
+            output_function_schema=(
+                str(value["output_function_schema"])
+                if value.get("output_function_schema") is not None
+                else None
+            ),
+            output_function_name=(
+                str(value["output_function_name"])
+                if value.get("output_function_name") is not None
+                else None
+            ),
         )
 
     @classmethod
@@ -292,6 +311,9 @@ class SourceTypeDescriptor:
             "connect_parameters": dict(self.connect_parameters),
             "nullable": self.nullable,
             "metadata": dict(self.metadata),
+            "output_function_oid": self.output_function_oid,
+            "output_function_schema": self.output_function_schema,
+            "output_function_name": self.output_function_name,
         }
 
     @property

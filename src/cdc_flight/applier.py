@@ -84,6 +84,7 @@ from .errors import (
 from .faults import matrix_crash, maybe_crash
 from .marker_accounting import SourceMarkerReceiptCounter
 from .occurrence import _commit_reservation
+from .policy import PolicyGate
 from .snapshot import SnapshotCoordinator
 from .snapshot_completion import (
     SnapshotCompletion,
@@ -150,6 +151,8 @@ class Applier:
         self.source_cluster_id = source_cluster_id
         self.source_timeline = source_timeline
         self.strict_event_identity = bool(strict_event_identity)
+        self.delete_policy = config.delete_policy
+        self.policy_gate = PolicyGate(config.pii_policy)
         #: `catalog.CatalogWatcher` or None. The only source of DROP TABLE knowledge
         #: (rubric 1.5): logical decoding does not carry DDL at all.
         self.catalog = catalog
@@ -259,6 +262,8 @@ class Applier:
             binary_mode=self.binary_handling_mode,
             hstore_mode=self.hstore_handling_mode,
             control_schema=self.control_schema,
+            policy_gate=self.policy_gate,
+            require_sanitized=True,
         )
         self.alerts = AlertSink(
             con, pipeline=pipeline, control_schema=self.control_schema
@@ -290,7 +295,27 @@ class Applier:
             control_schema=self.control_schema,
             max_destructive_per_group=config.drop_max_per_group,
             allow_mass_drop=config.drop_allow_mass,
+            policy_gate=self.policy_gate,
         )
+        if self.catalog is not None:
+            # Catalog-backed snapshot/backfill readers use the same application gate
+            # as streaming records. This is an instance attribute so compatibility
+            # watcher implementations remain usable without a new constructor API.
+            try:
+                self.catalog.policy_gate = self.policy_gate
+            except (AttributeError, TypeError):
+                # A few embedders pass a bound descriptor method as ``catalog``
+                # rather than the watcher object. The callable itself is not
+                # mutable; its owner is still configured above when available.
+                pass
+        if self.descriptor_provider is not None:
+            try:
+                self.descriptor_provider.policy_gate = self.policy_gate
+            except (AttributeError, TypeError):
+                # Bound methods and other immutable callables can still be used by
+                # the normal source-read path. They receive the gate through their
+                # owner (the watcher) or through explicit method arguments.
+                pass
         self._schema_epochs = schema_epoch.SchemaEpochCoordinator(
             spill=self.spill,
             apply_units=self._apply_units,
@@ -697,6 +722,7 @@ class Applier:
                     # BEGIN, while a committed STARTED notification has already
                     # installed the route.
                     self._ensure_backfill_route(rec.schema, rec.table, run, create=False)
+            self._sanitize_record(rec)
             ignored_source_record = rec.qualified_table in self.ignored_source_tables
             if ignored_source_record:
                 # The source signal row is a control-plane request. It still
@@ -859,6 +885,27 @@ class Applier:
     # ------------------------------------------------------------------ #
     def _add_unit(self, unit: CompleteUnit) -> None:
         unit_admission.add_unit(self, unit)
+
+    def _sanitize_record(self, record: PendingRecord) -> PendingRecord:
+        """Apply the one post-decode/pre-assembler policy boundary.
+
+        Descriptor lookup is a source-catalog read. It is intentionally performed
+        before the record enters the transaction assembler, while all destination
+        DDL/DML remains owned by the later commit group.
+        """
+        provider = self.descriptor_provider or (
+            getattr(self.catalog, "descriptors_for", None)
+            if self.catalog is not None
+            else None
+        )
+        context = None
+        if provider is not None and record.qualified_table:
+            context = provider(record.qualified_table)
+        record.delete_mode = self.delete_policy.resolve(record.qualified_table)
+        record.delete_policy_epoch = int(self.delete_policy.epoch)
+        record.delete_policy_digest = self.delete_policy.digest
+        self.policy_gate.sanitize(record, context)
+        return record
 
     def _reset_group(self) -> None:
         """One assignment, and that is the whole point (rubric 1.9).

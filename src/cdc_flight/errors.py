@@ -18,6 +18,7 @@ from .occurrence import LeaseReceipt, OffsetRowReceipt
 REFUSAL_ORIGIN_BY_MODULE = {
     "catalog": "catalog_state",
     "catalog_descriptors": "catalog_descriptor",
+    "catalog_apply": "schema_evolution",
     "catalog_poll": "catalog_poll",
     "catalog_state": "catalog_state",
     "catalog_support": "catalog_shape",
@@ -29,6 +30,7 @@ REFUSAL_ORIGIN_BY_MODULE = {
     "schema_registry": "schema_registry",
     "schema_shadow": "schema_shadow",
     "spill_protocol": "spill_protocol",
+    "policy": "policy",
     "table_work": "table_work",
     "table_writer": "table_writer",
 }

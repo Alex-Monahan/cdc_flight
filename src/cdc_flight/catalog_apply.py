@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from . import destination, naming, table_lifecycle
 from .catalog import (
@@ -29,7 +29,7 @@ from .catalog import (
     CatalogChange,
 )
 from .config import DROP_IGNORE, DROP_REPLICATE
-from .errors import AdmissionError, as_schema_refusal
+from .errors import AdmissionError, SchemaEvolutionRefused, as_schema_refusal
 from .machines import (
     CHANGE_DEFERRED,
     CHANGE_REFUSED,
@@ -87,6 +87,10 @@ class CatalogPlan:
     #: Destructive changes deliberately held back by the circuit breaker.
     refused: tuple[tuple[CatalogChange, str], ...] = ()
     alerts: list = field(default_factory=list)
+    #: Value-free governance records for fail-closed PII handling of newly added
+    #: source columns.  They travel with the schema action and are written in the
+    #: same MotherDuck transaction as the destination DDL/backfill.
+    policy_alerts: tuple[dict, ...] = ()
 
     @property
     def destructive(self) -> tuple[CatalogAction, ...]:
@@ -108,6 +112,7 @@ class CatalogCoordinator:
         control_schema: str | None = None,
         max_destructive_per_group: int = 1,
         allow_mass_drop: bool = False,
+        policy_gate=None,
     ):
         self.catalog = catalog
         self.pipeline = pipeline
@@ -118,6 +123,7 @@ class CatalogCoordinator:
         self.control_schema = control_schema
         self.max_destructive_per_group = max_destructive_per_group
         self.allow_mass_drop = allow_mass_drop
+        self.policy_gate = policy_gate
         self.tables_dropped = 0
         self.changes_applied = 0
         self.destructive_refused = 0
@@ -266,6 +272,7 @@ class CatalogCoordinator:
         actions: list[CatalogAction] = []
         refused: list[tuple[CatalogChange, str]] = []
         alerts: list[dict] = []
+        policy_alerts: list[dict] = []
         for change, lifecycle in blocked_changes:
             fingerprint = _deferral_fingerprint(change, lifecycle)
             if not self._deferral_alert_is_new(fingerprint):
@@ -400,6 +407,35 @@ class CatalogCoordinator:
                     detail=detail,
                 )
             )
+            if (
+                self.policy_gate is not None
+                and self.policy_gate.policy.enabled
+                and change.kind == CHANGE_SCHEMA
+            ):
+                for column_change in change.column_changes:
+                    if column_change.kind != "added" or not column_change.new_name:
+                        continue
+                    column = naming.normalize(column_change.new_name)
+                    rule = self.policy_gate.policy.rule_for(
+                        change.qualified, column
+                    )
+                    if rule.rule_id != "__unmatched__":
+                        continue
+                    policy_alerts.append(
+                        {
+                            "source_schema": change.schema,
+                            "source_table": change.table,
+                            "target_table": target,
+                            "column": column,
+                            "action": "exclude",
+                            "rule_id": rule.rule_id,
+                            "policy_epoch": self.policy_gate.policy.epoch,
+                            "policy_digest": self.policy_gate.policy.digest,
+                            "event_id": None,
+                            "source_lsn": change.detected_lsn,
+                            "code": "unmatched_column_excluded",
+                        }
+                    )
             if change.kind in DESTRUCTIVE:
                 alerts.append(
                     {
@@ -465,11 +501,115 @@ class CatalogCoordinator:
             catalog_epoch=self.catalog.epoch,
             refused=tuple(refused),
             alerts=alerts,
+            policy_alerts=tuple(policy_alerts),
         )
 
     # ------------------------------------------------------------------ #
     # applying, inside the commit group's transaction
     # ------------------------------------------------------------------ #
+    def _policy_changes(self, qualified: str, changes):
+        gate = self.policy_gate
+        if gate is None or not gate.policy.enabled:
+            return tuple(changes)
+        result = []
+        for change in changes:
+            name = change.destination_new_name or change.destination_old_name
+            if not name:
+                result.append(change)
+                continue
+            rule = gate.policy.rule_for(qualified, name)
+            if rule.action == "exclude":
+                if change.kind == "added":
+                    continue
+                if change.kind in {"renamed", "type_changed"}:
+                    # Removing a now-unmatched destination field is safe; retaining
+                    # its prior PII value would violate the fail-closed contract.
+                    result.append(
+                        replace(
+                            change,
+                            kind="dropped",
+                            old_name=change.old_name or change.new_name,
+                            new_name=None,
+                        )
+                    )
+                else:
+                    result.append(change)
+                continue
+            if rule.action in {"mask", "hash", "truncate"} and change.kind == "added":
+                descriptor = change.new_descriptor
+                if descriptor is None:
+                    raise SchemaEvolutionRefused(
+                        f"policy-controlled added column {qualified}.{name} has no "
+                        "catalog descriptor",
+                        source_schema=qualified.split(".", 1)[0],
+                        source_table=qualified.split(".", 1)[1],
+                        target=qualified,
+                        refusal_origin="schema_evolution",
+                    )
+                transformed = gate.policy.descriptor_for_transform(
+                    descriptor,
+                    action=rule.action,
+                    rule_id=str(rule.rule_id),
+                )
+                result.append(
+                    replace(
+                        change,
+                        type_oid=1043,
+                        type_name="character varying",
+                        new_descriptor=transformed,
+                    )
+                )
+                continue
+            if rule.action in {"mask", "hash", "truncate"} and change.kind in {
+                "renamed", "type_changed",
+            }:
+                raise SchemaEvolutionRefused(
+                    f"policy representation for existing column {qualified}.{name} "
+                    "changed; an atomic shadow rewrite is required",
+                    source_schema=qualified.split(".", 1)[0],
+                    source_table=qualified.split(".", 1)[1],
+                    target=qualified,
+                    refusal_origin="schema_evolution",
+                )
+            result.append(change)
+        return tuple(result)
+
+    def _read_columns(self, relation, key_columns, value_columns):
+        if self.policy_gate is None or not self.policy_gate.policy.enabled:
+            return self.catalog.read_columns(relation, key_columns, value_columns)
+        try:
+            return self.catalog.read_columns(
+                relation,
+                key_columns,
+                value_columns,
+                policy_gate=self.policy_gate,
+            )
+        except TypeError as exc:
+            # Compatibility adapters may expose the pre-policy three-argument
+            # method. They are allowed to serve only policies whose source values
+            # are already proven output text; hash/truncate still fail closed in
+            # ``sanitize_mapping`` below.
+            if "policy_gate" not in str(exc):
+                raise
+            rows = self.catalog.read_columns(relation, key_columns, value_columns)
+            descriptors = {
+                naming.normalize(column.name): column.descriptor
+                for column in relation.columns
+            }
+            return [
+                tuple(
+                    self.policy_gate.sanitize_mapping(
+                        relation.qualified,
+                        dict(zip(
+                            tuple(key_columns) + tuple(value_columns), row, strict=True
+                        )),
+                        descriptors,
+                        key_columns=tuple(key_columns),
+                    ).values()
+                )
+                for row in rows
+            ]
+
     def apply(self, con, plan: CatalogPlan, stats: dict) -> list[dict]:
         """Execute DDL and state writes after group DML, before MD COMMIT."""
         markers: list[dict] = []
@@ -477,8 +617,12 @@ class CatalogCoordinator:
             change = action.change
             if change.kind == CHANGE_SCHEMA:
                 try:
+                    changes = self._policy_changes(
+                        change.qualified,
+                        change.column_changes,
+                    )
                     apply_column_changes(
-                        self.registry, action.target, change.column_changes
+                        self.registry, action.target, changes
                     )
                 except AdmissionError as error:
                     refused = as_schema_refusal(error, refusal_origin="schema_evolution")
@@ -576,6 +720,13 @@ class CatalogCoordinator:
                 columns=relation.columns,
                 control_schema=self.control_schema,
             )
+        if plan.policy_alerts:
+            destination.write_policy_alerts(
+                con,
+                list(plan.policy_alerts),
+                pipeline=self.pipeline,
+                control_schema=self.control_schema,
+            )
         self.destructive_refused += len(plan.refused)
         return markers
 
@@ -592,6 +743,14 @@ class CatalogCoordinator:
                 for item in change.column_changes
                 if item.kind == "added" and item.destination_new_name
             )
+            if self.policy_gate is not None and self.policy_gate.policy.enabled:
+                value_columns = tuple(
+                    name
+                    for name in value_columns
+                    if self.policy_gate.policy.rule_for(
+                        change.qualified, name
+                    ).action != "exclude"
+                )
             if not value_columns:
                 continue
             table = self.registry.get(action.target)
@@ -605,7 +764,7 @@ class CatalogCoordinator:
             )
             try:
                 if len(stable_keys) == len(table.key_columns) and stable_keys:
-                    rows = self.catalog.read_columns(
+                    rows = self._read_columns(
                         change.new_relation, stable_keys, value_columns
                     )
                     if not rows:
@@ -627,7 +786,7 @@ class CatalogCoordinator:
                     )
                     continue
 
-                rows = self.catalog.read_columns(change.new_relation, (), value_columns)
+                rows = self._read_columns(change.new_relation, (), value_columns)
                 if not rows:
                     defaults = self._missing_defaults(change.new_relation, value_columns)
                     if defaults is not None:

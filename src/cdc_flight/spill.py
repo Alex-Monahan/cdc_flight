@@ -23,7 +23,7 @@ import json
 import logging
 from dataclasses import dataclass
 
-from . import apply_sql, naming
+from . import apply_sql
 from .config import resolve_control_schema
 from .envelope import KIND_DATA, KIND_TRUNCATE, OP_TRUNCATE, PendingRecord
 from .naming import control_table
@@ -37,6 +37,7 @@ _COLUMNS = [
     "source_table", "lsn", "txn_id", "total_order", "cdcf_event_id", "op",
     "source_ts_ms", "before_json", "after_json", "key_json", "source_cluster_id",
     "source_timeline", "relation_generation", "commit_lsn", "policy_epoch",
+    "policy_digest",
 ]
 _TYPES = [
     apply_sql.BIGINT, apply_sql.BIGINT, apply_sql.BIGINT, apply_sql.VARCHAR,
@@ -44,6 +45,7 @@ _TYPES = [
     apply_sql.BIGINT, apply_sql.VARCHAR, apply_sql.VARCHAR, apply_sql.BIGINT,
     apply_sql.VARCHAR, apply_sql.VARCHAR, apply_sql.VARCHAR, apply_sql.VARCHAR,
     apply_sql.BIGINT, apply_sql.VARCHAR, apply_sql.BIGINT, apply_sql.BIGINT,
+    apply_sql.VARCHAR,
 ]
 
 
@@ -69,12 +71,15 @@ class SpillBuffer:
 
     def __init__(
         self, con, *, binary_mode: str = "base64", hstore_mode: str = "map",
-        control_schema: str | None = None,
+        control_schema: str | None = None, policy_gate=None,
+        require_sanitized: bool = True,
     ):
         self.con = con
         self.control_schema = resolve_control_schema(control_schema)
         self.binary_mode = binary_mode
         self.hstore_mode = hstore_mode
+        self.policy_gate = policy_gate
+        self.require_sanitized = bool(require_sanitized)
         #: rows currently staged for the open commit group
         self.rows = 0
 
@@ -82,6 +87,11 @@ class SpillBuffer:
         """Insert `prepared` for `(commit_id, unit_seq)`. Returns rows written."""
         if not prepared:
             return 0
+        if self.require_sanitized:
+            if self.policy_gate is None:
+                raise ValueError("strict spill staging requires a policy gate")
+            for staged in prepared:
+                self.policy_gate.assert_sanitized(staged.event)
         rows = [
             [
                 commit_id, unit_seq, staged.seq, staged.target,
@@ -114,6 +124,7 @@ class SpillBuffer:
                 staged.event.relation_generation,
                 staged.event.commit_lsn,
                 staged.event.policy_epoch,
+                staged.event.policy_digest,
             ]
             for staged in prepared
         ]
@@ -137,7 +148,7 @@ class SpillBuffer:
             f"SELECT target_table, source_schema, source_table, lsn, txn_id, total_order, "
             "       cdcf_event_id, op, source_ts_ms, before_json, after_json, key_json, "
             "       source_cluster_id, source_timeline, relation_generation, commit_lsn, "
-            "       policy_epoch, event_seq "
+                "       policy_epoch, policy_digest, event_seq "
             f"FROM {control_table(self.control_schema, 'spill_events')} "
             "WHERE commit_id = ? AND unit_seq = ? "
             "ORDER BY event_seq",
@@ -149,7 +160,7 @@ class SpillBuffer:
                 target, schema, table, lsn, txn_id, total_order, event_id, op,
                 source_ts_ms, before_json, after_json, key_json, source_cluster_id,
                 source_timeline, relation_generation, stored_commit_lsn, policy_epoch,
-                event_seq,
+                policy_digest, event_seq,
             ) = row
             before, typed_before = _image_from_json(before_json)
             after, typed_after = _image_from_json(after_json)
@@ -174,6 +185,8 @@ class SpillBuffer:
                             else commit_lsn
                         ),
                         policy_epoch=int(policy_epoch or 0),
+                        policy_digest=policy_digest,
+                        sanitized=True,
                         source_ts_ms=source_ts_ms,
                         key=key,
                         before=before,
@@ -217,18 +230,20 @@ def _image_json(
     binary_mode: str = "base64",
     hstore_mode: str = "map",
 ) -> str | None:
-    """Serialize a typed image without changing the legacy raw image.
+    """Serialize only the closed, sanitized field-state image.
 
-    The raw mapping remains in the envelope for compatibility, while the typed sidecar
-    carries the closed field-state machine.  Marker recognition happens before the
-    spill boundary, so replay cannot turn an unchanged field into a SQL/Arrow value.
+    The input ``raw`` argument is retained only as a compatibility assertion.  A
+    spill image must have a typed sidecar produced by the policy gate; rebuilding a
+    sidecar from the decoded raw mapping here would make this storage boundary an
+    accidental PII bypass. On replay, the returned mapping is reconstructed from
+    sanitized VALUE/NULL fields in the typed sidecar.
     """
     if raw is None and image is None:
         return None
-    if image is None and not descriptors:
-        return json.dumps(raw, default=str) if raw is not None else None
+    if image is None:
+        raise ValueError("spill refuses an image without a sanitized typed sidecar")
     patch = RowPatch.from_image(
-        raw,
+        None,
         descriptors,
         typed=image,
         binary_mode=binary_mode,
@@ -239,24 +254,11 @@ def _image_json(
         for name, value in image.fields:
             fields.setdefault(name, value)
     typed = TypedImage(tuple(fields.items()))
-    safe_raw = raw
-    if isinstance(raw, dict):
-        marker_names = {
-            name for name, value in patch.fields.items()
-            if value.state.value == "unchanged_toast"
-        }
-        safe_raw = {
-            name: value
-            for name, value in raw.items()
-            if naming.normalize(str(name)) not in marker_names
-        }
     return json.dumps(
         {
             "__cdcf_typed_image__": _TYPED_IMAGE_VERSION,
-            "raw": safe_raw,
             "image": typed.to_dict(),
         },
-        default=str,
         sort_keys=True,
     )
 
@@ -266,14 +268,18 @@ def _image_from_json(value: str | None) -> tuple[dict | None, TypedImage | None]
         return None, None
     parsed = json.loads(value)
     if not isinstance(parsed, dict) or "__cdcf_typed_image__" not in parsed:
-        return parsed, None
+        raise ValueError("legacy raw spill images are not safe to replay")
     if parsed.get("__cdcf_typed_image__") != _TYPED_IMAGE_VERSION:
         raise ValueError(
             "unsupported typed spill image version "
             f"{parsed.get('__cdcf_typed_image__')!r}"
         )
-    raw = parsed.get("raw")
     image = TypedImage.from_dict(parsed.get("image") or {})
+    raw = {
+        name: field.value
+        for name, field in image.fields
+        if field.state.value in {"value", "explicit_null"}
+    }
     return raw, image
 
 

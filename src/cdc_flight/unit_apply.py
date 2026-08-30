@@ -81,6 +81,8 @@ def apply_units(
         source_cluster_id=applier.source_cluster_id,
         source_timeline=applier.source_timeline,
         strict_event_identity=applier.strict_event_identity,
+        delete_policy=applier.delete_policy,
+        policy_gate=applier.policy_gate,
     )
     for unit in group:
         if unit.fenced:

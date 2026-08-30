@@ -20,9 +20,18 @@ from .errors import (
     as_schema_refusal,
 )
 from .faults import arm_group, matrix_crash, maybe_crash
+from .policy import AcknowledgementHandle
 from .run_state import COMMIT_ACK
 
 OWNER = "commit-durability"
+
+
+def _ack_token(record):
+    """Unwrap the process-local acknowledgement handle exactly at Invariant O."""
+    raw = record.raw
+    if isinstance(raw, AcknowledgementHandle):
+        return raw.consume()
+    return raw
 
 
 def _unit_has_delivery_data(unit) -> bool:
@@ -277,7 +286,7 @@ def commit_group(self, trigger: str) -> CommitResult:
                     for rec in unit.records:
                         if rec.raw is None:  # released by `_add_unit`
                             continue
-                        self._committer.markProcessed(rec.raw)
+                        self._committer.markProcessed(_ack_token(rec))
                         marked += 1
                         if self.service_context is not None and marked == 1:
                             matrix_crash("service_after_one_ack_before_finish")
@@ -289,7 +298,7 @@ def commit_group(self, trigger: str) -> CommitResult:
                 for record in pending_discards:
                     if record.raw is None:
                         continue
-                    self._committer.markProcessed(record.raw)
+                    self._committer.markProcessed(_ack_token(record))
                     marked += 1
                     if self.service_context is not None and marked == 1:
                         matrix_crash("service_after_one_ack_before_finish")

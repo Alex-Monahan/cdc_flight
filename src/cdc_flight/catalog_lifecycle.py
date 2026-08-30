@@ -76,10 +76,18 @@ class CatalogLifecycleMixin:
         relation: SourceRelation,
         key_columns: tuple[str, ...],
         value_columns: tuple[str, ...],
+        *,
+        policy_gate=None,
     ) -> list[tuple]:
         from . import catalog_support
 
-        return catalog_support.read_columns(self, relation, key_columns, value_columns)
+        return catalog_support.read_columns(
+            self,
+            relation,
+            key_columns,
+            value_columns,
+            policy_gate=policy_gate or getattr(self, "policy_gate", None),
+        )
 
     def read_event_columns(self, event, value_columns):
         """Recover source fields omitted by stock Debezium's opaque-array path."""
@@ -89,8 +97,17 @@ class CatalogLifecycleMixin:
             if self._event_read_conn is None or self._event_read_conn.closed:
                 self._event_read_conn = catalog_poll.connect(self)
             try:
+                relation = self.known.get(event.qualified_table)
+                descriptors = {
+                    catalog_support.naming.normalize(column.name): column.descriptor
+                    for column in (relation.columns if relation is not None else ())
+                }
                 return catalog_support.read_event_columns_from_connection(
-                    self._event_read_conn, event, value_columns
+                    self._event_read_conn,
+                    event,
+                    value_columns,
+                    policy_gate=getattr(self, "policy_gate", None),
+                    descriptors=descriptors,
                 )
             except Exception:
                 # A failed statement can leave the reusable session unusable. Close

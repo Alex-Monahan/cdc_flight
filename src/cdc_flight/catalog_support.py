@@ -440,8 +440,99 @@ def _descriptor_changed(known: dict, incoming: dict, fields: set[str]) -> bool:
     return False
 
 
-def read_columns(watcher, relation, key_columns, value_columns) -> list[tuple]:
-    """Read current source values for a fenced add-column backfill."""
+def _policy_projection(relation, columns, policy_gate, *, key_columns=()):
+    """Build a source projection that does not select excluded columns."""
+    from .policy import PolicyValueRefused
+
+    descriptors = {
+        naming.normalize(column.name): column.descriptor
+        for column in relation.columns
+    }
+    normalized_keys = {naming.normalize(column) for column in key_columns}
+    allowed: list[str] = []
+    expressions: list[str] = []
+    kinds: dict[str, str] = {}
+    for name in columns:
+        normalized = naming.normalize(name)
+        rule = policy_gate.policy.rule_for(relation.qualified, normalized)
+        if normalized in normalized_keys and rule.action != "replicate":
+            raise PolicyValueRefused(
+                "a transformed or excluded source key cannot identify a backfill row"
+            )
+        if rule.action == "exclude":
+            continue
+        source_name = next(
+            column.name
+            for column in relation.columns
+            if naming.normalize(column.name) == normalized
+        )
+        if rule.action in {"hash", "truncate"}:
+            # PostgreSQL format(%s, value) invokes the value's type OUTPUT
+            # function. It is deliberately not a ::text cast or Python rendering.
+            expressions.append(f"format('%s', {naming.quote(source_name)})")
+            kinds[normalized] = "output"
+        else:
+            expressions.append(naming.quote(source_name))
+            kinds[normalized] = "raw"
+        allowed.append(normalized)
+    return allowed, expressions, kinds, descriptors
+
+
+def _sanitize_source_rows(
+    relation,
+    columns,
+    rows,
+    policy_gate,
+    *,
+    key_columns=(),
+    kinds=None,
+    descriptors=None,
+) -> list[tuple]:
+    from .policy import PostgreSQLOutputText
+
+    normalized_columns = [naming.normalize(column) for column in columns]
+    kinds = kinds or {}
+    descriptors = descriptors or {}
+    output = []
+    for row in rows:
+        mapping = dict(zip(normalized_columns, row, strict=True))
+        output_texts = {}
+        for name, kind in kinds.items():
+            if kind != "output" or mapping.get(name) is None:
+                continue
+            value = mapping[name]
+            if not isinstance(value, str):
+                raise TypeError("PostgreSQL output projection did not return text")
+            descriptor = descriptors.get(name)
+            output_texts[name] = PostgreSQLOutputText(
+                value,
+                getattr(descriptor, "output_function_oid", None),
+            )
+        sanitized = policy_gate.sanitize_mapping(
+            relation.qualified,
+            mapping,
+            descriptors,
+            output_texts=output_texts,
+            key_columns=tuple(key_columns),
+        )
+        output.append(tuple(sanitized[name] for name in normalized_columns if name in sanitized))
+    return output
+
+
+def read_columns(
+    watcher,
+    relation,
+    key_columns,
+    value_columns,
+    *,
+    policy_gate=None,
+) -> list[tuple]:
+    """Read current source values for a fenced add-column backfill.
+
+    With a policy gate, excluded fields are not part of the SELECT and hash/truncate
+    fields are projected through PostgreSQL's OUTPUT-function boundary before the
+    resulting row is returned to the destination backfill path.
+    """
     from .naming import normalize, quote
 
     source_names = {
@@ -454,12 +545,32 @@ def read_columns(watcher, relation, key_columns, value_columns) -> list[tuple]:
             f"source relation {relation.qualified} has no catalog columns for "
             f"{missing}"
         )
-    select_list = ", ".join(quote(source_names[name]) for name in destinations)
+    if policy_gate is not None and policy_gate.policy.enabled:
+        allowed, expressions, kinds, descriptors = _policy_projection(
+            relation, destinations, policy_gate, key_columns=key_columns
+        )
+        if not expressions:
+            return []
+        select_list = ", ".join(expressions)
+    else:
+        allowed = [normalize(name) for name in destinations]
+        select_list = ", ".join(quote(source_names[name]) for name in allowed)
     with watcher._connect() as conn:
-        return conn.execute(
+        rows = conn.execute(
             f"SELECT {select_list} FROM {quote(relation.schema)}."
             f"{quote(relation.table)}"
         ).fetchall()
+    if policy_gate is None or not policy_gate.policy.enabled:
+        return rows
+    return _sanitize_source_rows(
+        relation,
+        allowed,
+        rows,
+        policy_gate,
+        key_columns=key_columns,
+        kinds=kinds,
+        descriptors=descriptors,
+    )
 
 
 def read_event_columns(watcher, event, value_columns) -> dict[str, object] | None:
@@ -478,16 +589,29 @@ def read_event_columns(watcher, event, value_columns) -> dict[str, object] | Non
             normalize(column.name): column.name
             for column in (relation.columns if relation is not None else ())
         }
+        descriptors = {
+            normalize(column.name): column.descriptor
+            for column in (relation.columns if relation is not None else ())
+        }
     if not source_names:
         source_names = {normalize(name): str(name) for name in value_columns}
         for image in (event.key, event.before, event.after):
             for name in (image or {}):
                 source_names.setdefault(normalize(name), str(name))
     with watcher._connect() as conn:
-        return _read_event_columns(conn, event, value_columns, source_names)
+        return _read_event_columns(
+            conn,
+            event,
+            value_columns,
+            source_names,
+            policy_gate=getattr(watcher, "policy_gate", None),
+            descriptors=descriptors,
+        )
 
 
-def read_event_columns_from_connection(con, event, value_columns) -> dict[str, object] | None:
+def read_event_columns_from_connection(
+    con, event, value_columns, *, policy_gate=None, descriptors=None
+) -> dict[str, object] | None:
     """Connection-backed variant used by the bounded resnapshot descriptor provider."""
     from .naming import normalize
 
@@ -495,10 +619,25 @@ def read_event_columns_from_connection(con, event, value_columns) -> dict[str, o
     for image in (event.key, event.before, event.after):
         for name in (image or {}):
             source_names.setdefault(normalize(name), str(name))
-    return _read_event_columns(con, event, value_columns, source_names)
+    return _read_event_columns(
+        con,
+        event,
+        value_columns,
+        source_names,
+        policy_gate=policy_gate,
+        descriptors=descriptors,
+    )
 
 
-def _read_event_columns(con, event, value_columns, source_names) -> dict[str, object] | None:
+def _read_event_columns(
+    con,
+    event,
+    value_columns,
+    source_names,
+    *,
+    policy_gate=None,
+    descriptors=None,
+) -> dict[str, object] | None:
     from .naming import normalize, quote
 
     values = tuple(normalize(name) for name in value_columns)
@@ -518,6 +657,15 @@ def _read_event_columns(con, event, value_columns, source_names) -> dict[str, ob
     for raw_name, value in key.items():
         name = normalize(raw_name)
         if name in source_names:
+            if policy_gate is not None and policy_gate.policy.enabled:
+                rule = policy_gate.policy.rule_for(event.qualified_table, name)
+                if rule.action != "replicate":
+                    from .policy import PolicyValueRefused
+
+                    raise PolicyValueRefused(
+                        "a transformed or excluded source key cannot identify a "
+                        "source recovery row"
+                    )
             predicates.append(f"{quote(source_names[name])} IS NOT DISTINCT FROM %s")
             params.append(value)
     if not predicates:
@@ -528,7 +676,25 @@ def _read_event_columns(con, event, value_columns, source_names) -> dict[str, ob
                 continue
             predicates.append(f"{quote(source_names[name])} IS NOT DISTINCT FROM %s")
             params.append(value)
-    select_list = ", ".join(quote(source_names[name]) for name in values)
+    kinds: dict[str, str] = {}
+    if policy_gate is not None and policy_gate.policy.enabled:
+        descriptors = descriptors or {}
+        expressions = []
+        for name in values:
+            rule = policy_gate.policy.rule_for(event.qualified_table, name)
+            if rule.action == "exclude":
+                continue
+            if rule.action in {"hash", "truncate"}:
+                expressions.append(f"format('%s', {quote(source_names[name])})")
+                kinds[name] = "output"
+            else:
+                expressions.append(quote(source_names[name]))
+                kinds[name] = "raw"
+        select_list = ", ".join(expressions)
+        if not select_list:
+            return {}
+    else:
+        select_list = ", ".join(quote(source_names[name]) for name in values)
     query = (
         f"SELECT {select_list} FROM {quote(event.schema)}.{quote(event.table)}"
         + (" WHERE " + " AND ".join(predicates) if predicates else "")
@@ -546,4 +712,23 @@ def _read_event_columns(con, event, value_columns, source_names) -> dict[str, ob
             target=event.qualified_table,
             refusal_origin="catalog_shape",
         )
-    return dict(zip(values, rows[0], strict=True))
+    if policy_gate is None or not policy_gate.policy.enabled:
+        return dict(zip(values, rows[0], strict=True))
+    selected = [name for name in values if policy_gate.policy.rule_for(event.qualified_table, name).action != "exclude"]
+    raw = dict(zip(selected, rows[0], strict=True))
+    from .policy import PostgreSQLOutputText
+
+    output_texts = {
+        name: PostgreSQLOutputText(
+            raw[name],
+            getattr((descriptors or {}).get(name), "output_function_oid", None),
+        )
+        for name, kind in kinds.items()
+        if kind == "output" and raw.get(name) is not None
+    }
+    return policy_gate.sanitize_mapping(
+        event.qualified_table,
+        raw,
+        descriptors or {},
+        output_texts=output_texts,
+    )
