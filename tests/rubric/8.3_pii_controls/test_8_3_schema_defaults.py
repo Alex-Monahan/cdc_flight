@@ -12,9 +12,18 @@ from cdc_flight import destination
 from cdc_flight.apply_sql import SchemaRegistry
 from cdc_flight.catalog import CatalogChange, SourceRelation
 from cdc_flight.catalog_apply import CatalogAction, CatalogCoordinator, CatalogPlan
-from cdc_flight.catalog_support import CATALOG_SQL, missing_value_from_output
+from cdc_flight.catalog_support import (
+    CATALOG_SQL,
+    _policy_projection,
+    missing_value_from_output,
+)
 from cdc_flight.errors import SchemaEvolutionRefused
-from cdc_flight.policy import PIIPolicy, PolicyGate, PostgreSQLOutputText
+from cdc_flight.policy import (
+    PIIPolicy,
+    PolicyGate,
+    PolicyValueRefused,
+    PostgreSQLOutputText,
+)
 from cdc_flight.schema_evolution import COLUMN_ADDED, ColumnChange, SourceColumn
 from cdc_flight.source_relations import upsert_source_relation
 from cdc_flight.typed_types import SourceTypeDescriptor
@@ -118,6 +127,13 @@ def test_add_default_backfill_and_control_row_are_policy_sanitized(
             registry_of=lambda: registry,
             policy_gate=PolicyGate(policy),
         )
+        with pytest.raises(PolicyValueRefused, match="source key"):
+            _policy_projection(
+                relation,
+                ("secret",),
+                PolicyGate(policy),
+                key_columns=("secret",),
+            )
         planned_changes = coordinator._policy_changes(
             relation.qualified, (change,)
         )
