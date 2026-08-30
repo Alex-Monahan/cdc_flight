@@ -85,7 +85,7 @@ def test_all_controls_and_money_xml_contract_on_motherduck(motherduck_case, tmp_
                 1,
                 hmac.new(b"md-policy-private-salt", b"md-email-output", hashlib.sha256).hexdigest(),
                 "[PHONE]",
-                "md-",
+                "md-n",
                 "[XML]",
             )
         ]
