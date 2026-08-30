@@ -36,6 +36,10 @@ def test_keyed_and_keyless_delete_replay_is_exactly_once(sandbox, mode, anchor):
     customer_id = sandbox.pg_query(
         "SELECT id FROM app.customers WHERE name = 'p8-delete-crash-keyed'"
     )[0][0]
+    ledger_before = sandbox.duck_query(
+        "SELECT count(*), count(DISTINCT event_id) FROM _cdc_flight.delete_ledger "
+        "WHERE target_table IN ('cdcflight_app_customers', 'cdcflight_app_sensor_readings')"
+    )[0]
 
     sandbox.sql(
         [
@@ -86,4 +90,6 @@ def test_keyed_and_keyless_delete_replay_is_exactly_once(sandbox, mode, anchor):
         "SELECT count(*), count(DISTINCT event_id) FROM _cdc_flight.delete_ledger "
         "WHERE target_table IN ('cdcflight_app_customers', 'cdcflight_app_sensor_readings')"
     )
-    assert ledger == [(2, 2)]
+    assert ledger == [
+        (ledger_before[0] + 2, ledger_before[1] + 2)
+    ]
