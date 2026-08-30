@@ -724,7 +724,7 @@ correct assumptions in the notes below:
 | 7.3 | Partitioned tables handled gracefully | 3 | One logical table via `publish_via_partition_root`; DETACH/DROP PARTITION silently ignored; no per-partition or DuckLake option. |
 | 7.4 | Capture `pg_logical_emit_message` | 3 | Proven to land, but incidentally: base64 payload, raw un-unwrapped envelope, no test, no consumer. |
 | 8.1 | Hard and soft delete options | 1 | Soft delete only (`deleted='true'` rows), and not even a current-state view. |
-| 8.2 | Change history / SCD2 | 1 | Not supported in any form. |
+| 8.2 | Change history / SCD2 | ~~1~~ → **3** | SCD2 semantic bundle merged at `a303ac4`: history/current relations, current marking, tombstones, duplicate replay, verified late ordering, structural truncate, refusal of keyless/missing-predecessor identity, refusal of current-only refresh. Independent gate corrected the round's self-scored 4 down to 3 (`reviews/p78_gate.md`). **4 needs** a production CLI history-mode integration plus a real-process SCD2 crash-anchor matrix including the post-commit/pre-ack boundary; **5 needs** the history-preserving §3 refresh. |
 | 8.3 | PII controls | 1 | None: no column exclusion, masking, hashing or truncation. |
 
 **Baseline average: 66 / 40 = 1.65 out of 5.** Items at 5 in the baseline:
