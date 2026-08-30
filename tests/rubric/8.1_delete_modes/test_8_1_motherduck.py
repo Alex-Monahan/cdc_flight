@@ -9,7 +9,6 @@ import pytest
 from support.applier_lab import Lab, data, end
 from support.motherduck_probe import connect
 
-
 pytestmark = [pytest.mark.motherduck, pytest.mark.e2e]
 
 

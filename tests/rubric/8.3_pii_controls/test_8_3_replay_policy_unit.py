@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import os
-
-import pytest
 from support.applier_lab import data
 
 from cdc_flight.event_ledger import payload_digest

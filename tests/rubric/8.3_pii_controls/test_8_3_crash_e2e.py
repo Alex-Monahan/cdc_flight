@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import json
-
 import hashlib
 import hmac
-import pytest
+import json
 
+import pytest
 
 pytestmark = [pytest.mark.slow, pytest.mark.e2e]
 
@@ -34,15 +33,15 @@ def _policy_env(tmp_path):
 @pytest.mark.parametrize("anchor", ["pre_commit", "post_commit_pre_ack"])
 def test_sanitized_values_and_diagnostics_survive_crash_replay(sandbox, tmp_path, anchor):
     sandbox.reseed()
-    policy, salt = _policy_env(tmp_path)
+    policy, _salt = _policy_env(tmp_path)
     baseline = sandbox.run(reset_state=True, extra_env=policy, max_seconds=180)
     assert baseline["ok"] is True, baseline
 
     sentinel_name = "p8-name-sentinel-never-durable"
     sentinel_email = "p8-email-sentinel-never-durable@example.invalid"
     sandbox.sql(
-        "INSERT INTO app.customers (name, email) VALUES (%s, %s)"
-        % (repr(sentinel_name), repr(sentinel_email))
+        f"INSERT INTO app.customers (name, email) VALUES "
+        f"({sentinel_name!r}, {sentinel_email!r})"
     )
     crashed = sandbox.run(
         extra_env={**policy, "CDC_FAULT_INJECT": f"{anchor}:1"},
@@ -53,7 +52,7 @@ def test_sanitized_values_and_diagnostics_survive_crash_replay(sandbox, tmp_path
     recovered = sandbox.run(extra_env=policy, max_seconds=180)
     assert recovered["ok"] is True, recovered
     ident = sandbox.pg_query(
-        "SELECT id FROM app.customers WHERE name = %s" % repr(sentinel_name)
+        f"SELECT id FROM app.customers WHERE name = {sentinel_name!r}"
     )[0][0]
     expected_email = hmac.new(
         b"p8-crash-private-salt", sentinel_email.encode(), hashlib.sha256

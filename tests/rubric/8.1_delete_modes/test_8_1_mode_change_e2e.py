@@ -7,7 +7,6 @@ from support.applier_lab import Lab, begin, data, end
 
 from cdc_flight.delete_modes import DeleteModeResolver
 
-
 pytestmark = [pytest.mark.slow, pytest.mark.e2e]
 
 

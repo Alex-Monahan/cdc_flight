@@ -10,9 +10,8 @@ import pytest
 
 from cdc_flight.catalog import CatalogWatcher
 from cdc_flight.catalog_support import read_columns, read_event_columns_from_connection
+from cdc_flight.envelope import KIND_DATA, PendingRecord
 from cdc_flight.policy import PIIPolicy, PolicyGate
-from cdc_flight.envelope import PendingRecord, KIND_DATA
-
 
 pytestmark = pytest.mark.e2e
 

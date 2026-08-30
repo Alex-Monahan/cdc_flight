@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import pytest
 
-
 pytestmark = [pytest.mark.slow, pytest.mark.e2e]
 
 
@@ -43,7 +42,7 @@ def test_keyed_and_keyless_delete_replay_is_exactly_once(sandbox, mode, anchor):
 
     sandbox.sql(
         [
-            "DELETE FROM app.customers WHERE id = %s" % int(customer_id),
+            f"DELETE FROM app.customers WHERE id = {int(customer_id)}",
             "DELETE FROM app.sensor_readings WHERE ctid = ("
             "SELECT ctid FROM app.sensor_readings "
             "WHERE sensor_id = 'p8-delete-crash-keyless' LIMIT 1)",

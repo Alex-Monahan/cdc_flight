@@ -10,7 +10,6 @@ import pytest
 from cdc_flight.policy import PIIPolicy, PolicyGate, PostgreSQLOutputText
 from cdc_flight.typed_types import SourceTypeDescriptor, native_type
 
-
 MONEY = SourceTypeDescriptor(
     790, "pg_catalog.money", "money", output_function_oid=790,
 )

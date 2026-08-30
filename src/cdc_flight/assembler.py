@@ -148,9 +148,22 @@ class CompleteUnit:
 
 class _OpenTxn:
     __slots__ = (
-        "begin_seen", "count", "delivery_events", "events", "last_lsn", "mem_bytes", "message_count",
-        "nbytes", "orders", "per_table", "records", "spill_unit_seq", "spilled",
-        "touched_tables", "txn_id", "admission_refusals",
+        "admission_refusals",
+        "begin_seen",
+        "count",
+        "delivery_events",
+        "events",
+        "last_lsn",
+        "mem_bytes",
+        "message_count",
+        "nbytes",
+        "orders",
+        "per_table",
+        "records",
+        "spill_unit_seq",
+        "spilled",
+        "touched_tables",
+        "txn_id",
     )
 
     def __init__(self, txn_id: str, begin_seen: bool):
@@ -191,6 +204,7 @@ class _OpenTxn:
 
 class _OpenChunk:
     __slots__ = (
+        "admission_refusals",
         "count",
         "delivery_events",
         "events",
@@ -204,7 +218,6 @@ class _OpenChunk:
         "spilled",
         "table",
         "touched_tables",
-        "admission_refusals",
     )
 
     def __init__(self, schema: str | None, table: str | None, *, incremental: bool = False):

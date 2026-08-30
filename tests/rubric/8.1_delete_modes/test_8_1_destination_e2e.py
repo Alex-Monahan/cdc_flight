@@ -7,7 +7,6 @@ import json
 
 import pytest
 
-
 pytestmark = pytest.mark.e2e
 
 HARD_TABLE = "app.p8_delete_hard"

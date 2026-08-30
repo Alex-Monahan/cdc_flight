@@ -40,6 +40,7 @@ second path had grown alongside the first.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 import time
@@ -67,6 +68,7 @@ from .backfill import (
 from .catalog_apply import CatalogCoordinator, CatalogPlan
 from .commit_group import CommitResult, OpenGroup
 from .config import ApplierConfig, resolve_control_schema
+from .delete_modes import DeleteModeResolver
 from .destination import AlertSink, Lease, OccurrenceKey, ResumePoint
 from .envelope import (
     KIND_HEARTBEAT,
@@ -86,7 +88,6 @@ from .faults import matrix_crash, maybe_crash
 from .marker_accounting import SourceMarkerReceiptCounter
 from .occurrence import _commit_reservation
 from .policy import PolicyGate
-from .delete_modes import DeleteModeResolver
 from .snapshot import SnapshotCoordinator
 from .snapshot_completion import (
     SnapshotCompletion,
@@ -304,21 +305,17 @@ class Applier:
             # Catalog-backed snapshot/backfill readers use the same application gate
             # as streaming records. This is an instance attribute so compatibility
             # watcher implementations remain usable without a new constructor API.
-            try:
-                self.catalog.policy_gate = self.policy_gate
-            except (AttributeError, TypeError):
+            with contextlib.suppress(AttributeError, TypeError):
                 # A few embedders pass a bound descriptor method as ``catalog``
-                # rather than the watcher object. The callable itself is not
-                # mutable; its owner is still configured above when available.
-                pass
+                # rather than the watcher object. The callable itself is
+                # immutable; its owner is still configured above when available.
+                self.catalog.policy_gate = self.policy_gate
         if self.descriptor_provider is not None:
-            try:
-                self.descriptor_provider.policy_gate = self.policy_gate
-            except (AttributeError, TypeError):
+            with contextlib.suppress(AttributeError, TypeError):
                 # Bound methods and other immutable callables can still be used by
                 # the normal source-read path. They receive the gate through their
                 # owner (the watcher) or through explicit method arguments.
-                pass
+                self.descriptor_provider.policy_gate = self.policy_gate
         self._schema_epochs = schema_epoch.SchemaEpochCoordinator(
             spill=self.spill,
             apply_units=self._apply_units,

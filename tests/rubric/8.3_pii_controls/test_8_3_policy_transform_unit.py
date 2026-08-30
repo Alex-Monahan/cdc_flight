@@ -9,7 +9,6 @@ import pytest
 
 from cdc_flight.policy import (
     PIIPolicy,
-    PolicyGate,
     PolicyValueRefused,
     PostgreSQLOutputText,
 )
@@ -82,7 +81,6 @@ def test_hash_uses_only_the_explicit_postgresql_output_proof(
     salt_path.write_bytes(b"unit-salt")
     salt_path.chmod(0o600)
     policy = _policy("hash", column, salt_path=salt_path)
-    gate = PolicyGate(policy)
     sanitized = policy.sanitize_mapping(
         "app.pii",
         {column: value},
@@ -121,7 +119,6 @@ def test_per_column_regex_truncation_is_unicode_and_not_global():
         ],
         unmatched="exclude",
     )
-    gate = PolicyGate(policy)
     result = policy.sanitize_mapping(
         "app.pii",
         {"notes": "😀é漢字XYZ", "id": 7},

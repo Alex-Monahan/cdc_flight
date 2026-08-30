@@ -7,7 +7,6 @@ import json
 
 import pytest
 
-
 pytestmark = pytest.mark.e2e
 
 TABLE = "app.p8_unmatched_column"

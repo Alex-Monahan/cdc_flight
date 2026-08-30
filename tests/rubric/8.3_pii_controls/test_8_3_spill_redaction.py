@@ -5,10 +5,10 @@ from __future__ import annotations
 import pickle
 
 import pytest
-from support.applier_lab import Lab, data, end
+from support.applier_lab import Lab, data
 
-from cdc_flight.policy import PIIPolicy, PolicyGate
 from cdc_flight.planner import stream_event_id
+from cdc_flight.policy import PIIPolicy, PolicyGate
 from cdc_flight.spill import SpillBuffer, StagedEvent
 from cdc_flight.typed_types import SourceTypeDescriptor
 

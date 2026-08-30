@@ -33,9 +33,9 @@ from .errors import (
     ToastBaseMissing,
     as_schema_refusal,
 )
+from .policy import PIIPolicy, PolicyGate
 from .schema_evolution import COLUMN_TYPE_CHANGED, ColumnChange
 from .spill import SpillBuffer, StagedEvent
-from .policy import PIIPolicy, PolicyGate
 from .typed_types import (
     FieldState,
     FieldValue,

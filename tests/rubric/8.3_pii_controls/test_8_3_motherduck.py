@@ -14,7 +14,6 @@ from support.motherduck_probe import connect
 from cdc_flight.policy import PIIPolicy, PostgreSQLOutputText
 from cdc_flight.typed_types import SourceTypeDescriptor
 
-
 pytestmark = [pytest.mark.motherduck, pytest.mark.e2e]
 
 
