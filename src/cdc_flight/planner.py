@@ -731,6 +731,15 @@ class GroupPlan:
                 if self.policy_gate.policy.rule_for(qualified, name).action != "exclude"
             }
         for name, descriptor in catalog_descriptors.items():
+            if (
+                self.policy_gate is not None
+                and self.policy_gate.policy.enabled
+                and self.policy_gate.policy.rule_for(qualified, name).action == "exclude"
+            ):
+                # An explicitly or fail-closed excluded source column is never
+                # admitted to the destination schema, so an unsupported native
+                # representation there cannot block its table or peer columns.
+                continue
             try:
                 native_type(descriptor)
             except (AdmissionError, TypeError) as exc:

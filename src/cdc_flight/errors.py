@@ -284,7 +284,10 @@ class DestinationExecutionFailure(RuntimeError):
     """
 
     def __init__(self, refused: SchemaEvolutionRefused, original: Exception, target: str):
-        super().__init__(str(original))
+        super().__init__(
+            f"destination execution failure: "
+            f"{type(original).__module__}.{type(original).__qualname__}"
+        )
         self.refused = refused
         self.original = original
         self.target = target
@@ -303,7 +306,10 @@ class TableWriteFailure(RuntimeError):
     """
 
     def __init__(self, refused: SchemaEvolutionRefused | None, original: Exception, target: str):
-        super().__init__(str(original))
+        super().__init__(
+            f"table materialization failure: "
+            f"{type(original).__module__}.{type(original).__qualname__}"
+        )
         self.refused = refused
         self.original = original
         self.target = target
@@ -389,8 +395,16 @@ def as_schema_refusal(
     """
     if isinstance(error, SchemaEvolutionRefused):
         return error
+    # The two typed admission classes have their own value-free diagnostics in the
+    # codec. Preserve those stable type/schema details for existing operators and
+    # tests; arbitrary exceptions still contribute only their class, so a driver
+    # message cannot carry SQL parameters or source PII into durable refusal state.
+    if type(error).__name__ in {"UnsupportedType", "InvalidTypedValue"}:
+        message = str(error)
+    else:
+        message = f"{type(error).__module__}.{type(error).__qualname__}"
     return SchemaEvolutionRefused(
-        str(error),
+        message,
         source_schema=source_schema,
         source_table=source_table,
         target=target,

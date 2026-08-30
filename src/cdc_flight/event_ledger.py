@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import pickle
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -39,21 +40,42 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (bytes, bytearray, memoryview)):
         return {"__bytes__": base64.b64encode(bytes(value)).decode("ascii")}
     if isinstance(value, Decimal):
-        return {"__decimal__": str(value)}
+        sign, digits, exponent = value.as_tuple()
+        return {"__decimal__": [sign, list(digits), exponent]}
     if isinstance(value, (date, datetime)):
-        return {"__datetime__": value.isoformat()}
-    if isinstance(value, Mapping):
         return {
-            str(key): _jsonable(item)
-            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            "__datetime__": [
+                type(value).__module__,
+                type(value).__qualname__,
+                value.toordinal(),
+                getattr(value, "hour", 0),
+                getattr(value, "minute", 0),
+                getattr(value, "second", 0),
+                getattr(value, "microsecond", 0),
+            ]
         }
+    if isinstance(value, Mapping):
+        pairs = [(_jsonable(key), _jsonable(item)) for key, item in value.items()]
+        return {"__mapping__": sorted(pairs, key=lambda pair: canonical_json(pair[0]))}
     if isinstance(value, (list, tuple)):
         return [_jsonable(item) for item in value]
     if isinstance(value, set):
-        return sorted((_jsonable(item) for item in value), key=repr)
-    # A digest is not a destination value.  Keeping an opaque representation here
-    # avoids pretending that an unfamiliar source value has a PostgreSQL text form.
-    return {"__opaque_repr__": repr(value)}
+        values = [_jsonable(item) for item in value]
+        return {"__set__": sorted(values, key=canonical_json)}
+    # A digest is not a destination value. Never call repr()/str() on an unfamiliar
+    # source object: either preserve a private byte-level identity or retain only
+    # its type when the object is not safely serializable.
+    try:
+        encoded = pickle.dumps(value, protocol=4)
+    except Exception:
+        encoded = None
+    return {
+        "__opaque__": [
+            type(value).__module__,
+            type(value).__qualname__,
+            hashlib.sha256(encoded).hexdigest() if encoded is not None else None,
+        ]
+    }
 
 
 def canonical_json(value: Any) -> str:
@@ -68,7 +90,11 @@ def payload_digest(event: Any) -> str:
     for name in ("key_descriptors", "before_descriptors", "after_descriptors"):
         descriptors = getattr(event, name, {}) or {}
         descriptor_groups[name] = {
-            str(column): getattr(descriptor, "fingerprint", repr(descriptor))
+            str(column): getattr(
+                descriptor,
+                "fingerprint",
+                f"{type(descriptor).__module__}.{type(descriptor).__qualname__}",
+            )
             for column, descriptor in sorted(descriptors.items(), key=lambda pair: str(pair[0]))
         }
     material = {

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import pickle
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -35,7 +36,17 @@ def _jsonable(value: Any) -> Any:
             return {"__iso__": value.isoformat()}
         except (AttributeError, TypeError, ValueError):
             pass
-    return value
+    try:
+        encoded = pickle.dumps(value, protocol=4)
+    except Exception:
+        encoded = None
+    return {
+        "__opaque__": [
+            type(value).__module__,
+            type(value).__qualname__,
+            hashlib.sha256(encoded).hexdigest() if encoded is not None else None,
+        ]
+    }
 
 
 def _field_dict(value: FieldValue) -> dict[str, Any]:
@@ -208,7 +219,7 @@ class RowPatch:
                 for name, value in sorted(self.fields.items())
             },
         }
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     def to_dict(self) -> dict[str, Any]:

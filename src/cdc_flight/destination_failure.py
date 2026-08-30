@@ -103,7 +103,10 @@ class DestinationDataRejection(RuntimeError):
         statement: str,
         target: str,
     ):
-        super().__init__(str(original))
+        super().__init__(
+            f"destination data rejection: "
+            f"{type(original).__module__}.{type(original).__qualname__}"
+        )
         self.original = original
         self.operation = operation
         self.statement = statement

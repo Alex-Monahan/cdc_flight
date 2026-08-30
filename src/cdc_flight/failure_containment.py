@@ -18,6 +18,11 @@ log = logging.getLogger("cdc_flight.failure_containment")
 OWNER = "failure-containment"
 
 
+def _safe_exception_detail(error: Exception) -> str:
+    """Return an exception class, never driver text or bound source values."""
+    return f"{type(error).__module__}.{type(error).__qualname__}"
+
+
 def input_fingerprint(event) -> str:
     """Identify a durable refusal boundary without including the bad value."""
     descriptors = {
@@ -80,10 +85,7 @@ def as_contained_refusal(
         error.input_fingerprint = error.input_fingerprint or fingerprint
         error.refusal_origin = error.refusal_origin or "typed_planner"
         return error
-    try:
-        detail = str(error)
-    except Exception:
-        detail = "<exception text unavailable>"
+    detail = _safe_exception_detail(error)
     exception_type = f"{type(error).__module__}.{type(error).__qualname__}"
     return SchemaEvolutionRefused(
         f"unrecognised table-scoped materialization failure for "
@@ -153,10 +155,7 @@ def contain_table_failure(applier, refused, original) -> None:
     )
     refused.refusal_recorded = True
     applier.blocked_schema_tables.add(qualified)
-    try:
-        detail = str(original)
-    except Exception:
-        detail = "<exception text unavailable>"
+    detail = _safe_exception_detail(original)
     exception_type = f"{type(original).__module__}.{type(original).__qualname__}"
     fingerprint = refused.input_fingerprint or qualified
     if not destination.alert_marker_exists(
@@ -236,10 +235,7 @@ def contain_destination_failure(
     refused.refusal_recorded = True
     qualified = f"{refused.source_schema}.{refused.source_table}"
     applier.blocked_schema_tables.add(qualified)
-    try:
-        detail = str(original)
-    except Exception:
-        detail = "<exception text unavailable>"
+    detail = _safe_exception_detail(original)
     exception_type = f"{type(original).__module__}.{type(original).__qualname__}"
     fingerprint = refused.input_fingerprint or qualified
     if not destination.alert_marker_exists(

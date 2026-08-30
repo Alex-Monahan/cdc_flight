@@ -41,7 +41,7 @@ _ACTIONS = frozenset({"exclude", "mask", "hash", "truncate", "replicate"})
 _TEXT_KINDS = frozenset(
     {
         "char", "bpchar", "varchar", "text", "citext", "name", "string",
-        "money", "xml", "opaque", "inet", "cidr", "json", "jsonb", "multirange",
+        "xml", "opaque", "inet", "cidr", "json", "jsonb", "multirange",
     }
 )
 
@@ -95,7 +95,10 @@ class PIIRule:
         # normal spelling; the looser count also accepts a deliberate regex in each
         # component while still rejecting a column-only pattern.
         body = pattern[1:-1]
-        if body.count(".") + body.count(r"\.") < 2:
+        # Count escaped identifier separators once.  Counting both ``.`` and
+        # ``\.`` would accept ``schema\.column`` as a three-part name.
+        separator_body = body.replace(r"\.", ".")
+        if separator_body.count(".") < 2:
             raise PolicyConfigurationError(
                 "every PII column_regex must target schema.table.column"
             )
@@ -364,6 +367,9 @@ class PIIPolicy:
             oid=1043,
             qualified_name="pg_catalog.varchar",
             kind="varchar",
+            output_function_oid=1043,
+            output_function_schema="pg_catalog",
+            output_function_name="varcharout",
             domain_base=None,
             array_element=None,
             map_key=None,
@@ -492,12 +498,25 @@ class PIIPolicy:
                 raise PolicyValueRefused("source-read column has no catalog descriptor")
             supplied = output_texts.get(str(raw_name), output_texts.get(name))
             if rule.action in {"mask", "hash", "truncate"}:
-                value, _descriptor = self.transform(
-                    value,
-                    descriptor,
-                    rule,
-                    output_text=supplied,
-                )
+                try:
+                    value, _descriptor = self.transform(
+                        value,
+                        descriptor,
+                        rule,
+                        output_text=supplied,
+                    )
+                except PolicyValueRefused:
+                    # money/xml are an explicit VARCHAR transport carve-out.  A
+                    # missing source OUTPUT proof may omit that cell, but it may
+                    # never turn into a table-wide schema refusal.  A key remains
+                    # fatal above because omission would destroy row identity.
+                    if (
+                        descriptor is not None
+                        and str(descriptor.kind).lower() in {"money", "xml"}
+                        and name not in normalized_keys
+                    ):
+                        continue
+                    raise
             result[name] = value
         return result
 
@@ -548,6 +567,24 @@ class PolicyGate:
 
     def __init__(self, policy: PIIPolicy | None = None):
         self.policy = policy or PIIPolicy.disabled()
+
+    def sanitize_mapping(
+        self,
+        table: str,
+        mapping: Mapping[str, Any],
+        descriptors: Mapping[str, SourceTypeDescriptor] | None = None,
+        *,
+        output_texts: Mapping[str, Any] | None = None,
+        key_columns: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        """Apply the same gate to snapshot/backfill rows without an envelope."""
+        return self.policy.sanitize_mapping(
+            table,
+            mapping,
+            descriptors,
+            output_texts=output_texts,
+            key_columns=key_columns,
+        )
 
     def sanitize(self, event, descriptor_context=None):
         if not getattr(event, "is_data", False):
@@ -629,6 +666,33 @@ class PolicyGate:
                         output_text=_source_output_for(event, image_name, name),
                     ) if rule.action in {"mask", "hash", "truncate"} else (value, descriptor)
                 except PolicyValueRefused as exc:
+                    # PostgreSQL money and xml are deliberately represented as
+                    # VARCHAR downstream.  If the connector did not carry an
+                    # authoritative OUTPUT proof, omit that sensitive value and
+                    # emit only a value-free policy alert; neither type may block
+                    # a whole table.  Keys still fail above because omission would
+                    # make reconciliation impossible.
+                    if (
+                        descriptor is not None
+                        and str(descriptor.kind).lower() in {"money", "xml"}
+                        and image_name != "key"
+                    ):
+                        event.policy_alerts.append(
+                            {
+                                "source_schema": event.schema,
+                                "source_table": event.table,
+                                "target_table": event.qualified_table,
+                                "column": name,
+                                "action": rule.action,
+                                "rule_id": rule.rule_id,
+                                "policy_epoch": self.policy.epoch,
+                                "policy_digest": self.policy.digest,
+                                "event_id": None,
+                                "source_lsn": event.lsn,
+                                "code": "money_xml_output_proof_unavailable",
+                            }
+                        )
+                        continue
                     raise self._refusal(event, name, rule, str(exc)) from exc
                 new_image[name] = transformed
                 if transformed_descriptor is not None:
