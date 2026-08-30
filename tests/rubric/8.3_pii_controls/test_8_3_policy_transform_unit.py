@@ -6,6 +6,7 @@ import hashlib
 import hmac
 
 import pytest
+from support.applier_lab import Lab, data
 
 from cdc_flight.errors import SchemaEvolutionRefused
 from cdc_flight.policy import (
@@ -15,7 +16,6 @@ from cdc_flight.policy import (
     PostgreSQLOutputText,
 )
 from cdc_flight.typed_types import SourceTypeDescriptor
-from support.applier_lab import Lab, data
 
 
 def _descriptor(kind, oid, *, child=None, fields=()):
