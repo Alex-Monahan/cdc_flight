@@ -469,7 +469,13 @@ def _policy_projection(relation, columns, policy_gate, *, key_columns=()):
         if rule.action in {"hash", "truncate"}:
             # PostgreSQL format(%s, value) invokes the value's type OUTPUT
             # function. It is deliberately not a ::text cast or Python rendering.
-            expressions.append(f"format('%s', {naming.quote(source_name)})")
+            # Build the percent marker without a literal ``%s`` token: psycopg
+            # reserves that spelling for bind parameters even when the query has
+            # no selector parameters. PostgreSQL's format() still dispatches the
+            # value through its type OUTPUT function.
+            expressions.append(
+                f"format(chr(37) || 's', {naming.quote(source_name)})"
+            )
             kinds[normalized] = "output"
         else:
             expressions.append(naming.quote(source_name))
@@ -685,7 +691,9 @@ def _read_event_columns(
             if rule.action == "exclude":
                 continue
             if rule.action in {"hash", "truncate"}:
-                expressions.append(f"format('%s', {quote(source_names[name])})")
+                expressions.append(
+                    f"format(chr(37) || 's', {quote(source_names[name])})"
+                )
                 kinds[name] = "output"
             else:
                 expressions.append(quote(source_names[name]))
