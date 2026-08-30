@@ -153,27 +153,46 @@ def test_service_witness_rejects_membership_without_configured_route():
     )
     backend_start = datetime(2026, 1, 1, tzinfo=UTC)
     now = time.monotonic()
-    for sample_at in (now - 0.1, now):
-        health._ingest(
-            SlotSample(
-                at=sample_at,
-                exists=True,
-                active=True,
-                active_pid=3210,
-                activity_pid=3210,
-                activity_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
-                activity_backend_type="walsender",
-                activity_backend_start=backend_start,
-                replication_pid=3210,
-                replication_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
-                confirmed_pos=100,
-                lag_bytes=0,
-                publication_has_tables=True,
-                publication_has_configured_tables=False,
-            )
+    health._ingest(
+        SlotSample(
+            at=now - 3.0,
+            exists=True,
+            active=True,
+            active_pid=3210,
+            activity_pid=3210,
+            activity_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+            activity_backend_type="walsender",
+            activity_backend_start=backend_start,
+            replication_pid=3210,
+            replication_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+            confirmed_pos=100,
+            lag_bytes=0,
+            publication_has_tables=True,
+            publication_has_configured_tables=False,
         )
+    )
+    _service_status(health)
+    health._ingest(
+        SlotSample(
+            at=now,
+            exists=True,
+            active=True,
+            active_pid=3210,
+            activity_pid=3210,
+            activity_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+            activity_backend_type="walsender",
+            activity_backend_start=backend_start,
+            replication_pid=3210,
+            replication_application_name=STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
+            confirmed_pos=100,
+            lag_bytes=0,
+            publication_has_tables=True,
+            publication_has_configured_tables=False,
+        )
+    )
 
     assert _service_status(health) == "unproven"
+    assert health.dark_for >= 2.5
     summary = health.summary()
     assert summary["source_publication_has_tables"] is True
     assert summary["source_publication_has_configured_tables"] is False

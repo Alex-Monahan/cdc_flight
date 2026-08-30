@@ -17,7 +17,12 @@ from contextlib import suppress
 
 import psycopg
 import pytest
-from support.fixtures import TEST_SLOT_PREFIX, _drop_slot
+from support.fixtures import (
+    POSTGRES_TEST_INSTANCE,
+    TEST_SLOT_PREFIX,
+    _drop_slot,
+    _start_thread_with_slot_startup_gate,
+)
 
 from cdc_flight.config import ReplicationConfig
 from cdc_flight.debezium_props import (
@@ -122,10 +127,24 @@ def test_stock_queue_byte_bound_is_effective_in_the_live_task(
     properties["name"] = f"cdc-flight-{identity}"
     properties["topic.prefix"] = f"cdcflight_{identity}"
     engine = SupervisedDebeziumEngine(properties, _AcknowledgingHandler())
-    runner = threading.Thread(target=engine.run, name=f"p5-queue-{label}", daemon=True)
+    startup_gate_env = {
+        "PGHOST": postgres_cluster.host,
+        "PGPORT": str(postgres_cluster.port),
+        "PGUSER": postgres_cluster.user,
+        "PGPASSWORD": postgres_cluster.password,
+        "PGDATABASE": postgres_cluster.dbname,
+        "CDC_TEST_SLOT_STARTUP_LOCK": str(
+            POSTGRES_TEST_INSTANCE.slot_startup_lock_path
+        ),
+    }
+    runner = _start_thread_with_slot_startup_gate(
+        engine.run,
+        env=startup_gate_env,
+        slot=slot,
+        name=f"p5-queue-{label}",
+    )
     close_thread = None
     try:
-        runner.start()
         metrics = _wait_for_live_queue(engine, runner)
 
         # This first assertion is the effective task configuration, not the Python
@@ -253,7 +272,22 @@ def test_stock_queue_applies_byte_backpressure_before_acknowledgement(
     properties["table.include.list"] = "app.documents"
     handler = _GatedAcknowledgingHandler()
     engine = SupervisedDebeziumEngine(properties, handler)
-    runner = threading.Thread(target=engine.run, name="p5-queue-gate", daemon=True)
+    startup_gate_env = {
+        "PGHOST": postgres_cluster.host,
+        "PGPORT": str(postgres_cluster.port),
+        "PGUSER": postgres_cluster.user,
+        "PGPASSWORD": postgres_cluster.password,
+        "PGDATABASE": postgres_cluster.dbname,
+        "CDC_TEST_SLOT_STARTUP_LOCK": str(
+            POSTGRES_TEST_INSTANCE.slot_startup_lock_path
+        ),
+    }
+    runner = _start_thread_with_slot_startup_gate(
+        engine.run,
+        env=startup_gate_env,
+        slot=slot,
+        name="p5-queue-gate",
+    )
     source_error = []
     source_started = threading.Event()
     source_finished = threading.Event()
@@ -279,7 +313,6 @@ def test_stock_queue_applies_byte_backpressure_before_acknowledgement(
 
     source_writer = threading.Thread(target=write_source_burst, name="p5-source-burst")
     try:
-        runner.start()
         deadline = time.monotonic() + 30
         live = None
         while live is None and time.monotonic() < deadline:
