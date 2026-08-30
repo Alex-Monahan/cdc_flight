@@ -216,6 +216,7 @@ ADMISSION_BOUNDARY_MODULES = frozenset(
 ADMISSION_BOUNDARY_HANDLERS = frozenset(
     {
         ("applier.py", "_spill_events"),
+        ("applier.py", "_sanitize_record"),
         ("catalog.py", "descriptors_for"),
         ("catalog_apply.py", "apply"),
         ("catalog_apply.py", "backfill_schema"),
