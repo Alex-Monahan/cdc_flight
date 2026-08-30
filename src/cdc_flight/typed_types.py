@@ -769,7 +769,12 @@ def numeric_value(value: Any, descriptor: SourceTypeDescriptor | None = None) ->
     try:
         return UnionValue("finite", value if isinstance(value, Decimal) else Decimal(str(value)))
     except (InvalidOperation, ValueError, TypeError) as exc:
-        raise InvalidTypedValue(f"{value!r} is not a PostgreSQL numeric value") from exc
+        value_type = type(value)
+        raise InvalidTypedValue(
+            "value of type "
+            f"{value_type.__module__}.{value_type.__qualname__} "
+            "is not a PostgreSQL numeric value"
+        ) from exc
 
 
 # Value encoding and transport helpers live in their own owner module.  The

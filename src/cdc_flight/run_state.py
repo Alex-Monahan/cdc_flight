@@ -58,6 +58,7 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Mapping
 from contextlib import contextmanager
 
 from .config import resolve_control_schema
@@ -77,6 +78,65 @@ from .states import IllegalTransition
 log = logging.getLogger("cdc_flight.run_state")
 
 __all__ = ["COMMIT_ACK", "RunOutcome", "RunPhaseWriter"]
+
+
+# Run logs are operator diagnostics, not a second event store.  Only these
+# explicitly non-value fields may cross the serialization boundary.  In
+# particular, an exception's message, SQL text, raw image, or generic ``value``
+# key is never made JSON-safe by falling back to ``str``.
+_SAFE_CONTEXT_KEYS = frozenset({
+    "action", "alert_identity", "condition_marker", "code", "connector_failure_fingerprint",
+    "connector_offset_lsn", "connector_txid", "confirmed_flush_lsn", "durable_lsn",
+    "error_type", "event_id", "exception_type", "file_lsn", "input_fingerprint",
+    "marker_ack_lsn", "marker_ack_target", "marker_lsn", "occurrence_key", "ownership",
+    "pipeline", "policy_digest", "policy_epoch", "reason_code", "refusal_class",
+    "recovery_phase", "relation_attributed", "replication_lag_bytes", "restart_lsn",
+    "run_not_ok", "slot_active", "slot_active_application_name", "slot_active_pid",
+    "slot_attached", "slot_exists", "slot_health", "slot_name", "slot_replication_application_name",
+    "slot_replication_pid", "slot_restart_lsn", "slot_confirmed_flush_lsn", "slot_state",
+    "source_cluster_id", "source_lsn", "source_relation", "source_schema", "source_table",
+    "source_timeline", "source_unobservable_after_sec", "state", "status", "table",
+    "table_count", "table_counts", "tables", "target_table", "txn_id", "total_order",
+    "watermark", "captured_tables", "delete_mode", "delete_policy_epoch", "delete_policy_digest",
+    "pii_policy_epoch", "pii_policy_digest", "pii_salt_id",
+})
+_SAFE_CONTEXT_LIST_KEYS = frozenset({"tables", "captured_tables", "table_counts"})
+
+
+def _safe_context(value, *, key: str | None = None, depth: int = 0):
+    """Copy only value-free operational context for durable diagnostics."""
+    if depth > 4:
+        return None
+    if isinstance(value, Mapping):
+        result = {}
+        for raw_key, raw_value in value.items():
+            name = str(raw_key)
+            if name not in _SAFE_CONTEXT_KEYS:
+                continue
+            sanitized = _safe_context(raw_value, key=name, depth=depth + 1)
+            if sanitized is not None:
+                result[name] = sanitized
+        return result
+    if isinstance(value, (list, tuple)):
+        if key not in _SAFE_CONTEXT_LIST_KEYS:
+            return None
+        items = []
+        for item in value:
+            sanitized = _safe_context(item, key=key, depth=depth + 1)
+            if sanitized is not None:
+                items.append(sanitized)
+        return items
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str) and key in _SAFE_CONTEXT_KEYS:
+        return value
+    return None
+
+
+def _safe_log_message(event: str) -> str:
+    """Keep the durable log message an event label, never arbitrary exception text."""
+    label = "".join(char for char in str(event) if char.isalnum() or char in "._:-")
+    return f"operator event {label or 'unknown'}"
 
 
 class _CommitAckWindow:
@@ -639,6 +699,7 @@ class RunPhaseWriter:
             from .destination import now
 
             self._log_seq += 1
+            safe_context = _safe_context(context) if context else None
             self._sink.execute(
                 f"INSERT INTO {control_table(self.control_schema, 'run_logs')} "
                 "(pipeline, runner_id, log_seq, occurred_at, level, event, message, "
@@ -651,11 +712,13 @@ class RunPhaseWriter:
                     now(),
                     str(level).upper(),
                     event,
-                    message,
+                    _safe_log_message(event),
                     replication_lag_bytes,
                     slot_restart_lsn,
                     slot_confirmed_flush_lsn,
-                    json.dumps(context, default=str) if context else None,
+                    json.dumps(safe_context, sort_keys=True, separators=(",", ":"))
+                    if safe_context
+                    else None,
                 ],
             )
         except Exception:

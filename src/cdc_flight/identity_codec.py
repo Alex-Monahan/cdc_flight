@@ -23,14 +23,19 @@ if TYPE_CHECKING:
     from .schema_registry import TableSchema
 
 
+def _value_type(value: Any) -> str:
+    value_type = type(value)
+    return f"{value_type.__module__}.{value_type.__qualname__}"
+
+
 def _canonical_decimal_text(value: Any) -> str:
     """Render a finite PostgreSQL number without scale or exponent noise."""
     try:
         decimal = value if isinstance(value, Decimal) else Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError) as exc:
-        raise ValueError(f"{value!r} is not a number") from exc
+        raise ValueError(f"value of type {_value_type(value)} is not a number") from exc
     if not decimal.is_finite():
-        raise ValueError(f"{value!r} is not a finite number")
+        raise ValueError(f"value of type {_value_type(value)} is not a finite number")
     if decimal == 0:
         return "0"
     text = format(decimal, "f")
@@ -135,7 +140,7 @@ def _decimal_microseconds(value: str) -> int:
     """Convert an interval seconds token to integer microseconds exactly."""
     scaled = Decimal(value) * Decimal(1_000_000)
     if scaled != scaled.to_integral_value():
-        raise ValueError(f"interval precision exceeds microseconds: {value!r}")
+        raise ValueError("interval precision exceeds microseconds")
     return int(scaled)
 
 
@@ -207,7 +212,7 @@ def _interval_units(value: Any) -> dict[str, int]:
         tokens = list(_INTERVAL_TOKEN.finditer(text))
         clock = _INTERVAL_CLOCK.search(text)
         if not tokens and not clock:
-            raise ValueError(f"{value!r} is not an interval value")
+            raise ValueError(f"value of type {_value_type(value)} is not an interval value")
         for token in tokens:
             number = Decimal(token.group("value"))
             unit = token.group("unit").lower()
@@ -232,7 +237,7 @@ def _interval_units(value: Any) -> dict[str, int]:
                 + _decimal_microseconds(clock.group("seconds"))
             )
     if months != months.to_integral_value() or days != days.to_integral_value():
-        raise ValueError(f"interval calendar units are fractional: {value!r}")
+        raise ValueError("interval calendar units are fractional")
     days += months * 30
     return {"months": 0, "days": int(days), "microseconds": int(microseconds)}
 
@@ -261,7 +266,7 @@ def _numeric_identity(value: Any) -> dict[str, Any]:
     try:
         decimal = value if isinstance(value, Decimal) else Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError) as exc:
-        raise ValueError(f"{value!r} is not a numeric value") from exc
+        raise ValueError(f"value of type {_value_type(value)} is not a numeric value") from exc
     if not decimal.is_finite():
         return {"numeric": {"special": _canonical_float(float(decimal))}}
     return {"numeric": {"finite": _canonical_decimal_text(decimal)}}
@@ -414,7 +419,7 @@ def _range_compare(left: Any, right: Any) -> int:
 def _normalise_range(value: Any, source: Any) -> dict[str, Any]:
     """Normalize one PostgreSQL range before its bounds enter the identity tree."""
     if not isinstance(value, Mapping):
-        raise ValueError(f"{value!r} is not an encoded range")
+        raise ValueError(f"value of type {_value_type(value)} is not an encoded range")
     subtype = source.range_subtype
     empty = bool(value.get("is_empty", False))
     lower = value.get("lower")

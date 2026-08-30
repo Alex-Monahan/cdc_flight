@@ -527,9 +527,12 @@ class GroupPlan:
             snapshot is not None,
             incremental=incremental_target,
             delete_mode=(
-                self.delete_policy.resolve(event.qualified_table)
-                if getattr(self, "delete_policy", None) is not None
-                else getattr(event, "delete_mode", None)
+                getattr(event, "delete_mode", None)
+                or (
+                    self.delete_policy.resolve(event.qualified_table)
+                    if getattr(self, "delete_policy", None) is not None
+                    else None
+                )
             ),
         )
         if (

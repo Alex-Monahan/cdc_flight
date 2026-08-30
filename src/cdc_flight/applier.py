@@ -85,6 +85,7 @@ from .faults import matrix_crash, maybe_crash
 from .marker_accounting import SourceMarkerReceiptCounter
 from .occurrence import _commit_reservation
 from .policy import PolicyGate
+from .delete_modes import DeleteModeResolver
 from .snapshot import SnapshotCoordinator
 from .snapshot_completion import (
     SnapshotCompletion,
@@ -152,6 +153,7 @@ class Applier:
         self.source_timeline = source_timeline
         self.strict_event_identity = bool(strict_event_identity)
         self.delete_policy = config.delete_policy
+        self._pending_delete_policy: DeleteModeResolver | None = None
         self.policy_gate = PolicyGate(config.pii_policy)
         #: `catalog.CatalogWatcher` or None. The only source of DROP TABLE knowledge
         #: (rubric 1.5): logical decoding does not carry DDL at all.
@@ -893,6 +895,7 @@ class Applier:
         before the record enters the transaction assembler, while all destination
         DDL/DML remains owned by the later commit group.
         """
+        self._activate_delete_policy_at_boundary()
         provider = self.descriptor_provider or (
             getattr(self.catalog, "descriptors_for", None)
             if self.catalog is not None
@@ -906,6 +909,35 @@ class Applier:
         record.delete_policy_digest = self.delete_policy.digest
         self.policy_gate.sanitize(record, context)
         return record
+
+    def request_delete_policy(self, policy: DeleteModeResolver) -> None:
+        """Stage a delete-policy change for the next PostgreSQL transaction.
+
+        A configuration reload can arrive while Debezium is delivering an open
+        source transaction.  Applying it to one row in that transaction would make
+        the durable event ledger describe two semantics for one source commit.  The
+        request is therefore held until the assembler has observed the transaction's
+        END (or until the next implicit transaction boundary).
+        """
+        if not isinstance(policy, DeleteModeResolver):
+            raise TypeError("delete policy requests require DeleteModeResolver")
+        if policy.digest == self.delete_policy.digest:
+            self._pending_delete_policy = None
+            return
+        self._pending_delete_policy = policy
+
+    def _activate_delete_policy_at_boundary(self) -> None:
+        pending = self._pending_delete_policy
+        if pending is None or self.assembler.open_transaction_id is not None:
+            return
+        previous = self.delete_policy
+        self.delete_policy = pending
+        self._pending_delete_policy = None
+        # If the preceding whole transaction is buffered, make it its own
+        # destination transaction.  The current record has not entered the
+        # assembler yet, so this is a genuine source-transaction boundary.
+        if self.group.units and previous.digest != pending.digest:
+            self.commit_group("delete_policy_boundary")
 
     def _reset_group(self) -> None:
         """One assignment, and that is the whole point (rubric 1.9).

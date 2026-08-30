@@ -32,6 +32,12 @@ from .typed_types import (
 )
 
 
+def _value_type(value: Any) -> str:
+    """Name a value's runtime type without embedding its contents in an error."""
+    value_type = type(value)
+    return f"{value_type.__module__}.{value_type.__qualname__}"
+
+
 def encode_value(value: Any, descriptor: SourceTypeDescriptor | NativeType) -> Any:
     """Encode a value strictly according to its declared descriptor."""
 
@@ -64,7 +70,7 @@ def encode_value(value: Any, descriptor: SourceTypeDescriptor | NativeType) -> A
         try:
             integer = int(value)
         except (TypeError, ValueError) as exc:
-            raise InvalidTypedValue(f"{value!r} is not an integer") from exc
+            raise InvalidTypedValue(f"value of type {_value_type(value)} is not an integer") from exc
         limits = (
             (-(2**15), 2**15 - 1)
             if kind in {"smallint", "int2", "smallserial"}
@@ -85,7 +91,7 @@ def encode_value(value: Any, descriptor: SourceTypeDescriptor | NativeType) -> A
         if isinstance(value, str):
             lowered = value.strip().lower()
             if lowered not in {"true", "false", "t", "f", "1", "0"}:
-                raise InvalidTypedValue(f"{value!r} is not a boolean")
+                raise InvalidTypedValue(f"value of type {_value_type(value)} is not a boolean")
             return lowered in {"true", "t", "1"}
         return bool(value)
     if kind in {"char", "bpchar", "varchar", "text", "citext", "name", "string"}:
@@ -94,7 +100,7 @@ def encode_value(value: Any, descriptor: SourceTypeDescriptor | NativeType) -> A
         return _decode_bytes(value)
     if kind == "array":
         if not isinstance(value, (list, tuple)):
-            raise InvalidTypedValue(f"{value!r} is not an array")
+            raise InvalidTypedValue(f"value of type {_value_type(value)} is not an array")
         if source.array_element is None:
             raise UnsupportedType(f"array {source.qualified_name} has no element descriptor")
         return [encode_value(item, source.array_element) for item in value]
@@ -102,7 +108,7 @@ def encode_value(value: Any, descriptor: SourceTypeDescriptor | NativeType) -> A
         return _encode_struct(value, source)
     if kind == "map":
         if not isinstance(value, Mapping):
-            raise InvalidTypedValue(f"{value!r} is not a map")
+            raise InvalidTypedValue(f"value of type {_value_type(value)} is not a map")
         if source.map_key is None or source.map_value is None:
             raise UnsupportedType(f"map {source.qualified_name} has no key/value descriptor")
         return {
@@ -112,7 +118,9 @@ def encode_value(value: Any, descriptor: SourceTypeDescriptor | NativeType) -> A
     if kind == "enum":
         text = str(value)
         if source.enum_labels and text not in source.enum_labels:
-            raise InvalidTypedValue(f"enum value {text!r} is not in {source.enum_labels!r}")
+            raise InvalidTypedValue(
+                f"enum value of type {_value_type(value)} is not in the declared label set"
+            )
         return text
     if kind in {"date"}:
         return _date_value(value)
@@ -134,7 +142,7 @@ def encode_value(value: Any, descriptor: SourceTypeDescriptor | NativeType) -> A
         try:
             return str(value if isinstance(value, UUID) else UUID(str(value)))
         except (ValueError, AttributeError) as exc:
-            raise InvalidTypedValue(f"{value!r} is not a UUID") from exc
+            raise InvalidTypedValue(f"value of type {_value_type(value)} is not a UUID") from exc
     if kind == "json":
         return _encode_json(value, jsonb=False)
     if kind == "jsonb":
@@ -154,7 +162,9 @@ def encode_value(value: Any, descriptor: SourceTypeDescriptor | NativeType) -> A
             # equality logic belongs on this value path either way.
             return value
         if not isinstance(value, (list, tuple)):
-            raise InvalidTypedValue(f"{value!r} is not a multirange value")
+            raise InvalidTypedValue(
+                f"value of type {_value_type(value)} is not a multirange value"
+            )
         if source.range_subtype is None:
             raise UnsupportedType(f"multirange {source.qualified_name} has no range subtype")
         return [encode_value(item, source.range_subtype) for item in value]
@@ -266,7 +276,9 @@ def _encode_variable_numeric(value: Any) -> dict[str, Any]:
                 if not isinstance(special_value, float) or not (
                     math.isnan(special_value) or math.isinf(special_value)
                 ):
-                    raise InvalidTypedValue(f"{special!r} is not a numeric special value")
+                    raise InvalidTypedValue(
+                        f"numeric special has value of type {_value_type(special)}"
+                    )
                 return {"coefficient": None, "scale": None, "special": special_value}
             coefficient = value.get("coefficient")
             scale = value.get("scale", 0)
@@ -279,7 +291,9 @@ def _encode_variable_numeric(value: Any) -> dict[str, Any]:
                     "special": None,
                 }
             except (TypeError, ValueError) as exc:
-                raise InvalidTypedValue(f"{value!r} is not a variable numeric value") from exc
+                raise InvalidTypedValue(
+                    f"value of type {_value_type(value)} is not a variable numeric value"
+                ) from exc
         if "value" in value and "scale" in value:
             raw = value["value"]
             if isinstance(raw, (bytes, bytearray)):
@@ -327,7 +341,7 @@ def _encode_struct(value: Any, source: SourceTypeDescriptor) -> dict[str, Any]:
         if isinstance(value, Mapping):
             return {"x": float(value.get("x")), "y": float(value.get("y"))}
     if not isinstance(value, Mapping):
-        raise InvalidTypedValue(f"{value!r} is not a STRUCT value")
+        raise InvalidTypedValue(f"value of type {_value_type(value)} is not a STRUCT value")
     result: dict[str, Any] = {}
     for name, descriptor in source.composite_fields:
         result[name] = encode_value(value.get(name), descriptor)
@@ -360,11 +374,13 @@ def _encode_json(value: Any, *, jsonb: bool) -> str | JsonbNull:
         )
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         name = "jsonb" if jsonb else "json"
-        raise InvalidTypedValue(f"{value!r} is not valid PostgreSQL {name} JSON") from exc
+        raise InvalidTypedValue(
+            f"value of type {_value_type(value)} is not valid PostgreSQL {name} JSON"
+        ) from exc
 
 
 def _reject_json_constant(value: str) -> Any:
-    raise ValueError(f"non-finite JSON constant {value!r} is not valid JSON")
+    raise ValueError("non-finite JSON constant is not valid JSON")
 
 
 def _encode_bits(value: Any, source: SourceTypeDescriptor) -> dict[str, Any]:
@@ -374,7 +390,7 @@ def _encode_bits(value: Any, source: SourceTypeDescriptor) -> dict[str, Any]:
         try:
             bit_length = int(value.get("bit_length", len(packed or b"") * 8))
         except (TypeError, ValueError) as exc:
-            raise InvalidTypedValue(f"{value!r} is not a bit value") from exc
+            raise InvalidTypedValue(f"value of type {_value_type(value)} is not a bit value") from exc
         return {"bits": packed, "bit_length": bit_length}
     if isinstance(value, str) and value and set(value) <= {"0", "1"}:
         bit_text = value
@@ -409,11 +425,15 @@ def _encode_range(value: Any, source: SourceTypeDescriptor) -> dict[str, Any]:
             "upper_inclusive": False,
         }
     if len(text) < 2 or text[0] not in "([" or text[-1] not in ")]":
-        raise InvalidTypedValue(f"{value!r} is not a PostgreSQL range value")
+        raise InvalidTypedValue(
+            f"value of type {_value_type(value)} is not a PostgreSQL range value"
+        )
     inner = text[1:-1]
     comma = _range_separator(inner)
     if comma is None:
-        raise InvalidTypedValue(f"{value!r} is not a PostgreSQL range value")
+        raise InvalidTypedValue(
+            f"value of type {_value_type(value)} is not a PostgreSQL range value"
+        )
     lower_text, upper_text = inner[:comma], inner[comma + 1 :]
     lower_text = _unquote_range_bound(lower_text.strip())
     upper_text = _unquote_range_bound(upper_text.strip())
@@ -433,7 +453,9 @@ def _multirange_parts(value: str) -> list[str]:
     if text.lower() in {"{}", "{empty}"}:
         return []
     if len(text) < 2 or text[0] != "{" or text[-1] != "}":
-        raise InvalidTypedValue(f"{value!r} is not a PostgreSQL multirange value")
+        raise InvalidTypedValue(
+            f"value of type {_value_type(value)} is not a PostgreSQL multirange value"
+        )
     parts: list[str] = []
     start = 1
     depth = 0
@@ -496,7 +518,7 @@ def canonical_multirange_text(value: Any, source: SourceTypeDescriptor) -> Canon
         return CanonicalRangeText(decoded)
     if isinstance(value, (list, tuple)):
         return _render_multirange_parts(value, source)
-    raise InvalidTypedValue(f"{value!r} is not a multirange value")
+    raise InvalidTypedValue(f"value of type {_value_type(value)} is not a multirange value")
 
 
 def _render_multirange_parts(
@@ -581,7 +603,7 @@ def _decode_bytes(value: Any) -> bytes | None:
             return base64.b64decode(value, validate=True)
         except (binascii.Error, ValueError):
             raise InvalidTypedValue("bytea value is not valid base64") from None
-    raise InvalidTypedValue(f"{value!r} is not bytes or base64 text")
+    raise InvalidTypedValue(f"value of type {_value_type(value)} is not bytes or base64 text")
 
 
 def _float_text(value: str) -> float:
@@ -595,7 +617,9 @@ def _float_text(value: str) -> float:
     try:
         return float(value)
     except ValueError as exc:
-        raise InvalidTypedValue(f"{value!r} is not a floating-point value") from exc
+        raise InvalidTypedValue(
+            f"value of type {_value_type(value)} is not a floating-point value"
+        ) from exc
 
 
 def _date_value(value: Any) -> date:
@@ -619,12 +643,12 @@ def _date_value(value: Any) -> date:
             return date(1970, 1, 1) + timedelta(days=value)
         except OverflowError as exc:
             raise InvalidTypedValue(
-                f"date epoch-day value {value!r} is outside Python's supported range"
+                "date epoch-day value is outside Python's supported range"
             ) from exc
     try:
         return date.fromisoformat(str(value))
     except ValueError as exc:
-        raise InvalidTypedValue(f"{value!r} is not an ISO date") from exc
+        raise InvalidTypedValue(f"value of type {_value_type(value)} is not an ISO date") from exc
 
 
 def _time_value(value: Any, *, preserve_zone: bool = False) -> time:
@@ -641,7 +665,7 @@ def _time_value(value: Any, *, preserve_zone: bool = False) -> time:
     try:
         return time.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError as exc:
-        raise InvalidTypedValue(f"{value!r} is not an ISO time") from exc
+        raise InvalidTypedValue(f"value of type {_value_type(value)} is not an ISO time") from exc
 
 
 def _datetime_value(value: Any, *, zoned: bool) -> datetime:
@@ -664,7 +688,9 @@ def _datetime_value(value: Any, *, zoned: bool) -> datetime:
             result = result.replace(tzinfo=UTC)
         return result
     except ValueError as exc:
-        raise InvalidTypedValue(f"{value!r} is not an ISO timestamp") from exc
+        raise InvalidTypedValue(
+            f"value of type {_value_type(value)} is not an ISO timestamp"
+        ) from exc
 
 
 # PostgreSQL's JDBC/stock-Debezium infinity representations.  The first pair is
@@ -713,7 +739,7 @@ def _interval_value(value: Any) -> Any:
     if isinstance(value, timedelta):
         return value
     if not isinstance(value, str):
-        raise InvalidTypedValue(f"{value!r} is not an interval value")
+        raise InvalidTypedValue(f"value of type {_value_type(value)} is not an interval value")
     text = value.strip()
     match = re.fullmatch(
         r"(?P<sign>[+-])?P(?:(?P<years>[0-9]+(?:\.[0-9]+)?)Y)?"
@@ -754,7 +780,7 @@ def _descriptor_from_any(value: Any) -> SourceTypeDescriptor:
         if "type" in value and ("qualified_name" not in value and "type_name" not in value):
             return SourceTypeDescriptor.from_connect_schema(value)
         return SourceTypeDescriptor.from_dict(value)
-    raise TypeError(f"cannot make a source descriptor from {value!r}")
+    raise TypeError(f"cannot make a source descriptor from type {_value_type(value)}")
 
 
 def _connect_kind(raw_type: str, logical: str) -> str:

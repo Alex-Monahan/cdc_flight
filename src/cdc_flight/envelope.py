@@ -179,6 +179,26 @@ class PendingRecord:
     #: destination can defer the atomic swap until the shadow has received them.
     incremental_rows: int | None = None
 
+    def __repr__(self) -> str:
+        """Return an audit-safe description of the record.
+
+        ``PendingRecord`` is present in assembler and spill exceptions often enough
+        that the dataclass-generated representation would be a source-value leak:
+        it includes ``key``, both row images, typed fields, and the raw connector
+        object.  The acknowledgement handle is intentionally not represented either
+        (its delegate is the connector's private callback token).  Operational
+        diagnostics can use the identity and policy facts below without ever
+        serialising a source value.
+        """
+        return (
+            "PendingRecord("
+            f"kind={self.kind!r}, topic={self.topic!r}, op={self.op!r}, "
+            f"schema={self.schema!r}, table={self.table!r}, lsn={self.lsn!r}, "
+            f"txn_id={self.txn_id!r}, total_order={self.total_order!r}, "
+            f"sanitized={self.sanitized!r}, policy_epoch={self.policy_epoch!r}, "
+            f"policy_digest={self.policy_digest!r}, delete_mode={self.delete_mode!r})"
+        )
+
     @property
     def is_data(self) -> bool:
         return self.kind in (KIND_DATA, KIND_SNAPSHOT, KIND_TRUNCATE)

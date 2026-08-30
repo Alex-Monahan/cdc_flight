@@ -23,6 +23,15 @@ def _safe_exception_detail(error: Exception) -> str:
     return f"{type(error).__module__}.{type(error).__qualname__}"
 
 
+def _safe_descriptor_identity(descriptor) -> str:
+    """Return a stable descriptor identity without invoking an arbitrary repr."""
+    fingerprint = getattr(descriptor, "fingerprint", None)
+    if isinstance(fingerprint, str):
+        return fingerprint
+    descriptor_type = type(descriptor)
+    return f"{descriptor_type.__module__}.{descriptor_type.__qualname__}"
+
+
 def input_fingerprint(event) -> str:
     """Identify a durable refusal boundary without including the bad value."""
     descriptors = {
@@ -33,11 +42,11 @@ def input_fingerprint(event) -> str:
     payload = {
         "table": event.qualified_table,
         "descriptors": {
-            str(name): getattr(descriptor, "fingerprint", repr(descriptor))
+            str(name): _safe_descriptor_identity(descriptor)
             for name, descriptor in sorted(descriptors.items())
         },
     }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=repr)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
