@@ -726,18 +726,19 @@ class GroupPlan:
                 target=qualified,
                 refusal_origin="typed_planner",
             )
+        policy_gate = getattr(self, "policy_gate", None)
         required_descriptors = set(catalog_descriptors)
-        if self.policy_gate is not None and self.policy_gate.policy.enabled:
+        if policy_gate is not None and policy_gate.policy.enabled:
             required_descriptors = {
                 name
                 for name in required_descriptors
-                if self.policy_gate.policy.rule_for(qualified, name).action != "exclude"
+                if policy_gate.policy.rule_for(qualified, name).action != "exclude"
             }
         for name, descriptor in catalog_descriptors.items():
             if (
-                self.policy_gate is not None
-                and self.policy_gate.policy.enabled
-                and self.policy_gate.policy.rule_for(qualified, name).action == "exclude"
+                policy_gate is not None
+                and policy_gate.policy.enabled
+                and policy_gate.policy.rule_for(qualified, name).action == "exclude"
             ):
                 # An explicitly or fail-closed excluded source column is never
                 # admitted to the destination schema, so an unsupported native
@@ -797,8 +798,8 @@ class GroupPlan:
             for name, descriptor in catalog_descriptors.items():
                 if name not in present_names:
                     continue
-                if self.policy_gate is not None:
-                    rule = self.policy_gate.policy.rule_for(qualified, name)
+                if policy_gate is not None:
+                    rule = policy_gate.policy.rule_for(qualified, name)
                     if rule.action == "exclude":
                         continue
                     existing = descriptors.get(name)
