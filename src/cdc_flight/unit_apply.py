@@ -7,7 +7,7 @@ and reports the small set of counters/markers the owner exposes.
 
 from __future__ import annotations
 
-from . import destination
+from . import destination, spill_refusal
 from .faults import maybe_crash
 from .planner import GroupPlan
 
@@ -28,6 +28,19 @@ def apply_units(
         if created_in_txn is None
         else created_in_txn
     )
+    # A pre-assembler refusal is already scoped and its row image has been sealed
+    # away. Persist the decision after this destination transaction is open, before
+    # planning any rows, so refusal state and healthy peer data share one COMMIT.
+    for unit in group:
+        for refused in getattr(unit, "admission_refusals", ()):
+            if refused.refusal_recorded:
+                continue
+            spill_refusal.record_schema_refusal(
+                applier,
+                refused,
+                transaction_open=True,
+            )
+            refused.refusal_recorded = True
     plan = GroupPlan(
         applier.con,
         commit_id=commit_id,

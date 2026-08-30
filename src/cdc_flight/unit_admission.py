@@ -60,6 +60,18 @@ def add_unit(applier, unit) -> None:
 
 
 def _admit_unit(applier, unit) -> None:
+    # A source descriptor/policy refusal may have been discovered while sealing a
+    # record before assembly. Keep the decision attached to the complete source
+    # unit, but let the commit owner record it in the same destination transaction
+    # and contain only that relation. This preserves healthy co-published peers and
+    # gives the existing table-scoped quarantine route ownership of the refusal.
+    for refused in unit.admission_refusals:
+        if not refused.source_schema or not refused.source_table:
+            raise refused
+        qualified = f"{refused.source_schema}.{refused.source_table}"
+        applier.blocked_schema_tables.add(qualified)
+        if applier.error is None:
+            applier.error = refused
     hold_log_owed_tail(applier, unit)
     if applier.catalog is not None:
         applier.catalog.observe_unit(unit)

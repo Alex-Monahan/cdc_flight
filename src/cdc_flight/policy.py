@@ -748,6 +748,37 @@ class PolicyGate:
             event.raw = AcknowledgementHandle(raw)
         return event
 
+    def seal_refusal(self, event, refusal: SchemaEvolutionRefused):
+        """Seal a scoped refusal without carrying its source image downstream.
+
+        Descriptor lookup is itself part of the pre-assembler gate. If that
+        authoritative read proves that a source column cannot be represented, the
+        refusal must wait for the complete source transaction so the normal atomic
+        rollback/quarantine path can own it. This method retains only protocol
+        identity and the value-free refusal object; all row images and typed
+        payloads are discarded before the record enters assembly.
+        """
+        if not isinstance(refusal, SchemaEvolutionRefused):
+            raise TypeError("policy refusals must be SchemaEvolutionRefused")
+        event.admission_refusal = refusal
+        event.key = None
+        event.before = None
+        event.after = None
+        event.key_descriptors = {}
+        event.before_descriptors = {}
+        event.after_descriptors = {}
+        event.typed_key = None
+        event.typed_before = None
+        event.typed_after = None
+        event.output_texts = {}
+        event.policy_epoch = int(self.policy.epoch)
+        event.policy_digest = self.policy.digest
+        event.sanitized = True
+        raw = getattr(event, "raw", None)
+        if raw is not None and not isinstance(raw, AcknowledgementHandle):
+            event.raw = AcknowledgementHandle(raw)
+        return event
+
     def revalidate(self, event, descriptor_context=None):
         if not getattr(event, "sanitized", False):
             return self.sanitize(event, descriptor_context)

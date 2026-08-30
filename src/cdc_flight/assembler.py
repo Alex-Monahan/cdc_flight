@@ -125,6 +125,10 @@ class CompleteUnit:
     #: relation must remain captured for control-plane writes, but it is not a
     #: destination table and must not create a shadow or snapshot swap.
     ignored: bool = False
+    #: Scoped schema/value refusals sealed before the record entered assembly.
+    #: These are protocol decisions, not row payloads, and survive spill because
+    #: the open-unit counter carries them independently of staged images.
+    admission_refusals: list[Any] = field(default_factory=list)
 
     @property
     def terminal(self) -> PendingRecord | None:
@@ -146,7 +150,7 @@ class _OpenTxn:
     __slots__ = (
         "begin_seen", "count", "delivery_events", "events", "last_lsn", "mem_bytes", "message_count",
         "nbytes", "orders", "per_table", "records", "spill_unit_seq", "spilled",
-        "touched_tables", "txn_id",
+        "touched_tables", "txn_id", "admission_refusals",
     )
 
     def __init__(self, txn_id: str, begin_seen: bool):
@@ -172,6 +176,7 @@ class _OpenTxn:
         #: relation names are retained independently of the event payloads so admission
         #: remains correct after the payload prefix is moved to `spill_events`
         self.touched_tables: set[str] = set()
+        self.admission_refusals: list[Any] = []
         #: every `transaction.total_order` seen, so a duplicate or a gap is loud
         self.orders: set[int] = set()
         #: counted events that belong to no captured table (logical-decoding
@@ -199,6 +204,7 @@ class _OpenChunk:
         "spilled",
         "table",
         "touched_tables",
+        "admission_refusals",
     )
 
     def __init__(self, schema: str | None, table: str | None, *, incremental: bool = False):
@@ -213,6 +219,7 @@ class _OpenChunk:
         self.spilled = 0
         self.spill_unit_seq: int | None = None
         self.touched_tables: set[str] = set()
+        self.admission_refusals: list[Any] = []
         #: True once Debezium actually said `snapshot=last` for this chunk. Only
         #: then may the chunk claim the whole snapshot ended (Opus M-7).
         self.saw_last = False
@@ -457,6 +464,8 @@ class TransactionAssembler:
         self._txn.orders.add(order)
         rec.total_order = order
         self._txn.count += 1
+        if rec.admission_refusal is not None:
+            self._txn.admission_refusals.append(rec.admission_refusal)
         if rec.is_delivery_data:
             self._txn.delivery_events += 1
         self._retain(self._txn, rec)
@@ -512,6 +521,7 @@ class TransactionAssembler:
             spill_unit_seq=txn.spill_unit_seq,
             discarded_events=txn.count - len(txn.events) - spilled,
             delivery_events=txn.delivery_events,
+            admission_refusals=list(txn.admission_refusals),
         )
         return [unit]
 
@@ -627,6 +637,11 @@ class TransactionAssembler:
             last_lsn=rec.lsn or 0,
             commit_lsn=rec.lsn,
             nbytes=rec.nbytes,
+            admission_refusals=(
+                [rec.admission_refusal]
+                if rec.admission_refusal is not None
+                else []
+            ),
         )
 
     # -- snapshot ----------------------------------------------------------- #
@@ -668,6 +683,8 @@ class TransactionAssembler:
         rec.snapshot_ordinal = ordinal
 
         self._chunk.events.append(rec)
+        if rec.admission_refusal is not None:
+            self._chunk.admission_refusals.append(rec.admission_refusal)
         self._chunk.count += 1
         if rec.is_delivery_data:
             self._chunk.delivery_events += 1
@@ -712,6 +729,7 @@ class TransactionAssembler:
             spill_unit_seq=chunk.spill_unit_seq,
             incremental=chunk.incremental,
             delivery_events=chunk.delivery_events,
+            admission_refusals=list(chunk.admission_refusals),
         )
         return [unit]
 

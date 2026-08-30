@@ -897,23 +897,38 @@ class Applier:
         DDL/DML remains owned by the later commit group.
         """
         self._activate_delete_policy_at_boundary()
+        # Capture only the non-sensitive offset facts before any source mapping is
+        # sealed behind the acknowledgement handle. Resume-point construction must
+        # never need to inspect the connector envelope after this method returns.
+        if record.raw is not None and record.source_offset is None:
+            record.source_partition, record.source_offset = offsets_of(record.raw)
+        record.delete_mode = self.delete_policy.resolve(record.qualified_table)
+        record.delete_policy_epoch = int(self.delete_policy.epoch)
+        record.delete_policy_digest = self.delete_policy.digest
         provider = self.descriptor_provider or (
             getattr(self.catalog, "descriptors_for", None)
             if self.catalog is not None
             else None
         )
         context = None
-        if provider is not None and record.qualified_table:
-            context = provider(record.qualified_table)
-        # The policy gate replaces the connector object with an opaque
-        # acknowledgement handle.  Capture only the non-sensitive Connect offset
-        # facts before that replacement so the durable resume-point builder never
-        # needs to inspect the handle (or retain a decoded source mapping).
-        if record.raw is not None and record.source_offset is None:
-            record.source_partition, record.source_offset = offsets_of(record.raw)
-        record.delete_mode = self.delete_policy.resolve(record.qualified_table)
-        record.delete_policy_epoch = int(self.delete_policy.epoch)
-        record.delete_policy_digest = self.delete_policy.digest
+        try:
+            if provider is not None and record.qualified_table:
+                context = provider(record.qualified_table)
+        except AdmissionError as error:
+            refused = as_schema_refusal(
+                error,
+                refusal_origin=(
+                    getattr(error, "refusal_origin", None) or "policy"
+                ),
+            )
+            if not refused.source_schema or not refused.source_table:
+                refused.source_schema = record.schema
+                refused.source_table = record.table
+                refused.target = record.qualified_table
+            if refused.detected_lsn is None:
+                refused.detected_lsn = record.lsn
+            self.policy_gate.seal_refusal(record, refused)
+            return record
         self.policy_gate.sanitize(record, context)
         return record
 

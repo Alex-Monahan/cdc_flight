@@ -163,6 +163,11 @@ class PendingRecord:
     typed_key: TypedImage | None = None
     typed_before: TypedImage | None = None
     typed_after: TypedImage | None = None
+    #: A value-free admission decision made while sealing this record. The
+    #: assembler carries the decision to the complete-unit boundary even if the
+    #: row image itself is moved to spill storage; it is never serialized as a
+    #: source image.
+    admission_refusal: Any | None = None
     #: Stock incremental READ metadata.  These fields are deliberately separate
     #: from snapshot_ordinal: an arrival ordinal is not a resumable cursor.
     incremental: bool = False
