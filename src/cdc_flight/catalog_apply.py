@@ -802,7 +802,7 @@ class CatalogCoordinator:
                     rows=rows,
                 )
             except AdmissionError as error:
-                refused = as_schema_refusal(error, refusal_origin="schema_backfill")
+                refused = as_schema_refusal(error, refusal_origin="schema_evolution")
                 refused.source_schema = refused.source_schema or change.schema
                 refused.source_table = refused.source_table or change.table
                 refused.target = refused.target or action.target
@@ -846,7 +846,7 @@ class CatalogCoordinator:
                 source_schema=relation.schema,
                 source_table=relation.table,
                 target=relation.qualified,
-                refusal_origin="schema_backfill",
+                refusal_origin="schema_evolution",
             )
         return tuple(sanitized[name] for name in value_columns)
 
