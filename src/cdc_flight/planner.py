@@ -50,7 +50,7 @@ from .errors import (
 )
 from .snapshot import SnapshotTable
 from .table_work import TableWork
-from .typed_types import native_type
+from .typed_types import FieldValue, TypedImage, native_type
 
 log = logging.getLogger("cdc_flight.planner")
 OWNER = "commit-group-planning"
@@ -782,7 +782,22 @@ class GroupPlan:
             catalog_descriptors,
         )
         if recoverable:
+            if policy_gate is None:
+                raise SchemaEvolutionRefused(
+                    f"omitted source field(s) {list(recoverable)!r} for "
+                    f"{qualified} require an attached policy gate before recovery",
+                    source_schema=event.schema,
+                    source_table=event.table,
+                    target=qualified,
+                    detected_lsn=event.lsn,
+                    refusal_origin="typed_planner",
+                )
             self._hydrate_omitted_xml_arrays(event, recoverable, catalog_descriptors, watcher)
+            # Hydration occurs after the ordinary post-decode gate.  Revalidate the
+            # newly acquired image immediately, before descriptor merging or row
+            # folding can observe it; a reader that bypassed its own gate therefore
+            # becomes a refusal rather than a late raw-value leak.
+            policy_gate.revalidate(event, catalog_descriptors)
         present_names = {
             naming.normalize(str(name))
             for image_name in ("key", "before", "after")
@@ -871,6 +886,17 @@ class GroupPlan:
         # rows still use the source output value when the reader can observe them;
         # the limitation is recorded loudly in the run log rather than hidden as a
         # fabricated XML string.
+        policy_gate = getattr(self, "policy_gate", None)
+        if policy_gate is None:
+            raise SchemaEvolutionRefused(
+                f"omitted source field(s) {list(columns)!r} for "
+                f"{event.qualified_table} require an attached policy gate",
+                source_schema=event.schema,
+                source_table=event.table,
+                target=event.qualified_table,
+                detected_lsn=event.lsn,
+                refusal_origin="typed_planner",
+            )
         if values is None:
             log.warning(
                 "stock Debezium omitted xml[] field(s) %s for %s and the source "
@@ -879,16 +905,70 @@ class GroupPlan:
                 list(columns),
                 event.qualified_table,
             )
-            values = {name: None for name in columns}
+            values = policy_gate.sanitize_mapping(
+                event.qualified_table,
+                {name: None for name in columns},
+                {
+                    name: catalog_descriptors[name]
+                    for name in columns
+                    if name in catalog_descriptors
+                },
+            )
+        elif not isinstance(values, dict):
+            raise SchemaEvolutionRefused(
+                f"source recovery for {event.qualified_table} returned a non-mapping",
+                source_schema=event.schema,
+                source_table=event.table,
+                target=event.qualified_table,
+                detected_lsn=event.lsn,
+                refusal_origin="typed_planner",
+            )
         image_name = "before" if event.op == "d" else "after"
         image = getattr(event, image_name)
         if image is None:
             image = {}
             setattr(event, image_name, image)
         descriptors = getattr(event, f"{image_name}_descriptors")
+        typed = getattr(event, f"typed_{image_name}", None)
+        typed_fields = dict(typed.fields) if typed is not None else {}
         for name in columns:
+            rule = policy_gate.policy.rule_for(event.qualified_table, name)
+            if rule.action == "exclude":
+                continue
+            if name not in values:
+                raise SchemaEvolutionRefused(
+                    f"policy-gated source recovery omitted {event.qualified_table}.{name}",
+                    source_schema=event.schema,
+                    source_table=event.table,
+                    target=event.qualified_table,
+                    detected_lsn=event.lsn,
+                    refusal_origin="typed_planner",
+                )
+            descriptor = catalog_descriptors.get(name)
+            if descriptor is None:
+                raise SchemaEvolutionRefused(
+                    f"source recovery lacks a descriptor for {event.qualified_table}.{name}",
+                    source_schema=event.schema,
+                    source_table=event.table,
+                    target=event.qualified_table,
+                    detected_lsn=event.lsn,
+                    refusal_origin="typed_planner",
+                )
+            if rule.action in {"mask", "hash", "truncate"}:
+                descriptor = policy_gate.policy.descriptor_for_transform(
+                    descriptor,
+                    action=rule.action,
+                    rule_id=str(rule.rule_id),
+                )
             image[name] = values[name]
-            descriptors[name] = catalog_descriptors[name]
+            descriptors[name] = descriptor
+            typed_fields[name] = FieldValue.of(values[name], descriptor)
+        if typed_fields:
+            setattr(
+                event,
+                f"typed_{image_name}",
+                TypedImage(tuple(sorted(typed_fields.items()))),
+            )
 
     def _count_event(self, event: PendingRecord) -> None:
         """Group-level bookkeeping every event contributes to, whatever it is.

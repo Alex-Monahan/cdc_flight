@@ -212,7 +212,13 @@ def _first_missing_default_element(output: str) -> str | None:
 
 
 def missing_value_from_output(
-    output: object, descriptor
+    output: object,
+    descriptor,
+    *,
+    source_schema: str | None = None,
+    source_table: str | None = None,
+    target: str | None = None,
+    detected_lsn: int | None = None,
 ) -> object | None:
     """Return a proven source default, or refuse an unproven catalog shape.
 
@@ -220,18 +226,24 @@ def missing_value_from_output(
     The returned nominal wrapper preserves that proof through the policy transform;
     it is deliberately never persisted in the destination control row.
     """
-    output_oid = getattr(descriptor, "output_function_oid", None)
-    if not output_oid:
-        raise SchemaEvolutionRefused(
-            "ADD DEFAULT has no catalog-resolved PostgreSQL OUTPUT identity",
+    def refusal(message: str) -> SchemaEvolutionRefused:
+        return SchemaEvolutionRefused(
+            message,
+            source_schema=source_schema,
+            source_table=source_table,
+            target=target,
+            detected_lsn=detected_lsn,
             refusal_origin="catalog_shape",
         )
+
+    output_oid = getattr(descriptor, "output_function_oid", None)
+    if not output_oid:
+        raise refusal("ADD DEFAULT has no catalog-resolved PostgreSQL OUTPUT identity")
     try:
         value = _first_missing_default_element(output)
     except ValueError as error:
-        raise SchemaEvolutionRefused(
-            "ADD DEFAULT cannot be decoded from PostgreSQL OUTPUT text",
-            refusal_origin="catalog_shape",
+        raise refusal(
+            "ADD DEFAULT cannot be decoded from PostgreSQL OUTPUT text"
         ) from error
     if value is None:
         return None
@@ -767,6 +779,16 @@ def _read_event_columns(
     descriptors=None,
 ) -> dict[str, object] | None:
     from .naming import normalize, quote
+
+    if policy_gate is None:
+        raise SchemaEvolutionRefused(
+            f"source recovery for {event.qualified_table} requires an attached "
+            "policy gate",
+            source_schema=event.schema,
+            source_table=event.table,
+            target=event.qualified_table,
+            refusal_origin="catalog_shape",
+        )
 
     values = tuple(normalize(name) for name in value_columns)
     missing = [name for name in values if name not in source_names]

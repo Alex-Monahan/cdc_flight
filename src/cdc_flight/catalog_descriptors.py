@@ -196,6 +196,11 @@ class RelationDescriptorProvider:
         default_factory=threading.Lock, init=False, repr=False
     )
     _event_read_conn: object | None = field(default=None, init=False, repr=False)
+    #: Applier-owned mandatory policy attachment.  Keeping it on the provider
+    #: object (rather than a bound ``descriptors_for`` method) makes the resnapshot
+    #: acquisition seam inspectable and prevents an immutable-method assignment
+    #: from being silently ignored.
+    policy_gate: object | None = field(default=None, init=False, repr=False)
 
     @classmethod
     def from_tables(
@@ -309,11 +314,25 @@ class RelationDescriptorProvider:
     def descriptors_for(self, qualified: str) -> dict[str, SourceTypeDescriptor]:
         return dict(self.relations.get(str(qualified), {}))
 
+    def __call__(self, qualified: str) -> dict[str, SourceTypeDescriptor]:
+        """Remain callable for planners while retaining provider ownership."""
+        return self.descriptors_for(qualified)
+
     def relation_generation_for(self, qualified: str) -> str | None:
         return self.relation_generations.get(str(qualified))
 
     def read_event_columns(self, event, value_columns):
         """Recover omitted opaque-array fields through one bounded source session."""
+        policy_gate = self.policy_gate
+        if policy_gate is None:
+            raise SchemaEvolutionRefused(
+                "the bounded descriptor provider has no attached policy gate for "
+                f"opaque-array recovery of {event.qualified_table}",
+                source_schema=event.schema,
+                source_table=event.table,
+                target=event.qualified_table,
+                refusal_origin="catalog_descriptor",
+            )
         if not self.source_dsn:
             raise SchemaEvolutionRefused(
                 "the bounded descriptor provider has no source connection for "
@@ -341,7 +360,7 @@ class RelationDescriptorProvider:
                     con,
                     event,
                     value_columns,
-                    policy_gate=getattr(self, "policy_gate", None),
+                    policy_gate=policy_gate,
                     descriptors=self.relations.get(event.qualified_table, {}),
                 )
             except Exception:
@@ -458,7 +477,7 @@ def provider_for_source(source) -> object:
     ) as descriptor_con:
         return RelationDescriptorProvider.from_tables(
             descriptor_con, requested, source_dsn=source.dsn
-        ).descriptors_for
+        )
 
 
 def _column_facts(

@@ -41,7 +41,6 @@ second path had grown alongside the first.
 from __future__ import annotations
 
 import logging
-import contextlib
 import threading
 import time
 from typing import Any
@@ -305,11 +304,18 @@ class Applier:
             # Catalog-backed snapshot/backfill readers use the same application gate
             # as streaming records. This is an instance attribute so compatibility
             # watcher implementations remain usable without a new constructor API.
-            with contextlib.suppress(AttributeError, TypeError):
-                self.catalog.policy_gate = self.policy_gate
+            self._attach_policy_gate(
+                self.catalog, self.policy_gate, owner_name="catalog"
+            )
         if self.descriptor_provider is not None:
-            with contextlib.suppress(AttributeError, TypeError):
-                self.descriptor_provider.policy_gate = self.policy_gate
+            # A bound method is immutable, so the attachment helper targets its
+            # owner. Any other non-writable provider fails loudly: silently
+            # continuing here creates an ungated source acquisition path.
+            self._attach_policy_gate(
+                self.descriptor_provider,
+                self.policy_gate,
+                owner_name="descriptor provider",
+            )
         self._schema_epochs = schema_epoch.SchemaEpochCoordinator(
             spill=self.spill,
             apply_units=self._apply_units,
@@ -409,6 +415,24 @@ class Applier:
             target=self._age_timer, name="cdc-commit-age", daemon=True
         )
         self._timer.start()
+
+    @staticmethod
+    def _attach_policy_gate(candidate, gate: PolicyGate, *, owner_name: str) -> None:
+        """Attach the required policy gate, including to a bound-method owner.
+
+        Source acquisition is security-sensitive. A failed attachment must abort
+        construction rather than degrade into an unredacted reader.
+        """
+        owner = getattr(candidate, "__self__", None)
+        target = owner if owner is not None else candidate
+        try:
+            target.policy_gate = gate
+        except (AttributeError, TypeError) as error:
+            raise TypeError(
+                f"{owner_name} must expose a writable policy_gate"
+            ) from error
+        if getattr(target, "policy_gate", None) is not gate:
+            raise TypeError(f"{owner_name} rejected the required policy_gate")
 
     # ------------------------------------------------------------------ #
     # supervisor-facing surface (kept identical to the previous handler)
