@@ -86,7 +86,7 @@ from .errors import (
 from .faults import matrix_crash, maybe_crash
 from .marker_accounting import SourceMarkerReceiptCounter
 from .occurrence import _commit_reservation
-from .policy import PolicyGate
+from .policy import AcknowledgementHandle, PolicyGate
 from .snapshot import SnapshotCoordinator
 from .snapshot_completion import (
     SnapshotCompletion,
@@ -97,6 +97,62 @@ from .spill import SpillBuffer
 
 log = logging.getLogger("cdc_flight.applier")
 OWNER = "applier-lifecycle"
+
+
+def _set_policy_boundary_field(record: PendingRecord, attribute: str, value) -> bool:
+    """Set one fallback field without allowing cleanup to raise."""
+    try:
+        object.__setattr__(record, attribute, value)
+        return True
+    except BaseException:
+        try:
+            record.__dict__[attribute] = value
+        except BaseException:
+            return False
+        return True
+
+
+def _clear_policy_boundary_payload(record: PendingRecord) -> None:
+    """Strip source payload after any pre-assembler boundary escape.
+
+    This is deliberately a last-resort helper rather than another policy operation:
+    it must not call code that can raise while the original boundary error is in
+    flight.  ``PendingRecord`` is a mutable dataclass, so ``object.__setattr__``
+    clears its fields without invoking an adapter's custom ``__setattr__``.  The
+    ``__dict__`` writes are a second, still-local fallback; every operation is
+    guarded so cleanup cannot replace the error that caused it.
+    """
+    for attribute in ("key", "before", "after"):
+        _set_policy_boundary_field(record, attribute, None)
+    for attribute in (
+        "key_descriptors",
+        "before_descriptors",
+        "after_descriptors",
+        "output_texts",
+    ):
+        _set_policy_boundary_field(record, attribute, {})
+    for attribute in (
+        "typed_key",
+        "typed_before",
+        "typed_after",
+        "value_schema",
+        "key_schema",
+        "before_schema",
+        "after_schema",
+    ):
+        _set_policy_boundary_field(record, attribute, None)
+
+    try:
+        raw = object.__getattribute__(record, "raw")
+    except BaseException:
+        raw = None
+    if raw is None or isinstance(raw, AcknowledgementHandle):
+        return
+    try:
+        handle = AcknowledgementHandle(raw)
+    except BaseException:
+        return
+    _set_policy_boundary_field(record, "raw", handle)
 
 
 class Applier:
@@ -911,28 +967,37 @@ class Applier:
         before the record enters the transaction assembler, while all destination
         DDL/DML remains owned by the later commit group.
         """
-        self._activate_delete_policy_at_boundary()
-        # Capture only the non-sensitive offset facts before any source mapping is
-        # sealed behind the acknowledgement handle. Resume-point construction must
-        # never need to inspect the connector envelope after this method returns.
-        if record.raw is not None and record.source_offset is None:
-            record.source_partition, record.source_offset = offsets_of(record.raw)
-        record.delete_mode = self.delete_policy.resolve(record.qualified_table)
-        record.delete_policy_epoch = int(self.delete_policy.epoch)
-        record.delete_policy_digest = self.delete_policy.digest
-        provider = self.descriptor_provider or (
-            getattr(self.catalog, "descriptors_for", None)
-            if self.catalog is not None
-            else None
-        )
-        context = None
         try:
-            if provider is not None and record.qualified_table:
-                context = provider(record.qualified_table)
-            self.policy_gate.sanitize(record, context)
-        except AdmissionError as error:
-            self._seal_policy_refusal(record, error)
-        return record
+            self._activate_delete_policy_at_boundary()
+            # Capture only the non-sensitive offset facts before any source mapping
+            # is sealed behind the acknowledgement handle. Resume-point construction
+            # must never need to inspect the connector envelope after this method
+            # returns. Invariant O requires this ordering.
+            if record.raw is not None and record.source_offset is None:
+                record.source_partition, record.source_offset = offsets_of(record.raw)
+            record.delete_mode = self.delete_policy.resolve(record.qualified_table)
+            record.delete_policy_epoch = int(self.delete_policy.epoch)
+            record.delete_policy_digest = self.delete_policy.digest
+            provider = self.descriptor_provider or (
+                getattr(self.catalog, "descriptors_for", None)
+                if self.catalog is not None
+                else None
+            )
+            context = None
+            try:
+                if provider is not None and record.qualified_table:
+                    context = provider(record.qualified_table)
+                self.policy_gate.sanitize(record, context)
+            except AdmissionError as error:
+                self._seal_policy_refusal(record, error)
+            return record
+        except BaseException:
+            # Activation, offset capture, mode/provider resolution, sanitization,
+            # and refusal sealing are one total source-image boundary. Do not turn
+            # an internal failure into a leak, and do not swallow the failure after
+            # making the record safe to inspect.
+            _clear_policy_boundary_payload(record)
+            raise
 
     def _seal_policy_refusal(
         self, record: PendingRecord, error: AdmissionError

@@ -8,14 +8,14 @@ import hmac
 import pytest
 from support.applier_lab import Lab, data
 
-from cdc_flight.errors import SchemaEvolutionRefused
+from cdc_flight.errors import AdmissionError, SchemaEvolutionRefused
 from cdc_flight.policy import (
     AcknowledgementHandle,
     PIIPolicy,
     PolicyValueRefused,
     PostgreSQLOutputText,
 )
-from cdc_flight.typed_types import SourceTypeDescriptor
+from cdc_flight.typed_types import SourceTypeDescriptor, TypedImage
 
 
 def _descriptor(kind, oid, *, child=None, fields=()):
@@ -206,5 +206,122 @@ def test_policy_refusal_seals_key_and_after_before_the_seam_returns(tmp_path, ac
         assert isinstance(record.raw, AcknowledgementHandle)
         assert "KEY_SOURCE_SENTINEL" not in repr(record)
         assert "AFTER_SOURCE_SENTINEL" not in repr(record)
+    finally:
+        box.close()
+
+
+def _boundary_failure_record(box):
+    record = data(
+        "boundary-failure",
+        1,
+        201,
+        table="pii_boundary",
+        key={"secret": "KEY_SOURCE_SENTINEL"},
+        before={"secret": "BEFORE_SOURCE_SENTINEL"},
+        after={"secret": "AFTER_SOURCE_SENTINEL"},
+    )
+    descriptor = SourceTypeDescriptor(
+        25,
+        "pg_catalog.text",
+        "text",
+        output_function_oid=1009,
+    )
+    box._fixture_descriptor_map[record.qualified_table] = {"secret": descriptor}
+    record.key_descriptors = {"secret": descriptor}
+    record.before_descriptors = {"secret": descriptor}
+    record.after_descriptors = {"secret": descriptor}
+    record.typed_key = TypedImage.from_mapping(record.key, record.key_descriptors)
+    record.typed_before = TypedImage.from_mapping(record.before, record.before_descriptors)
+    record.typed_after = TypedImage.from_mapping(record.after, record.after_descriptors)
+    record.output_texts = {
+        "after": {
+            "secret": PostgreSQLOutputText("OUTPUT_SOURCE_SENTINEL", 1009),
+        }
+    }
+    return record
+
+
+def _boundary_refusal_policy():
+    return PIIPolicy.from_manifest(
+        [
+            {
+                "column_regex": r"^app\.pii_boundary\.secret$",
+                "action": "exclude",
+            }
+        ],
+        unmatched="replicate",
+    )
+
+
+def _assert_boundary_payload_is_stripped(record, original_raw):
+    assert record.key is None
+    assert record.before is None
+    assert record.after is None
+    assert record.key_descriptors == {}
+    assert record.before_descriptors == {}
+    assert record.after_descriptors == {}
+    assert record.typed_key is None
+    assert record.typed_before is None
+    assert record.typed_after is None
+    assert record.output_texts == {}
+    assert isinstance(record.raw, AcknowledgementHandle)
+    assert record.raw is not original_raw
+
+
+def test_policy_boundary_sealer_failure_strips_payload_and_reraises(tmp_path, monkeypatch):
+    box = Lab(tmp_path / "sealer-failure.duckdb", pii_policy=_boundary_refusal_policy())
+    try:
+        record = _boundary_failure_record(box)
+        original_raw = record.raw
+
+        def fail_inside_sealer(_event, _refusal):
+            raise RuntimeError("injected sealer failure")
+
+        monkeypatch.setattr(
+            box.applier.policy_gate, "seal_refusal", fail_inside_sealer
+        )
+        with pytest.raises(RuntimeError, match="injected sealer failure"):
+            box.applier._sanitize_record(record)
+        _assert_boundary_payload_is_stripped(record, original_raw)
+    finally:
+        box.close()
+
+
+def test_policy_boundary_activation_failure_strips_payload_and_reraises(
+    tmp_path, monkeypatch
+):
+    box = Lab(tmp_path / "activation-failure.duckdb")
+    try:
+        record = _boundary_failure_record(box)
+        original_raw = record.raw
+
+        class InjectedAdmission(AdmissionError):
+            pass
+
+        def fail_before_boundary():
+            raise InjectedAdmission("injected activation failure")
+
+        monkeypatch.setattr(
+            box.applier, "_activate_delete_policy_at_boundary", fail_before_boundary
+        )
+        with pytest.raises(InjectedAdmission, match="injected activation failure"):
+            box.applier._sanitize_record(record)
+        _assert_boundary_payload_is_stripped(record, original_raw)
+    finally:
+        box.close()
+
+
+def test_policy_boundary_ordinary_refusal_still_returns_sealed_record(tmp_path):
+    box = Lab(tmp_path / "ordinary-refusal.duckdb", pii_policy=_boundary_refusal_policy())
+    try:
+        record = _boundary_failure_record(box)
+        original_raw = record.raw
+
+        returned = box.applier._sanitize_record(record)
+
+        assert returned is record
+        assert isinstance(record.admission_refusal, SchemaEvolutionRefused)
+        assert record.sanitized is True
+        _assert_boundary_payload_is_stripped(record, original_raw)
     finally:
         box.close()
