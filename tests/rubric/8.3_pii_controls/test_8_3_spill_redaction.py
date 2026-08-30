@@ -60,48 +60,80 @@ def test_spill_refuses_an_unsanitized_record(tmp_path):
 def test_post_gate_event_and_spill_state_have_no_original_or_salt(tmp_path):
     # This drives the actual sanitizer and the actual Applier/SpillBuffer contract;
     # the source values that are policy-transformed are never passed to spill.
-    policy = _policy(tmp_path)
-    gate = PolicyGate(policy)
-    descriptor = SourceTypeDescriptor(
-        25, "pg_catalog.text", "text", output_function_oid=25
-    )
-    event = data(
-        "spill", 1, 100, table="spill_pii", key={"id": 1},
-        after={
-            "id": 1,
-            "excluded": "excluded-secret",
-            "masked": "masked-secret",
-            "hashed": "hashed-secret",
-            "truncated": "truncated-secret",
-        },
-    )
+    box = Lab(tmp_path / "sanitized-spill.duckdb")
+    try:
+        policy = _policy(tmp_path)
+        gate = PolicyGate(policy)
+        descriptor = SourceTypeDescriptor(
+            25, "pg_catalog.text", "text", output_function_oid=25
+        )
+        event = data(
+            "spill", 1, 100, table="spill_pii", key={"id": 1},
+            after={
+                "id": 1,
+                "excluded": "excluded-secret",
+                "masked": "masked-secret",
+                "hashed": "hashed-secret",
+                "truncated": "truncated-secret",
+            },
+        )
     # The direct fixture descriptor has no output proof for the hash/truncate fields;
     # supply the source-output wrapper exactly as the PostgreSQL projection does.
-    event.after_descriptors = {
-        name: descriptor for name in event.after
-    }
-    event.after_descriptors["id"] = SourceTypeDescriptor(
-        23, "pg_catalog.int4", "int4", output_function_oid=43
-    )
-    from cdc_flight.policy import PostgreSQLOutputText
-
-    event.output_texts = {
-        "after": {
-            "hashed": PostgreSQLOutputText("hashed-secret-output", 25),
-            "truncated": PostgreSQLOutputText("truncated-secret-output", 25),
+        event.after_descriptors = {
+            name: descriptor for name in event.after
         }
-    }
-    gate.sanitize(event, event.after_descriptors)
-    hashed = event.after["hashed"]
-    assert event.after == {
-        "id": 1,
-        "masked": "[MASK]",
-        "hashed": hashed,
-        "truncated": "tru",
-    }
-    assert "excluded" not in event.after
-    assert event.raw is not None
-    assert "excluded-secret" not in repr(event)
-    assert "spill-only-salt" not in repr(event)
-    with pytest.raises(TypeError, match="non-serializable"):
-        pickle.dumps(event.raw)  # acknowledgement handle is process-local
+        event.after_descriptors["id"] = SourceTypeDescriptor(
+            23, "pg_catalog.int4", "int4", output_function_oid=43
+        )
+        from cdc_flight.policy import PostgreSQLOutputText
+
+        event.output_texts = {
+            "after": {
+                "hashed": PostgreSQLOutputText("hashed-secret-output", 25),
+                "truncated": PostgreSQLOutputText("truncated-secret-output", 25),
+            }
+        }
+        gate.sanitize(event, event.after_descriptors)
+        hashed = event.after["hashed"]
+        assert event.after == {
+            "id": 1,
+            "masked": "[MASK]",
+            "hashed": hashed,
+            "truncated": "tru",
+        }
+        assert "excluded" not in event.after
+        assert event.raw is not None
+        assert "excluded-secret" not in repr(event)
+        assert "spill-only-salt" not in repr(event)
+        with pytest.raises(TypeError, match="non-serializable"):
+            pickle.dumps(event.raw)  # acknowledgement handle is process-local
+
+        spill = SpillBuffer(box.con, policy_gate=gate, require_sanitized=True)
+        spill.stage(
+            commit_id=9,
+            unit_seq=1,
+            prepared=[
+                StagedEvent(
+                    event=event,
+                    event_id=stream_event_id(event),
+                    target=box.target("spill_pii"),
+                    seq=1,
+                )
+            ],
+        )
+        durable = box.q(
+            "SELECT before_json, after_json, key_json, policy_digest "
+            "FROM _cdc_flight.spill_events WHERE commit_id = 9 AND unit_seq = 1"
+        )
+        assert len(durable) == 1
+        assert all(
+            value is None
+            or all(secret not in value for secret in ("excluded-secret", "masked-secret", "hashed-secret", "truncated-secret", "spill-only-salt"))
+            for value in durable[0][:3]
+        )
+        assert durable[0][3] == policy.digest
+        replayed = spill.load(commit_id=9, unit_seq=1)
+        assert len(replayed) == 1
+        assert replayed[0].event.after == event.after
+    finally:
+        box.close()
