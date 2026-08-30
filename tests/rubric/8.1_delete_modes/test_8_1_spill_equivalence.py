@@ -54,4 +54,3 @@ def test_complete_delete_transaction_has_identical_memory_and_spill_results(tmp_
     finally:
         for box in boxes:
             box.close()
-

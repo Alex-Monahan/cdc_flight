@@ -80,4 +80,3 @@ def test_private_salt_permissions_are_enforced(tmp_path):
             ],
             salt_file=path,
         )
-

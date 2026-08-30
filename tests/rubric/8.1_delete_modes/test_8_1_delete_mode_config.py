@@ -68,4 +68,3 @@ def test_applier_config_and_shared_construction_use_one_delete_policy(monkeypatc
     assert cfg.delete_policy.epoch == 11
     assert cfg.delete_policy.digest == resolver.digest
     assert cfg.delete_policy.canonical_manifest() == resolver.canonical_manifest()
-

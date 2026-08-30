@@ -111,4 +111,3 @@ def test_hard_delete_keeps_reconciliation_evidence(delete_lab):
     assert box.scalar(
         "SELECT count(*) FROM _cdc_flight.commit_log WHERE pipeline = 'lab'"
     ) >= 2
-
