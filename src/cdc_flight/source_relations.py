@@ -101,11 +101,6 @@ def upsert_source_relation(
                         ),
                         "nullable": column.nullable,
                         "has_missing_default": column.has_missing_default,
-                        "missing_value_text": (
-                            str(column.missing_value)
-                            if column.has_missing_default and column.missing_value is not None
-                            else None
-                        ),
                     }
                     for column in columns
                 ],

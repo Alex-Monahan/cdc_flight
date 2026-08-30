@@ -10,7 +10,7 @@ from . import catalog_support as observation_mod
 from . import faults as faults_mod
 from .catalog_descriptors import CatalogDescriptorReader
 from .catalog_generation import identities_equal, identity_for
-from .catalog_state import FENCED, SourceRelation, _missing_value
+from .catalog_state import FENCED, SourceRelation
 from .errors import AdmissionError, SchemaEvolutionRefused, as_schema_refusal
 from .machines import (
     CATALOG_SCHEMA_LIVENESS,
@@ -65,6 +65,54 @@ def _apply_formatted_precision(
         element = _apply_formatted_precision(descriptor.array_element, element_text)
         return replace(descriptor, array_element=element)
     return descriptor
+
+
+def _source_column(
+    raw: dict,
+    descriptors: dict[int, SourceTypeDescriptor],
+    *,
+    source_schema: str,
+    source_table: str,
+    detected_lsn: int,
+) -> SourceColumn:
+    """Build one observed column without synthesizing its default value."""
+    descriptor = (
+        SourceTypeDescriptor.from_dict(raw["descriptor"])
+        if raw.get("descriptor")
+        else _column_descriptor(raw, descriptors)
+    )
+    has_missing_default = bool(raw.get("has_missing_default", False))
+    missing_value = None
+    if has_missing_default:
+        try:
+            missing_value = observation_mod.missing_value_from_output(
+                raw.get("missing_value_output"), descriptor
+            )
+        except AdmissionError as exc:
+            raise SchemaEvolutionRefused(
+                f"source catalog default for {source_schema}.{source_table}."
+                f"{raw.get('name', '<unknown>')} is not proven by a PostgreSQL "
+                f"OUTPUT function: {exc}",
+                source_schema=source_schema,
+                source_table=source_table,
+                target=f"{source_schema}.{source_table}",
+                detected_lsn=detected_lsn,
+                refusal_origin=(
+                    getattr(exc, "refusal_origin", None) or "catalog_poll"
+                ),
+            ) from exc
+    return SourceColumn(
+        attnum=int(raw["attnum"]),
+        name=str(raw["name"]),
+        type_oid=int(raw["type_oid"]),
+        type_name=str(raw["type_name"]),
+        typmod=(int(raw["typmod"]) if raw.get("typmod") is not None else None),
+        nullable=bool(raw.get("nullable", True)),
+        has_missing_default=has_missing_default,
+        missing_value=missing_value,
+        attstorage=(str(raw["attstorage"]) if raw.get("attstorage") else None),
+        descriptor=descriptor,
+    )
 
 
 def connect(watcher, *, autocommit: bool = True, dsn: str | None = None):
@@ -469,23 +517,12 @@ def poll(watcher):
         for index, row in enumerate(rows):
             raw_columns = parsed_columns[index]
             columns = tuple(
-                SourceColumn(
-                    attnum=int(raw["attnum"]),
-                    name=str(raw["name"]),
-                    type_oid=int(raw["type_oid"]),
-                    type_name=str(raw["type_name"]),
-                    typmod=(int(raw["typmod"]) if raw.get("typmod") is not None else None),
-                    nullable=bool(raw.get("nullable", True)),
-                    has_missing_default=bool(raw.get("has_missing_default", False)),
-                    missing_value=_missing_value(
-                        raw.get("missing_value_text"), str(raw["type_name"])
-                    ),
-                    attstorage=(str(raw["attstorage"]) if raw.get("attstorage") else None),
-                    descriptor=(
-                        SourceTypeDescriptor.from_dict(raw["descriptor"])
-                        if raw.get("descriptor")
-                        else _column_descriptor(raw, descriptors)
-                    ),
+                _source_column(
+                    raw,
+                    descriptors,
+                    source_schema=str(row[0]),
+                    source_table=str(row[1]),
+                    detected_lsn=lsn,
                 )
                 for raw in (raw_columns or [])
             )

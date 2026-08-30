@@ -809,16 +809,46 @@ class CatalogCoordinator:
                 refused.detected_lsn = refused.detected_lsn or change.detected_lsn
                 raise
 
-    @staticmethod
-    def _missing_defaults(relation, value_columns: tuple[str, ...]) -> tuple | None:
+    def _missing_defaults(self, relation, value_columns: tuple[str, ...]) -> tuple | None:
         by_name = {naming.normalize(column.name): column for column in relation.columns}
-        values = []
+        values = {}
         for name in value_columns:
             column = by_name.get(name)
             if column is None or not column.has_missing_default:
                 return None
-            values.append(column.missing_value)
-        return tuple(values)
+            values[name] = column.missing_value
+        if self.policy_gate is None or not self.policy_gate.policy.enabled:
+            return tuple(values[name] for name in value_columns)
+
+        from .policy import PostgreSQLOutputText
+
+        descriptors = {
+            name: by_name[name].descriptor
+            for name in value_columns
+            if by_name[name].descriptor is not None
+        }
+        output_texts = {
+            name: value
+            for name, value in values.items()
+            if isinstance(value, PostgreSQLOutputText)
+        }
+        sanitized = self.policy_gate.sanitize_mapping(
+            relation.qualified,
+            values,
+            descriptors,
+            output_texts=output_texts,
+        )
+        missing = tuple(name for name in value_columns if name not in sanitized)
+        if missing:
+            raise SchemaEvolutionRefused(
+                f"PII policy did not produce schema-default values for "
+                f"{relation.qualified}: {missing!r}",
+                source_schema=relation.schema,
+                source_table=relation.table,
+                target=relation.qualified,
+                refusal_origin="schema_backfill",
+            )
+        return tuple(sanitized[name] for name in value_columns)
 
     # ------------------------------------------------------------------ #
     # after COMMIT

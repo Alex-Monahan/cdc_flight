@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from . import naming
 from .catalog_state import CHANGE_NEW, CHANGE_SCHEMA, CHANGE_UNPUBLISHED, DESTRUCTIVE
-from .errors import SchemaShapeUnexplained
+from .errors import SchemaEvolutionRefused, SchemaShapeUnexplained
 from .machines import ADMISSION_ADMITTED, ADMISSION_EXTERNAL
 from .toast import ToastRoute, classify_relation
 
@@ -43,8 +43,8 @@ SELECT n.nspname                                  AS source_schema,
                    'typrelid', typ.typrelid::bigint,
                    'nullable', NOT a.attnotnull,
                    'has_missing_default', COALESCE(a.atthasmissing, false),
-                   'missing_value_text', CASE WHEN a.atthasmissing
-                       THEN a.attmissingval::text ELSE NULL END
+                   'missing_value_output', CASE WHEN a.atthasmissing
+                       THEN format(chr(37) || 's', a.attmissingval) ELSE NULL END
                ) ORDER BY a.attnum
            ) FILTER (WHERE a.attnum IS NOT NULL),
            '[]'::jsonb
@@ -116,6 +116,128 @@ WHERE parent.relkind IN ('r', 'p')
   )
   AND (COALESCE(p.puballtables, false) OR pr.prrelid IS NOT NULL)
 """
+
+
+def _first_missing_default_element(output: str) -> str | None:
+    """Unwrap PostgreSQL's one-element ``attmissingval`` output envelope.
+
+    ``pg_attribute.attmissingval`` is declared as the polymorphic ``anyarray``;
+    PostgreSQL does not permit a client query to subscript or unnest that value
+    without losing the element type.  Formatting the array therefore asks
+    PostgreSQL's array output routine to invoke the actual element type's
+    ``typoutput`` function.  This parser removes only that outer, one-element
+    array envelope.  It never renders a Python value or reparses a type.
+    """
+    if not isinstance(output, str):
+        raise ValueError("catalog missing-default output is not text")
+    opening = output.find("{")
+    if opening < 0:
+        raise ValueError("catalog missing-default output has no array envelope")
+    index = opening + 1
+    if index >= len(output):
+        raise ValueError("catalog missing-default output is truncated")
+    if output[index] == "}":
+        return None
+
+    if output[index] == '"':
+        index += 1
+        value: list[str] = []
+        while index < len(output):
+            character = output[index]
+            if character == "\\":
+                if index + 1 >= len(output):
+                    raise ValueError("catalog missing-default output has a dangling escape")
+                value.append(output[index + 1])
+                index += 2
+                continue
+            if character == '"':
+                index += 1
+                break
+            value.append(character)
+            index += 1
+        else:
+            raise ValueError("catalog missing-default output has an unterminated quote")
+        if not output[index:].lstrip().startswith("}"):
+            raise ValueError("catalog missing-default output contains multiple elements")
+        return "".join(value)
+
+    if output[index] == "{":
+        start = index
+        depth = 0
+        quoted = False
+        escaped = False
+        while index < len(output):
+            character = output[index]
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                quoted = not quoted
+            elif not quoted and character == "{":
+                depth += 1
+            elif not quoted and character == "}":
+                depth -= 1
+                if depth == 0:
+                    element = output[start : index + 1]
+                    if not output[index + 1 :].lstrip().startswith("}"):
+                        raise ValueError(
+                            "catalog missing-default output contains multiple elements"
+                        )
+                    return element
+            index += 1
+        raise ValueError("catalog missing-default output has an unterminated nested value")
+
+    value = []
+    while index < len(output):
+        character = output[index]
+        if character in ",}":
+            break
+        if character == "\\":
+            if index + 1 >= len(output):
+                raise ValueError("catalog missing-default output has a dangling escape")
+            value.append(output[index + 1])
+            index += 2
+            continue
+        value.append(character)
+        index += 1
+    if index >= len(output) or output[index] != "}":
+        raise ValueError("catalog missing-default output contains multiple elements")
+    token = "".join(value)
+    if token.upper() == "NULL":
+        return None
+    if not token:
+        raise ValueError("catalog missing-default output contains an empty element")
+    return token
+
+
+def missing_value_from_output(
+    output: object, descriptor
+) -> object | None:
+    """Return a proven source default, or refuse an unproven catalog shape.
+
+    The descriptor's ``typoutput`` OID is resolved by ``CatalogDescriptorReader``.
+    The returned nominal wrapper preserves that proof through the policy transform;
+    it is deliberately never persisted in the destination control row.
+    """
+    output_oid = getattr(descriptor, "output_function_oid", None)
+    if not output_oid:
+        raise SchemaEvolutionRefused(
+            "ADD DEFAULT has no catalog-resolved PostgreSQL OUTPUT identity",
+            refusal_origin="catalog_shape",
+        )
+    try:
+        value = _first_missing_default_element(output)
+    except ValueError as error:
+        raise SchemaEvolutionRefused(
+            "ADD DEFAULT cannot be decoded from PostgreSQL OUTPUT text",
+            refusal_origin="catalog_shape",
+        ) from error
+    if value is None:
+        return None
+    from .policy import PostgreSQLOutputText
+
+    return PostgreSQLOutputText(value, int(output_oid))
 
 
 def summary(watcher) -> dict:
