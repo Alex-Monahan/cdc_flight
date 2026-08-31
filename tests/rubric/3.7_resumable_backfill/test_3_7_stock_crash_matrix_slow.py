@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import subprocess
 import sys
@@ -185,6 +186,7 @@ def _child_env(
     point: str,
     nth: int,
     table_specs,
+    armed_path: Path,
     insert_signal: bool = False,
 ):
     qualified_tables = tuple(qualified for _name, qualified in table_specs)
@@ -197,6 +199,7 @@ def _child_env(
         "CDC_BACKFILL_REQUEST_ID": REQUEST_ID,
         "CDC_BACKFILL_SOURCE_DSN": sandbox.source.dsn,
         "CDC_BACKFILL_INSERT_SIGNAL": "1" if insert_signal else "0",
+        "CDC_CRASH_MATRIX_ARMED_FILE": str(armed_path),
         "CDC_AUTO_DISCOVERY": "0",
         "CDC_DROP_MODE": "ignore",
         "CDC_TABLES": ",".join(name for name, _qualified in table_specs),
@@ -205,11 +208,54 @@ def _child_env(
     }
 
 
+def _wait_for_matrix_child_armed(
+    sandbox, process, armed_path: Path, *, point: str, nth: int
+) -> dict:
+    """Wait for the child to parse and arm the selected fault before driving it."""
+    deadline = time.monotonic() + 90
+    while True:
+        if armed_path.exists():
+            try:
+                armed = json.loads(armed_path.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise AssertionError(
+                    f"crash-matrix armed sentinel is unreadable: {armed_path}"
+                ) from exc
+            assert armed == {
+                "action": "137",
+                "armed": True,
+                "nth": nth,
+                "pid": process.pid,
+                "point": point,
+            }, armed
+            return armed
+        if process.poll() is not None:
+            fired = sandbox.fired_fault()
+            if fired is None:
+                raise AssertionError(
+                    "crash-matrix child died before arming its selected anchor: "
+                    f"point={point}:{nth}, returncode={process.returncode}, "
+                    "armed_sentinel=absent"
+                )
+            raise AssertionError(
+                "crash-matrix child exited before its armed sentinel was observed: "
+                f"point={point}:{nth}, returncode={process.returncode}, fired={fired!r}"
+            )
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                "crash-matrix child did not publish its armed sentinel: "
+                f"point={point}:{nth}"
+            )
+        time.sleep(0.1)
+
+
 def _run_admission_child(
     sandbox, *, point: str, table_specs, insert_signal: bool
-) -> subprocess.CompletedProcess:
+) -> subprocess.Popen:
     sandbox.clear_fired_fault()
-    proc = subprocess.run(
+    armed_path = sandbox.dir / "crash_matrix_armed.json"
+    armed_path.unlink(missing_ok=True)
+    proc = subprocess.Popen(
         [sys.executable, str(CHILD)],
         cwd=Path(__file__).resolve().parents[3],
         env=_child_env(
@@ -217,18 +263,20 @@ def _run_admission_child(
             point=point,
             nth=1,
             table_specs=table_specs,
+            armed_path=armed_path,
             insert_signal=insert_signal,
         ),
         capture_output=True,
         text=True,
-        timeout=180,
     )
-    assert proc.returncode == 137, (
-        point,
-        proc.returncode,
-        proc.stdout[-3000:],
-        proc.stderr[-6000:],
-    )
+    try:
+        _wait_for_matrix_child_armed(sandbox, proc, armed_path, point=point, nth=1)
+        stdout, stderr = proc.communicate(timeout=180)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.communicate(timeout=60)
+    assert proc.returncode == 137, (point, proc.returncode, stdout[-3000:], stderr[-6000:])
     fired = sandbox.fired_fault()
     assert fired is not None
     assert fired["point"] == point
@@ -239,6 +287,8 @@ def _run_admission_child(
 
 def _run_pipeline_crash(sandbox, signal, *, point: str, nth: int, table_specs) -> None:
     sandbox.clear_fired_fault()
+    armed_path = sandbox.dir / "crash_matrix_armed.json"
+    armed_path.unlink(missing_ok=True)
     process = sandbox.spawn(
         max_seconds=360,
         idle_seconds=90,
@@ -249,11 +299,13 @@ def _run_pipeline_crash(sandbox, signal, *, point: str, nth: int, table_specs) -
             "CDC_INCREMENTAL_SNAPSHOT_CHUNK_SIZE": "400",
             "CDC_COMMIT_MAX_EVENTS": "400",
             "CDC_FAULT_INJECT": f"{point}:{nth}",
+            "CDC_CRASH_MATRIX_ARMED_FILE": str(armed_path),
         },
         capture=True,
         matrix_arm=True,
     )
     try:
+        _wait_for_matrix_child_armed(sandbox, process, armed_path, point=point, nth=nth)
         sandbox.wait_for_slot_active(process=process, timeout=74)
         if point in LOAD_SENSITIVE_POINTS:
             _write_signal(sandbox, signal)
