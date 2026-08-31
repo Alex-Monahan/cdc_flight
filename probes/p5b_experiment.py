@@ -156,17 +156,38 @@ def _one_row_transactions(prefix: str, count: int) -> dict[str, float | int]:
 def _paced_one_row_transactions(
     prefix: str, count: int, *, workers: int = 8, target_tps: float = 500.0
 ) -> dict[str, float | int]:
-    """Drive independent one-row commits at a sustained source rate."""
+    return _paced_transactions(
+        prefix, count, rows_per_transaction=1, workers=workers, target_tps=target_tps
+    )
+
+
+def _paced_transactions(
+    prefix: str,
+    count: int,
+    *,
+    rows_per_transaction: int,
+    workers: int = 8,
+    target_tps: float = 500.0,
+) -> dict[str, float | int]:
+    """Drive whole multi-row commits at a sustained source transaction rate."""
+    if rows_per_transaction <= 0 or count % rows_per_transaction:
+        raise ValueError("count must be a positive multiple of rows_per_transaction")
+    transactions = count // rows_per_transaction
     started = time.monotonic()
 
     def write_worker(worker: int) -> None:
-        with psycopg.connect(_source_dsn(), autocommit=True) as connection:
-            for index in range(worker, count, workers):
+        with psycopg.connect(_source_dsn(), autocommit=False) as connection:
+            for transaction_index in range(worker, transactions, workers):
+                first = transaction_index * rows_per_transaction + 1
+                last = first + rows_per_transaction - 1
                 connection.execute(
-                    "INSERT INTO app.customers (name, email, lifetime_value) VALUES (%s, %s, %s)",
-                    (f"{prefix}-{index}", f"{prefix}-{index}@example.com", index % 100),
+                    "INSERT INTO app.customers (name, email, lifetime_value) "
+                    "SELECT %s || '-' || i, %s || '-' || i || '@example.com', "
+                    "(i %% 100)::numeric FROM generate_series(%s::bigint, %s::bigint) i",
+                    (prefix, prefix, first, last),
                 )
-                due = started + (index + 1) / target_tps
+                connection.commit()
+                due = started + (transaction_index + 1) / target_tps
                 remaining = due - time.monotonic()
                 if remaining > 0:
                     time.sleep(remaining)
@@ -178,11 +199,13 @@ def _paced_one_row_transactions(
     elapsed = time.monotonic() - started
     return {
         "rows": count,
-        "transactions": count,
+        "transactions": transactions,
         "workers": workers,
         "target_tps": target_tps,
+        "rows_per_transaction": rows_per_transaction,
         "wall_sec": round(elapsed, 3),
-        "source_tps": round(count / max(elapsed, 0.001), 2),
+        "source_tps": round(transactions / max(elapsed, 0.001), 2),
+        "source_rows_per_sec": round(count / max(elapsed, 0.001), 2),
     }
 
 
@@ -226,6 +249,7 @@ def _case(
     rows: int,
     shape: str,
     commit_max_age: str | None = None,
+    rows_per_transaction: int = 1,
 ) -> dict:
     probe = Probe(f"p5b_{name}", tables="customers")
     dataset = f"p5b_{name}_{uuid.uuid4().hex[:8]}"
@@ -261,7 +285,11 @@ def _case(
             process, child_started = _start_pipeline(env, min_records=rows)
             _wait_for_slot(probe, process)
             source_started = time.monotonic()
-            result["source"] = _paced_one_row_transactions(prefix, rows)
+            result["source"] = _paced_transactions(
+                prefix,
+                rows,
+                rows_per_transaction=rows_per_transaction,
+            )
             result["source_start_after_child_sec"] = round(
                 source_started - child_started, 3
             )
