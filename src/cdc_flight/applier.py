@@ -460,6 +460,7 @@ class Applier:
             "fold_sec": 0.0,
             "spill_sec": 0.0,
             "event_ledger_sec": 0.0,
+            "event_ledger_prefetch_sec": 0.0,
             "destination_write_sec": 0.0,
             "commit_sec": 0.0,
         }

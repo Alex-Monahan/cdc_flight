@@ -1031,7 +1031,7 @@ class EventLedgerBatch:
             if txn_id is None:
                 continue
             grouped.setdefault(str(target_table), set()).add(str(txn_id))
-        batch_size = 256
+        batch_size = 1024
         for target_table, txn_ids in grouped.items():
             pending = sorted(
                 txn_id

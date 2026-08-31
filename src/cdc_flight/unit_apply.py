@@ -115,7 +115,16 @@ def apply_units(
                 and not event.incremental
             )
         ]
-        plan._event_ledger.prefetch_transactions(stream_pairs)
+        prefetch_started = (
+            time.perf_counter() if getattr(applier, "_perf_timing", False) else None
+        )
+        try:
+            plan._event_ledger.prefetch_transactions(stream_pairs)
+        finally:
+            if prefetch_started is not None:
+                applier._phase_timings["event_ledger_prefetch_sec"] += (
+                    time.perf_counter() - prefetch_started
+                )
     fold_started = (
         time.perf_counter() if getattr(applier, "_perf_timing", False) else None
     )
