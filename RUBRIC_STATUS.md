@@ -713,10 +713,10 @@ correct assumptions in the notes below:
 | 4.5 | Errors must not hang or lock | ~~4~~ → **5** | Every engine, source, catalog, destination-retirement, phase-sink, and commit wait has an explicit bound and failure outcome; the real concurrent and idle probes complete. A complete adversarial hang matrix for every individual wait remains unproven. |
 | 4.6 | Detect silently-dead Postgres connection | **4** | The source sampler uses bounded connect/query/TCP keepalive waits, Debezium uses effective pgjdbc connect/socket bounds, and heartbeat is enabled. Real idle proof passes. A real blackholed source process exits non-zero with a durable critical `source_dark` alert in an isolated run and in the final contended two-worker lane; source-dark precedence now survives a later connector shutdown error. A dedicated JDBC-only blackhole probe against the new 60-second socket bound remains unproven. |
 | 4.7 | Self-heal without human intervention | **1** | The inventory now resolves all former undefined cases: **70 rows, 47 AUTO / 23 MANUAL / 0 UNDEFINED**. The >2 manual ceiling remains, honestly limiting this item to 1; the remaining manual cases and reasons are enumerated in ADR §19/A51. |
-| 5.1 | CDC fast on large changes | **3** | 50 k-row transaction absorbed at ~3.5 k rows/s into local DuckDB; no failure, but a full `dlt.run()` per 2048-row batch is the ceiling. |
+| 5.1 | CDC fast on large changes | **3** | P5b re-measurement: an exact 50 k-row PostgreSQL transaction reached 232 rows/s end-to-end into MotherDuck (243 rows/s after the bounded job was warm), with no loss or duplication. It completes, but remains slow; MotherDuck destination writes dominate. |
 | 5.2 | Low latency on small changes | ~~1~~ → **5** | Capture latency is 83 ms, but the deliverable is a bounded batch job with no defined cadence — end-to-end latency is the schedule interval. |
-| 5.3 | Keep up with high Postgres TPS | **2** | ~1 k events/s inside the engine, but ~17 s of per-run JVM/connect overhead drops the shipped bounded job to ~157 events/s to MotherDuck. |
-| 5.4 | Bounded memory / spill to disk | ~~1~~ → **3** | `max.queue.size.in.bytes=0` (disabled): the bound is on record count only. A 2048-row batch of 64 kB TOAST bodies is ~128 MB of JSON before parsing. |
+| 5.3 | Keep up with high Postgres TPS | **2** | P5b: cold-start throughput was 110 events/s including JVM/connect/shutdown; the best sustained warm rate was 265 events/s for 100 k rows in 2,000 whole PostgreSQL transactions, with the paced source at 499.6 TPS. This remains below the literal 300-event/s band boundary. |
+| 5.4 | Bounded memory / spill to disk | ~~1~~ → **5** | Main's effective `max.queue.size.in.bytes` is 134,217,728 (128 MiB), and the application spills transaction prefixes to `_cdc_flight.spill_events` at 64 MiB or 500,000 events. A 2,048-row × 65,536-byte adversarial transaction engaged both queue backpressure and application spill without exceeding the queue byte watermark; disabling the byte guard fails configuration and the live production guard test. |
 | 6.1 | Detailed logs in MotherDuck incl. replication lag | **5** | `_cdc_flight.run_logs` is durable in the control schema with event/level/message, restart/confirmed LSNs and `replication_lag_bytes`; real healthy runs populate it, including the MotherDuck destination path. Logging is bounded/best-effort and outside the commit→ack window. |
 | 6.2 | Alerts and warnings | **5** | Real dropped-slot refusal, corrupt-offset, and MotherDuck concurrent-destination failures exit non-zero and persist severity-coded alerts; repeated offset failure is alert-deduplicated by a durable condition marker. |
 | 7.1 | No Postgres extension required | 5 | `plugin.name=pgoutput` with a version-controlled `PUBLICATION`. |
@@ -2727,38 +2727,39 @@ which is rubric 4.3's work on malformed WAL and assembly errors.
 
 ## 5. Performance, Latency & Scale
 
-All numbers below are from `probes/p06_perf_latency_memory.py` and
-`probes/p08_snapshot_consistency.py` on an M-series Mac, local DuckDB
-destination, unless stated otherwise.
+The P5b measurements below supersede the earlier local-DuckDB and bounded-job
+figures. They were taken on 2026-08-30 on this M-series Mac against PostgreSQL
+on `CDC_TEST_PGPORT=15432` and uniquely named MotherDuck databases, unless
+stated otherwise. The production destination writer remained single-threaded;
+`snapshot.max.threads` remained pinned to 1.
 
 ### 5.1 CDC scalable and performant for large changes — **3 / 5**
 
 `fails on large changes=1, slow=3, fast=5`
 
-**Evidence.** One transaction inserting 50 000 rows (Postgres committed it in
-0.23 s) was absorbed in 24.2 s of engine time across **25 batches**, ≈ 14 s
-excluding the 10 s idle tail → **~3 500 rows/s**. No failure, no memory error.
-The snapshot path in `p08` was similar (~4 300 rows/s for 120 k rows).
+**Evidence.** The final end-to-end probe inserted 50,000 rows in one whole
+PostgreSQL transaction into one table (`app.customers`; measured physical row
+size 160–168 bytes, average 167.98 bytes). The child wall time, including JVM
+startup, connect, idle shutdown, and process teardown, was **215.381 s**:
+**232.15 rows/s**. The pipeline's active summary was 205.38 s, or **243.45
+rows/s**. Destination rows were exactly 50,000, with one data commit group and
+43,413 application-spilled events.
 
-Against **MotherDuck** (`probes/p12_motherduck_throughput.py`, deliberately
-light): 5 000 rows in 3 batches, 15.1 s of engine time (≈ 5 s excluding the 10 s
-idle tail) → ~1 000 rows/s, 4 dlt load packages, `md_row_count == 5005` with no
-duplication. Per-run fixed cost is the striking number: `wall_sec == 31.9` for
-15.1 s of engine time, i.e. **~17 s of JVM start + MotherDuck connect before any
-work happens**.
+The phase clocks for that run were: decode **28.978 s**, fold **44.421 s**,
+spill **19.476 s**, destination write **98.412 s**, event-ledger prefetch
+**0.206 s**, event-ledger work **0.747 s**, and commit **1.579 s**. The
+commit-to-slot confirmation window was **3.229 s** after MotherDuck durability.
+The dominant measured cost is **MotherDuck destination write**, followed by
+folding; the slot gate was not the bottleneck. Earlier live profiling showed
+DuckDB `SetupPlanFragments`/`SubmitActionWithRetries` beneath the destination
+execute path, which agrees with the phase clocks.
 
-The ceiling is structural: every batch is a full `dlt_pipeline.run()`
-(`src/cdc_flight/handler.py:116`) — schema resolution, normalisation, a load
-package on disk, `INSERT … VALUES` fragments, then `complete_load`. That is
-several hundred milliseconds of fixed cost per 2048 rows even against a local
-file.
-
-**Evidence that would raise or lower this.** The same test at 10 M rows, and a
-sustained (≥100 k row) MotherDuck run rather than the 5 k smoke test.
-
-**Gap to 5.** Stop calling `dlt.run()` per batch. Write Arrow/Parquet and use
-DuckDB/MotherDuck's bulk ingest inside one transaction per commit group, with the
-schema resolved once per run instead of once per batch.
+**Gap to 5.** The run is correct and completes, but it is not FAST under the
+rubric's qualitative band. A repeatable materially faster large-change result
+would need to reduce the native MotherDuck plan/remote-write cost, probably by
+using a true bulk ingest/schema-once path while retaining one atomic commit
+group, whole PostgreSQL transactions, and the post-durability slot advance.
+A 10 M-row/FAST demonstration remains unproven.
 
 ### 5.2 CDC low latency on small changes — **1 / 5**
 
@@ -2780,58 +2781,86 @@ size-or-time trigger — which 1.3 needs anyway), or a demonstrated sub-30 s run
 cadence with the JVM start amortised. Then measure commit-in-Postgres →
 visible-in-MotherDuck end to end, not `dbz_ts_ms`.
 
-### 5.3 Keep up with high Postgres TPS — **2 / 5** (provisional)
+### 5.3 Keep up with high Postgres TPS — **2 / 5**
 
 `<100=1, 100-300=2, 300-1000=3, 1000-2000=4, >2000=5`
 
-**Evidence.** 5 000 single-row autocommit transactions were committed by
-Postgres in 0.39 s (**~12 950 TPS** at the source) and absorbed by the pipeline in
-~5 s of engine time across **3 batches** → **~1 000 rows/s** sustained; the
-50 k-row burst reached ~3 500 rows/s. Batching itself works well (5 000
-single-row transactions collapsed into 3 dlt loads).
+**Workload.** One table, the same narrow ten-column logical customer shape as
+5.1 (`id`, UUID, text names/emails, timestamptz, numeric, boolean, JSONB, array,
+and timestamptz), with measured source rows about 160–168 physical bytes. The
+production writer stayed single-threaded. The paced sustained source used eight
+PostgreSQL connections and a 500 TPS target; the source achieved **499.6–500.0
+TPS**, so the pipeline, not the source, was the limiting side. The source
+harness was intentionally capped at 500 TPS; its short unpaced cold burst
+reached about 20.7k TPS, but that is not a sustained high-TPS claim.
 
-Against MotherDuck (`p12`) the *engine-time* rate is comparable (~1 000 rows/s
-for 5 000 rows in 3 batches), but the delivered artifact is a bounded job that
-pays ~17 s of JVM + connect overhead per run: amortised over the whole process
-the same 5 000 rows landed at **157 events/s**, which is the rubric's band 2.
-Scored on that number, not the in-engine one, because process restarts are the
-shipped behaviour. It is also a 5 000-row smoke test, not a sustained load, and
-the batches are not transaction-aligned — once 1.3 forces whole-transaction
-commit groups, MotherDuck's ~100 transactions/s becomes the binding constraint
-rather than row throughput.
+**Cold-start job.** 5,000 one-row PostgreSQL transactions landed exactly once
+in **45.273 s** of child wall time including JVM start, connect, and shutdown:
+**110.44 events/s** end to end (the active interval was about 140.8 events/s).
+This is what a per-run bounded batch job experiences; startup is paid every run.
 
-**Evidence that would raise this.** A sustained MotherDuck run (≥100 k events)
-with events/s *and* commits/s reported, from a long-running engine rather than a
-cold start.
+**Sustained warm stream.** The engine was started before the source and kept
+warm while the source was paced. For 100,000 one-row transactions, the source
+held **499.98 TPS** for 200.007 s and the warm pipeline absorbed **195.9
+events/s** over 510.481 s. The 10-row whole-transaction case absorbed **258.3
+events/s** over 387.217 s at 499.91 source transactions/s; the 50-row case
+absorbed **265.1 events/s** over 377.235 s at 499.59 source transactions/s.
+Every case landed exactly 100,000 rows. Batching improved the one-row result by
+about 31.8% (195.9 → 258.3) and the 50-row result reached 265.1; these are
+whole-transaction commit groups, not split PostgreSQL transactions. Ledger
+prefetch (256 → 1024) improved the comparable one-row run from about 188.2 to
+195.9 events/s, roughly 4.1%, within the host-noise range.
 
-**Gap to 5.** 1.3's commit-group design (many PG transactions per MotherDuck
-transaction) plus 5.1's bulk ingest. Then re-measure against MotherDuck.
+The rubric wording asks whether CDC can “keep up with high PostgreSQL TPS”
+“through batching,” which makes the warm sustained result the relevant
+deployment measure for a long-running Flight: JVM startup is paid once. The
+cold result still belongs in the report because the shipped bounded job pays
+the lifecycle cost on every invocation. Neither should be relabeled as the
+other. The best measured sustained rate is still below 300, so the honest band
+is **2**, not 3.
 
-### 5.4 Well-managed low memory use and/or spill to disk — **1 / 5**
+**Gap to 3.** Demonstrate a repeatable sustained **300–1,000 events/s** into
+MotherDuck on a long-running, high-source-TPS workload with the one production
+writer and all transaction/durability invariants intact. Rates above the
+harness's 500-TPS source target and a larger source-transaction-duration
+matrix remain unproven.
+
+### 5.4 Well-managed low memory use and/or spill to disk — **5 / 5**
 
 `all in memory, no guardrails=1, in memory with guardrails=5, disk backed/spill=5`
 
-**Evidence.** Max RSS (`/usr/bin/time -l`): 318 MB idle (JVM + Python floor),
-481 MB for the 5 000-row run, **629 MB** for the 50 000-row burst. Bounded in
-practice for narrow rows.
+**Effective configuration on main @ 62657e8.** The stale status note was wrong:
+`src/cdc_flight/debezium_props.py` installs
+`max.queue.size.in.bytes=134217728` (128 MiB), alongside
+`max.batch.size=2048` and `max.queue.size=8192`. The value was verified from the
+effective stock Debezium queue configuration and by a live production task; it
+is not the documented Debezium default of zero.
 
-But the only bound is on **record count**: `max.batch.size=2048`,
-`max.queue.size=8192` (`src/cdc_flight/debezium_props.py:79-81`), while
-`max.queue.size.in.bytes` defaults to **0 = disabled**
-(`repos/debezium/.../CommonConnectorConfig.java:649,747-755`). A batch of 2048
-rows from `app.documents` (64 kB TOASTed bodies) is ~128 MB of JSON text before
-`json.loads` triples it, and the handler materialises the whole batch as Python
-dicts (`src/cdc_flight/handler.py:93-107`) before dlt ever sees it. Scored at the
-floor because the byte-bounded case is the one that matters and it is both
-unbounded and untested.
+**What is bounded.** Stock Debezium's queue uses the positive byte watermark as
+source admission backpressure (with a finite one-record/object-size overshoot)
+and also has the record-count ceiling. Independently, the assembler spills a
+complete ordered transaction prefix to `_cdc_flight.spill_events` when its raw
+JSON byte proxy reaches 64 MiB or its event count reaches 500,000. It drains
+that relation in order and clears it in the same MotherDuck transaction as the
+corresponding data/state publication, so PostgreSQL transactions are never
+split. A real oversized transaction of 2,048 rows × 65,536-byte bodies was
+held below the 128 MiB queue watermark (peak **109,958,232 bytes**, 81.9% of
+the nominal watermark, peak count 1,606, no overage), spilled **1,948** events to the
+relation, and committed all 2,048 exact rows without unbounded queue growth.
 
-**Evidence that would raise this.** A burst of thousands of TOAST-heavy rows with
-RSS measured; if it stays flat, this is a 3–5.
+**Mutation proof.** Temporarily changing the installed constant to `0` made
+`tests/unit/test_config.py::test_properties_install_the_stock_queue_byte_bound`
+fail (`expected 134217728, got 0`) and made the live production guard test fail
+closed with `EngineFailure` stating that the required positive byte bound was
+disabled. The constant was restored before the lane runs.
 
-**Gap to 5.** Set `max.queue.size.in.bytes`, stream events into the destination
-writer instead of building a full Python list per batch, and add a memory
-watermark that forces an early commit. dlt already spills its load packages to
-disk; the Python-side buffer does not.
+The literal rubric has no middle band: the guardrails and application spill
+engaged under the adversarial payload, so the honest score is **5**, not the old
+judgement-call 3. This is not a claim of a global process-RSS cap: Python
+decoded objects, Arrow/DuckDB/JVM allocations, MotherDuck server memory, temp
+files, and page cache are outside these two queue/spill bounds. If the rubric
+were asking for global RSS, that part remains unproven; under its stated
+guardrail/spill bands, 5 is the defensible result.
 
 ---
 
