@@ -53,8 +53,12 @@ after the change.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import pickle
 from dataclasses import dataclass, field
+from datetime import date, datetime, time
+from decimal import Decimal
 from typing import Any
 
 from . import apply_sql, keyless_work, naming
@@ -65,7 +69,14 @@ from .errors import (
     SchemaEvolutionRefused,
     ToastBaseMissing,
 )
-from .naming import CDCF_COMMIT_ID, CDCF_EVENT_ID, CDCF_TOTAL_ORDER
+from .naming import (
+    CDCF_COMMIT_ID,
+    CDCF_DELETE_EVENT_ID,
+    CDCF_DELETE_LSN,
+    CDCF_DELETED,
+    CDCF_EVENT_ID,
+    CDCF_TOTAL_ORDER,
+)
 from .row_patch import RowPatch
 from .toast import is_structural_marker
 from .typed_types import FieldState, FieldValue
@@ -85,6 +96,11 @@ APPLIER_COLUMN_TYPES = {
     CDCF_COMMIT_ID: apply_sql.BIGINT,
     CDCF_EVENT_ID: apply_sql.VARCHAR,
     CDCF_TOTAL_ORDER: apply_sql.BIGINT,
+    CDCF_DELETED: apply_sql.BOOLEAN,
+    CDCF_DELETE_EVENT_ID: apply_sql.VARCHAR,
+    # Keep the source-position spelling lossless and uniform with the durable
+    # delete ledger; connectors may expose a decimal/hex LSN rather than an int.
+    CDCF_DELETE_LSN: apply_sql.VARCHAR,
     **DBZ_COLUMN_TYPES,
 }
 OWNER = "table-physical-fold"
@@ -197,11 +213,23 @@ class TableWork:
     #: in the same transaction. Snapshot rows already have the cdcf identity merge;
     #: their shadow is rebuilt atomically and does not need this stream ledger.
     keyless_ledger: list[tuple[str, str, str | None]] = field(default_factory=list)
+    #: Current-state soft-delete effects. The fold removes a deleted row from
+    #: the source-current image, while the writer marks its destination row.
+    soft_deletes: dict[tuple, keyless_work.KeylessOperation] = field(default_factory=dict)
+    soft_replacements: dict[tuple, RowPatch] = field(default_factory=dict)
+    delete_effects: dict[str, keyless_work.KeylessOperation] = field(default_factory=dict)
+    delete_mode: str = "hard"
+    delete_policy_epoch: int = 1
+    delete_policy_digest: str | None = None
+    previous_delete_mode: str | None = None
+    policy_epoch: int = 0
+    policy_digest: str | None = None
+    pii_salt_id: str | None = None
 
 
 def work_for(
     work: dict[str, TableWork], target: str, event: PendingRecord, snapshot: bool,
-    *, incremental: bool = False,
+    *, incremental: bool = False, delete_mode: str | None = None,
 ) -> TableWork:
     """The `TableWork` for `target`, created on first sight.
 
@@ -219,6 +247,12 @@ def work_for(
             target=target,
             snapshot=snapshot,
             incremental=incremental,
+            delete_mode=str(delete_mode or getattr(event, "delete_mode", None) or "hard").lower(),
+            delete_policy_epoch=int(getattr(event, "delete_policy_epoch", 1) or 1),
+            delete_policy_digest=getattr(event, "delete_policy_digest", None),
+            policy_epoch=int(getattr(event, "policy_epoch", 0) or 0),
+            policy_digest=getattr(event, "policy_digest", None),
+            pii_salt_id=getattr(getattr(event, "policy_gate", None), "salt_id", None),
         )
         work[target] = item
     elif incremental:
@@ -227,6 +261,16 @@ def work_for(
         # group.  Upgrade the shared fold rather than leaving its first-event flag
         # to decide whether the missing-base rule is available.
         item.incremental = True
+    observed_mode = str(delete_mode or getattr(event, "delete_mode", None) or item.delete_mode).lower()
+    if observed_mode != item.delete_mode:
+        raise SchemaEvolutionRefused(
+            f"{item.target}: delete mode changed inside one admitted source unit; "
+            "the unit must be replayed at a policy boundary",
+            source_schema=event.schema,
+            source_table=event.table,
+            target=target,
+            refusal_origin="table_work",
+        )
     if item.source_schema is None and event.schema:
         item.source_schema = event.schema
         item.source_table = event.table
@@ -270,11 +314,7 @@ def _key_token(
                 target=item.target,
                 refusal_origin="table_work",
             )
-        try:
-            rendered = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
-        except (TypeError, ValueError):
-            rendered = repr(value)
-        token.append(f"{fingerprint}:{rendered}")
+        token.append(f"{fingerprint}:{_opaque_identity_digest(value)}")
         if update_native and descriptor is not None and (
             column not in item.native_columns or column in item.key_columns
         ):
@@ -300,6 +340,72 @@ def _key_token(
     item.key_values[result] = tuple(stored_values)
     item.key_descriptors[result] = resolved_descriptors
     return result
+
+
+def _opaque_identity_digest(value: Any) -> str:
+    """Digest a fold identity without putting its source value in diagnostics.
+
+    The fold still keeps the original typed key in ``key_values`` for destination
+    binding.  Only the map key and any error text use this opaque representation.
+    Primitive containers have an unambiguous type-tagged encoding; unsupported
+    custom values are refused by the native descriptor path before they can be
+    materialized, while a pickle digest keeps even their diagnostic form value-free.
+    """
+
+    def payload(item):
+        if item is None:
+            return ["null"]
+        if isinstance(item, bool):
+            return ["bool", item]
+        if isinstance(item, int):
+            return ["int", str(item)]
+        if isinstance(item, float):
+            return ["float", item.hex()]
+        if isinstance(item, str):
+            return ["str", item]
+        if isinstance(item, (bytes, bytearray, memoryview)):
+            return ["bytes", bytes(item).hex()]
+        if isinstance(item, Decimal):
+            return ["decimal", item.as_tuple()]
+        if isinstance(item, (datetime, date, time)):
+            return [type(item).__qualname__, item.isoformat()]
+        if isinstance(item, dict):
+            members = sorted(
+                (
+                    json.dumps(
+                        payload(key),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        default=_json_tuple,
+                    ),
+                    payload(value),
+                )
+                for key, value in item.items()
+            )
+            return ["dict", members]
+        if isinstance(item, (list, tuple)):
+            return [type(item).__qualname__, [payload(value) for value in item]]
+        try:
+            encoded = pickle.dumps(item, protocol=5)
+        except (AttributeError, TypeError, ValueError, pickle.PickleError):
+            return [
+                "opaque",
+                f"{type(item).__module__}.{type(item).__qualname__}",
+            ]
+        return [
+            "opaque-pickle",
+            f"{type(item).__module__}.{type(item).__qualname__}",
+            hashlib.sha256(encoded).hexdigest(),
+        ]
+
+    encoded = json.dumps(payload(value), sort_keys=True, separators=(",", ":"), default=_json_tuple)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _json_tuple(value):
+    if isinstance(value, tuple):
+        return list(value)
+    raise TypeError("identity payload contains unsupported value")
 
 
 def _raw_key(item: TableWork, key: tuple) -> tuple:
@@ -429,6 +535,8 @@ def collect(
         return
     item.cdc_keys.add(key)
     if event.op == "d":
+        from .event_ledger import payload_digest
+
         before_values = tuple(
             (event.before or {}).get(column) for column in item.key_columns
         )
@@ -445,6 +553,27 @@ def collect(
             probe,
             descriptors=event.before_descriptors,
             typed=event.typed_before,
+        )
+        if item.delete_mode == "soft":
+            item.soft_deletes[key] = keyless_work.KeylessOperation(
+                event_id=event_id,
+                operation="d",
+                before=event.before,
+                image_digest=payload_digest(event),
+                delete_mode=item.delete_mode,
+                source_lsn=event.lsn,
+                txn_id=event.txn_id,
+                total_order=event.total_order,
+            )
+        item.delete_effects[event_id] = keyless_work.KeylessOperation(
+            event_id=event_id,
+            operation="d",
+            before=event.before,
+            image_digest=payload_digest(event),
+            delete_mode=item.delete_mode,
+            source_lsn=event.lsn,
+            txn_id=event.txn_id,
+            total_order=event.total_order,
         )
         return
 
@@ -535,10 +664,10 @@ def end_transaction(item: TableWork) -> None:
     """
     if not item.multi:
         return
-    keys = sorted(item.multi, key=repr)
+    keys = sorted(item.multi, key=lambda value: str(value))
     raise AmbiguousDelete(
         f"{item.target}: {len(keys)} identity key(s) end a source transaction wearing "
-        f"two or more rows (first: {keys[0]!r}). A unique key admits one row per key "
+        f"two or more rows (first opaque identity: {keys[0]}). A unique key admits one row per key "
         "at a transaction boundary, so this fold would durably commit a duplicate "
         "(ADR 0001 §18/A35).",
         source_schema=item.source_schema,
@@ -805,9 +934,9 @@ def _distinguishing(item: TableWork, before, *, descriptors=None, typed=None) ->
 
 def _unattributable(item, key, entries, before, what, why) -> AmbiguousDelete:
     return AmbiguousDelete(
-        f"{item.target}: cannot attribute a {what} of identity {key!r} - {why}. "
+        f"{item.target}: cannot attribute a {what} identity (opaque fold digest) - {why}. "
         f"{len(entries)} row(s) wear that key inside this source transaction and the "
-        f"before-image {before!r} does not say which one this event describes. "
+        "before-image does not say which one this event describes. "
         "Folding a guess would durably commit a wrong answer, so the commit group is "
         "refused and replays instead (ADR 0001 §18/A35). A deferred unique constraint "
         "requires REPLICA IDENTITY FULL, which supplies the image this needs.",

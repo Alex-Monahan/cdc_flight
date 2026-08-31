@@ -415,9 +415,19 @@ class SchemaRegistry(
                         )
                     continue
                 try:
+                    ddl_type = (
+                        # DuckDB does not support adding a constrained column to an
+                        # existing table, and a DEFAULT here conflicts with later
+                        # same-transaction source ALTERs. New tables still declare
+                        # this metadata NOT NULL in _create_strict; the legacy
+                        # column is backfilled by the table writer before DML.
+                        "BOOLEAN"
+                        if column == "cdcf_deleted"
+                        else physical_type
+                    )
                     self.con.execute(
                         f"ALTER TABLE {table.qualified} ADD COLUMN {quote(column)} "
-                        f"{physical_type}"
+                        f"{ddl_type}"
                     )
                 except Exception as exc:
                     raise SchemaEvolutionRefused(

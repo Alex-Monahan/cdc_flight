@@ -18,6 +18,20 @@ log = logging.getLogger("cdc_flight.failure_containment")
 OWNER = "failure-containment"
 
 
+def _safe_exception_detail(error: Exception) -> str:
+    """Return an exception class, never driver text or bound source values."""
+    return f"{type(error).__module__}.{type(error).__qualname__}"
+
+
+def _safe_descriptor_identity(descriptor) -> str:
+    """Return a stable descriptor identity without invoking an arbitrary repr."""
+    fingerprint = getattr(descriptor, "fingerprint", None)
+    if isinstance(fingerprint, str):
+        return fingerprint
+    descriptor_type = type(descriptor)
+    return f"{descriptor_type.__module__}.{descriptor_type.__qualname__}"
+
+
 def input_fingerprint(event) -> str:
     """Identify a durable refusal boundary without including the bad value."""
     descriptors = {
@@ -28,11 +42,11 @@ def input_fingerprint(event) -> str:
     payload = {
         "table": event.qualified_table,
         "descriptors": {
-            str(name): getattr(descriptor, "fingerprint", repr(descriptor))
+            str(name): _safe_descriptor_identity(descriptor)
             for name, descriptor in sorted(descriptors.items())
         },
     }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=repr)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
@@ -80,10 +94,7 @@ def as_contained_refusal(
         error.input_fingerprint = error.input_fingerprint or fingerprint
         error.refusal_origin = error.refusal_origin or "typed_planner"
         return error
-    try:
-        detail = str(error)
-    except Exception:
-        detail = "<exception text unavailable>"
+    detail = _safe_exception_detail(error)
     exception_type = f"{type(error).__module__}.{type(error).__qualname__}"
     return SchemaEvolutionRefused(
         f"unrecognised table-scoped materialization failure for "
@@ -153,10 +164,7 @@ def contain_table_failure(applier, refused, original) -> None:
     )
     refused.refusal_recorded = True
     applier.blocked_schema_tables.add(qualified)
-    try:
-        detail = str(original)
-    except Exception:
-        detail = "<exception text unavailable>"
+    detail = _safe_exception_detail(original)
     exception_type = f"{type(original).__module__}.{type(original).__qualname__}"
     fingerprint = refused.input_fingerprint or qualified
     if not destination.alert_marker_exists(
@@ -236,10 +244,7 @@ def contain_destination_failure(
     refused.refusal_recorded = True
     qualified = f"{refused.source_schema}.{refused.source_table}"
     applier.blocked_schema_tables.add(qualified)
-    try:
-        detail = str(original)
-    except Exception:
-        detail = "<exception text unavailable>"
+    detail = _safe_exception_detail(original)
     exception_type = f"{type(original).__module__}.{type(original).__qualname__}"
     fingerprint = refused.input_fingerprint or qualified
     if not destination.alert_marker_exists(

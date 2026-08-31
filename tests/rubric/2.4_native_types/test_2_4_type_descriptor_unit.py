@@ -22,6 +22,7 @@ from cdc_flight.destination import (
 from cdc_flight.envelope import KIND_DATA, PendingRecord
 from cdc_flight.errors import SchemaEvolutionRefused
 from cdc_flight.planner import GroupPlan
+from cdc_flight.policy import PIIPolicy, PolicyGate
 from cdc_flight.spill import SpillBuffer, StagedEvent
 from cdc_flight.typed_types import (
     FieldState,
@@ -549,7 +550,12 @@ def test_typed_spill_round_trip_preserves_descriptor_and_raw_toast_like_string()
             {"id": integer, "payload": text},
         ),
     )
-    spill = SpillBuffer(con)
+    policy_gate = PolicyGate(PIIPolicy.disabled())
+    policy_gate.sanitize(
+        event,
+        {"id": integer, "payload": text},
+    )
+    spill = SpillBuffer(con, policy_gate=policy_gate)
     spill.stage(
         commit_id=1,
         unit_seq=1,

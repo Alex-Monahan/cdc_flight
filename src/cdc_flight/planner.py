@@ -50,7 +50,7 @@ from .errors import (
 )
 from .snapshot import SnapshotTable
 from .table_work import TableWork
-from .typed_types import native_type
+from .typed_types import FieldValue, TypedImage, native_type
 
 log = logging.getLogger("cdc_flight.planner")
 OWNER = "commit-group-planning"
@@ -91,6 +91,8 @@ class GroupPlan:
         source_timeline: int | None = None,
         strict_event_identity: bool = False,
         history_modes: dict[str, str] | None = None,
+        delete_policy=None,
+        policy_gate=None,
     ):
         self.con = con
         self.commit_id = commit_id
@@ -118,6 +120,9 @@ class GroupPlan:
         self.source_cluster_id = source_cluster_id
         self.source_timeline = source_timeline
         self.strict_event_identity = bool(strict_event_identity)
+        self.delete_policy = delete_policy
+        self.policy_gate = policy_gate
+        self.policy_alerts: list[dict] = []
         self.history_modes = {
             str(name): str(mode).lower() for name, mode in (history_modes or {}).items()
         }
@@ -414,6 +419,11 @@ class GroupPlan:
             self._truncate(event, target, snapshot=snapshot)
             return
         self._enrich_descriptors(event)
+        policy_gate = getattr(self, "policy_gate", None)
+        if policy_gate is not None:
+            policy_gate.revalidate(event, self._catalog_descriptor_cache.get(event.qualified_table, {}))
+        if hasattr(self, "policy_alerts"):
+            self.policy_alerts.extend(getattr(event, "policy_alerts", ()) or ())
         descriptor_provider = getattr(self, "descriptor_provider", None)
         connection = getattr(self, "con", None)
         pipeline = getattr(self, "pipeline", "")
@@ -509,13 +519,39 @@ class GroupPlan:
             self.stats["tables"].add(target)
             self.source_tables.add(f"{event.schema}.{event.table}")
             return
+        item_was_new = target not in self.work
         item = table_work.work_for(
             self.work,
             target,
             event,
             snapshot is not None,
             incremental=incremental_target,
+            delete_mode=(
+                getattr(event, "delete_mode", None)
+                or (
+                    self.delete_policy.resolve(event.qualified_table)
+                    if getattr(self, "delete_policy", None) is not None
+                    else None
+                )
+            ),
         )
+        if (
+            getattr(self, "pipeline", "")
+            and item.previous_delete_mode is None
+            and event.schema
+            and event.table
+        ):
+            prior_policy = destination.read_table_policy_state(
+                self.con,
+                pipeline=self.pipeline,
+                source_schema=event.schema,
+                source_table=event.table,
+                control_schema=self._control_schema,
+            )
+            if prior_policy is not None and prior_policy.get("delete_mode"):
+                item.previous_delete_mode = str(prior_policy["delete_mode"]).lower()
+        if policy_gate is not None:
+            item.pii_salt_id = getattr(policy_gate.policy, "salt_id", None)
         try:
             patch = table_work.patch_for(
                 event,
@@ -552,7 +588,7 @@ class GroupPlan:
             policy_epoch=event.policy_epoch,
             target_table=target,
             require_strong=strict_event_identity,
-            digest=patch.digest,
+            digest=event_ledger.payload_digest(event),
         )
         if pipeline and identity.ledger_eligible and destination.claim_event_ledger(
                 connection,
@@ -564,8 +600,47 @@ class GroupPlan:
                 ledger=self._event_ledger,
                 snapshot=snapshot is not None or event.incremental,
         ):
+            if item_was_new and not item.events:
+                self.work.pop(target, None)
             self.source_tables.add(f"{event.schema}.{event.table}")
             return
+        if pipeline and event.op == "d" and snapshot is None:
+            # The common delete ledger is also a compatibility fence for events
+            # whose older shared-ledger identity was not strong enough to claim. It
+            # is checked before folding or physical DML, so a crash after the
+            # destination commit cannot replay a hard DELETE or soft tombstone.
+            from .keyless_work import KeylessOperation
+
+            delete_operation = KeylessOperation(
+                event_id=event_id,
+                operation="d",
+                image_digest=event_ledger.payload_digest(event),
+                delete_mode=item.delete_mode,
+                source_lsn=event.lsn,
+                txn_id=event.txn_id,
+                total_order=event.total_order,
+            )
+            if destination.claim_delete_ledger(
+                connection,
+                pipeline=pipeline,
+                target_table=target,
+                event_id=event_id,
+                source_schema=event.schema,
+                source_table=event.table,
+                source_lsn=event.lsn,
+                txn_id=event.txn_id,
+                total_order=event.total_order,
+                delete_mode=item.delete_mode,
+                policy_epoch=item.delete_policy_epoch,
+                policy_digest=item.delete_policy_digest,
+                identity_digest=destination.delete_identity_digest(delete_operation),
+                effect_digest=destination.delete_effect_digest(delete_operation),
+                control_schema=control_schema,
+            ):
+                if item_was_new and not item.events:
+                    self.work.pop(target, None)
+                self.source_tables.add(f"{event.schema}.{event.table}")
+                return
         table_work.collect(item, event, row, event_id, probe=self, patch=patch)
         image = event.after if event.op != "d" else event.before
         # Complete INSERT/snapshot images cannot create the late-rename NULL vs
@@ -651,7 +726,24 @@ class GroupPlan:
                 target=qualified,
                 refusal_origin="typed_planner",
             )
+        policy_gate = getattr(self, "policy_gate", None)
+        required_descriptors = set(catalog_descriptors)
+        if policy_gate is not None and policy_gate.policy.enabled:
+            required_descriptors = {
+                name
+                for name in required_descriptors
+                if policy_gate.policy.rule_for(qualified, name).action != "exclude"
+            }
         for name, descriptor in catalog_descriptors.items():
+            if (
+                policy_gate is not None
+                and policy_gate.policy.enabled
+                and policy_gate.policy.rule_for(qualified, name).action == "exclude"
+            ):
+                # An explicitly or fail-closed excluded source column is never
+                # admitted to the destination schema, so an unsupported native
+                # representation there cannot block its table or peer columns.
+                continue
             try:
                 native_type(descriptor)
             except (AdmissionError, TypeError) as exc:
@@ -671,7 +763,7 @@ class GroupPlan:
             missing = ()
         else:
             missing = tuple(
-                sorted(set(catalog_descriptors) - catalog_support.delivered_event_fields(event))
+                sorted(required_descriptors - catalog_support.delivered_event_fields(event))
             )
         if missing:
             raise SchemaEvolutionRefused(
@@ -690,7 +782,27 @@ class GroupPlan:
             catalog_descriptors,
         )
         if recoverable:
+            if policy_gate is None:
+                raise SchemaEvolutionRefused(
+                    f"omitted source field(s) {list(recoverable)!r} for "
+                    f"{qualified} require an attached policy gate before recovery",
+                    source_schema=event.schema,
+                    source_table=event.table,
+                    target=qualified,
+                    detected_lsn=event.lsn,
+                    refusal_origin="typed_planner",
+                )
             self._hydrate_omitted_xml_arrays(event, recoverable, catalog_descriptors, watcher)
+            # Hydration occurs after the ordinary post-decode gate.  Revalidate the
+            # newly acquired image immediately, before descriptor merging or row
+            # folding can observe it; a reader that bypassed its own gate therefore
+            # becomes a refusal rather than a late raw-value leak.
+            policy_gate.revalidate(event, catalog_descriptors)
+        present_names = {
+            naming.normalize(str(name))
+            for image_name in ("key", "before", "after")
+            for name in (getattr(event, image_name, {}) or {})
+        }
         for attribute in ("key_descriptors", "before_descriptors", "after_descriptors"):
             descriptors = getattr(event, attribute)
             if len(descriptors) >= len(catalog_descriptors) and all(
@@ -699,6 +811,18 @@ class GroupPlan:
             ):
                 continue
             for name, descriptor in catalog_descriptors.items():
+                if name not in present_names:
+                    continue
+                if policy_gate is not None:
+                    rule = policy_gate.policy.rule_for(qualified, name)
+                    if rule.action == "exclude":
+                        continue
+                    existing = descriptors.get(name)
+                    existing_meta = dict(getattr(existing, "metadata", ()) or {})
+                    if rule.action in {"mask", "hash", "truncate"} and existing_meta.get(
+                        "policy_action"
+                    ) == rule.action:
+                        continue
                 # The source catalog is authoritative for physical PostgreSQL
                 # identity and typmod.  Connect may intentionally flatten a value
                 # to STRING (decimal/interval) while retaining no logical name.
@@ -762,6 +886,17 @@ class GroupPlan:
         # rows still use the source output value when the reader can observe them;
         # the limitation is recorded loudly in the run log rather than hidden as a
         # fabricated XML string.
+        policy_gate = getattr(self, "policy_gate", None)
+        if policy_gate is None:
+            raise SchemaEvolutionRefused(
+                f"omitted source field(s) {list(columns)!r} for "
+                f"{event.qualified_table} require an attached policy gate",
+                source_schema=event.schema,
+                source_table=event.table,
+                target=event.qualified_table,
+                detected_lsn=event.lsn,
+                refusal_origin="typed_planner",
+            )
         if values is None:
             log.warning(
                 "stock Debezium omitted xml[] field(s) %s for %s and the source "
@@ -770,16 +905,70 @@ class GroupPlan:
                 list(columns),
                 event.qualified_table,
             )
-            values = {name: None for name in columns}
+            values = policy_gate.sanitize_mapping(
+                event.qualified_table,
+                {name: None for name in columns},
+                {
+                    name: catalog_descriptors[name]
+                    for name in columns
+                    if name in catalog_descriptors
+                },
+            )
+        elif not isinstance(values, dict):
+            raise SchemaEvolutionRefused(
+                f"source recovery for {event.qualified_table} returned a non-mapping",
+                source_schema=event.schema,
+                source_table=event.table,
+                target=event.qualified_table,
+                detected_lsn=event.lsn,
+                refusal_origin="typed_planner",
+            )
         image_name = "before" if event.op == "d" else "after"
         image = getattr(event, image_name)
         if image is None:
             image = {}
             setattr(event, image_name, image)
         descriptors = getattr(event, f"{image_name}_descriptors")
+        typed = getattr(event, f"typed_{image_name}", None)
+        typed_fields = dict(typed.fields) if typed is not None else {}
         for name in columns:
+            rule = policy_gate.policy.rule_for(event.qualified_table, name)
+            if rule.action == "exclude":
+                continue
+            if name not in values:
+                raise SchemaEvolutionRefused(
+                    f"policy-gated source recovery omitted {event.qualified_table}.{name}",
+                    source_schema=event.schema,
+                    source_table=event.table,
+                    target=event.qualified_table,
+                    detected_lsn=event.lsn,
+                    refusal_origin="typed_planner",
+                )
+            descriptor = catalog_descriptors.get(name)
+            if descriptor is None:
+                raise SchemaEvolutionRefused(
+                    f"source recovery lacks a descriptor for {event.qualified_table}.{name}",
+                    source_schema=event.schema,
+                    source_table=event.table,
+                    target=event.qualified_table,
+                    detected_lsn=event.lsn,
+                    refusal_origin="typed_planner",
+                )
+            if rule.action in {"mask", "hash", "truncate"}:
+                descriptor = policy_gate.policy.descriptor_for_transform(
+                    descriptor,
+                    action=rule.action,
+                    rule_id=str(rule.rule_id),
+                )
             image[name] = values[name]
-            descriptors[name] = catalog_descriptors[name]
+            descriptors[name] = descriptor
+            typed_fields[name] = FieldValue.of(values[name], descriptor)
+        if typed_fields:
+            setattr(
+                event,
+                f"typed_{image_name}",
+                TypedImage(tuple(sorted(typed_fields.items()))),
+            )
 
     def _count_event(self, event: PendingRecord) -> None:
         """Group-level bookkeeping every event contributes to, whatever it is.
@@ -1011,6 +1200,20 @@ class GroupPlan:
                     pipeline=self.pipeline,
                     control_schema=self._control_schema,
                 )
+            if not item.snapshot and self.pipeline:
+                destination.write_delete_ledger(
+                    self.con,
+                    item,
+                    pipeline=self.pipeline,
+                    commit_id=self.commit_id,
+                    control_schema=self._control_schema,
+                )
+                destination.write_table_policy_state(
+                    self.con,
+                    item,
+                    pipeline=self.pipeline,
+                    control_schema=self._control_schema,
+                )
             if not item.snapshot and item.source_schema and item.target in self.created_in_txn:
                 # Codex 5: destination ownership has to be persisted by whoever first
                 # materialises the table, snapshot or streaming, or a table that only
@@ -1032,6 +1235,14 @@ class GroupPlan:
             self.con, presence_rows, control_schema=self._control_schema
         )
 
+        if self.policy_alerts and self.pipeline:
+            destination.write_policy_alerts(
+                self.con,
+                self.policy_alerts,
+                pipeline=self.pipeline,
+                control_schema=self._control_schema,
+            )
+
         if self.staged_units and clear_spill:
             self.spill.clear(self.commit_id)
 
@@ -1046,6 +1257,23 @@ class GroupPlan:
             if self.snapshots.swap(
                 state, commit_id=self.commit_id, snapshot_lsn=self.stats.get("last_lsn")
             ):
+                table = self.registry.get(state.target)
+                if table.exists:
+                    # The view name survives a table swap, but DuckDB may retain a
+                    # dependency on the pre-swap table object. Rebind it after the
+                    # shadow is promoted so consumers always see the current image.
+                    table_writer.ensure_live_view(
+                        self.con, table, target=state.target
+                    )
+                snapshot_item = self.work.get(state.shadow) or self.work.get(state.target)
+                if snapshot_item is not None and self.pipeline:
+                    destination.write_table_policy_state(
+                        self.con,
+                        snapshot_item,
+                        pipeline=self.pipeline,
+                        target_table=state.target,
+                        control_schema=self._control_schema,
+                    )
                 self.stats["tables"].add(state.target)
         return self.stats
 

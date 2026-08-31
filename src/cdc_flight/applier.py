@@ -67,12 +67,14 @@ from .backfill import (
 from .catalog_apply import CatalogCoordinator, CatalogPlan
 from .commit_group import CommitResult, OpenGroup
 from .config import ApplierConfig, resolve_control_schema
+from .delete_modes import DeleteModeResolver
 from .destination import AlertSink, Lease, OccurrenceKey, ResumePoint
 from .envelope import (
     KIND_HEARTBEAT,
     KIND_SNAPSHOT_BOUNDARY,
     PendingRecord,
     decode,
+    offsets_of,
 )
 from .errors import (
     AdmissionError,
@@ -84,6 +86,7 @@ from .errors import (
 from .faults import matrix_crash, maybe_crash
 from .marker_accounting import SourceMarkerReceiptCounter
 from .occurrence import _commit_reservation
+from .policy import AcknowledgementHandle, PolicyGate
 from .snapshot import SnapshotCoordinator
 from .snapshot_completion import (
     SnapshotCompletion,
@@ -94,6 +97,54 @@ from .spill import SpillBuffer
 
 log = logging.getLogger("cdc_flight.applier")
 OWNER = "applier-lifecycle"
+
+# These are created once, before a boundary failure can be in flight.  The cleanup
+# path must only assign them; it cannot afford to construct a replacement handle or
+# an empty mapping while preserving another exception.
+_POLICY_BOUNDARY_ACK = AcknowledgementHandle(None)
+_POLICY_BOUNDARY_EMPTY_KEY_DESCRIPTORS: dict[str, Any] = {}
+_POLICY_BOUNDARY_EMPTY_BEFORE_DESCRIPTORS: dict[str, Any] = {}
+_POLICY_BOUNDARY_EMPTY_AFTER_DESCRIPTORS: dict[str, Any] = {}
+_POLICY_BOUNDARY_EMPTY_OUTPUT_TEXTS: dict[str, Any] = {}
+
+
+def _set_policy_boundary_field(record: PendingRecord, attribute: str, value) -> bool:
+    """Set one fallback field without allowing cleanup to raise."""
+    try:
+        object.__setattr__(record, attribute, value)
+        return True
+    except BaseException:
+        try:
+            record.__dict__[attribute] = value
+        except BaseException:
+            return False
+        return True
+
+
+def _clear_policy_boundary_payload(record: PendingRecord) -> None:
+    """Strip source payload after any pre-assembler boundary escape.
+
+    ``PendingRecord`` is a known mutable dataclass.  Keep this list explicit and use
+    only direct assignments: a failure injected into the old dynamic setter cannot
+    interrupt the list, and no constructor or method dispatch runs while the
+    original boundary error is in flight.  The acknowledgement handle and empty
+    mappings are import-time singletons for the same reason.
+    """
+    record.key = None
+    record.before = None
+    record.after = None
+    record.key_descriptors = _POLICY_BOUNDARY_EMPTY_KEY_DESCRIPTORS
+    record.before_descriptors = _POLICY_BOUNDARY_EMPTY_BEFORE_DESCRIPTORS
+    record.after_descriptors = _POLICY_BOUNDARY_EMPTY_AFTER_DESCRIPTORS
+    record.typed_key = None
+    record.typed_before = None
+    record.typed_after = None
+    record.value_schema = None
+    record.key_schema = None
+    record.before_schema = None
+    record.after_schema = None
+    record.output_texts = _POLICY_BOUNDARY_EMPTY_OUTPUT_TEXTS
+    record.raw = _POLICY_BOUNDARY_ACK
 
 
 class Applier:
@@ -150,6 +201,9 @@ class Applier:
         self.source_cluster_id = source_cluster_id
         self.source_timeline = source_timeline
         self.strict_event_identity = bool(strict_event_identity)
+        self.delete_policy = config.delete_policy
+        self._pending_delete_policy: DeleteModeResolver | None = None
+        self.policy_gate = PolicyGate(config.pii_policy)
         #: `catalog.CatalogWatcher` or None. The only source of DROP TABLE knowledge
         #: (rubric 1.5): logical decoding does not carry DDL at all.
         self.catalog = catalog
@@ -259,6 +313,8 @@ class Applier:
             binary_mode=self.binary_handling_mode,
             hstore_mode=self.hstore_handling_mode,
             control_schema=self.control_schema,
+            policy_gate=self.policy_gate,
+            require_sanitized=True,
         )
         self.alerts = AlertSink(
             con, pipeline=pipeline, control_schema=self.control_schema
@@ -290,7 +346,24 @@ class Applier:
             control_schema=self.control_schema,
             max_destructive_per_group=config.drop_max_per_group,
             allow_mass_drop=config.drop_allow_mass,
+            policy_gate=self.policy_gate,
         )
+        if self.catalog is not None:
+            # Catalog-backed snapshot/backfill readers use the same application gate
+            # as streaming records. This is an instance attribute so compatibility
+            # watcher implementations remain usable without a new constructor API.
+            self._attach_policy_gate(
+                self.catalog, self.policy_gate, owner_name="catalog"
+            )
+        if self.descriptor_provider is not None:
+            # A bound method is immutable, so the attachment helper targets its
+            # owner. Any other non-writable provider fails loudly: silently
+            # continuing here creates an ungated source acquisition path.
+            self._attach_policy_gate(
+                self.descriptor_provider,
+                self.policy_gate,
+                owner_name="descriptor provider",
+            )
         self._schema_epochs = schema_epoch.SchemaEpochCoordinator(
             spill=self.spill,
             apply_units=self._apply_units,
@@ -390,6 +463,24 @@ class Applier:
             target=self._age_timer, name="cdc-commit-age", daemon=True
         )
         self._timer.start()
+
+    @staticmethod
+    def _attach_policy_gate(candidate, gate: PolicyGate, *, owner_name: str) -> None:
+        """Attach the required policy gate, including to a bound-method owner.
+
+        Source acquisition is security-sensitive. A failed attachment must abort
+        construction rather than degrade into an unredacted reader.
+        """
+        owner = getattr(candidate, "__self__", None)
+        target = owner if owner is not None else candidate
+        try:
+            target.policy_gate = gate
+        except (AttributeError, TypeError) as error:
+            raise TypeError(
+                f"{owner_name} must expose a writable policy_gate"
+            ) from error
+        if getattr(target, "policy_gate", None) is not gate:
+            raise TypeError(f"{owner_name} rejected the required policy_gate")
 
     # ------------------------------------------------------------------ #
     # supervisor-facing surface (kept identical to the previous handler)
@@ -697,6 +788,7 @@ class Applier:
                     # BEGIN, while a committed STARTED notification has already
                     # installed the route.
                     self._ensure_backfill_route(rec.schema, rec.table, run, create=False)
+            self._sanitize_record(rec)
             ignored_source_record = rec.qualified_table in self.ignored_source_tables
             if ignored_source_record:
                 # The source signal row is a control-plane request. It still
@@ -859,6 +951,90 @@ class Applier:
     # ------------------------------------------------------------------ #
     def _add_unit(self, unit: CompleteUnit) -> None:
         unit_admission.add_unit(self, unit)
+
+    def _sanitize_record(self, record: PendingRecord) -> PendingRecord:
+        """Apply the one post-decode/pre-assembler policy boundary.
+
+        Descriptor lookup is a source-catalog read. It is intentionally performed
+        before the record enters the transaction assembler, while all destination
+        DDL/DML remains owned by the later commit group.
+        """
+        try:
+            self._activate_delete_policy_at_boundary()
+            # Capture only the non-sensitive offset facts before any source mapping
+            # is sealed behind the acknowledgement handle. Resume-point construction
+            # must never need to inspect the connector envelope after this method
+            # returns. Invariant O requires this ordering.
+            if record.raw is not None and record.source_offset is None:
+                record.source_partition, record.source_offset = offsets_of(record.raw)
+            record.delete_mode = self.delete_policy.resolve(record.qualified_table)
+            record.delete_policy_epoch = int(self.delete_policy.epoch)
+            record.delete_policy_digest = self.delete_policy.digest
+            provider = self.descriptor_provider or (
+                getattr(self.catalog, "descriptors_for", None)
+                if self.catalog is not None
+                else None
+            )
+            context = None
+            try:
+                if provider is not None and record.qualified_table:
+                    context = provider(record.qualified_table)
+                self.policy_gate.sanitize(record, context)
+            except AdmissionError as error:
+                self._seal_policy_refusal(record, error)
+            return record
+        except BaseException:
+            # Activation, offset capture, mode/provider resolution, sanitization,
+            # and refusal sealing are one total source-image boundary. Do not turn
+            # an internal failure into a leak, and do not swallow the failure after
+            # making the record safe to inspect.
+            _clear_policy_boundary_payload(record)
+            raise
+
+    def _seal_policy_refusal(
+        self, record: PendingRecord, error: AdmissionError
+    ) -> None:
+        """Seal every policy/admission refusal before the seam can return."""
+        refused = as_schema_refusal(
+            error,
+            refusal_origin=(getattr(error, "refusal_origin", None) or "policy"),
+        )
+        if not refused.source_schema or not refused.source_table:
+            refused.source_schema = record.schema
+            refused.source_table = record.table
+            refused.target = record.qualified_table
+        if refused.detected_lsn is None:
+            refused.detected_lsn = record.lsn
+        self.policy_gate.seal_refusal(record, refused)
+
+    def request_delete_policy(self, policy: DeleteModeResolver) -> None:
+        """Stage a delete-policy change for the next PostgreSQL transaction.
+
+        A configuration reload can arrive while Debezium is delivering an open
+        source transaction.  Applying it to one row in that transaction would make
+        the durable event ledger describe two semantics for one source commit.  The
+        request is therefore held until the assembler has observed the transaction's
+        END (or until the next implicit transaction boundary).
+        """
+        if not isinstance(policy, DeleteModeResolver):
+            raise TypeError("delete policy requests require DeleteModeResolver")
+        if policy.digest == self.delete_policy.digest:
+            self._pending_delete_policy = None
+            return
+        self._pending_delete_policy = policy
+
+    def _activate_delete_policy_at_boundary(self) -> None:
+        pending = self._pending_delete_policy
+        if pending is None or self.assembler.open_transaction_id is not None:
+            return
+        previous = self.delete_policy
+        self.delete_policy = pending
+        self._pending_delete_policy = None
+        # If the preceding whole transaction is buffered, make it its own
+        # destination transaction.  The current record has not entered the
+        # assembler yet, so this is a genuine source-transaction boundary.
+        if self.group.units and previous.digest != pending.digest:
+            self.commit_group("delete_policy_boundary")
 
     def _reset_group(self) -> None:
         """One assignment, and that is the whole point (rubric 1.9).

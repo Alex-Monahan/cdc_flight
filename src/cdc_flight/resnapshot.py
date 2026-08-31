@@ -501,7 +501,7 @@ def run(
         )
         descriptor_provider = RelationDescriptorProvider.from_tables(
             descriptor_connection, tables, source_dsn=source.dsn
-        ).descriptors_for
+        )
         applier = Applier(
             con,
             pipeline=pipeline,
@@ -712,9 +712,12 @@ def run(
             recovery.consume()
         raise
     finally:
-        provider_owner = getattr(descriptor_provider, "__self__", None)
-        if provider_owner is not None and hasattr(provider_owner, "close"):
-            provider_owner.close()
+        provider_close = getattr(descriptor_provider, "close", None)
+        if provider_close is None:
+            provider_owner = getattr(descriptor_provider, "__self__", None)
+            provider_close = getattr(provider_owner, "close", None)
+        if provider_close is not None:
+            provider_close()
         if descriptor_connection is not None:
             descriptor_connection.close()
         if not source_stopped:

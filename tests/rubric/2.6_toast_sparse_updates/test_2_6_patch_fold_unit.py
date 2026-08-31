@@ -384,9 +384,16 @@ def test_typed_image_spill_shape_preserves_field_state():
 
 
 def test_absent_fields_are_persisted_and_marker_is_not_in_spill_raw_image():
+    typed = TypedImage(
+        (
+            ("body", FieldValue.unchanged_toast(TEXT)),
+            ("touch", FieldValue.of(1, INT4)),
+            ("later", FieldValue.absent(TEXT)),
+        )
+    )
     serialized = _image_json(
         {"body": STRUCTURAL_MARKER, "touch": 1},
-        None,
+        typed,
         {"body": TEXT, "touch": INT4, "later": TEXT},
     )
     assert serialized is not None

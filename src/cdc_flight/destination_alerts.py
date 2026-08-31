@@ -36,6 +36,38 @@ faults = _d.faults
 table_lifecycle = _d.table_lifecycle
 quote = _d.quote
 
+_SENSITIVE_ALERT_KEYS = frozenset({
+    "after", "before", "connector_error", "exception_message", "original",
+    "payload", "raw", "salt", "salt_bytes", "source_value", "value",
+})
+
+
+def _json_safe_alert(value, *, key: str | None = None):
+    """Make alert context JSON without a value-to-string escape hatch."""
+    if key is not None and key.lower() in _SENSITIVE_ALERT_KEYS:
+        return None
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        result = {}
+        for raw_key, raw_value in value.items():
+            name = str(raw_key)
+            item = _json_safe_alert(raw_value, key=name)
+            if item is not None:
+                result[name] = item
+        return result
+    if isinstance(value, (list, tuple)):
+        return [
+            item
+            for item in (_json_safe_alert(item, key=key) for item in value)
+            if item is not None
+        ]
+    value_type = type(value)
+    return {
+        "__omitted_value_type__":
+        f"{value_type.__module__}.{value_type.__qualname__}"
+    }
+
 
 def _alert_identity(condition_key: str, occurrence_key: OccurrenceKey) -> str:
     """Build a deduplication identity from two independently named parts."""
@@ -237,13 +269,14 @@ def _write_alert_row(
     context=None,
     control_schema: str | None = None,
 ) -> bool:
-    payload = dict(context or {})
+    payload = _json_safe_alert(dict(context or {}))
     try:
         con.execute(
             f"INSERT INTO {_control_table(control_schema, 'alerts')} "
             "(pipeline, raised_at, severity, code, message, context) VALUES (?,?,?,?,?,?)",
             [pipeline, now(), severity, code, message,
-             json.dumps(payload, default=str) if payload else None],
+             json.dumps(payload, sort_keys=True)
+             if payload else None],
         )
     except Exception:  # pragma: no cover - alerting must never mask the cause
         log.warning("could not write alert %s", code, exc_info=True)
@@ -760,7 +793,8 @@ def persist_fallback_alert(
             "destination_kind": dest.kind,
             "destination_path": str(getattr(dest, "duckdb_path", "")),
         }
-        line = (json.dumps(payload, default=str, sort_keys=True) + "\n").encode("utf-8")
+        safe_payload = _json_safe_alert(payload)
+        line = (json.dumps(safe_payload, sort_keys=True) + "\n").encode("utf-8")
         path.parent.mkdir(parents=True, exist_ok=True)
         descriptor = os.open(
             str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT,

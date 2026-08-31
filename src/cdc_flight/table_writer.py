@@ -33,6 +33,7 @@ from .table_work import (
     _missing_toast_base,
     _raw_key,
 )
+from .typed_types import FieldValue
 
 OWNER = "table-destination-materialization"
 
@@ -58,6 +59,27 @@ def write(
     columns.update(APPLIER_COLUMN_TYPES)
     for column in item.key_columns:
         columns.setdefault(column, apply_sql.VARCHAR)
+
+    # Add the fixed metadata columns to a legacy table before the typed source
+    # ensure. DuckDB's ALTER TABLE transaction bookkeeping can reject a later
+    # Arrow/DML write when metadata ALTERs are interleaved with source-column ALTERs.
+    # New tables receive all of these columns in _create_strict below.
+    existing_table = registry.get(item.target)
+    if existing_table.exists:
+        # The first four fields are the fixed row-state prefix. Adding that prefix
+        # before SchemaRegistry's source-column loop avoids a DuckDB catalog bug
+        # when all fixed metadata fields are introduced by the typed ensure in one
+        # pass; the remaining fixed fields can then be added by that same loop.
+        _ensure_applier_columns(
+            con,
+            existing_table,
+            names=(
+                naming.CDCF_COMMIT_ID,
+                naming.CDCF_EVENT_ID,
+                naming.CDCF_TOTAL_ORDER,
+                naming.CDCF_DELETED,
+            ),
+        )
 
     if item.native_columns:
         typed_columns = {**columns, **item.native_columns}
@@ -91,13 +113,30 @@ def write(
     if created:
         created_in_txn.add(item.target)
     fresh = item.target in created_in_txn
+    _ensure_applier_columns(con, table)
 
     column_order = [c for c in table.columns if c in columns] + [
         c for c in columns if c not in table.columns
     ]
     column_order = list(dict.fromkeys(column_order))
+    ensure_live_view(con, table, target=item.target)
     data_con = _table_dml_connection(con, item.target)
     try:
+        if (
+            not item.snapshot
+            and not fresh
+            and item.previous_delete_mode == "soft"
+            and item.delete_mode == "hard"
+        ):
+            # A soft->hard policy transition is itself a fenced data operation:
+            # remove committed tombstones before admitting the next hard-mode
+            # source unit.  No row is resurrected, and the existing event/delete
+            # ledgers remain durable in this same transaction.
+            execute_table_dml(
+                data_con,
+                f"DELETE FROM {table.qualified} "
+                f"WHERE {naming.quote('cdcf_deleted')} = true",
+            )
         _write_table(con, table, item, column_order, fresh=fresh, data_con=data_con)
     except (
         AdmissionError,
@@ -146,6 +185,8 @@ def _write_table(con, table, item: TableWork, column_order: list[str], *, fresh:
             for key in delete_keys
         ]
         apply_sql.delete_keys(data_con, table, item.key_columns, keys)
+    if not item.snapshot and not fresh and item.soft_deletes:
+        _mark_keyed_soft_deletes(data_con, table, item)
     _finish_truncate_audit(item)
 
     updates: list[tuple[tuple, dict[str, Any]]] = []
@@ -165,6 +206,16 @@ def _write_table(con, table, item: TableWork, column_order: list[str], *, fresh:
             _key_value(table, column, value)
             for column, value in zip(item.key_columns, source_key_values, strict=False)
         )
+        updates.append((source_key, assignments))
+    for key, patch in item.soft_replacements.items():
+        source_key = tuple(
+            _key_value(table, column, value)
+            for column, value in zip(item.key_columns, _raw_key(item, key), strict=False)
+        )
+        assignments = patch.bindable_values()
+        assignments["cdcf_deleted"] = False
+        assignments["cdcf_delete_event_id"] = None
+        assignments["cdcf_delete_lsn"] = None
         updates.append((source_key, assignments))
     if updates:
         affected = (
@@ -268,12 +319,15 @@ def _write_keyless_operations(
                 None,
                 reason=f"keyless {operation.operation} has no complete before-image",
             )
-        affected = apply_sql.delete_matching_row(
-            data_con,
-            table,
-            tuple(operation.before),
-            operation.before,
-        )
+        if operation.operation == "d" and operation.delete_mode == "soft":
+            affected = _mark_keyless_soft_delete(data_con, table, operation)
+        else:
+            affected = apply_sql.delete_matching_row(
+                data_con,
+                table,
+                tuple(operation.before),
+                operation.before,
+            )
         if affected != 1:
             _missing_toast_base(
                 item,
@@ -290,6 +344,97 @@ def _write_keyless_operations(
             flush_inserts()
 
     flush_inserts()
+
+
+def ensure_live_view(con, table, *, target: str | None = None) -> None:
+    """Expose one stable current/live projection for both storage modes."""
+    target = target or getattr(table, "name", None)
+    if not target:
+        raise ValueError("a destination target is required to create its live view")
+    view_name = naming.quote(f"{target}__live")
+    qualified_view = f"{naming.quote(table.dataset)}.{view_name}"
+    con.execute(
+        f"CREATE OR REPLACE VIEW {qualified_view} AS SELECT * FROM {table.qualified} "
+        # Legacy tables receive a nullable additive metadata column because
+        # DuckDB cannot add a constrained column in-place. NULL means "not yet
+        # tombstoned" for those rows and must remain visible in the live view.
+        f"WHERE {naming.quote('cdcf_deleted')} IS NOT TRUE"
+    )
+
+
+def _ensure_applier_columns(con, table, *, names=None) -> None:
+    """Repair additive metadata on a legacy table before creating the live view."""
+    selected = names if names is not None else APPLIER_COLUMN_TYPES
+    for column in selected:
+        type_name = APPLIER_COLUMN_TYPES[column]
+        if column in table.columns:
+            continue
+        ddl_type = (
+            # DuckDB rejects constraints in ALTER TABLE ADD COLUMN, and a DEFAULT
+            # on this column conflicts with later same-transaction source ALTERs.
+            # The create path declares cdcf_deleted NOT NULL; legacy tables get a
+            # plain boolean; the live-view predicate treats legacy NULL as not
+            # deleted and every newly written row binds the field explicitly.
+            "BOOLEAN"
+            if column == "cdcf_deleted"
+            else type_name
+        )
+        con.execute(
+            f"ALTER TABLE {table.qualified} ADD COLUMN {naming.quote(column)} {ddl_type}"
+        )
+        table.columns[column] = type_name
+        table.raw_types[column] = type_name
+
+
+def _mark_keyed_soft_deletes(data_con, table, item: TableWork) -> None:
+    updates = []
+    for key, operation in item.soft_deletes.items():
+        source_key = tuple(
+            _key_value(table, column, value)
+            for column, value in zip(item.key_columns, _raw_key(item, key), strict=False)
+        )
+        updates.append(
+            (
+                source_key,
+                {
+                    "cdcf_deleted": True,
+                    "cdcf_delete_event_id": operation.event_id,
+                    "cdcf_delete_lsn": operation.source_lsn,
+                },
+            )
+        )
+    if updates:
+        # A replay is fenced by event_ledger before this point. A zero-row mark is
+        # therefore a legitimate reconciliation no-op (the source row may already
+        # have been physically removed by an earlier hard policy epoch).
+        apply_sql.update_rows(data_con, table, item.key_columns, updates)
+
+
+def _mark_keyless_soft_delete(data_con, table, operation) -> int:
+    """Mark exactly one keyless physical row without removing its before-image."""
+    predicates = []
+    params = []
+    for column, value in operation.before.items():
+        if column not in table.columns or column in APPLIER_COLUMN_TYPES:
+            continue
+        expression, bound = apply_sql._typed_assignment(table, column, value)
+        predicates.append(f"{naming.quote(column)} IS NOT DISTINCT FROM {expression}")
+        params.extend(bound)
+    if not predicates:
+        return 0
+    assignments = (
+        f"{naming.quote('cdcf_deleted')} = true, "
+        f"{naming.quote('cdcf_delete_event_id')} = ?, "
+        f"{naming.quote('cdcf_delete_lsn')} = ?"
+    )
+    result = execute_table_dml(
+        data_con,
+        f"UPDATE {table.qualified} SET {assignments} WHERE "
+        + " AND ".join(predicates)
+        + " RETURNING 1",
+        [operation.event_id, operation.source_lsn, *params],
+    )
+    return len(result.fetchall())
 
 
 def _key_value(table, column: str, value):
@@ -322,10 +467,22 @@ def _plan(
         if len(entries) == 1 and entries[0] is START:
             continue
         if not entries:
-            delete_keys.append(key)
+            if key not in item.soft_deletes:
+                delete_keys.append(key)
             continue
         if len(entries) == 1:
             entry = entries[0]
+            if key in item.soft_deletes:
+                if isinstance(entry, RowPatch):
+                    item.soft_replacements[key] = entry
+                elif isinstance(entry, RowMove):
+                    item.soft_replacements[key] = entry.patch
+                else:
+                    item.soft_replacements[key] = RowPatch(
+                        {name: FieldValue.of(value) for name, value in entry.items()},
+                        complete=True,
+                    )
+                continue
             if isinstance(entry, RowMove):
                 moves.append(entry)
             elif isinstance(entry, RowPatch) and not entry.complete:
@@ -337,13 +494,19 @@ def _plan(
             concrete = [entry for entry in entries if entry is not START]
             if len(concrete) > 1:
                 raise AmbiguousDelete(
-                    f"{item.target}: identity {key!r} would be written twice by one "
+                    f"{item.target}: opaque identity {key} would be written twice by one "
                     "commit group (ADR 0001 §18/A35)",
                     source_schema=item.source_schema,
                     source_table=item.source_table,
                     target=item.target,
                 )
             for entry in concrete:
+                if key in item.soft_deletes:
+                    if isinstance(entry, RowPatch):
+                        item.soft_replacements[key] = entry
+                    elif isinstance(entry, RowMove):
+                        item.soft_replacements[key] = entry.patch
+                    continue
                 if isinstance(entry, RowPatch) and not entry.complete:
                     partial_updates.append((key, entry))
                 elif isinstance(entry, RowMove):

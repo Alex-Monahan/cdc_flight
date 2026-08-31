@@ -308,6 +308,14 @@ class SchemaEpochCoordinator:
                     for relation in (catalog_plan.relations if catalog_plan else ())
                     if relation.qualified in names
                 ),
+                policy_alerts=tuple(
+                    alert
+                    for alert in (catalog_plan.policy_alerts if catalog_plan else ())
+                    if (
+                        f"{alert.get('source_schema', '')}."
+                        f"{alert.get('source_table', '')}"
+                    ) in names
+                ),
             )
             self._apply_catalog_phase(
                 commit_id, phase, catalog_stats, schema_only=True

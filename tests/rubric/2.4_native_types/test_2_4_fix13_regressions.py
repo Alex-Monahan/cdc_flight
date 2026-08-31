@@ -195,6 +195,7 @@ ADMISSION_BOUNDARY_MODULES = frozenset(
         "catalog_poll.py",
         "commit_protocol.py",
         "physical_row_matrix.py",
+        "policy.py",
         "planner.py",
         "resnapshot_batches.py",
         "schema_evolution.py",
@@ -215,6 +216,7 @@ ADMISSION_BOUNDARY_MODULES = frozenset(
 ADMISSION_BOUNDARY_HANDLERS = frozenset(
     {
         ("applier.py", "_spill_events"),
+        ("applier.py", "_sanitize_record"),
         ("catalog.py", "descriptors_for"),
         ("catalog_apply.py", "apply"),
         ("catalog_apply.py", "backfill_schema"),
@@ -223,6 +225,8 @@ ADMISSION_BOUNDARY_HANDLERS = frozenset(
         ("catalog_poll.py", "poll"),
         ("commit_protocol.py", "commit_group"),
         ("physical_row_matrix.py", "_exercise_cell"),
+        ("policy.py", "sanitize"),
+        ("policy.py", "sanitize_mapping"),
         ("planner.py", "_collect"),
         ("planner.py", "_enrich_descriptors"),
         ("resnapshot_batches.py", "run_owed"),

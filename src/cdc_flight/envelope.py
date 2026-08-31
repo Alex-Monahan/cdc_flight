@@ -119,6 +119,19 @@ class PendingRecord:
     #: PostgreSQL transaction commit LSN, distinct from the event's own WAL LSN.
     commit_lsn: int | None = None
     policy_epoch: int = 0
+    #: Opaque post-decode policy identity. The digest is safe to persist; the
+    #: source mapping is deliberately not retained here.
+    policy_digest: str | None = None
+    sanitized: bool = False
+    policy_alerts: list[dict[str, Any]] = field(default_factory=list)
+    #: The mode is attached at admission so a source transaction cannot mix a
+    #: configuration epoch while it is open.
+    delete_mode: str | None = None
+    delete_policy_epoch: int = 1
+    delete_policy_digest: str | None = None
+    #: Proven PostgreSQL OUTPUT-function text supplied by a source adapter/read.
+    #: It is consumed by the policy gate and never written to diagnostics.
+    output_texts: dict[str, Any] = field(default_factory=dict)
     data_collection_order: int | None = None
     source_ts_ms: int | None = None
     snapshot: str | None = None
@@ -150,6 +163,11 @@ class PendingRecord:
     typed_key: TypedImage | None = None
     typed_before: TypedImage | None = None
     typed_after: TypedImage | None = None
+    #: A value-free admission decision made while sealing this record. The
+    #: assembler carries the decision to the complete-unit boundary even if the
+    #: row image itself is moved to spill storage; it is never serialized as a
+    #: source image.
+    admission_refusal: Any | None = None
     #: Stock incremental READ metadata.  These fields are deliberately separate
     #: from snapshot_ordinal: an arrival ordinal is not a resumable cursor.
     incremental: bool = False
@@ -165,6 +183,26 @@ class PendingRecord:
     #: embedded-engine callback stream.  Preserve its declared row total so the
     #: destination can defer the atomic swap until the shadow has received them.
     incremental_rows: int | None = None
+
+    def __repr__(self) -> str:
+        """Return an audit-safe description of the record.
+
+        ``PendingRecord`` is present in assembler and spill exceptions often enough
+        that the dataclass-generated representation would be a source-value leak:
+        it includes ``key``, both row images, typed fields, and the raw connector
+        object.  The acknowledgement handle is intentionally not represented either
+        (its delegate is the connector's private callback token).  Operational
+        diagnostics can use the identity and policy facts below without ever
+        serialising a source value.
+        """
+        return (
+            "PendingRecord("
+            f"kind={self.kind!r}, topic={self.topic!r}, op={self.op!r}, "
+            f"schema={self.schema!r}, table={self.table!r}, lsn={self.lsn!r}, "
+            f"txn_id={self.txn_id!r}, total_order={self.total_order!r}, "
+            f"sanitized={self.sanitized!r}, policy_epoch={self.policy_epoch!r}, "
+            f"policy_digest={self.policy_digest!r}, delete_mode={self.delete_mode!r})"
+        )
 
     @property
     def is_data(self) -> bool:

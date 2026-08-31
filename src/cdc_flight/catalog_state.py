@@ -194,29 +194,6 @@ def queued(change: CatalogChange) -> CatalogChange:
     return change
 
 
-def _missing_value(raw: str | None, type_name: str) -> object | None:
-    if raw is None:
-        return None
-    text = str(raw)
-    if text.startswith("{") and text.endswith("}"):
-        text = text[1:-1]
-    if text == "" or text.upper() == "NULL":
-        return None
-    lowered = type_name.lower()
-    try:
-        if lowered in {"smallint", "integer", "bigint", "int2", "int4", "int8"}:
-            return int(text)
-        if lowered in {
-            "real", "double precision", "float4", "float8", "numeric", "decimal"
-        }:
-            return float(text)
-        if lowered in {"boolean", "bool"}:
-            return text.lower() in {"t", "true", "1"}
-    except ValueError:
-        return None
-    return text.replace('\\"', '"').replace('\\\\', '\\')
-
-
 def read_known_relations(
     con, pipeline: str, *, control_schema: str | None = None
 ) -> dict[str, SourceRelation]:
@@ -275,9 +252,10 @@ def read_known_relations(
                 typmod=(int(raw["typmod"]) if raw.get("typmod") is not None else None),
                 nullable=bool(raw.get("nullable", True)),
                 has_missing_default=bool(raw.get("has_missing_default", False)),
-                missing_value=_missing_value(
-                    raw.get("missing_value_text"), str(raw["type_name"])
-                ),
+                # Source default values are deliberately not durable state.  A
+                # restart must re-observe the live catalog and obtain a fresh
+                # typoutput proof before a default can enter the policy gate.
+                missing_value=None,
                 attstorage=(str(raw["attstorage"]) if raw.get("attstorage") else None),
                 descriptor=_durable_descriptor(raw, schema=schema, table=table),
             )

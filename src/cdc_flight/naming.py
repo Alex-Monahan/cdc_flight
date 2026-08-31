@@ -27,6 +27,9 @@ from .config import DEFAULT_CONTROL_SCHEMA
 CDCF_COMMIT_ID = "cdcf_commit_id"
 CDCF_EVENT_ID = "cdcf_event_id"
 CDCF_TOTAL_ORDER = "cdcf_total_order"
+CDCF_DELETED = "cdcf_deleted"
+CDCF_DELETE_EVENT_ID = "cdcf_delete_event_id"
+CDCF_DELETE_LSN = "cdcf_delete_lsn"
 DBZ_COLUMNS = (
     "dbz_op",
     "dbz_lsn",
@@ -36,7 +39,15 @@ DBZ_COLUMNS = (
     "dbz_source_ts_ms",
 )
 #: Every column the applier adds to a replicated table (ADR 0001 §4.9).
-APPLIER_COLUMNS = (CDCF_COMMIT_ID, CDCF_EVENT_ID, CDCF_TOTAL_ORDER, *DBZ_COLUMNS)
+APPLIER_COLUMNS = (
+    CDCF_COMMIT_ID,
+    CDCF_EVENT_ID,
+    CDCF_TOTAL_ORDER,
+    CDCF_DELETED,
+    CDCF_DELETE_EVENT_ID,
+    CDCF_DELETE_LSN,
+    *DBZ_COLUMNS,
+)
 
 #: Suffix of the shadow table a snapshot loads into before the swap (ADR D7).
 SHADOW_SUFFIX = "__cdcf_tmp"

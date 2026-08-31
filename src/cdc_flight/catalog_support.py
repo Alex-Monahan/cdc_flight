@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from . import naming
 from .catalog_state import CHANGE_NEW, CHANGE_SCHEMA, CHANGE_UNPUBLISHED, DESTRUCTIVE
-from .errors import SchemaShapeUnexplained
+from .errors import SchemaEvolutionRefused, SchemaShapeUnexplained
 from .machines import ADMISSION_ADMITTED, ADMISSION_EXTERNAL
 from .toast import ToastRoute, classify_relation
 
@@ -34,6 +34,7 @@ SELECT n.nspname                                  AS source_schema,
                    'name', a.attname,
                    'type_oid', a.atttypid::bigint,
                    'type_name', format_type(a.atttypid, a.atttypmod),
+                   'type_delimiter', typ.typdelim,
                    'typmod', a.atttypmod,
                    'attstorage', a.attstorage,
                    'type_schema', typ_ns.nspname,
@@ -43,8 +44,8 @@ SELECT n.nspname                                  AS source_schema,
                    'typrelid', typ.typrelid::bigint,
                    'nullable', NOT a.attnotnull,
                    'has_missing_default', COALESCE(a.atthasmissing, false),
-                   'missing_value_text', CASE WHEN a.atthasmissing
-                       THEN a.attmissingval::text ELSE NULL END
+                   'missing_value_output', CASE WHEN a.atthasmissing
+                       THEN format(chr(37) || 's', a.attmissingval) ELSE NULL END
                ) ORDER BY a.attnum
            ) FILTER (WHERE a.attnum IS NOT NULL),
            '[]'::jsonb
@@ -116,6 +117,145 @@ WHERE parent.relkind IN ('r', 'p')
   )
   AND (COALESCE(p.puballtables, false) OR pr.prrelid IS NOT NULL)
 """
+
+
+def _first_missing_default_element(
+    output: str, delimiter: str = ","
+) -> str | None:
+    """Unwrap PostgreSQL's one-element ``attmissingval`` output envelope.
+
+    ``pg_attribute.attmissingval`` is declared as the polymorphic ``anyarray``;
+    PostgreSQL does not permit a client query to subscript or unnest that value
+    without losing the element type.  Formatting the array therefore asks
+    PostgreSQL's array output routine to invoke the actual element type's
+    ``typoutput`` function.  This parser removes only that outer, one-element
+    array envelope.  It never renders a Python value or reparses a type.
+    """
+    if not isinstance(output, str):
+        raise ValueError("catalog missing-default output is not text")
+    if not isinstance(delimiter, str) or len(delimiter) != 1:
+        raise ValueError("catalog missing-default output has no valid array delimiter")
+    opening = output.find("{")
+    if opening < 0:
+        raise ValueError("catalog missing-default output has no array envelope")
+    index = opening + 1
+    if index >= len(output):
+        raise ValueError("catalog missing-default output is truncated")
+    if output[index] == "}":
+        return None
+
+    if output[index] == '"':
+        index += 1
+        value: list[str] = []
+        while index < len(output):
+            character = output[index]
+            if character == "\\":
+                if index + 1 >= len(output):
+                    raise ValueError("catalog missing-default output has a dangling escape")
+                value.append(output[index + 1])
+                index += 2
+                continue
+            if character == '"':
+                index += 1
+                break
+            value.append(character)
+            index += 1
+        else:
+            raise ValueError("catalog missing-default output has an unterminated quote")
+        if not output[index:].lstrip().startswith("}"):
+            raise ValueError("catalog missing-default output contains multiple elements")
+        return "".join(value)
+
+    if output[index] == "{":
+        start = index
+        depth = 0
+        quoted = False
+        escaped = False
+        while index < len(output):
+            character = output[index]
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                quoted = not quoted
+            elif not quoted and character == "{":
+                depth += 1
+            elif not quoted and character == "}":
+                depth -= 1
+                if depth == 0:
+                    element = output[start : index + 1]
+                    if not output[index + 1 :].lstrip().startswith("}"):
+                        raise ValueError(
+                            "catalog missing-default output contains multiple elements"
+                        )
+                    return element
+            index += 1
+        raise ValueError("catalog missing-default output has an unterminated nested value")
+
+    value = []
+    while index < len(output):
+        character = output[index]
+        if character in (delimiter, "}"):
+            break
+        if character == "\\":
+            if index + 1 >= len(output):
+                raise ValueError("catalog missing-default output has a dangling escape")
+            value.append(output[index + 1])
+            index += 2
+            continue
+        value.append(character)
+        index += 1
+    if index >= len(output) or output[index] != "}":
+        raise ValueError("catalog missing-default output contains multiple elements")
+    token = "".join(value)
+    if token.upper() == "NULL":
+        return None
+    if not token:
+        raise ValueError("catalog missing-default output contains an empty element")
+    return token
+
+
+def missing_value_from_output(
+    output: object,
+    descriptor,
+    *,
+    delimiter: str | None = None,
+    source_schema: str | None = None,
+    source_table: str | None = None,
+    target: str | None = None,
+    detected_lsn: int | None = None,
+) -> object | None:
+    """Return a proven source default, or refuse an unproven catalog shape.
+
+    The descriptor's ``typoutput`` OID is resolved by ``CatalogDescriptorReader``.
+    The returned nominal wrapper preserves that proof through the policy transform;
+    it is deliberately never persisted in the destination control row.
+    """
+    def refusal(message: str) -> SchemaEvolutionRefused:
+        return SchemaEvolutionRefused(
+            message,
+            source_schema=source_schema,
+            source_table=source_table,
+            target=target,
+            detected_lsn=detected_lsn,
+            refusal_origin="catalog_shape",
+        )
+
+    output_oid = getattr(descriptor, "output_function_oid", None)
+    if not output_oid:
+        raise refusal("ADD DEFAULT has no catalog-resolved PostgreSQL OUTPUT identity")
+    try:
+        value = _first_missing_default_element(output, delimiter or ",")
+    except ValueError as error:
+        raise refusal(
+            "ADD DEFAULT cannot be decoded from PostgreSQL OUTPUT text"
+        ) from error
+    if value is None:
+        return None
+    from .policy import PostgreSQLOutputText
+
+    return PostgreSQLOutputText(value, int(output_oid))
 
 
 def summary(watcher) -> dict:
@@ -440,8 +580,105 @@ def _descriptor_changed(known: dict, incoming: dict, fields: set[str]) -> bool:
     return False
 
 
-def read_columns(watcher, relation, key_columns, value_columns) -> list[tuple]:
-    """Read current source values for a fenced add-column backfill."""
+def _policy_projection(relation, columns, policy_gate, *, key_columns=()):
+    """Build a source projection that does not select excluded columns."""
+    from .policy import PolicyValueRefused
+
+    descriptors = {
+        naming.normalize(column.name): column.descriptor
+        for column in relation.columns
+    }
+    normalized_keys = {naming.normalize(column) for column in key_columns}
+    allowed: list[str] = []
+    expressions: list[str] = []
+    kinds: dict[str, str] = {}
+    for name in columns:
+        normalized = naming.normalize(name)
+        rule = policy_gate.policy.rule_for(relation.qualified, normalized)
+        if normalized in normalized_keys and rule.action != "replicate":
+            raise PolicyValueRefused(
+                "a transformed or excluded source key cannot identify a backfill row"
+            )
+        if rule.action == "exclude":
+            continue
+        source_name = next(
+            column.name
+            for column in relation.columns
+            if naming.normalize(column.name) == normalized
+        )
+        if rule.action in {"hash", "truncate"}:
+            # PostgreSQL format(%s, value) invokes the value's type OUTPUT
+            # function. It is deliberately not a ::text cast or Python rendering.
+            # Build the percent marker without a literal ``%s`` token: psycopg
+            # reserves that spelling for bind parameters even when the query has
+            # no selector parameters. PostgreSQL's format() still dispatches the
+            # value through its type OUTPUT function.
+            expressions.append(
+                f"format(chr(37) || 's', {naming.quote(source_name)})"
+            )
+            kinds[normalized] = "output"
+        else:
+            expressions.append(naming.quote(source_name))
+            kinds[normalized] = "raw"
+        allowed.append(normalized)
+    return allowed, expressions, kinds, descriptors
+
+
+def _sanitize_source_rows(
+    relation,
+    columns,
+    rows,
+    policy_gate,
+    *,
+    key_columns=(),
+    kinds=None,
+    descriptors=None,
+) -> list[tuple]:
+    from .policy import PostgreSQLOutputText
+
+    normalized_columns = [naming.normalize(column) for column in columns]
+    kinds = kinds or {}
+    descriptors = descriptors or {}
+    output = []
+    for row in rows:
+        mapping = dict(zip(normalized_columns, row, strict=True))
+        output_texts = {}
+        for name, kind in kinds.items():
+            if kind != "output" or mapping.get(name) is None:
+                continue
+            value = mapping[name]
+            if not isinstance(value, str):
+                raise TypeError("PostgreSQL output projection did not return text")
+            descriptor = descriptors.get(name)
+            output_texts[name] = PostgreSQLOutputText(
+                value,
+                getattr(descriptor, "output_function_oid", None),
+            )
+        sanitized = policy_gate.sanitize_mapping(
+            relation.qualified,
+            mapping,
+            descriptors,
+            output_texts=output_texts,
+            key_columns=tuple(key_columns),
+        )
+        output.append(tuple(sanitized[name] for name in normalized_columns if name in sanitized))
+    return output
+
+
+def read_columns(
+    watcher,
+    relation,
+    key_columns,
+    value_columns,
+    *,
+    policy_gate=None,
+) -> list[tuple]:
+    """Read current source values for a fenced add-column backfill.
+
+    With a policy gate, excluded fields are not part of the SELECT and hash/truncate
+    fields are projected through PostgreSQL's OUTPUT-function boundary before the
+    resulting row is returned to the destination backfill path.
+    """
     from .naming import normalize, quote
 
     source_names = {
@@ -454,12 +691,32 @@ def read_columns(watcher, relation, key_columns, value_columns) -> list[tuple]:
             f"source relation {relation.qualified} has no catalog columns for "
             f"{missing}"
         )
-    select_list = ", ".join(quote(source_names[name]) for name in destinations)
+    if policy_gate is not None and policy_gate.policy.enabled:
+        allowed, expressions, kinds, descriptors = _policy_projection(
+            relation, destinations, policy_gate, key_columns=key_columns
+        )
+        if not expressions:
+            return []
+        select_list = ", ".join(expressions)
+    else:
+        allowed = [normalize(name) for name in destinations]
+        select_list = ", ".join(quote(source_names[name]) for name in allowed)
     with watcher._connect() as conn:
-        return conn.execute(
+        rows = conn.execute(
             f"SELECT {select_list} FROM {quote(relation.schema)}."
             f"{quote(relation.table)}"
         ).fetchall()
+    if policy_gate is None or not policy_gate.policy.enabled:
+        return rows
+    return _sanitize_source_rows(
+        relation,
+        allowed,
+        rows,
+        policy_gate,
+        key_columns=key_columns,
+        kinds=kinds,
+        descriptors=descriptors,
+    )
 
 
 def read_event_columns(watcher, event, value_columns) -> dict[str, object] | None:
@@ -478,16 +735,29 @@ def read_event_columns(watcher, event, value_columns) -> dict[str, object] | Non
             normalize(column.name): column.name
             for column in (relation.columns if relation is not None else ())
         }
+        descriptors = {
+            normalize(column.name): column.descriptor
+            for column in (relation.columns if relation is not None else ())
+        }
     if not source_names:
         source_names = {normalize(name): str(name) for name in value_columns}
         for image in (event.key, event.before, event.after):
             for name in (image or {}):
                 source_names.setdefault(normalize(name), str(name))
     with watcher._connect() as conn:
-        return _read_event_columns(conn, event, value_columns, source_names)
+        return _read_event_columns(
+            conn,
+            event,
+            value_columns,
+            source_names,
+            policy_gate=getattr(watcher, "policy_gate", None),
+            descriptors=descriptors,
+        )
 
 
-def read_event_columns_from_connection(con, event, value_columns) -> dict[str, object] | None:
+def read_event_columns_from_connection(
+    con, event, value_columns, *, policy_gate=None, descriptors=None
+) -> dict[str, object] | None:
     """Connection-backed variant used by the bounded resnapshot descriptor provider."""
     from .naming import normalize
 
@@ -495,11 +765,36 @@ def read_event_columns_from_connection(con, event, value_columns) -> dict[str, o
     for image in (event.key, event.before, event.after):
         for name in (image or {}):
             source_names.setdefault(normalize(name), str(name))
-    return _read_event_columns(con, event, value_columns, source_names)
+    return _read_event_columns(
+        con,
+        event,
+        value_columns,
+        source_names,
+        policy_gate=policy_gate,
+        descriptors=descriptors,
+    )
 
 
-def _read_event_columns(con, event, value_columns, source_names) -> dict[str, object] | None:
+def _read_event_columns(
+    con,
+    event,
+    value_columns,
+    source_names,
+    *,
+    policy_gate=None,
+    descriptors=None,
+) -> dict[str, object] | None:
     from .naming import normalize, quote
+
+    if policy_gate is None:
+        raise SchemaEvolutionRefused(
+            f"source recovery for {event.qualified_table} requires an attached "
+            "policy gate",
+            source_schema=event.schema,
+            source_table=event.table,
+            target=event.qualified_table,
+            refusal_origin="catalog_shape",
+        )
 
     values = tuple(normalize(name) for name in value_columns)
     missing = [name for name in values if name not in source_names]
@@ -518,6 +813,15 @@ def _read_event_columns(con, event, value_columns, source_names) -> dict[str, ob
     for raw_name, value in key.items():
         name = normalize(raw_name)
         if name in source_names:
+            if policy_gate is not None and policy_gate.policy.enabled:
+                rule = policy_gate.policy.rule_for(event.qualified_table, name)
+                if rule.action != "replicate":
+                    from .policy import PolicyValueRefused
+
+                    raise PolicyValueRefused(
+                        "a transformed or excluded source key cannot identify a "
+                        "source recovery row"
+                    )
             predicates.append(f"{quote(source_names[name])} IS NOT DISTINCT FROM %s")
             params.append(value)
     if not predicates:
@@ -528,7 +832,27 @@ def _read_event_columns(con, event, value_columns, source_names) -> dict[str, ob
                 continue
             predicates.append(f"{quote(source_names[name])} IS NOT DISTINCT FROM %s")
             params.append(value)
-    select_list = ", ".join(quote(source_names[name]) for name in values)
+    kinds: dict[str, str] = {}
+    if policy_gate is not None and policy_gate.policy.enabled:
+        descriptors = descriptors or {}
+        expressions = []
+        for name in values:
+            rule = policy_gate.policy.rule_for(event.qualified_table, name)
+            if rule.action == "exclude":
+                continue
+            if rule.action in {"hash", "truncate"}:
+                expressions.append(
+                    f"format(chr(37) || 's', {quote(source_names[name])})"
+                )
+                kinds[name] = "output"
+            else:
+                expressions.append(quote(source_names[name]))
+                kinds[name] = "raw"
+        select_list = ", ".join(expressions)
+        if not select_list:
+            return {}
+    else:
+        select_list = ", ".join(quote(source_names[name]) for name in values)
     query = (
         f"SELECT {select_list} FROM {quote(event.schema)}.{quote(event.table)}"
         + (" WHERE " + " AND ".join(predicates) if predicates else "")
@@ -546,4 +870,23 @@ def _read_event_columns(con, event, value_columns, source_names) -> dict[str, ob
             target=event.qualified_table,
             refusal_origin="catalog_shape",
         )
-    return dict(zip(values, rows[0], strict=True))
+    if policy_gate is None or not policy_gate.policy.enabled:
+        return dict(zip(values, rows[0], strict=True))
+    selected = [name for name in values if policy_gate.policy.rule_for(event.qualified_table, name).action != "exclude"]
+    raw = dict(zip(selected, rows[0], strict=True))
+    from .policy import PostgreSQLOutputText
+
+    output_texts = {
+        name: PostgreSQLOutputText(
+            raw[name],
+            getattr((descriptors or {}).get(name), "output_function_oid", None),
+        )
+        for name, kind in kinds.items()
+        if kind == "output" and raw.get(name) is not None
+    }
+    return policy_gate.sanitize_mapping(
+        event.qualified_table,
+        raw,
+        descriptors or {},
+        output_texts=output_texts,
+    )

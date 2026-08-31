@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .envelope import PendingRecord
+from .event_ledger import payload_digest
 from .row_patch import RowPatch
 from .typed_types import FieldState
 
@@ -26,6 +27,10 @@ class KeylessOperation:
     after: dict[str, Any] | None = None
     before: dict[str, Any] | None = None
     image_digest: str | None = None
+    delete_mode: str = "hard"
+    source_lsn: int | None = None
+    txn_id: str | None = None
+    total_order: int | None = None
 
 
 def collect(
@@ -80,15 +85,20 @@ def collect(
             # reading and composing the matched physical row.  Refuse that
             # impossible image rather than inventing unchanged values.
             complete_image(item, patch, after=True)
-        item.keyless_operations.append(
-            KeylessOperation(
-                event_id=event_id,
-                operation=event.op,
-                before=before,
-                after=after,
-                image_digest=patch.digest,
-            )
+        operation = KeylessOperation(
+            event_id=event_id,
+            operation=event.op,
+            before=before,
+            after=after,
+            image_digest=payload_digest(event),
+            delete_mode=getattr(event, "delete_mode", None) or "hard",
+            source_lsn=event.lsn,
+            txn_id=event.txn_id,
+            total_order=event.total_order,
         )
+        item.keyless_operations.append(operation)
+        if event.op == "d":
+            item.delete_effects[event_id] = operation
     else:
         if patch.has_marker():
             _missing_toast_base(item, reason="keyless sparse change has no safe base")
@@ -97,12 +107,16 @@ def collect(
                 event_id=event_id,
                 operation=event.op,
                 after=patch.encoded_values(),
-                image_digest=patch.digest,
+                image_digest=payload_digest(event),
+                delete_mode=getattr(event, "delete_mode", None) or "hard",
+                source_lsn=event.lsn,
+                txn_id=event.txn_id,
+                total_order=event.total_order,
             )
         )
     item.keyless_event_ids.add(event_id)
     if not item.snapshot:
-        item.keyless_ledger.append((event_id, event.op, patch.digest))
+        item.keyless_ledger.append((event_id, event.op, payload_digest(event)))
 
 
 def complete_image(item, patch: RowPatch, *, after: bool) -> dict[str, Any]:

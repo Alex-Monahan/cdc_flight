@@ -22,6 +22,11 @@ ARROW_CHUNK = 100_000
 
 log = logging.getLogger("cdc_flight.typed_materialization")
 
+
+def _value_type(value: Any) -> str:
+    value_type = type(value)
+    return f"{value_type.__module__}.{value_type.__qualname__}"
+
 def _copy_rows_with_identity(
     con,
     table: TableSchema,
@@ -657,7 +662,10 @@ def _bulk_insert_typed_rows(
                 if value is None:
                     value = _tagged_union_null(native)
                 if not isinstance(value, UnionValue) or value.member.lower() not in members:
-                    raise ValueError(f"invalid numeric UNION value for {column}: {value!r}")
+                    raise ValueError(
+                        f"invalid numeric UNION value for {column}: "
+                        f"{_value_type(value)}"
+                    )
                 member = value.member.lower()
                 member_type = members[member]
                 member_values.append(member)
@@ -750,8 +758,8 @@ def insert_typed_rows(
             row_params.extend(bound)
         if any(_contains_union(parameter, UnionValue) for parameter in row_params):
             raise ValueError(
-                f"typed parameter escaped UNION lowering for columns {columns!r}: "
-                f"{row_params!r}"
+                f"typed parameter escaped UNION lowering for columns {columns!r}; "
+                "bound values are intentionally omitted"
             )
         if value_rows and (
             len(value_rows) >= MAX_ROWS_PER_STATEMENT
@@ -814,7 +822,9 @@ def _typed_parameter(value: Any, native: Any) -> tuple[str, list[Any]]:
             # native VARIANT value.  This is also the recursive form used inside
             # LIST/STRUCT/MAP and UNION members.
             return "CAST(CAST(? AS JSON) AS VARIANT)", [value]
-        raise ValueError(f"value for VARIANT is not validated JSON text: {value!r}")
+        raise ValueError(
+            f"value for VARIANT is not validated JSON text ({_value_type(value)})"
+        )
     if native.kind == "JSON":
         source = native.source
         seen: set[int] = set()
@@ -827,7 +837,9 @@ def _typed_parameter(value: Any, native: Any) -> tuple[str, list[Any]]:
             return "JSON 'null'", []
         if isinstance(value, str):
             return "CAST(? AS JSON)", [value]
-        raise ValueError(f"value for JSON is not validated JSON text: {value!r}")
+        raise ValueError(
+            f"value for JSON is not validated JSON text ({_value_type(value)})"
+        )
     if native.kind in {"UNION", "NUMERIC_UNION"}:
         raise ValueError(
             f"value for {native.sql} lacks an explicit UNION member; refusing an implicit cast"

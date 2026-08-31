@@ -117,10 +117,6 @@ def _queued(change: CatalogChange) -> CatalogChange:
     return catalog_state.queued(change)
 
 
-def _missing_value(raw: str | None, type_name: str) -> object | None:
-    return catalog_state._missing_value(raw, type_name)
-
-
 def read_known_relations(
     con, pipeline: str, *, control_schema: str | None = None
 ) -> dict[str, SourceRelation]:
