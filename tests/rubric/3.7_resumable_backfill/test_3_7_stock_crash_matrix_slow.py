@@ -6,6 +6,7 @@ import hashlib
 import re
 import subprocess
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from cdc_flight.backfill import (
 pytestmark = pytest.mark.slow
 
 QUALIFIED_TABLES = ("app.p3b_resume_composite", "app.p3b_resume_uuid")
+TRIGGER_TABLE = ("p3b_resume_trigger", "app.p3b_resume_trigger")
 TABLE_CASES = {
     "composite": ("p3b_resume_composite", "app.p3b_resume_composite"),
     "uuid": ("p3b_resume_uuid", "app.p3b_resume_uuid"),
@@ -30,6 +32,12 @@ TABLE_CASES = {
 SIGNAL_ID = "p3b-stock-crash-signal"
 REQUEST_ID = "p3b-stock-crash-request"
 CHILD = Path(__file__).resolve().parents[2] / "support" / "crash_matrix_child.py"
+
+
+def _cdc_table_names(table_specs) -> str:
+    return ",".join(
+        [name for name, _qualified in table_specs] + [TRIGGER_TABLE[0]]
+    )
 
 
 def _seed_key_types(sandbox, label: str, table_specs) -> None:
@@ -50,14 +58,18 @@ def _seed_key_types(sandbox, label: str, table_specs) -> None:
             "PRIMARY KEY (tenant_id, row_id))",
             "CREATE TABLE app.p3b_resume_uuid ("
             "id uuid PRIMARY KEY, payload text NOT NULL)",
+            "CREATE TABLE app.p3b_resume_trigger ("
+            "id integer PRIMARY KEY, payload text NOT NULL)",
             "ALTER PUBLICATION cdc_flight_pub ADD TABLE app.p3b_resume_composite",
             "ALTER PUBLICATION cdc_flight_pub ADD TABLE app.p3b_resume_uuid",
+            "ALTER PUBLICATION cdc_flight_pub ADD TABLE app.p3b_resume_trigger",
             "INSERT INTO app.p3b_resume_composite (tenant_id, row_id, payload) "
             "SELECT ((g - 1) % 17) + 1, g, 'composite-' || g "
             "FROM generate_series(1, 1200) AS s(g)",
             "INSERT INTO app.p3b_resume_uuid (id, payload) "
             "SELECT gen_random_uuid(), 'uuid-' || g "
             "FROM generate_series(1, 1200) AS s(g)",
+            "INSERT INTO app.p3b_resume_trigger (id, payload) VALUES (1, 'baseline')",
         ],
         one_transaction=True,
     )
@@ -68,7 +80,7 @@ def _seed_key_types(sandbox, label: str, table_specs) -> None:
         extra_env={
             "CDC_AUTO_DISCOVERY": "0",
             "CDC_DROP_MODE": "ignore",
-            "CDC_TABLES": ",".join(name for name, _qualified in table_specs),
+            "CDC_TABLES": _cdc_table_names(table_specs),
             "CDC_INCREMENTAL_SNAPSHOT_CHUNK_SIZE": "400",
             "CDC_COMMIT_MAX_EVENTS": "400",
         },
@@ -107,6 +119,49 @@ def _write_signal(sandbox, signal) -> None:
     ).insert(signal)
 
 
+def _write_trigger_update(sandbox, *, point: str, nth: int, table_specs) -> str:
+    payload = f"trigger-{table_specs[0][0]}-{point}-{nth}"
+    with psycopg.connect(sandbox.source.dsn) as source:
+        source.execute(
+            "UPDATE app.p3b_resume_trigger SET payload = %s WHERE id = 1",
+            (payload,),
+        )
+        trigger_lsn = source.execute(
+            "SELECT pg_current_wal_lsn()"
+        ).fetchone()[0]
+        source.commit()
+    return str(trigger_lsn)
+
+
+def _wait_for_trigger_durable(sandbox, process, trigger_lsn: str) -> None:
+    """Wait for the trigger update's actual destination commit outcome.
+
+    The source slot's confirmed flush LSN is advanced only after the product
+    has committed the corresponding change in the destination. The deadline
+    only bounds a broken pipeline; completion is gated by that durable outcome,
+    not by elapsed time or a scheduling sleep.
+    """
+    deadline = time.monotonic() + 180
+    while True:
+        if process.poll() is not None:
+            raise AssertionError(
+                "pipeline exited before the trigger update became durable "
+                f"(returncode={process.returncode})"
+            )
+        if sandbox.pg_query(
+            "SELECT confirmed_flush_lsn IS NOT NULL "
+            "AND confirmed_flush_lsn >= %s::pg_lsn "
+            "FROM pg_replication_slots WHERE slot_name = %s",
+            (trigger_lsn, sandbox.slot),
+        ) == [(True,)]:
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                "trigger update did not reach its durable destination row"
+            )
+        time.sleep(0.1)
+
+
 def _child_env(
     sandbox,
     *,
@@ -127,7 +182,7 @@ def _child_env(
         "CDC_BACKFILL_INSERT_SIGNAL": "1" if insert_signal else "0",
         "CDC_AUTO_DISCOVERY": "0",
         "CDC_DROP_MODE": "ignore",
-        "CDC_TABLES": ",".join(name for name, _qualified in table_specs),
+        "CDC_TABLES": _cdc_table_names(table_specs),
         "CDC_INCREMENTAL_SNAPSHOT_CHUNK_SIZE": "400",
         "CDC_COMMIT_MAX_EVENTS": "400",
     }
@@ -173,7 +228,7 @@ def _run_pipeline_crash(sandbox, signal, *, point: str, nth: int, table_specs) -
         extra_env={
             "CDC_AUTO_DISCOVERY": "0",
             "CDC_DROP_MODE": "ignore",
-            "CDC_TABLES": ",".join(name for name, _qualified in table_specs),
+            "CDC_TABLES": _cdc_table_names(table_specs),
             "CDC_INCREMENTAL_SNAPSHOT_CHUNK_SIZE": "400",
             "CDC_COMMIT_MAX_EVENTS": "400",
             "CDC_FAULT_INJECT": f"{point}:{nth}",
@@ -183,6 +238,10 @@ def _run_pipeline_crash(sandbox, signal, *, point: str, nth: int, table_specs) -
     )
     try:
         sandbox.wait_for_slot_active(process=process, timeout=74)
+        trigger_lsn = _write_trigger_update(
+            sandbox, point=point, nth=nth, table_specs=table_specs
+        )
+        _wait_for_trigger_durable(sandbox, process, trigger_lsn)
         _write_signal(sandbox, signal)
         stdout, stderr = process.communicate(timeout=360)
         fired = sandbox.fired_fault()
@@ -212,7 +271,7 @@ def _recover_and_assert_exact(sandbox, table_specs) -> None:
         extra_env={
             "CDC_AUTO_DISCOVERY": "0",
             "CDC_DROP_MODE": "ignore",
-            "CDC_TABLES": ",".join(name for name, _qualified in table_specs),
+            "CDC_TABLES": _cdc_table_names(table_specs),
             "CDC_INCREMENTAL_SNAPSHOT_CHUNK_SIZE": "400",
             "CDC_COMMIT_MAX_EVENTS": "400",
         },
