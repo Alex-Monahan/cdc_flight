@@ -7,6 +7,8 @@ and reports the small set of counters/markers the owner exposes.
 
 from __future__ import annotations
 
+import time
+
 from . import destination, spill_refusal
 from .faults import maybe_crash
 from .planner import GroupPlan
@@ -97,15 +99,39 @@ def apply_units(
         delete_policy=applier.delete_policy,
         policy_gate=applier.policy_gate,
     )
-    for unit in group:
-        if unit.fenced:
-            if unit.spill_unit_seq is not None:
-                applier.fenced_spilled_events += unit.spilled_events
-                plan.staged_units = True
-            continue
-        if unit.kind == "snapshot_chunk" and not getattr(unit, "incremental", False):
-            applier.group.is_snapshot = True
-        plan.add_unit(unit)
+    if plan._event_ledger is not None:
+        stream_pairs = [
+            (
+                applier.snapshots.target_table(event.schema, event.table),
+                str(event.txn_id),
+            )
+            for unit in group
+            if unit.kind != "snapshot_chunk"
+            for event in unit.events
+            if (
+                event.txn_id is not None
+                and event.schema
+                and event.table
+                and not event.incremental
+            )
+        ]
+        plan._event_ledger.prefetch_transactions(stream_pairs)
+    fold_started = (
+        time.perf_counter() if getattr(applier, "_perf_timing", False) else None
+    )
+    try:
+        for unit in group:
+            if unit.fenced:
+                if unit.spill_unit_seq is not None:
+                    applier.fenced_spilled_events += unit.spilled_events
+                    plan.staged_units = True
+                continue
+            if unit.kind == "snapshot_chunk" and not getattr(unit, "incremental", False):
+                applier.group.is_snapshot = True
+            plan.add_unit(unit)
+    finally:
+        if fold_started is not None:
+            plan.stats["fold_sec"] = time.perf_counter() - fold_started
 
     anchor = None
     if has_data:

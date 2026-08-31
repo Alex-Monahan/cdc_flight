@@ -236,6 +236,9 @@ def commit_group(self, trigger: str) -> CommitResult:
         # callback is deliberately I/O-free: if it fires, it may be running inside
         # COMMIT_ACK and may only terminate the process.
         self._arm_commit_timeout_alert(commit_id)
+        commit_started = (
+            time.monotonic() if getattr(self, "_perf_timing", False) else None
+        )
         ack_entered = False
         with self_heal.commit_watchdog(self.cfg.commit_timeout, commit_id):
             # INSIDE the watchdog (Codex r3 MAJOR-2). `enter()` waits, without a
@@ -322,6 +325,10 @@ def commit_group(self, trigger: str) -> CommitResult:
         # This DELETE is observability I/O, so it is intentionally after
         # COMMIT_ACK.leave() and outside the watchdog's guarded window.
         self._clear_commit_timeout_alert(commit_id)
+        if commit_started is not None and self.last_commit_monotonic is not None:
+            self._phase_timings["commit_sec"] += (
+                self.last_commit_monotonic - commit_started
+            )
     # SCD2 refusals are admission-classified for the package-wide containment
     # closure, but retain AmbiguousDelete's history-aware resnapshot route.  The
     # specialized handler must therefore precede the common admission handler.

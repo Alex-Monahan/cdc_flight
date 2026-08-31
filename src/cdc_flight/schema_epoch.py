@@ -216,6 +216,9 @@ def merge_apply_stats(total: dict | None, part: dict) -> dict:
         total["max_source_ts"] = max(
             total["max_source_ts"] or 0, part["max_source_ts"]
         )
+    for name in ("fold_sec", "event_ledger_sec", "destination_write_sec"):
+        if name in part:
+            total[name] = total.get(name, 0.0) + part[name]
     return total
 
 

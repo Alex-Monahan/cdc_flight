@@ -25,6 +25,7 @@ there is no attempt to commit a torn in-place table.
 from __future__ import annotations
 
 import logging
+import time
 
 from . import (
     apply_sql,
@@ -1147,7 +1148,11 @@ class GroupPlan:
         # both SCD2 history DML and current-table materialization.  A rollback
         # discards this batch together with the data/state transaction.
         if self._event_ledger is not None:
+            ledger_started = time.perf_counter()
             self._event_ledger.flush()
+            self.stats["event_ledger_sec"] = time.perf_counter() - ledger_started
+        else:
+            self.stats["event_ledger_sec"] = 0.0
         for event in self.scd2_events:
             result = scd2.apply_event(
                 self.con,
@@ -1170,6 +1175,7 @@ class GroupPlan:
             after_first_table()
             anchor_called = True
 
+        destination_started = time.perf_counter()
         for index, item in enumerate(list(self.work.values())):
             try:
                 table_writer.write(
@@ -1225,6 +1231,7 @@ class GroupPlan:
             if item.events:
                 self.stats["tables"].add(item.target)
                 self.table_counts[item.target] = self.table_counts.get(item.target, 0) + item.events
+        self.stats["destination_write_sec"] = time.perf_counter() - destination_started
 
         presence_rows = [
             (self.registry.dataset, target, event_id, column, True, digest)

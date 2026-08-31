@@ -326,6 +326,7 @@ def test_stream_ledger_batch_reads_one_source_transaction_for_replay(monkeypatch
 
         monkeypatch.setattr(destination, "read_event_ledger", unexpected_per_event_read)
         replay = destination.EventLedgerBatch(con, pipeline="p78")
+        replay.prefetch_transactions([("target", str(first_identity.txn_id))])
         con.execute("BEGIN")
         assert destination.claim_event_ledger(
             con,

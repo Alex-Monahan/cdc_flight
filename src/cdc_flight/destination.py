@@ -1016,6 +1016,47 @@ class EventLedgerBatch:
             )
         self._loaded_transactions.add(cache_key)
 
+    def prefetch_transactions(self, pairs: list[tuple[str, str]]) -> None:
+        """Load a bounded set of streaming transactions with batched reads.
+
+        A high-TPS source commonly emits many one-row PostgreSQL transactions.
+        The identity check still happens before folding and the ledger insert still
+        happens in this destination transaction, but a plan can discover existing
+        claims with a bounded number of indexed reads instead of one round trip per
+        source transaction.  The caller supplies only the current whole-unit group,
+        so this cache cannot become a process-lifetime event-ledger index.
+        """
+        grouped: dict[str, set[str]] = {}
+        for target_table, txn_id in pairs:
+            if txn_id is None:
+                continue
+            grouped.setdefault(str(target_table), set()).add(str(txn_id))
+        batch_size = 256
+        for target_table, txn_ids in grouped.items():
+            pending = sorted(
+                txn_id
+                for txn_id in txn_ids
+                if (target_table, txn_id) not in self._loaded_transactions
+            )
+            for start in range(0, len(pending), batch_size):
+                batch = pending[start : start + batch_size]
+                placeholders = ", ".join("?" for _ in batch)
+                rows = self.con.execute(
+                    f"SELECT event_id, {self._READ_COLUMNS} FROM "
+                    f"{_control_table(self.control_schema, 'event_ledger')} "
+                    "WHERE pipeline = ? AND target_table = ? "
+                    f"AND txn_id IN ({placeholders})",
+                    [self.pipeline, target_table, *batch],
+                ).fetchall()
+                for row in rows:
+                    event_id = str(row[0])
+                    self._known[(target_table, event_id)] = self._row_from_values(
+                        target_table, event_id, row[1:]
+                    )
+                self._loaded_transactions.update(
+                    (target_table, txn_id) for txn_id in batch
+                )
+
     @staticmethod
     def _pending_row(identity, *, pipeline: str, target_table: str, source_lsn: int | None):
         return [

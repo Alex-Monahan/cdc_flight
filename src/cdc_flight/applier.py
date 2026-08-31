@@ -41,6 +41,7 @@ second path had grown alongside the first.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from typing import Any
@@ -451,6 +452,17 @@ class Applier:
         #: Set immediately after the destination COMMIT for supervisor timing
         #: evidence; it is never used to authorize an acknowledgement.
         self.last_commit_monotonic: float | None = None
+        #: Optional evidence-only phase clocks. They are off by default so the
+        #: production hot path does not pay a clock read per record.
+        self._perf_timing = os.environ.get("CDC_PERF_TIMING") == "1"
+        self._phase_timings = {
+            "decode_sec": 0.0,
+            "fold_sec": 0.0,
+            "spill_sec": 0.0,
+            "event_ledger_sec": 0.0,
+            "destination_write_sec": 0.0,
+            "commit_sec": 0.0,
+        }
         self.error: BaseException | None = None
         self._next_commit_id = destination.next_commit_id(
             con, pipeline, control_schema=self.control_schema
@@ -582,6 +594,16 @@ class Applier:
             "callback_quiesced": self.callback_quiesced,
             "drain_requested": self._drain_requested,
             "source_marker_records_received": self.source_marker_records_received,
+            **(
+                {
+                    "performance_timings": {
+                        name: round(value, 6)
+                        for name, value in self._phase_timings.items()
+                    }
+                }
+                if self._perf_timing
+                else {}
+            ),
             **self.catalog_coordinator.summary(),
             **(self.catalog.summary() if self.catalog is not None else {}),
         }
@@ -763,32 +785,37 @@ class Applier:
                 continue
 
             source_records += 1
-            rec = decode(raw, topic_prefix=self.topic_prefix)
-            if rec.incremental:
-                run = self.backfill.incremental_owner(rec.schema or "", rec.table or "")
-                rec = decode_incremental_record(
-                    raw,
-                    topic_prefix=self.topic_prefix,
-                    signal_id=run.signal_id if run is not None else None,
-                )
-                if run is not None and run.state == "complete":
-                    # The terminal run is retained until source-offset
-                    # reconciliation. A replay in that interval is already
-                    # durable in the published shadow image; acknowledge it as a
-                    # control record rather than ever feeding a stale READ into
-                    # the new live table.
-                    rec.kind = KIND_HEARTBEAT
-                    rec.schema = None
-                    rec.table = None
-                    rec.op = None
-                else:
-                    # A row may be replayed before its STARTED notification's
-                    # commit is observed. Do not create lifecycle/shadow state
-                    # outside the commit protocol; GroupPlan will admit it after
-                    # BEGIN, while a committed STARTED notification has already
-                    # installed the route.
-                    self._ensure_backfill_route(rec.schema, rec.table, run, create=False)
-            self._sanitize_record(rec)
+            decode_started = time.perf_counter() if self._perf_timing else None
+            try:
+                rec = decode(raw, topic_prefix=self.topic_prefix)
+                if rec.incremental:
+                    run = self.backfill.incremental_owner(rec.schema or "", rec.table or "")
+                    rec = decode_incremental_record(
+                        raw,
+                        topic_prefix=self.topic_prefix,
+                        signal_id=run.signal_id if run is not None else None,
+                    )
+                    if run is not None and run.state == "complete":
+                        # The terminal run is retained until source-offset
+                        # reconciliation. A replay in that interval is already
+                        # durable in the published shadow image; acknowledge it as a
+                        # control record rather than ever feeding a stale READ into
+                        # the new live table.
+                        rec.kind = KIND_HEARTBEAT
+                        rec.schema = None
+                        rec.table = None
+                        rec.op = None
+                    else:
+                        # A row may be replayed before its STARTED notification's
+                        # commit is observed. Do not create lifecycle/shadow state
+                        # outside the commit protocol; GroupPlan will admit it after
+                        # BEGIN, while a committed STARTED notification has already
+                        # installed the route.
+                        self._ensure_backfill_route(rec.schema, rec.table, run, create=False)
+                self._sanitize_record(rec)
+            finally:
+                if decode_started is not None:
+                    self._phase_timings["decode_sec"] += time.perf_counter() - decode_started
             ignored_source_record = rec.qualified_table in self.ignored_source_tables
             if ignored_source_record:
                 # The source signal row is a control-plane request. It still
@@ -1319,7 +1346,7 @@ class Applier:
         catalog_plan: CatalogPlan | None,
         catalog_stats: dict,
     ) -> dict:
-        return self._schema_epochs.apply(
+        stats = self._schema_epochs.apply(
             group,
             commit_id,
             has_data=has_data,
@@ -1327,6 +1354,10 @@ class Applier:
             catalog_stats=catalog_stats,
             created_in_txn=self.group.created_in_txn,
         )
+        if self._perf_timing:
+            for name in ("fold_sec", "event_ledger_sec", "destination_write_sec"):
+                self._phase_timings[name] += stats.get(name, 0.0)
+        return stats
 
     @staticmethod
     def _refuse_mixed_schema_epoch(events: list, actions: list) -> None:
@@ -1404,9 +1435,14 @@ class Applier:
         snapshot: tuple[str | None, str | None] | None = None,
     ) -> int:
         try:
-            return spill_protocol.stage_events(
-                self, events, unit_seq=unit_seq, snapshot=snapshot
-            )
+            started = time.perf_counter() if self._perf_timing else None
+            try:
+                return spill_protocol.stage_events(
+                    self, events, unit_seq=unit_seq, snapshot=snapshot
+                )
+            finally:
+                if started is not None:
+                    self._phase_timings["spill_sec"] += time.perf_counter() - started
         except AdmissionError as error:
             refused = as_schema_refusal(error, refusal_origin="spill_protocol")
             self._handle_spill_refusal(refused, events)
