@@ -1599,6 +1599,39 @@ class BackfillCoordinator:
         else:
             self.repository.transaction(publish)
 
+    def complete_after_resnapshot(
+        self, schema: str, table: str, *, snapshot_lsn: int | None
+    ) -> None:
+        """Close an interrupted incremental run after its fallback image is durable.
+
+        A process can die after an incremental shadow has become durable but before
+        the stock signal's source offset is acknowledged.  Startup promotes that
+        half-built lifecycle to the blocking re-snapshot queue.  Once the replacement
+        image commits, the old incremental run is no longer work that a replayed stock
+        notification may reopen: the image has already replaced it.  Finish that
+        durable run here, before the main engine is allowed to consume the replay.
+        """
+        def publish() -> None:
+            run = self.repository.active(schema, table)
+            if run is None or run.effective_mode != "incremental":
+                return
+            if run.state == "loading":
+                run = self.repository.transition(run, "ready_to_swap")
+            if run.state == "ready_to_swap":
+                run = self.repository.transition(run, "swapping")
+            if run.state == "swapping":
+                run = self.repository.transition(
+                    run,
+                    "complete",
+                    terminal_source_point=str(snapshot_lsn or ""),
+                    notification_status="COMPLETED",
+                )
+                self.claims.release(
+                    schema, table, owner_kind="backfill", owner_id=run.run_id
+                )
+
+        self.repository.transaction(publish)
+
     def observe_notification(
         self, notification: IncrementalNotification, *, in_transaction: bool = False
     ) -> BackfillRun | None:

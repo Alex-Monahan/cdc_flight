@@ -45,6 +45,7 @@ def run_owed(
     control_schema: str | None,
     catalog=None,
     resnapshot_run,
+    on_table_complete=None,
 ) -> tuple[list[dict], dict, int]:
     """Retry pending refusals alone, then rebuild healthy tables together."""
     quarantined_names = destination.quarantined_tables(
@@ -159,6 +160,15 @@ def run_owed(
             )
             detail = result.as_dict()
             snapshot_epoch = max(snapshot_epoch, result.snapshot_epoch)
+            if on_table_complete is not None:
+                for qualified in (
+                    *result.swapped,
+                    *result.emptied,
+                    *result.logged_drops,
+                    *result.dropped,
+                ):
+                    schema, table = qualified.split(".", 1)
+                    on_table_complete(schema, table, result.consistent_lsn)
         except AdmissionError as error:
             refused = as_schema_refusal(error, refusal_origin="schema_backfill")
             # The refusal writer has already scoped this batch's table.  Continue

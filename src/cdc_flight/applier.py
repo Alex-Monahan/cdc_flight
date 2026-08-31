@@ -776,11 +776,17 @@ class Applier:
                     # reconciliation. A replay in that interval is already
                     # durable in the published shadow image; acknowledge it as a
                     # control record rather than ever feeding a stale READ into
-                    # the new live table.
+                    # the new live table. Clear the snapshot markers as well as
+                    # the kind: the assembler must not turn this acknowledged
+                    # replay back into an incremental CompleteUnit and reopen a
+                    # shadow after a fallback re-snapshot.
                     rec.kind = KIND_HEARTBEAT
                     rec.schema = None
                     rec.table = None
                     rec.op = None
+                    rec.snapshot = None
+                    rec.incremental = False
+                    rec.snapshot_identity = None
                 else:
                     # A row may be replayed before its STARTED notification's
                     # commit is observed. Do not create lifecycle/shadow state
@@ -889,8 +895,31 @@ class Applier:
         # Queue state with the source notification. The commit protocol applies
         # it after its one BEGIN and before row DML, so notification state,
         # shadow rows, progress, and the resume point share one transaction.
-        self._pending_backfill_notifications.append(notification)
         decoded = decode(raw, topic_prefix=self.topic_prefix, want_offsets=True)
+        if notification.table and "." in notification.table:
+            schema, table = notification.table.split(".", 1)
+            run = self.backfill.incremental_owner(schema, table)
+            if run is not None and run.state == "complete":
+                # A fallback re-snapshot may publish the replacement image before
+                # the source signal's unacknowledged terminal notification is
+                # replayed. That notification is already represented by the
+                # durable terminal run; acknowledge it as control rather than
+                # reopening an incremental shadow after the replacement image.
+                decoded.kind = KIND_HEARTBEAT
+                decoded.schema = None
+                decoded.table = None
+                decoded.op = None
+                self._add_unit(
+                    CompleteUnit(
+                        kind=UNIT_CONTROL,
+                        records=[decoded],
+                        nbytes=decoded.nbytes,
+                        last_lsn=decoded.lsn or 0,
+                        commit_lsn=decoded.lsn,
+                    )
+                )
+                return
+        self._pending_backfill_notifications.append(notification)
         decoded.kind = KIND_HEARTBEAT
         decoded.schema = None
         decoded.table = None

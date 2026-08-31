@@ -830,6 +830,12 @@ def run(
         )
         if interrupted:
             summary_extra["interrupted_snapshots_requeued"] = interrupted
+        backfill = BackfillCoordinator(
+            con,
+            pipeline=dest.pipeline_name,
+            control_schema=control_schema,
+            topic_prefix=replication.topic_prefix,
+        )
         owed = dest_mod.tables_awaiting_snapshot(
             con, dest.pipeline_name, control_schema=control_schema
         )
@@ -892,6 +898,11 @@ def run(
                     drop_mode=applier_cfg.drop_mode,
                     control_schema=control_schema, catalog=watcher,
                     resnapshot_run=resnapshot_mod.run,
+                    on_table_complete=(
+                        lambda schema, table, snapshot_lsn: backfill.complete_after_resnapshot(
+                            schema, table, snapshot_lsn=snapshot_lsn
+                        )
+                    ),
                 )
             )
             summary_extra.update(latest_resnapshot)
@@ -957,12 +968,6 @@ def run(
         # swap callback, so a restart sees either the old active run or the fully
         # published image. This is deliberately startup consumption: a live main-
         # engine polling loop would create a second source owner.
-        backfill = BackfillCoordinator(
-            con,
-            pipeline=dest.pipeline_name,
-            control_schema=control_schema,
-            topic_prefix=replication.topic_prefix,
-        )
         scheduled_full = [
             run for run in backfill.active_runs()
             if run.effective_mode == "full"
