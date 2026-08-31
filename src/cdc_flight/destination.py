@@ -931,7 +931,7 @@ def read_event_ledger(
 
 
 class EventLedgerBatch:
-    """Claim event identities with one read and one bulk insert per plan.
+    """Claim event identities with bounded reads and one bulk insert per plan.
 
     Snapshot callbacks can contain tens of thousands of rows.  The old claim path
     issued a destination SELECT and INSERT for every row, which made the callback
@@ -968,6 +968,10 @@ class EventLedgerBatch:
         self.control_schema = control_schema
         self._known: dict[tuple[str, str], object] = {}
         self._loaded_targets: set[str] = set()
+        #: Streaming identities carry the source transaction id.  Loading only that
+        #: transaction keeps replay checks exact without turning a long-lived
+        #: pipeline into an unbounded event-ledger cache.
+        self._loaded_transactions: set[tuple[str, str]] = set()
         self._pending: list[list[Any]] = []
 
     def _row_from_values(self, target_table: str, event_id: str, row) -> dict[str, Any]:
@@ -993,6 +997,24 @@ class EventLedgerBatch:
                 target_table, event_id, row[1:]
             )
         self._loaded_targets.add(target_table)
+
+    def _load_transaction(self, target_table: str, txn_id: str) -> None:
+        """Read committed claims for one source transaction into the plan cache."""
+        cache_key = (target_table, str(txn_id))
+        if cache_key in self._loaded_transactions:
+            return
+        rows = self.con.execute(
+            f"SELECT event_id, {self._READ_COLUMNS} FROM "
+            f"{_control_table(self.control_schema, 'event_ledger')} "
+            "WHERE pipeline = ? AND target_table = ? AND txn_id = ?",
+            [self.pipeline, target_table, txn_id],
+        ).fetchall()
+        for row in rows:
+            event_id = str(row[0])
+            self._known[(target_table, event_id)] = self._row_from_values(
+                target_table, event_id, row[1:]
+            )
+        self._loaded_transactions.add(cache_key)
 
     @staticmethod
     def _pending_row(identity, *, pipeline: str, target_table: str, source_lsn: int | None):
@@ -1028,6 +1050,8 @@ class EventLedgerBatch:
         key = (target_table, identity.event_id)
         if snapshot:
             self._load_target(target_table)
+        elif identity.txn_id is not None:
+            self._load_transaction(target_table, str(identity.txn_id))
         observed = self._known.get(key)
         if observed is not None:
             if isinstance(observed, dict):
@@ -1047,7 +1071,7 @@ class EventLedgerBatch:
                 raise
             return True
 
-        if not snapshot:
+        if not snapshot and identity.txn_id is None:
             existing = read_event_ledger(
                 self.con,
                 pipeline=self.pipeline,

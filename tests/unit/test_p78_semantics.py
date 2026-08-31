@@ -292,6 +292,62 @@ def test_snapshot_ledger_batch_claims_before_dml_and_replays_as_noop():
         con.close()
 
 
+def test_stream_ledger_batch_reads_one_source_transaction_for_replay(monkeypatch):
+    con = _con()
+    try:
+        first = _event("c", 100, key=None, after={"value": "one"})
+        second = _event("c", 100, key=None, after={"value": "two"}, total_order=2)
+        first_identity = _identity(first)
+        second_identity = _identity(second)
+        batch = destination.EventLedgerBatch(con, pipeline="p78")
+
+        con.execute("BEGIN")
+        assert not destination.claim_event_ledger(
+            con,
+            first_identity,
+            pipeline="p78",
+            target_table="target",
+            source_lsn=first_identity.source_lsn,
+            ledger=batch,
+        )
+        assert not destination.claim_event_ledger(
+            con,
+            second_identity,
+            pipeline="p78",
+            target_table="target",
+            source_lsn=second_identity.source_lsn,
+            ledger=batch,
+        )
+        batch.flush()
+        con.execute("COMMIT")
+
+        def unexpected_per_event_read(*_args, **_kwargs):
+            raise AssertionError("stream replay fell back to one SELECT per event")
+
+        monkeypatch.setattr(destination, "read_event_ledger", unexpected_per_event_read)
+        replay = destination.EventLedgerBatch(con, pipeline="p78")
+        con.execute("BEGIN")
+        assert destination.claim_event_ledger(
+            con,
+            first_identity,
+            pipeline="p78",
+            target_table="target",
+            source_lsn=first_identity.source_lsn,
+            ledger=replay,
+        )
+        assert destination.claim_event_ledger(
+            con,
+            second_identity,
+            pipeline="p78",
+            target_table="target",
+            source_lsn=second_identity.source_lsn,
+            ledger=replay,
+        )
+        con.execute("ROLLBACK")
+    finally:
+        con.close()
+
+
 def test_scd2_close_insert_tombstone_and_duplicate_replay():
     con = _con()
     try:
