@@ -33,8 +33,14 @@ REQUEST_ID = "p3b-stock-crash-request"
 CHILD = Path(__file__).resolve().parents[2] / "support" / "crash_matrix_child.py"
 LOAD_SENSITIVE_POINTS = frozenset(
     {
+        "incremental_chunk_before_shadow_write",
+        "incremental_chunk_after_shadow_write_before_progress",
+        "incremental_chunk_after_progress_before_md_commit",
         "after_md_commit_before_markProcessed",
         "after_markProcessed_before_markBatchFinished",
+        "after_ack_before_next_poll",
+        "before_swap_commit",
+        "after_swap_commit_before_ack",
     }
 )
 
