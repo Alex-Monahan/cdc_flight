@@ -162,9 +162,16 @@ def _wait_for_anchor_update_durable(sandbox, process, update_lsn: str) -> None:
     deadline = time.monotonic() + 180
     while True:
         if process.poll() is not None:
+            fired = sandbox.fired_fault()
+            if fired is None:
+                raise AssertionError(
+                    "pipeline died after startup readiness but before the target "
+                    "update became durable and before the selected crash fired "
+                    f"(returncode={process.returncode})"
+                )
             raise AssertionError(
-                "pipeline exited before the target update became durable "
-                f"(returncode={process.returncode})"
+                "pipeline crash fired before the target update became durable "
+                f"(returncode={process.returncode}, fired={fired!r})"
             )
         if sandbox.pg_query(
             "SELECT confirmed_flush_lsn IS NOT NULL "
@@ -266,7 +273,8 @@ def _run_admission_child(
             armed_path=armed_path,
             insert_signal=insert_signal,
         ),
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
     )
     try:
