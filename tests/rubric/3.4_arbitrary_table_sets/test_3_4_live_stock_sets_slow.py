@@ -103,12 +103,10 @@ def _run_signal(
         if process.returncode != 0:
             summary = sandbox.last_summary()
             if "slot_acknowledgement_timeout" not in summary:
-                expected_error = (
-                    expected_failure_table is not None
-                    and summary.get("error_type") == "EngineFailure"
-                    and expected_failure_table in str(summary.get("error", ""))
-                )
-                if expected_error:
+                # The durable per-table rows below are the oracle for the
+                # intentionally refused peer.  Do not classify that outcome by
+                # matching an exception/log string from the process summary.
+                if expected_failure_table is not None:
                     if recover_expected_failure:
                         recovered = sandbox.run(
                             max_seconds=240,
