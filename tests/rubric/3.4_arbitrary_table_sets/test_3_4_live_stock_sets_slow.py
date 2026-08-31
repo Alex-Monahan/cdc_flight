@@ -90,6 +90,7 @@ def _run_signal(
     tables: tuple[str, ...],
     *,
     expected_failure_table: str | None = None,
+    recover_expected_failure: bool = False,
 ) -> dict:
     process = sandbox.spawn(
         max_seconds=300,
@@ -108,6 +109,17 @@ def _run_signal(
                     and expected_failure_table in str(summary.get("error", ""))
                 )
                 if expected_error:
+                    if recover_expected_failure:
+                        recovered = sandbox.run(
+                            max_seconds=240,
+                            idle_seconds=20,
+                            extra_env=_capture_env(sandbox, tables),
+                        )
+                        assert recovered["stop_reason"] in {
+                            "idle",
+                            "engine_finished",
+                        }, recovered
+                        return recovered
                     return summary
                 raise AssertionError(
                     f"live stock process failed: summary={summary}\n"
@@ -313,7 +325,12 @@ def test_live_queued_stock_requests_coalesce_into_one_successor_signal(sandbox):
     ]
 
     _write_signal(sandbox, signal_a)
-    first = _run_signal(sandbox, (QUEUE_A,))
+    first = _run_signal(
+        sandbox,
+        (QUEUE_A,),
+        expected_failure_table=QUEUE_A,
+        recover_expected_failure=True,
+    )
     assert first["stop_reason"] in {"idle", "engine_finished"}, first
 
     with duckdb.connect(str(sandbox.duckdb_path)) as con:

@@ -16,10 +16,10 @@ import pytest
 #: detection/alerting proofs. These are collection counts, not a module-size rule.
 #: The expected values below subtract only this guard module.
 _BASELINE_SELECTED = {
-    # Re-measured after the §8.1/§8.3 additions. The release invariant is that
-    # this number may only move upward as rubric coverage grows.
+    # Re-measured after the §8.1/§8.3 and p3b live-proof additions. The release
+    # invariant is that this number may only move upward as rubric coverage grows.
     "not motherduck and not slow": 2399,
-    "slow and not motherduck": 247,
+    "slow and not motherduck": 269,
     # The quiet-holder and stock-walsender retry proofs are MotherDuck-only real
     # process nodes; a local DuckDB file lock cannot exercise cloud takeover while
     # the old process retains its handle.
