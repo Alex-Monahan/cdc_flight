@@ -20,6 +20,7 @@ from . import recovery as recovery_mod
 from .config import resolve_control_schema
 from .machines import PHASE_RECOVERING
 from .naming import control_table
+from .source_routes import SourceRoutePolicy
 
 log = logging.getLogger("cdc_flight.acquisition")
 
@@ -72,7 +73,8 @@ def captured_tables(
 
 
 def resume_any_journalled_recovery(
-    con, *, source, replication, dest, namespace: str, phases=None
+    con, *, source, replication, dest, namespace: str, phases=None,
+    routes: SourceRoutePolicy | None = None,
 ) -> tuple:
     """Finish a recovery an earlier process left half-done, BEFORE anything else looks.
 
@@ -84,6 +86,7 @@ def resume_any_journalled_recovery(
     exact durable shape - no resume row, maybe no slot - that the slot check reads as a
     brand-new problem.
     """
+    routes = routes or source.route_policy
     record = recovery_mod.read(
         con, pipeline=dest.pipeline_name, namespace=namespace,
         control_schema=dest.control_schema,
@@ -115,16 +118,18 @@ def resume_any_journalled_recovery(
         pipeline=dest.pipeline_name,
         namespace=namespace,
         record=record,
-        # Recovery.resume() drops the source slot; administrative recovery must
-        # never use a hot-standby read endpoint.
-        dsn=source.primary_dsn,
+        # Recovery.resume() administers the logical slot.  In standby mode that
+        # slot is physically local, so its owner is the standby—not the primary
+        # source-write route.
+        dsn=routes.slot_owner_dsn,
         control_schema=dest.control_schema,
     )
     return record, result
 
 
 def check_the_slot(
-    con, *, source, replication, dest, namespace: str, captured, orphan_file: bool
+    con, *, source, replication, dest, namespace: str, captured, orphan_file: bool,
+    routes: SourceRoutePolicy | None = None,
 ) -> tuple:
     """Run rubric 1.8's check and, if it says so, arm the automatic re-snapshot.
 
@@ -132,6 +137,7 @@ def check_the_slot(
     that is what makes "the slot was recreated" and "the cluster was restored"
     detectable at all on the *next* run (`_cdc_flight.slot_state`).
     """
+    routes = routes or source.route_policy
     durable = con.execute(
         f"SELECT last_lsn FROM "
         f"{control_table(dest.control_schema, 'debezium_offsets')} "
@@ -139,7 +145,7 @@ def check_the_slot(
         [dest.pipeline_name, namespace],
     ).fetchall()
     durable_lsn = int(durable[0][0]) if durable else None
-    observation = reconcile_mod.observe_slot(source.dsn, replication.slot_name)
+    observation = reconcile_mod.observe_slot(routes.read_dsn, replication.slot_name)
     # A reachable source closes the previous dark episode. An unobservable source is
     # intentionally not treated as a transition here; the supervisor must first prove
     # that a source which was answering has stayed dark for its configured threshold.
@@ -264,9 +270,10 @@ def check_the_slot(
             con,
             pipeline=dest.pipeline_name,
             namespace=namespace,
-            # The recovery journal owns slot deletion, so give it the explicit
-            # primary write route rather than the standby decoder DSN.
-            dsn=source.primary_dsn,
+            # The recovery journal owns slot deletion.  Route that operation to
+            # the physical local-slot owner; source writes and slot ownership are
+            # deliberately different concepts in standby mode.
+            dsn=routes.slot_owner_dsn,
             slot_name=replication.slot_name,
             offset_path=replication.offset_file,
             verdict=verdict,
@@ -300,6 +307,7 @@ def check_the_slot(
 
 def journal_the_reset(
     con, *, source, replication, dest, namespace: str, captured, phases,
+    routes: SourceRoutePolicy | None = None,
 ) -> dict:
     """`--reset-state`, as ONE journalled, idempotent, re-entrant sequence.
 
@@ -323,6 +331,7 @@ def journal_the_reset(
     makes the sequence converge - it is also required for correctness, because Debezium
     only pairs a snapshot with an exact WAL position when it creates the slot itself.
     """
+    routes = routes or source.route_policy
     phases.ensure(PHASE_RECOVERING, detail="--reset-state")
     previous_slot = dest_mod.read_slot_state(
         con,
@@ -369,9 +378,9 @@ def journal_the_reset(
         pipeline=dest.pipeline_name,
         namespace=namespace,
         record=record,
-        # --reset-state also drops a replication slot and therefore requires the
-        # explicit primary administration route.
-        dsn=source.primary_dsn,
+        # --reset-state administers the local logical slot.  It must follow the
+        # slot-owner route even though catalog/marker writes use the primary.
+        dsn=routes.slot_owner_dsn,
         control_schema=dest.control_schema,
     )
     log.info("--reset-state is journalled and armed: %s", result)

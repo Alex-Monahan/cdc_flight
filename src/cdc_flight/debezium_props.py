@@ -15,6 +15,7 @@ from .errors import UnsafeDebeziumProperty
 from .logical_messages import MessagePrefixPolicy
 from .snapshot_completion import notification_topic
 from .toast import UNAVAILABLE_VALUE_PLACEHOLDER
+from .source_routes import SourceRoutePolicy
 
 # Re-exported for configuration callers.  The value is owned by ``toast.py`` so
 # the connector property and the decoder cannot drift apart.
@@ -190,6 +191,11 @@ HEARTBEAT_INTERVAL_MS = "5000"
 HEARTBEAT_ACTION_QUERY = (
     "SELECT pg_logical_emit_message(true, 'cdc_flight_heartbeat', '')"
 )
+# Private Flight evidence consumed by ``engine._probe_effective_configuration``.
+# It is intentionally not a Debezium fork or an SMT/converter setting: the stock
+# action is empty on a standby, and SourceHealth emits the same protected marker
+# through the primary source-write route.
+STANDBY_HEARTBEAT_DISABLED_PROPERTY = "cdc_flight.standby.heartbeat.disabled"
 JDBC_SOCKET_TIMEOUT_SECONDS = "60"
 JDBC_CONNECT_TIMEOUT_SECONDS = "5"
 MESSAGE_PREFIX_PROPERTY = "message.prefix.include.list"
@@ -209,6 +215,7 @@ def build_properties(
     source: SourceConfig,
     replication: ReplicationConfig,
     *,
+    routes: SourceRoutePolicy | None = None,
     snapshot_mode: str | None = None,
     max_batch_size: int = 2048,
     poll_interval_ms: int = 500,
@@ -226,6 +233,13 @@ def build_properties(
     refuse: an operator (or a future config surface) that tries to change one of
     `INVARIANT_O_PINS` gets `UnsafeDebeziumProperty`, not a warning.
     """
+    # Resolve the route before creating the state directory. In standby mode this
+    # calls SourceConfig's fail-closed CDC_PRIMARY_DSN check at admission time.
+    routes = routes or source.route_policy
+    heartbeat_action_query = (
+        "" if routes.role == "standby" else HEARTBEAT_ACTION_QUERY
+    )
+    heartbeat_disabled = "true" if routes.role == "standby" else "false"
     replication.state_dir.mkdir(parents=True, exist_ok=True)
     snapshot = snapshot_mode or replication.snapshot_mode
     logical_message_policy = message_prefix_policy(replication)
@@ -241,7 +255,8 @@ def build_properties(
         "plugin.name": "pgoutput",
         "snapshot.max.threads": PRODUCTION_SNAPSHOT_MAX_THREADS,
         "heartbeat.interval.ms": HEARTBEAT_INTERVAL_MS,
-        "heartbeat.action.query": HEARTBEAT_ACTION_QUERY,
+        "heartbeat.action.query": heartbeat_action_query,
+        STANDBY_HEARTBEAT_DISABLED_PROPERTY: heartbeat_disabled,
         "driver.socketTimeout": str(
             int(jdbc_socket_timeout_seconds)
             if jdbc_socket_timeout_seconds is not None
@@ -277,8 +292,14 @@ def build_properties(
             "failure"
         ),
         "heartbeat.action.query": (
-            "the source-side action is the transactional, data-free logical heartbeat "
-            "that makes the cadence effective"
+            "primary mode retains the protected stock transactional action; standby "
+            "mode must disable it because the decoder connection is read-only and the "
+            "Flight-owned writer emits the same marker on CDC_PRIMARY_DSN"
+        ),
+        STANDBY_HEARTBEAT_DISABLED_PROPERTY: (
+            "standby mode must make the intentional stock-action disablement explicit; "
+            "otherwise the runtime probe cannot distinguish a safe split from a missing "
+            "heartbeat configuration"
         ),
         "driver.socketTimeout": (
             "stock pgjdbc must fail a dead established source socket within the "
@@ -388,7 +409,11 @@ def build_properties(
         # ``confirmed_flush_lsn`` to advance.  This is separate from the Python
         # completion marker: it is a connector-level liveness/retained-WAL guard.
         "heartbeat.interval.ms": HEARTBEAT_INTERVAL_MS,
-        "heartbeat.action.query": HEARTBEAT_ACTION_QUERY,
+        # The primary retains the stock write action. Standby mode sets this to the
+        # empty string; the runtime probe accepts that only with the explicit private
+        # Flight evidence above, so a connector can never issue a write on recovery.
+        "heartbeat.action.query": heartbeat_action_query,
+        STANDBY_HEARTBEAT_DISABLED_PROPERTY: heartbeat_disabled,
         # PINNED, not left to the default. See LSN_FLUSH_MODE_SAFE above: this is
         # the one path that can confirm WAL to Postgres without ever reading the
         # offset store, i.e. the one thing that could break Invariant O from

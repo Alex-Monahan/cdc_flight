@@ -29,6 +29,7 @@ def run_owed(
     *,
     source,
     replication,
+    routes=None,
     pipeline: str,
     dataset: str,
     owed: list[tuple[str, str, str]],
@@ -47,6 +48,7 @@ def run_owed(
     resnapshot_run,
 ) -> tuple[list[dict], dict, int]:
     """Retry pending refusals alone, then rebuild healthy tables together."""
+    routes = routes or source.route_policy
     quarantined_names = destination.quarantined_tables(
         con, pipeline, control_schema=control_schema
     )
@@ -57,7 +59,7 @@ def run_owed(
             # absence or a changed relation/descriptor fingerprint; this keeps a
             # deterministic refusal from reopening an unbounded snapshot loop.
             source_exists, source_fingerprint = source_relation_fingerprint(
-                source.dsn, schema, table
+                routes.read_dsn, schema, table
             )
             retry_allowed = destination.quarantine_retry_allowed(
                 con,
@@ -72,7 +74,7 @@ def run_owed(
                 # Positive absence is a terminal discharge, never a trigger for a
                 # throwaway snapshot of a relation that no longer exists.
                 evidence = gather_emptiness_evidence(
-                    source.dsn,
+                    routes.read_dsn,
                     pending=[(schema, table, target)],
                     snapshot_phase_ended=True,
                     tables_seen=set(),
@@ -141,6 +143,7 @@ def run_owed(
                 con,
                 source=source,
                 replication=replication,
+                routes=routes,
                 pipeline=pipeline,
                 dataset=dataset,
                 tables=batch,

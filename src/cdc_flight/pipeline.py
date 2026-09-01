@@ -129,6 +129,10 @@ def run(
         log.warning("fault injection armed: point=%s group=%s action=%s", *fault_spec)
 
     source = SourceConfig()
+    # Resolve all three source endpoints before destination/state mutation.  In
+    # standby mode this deliberately raises when CDC_PRIMARY_DSN is absent; there
+    # is no late fallback to the read-only decoder endpoint.
+    routes = source.route_policy
     replication = ReplicationConfig()
     dest = DestinationConfig(**({"kind": destination} if destination else {}))
     control_schema = dest.control_schema
@@ -166,6 +170,7 @@ def run(
     props = build_properties(
         source,
         replication,
+        routes=routes,
         snapshot_mode=snapshot_mode,
         truncate_mode=settings["truncate_mode"],
         jdbc_socket_timeout_seconds=run_cfg.jdbc_socket_timeout_seconds,
@@ -228,7 +233,7 @@ def run(
         with contextlib.suppress(Exception):
             exc.summary = failure_summary
         raise
-    summary_extra: dict = {}
+    summary_extra: dict = {"source_routes": routes.as_dict()}
     lease: Lease | None = None
     lease_held = False
     phases: RunPhaseWriter | None = None
@@ -304,9 +309,9 @@ def run(
             # is snapshot-only; do not construct a connector that would appear
             # healthy while its local logical slot is absent or invalid.
             standby = standby_mod.inspect(
-                source.dsn,
+                routes.read_dsn,
                 replication.slot_name,
-                primary_dsn=source.primary_dsn,
+                primary_dsn=routes.source_write_dsn,
                 physical_slot_name=source.physical_slot_name,
                 connect_timeout=run_cfg.jdbc_connect_timeout_seconds,
                 statement_timeout_ms=run_cfg.jdbc_socket_timeout_seconds * 1000,
@@ -408,7 +413,7 @@ def run(
         # Swept unconditionally, by the one name this pipeline derives from its own slot
         # (Opus MAJOR-2, observed leaking twice on the shared cluster in one day).
         summary_extra["stale_resnapshot_slot"] = resnapshot_mod.sweep_stale_slot(
-            source.primary_dsn, replication.slot_name
+            routes.slot_owner_dsn, replication.slot_name
         )
 
         captured_tables = acquisition.captured_tables(
@@ -428,6 +433,7 @@ def run(
             summary_extra["reset_state"] = acquisition.journal_the_reset(
                 con, source=source, replication=replication, dest=dest,
                 namespace=namespace, captured=captured_tables, phases=phases,
+                routes=routes,
             )
 
         # A recovery an earlier process did not finish is resumed BEFORE the slot check
@@ -436,7 +442,7 @@ def run(
         # work as an operator error and refuse for ever (Codex B3 / Opus MAJOR-1).
         journal, resumed = acquisition.resume_any_journalled_recovery(
             con, source=source, replication=replication, dest=dest, namespace=namespace,
-            phases=phases,
+            phases=phases, routes=routes,
         )
         if resumed is not None:
             summary_extra["recovery_resumed"] = resumed
@@ -451,6 +457,7 @@ def run(
             dest=dest,
             namespace=namespace,
             captured=captured_tables,
+            routes=routes,
             # Deliberately independent of `--accept-orphan-offsets`: whether the file is
             # trusted, refused or deleted is reconciliation's decision, and it is the one
             # place that knows the difference. The slot check only has to stay out of it.
@@ -500,9 +507,9 @@ def run(
             # check names the missing fact and fails before the callback lifecycle
             # exists, rather than treating a JDBC timeout as a standby proof.
             standby = standby_mod.inspect(
-                source.dsn,
+                routes.read_dsn,
                 replication.slot_name,
-                primary_dsn=source.primary_dsn,
+                primary_dsn=routes.source_write_dsn,
                 physical_slot_name=source.physical_slot_name,
                 connect_timeout=run_cfg.jdbc_connect_timeout_seconds,
                 statement_timeout_ms=run_cfg.jdbc_socket_timeout_seconds * 1000,
@@ -517,7 +524,7 @@ def run(
             offset_path=replication.offset_file,
             accept_orphan=accept_orphan_offsets,
             repair=applier_cfg.repair_offset_file,
-            dsn=source.dsn,
+            dsn=routes.read_dsn,
             slot_name=replication.slot_name,
         )
         summary_extra["reconciliation"] = reconciliation.decision
@@ -577,7 +584,7 @@ def run(
                 pipeline=dest.pipeline_name,
                 namespace=namespace,
                 record=journal,
-                dsn=source.primary_dsn,
+                dsn=routes.slot_owner_dsn,
                 control_schema=control_schema,
             )
         if (
@@ -597,7 +604,7 @@ def run(
         # decides the "slot exists / no durable destination row" cell (Codex 3).
         summary_extra["invariant_o_start"] = reconcile_mod.check_invariant_o(
             con, pipeline=dest.pipeline_name, namespace=namespace,
-            dsn=source.dsn, slot_name=replication.slot_name,
+            dsn=routes.read_dsn, slot_name=replication.slot_name,
             snapshot_mode=props["snapshot.mode"],
             control_schema=control_schema,
         )
@@ -700,8 +707,9 @@ def run(
         descriptor_provider = None
         if catalog_enabled:
             watcher = catalog_mod.CatalogWatcher(
-                dsn=source.dsn,
-                primary_dsn=source.primary_dsn,
+                dsn=routes.read_dsn,
+                primary_dsn=routes.source_write_dsn,
+                routes=routes,
                 publication=replication.publication_name,
                 schema=source.schema,
                 schemas=source.schemas,
@@ -818,7 +826,7 @@ def run(
             from .catalog_descriptors import provider_for_source
 
             try:
-                descriptor_provider = provider_for_source(source)
+                descriptor_provider = provider_for_source(source, routes=routes)
             except ValueError as exc:
                 raise EngineFailure(str(exc), dict(summary_extra)) from exc
 
@@ -896,6 +904,7 @@ def run(
                     new_relations={relation.qualified for relation in discovered},
                     drop_mode=applier_cfg.drop_mode,
                     control_schema=control_schema, catalog=watcher,
+                    routes=routes,
                     resnapshot_run=resnapshot_mod.run,
                 )
             )
@@ -990,6 +999,7 @@ def run(
                 con,
                 source=source,
                 replication=replication,
+                routes=routes,
                 pipeline=dest.pipeline_name,
                 dataset=dest.dataset_name,
                 tables=full_tables,
@@ -1042,7 +1052,7 @@ def run(
         )
         completion_stage = PostEngineCompletion(
             con=con,
-            source_dsn=source.dsn,
+            source_dsn=routes.read_dsn,
             slot_name=replication.slot_name,
             pipeline=dest.pipeline_name,
             namespace=namespace,
@@ -1084,6 +1094,7 @@ def run(
         coordinator = LiveDiscoveryCoordinator(
             con=con,
             source=source,
+            routes=routes,
             replication=replication,
             destination=dest,
             namespace=namespace,

@@ -13,6 +13,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .source_routes import SourceRoutePolicy
+
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_CONTROL_SCHEMA = "_cdc_flight"
 
@@ -219,6 +221,16 @@ class SourceConfig:
                 "refusing to use the read-only source DSN for administration or writes"
             )
         return self.dsn
+
+    @property
+    def route_policy(self) -> SourceRoutePolicy:
+        """Resolve the complete three-route policy at admission time."""
+        return SourceRoutePolicy.from_source(self)
+
+    @property
+    def routes(self) -> SourceRoutePolicy:
+        """Compatibility alias for callers that refer to source routes directly."""
+        return self.route_policy
 
     @property
     def tables(self) -> list[str]:

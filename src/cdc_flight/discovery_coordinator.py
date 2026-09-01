@@ -27,6 +27,7 @@ from .run_state import RunOutcome, RunPhaseWriter
 from .snapshot_completion import SnapshotCompletion
 from .source_health import SourceHealth
 from .source_marker import SourceMarker
+from .source_routes import SourceRoutePolicy
 from .supervisor import run_engine_bounded
 from .witness_contract import STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME
 
@@ -41,6 +42,7 @@ class LiveDiscoveryCoordinator:
         *,
         con,
         source: SourceConfig,
+        routes: SourceRoutePolicy | None = None,
         replication: ReplicationConfig,
         destination,
         namespace: str,
@@ -69,6 +71,7 @@ class LiveDiscoveryCoordinator:
     ) -> None:
         self.con = con
         self.source = source
+        self.routes = routes or source.route_policy
         self.replication = replication
         self.destination = destination
         self.namespace = namespace
@@ -179,7 +182,7 @@ class LiveDiscoveryCoordinator:
                     self.service_context.rearm_process_signals()
                 self._wire_consumer(engine, self.applier)
                 self.health = SourceHealth(
-                    dsn=self.source.dsn,
+                    dsn=self.routes.read_dsn,
                     slot_name=self.replication.slot_name,
                     expected_application_name=(
                         STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME
@@ -195,7 +198,9 @@ class LiveDiscoveryCoordinator:
                     capture_tables=(
                         self.capture_tables if self.service_context is not None else None
                     ),
-                    primary_dsn=self.source.primary_dsn,
+                    primary_dsn=self.routes.source_write_dsn,
+                    source_write_dsn=self.routes.source_write_dsn,
+                    standby_heartbeat=self.routes.role == "standby",
                     source_marker=(
                         getattr(self.watcher, "marker", None)
                         or SourceMarker(
@@ -344,6 +349,7 @@ class LiveDiscoveryCoordinator:
                 resnap = resnapshot_mod.run(
                     self.con,
                     source=self.source,
+                    routes=self.routes,
                     replication=self.replication,
                     pipeline=self.destination.pipeline_name,
                     dataset=self.destination.dataset_name,
@@ -503,7 +509,7 @@ class LiveDiscoveryCoordinator:
                 if handler._callback_sealed:
                     return {"checked": False, "reason": "callback admission sealed"}
             observation = reconcile_mod.observe_slot(
-                self.source.dsn,
+                self.routes.read_dsn,
                 self.replication.slot_name,
                 connect_timeout=max(1, int(self.run_cfg.jdbc_connect_timeout_seconds)),
             )

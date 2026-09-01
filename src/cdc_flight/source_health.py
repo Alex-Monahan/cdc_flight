@@ -45,7 +45,7 @@ from datetime import UTC, datetime
 
 from . import faults
 from .machines import SOURCE_HEALTH_STATES
-from .source_marker import IDLE_HEARTBEAT, SourceMarker
+from .source_marker import HEARTBEAT, IDLE_HEARTBEAT, SourceMarker
 from .witness_contract import (
     STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
     ServiceWitnessEvidence,
@@ -55,9 +55,8 @@ from .witness_contract import (
 log = logging.getLogger("cdc_flight.source_health")
 
 #: How far `confirmed_flush_lsn` may trail the source's available WAL position and
-#: still count as "caught up".  On a hot standby the primary-only
-#: ``pg_current_wal_lsn()`` function raises ``recovery is in progress``; the
-#: recovery-safe expression below uses the receive position instead.
+#: still count as "caught up". The role-conditional expression below uses the
+#: standby receive position during recovery and the current position on a primary.
 #:
 #: MEASURED (2026-07-30, 60 000-row stream into local DuckDB, per-batch offset
 #: flush). A healthy run settles at **328-384 bytes** of lag within a second of
@@ -293,6 +292,14 @@ class SourceHealth:
     #: not the Debezium replication connection; in a hot-standby topology this is
     #: the primary DSN.
     primary_dsn: str | None = None
+    #: Explicit source-write spelling. Production route policy supplies this
+    #: separately so a local slot owner cannot be mistaken for the write route.
+    source_write_dsn: str | None = None
+    #: In standby mode the stock connector write action is disabled. This
+    #: Flight-owned bounded writer emits the protected logical heartbeat on the
+    #: source-write route after a live stream has been observed.
+    standby_heartbeat: bool = False
+    heartbeat_interval: float = 5.0
     source_marker: SourceMarker | None = None
     max_lag_bytes: int = DEFAULT_MAX_IDLE_LAG_BYTES
     interval: float = 0.5
@@ -350,6 +357,13 @@ class SourceHealth:
     _bound_walsender_pid: int | None = field(default=None, repr=False)
     _bound_walsender_backend_start: datetime | None = field(default=None, repr=False)
     _bound_walsender_ack_at: float | None = field(default=None, repr=False)
+    _standby_heartbeat_marker: SourceMarker | None = field(
+        default=None, repr=False
+    )
+    _next_standby_heartbeat_at: float | None = field(default=None, repr=False)
+    _heartbeat_attempts: int = field(default=0, repr=False)
+    _heartbeat_writes: int = field(default=0, repr=False)
+    _heartbeat_failures: int = field(default=0, repr=False)
 
     # -- lifecycle ---------------------------------------------------------- #
     def start(self) -> SourceHealth:
@@ -379,7 +393,39 @@ class SourceHealth:
     def _loop(self) -> None:
         while not self._stop.is_set():
             self._ingest(self.sample_once())
+            self._maybe_emit_standby_heartbeat()
             self._stop.wait(self.interval)
+
+    def _maybe_emit_standby_heartbeat(self) -> None:
+        """Emit the standby heartbeat through the primary at a bounded cadence.
+
+        This runs only after a real slot sample has observed streaming. Logical
+        messages are control records: they do not affect any source-data liveness
+        clock, and a failed primary write remains visible in the health summary.
+        """
+        if not self.standby_heartbeat or not self.ever_streamed:
+            return
+        now = time.monotonic()
+        if (
+            self._next_standby_heartbeat_at is not None
+            and now < self._next_standby_heartbeat_at
+        ):
+            return
+        self._next_standby_heartbeat_at = now + max(0.25, self.heartbeat_interval)
+        self._heartbeat_attempts += 1
+        if self._standby_heartbeat_marker is None:
+            self._standby_heartbeat_marker = SourceMarker(
+                prefix="cdc_flight", enabled=True
+            )
+        marker_lsn = self.emit_marker(
+            self._standby_heartbeat_marker,
+            HEARTBEAT,
+            {"slot": self.slot_name, "source_role": "standby"},
+        )
+        if marker_lsn is None:
+            self._heartbeat_failures += 1
+        else:
+            self._heartbeat_writes += 1
 
     def _ingest(self, sample: SlotSample) -> None:
         """Fold one observation into the derived clocks.
@@ -771,7 +817,7 @@ class SourceHealth:
         bounded timeouts the sampler uses, and an error that is an operational
         condition rather than a crash.
         """
-        dsn = self.primary_dsn
+        dsn = self.source_write_dsn or self.primary_dsn
         if marker is None or not dsn:
             return None
         try:
@@ -1080,10 +1126,11 @@ class SourceHealth:
     def outstanding_bytes(self, received_high_water: int | None) -> int | None:
         """OUR undelivered backlog, in bytes, or ``None`` when it cannot be read.
 
-        ``slot_lag_bytes`` is ``pg_wal_lsn_diff(pg_current_wal_lsn(),
-        confirmed_flush_lsn)`` — the WAL PostgreSQL must RETAIN, which is a
-        CLUSTER-wide quantity.  Another database in the same cluster moves
-        ``pg_current_wal_lsn()`` on every 0.5 s sample without a single byte of
+        ``slot_lag_bytes`` is the role-appropriate source-retained WAL distance
+        (receive high-water on a standby, current position on a primary) to
+        ``confirmed_flush_lsn`` — the WAL PostgreSQL must RETAIN, which is a
+        CLUSTER-wide quantity. Another database in the same cluster moves the
+        primary's current position on every 0.5 s sample without a single byte of
         it being ours, which is exactly how review r12 (R12-3) measured every
         bounded run burning its whole ``--max-seconds`` under an ordinary
         neighbour: 60.44 s with a co-tenant against 10.55 s without.
@@ -1223,8 +1270,8 @@ class SourceHealth:
         if self.streaming_for < min_seconds:
             return False
         # (2) And OUR backlog must be gone.  ROUND 13 (review r12, R12-3 and
-        #     R12-6).  Round 12 measured this against `pg_current_wal_lsn()`,
-        #     which is cluster-wide: the reviewer proved that one ordinary
+        #     R12-6). Round 12 measured this against a cluster-wide current-WAL
+        #     position, which made the reviewer prove that one ordinary
         #     co-tenant database writing WAL made this branch unsatisfiable and
         #     cost every bounded run its entire `--max-seconds` (60.44 s against
         #     10.55 s, one file swapped).  `outstanding_bytes` measures the
@@ -1257,6 +1304,14 @@ class SourceHealth:
         return self.lag_steady_for >= min_seconds
 
     def summary(self) -> dict:
+        heartbeat_summary = {
+            "standby_heartbeat_enabled": self.standby_heartbeat,
+            "standby_heartbeat_route": self.source_write_dsn or self.primary_dsn,
+            "standby_heartbeat_attempts": self._heartbeat_attempts,
+            "standby_heartbeat_writes": self._heartbeat_writes,
+            "standby_heartbeat_failures": self._heartbeat_failures,
+            "standby_heartbeat_interval_sec": self.heartbeat_interval,
+        }
         sample = self.last
         if sample is None:
             return {
@@ -1264,6 +1319,7 @@ class SourceHealth:
                 "source_publication": self.publication_name,
                 "source_publication_has_configured_tables": None,
                 "service_source_quiet_ready": False,
+                **heartbeat_summary,
             }
         if sample.unknown:
             return {
@@ -1285,6 +1341,7 @@ class SourceHealth:
                     sample.publication_has_configured_tables
                 ),
                 "service_source_quiet_ready": self.service_quiet_ready,
+                **heartbeat_summary,
             }
         return {
             "slot_health": self.state(),
@@ -1340,4 +1397,5 @@ class SourceHealth:
                 if self.source_marker is not None
                 else {}
             ),
+            **heartbeat_summary,
         }

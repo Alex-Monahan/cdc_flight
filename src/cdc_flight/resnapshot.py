@@ -143,6 +143,7 @@ from .resnapshot_source_policy import (
 from .resnapshot_source_policy import gather_emptiness_evidence as _gather_emptiness_evidence
 from .snapshot_completion import SnapshotCompletion
 from .source_health import SourceHealth
+from .source_routes import SourceRoutePolicy
 
 log = logging.getLogger("cdc_flight.resnapshot")
 OWNER = "resnapshot-protocol"
@@ -367,6 +368,7 @@ def build_resnapshot_properties(
     *,
     tables: list[tuple[str, str, str]],
     truncate_mode: str,
+    routes: SourceRoutePolicy | None = None,
 ) -> dict[str, str]:
     """Build the throwaway connector properties for one exact source image.
 
@@ -378,6 +380,7 @@ def build_resnapshot_properties(
     props = build_properties(
         source,
         replication,
+        routes=routes or source.route_policy,
         snapshot_mode="initial",
         truncate_mode=truncate_mode,
     )
@@ -393,6 +396,7 @@ def run(
     *,
     source: SourceConfig,
     replication: ReplicationConfig,
+    routes: SourceRoutePolicy | None = None,
     pipeline: str,
     dataset: str,
     tables: list[tuple[str, str, str]],
@@ -422,6 +426,8 @@ def run(
     if not tables:
         return outcome
 
+    routes = routes or source.route_policy
+
     slot = slot_name_for(replication.slot_name)
     state_dir = replication.state_dir / "resnapshot"
     recovery = InterruptionRecovery.prepare(
@@ -429,10 +435,10 @@ def run(
     )
     # A leftover slot from an interrupted re-snapshot would make Debezium take the
     # pre-existing-slot path, which is exactly the path that does not export a snapshot.
-    # Slot removal is source administration, not a catalog read.  In standby mode
-    # the local recovery endpoint is read-only, so this must use the explicit
-    # primary route and fail closed when CDC_PRIMARY_DSN is absent.
-    reconcile_mod.drop_slot(source.primary_dsn, slot)
+    # Slot removal is local logical-slot administration.  In standby mode the
+    # slot physically belongs to the decoder endpoint, so it must never be sent
+    # through the primary source-write route.
+    reconcile_mod.drop_slot(routes.slot_owner_dsn, slot)
 
     resnap_replication = dataclasses.replace(
         replication, slot_name=slot, state_dir=state_dir
@@ -442,6 +448,7 @@ def run(
         resnap_replication,
         tables=tables,
         truncate_mode=settings["truncate_mode"],
+        routes=routes,
     )
     include = props["table.include.list"].split(",")
 
@@ -460,7 +467,7 @@ def run(
         "RE-SNAPSHOT starting for %s (%s) via throwaway slot %r",
         ", ".join(include), reason, slot,
     )
-    watcher = _SlotWatcher(source.dsn, slot).start()
+    watcher = _SlotWatcher(routes.read_dsn, slot).start()
     health = None
     applier = None
     source_stopped = False
@@ -492,7 +499,7 @@ def run(
         from .catalog_descriptors import RelationDescriptorProvider
 
         descriptor_connection = psycopg.connect(
-            source.dsn,
+            routes.read_dsn,
             autocommit=True,
             **source_connection_kwargs(
                 connect_timeout=run_cfg.jdbc_connect_timeout_seconds,
@@ -500,7 +507,7 @@ def run(
             ),
         )
         descriptor_provider = RelationDescriptorProvider.from_tables(
-            descriptor_connection, tables, source_dsn=source.dsn
+            descriptor_connection, tables, source_dsn=routes.read_dsn
         )
         applier = Applier(
             con,
@@ -541,7 +548,12 @@ def run(
         applier.verifier = None
         engine.consumer  # noqa: B018 - builds the consumer and attaches the verifier
         health = SourceHealth(
-            dsn=source.dsn, slot_name=slot, max_lag_bytes=run_cfg.idle_max_lag_bytes
+            dsn=routes.read_dsn,
+            slot_name=slot,
+            max_lag_bytes=run_cfg.idle_max_lag_bytes,
+            primary_dsn=routes.source_write_dsn,
+            source_write_dsn=routes.source_write_dsn,
+            standby_heartbeat=routes.role == "standby",
         ).start()
         ownership.activate(applier)
         try:
@@ -587,7 +599,7 @@ def run(
             )
         pending = [t for t in tables if f"{t[0]}.{t[1]}" not in set(outcome.swapped)]
         evidence = _gather_emptiness_evidence(
-            source.dsn,
+            routes.read_dsn,
             pending=pending,
             snapshot_phase_ended=outcome.snapshot_phase_ended,
             tables_seen=completion.tables_seen,
@@ -678,7 +690,7 @@ def run(
                     refused=refused,
                     pipeline=pipeline,
                     tables=tables,
-                    source_dsn=source.dsn,
+                    source_dsn=routes.read_dsn,
                     control_schema=control_schema,
                 )
             reassert_owed(
@@ -735,7 +747,7 @@ def run(
             # ownership token proves every destination user has left AND a safe owner
             # has discharged the durable recovery obligation.
             # Terminal throwaway-slot retirement is also source administration.
-            recovery.retire_terminal_resources(dsn=source.primary_dsn, slot=slot)
+            recovery.retire_terminal_resources(dsn=routes.slot_owner_dsn, slot=slot)
 
 
 def reassert_owed(

@@ -7,6 +7,7 @@ the *same* write (Opus Q3, ADR D9 / §18/A36):
 |---|---|---|
 | `catalog_fence` | rubric 1.5, `cdc_flight.catalog` | a `DROP TABLE` is detected out of band, and the action may only be applied once the destination has consumed everything before it. On a quiet source nothing would ever advance the durable LSN past the detection point. |
 | `idle_heartbeat` | rubric 4.4 / 7.2, ADR D9 | a slot that only publishes a subset of tables never advances while other tables are busy, so the WAL it pins grows without bound. |
+| `heartbeat` | rubric 7.2 standby route | a standby connector cannot execute the stock write action, so Flight emits the same protected logical heartbeat through the primary write route. |
 | `completion_watermark` | `cdc_flight.completion_watermark` | a run must END on a POSITION rather than on a timer. Nothing in the source's own WAL is guaranteed to be delivered to *this* slot, so the run writes the position it wants to reach. |
 
 This is deliberately a small, complete component rather than one call inlined into
@@ -59,7 +60,8 @@ IDLE_HEARTBEAT = "idle_heartbeat"
 #: `cdc_flight.completion_watermark`: the position a run must reach before it may
 #: say it is finished. The LSN PostgreSQL assigns this record IS the watermark.
 COMPLETION_WATERMARK = "completion_watermark"
-REASONS = (CATALOG_FENCE, IDLE_HEARTBEAT, COMPLETION_WATERMARK)
+HEARTBEAT = "heartbeat"
+REASONS = (CATALOG_FENCE, IDLE_HEARTBEAT, COMPLETION_WATERMARK, HEARTBEAT)
 
 
 class SourceMarker:
@@ -68,6 +70,7 @@ class SourceMarker:
     CATALOG_FENCE = CATALOG_FENCE
     IDLE_HEARTBEAT = IDLE_HEARTBEAT
     COMPLETION_WATERMARK = COMPLETION_WATERMARK
+    HEARTBEAT = HEARTBEAT
 
     def __init__(
         self,

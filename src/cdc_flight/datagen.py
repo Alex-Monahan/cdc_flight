@@ -42,7 +42,9 @@ class ChangeReport:
 
 def connect(source: SourceConfig | None = None) -> psycopg.Connection:
     source = source or SourceConfig()
-    return psycopg.connect(source.dsn, autocommit=False)
+    # Test/operator data generation is a source write too. In standby mode it
+    # must target the explicit primary write route, never the recovery endpoint.
+    return psycopg.connect(source.route_policy.source_write_dsn, autocommit=False)
 
 
 def _big_body(rng: random.Random, kb: int = 64) -> str:

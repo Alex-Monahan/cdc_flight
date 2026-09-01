@@ -52,6 +52,8 @@ class StandbyObservation:
     local_slot_invalidation_reason: str | None
     system_identifier: str | None
     timeline_id: int | None
+    primary_system_identifier: str | None = None
+    primary_timeline_id: int | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -124,6 +126,25 @@ def unsupported_reasons(
         reasons.append(
             "local logical slot is invalidated: "
             f"{observation.local_slot_invalidation_reason}"
+        )
+    if (
+        observation.primary_system_identifier is not None
+        and observation.system_identifier is not None
+        and observation.primary_system_identifier != observation.system_identifier
+    ):
+        reasons.append(
+            "standby and primary system identifiers differ "
+            f"({observation.system_identifier!r} != "
+            f"{observation.primary_system_identifier!r})"
+        )
+    if (
+        observation.primary_timeline_id is not None
+        and observation.timeline_id is not None
+        and observation.primary_timeline_id != observation.timeline_id
+    ):
+        reasons.append(
+            "standby and primary timelines differ "
+            f"({observation.timeline_id!r} != {observation.primary_timeline_id!r})"
         )
     return tuple(reasons)
 
@@ -223,9 +244,17 @@ def inspect(
         timeline_id = _scalar(conn, "SELECT timeline_id FROM pg_control_checkpoint()")
 
     primary_wal_level = None
+    primary_system_identifier = None
+    primary_timeline_id = None
     if primary_dsn:
         with psycopg.connect(primary_dsn, **kwargs) as conn:
             primary_wal_level = str(_scalar(conn, "SHOW wal_level") or "").lower() or None
+            primary_system_identifier = _scalar(
+                conn, "SELECT system_identifier::text FROM pg_control_system()"
+            )
+            primary_timeline_id = _scalar(
+                conn, "SELECT timeline_id FROM pg_control_checkpoint()"
+            )
     elif not in_recovery:
         primary_wal_level = str(wal_level or "").lower() or None
 
@@ -257,6 +286,14 @@ def inspect(
         ),
         system_identifier=(str(system_identifier) if system_identifier is not None else None),
         timeline_id=int(timeline_id) if timeline_id is not None else None,
+        primary_system_identifier=(
+            str(primary_system_identifier)
+            if primary_system_identifier is not None
+            else None
+        ),
+        primary_timeline_id=(
+            int(primary_timeline_id) if primary_timeline_id is not None else None
+        ),
     )
     return assert_supported(observation)
 
