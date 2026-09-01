@@ -454,6 +454,12 @@ class StandbyTopology:
             return conn.execute(statement, params).fetchall()
 
     def stream_facts(self) -> dict[str, Any]:
+        # Fact collection itself is a precondition fence.  The primary WAL can
+        # advance between the two read-only sessions below (another test or a
+        # bounded source marker may commit in that interval); report only after
+        # the receiver has caught up to a primary WAL sample, never by relying on
+        # a startup sleep or on an elapsed-time guess.
+        self._wait_for_receiver_and_replay()
         observation = self.assert_preconditions()
         with self._admin(self.primary.dsn) as conn:
             primary_wal = _lsn_value(conn, "pg_current_wal_lsn() - '0/0'")
