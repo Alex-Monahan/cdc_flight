@@ -710,10 +710,10 @@ class GroupPlan:
             MESSAGE_LAST_BYTE_LENGTH=len(content),
         )
         route = self.message_prefix_policy.classify(event.message_prefix)
-        # Keep the legacy applied-event count/data commit log free of internal
-        # heartbeat/marker traffic, while still recording this source LSN in the
-        # group's observability bounds. A newly materialized application message
-        # is counted below as a real consumer row.
+        # Keep the legacy applied-event count/data commit log free of all logical
+        # message traffic, while still recording this source LSN in the group's
+        # source-event bounds. The consumer row has its own logical-message
+        # counters; it is not an ordinary data event or table count.
         self._count_event(event, count=False)
         self.stats["logical_messages_received"] += 1
         if route == "rejected":
@@ -825,13 +825,8 @@ class GroupPlan:
             self.stats["logical_messages_internal"] += 1
             status = "internal"
         else:
-            self.stats["events"] += 1
             self.stats["logical_messages_delivered"] += 1
             self._message_rows.append(expected)
-            self.stats["tables"].add(logical_messages.LOGICAL_MESSAGE_TABLE)
-            self.table_counts[logical_messages.LOGICAL_MESSAGE_TABLE] = (
-                self.table_counts.get(logical_messages.LOGICAL_MESSAGE_TABLE, 0) + 1
-            )
             status = "delivered"
         audit = dict(expected)
         audit.update(

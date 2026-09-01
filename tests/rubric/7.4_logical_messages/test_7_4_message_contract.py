@@ -13,6 +13,9 @@ import json
 
 import duckdb
 import pytest
+from support.applier_lab import Lab as ApplierLab
+from support.applier_lab import begin as lab_begin
+from support.applier_lab import end as lab_end
 
 from cdc_flight import event_ledger
 from cdc_flight.assembler import (
@@ -402,6 +405,44 @@ def test_consumer_materialization_is_exact_and_replay_is_a_noop_with_collision_g
                 con.execute("ROLLBACK")
     finally:
         con.close()
+
+
+def test_message_only_applier_commit_excludes_ordinary_data_accounting(tmp_path):
+    """A durable message is not a row event in the legacy data counters."""
+    box = ApplierLab(
+        tmp_path / "message-accounting.duckdb",
+        pipeline="p74-accounting",
+        ack_every_record=True,
+    )
+    try:
+        message = _message(
+            "tx-only", 1, 1020, b"", prefix="app_accounting", transactional=True
+        )
+        message.source_cluster_id = "cluster-accounting"
+        message.source_timeline = 1
+        box.run(
+            [
+                lab_begin("tx-only", 1010),
+                message,
+                lab_end("tx-only", 1, 1030),
+            ]
+        )
+
+        assert box.applier.applied_events == 0
+        assert box.applier.data_commit_groups == 0
+        assert box.applier.snapshot_counts() == {}
+        assert box.q(
+            "SELECT event_count, tables_touched FROM _cdc_flight.commit_log"
+        ) == [(0, [])]
+        assert box.q(
+            "SELECT content FROM cdc_raw.cdcflight_logical_messages"
+        ) == [(b"",)]
+        # BEGIN, message, and END are all acknowledgeable in this conservative
+        # harness mode. The separate spill-boundary test covers the opaque handle
+        # required before a message can be staged.
+        assert box.committer.marked == 3
+    finally:
+        box.close()
 
 
 def test_message_identity_is_source_based_and_digest_is_byte_sensitive():
