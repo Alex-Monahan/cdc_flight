@@ -48,9 +48,9 @@ from cdc_flight.logical_messages import (
     message_prefix_include_list,
     read_logical_messages,
 )
+from cdc_flight.planner import GroupPlan
 from cdc_flight.policy import AcknowledgementHandle
 from cdc_flight.spill import SpillBuffer, StagedEvent
-from cdc_flight.planner import GroupPlan
 
 TOPIC_PREFIX = "cdcflight"
 DATASET = "cdc_raw"
