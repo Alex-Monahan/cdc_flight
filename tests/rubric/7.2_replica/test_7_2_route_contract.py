@@ -294,7 +294,7 @@ def test_standby_cannot_retain_stock_write_heartbeat_action(monkeypatch, tmp_pat
     assert props["heartbeat.action.query"] == ""
     assert props[STANDBY_HEARTBEAT_DISABLED_PROPERTY] == "true"
     assert props["heartbeat.interval.ms"] == "5000"
-    with pytest.raises(UnsafeDebeziumProperty, match="heartbeat\.action\.query"):
+    with pytest.raises(UnsafeDebeziumProperty, match=r"heartbeat\.action\.query"):
         build_properties(
             source,
             replication,

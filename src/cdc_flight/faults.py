@@ -762,6 +762,12 @@ class FaultyConnection:
         lowered = statement.lstrip().lower()
         if (
             self._point == "destination_hang"
+            and os.environ.get(DESTINATION_FAULT_ARM_ENV)
+            and not os.path.exists(os.environ[DESTINATION_FAULT_ARM_ENV])
+        ):
+            return
+        if (
+            self._point == "destination_hang"
             and os.environ.get("CDC_FAULT_HANG_PHASE", "commit") == "pre_commit"
             and _is_data_statement(statement, self._control_schema)
         ):
@@ -832,6 +838,12 @@ class FaultyConnection:
 HANG_SECONDS_ENV = "CDC_FAULT_HANG_SECONDS"
 DEFAULT_HANG_SECONDS = 3600.0
 CALLBACK_ENTERED_ENV = "CDC_TEST_CALLBACK_ENTERED"
+# Test-only arming barrier for a live callback-held destination fault.  The
+# destination wrapper is installed before the production child starts, but the
+# fault must not be allowed to fire during snapshot acquisition.  A test opens
+# this file only after it has durably observed the live streaming phase and before
+# it writes its post-arm source sentinel.
+DESTINATION_FAULT_ARM_ENV = "CDC_TEST_DESTINATION_FAULT_ARM"
 
 
 def hang_seconds() -> float:

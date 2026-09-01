@@ -467,6 +467,23 @@ class StandbyTopology:
                 (self.local_slot,),
             )
 
+    def wait_for_slot_inactive(self, *, timeout: float = 30) -> None:
+        """Wait until the local slot no longer has a decoder backend."""
+
+        def inactive() -> bool:
+            status = self.local_slot_status()
+            return status is None or not status["active"]
+
+        self._wait_until(inactive, timeout=timeout, description="local slot inactivity")
+
+    def repair_local_slot(self) -> None:
+        """Create the local decoder slot after a recorded loss/invalidation."""
+        if not self._provisioned:
+            raise RuntimeError("cannot repair a standby topology before provisioning")
+        self._wait_for_receiver_and_replay()
+        self._create_local_slot()
+        self.assert_preconditions()
+
     def cleanup(self) -> None:
         """Stop the explicit standby target, drop its primary slot, and prove cleanup."""
         self._stop_existing()
@@ -533,6 +550,7 @@ class StandbyCase:
     def spawn_service(
         self,
         *,
+        destination: str = "duckdb",
         extra_env: dict[str, str] | None = None,
         capture: bool = False,
     ) -> subprocess.Popen:
@@ -546,7 +564,7 @@ class StandbyCase:
             **(extra_env or {}),
         }
         return _popen_with_slot_startup_gate(
-            [str(executable), "--destination", "duckdb"],
+            [str(executable), "--destination", destination],
             env=environment,
             cwd=PROJECT_DIR,
             stdout=sink,
