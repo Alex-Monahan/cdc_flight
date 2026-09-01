@@ -91,6 +91,53 @@ def _wait_md_phase(
     _wait_until(reached, timeout=timeout, description=f"MotherDuck phase {phase!r}")
 
 
+def _wait_for_md_lease_available(
+    md: dict[str, str],
+    expected_service_id: str,
+    *,
+    timeout: float = 240,
+) -> None:
+    """Wait for the MotherDuck service lease's server-clock fence."""
+    observer: duckdb.DuckDBPyConnection | None = None
+    lease = _quoted(md["control_schema"]) + ".lease"
+    holder_observed = False
+
+    def available() -> bool:
+        nonlocal holder_observed, observer
+        if observer is None:
+            observer = connect(md["token"], md["database"])
+        try:
+            observer.execute("FORCE CHECKPOINT")
+            rows = observer.execute(
+                f"SELECT state, service_id, expires_at <= current_timestamp FROM {lease} "
+                "WHERE service_id = ? LIMIT 1",
+                (expected_service_id,),
+            ).fetchall()
+        except (duckdb.Error, RuntimeError):
+            observer.close()
+            observer = None
+            return False
+        if not rows:
+            return False
+        state, service_id, expired = rows[0]
+        if not holder_observed:
+            if str(state or "") != "held" or str(service_id or "") != expected_service_id:
+                return False
+            holder_observed = True
+            return False
+        return str(state or "held") == "released" or bool(expired)
+
+    try:
+        _wait_until(
+            available,
+            timeout=timeout,
+            description="MotherDuck service lease release or expiry",
+        )
+    finally:
+        if observer is not None:
+            observer.close()
+
+
 def _arm_stream(
     case: StandbyCase,
     topology: StandbyTopology,
@@ -150,6 +197,31 @@ def _insert_sentinel(topology: StandbyTopology, prefix: str) -> tuple[str, int]:
     return sentinel, source_lsn
 
 
+def _wait_for_post_arm_ack(
+    topology: StandbyTopology,
+    process,
+    source_lsn: int,
+    *,
+    timeout: float = 300,
+) -> None:
+    """Wait for the standby-owned slot to confirm a real post-arm source fence."""
+
+    def acknowledged() -> bool:
+        if process.poll() is not None:
+            raise AssertionError(
+                "NEVER_ARMED: the MotherDuck child exited before the post-arm "
+                f"sentinel was confirmed (returncode={process.returncode})"
+            )
+        confirmed = topology.local_slot_confirmed_lsn()
+        return confirmed is not None and confirmed >= source_lsn
+
+    _wait_until(
+        acknowledged,
+        timeout=timeout,
+        description=f"standby local slot confirmation at {source_lsn}",
+    )
+
+
 def _md_receipt(
     con: duckdb.DuckDBPyConnection,
     md: dict[str, str],
@@ -187,14 +259,15 @@ def _md_receipt_in_transaction(
     ).fetchall()
     if len(data_rows) != 1:
         return None
-    event_id, commit_id, dbz_lsn = data_rows[0]
-    if event_id is None or commit_id is None or dbz_lsn is None:
+    data_event_id, commit_id, dbz_lsn = data_rows[0]
+    if data_event_id is None or commit_id is None or dbz_lsn is None:
         return None
     ledger = con.execute(
-        f"SELECT state, source_schema, source_table, source_lsn, commit_lsn "
+        f"SELECT event_id, state, source_schema, source_table, source_lsn, commit_lsn "
         f"FROM {control}.event_ledger "
-        "WHERE pipeline = ? AND target_table = 'cdcflight_app_customers' AND event_id = ?",
-        (case.pipeline, event_id),
+        "WHERE pipeline = ? AND target_table = 'cdcflight_app_customers' "
+        "AND source_lsn = ? AND source_schema = 'app' AND source_table = 'customers'",
+        (case.pipeline, dbz_lsn),
     ).fetchall()
     commits = con.execute(
         f"SELECT event_count, first_lsn, last_lsn FROM {control}.commit_log "
@@ -216,7 +289,7 @@ def _md_receipt_in_transaction(
     ledger_row = ledger[0]
     commit_row = commits[0]
     offset_row = offsets[0]
-    if ledger_row[0] != "applied" or ledger_row[1:3] != ("app", "customers"):
+    if ledger_row[1] != "applied" or ledger_row[2:4] != ("app", "customers"):
         return None
     if state[0][0] != "complete":
         return None
@@ -224,11 +297,13 @@ def _md_receipt_in_transaction(
         return None
     return {
         "sentinel": sentinel,
-        "event_id": str(event_id),
+        "event_id": str(ledger_row[0]),
+        "data_event_id": str(data_event_id),
+        "ledger_event_id": str(ledger_row[0]),
         "commit_id": int(commit_id),
         "dbz_lsn": int(dbz_lsn),
-        "ledger_source_lsn": ledger_row[3],
-        "ledger_commit_lsn": ledger_row[4],
+        "ledger_source_lsn": ledger_row[4],
+        "ledger_commit_lsn": ledger_row[5],
         "commit_event_count": int(commit_row[0]),
         "commit_first_lsn": commit_row[1],
         "commit_last_lsn": int(commit_row[2]),
@@ -239,87 +314,46 @@ def _md_receipt_in_transaction(
     }
 
 
-def _wait_md_committed(
+def _wait_md_committed_after_stop(
     case: StandbyCase,
     topology: StandbyTopology,
     md: dict[str, str],
-    process,
     sentinel: str,
-    source_lsn: int,
     *,
+    require_slot_ack: bool = True,
     timeout: float = 300,
 ) -> dict:
+    """Read the atomic MotherDuck receipt after the service writer stopped.
+
+    The live-stream witness is the standby slot confirmation above.  This
+    observer intentionally runs after the child has been cleanly stopped (or
+    has fired the replay fault), so a remote ``FORCE CHECKPOINT`` cannot race a
+    production destination commit.
+    """
     result: dict | None = None
     observer: duckdb.DuckDBPyConnection | None = None
 
     def committed() -> bool:
         nonlocal observer, result
-        if process.poll() is not None:
-            if observer is not None:
-                observer.close()
-                observer = None
-            output = case.close_output(process)
-            try:
-                server_log = topology.log_path.read_text(encoding="utf-8")[-12000:]
-            except OSError as exc:
-                server_log = f"<standby log unavailable: {exc}>"
-            (case.root / "motherduck-child-output.log").write_text(
-                output, encoding="utf-8"
-            )
-            (case.root / "standby-server-log-tail.log").write_text(
-                server_log, encoding="utf-8"
-            )
-            interesting = "\n".join(
-                line
-                for line in output.splitlines()
-                if any(
-                    token in line
-                    for token in (
-                        "ERROR",
-                        "WARN",
-                        "Exception",
-                        "exception",
-                        "failed",
-                        "Failed",
-                        "disconnect",
-                        "timeout",
-                    )
-                )
-            )
-            print("MOTHERDUCK CHILD DIAGNOSTICS:\n" + interesting, flush=True)
-            print("STANDBY SERVER LOG TAIL:\n" + server_log, flush=True)
-            raise AssertionError(
-                "NEVER_ARMED: the standby MotherDuck child exited before the "
-                f"durable row/state/ledger/resume tuple for {sentinel!r} "
-                f"(returncode={process.returncode})\n{interesting}\n{server_log}"
-            )
-        # The standby-owned slot can only acknowledge this source position after
-        # the production commit protocol has committed the destination transaction
-        # and completed ``markBatchFinished``.  Wait on that source-side witness
-        # before opening the remote observer, so the observer's checkpoint cannot
-        # conflict with the live destination commit and the cloud polling loop does
-        # not add work to the source path.
-        confirmed_before_read = topology.local_slot_confirmed_lsn()
-        if confirmed_before_read is None or confirmed_before_read < source_lsn:
-            return False
         if observer is None:
             observer = connect(md["token"], md["database"])
         try:
             result = _md_receipt(observer, md, case, sentinel)
-        except duckdb.Error:
+        except (duckdb.Error, RuntimeError):
             observer.close()
             observer = None
             return False
         if result is None:
             return False
+        if not require_slot_ack:
+            return True
         confirmed = topology.local_slot_confirmed_lsn()
         return confirmed is not None and confirmed >= result["offset_last_lsn"]
 
     try:
         _wait_until(
             committed,
-            timeout=timeout,
-            description=f"MotherDuck commit for {sentinel}",
+            timeout=timeout, description=f"MotherDuck commit for {sentinel}"
         )
         assert result is not None
         return result
@@ -402,18 +436,22 @@ def test_standby_motherduck_commit_ack_and_replay_boundary(
         first_armed = _arm_stream(case, topology, md, process, baseline, "md_first")
         first_sentinel, first_lsn = _insert_sentinel(topology, "p72_md_first")
         sentinels.append(first_sentinel)
-        first_receipt = _wait_md_committed(
-            case, topology, md, process, first_sentinel, first_lsn
+        first_fence_lsn = topology.primary_marker_with_wal("md_first")
+        _wait_for_post_arm_ack(
+            topology, process, first_fence_lsn
         )
         _mark_fired(first_armed, sentinel=first_sentinel, source_lsn=first_lsn)
+        assert case.terminate(process, timeout=120) == 0
+        process = None
+        first_receipt = _wait_md_committed_after_stop(
+            case, topology, md, first_sentinel
+        )
         _write_durable(
             case.root / "MD_COMMITTED.json",
             {"event": "MD_COMMITTED", "sentinel": first_sentinel, **first_receipt},
         )
         first_confirmed = topology.local_slot_confirmed_lsn()
         assert first_confirmed is not None and first_confirmed >= first_receipt["offset_last_lsn"]
-        assert case.terminate(process, timeout=120) == 0
-        process = None
 
         # The fault is not present in the first service. It is armed only after
         # STREAM_ARMED and MD_COMMITTED have both been durably witnessed above.
@@ -428,6 +466,7 @@ def test_standby_motherduck_commit_ack_and_replay_boundary(
         replay_armed = _arm_stream(case, topology, md, replay_process, baseline, "md_replay")
         second_sentinel, second_lsn = _insert_sentinel(topology, "p72_md_replay")
         sentinels.append(second_sentinel)
+        second_fence_lsn = topology.primary_marker_with_wal("md_replay")
 
         def replay_fault_fired() -> bool:
             if replay_process.poll() is not None:
@@ -451,19 +490,12 @@ def test_standby_motherduck_commit_ack_and_replay_boundary(
         assert replay_rc != 0, {"returncode": replay_rc, "fault": case.fired_fault()}
         replay_process = None
         _mark_fired(replay_armed, sentinel=second_sentinel, source_lsn=second_lsn)
-        second_observer = connect(md["token"], md["database"])
-        try:
-            second_receipt = _md_receipt(
-                second_observer, md, case, second_sentinel
-            )
-        finally:
-            second_observer.close()
-        assert second_receipt is not None, (
-            "FIRED: the destination commit did not leave the complete durable "
-            f"tuple for {second_sentinel!r}"
-        )
+        topology.wait_for_slot_inactive(timeout=60)
         crash_confirmed = topology.local_slot_confirmed_lsn()
-        assert crash_confirmed is not None, second_receipt
+        assert crash_confirmed is not None, second_sentinel
+        second_receipt = _wait_md_committed_after_stop(
+            case, topology, md, second_sentinel, require_slot_ack=False
+        )
         assert crash_confirmed <= first_receipt["offset_last_lsn"], {
             "confirmed_after_replay_crash": crash_confirmed,
             "first": first_receipt,
@@ -475,7 +507,10 @@ def test_standby_motherduck_commit_ack_and_replay_boundary(
         }
 
         # Reopen the same production pipeline. Its event ledger makes the replay a
-        # no-op while the acknowledgement now advances the standby-owned slot.
+        # no-op while the acknowledgement now advances the standby-owned slot. A
+        # hard crash deliberately leaves the physical destination lease fenced until
+        # its server-clock expiry; wait on that durable condition before admission.
+        _wait_for_md_lease_available(md, "p72-md-replay", timeout=240)
         restart_process = case.spawn_service(
             destination="motherduck",
             extra_env={**md_env, **_service_env("p72-md-restart")},
@@ -483,15 +518,18 @@ def test_standby_motherduck_commit_ack_and_replay_boundary(
         restart_armed = _arm_stream(
             case, topology, md, restart_process, baseline, "md_restart"
         )
-        replayed = _wait_md_committed(
-            case, topology, md, restart_process, second_sentinel, second_lsn
+        _wait_for_post_arm_ack(
+            topology, restart_process, second_fence_lsn
         )
         _mark_fired(restart_armed, sentinel=second_sentinel, source_lsn=second_lsn)
+        assert case.terminate(restart_process, timeout=120) == 0
+        restart_process = None
+        replayed = _wait_md_committed_after_stop(
+            case, topology, md, second_sentinel
+        )
         assert replayed["event_id"] == second_receipt["event_id"], replayed
         assert replayed["commit_id"] == second_receipt["commit_id"], replayed
         assert topology.local_slot_confirmed_lsn() >= second_receipt["offset_last_lsn"]
-        assert case.terminate(restart_process, timeout=120) == 0
-        restart_process = None
 
         for sentinel in sentinels:
             rows = _q(
