@@ -362,7 +362,10 @@ def test_messages_are_atomic_and_replay_safe_in_motherduck(
                 f"SELECT cdcf_commit_id FROM {customer_table} WHERE name LIKE 'p74-md-data-%' "
                 f"ORDER BY cdcf_commit_id DESC LIMIT 1"
             ).fetchone()
-            assert commit and int(commit[0]) == commit_id and int(commit[1]) >= 2
+            # The commit contains one ordinary customer row and one logical
+            # message.  commit_log.event_count is the ordinary-data count; the
+            # message remains represented by its own consumer/ledger/audit rows.
+            assert commit and int(commit[0]) == commit_id and int(commit[1]) == 1
             assert offset and int(offset[0]) == commit_id and int(offset[1]) >= int(commit[2])
             assert table_state and table_state[0] in {"none", "complete"}
             assert customer and int(customer[0]) == commit_id
