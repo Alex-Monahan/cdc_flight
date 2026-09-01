@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 
 from cdc_flight.config import SourceConfig
+from cdc_flight.source_routes import SourceRoutePolicy
 from cdc_flight.source_health import _SLOT_SQL, _SLOT_SQL_FAST
 from cdc_flight.standby import (
     StandbyCapabilityError,
@@ -94,6 +95,28 @@ def test_standby_source_uses_only_the_explicit_primary_write_route(monkeypatch):
     monkeypatch.setenv("CDC_PRIMARY_DSN", "postgresql://writer:pw@primary:15432/db")
     source = SourceConfig()
     assert source.primary_dsn == "postgresql://writer:pw@primary:15432/db"
+
+
+def test_standby_route_policy_keeps_local_slot_admin_on_the_read_endpoint(monkeypatch):
+    monkeypatch.setenv("CDC_SOURCE_ROLE", "standby")
+    monkeypatch.setenv("CDC_PRIMARY_DSN", "postgresql://writer:pw@primary:15432/db")
+    source = SourceConfig(host="replica", port=15435)
+    assert source.route_policy == SourceRoutePolicy(
+        role="standby",
+        read_replication_dsn=source.dsn,
+        source_write_dsn=source.primary_dsn,
+        slot_owner_dsn=source.dsn,
+    )
+
+
+def test_standby_identity_mismatch_is_a_capability_failure():
+    observation = replace(
+        _healthy(),
+        primary_system_identifier="different-system",
+    )
+    assert any("system identifiers differ" in reason for reason in unsupported_reasons(observation))
+    with pytest.raises(StandbyCapabilityError, match="system identifiers differ"):
+        assert_supported(observation)
 
 
 def test_source_health_wal_position_is_recovery_safe():

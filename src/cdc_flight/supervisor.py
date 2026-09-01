@@ -697,10 +697,13 @@ def run_engine_bounded(
             service_context.begin_teardown()
             if service_context.lease_lost or service_context.stalled:
                 outcome.record("engine_error")
-            # Set drain intent before any final source hand-off.  If a callback is
-            # admitted during that bounded hand-off it can still close a complete
-            # group; ``shutdown`` below then seals admission and waits for it.
-            handler.request_drain()
+        # Set drain intent before any final source hand-off. If a callback is
+        # admitted during that bounded hand-off it can still close a complete
+        # group; ``shutdown`` below then seals admission and waits for it. Older
+        # unit fakes have no drain method, but every production Applier does.
+        request_drain = getattr(handler, "request_drain", None)
+        if request_drain is not None:
+            request_drain()
         # The shutdown state machine is deliberately linear.  The source feedback
         # hand-off happens while callbacks are still admitted; then admission is
         # sealed, admitted callbacks are drained, our own timer is retired, and only

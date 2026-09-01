@@ -241,7 +241,7 @@ def check_slot(
     | durable row, slot gone | `slot_missing` | re-snapshot |
     | `system_identifier` changed | `source_identity_changed` | re-snapshot |
     | `timeline_id` changed | `source_timeline_changed` | re-snapshot |
-    | `pg_current_wal_lsn() < durable` | `source_lsn_regressed` | re-snapshot |
+    | `source WAL upper bound < durable` | `source_lsn_regressed` | re-snapshot |
     | `restart_lsn` regressed vs the last observation | `slot_recreated` | re-snapshot |
     | `confirmed_flush_lsn > durable` | `slot_ahead_of_destination` | re-snapshot |
     | otherwise | `ok` | stream |
@@ -365,7 +365,7 @@ def check_slot(
             ok=False,
             resnapshot=True,
             message=(
-                f"pg_current_wal_lsn()={observation.current_wal_lsn} is BEHIND the "
+                f"source WAL upper bound={observation.current_wal_lsn} is BEHIND the "
                 f"durable destination offset {durable_lsn}: the source has been rewound "
                 "(a base-backup restore or a timeline change), so the events the "
                 "destination already holds are no longer the source's history"
@@ -463,7 +463,8 @@ def drop_slot(dsn: str, slot_name: str) -> str:
     creates the slot as part of the same start-up (`PostgresSnapshotChangeEventSource.
     getTransactionStartLsn`: "if any SQL operations occur mid-snapshot ... otherwise
     they'll be lost"). With a pre-existing slot it falls back to an ordinary snapshot
-    plus `pg_current_wal_lsn()`, and the snapshot/stream boundary is then only as exact
+    plus a role-appropriate source WAL upper-bound sample, and the snapshot/stream
+    boundary is then only as exact
     as that pairing happens to be. VERIFIED in the engine log: a fresh slot gets
     `SET TRANSACTION SNAPSHOT '…'`, a pre-existing one does not.
 

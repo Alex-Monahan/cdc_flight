@@ -922,7 +922,7 @@ def finish_verified_empty_tables(
                 "the source relation was VERIFIED to hold no rows: the ordered "
                 "per-table and global snapshot callbacks completed, and no record "
                 "was produced for this table, and a REPEATABLE READ count taken after "
-                f"pg_current_wal_lsn()={consistent_lsn} returned zero. The "
+                f"source WAL upper bound={consistent_lsn} returned zero. The "
                 "destination table was emptied rather than swapped, and is fenced "
                 "at that LSN so every later transaction is applied on top."
             )

@@ -471,7 +471,8 @@ class RunConfig:
     watermark_quiet_seconds: float = field(
         default_factory=lambda: float(_env("CDC_WATERMARK_QUIET_SECONDS", "0.5"))
     )
-    #: How far the slot's `confirmed_flush_lsn` may trail `pg_current_wal_lsn()`
+    #: How far the slot's `confirmed_flush_lsn` may trail the role-appropriate
+    #: source WAL upper bound (receive LSN on a standby, current LSN on a primary)
     #: and still allow the supervisor to call a quiet stream "idle". A quiet
     #: stream with a large backlog means the connector is not streaming - most
     #: often Debezium's 10 s retriable-restart backoff, which is longer than the

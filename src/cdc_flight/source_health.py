@@ -85,6 +85,20 @@ CASE WHEN pg_is_in_recovery()
 END
 """
 
+
+def assert_recovery_safe_wal_sql(sql: str) -> None:
+    """Reject a standby WAL query that calls current-LSN unconditionally.
+
+    This is both a construction guard and a small static-test seam. A standby
+    connection may contain the primary branch in a role-conditional CASE, but it
+    must never execute a bare ``pg_current_wal_lsn()`` statement.
+    """
+    normalized = " ".join(str(sql).lower().split())
+    if "pg_current_wal_lsn()" in normalized and "case when pg_is_in_recovery()" not in normalized:
+        raise ValueError(
+            "standby WAL evidence must guard pg_current_wal_lsn() with pg_is_in_recovery()"
+        )
+
 # The finite-run sampler only needs the slot liveness and confirmed position. The
 # service watchdog opts into the identity join below; keeping that expensive,
 # cluster-wide statistics lookup off the ordinary watermark path matters because
@@ -538,6 +552,7 @@ class SourceHealth:
                 tcp_user_timeout=self.query_timeout_ms,
             ) as conn:
                 sql = _SLOT_SQL if self.identity_required else _SLOT_SQL_FAST
+                assert_recovery_safe_wal_sql(sql)
                 row = conn.execute(sql, (self.slot_name,)).fetchone()
                 publication_has_tables = None
                 publication_has_configured_tables = None
