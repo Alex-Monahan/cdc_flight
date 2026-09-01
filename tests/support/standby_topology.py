@@ -729,7 +729,7 @@ class StandbyCase:
             state, expired = rows[0]
             return str(state or "held") == "released" or bool(expired)
 
-        self._wait_until(
+        self.topology._wait_until(
             available,
             timeout=timeout,
             description="destination service lease release or expiry",
