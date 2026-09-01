@@ -722,7 +722,7 @@ correct assumptions in the notes below:
 | 7.1 | No Postgres extension required | 5 | `plugin.name=pgoutput` with a version-controlled `PUBLICATION`. |
 | 7.2 | Read from a Postgres replica | ~~1~~ → **3** | Snapshot from a hot standby proven to work, but streaming was never exercised and the run hung on shutdown. |
 | 7.3 | Partitioned tables handled gracefully | 3 | One logical table via `publish_via_partition_root`; DETACH/DROP PARTITION silently ignored; no per-partition or DuckLake option. |
-| 7.4 | Capture `pg_logical_emit_message` | ~~3~~ → **5** | The binary capability is now end-to-end: stock Debezium messages are strictly base64-decoded to exact BLOB bytes, prefix-filtered, classified to exclude internal heartbeats, metadata-bearing transactional and non-transactional messages are ledger-fenced and atomically materialized in `cdc_raw.cdcflight_logical_messages`, and a real MotherDuck consumer row is proven durable and replay-safe. The service liveness high-water remains ordinary delivered source data only; messages and heartbeat/signal writes never refresh it, while the existing heartbeat still advances `confirmed_flush_lsn` on a quiet source. See the FIX ROUND §7.4 closure below. |
+| 7.4 | Capture `pg_logical_emit_message` | ~~3~~ → ~~1~~ → **5** | The binary capability is now end-to-end: stock Debezium messages are strictly base64-decoded to exact BLOB bytes, prefix-filtered, classified to exclude internal heartbeats, metadata-bearing transactional and non-transactional messages are ledger-fenced and atomically materialized in `cdc_raw.cdcflight_logical_messages`, and a real MotherDuck consumer row is proven durable and replay-safe. The service liveness high-water remains ordinary delivered source data only; messages and heartbeat/signal writes never refresh it, while the existing heartbeat still advances `confirmed_flush_lsn` on a quiet source. See the FIX ROUND §7.4 closure below. |
 | 8.1 | Hard and soft delete options | ~~1~~ → **5** | Both modes selectable globally AND per fully qualified table (`90cea8e`). Hard physically deletes; soft records a tombstone hidden from the live view. Both replay-fenced; mid-stream mode changes boundary-fenced with no resurrection. Gate `reviews/p8_gate4.md` confirmed 5/5 independently (also confirmed at gates 1-3). |
 | 8.2 | Change history / SCD2 | ~~1~~ → **3** | SCD2 semantic bundle merged at `a303ac4`: history/current relations, current marking, tombstones, duplicate replay, verified late ordering, structural truncate, refusal of keyless/missing-predecessor identity, refusal of current-only refresh. Independent gate corrected the round's self-scored 4 down to 3 (`reviews/p78_gate.md`). **4 needs** a production CLI history-mode integration plus a real-process SCD2 crash-anchor matrix including the post-commit/pre-ack boundary; **5 needs** the history-preserving §3 refresh. |
 | 8.3 | PII controls | ~~1~~ → **5** | All four controls — exclusion, fixed masking, salted HMAC-SHA-256 pseudonymization, anchored per-column-regex truncation — enforced by the APPLICATION before assembler, spill or destination admission (`90cea8e`). ⛔ Stock Debezium cannot do this: `MaskStrings` is character-types-only, `TruncateColumn` is String/ByteBuffer-only, the stock hash mapper uses Java `toString()` not the PG output function and keeps the salt, snapshot exclusion falls back to ALL columns when the filter excludes everything, and `TableSchemaBuilder` lets KEY columns bypass the value mapper. All 12 control×path mutation cells fail when disabled. Salt via `CDC_PII_HASH_SALT_FILE`, never reaching destination/logs/alerts/Debezium. Unmatched new column FAILS CLOSED. Four gates closed seven containment defects. |
@@ -2950,7 +2950,7 @@ naming), or a partitioned DuckLake target; plus handling for
 DETACH/DROP PARTITION that removes or tombstones the affected rows at the
 destination.
 
-### 7.4 Capture `pg_logical_emit_message` messages — **3 / 5**
+### 7.4 Capture `pg_logical_emit_message` messages — **5 / 5**
 
 `not supported=1, supported=5`
 
@@ -2962,21 +2962,69 @@ captured and landed in a `cdcflight_message` table:
 ('m', 'cdc_flight', 'bm9udHJhbnNhY3Rpb25hbC1oZWxsbw==',    lsn=47288840, tx_id=NULL)
 ```
 
-So the capability is real and this contradicts the informal note in
-`research/NOTES.md` §4 §7.4.
+This was historical evidence: the capability was real, but the then-score was
+3/5 because it worked by accident. The records were not deliberately unwrapped,
+the payload remained base64, table resolution fell back to the topic, and there
+was no contract test.
 
-Scored 3, not 5, because it works by accident rather than by design: the message
-records are **not** unwrapped by `ExtractNewRecordState` (the table carries the
-raw envelope — `op`, `ts_ms`, `source__*` — not the `dbz_*` metadata every other
-table has), the payload is base64, `resolve_table_name()`
-(`src/cdc_flight/handler.py:28-42`) falls back to the topic name for them, and
-there is no test. A later change to the SMT config or the internal-topic filter
-in `src/cdc_flight/pipeline.py:42` would silently drop them.
+#### FIX ROUND 18 closure (2026-08-31)
 
-**Gap to 5.** Decide the message shape deliberately: decode the content, give it
-the same `dbz_*` metadata columns, use `logical_decoding_message.prefix.include.list`
-to separate heartbeat messages (4.4) from application messages, and pin it with a
-test.
+The message path is now a deliberate, consumable feature rather than an
+accidental landing path:
+
+* Stock Debezium's `message.prefix.include.list` is configured with anchored
+  application prefixes plus the Flight heartbeat/internal markers. The
+  application classifies messages again, so an internal heartbeat is never a
+  public row and an unmatched prefix is not silently delivered.
+* The envelope decoder performs strict ASCII base64 validation and stores the
+  decoded `bytes` directly. Empty payloads and arbitrary non-UTF-8 bytes are
+  accepted without a text round trip; malformed base64 fails closed.
+* The assembler preserves transactional messages inside the PostgreSQL
+  transaction and emits a separate unit for non-transactional messages. END
+  event counts/order proofs include messages without treating them as ordinary
+  table delivery events.
+* Source-proof counters intentionally keep messages: assembler transaction
+  counts, message counts, ordinals, `END.event_count`, complete-unit event
+  counts, open-group event counts, and unit byte counts. Ordinary data counters
+  intentionally exclude application messages: planner `stats["events"]`, the
+  resulting `commit_log.event_count` and `applied_events`, plus ordinary
+  `table_counts`/`tables_touched`.
+* The ledger identity includes source cluster/timeline plus transaction/order
+  identity (or source LSN/sequence for a non-transactional message), and its
+  digest includes the exact bytes and message metadata. Collisions fail closed;
+  claimed/replayed identities are no-ops.
+* One MotherDuck transaction writes the message BLOB row, ledger state, audit
+  metadata, commit/state records, and offset. Slot advancement remains after
+  that durable commit. The destination relation
+  `cdc_raw.cdcflight_logical_messages` is a real consumer surface with
+  `content BLOB`, metadata, transactional classification, and delivery state.
+* Sanitized messages receive a real `AcknowledgementHandle` before the normal
+  spill boundary. The boundary still refuses raw decoded mappings; messages are
+  not exempted from PII containment, and the `schema_refusal_unscoped` guard is
+  unchanged.
+* The liveness high-water rule is preserved: logical messages, heartbeat
+  messages, and Flight signal-table writes never update the service liveness
+  clocks or ordinary data high-water. The existing heartbeat path still
+  acknowledges and advances `confirmed_flush_lsn` on a quiet source (4.4).
+
+The contract lane covers exact empty/non-UTF-8 bytes, filtering, metadata,
+transactional/non-transactional assembly, END accounting, consumer rows,
+collision handling, replay, data-count exclusion, and spill acknowledgement.
+The live message test first waits for the existing active-slot/alive predicate,
+inserts a unique ordinary-DML sentinel, waits for that sentinel in the
+destination, and only then emits messages. It uses explicit `NEVER_ARMED` versus
+`FIRED` diagnostics. The MotherDuck test uses the same barrier, independently
+verifies the sentinel, waits for the message callback/seen handshake, and
+distinguishes a child that never armed from a post-commit crash.
+
+Validation in this fix round: the default lane collected 2,421 with 12 workers
+(the run observed 2,418 passed plus the stale collection guard and two unrelated
+§1.6 snapshot-boundary failures; the guard was remeasured from 2,406 to 2,410
+after the four new tests). The slow lane collected 249 with 2 workers and had
+248 passes plus the pre-characterized §3.6 partition failure. The final
+post-edit MotherDuck lane collected 63 with 8 workers and had 61 passes plus the
+pre-characterized §1.7 crash-matrix setup timeout and an unrelated §1.7 lease
+expiry failure; the §7.4 MotherDuck contract passed. Ruff passed.
 
 ---
 
@@ -4625,56 +4673,3 @@ row-by-row probe both pass this boundary: the ceiling run exits non-zero with ro
 missing at that instant, and the following run reconciles the complete source set.
 This strengthens the 1.9 / 4.5 claim without changing the honest carry-forwards
 above (stock Debezium `xml[]`, marker-preserving TOAST, and money fidelity).
-
-## FIX ROUND 18 closure — rubric 7.4 (2026-08-31)
-
-### 7.4 Capture `pg_logical_emit_message` messages — **5 / 5**
-
-The message path is now a deliberate, consumable feature rather than an
-accidental landing path:
-
-* Stock Debezium's `message.prefix.include.list` is configured with anchored
-  application prefixes plus the Flight heartbeat/internal markers. The
-  application classifies messages again, so an internal heartbeat is never a
-  public row and an unmatched prefix is not silently delivered.
-* The envelope decoder performs strict ASCII base64 validation and stores the
-  decoded `bytes` directly. Empty payloads and arbitrary non-UTF-8 bytes are
-  accepted without a text round trip; malformed base64 fails closed.
-* The assembler preserves transactional messages inside the PostgreSQL
-  transaction and emits a separate unit for non-transactional messages. END
-  event counts/order proofs include messages without treating them as ordinary
-  table delivery events.
-* The ledger identity includes source cluster/timeline plus transaction/order
-  identity (or source LSN/sequence for a non-transactional message), and its
-  digest includes the exact bytes and message metadata. Collisions fail closed;
-  claimed/replayed identities are no-ops.
-* One MotherDuck transaction writes the message BLOB row, ledger state, audit
-  metadata, commit/state records, and offset. Slot advancement remains after
-  that durable commit. The destination relation
-  `cdc_raw.cdcflight_logical_messages` is a real consumer surface with
-  `content BLOB`, metadata, transactional classification, and delivery state;
-  the MotherDuck test reads and acts on that row after an injected
-  post-commit/pre-ack crash.
-* The liveness high-water rule is preserved: logical messages, heartbeat
-  messages, and Flight signal-table writes never update the service liveness
-  clocks or ordinary data high-water. The existing heartbeat path still
-  acknowledges and advances `confirmed_flush_lsn` on a quiet source (4.4).
-
-The contract lane covers exact empty/non-UTF-8 bytes, filtering, metadata,
-transactional/non-transactional assembly, END accounting, consumer rows,
-collision handling, and replay. The live message test first waits for the
-existing active-slot/alive predicate, inserts a unique ordinary-DML sentinel,
-waits for that sentinel in the destination, and only then emits messages. It
-uses explicit `NEVER_ARMED` versus `FIRED` diagnostics. The MotherDuck test
-uses the same barrier, independently verifies the sentinel, waits for the
-message callback/seen handshake, and distinguishes a child that never armed
-from a post-commit crash.
-
-Validation on the feature arm: the default lane was 2,417/2,417 passed with
-12 workers; the slow lane collected 249 with 247 passed and two unrelated
-pre-existing failures, while the new 7.4 E2E passed; the MotherDuck lane
-collected 63 with 61 passed and the two pre-characterized 1.7 errors, while
-the new 7.4 MotherDuck test passed; Ruff passed. The two slow-lane failures
-also passed in focused reruns on both feature and `main`; the MotherDuck
-errors are the known marginal 1.7 crash-matrix/contention recurrence and are
-not attributed to 7.4.
