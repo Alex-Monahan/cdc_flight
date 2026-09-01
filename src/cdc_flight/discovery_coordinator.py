@@ -630,6 +630,7 @@ class LiveDiscoveryCoordinator:
             source_cluster_id=source_cluster_id,
             source_timeline=source_timeline,
             strict_event_identity=True,
+            message_prefix_allowlist=self.replication.message_prefix_allowlist,
         )
         self.ownership.attach(applier)
         return applier

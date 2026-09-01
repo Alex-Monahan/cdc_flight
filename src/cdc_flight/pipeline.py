@@ -290,6 +290,11 @@ def run(
             )
         dest_mod.ensure_control_schema(con, control_schema)
         dest_mod.ensure_dataset(con, dest.dataset_name)
+        # The logical-message consumer is a stable destination relation, not a
+        # callback side channel. It is created during destination setup; rows and
+        # the shared ledger/resume point are still written only by commit_group's
+        # one open transaction.
+        dest_mod.ensure_logical_message_table(con, dest.dataset_name)
         summary_extra["source_role"] = source.role
         if source.role == "standby":
             # This is a read-only capability gate.  Stock Debezium remains the

@@ -286,6 +286,14 @@ class SupervisedDebeziumEngine(DebeziumJsonEngine):
             "validation": "io.debezium.connector.postgresql.PostgresConnectorConfig",
             "heartbeat.interval.ms": interval_ms,
             "heartbeat.action.query": action_query,
+            # Keep the stock connector's effective logical-message route in the
+            # run evidence.  The Python policy and the Java filter must agree;
+            # recording the value consumed by PostgresConnectorConfig makes a
+            # filtered-prefix diagnosis distinguishable from an emitter/source
+            # problem.
+            "message.prefix.include.list": str(
+                config.getString("message.prefix.include.list") or ""
+            ),
             "driver.socketTimeout": str(
                 pg_property.forName("socketTimeout").get(jdbc_props)
             ),

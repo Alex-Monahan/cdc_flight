@@ -145,13 +145,14 @@ def test_a_logical_message_retains_the_nested_marker_prefix():
                 "transaction": {"id": "78:901", "total_order": 1},
                 "message": {
                     "prefix": "cdcf_completion_watermark",
-                    "content": "payload",
+                    "content": "cGF5bG9hZA==",
                 },
             },
         )
     )
     assert rec.kind == KIND_MESSAGE
     assert rec.message_prefix == "cdcf_completion_watermark"
+    assert rec.message_content == b"payload"
 
 
 def test_a_snapshot_record_never_carries_transaction_metadata():

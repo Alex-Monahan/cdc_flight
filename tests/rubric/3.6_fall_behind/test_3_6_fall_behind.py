@@ -202,9 +202,18 @@ def test_live_slot_sampler_drives_byte_and_age_requests(sandbox):
         pending_source_ms = sandbox.pg_query(
             "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint"
         )[0][0]
+        # `occurred_at` is deliberately a FIXED in-range timestamp, never
+        # `clock_timestamp()`.  `app.audit_log` is range-partitioned by month with
+        # fixed partitions declared in sql/01_schema.sql, whose last one ends at
+        # '2026-09-01' EXCLUSIVE -- a current timestamp matches no partition and
+        # raises `CheckViolation: no partition of relation "audit_log" found`.
+        # This row's value is not read by the age assertion below: the age input is
+        # `pending_source_ms`, captured by its own clock_timestamp() query.  The
+        # insert exists only to create a second real pending source unit.
         sandbox.sql(
             "INSERT INTO app.audit_log (occurred_at, actor, action, payload) "
-            "VALUES (clock_timestamp(), 'lag-age-test', 'insert', '{\"n\":1}'::jsonb)",
+            "VALUES ('2026-08-15T00:00:00Z'::timestamptz, 'lag-age-test', 'insert', "
+            "'{\"n\":1}'::jsonb)",
             one_transaction=True,
         )
         age_lsn = sandbox.pg_query(

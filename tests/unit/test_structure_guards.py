@@ -18,12 +18,13 @@ import pytest
 _BASELINE_SELECTED = {
     # Re-measured after the §8.1/§8.3 additions. The release invariant is that
     # this number may only move upward as rubric coverage grows.
-    "not motherduck and not slow": 2399,
-    "slow and not motherduck": 247,
+    # Four §7.4 contract tests were added in this round.
+    "not motherduck and not slow": 2410,
+    "slow and not motherduck": 248,
     # The quiet-holder and stock-walsender retry proofs are MotherDuck-only real
     # process nodes; a local DuckDB file lock cannot exercise cloud takeover while
     # the old process retains its handle.
-    "motherduck": 61,
+    "motherduck": 62,
 }
 
 

@@ -130,6 +130,15 @@ class AdmissionError(ValueError):
     """
 
 
+class LogicalMessageRejected(AdmissionError):
+    """A decoded logical message has no permitted application route."""
+
+    def __init__(self, message: str, *, prefix: str | None = None, byte_length: int | None = None):
+        super().__init__(message)
+        self.prefix = prefix
+        self.byte_length = byte_length
+
+
 class ServiceStandDown(AdmissionError):
     """This scheduled Flight is healthy but not the live destination holder.
 

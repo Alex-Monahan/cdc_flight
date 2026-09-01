@@ -96,23 +96,29 @@ def apply_units(
         strict_event_identity=applier.strict_event_identity,
         delete_policy=applier.delete_policy,
         policy_gate=applier.policy_gate,
+        message_prefix_policy=applier.message_prefix_policy,
     )
-    for unit in group:
-        if unit.fenced:
-            if unit.spill_unit_seq is not None:
-                applier.fenced_spilled_events += unit.spilled_events
-                plan.staged_units = True
-            continue
-        if unit.kind == "snapshot_chunk" and not getattr(unit, "incremental", False):
-            applier.group.is_snapshot = True
-        plan.add_unit(unit)
+    try:
+        for unit in group:
+            if unit.fenced:
+                if unit.spill_unit_seq is not None:
+                    applier.fenced_spilled_events += unit.spilled_events
+                    plan.staged_units = True
+                continue
+            if unit.kind == "snapshot_chunk" and not getattr(unit, "incremental", False):
+                applier.group.is_snapshot = True
+            plan.add_unit(unit)
 
-    anchor = None
-    if has_data:
-        def anchor() -> None:
-            maybe_crash("mid_apply", applier.data_commit_groups + 1)
+        anchor = None
+        if has_data:
+            def anchor() -> None:
+                maybe_crash("mid_apply", applier.data_commit_groups + 1)
 
-    stats = plan.write(after_first_table=anchor, clear_spill=clear_spill)
+        stats = plan.write(after_first_table=anchor, clear_spill=clear_spill)
+    except BaseException:
+        _merge_message_stats(applier, plan.stats)
+        raise
+    _merge_message_stats(applier, stats)
     applier.group.created_in_txn.update(created_in_txn)
     for target, (schema, table) in plan.created_tables.items():
         destination.register_table(
@@ -136,3 +142,19 @@ def apply_units(
     applier.group.table_events.extend(plan.markers())
     applier._flush_table_events(commit_id)
     return stats
+
+
+def _merge_message_stats(applier, stats: dict) -> None:
+    """Publish message metadata even when the surrounding group is refused."""
+    with applier._lock:
+        for name in (
+            "logical_messages_received",
+            "logical_messages_delivered",
+            "logical_messages_replayed",
+            "logical_messages_internal",
+            "logical_messages_rejected",
+        ):
+            applier.logical_message_counts[name] += stats.get(name, 0)
+        applier.logical_message_observations.extend(
+            stats.get("logical_message_observations", ())
+        )

@@ -42,7 +42,9 @@ from .typed_materialization import (  # noqa: F401
     update_rows,
 )
 
-BOOLEAN, BIGINT, DOUBLE, JSON_T, VARCHAR = "BOOLEAN", "BIGINT", "DOUBLE", "JSON", "VARCHAR"
+BOOLEAN, BIGINT, DOUBLE, JSON_T, VARCHAR, BLOB = (
+    "BOOLEAN", "BIGINT", "DOUBLE", "JSON", "VARCHAR", "BLOB"
+)
 
 
 def sql_type(value: Any) -> str | None:
@@ -110,6 +112,7 @@ def bind(value: Any, column_type: str) -> Any:
 
 __all__ = [
     "BIGINT",
+    "BLOB",
     "BOOLEAN",
     "CDCF_COMMIT_ID",
     "CDCF_EVENT_ID",

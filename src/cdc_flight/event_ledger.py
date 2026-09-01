@@ -105,6 +105,15 @@ def payload_digest(event: Any) -> str:
         "descriptors": descriptor_groups,
         "snapshot_identity": getattr(event, "snapshot_identity", None),
     }
+    if getattr(event, "kind", None) == "logical_message":
+        # Message content is already exact bytes at the decoder boundary. The
+        # digest must preserve that byte identity and the route metadata; a
+        # textual round trip would make a same-ID non-UTF-8 collision invisible.
+        material["message_prefix"] = getattr(event, "message_prefix", None)
+        material["message_content"] = getattr(event, "message_content", None)
+        material["message_transactional"] = getattr(event, "message_transactional", None)
+        material["source_sequence"] = getattr(event, "source_sequence", None)
+        material["event_ts_ms"] = getattr(event, "event_ts_ms", None)
     return hashlib.sha256(canonical_json(material).encode("utf-8")).hexdigest()
 
 
@@ -376,6 +385,156 @@ def identity_for(
     )
 
 
+def message_identity_for(
+    event: Any,
+    *,
+    event_id: str | None = None,
+    source_cluster_id: str | None = None,
+    source_timeline: int | None = None,
+    commit_lsn: int | None = None,
+    policy_epoch: int | None = None,
+    require_strong: bool = False,
+    digest: str | None = None,
+) -> EventIdentity:
+    """Build a logical-message identity without inventing a transaction.
+
+    Transactional messages use source cluster/timeline + transaction id + source
+    event LSN + Debezium ordinal. Non-transactional messages use source
+    cluster/timeline + message LSN, or the source sequence when that is the only
+    source cursor present. The destination commit LSN is retained as a collision
+    guard, but is not used as the identity component because it is only known when
+    the transaction's END marker arrives (after spill staging).
+    """
+    cluster = source_cluster_id
+    if cluster is None:
+        cluster = getattr(event, "source_cluster_id", None)
+    timeline = source_timeline
+    if timeline is None:
+        timeline = getattr(event, "source_timeline", None)
+    try:
+        timeline = int(timeline) if timeline is not None else None
+    except (TypeError, ValueError):
+        timeline = None
+    source_lsn = getattr(event, "lsn", None)
+    try:
+        source_lsn = int(source_lsn) if source_lsn is not None else None
+    except (TypeError, ValueError):
+        source_lsn = None
+    source_commit_lsn = commit_lsn
+    if source_commit_lsn is None:
+        source_commit_lsn = getattr(event, "commit_lsn", None)
+    try:
+        source_commit_lsn = (
+            int(source_commit_lsn) if source_commit_lsn is not None else None
+        )
+    except (TypeError, ValueError):
+        source_commit_lsn = None
+    txn_id = getattr(event, "txn_id", None)
+    try:
+        order = getattr(event, "total_order", None)
+        order = int(order) if order is not None else None
+    except (TypeError, ValueError):
+        order = None
+    sequence = getattr(event, "source_sequence", None)
+    transactional = getattr(event, "message_transactional", None)
+    if transactional is None:
+        transactional = txn_id is not None or order is not None
+    transactional = bool(transactional)
+    cursor = source_lsn if source_lsn is not None else source_commit_lsn
+    if transactional:
+        missing = [
+            name
+            for name, value in (
+                ("cluster", cluster),
+                ("timeline", timeline),
+                ("transaction id", txn_id),
+                ("total order", order),
+                ("source LSN", cursor),
+            )
+            if value is None or value == ""
+        ]
+        if missing:
+            raise DestinationIdentityCollision(
+                "transactional logical message is missing stable identity fact(s): "
+                + ", ".join(missing),
+                source_schema=None,
+                source_table=None,
+            )
+    else:
+        if cursor is None and not sequence:
+            raise DestinationIdentityCollision(
+                "non-transactional logical message has neither source LSN nor source "
+                "sequence; refusing to invent an arrival identity",
+                source_schema=None,
+                source_table=None,
+            )
+        if cluster is None or cluster == "" or timeline is None:
+            raise DestinationIdentityCollision(
+                "non-transactional logical message is missing source cluster/timeline "
+                "identity facts; refusing to guess an id",
+                source_schema=None,
+                source_table=None,
+            )
+
+    strong = bool(
+        cluster not in (None, "")
+        and timeline is not None
+        and (
+            (transactional and txn_id not in (None, "") and order is not None and cursor is not None)
+            or (not transactional and (cursor is not None or sequence))
+        )
+    )
+    if event_id is not None:
+        stable_id = str(event_id)
+    elif strong:
+        components = ["message-v1", _component(cluster), str(timeline)]
+        if transactional:
+            components.extend(("tx", _component(txn_id), str(order), str(cursor)))
+        elif cursor is not None:
+            components.extend(("lsn", str(cursor)))
+        else:
+            components.extend(("sequence", _component(sequence)))
+        stable_id = ".".join(components)
+    else:
+        # Compatibility adapters may not know source lineage. They can inspect the
+        # identity, but production planners reject the non-ledger-eligible result.
+        stable_id = ".".join(
+            (
+                "message-v1-unscoped",
+                "tx" if transactional else "event",
+                _component(txn_id if transactional else (cursor or sequence)),
+                str(order) if transactional else "_",
+            )
+        )
+    try:
+        epoch = int(
+            policy_epoch
+            if policy_epoch is not None
+            else getattr(event, "policy_epoch", 0) or 0
+        )
+    except (TypeError, ValueError):
+        epoch = 0
+    return EventIdentity(
+        event_id=stable_id,
+        source_schema=None,
+        source_table=None,
+        source_cluster_id=str(cluster) if cluster is not None else None,
+        source_timeline=timeline,
+        relation_generation=None,
+        txn_id=str(txn_id) if txn_id is not None else None,
+        commit_lsn=source_commit_lsn,
+        source_lsn=source_lsn,
+        total_order=order,
+        operation="m",
+        payload_digest=digest or payload_digest(event),
+        key_guard_digest=None,
+        policy_epoch=epoch,
+        policy_digest=getattr(event, "policy_digest", None),
+        delete_mode=None,
+        strong=strong,
+    )
+
+
 def stable_event_id(event: Any, **kwargs: Any) -> str:
     return identity_for(event, **kwargs).event_id
 
@@ -418,6 +577,7 @@ __all__ = [
     "identity_for",
     "key_guard_digest",
     "latest_snapshot_epoch",
+    "message_identity_for",
     "payload_digest",
     "relation_generation_for",
     "relation_generation_from_relation",

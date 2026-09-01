@@ -270,6 +270,22 @@ class ReplicationConfig:
     signal_data_collection: str | None = field(
         default_factory=lambda: os.environ.get("CDC_SIGNAL_DATA_COLLECTION")
     )
+    #: Regexes passed to stock Debezium's ``message.prefix.include.list``.  The
+    #: Flight-owned marker and heartbeat namespaces are added by
+    #: ``debezium_props`` and routed internally; these are the application
+    #: namespaces that become rows in the public logical-message relation.
+    message_prefix_allowlist: tuple[str, ...] = field(
+        default_factory=lambda: tuple(
+            item.strip()
+            for item in (
+                os.environ.get(
+                    "CDC_MESSAGE_PREFIX_ALLOWLIST",
+                    os.environ.get("CDC_LOGICAL_MESSAGE_PREFIXES", "app_.*"),
+                )
+            ).split(",")
+            if item.strip()
+        )
+    )
     snapshot_mode: str = field(default_factory=lambda: _env("CDC_SNAPSHOT_MODE", "initial"))
     state_dir: Path = field(
         default_factory=lambda: Path(

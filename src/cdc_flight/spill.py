@@ -25,7 +25,7 @@ from dataclasses import dataclass
 
 from . import apply_sql
 from .config import resolve_control_schema
-from .envelope import KIND_DATA, KIND_TRUNCATE, OP_TRUNCATE, PendingRecord
+from .envelope import KIND_DATA, KIND_MESSAGE, KIND_TRUNCATE, OP_MESSAGE, OP_TRUNCATE, PendingRecord
 from .naming import control_table
 from .row_patch import RowPatch
 from .typed_types import SourceTypeDescriptor, TypedImage
@@ -37,7 +37,8 @@ _COLUMNS = [
     "source_table", "lsn", "txn_id", "total_order", "cdcf_event_id", "op",
     "source_ts_ms", "before_json", "after_json", "key_json", "source_cluster_id",
     "source_timeline", "relation_generation", "commit_lsn", "policy_epoch",
-    "policy_digest",
+    "policy_digest", "message_prefix", "message_content", "message_transactional",
+    "source_sequence", "event_ts_ms",
 ]
 _TYPES = [
     apply_sql.BIGINT, apply_sql.BIGINT, apply_sql.BIGINT, apply_sql.VARCHAR,
@@ -45,7 +46,8 @@ _TYPES = [
     apply_sql.BIGINT, apply_sql.VARCHAR, apply_sql.VARCHAR, apply_sql.BIGINT,
     apply_sql.VARCHAR, apply_sql.VARCHAR, apply_sql.VARCHAR, apply_sql.VARCHAR,
     apply_sql.BIGINT, apply_sql.VARCHAR, apply_sql.BIGINT, apply_sql.BIGINT,
-    apply_sql.VARCHAR,
+    apply_sql.VARCHAR, apply_sql.VARCHAR, apply_sql.BLOB, apply_sql.BOOLEAN,
+    apply_sql.VARCHAR, apply_sql.BIGINT,
 ]
 
 
@@ -125,6 +127,11 @@ class SpillBuffer:
                 staged.event.commit_lsn,
                 staged.event.policy_epoch,
                 staged.event.policy_digest,
+                staged.event.message_prefix,
+                staged.event.message_content,
+                staged.event.message_transactional,
+                staged.event.source_sequence,
+                staged.event.event_ts_ms,
             ]
             for staged in prepared
         ]
@@ -148,7 +155,8 @@ class SpillBuffer:
             f"SELECT target_table, source_schema, source_table, lsn, txn_id, total_order, "
             "       cdcf_event_id, op, source_ts_ms, before_json, after_json, key_json, "
             "       source_cluster_id, source_timeline, relation_generation, commit_lsn, "
-                "       policy_epoch, policy_digest, event_seq "
+            "       policy_epoch, policy_digest, message_prefix, message_content, "
+            "       message_transactional, source_sequence, event_ts_ms, event_seq "
             f"FROM {control_table(self.control_schema, 'spill_events')} "
             "WHERE commit_id = ? AND unit_seq = ? "
             "ORDER BY event_seq",
@@ -160,7 +168,8 @@ class SpillBuffer:
                 target, schema, table, lsn, txn_id, total_order, event_id, op,
                 source_ts_ms, before_json, after_json, key_json, source_cluster_id,
                 source_timeline, relation_generation, stored_commit_lsn, policy_epoch,
-                policy_digest, event_seq,
+                policy_digest, message_prefix, message_content, message_transactional,
+                source_sequence, event_ts_ms, event_seq,
             ) = row
             before, typed_before = _image_from_json(before_json)
             after, typed_after = _image_from_json(after_json)
@@ -173,7 +182,11 @@ class SpillBuffer:
                         # as `KIND_DATA` would be folded as a keyless row instead of
                         # emptying the table (rubric 1.5).
                         raw=None,
-                        kind=KIND_TRUNCATE if op == OP_TRUNCATE else KIND_DATA,
+                        kind=(
+                            KIND_MESSAGE
+                            if op == OP_MESSAGE
+                            else KIND_TRUNCATE if op == OP_TRUNCATE else KIND_DATA
+                        ),
                         topic="", nbytes=0, op=op, schema=schema,
                         table=table, lsn=lsn, txn_id=txn_id, total_order=total_order,
                         source_cluster_id=source_cluster_id,
@@ -186,7 +199,14 @@ class SpillBuffer:
                         ),
                         policy_epoch=int(policy_epoch or 0),
                         policy_digest=policy_digest,
+                        message_prefix=message_prefix,
+                        message_content=(
+                            bytes(message_content) if message_content is not None else None
+                        ),
+                        message_transactional=message_transactional,
                         sanitized=True,
+                        source_sequence=source_sequence,
+                        event_ts_ms=event_ts_ms,
                         source_ts_ms=source_ts_ms,
                         key=key,
                         before=before,

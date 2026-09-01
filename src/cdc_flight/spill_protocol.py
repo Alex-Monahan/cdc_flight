@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import logging
 
-from . import catalog_support
-from .envelope import PendingRecord
+from . import catalog_support, event_ledger, logical_messages
+from .envelope import KIND_MESSAGE, PendingRecord
 from .errors import AdmissionError, SchemaEvolutionRefused
 from .faults import maybe_crash
 from .planner import stream_event_id
@@ -42,6 +42,22 @@ def stage_events(
 
     prepared: list[StagedEvent] = []
     for event in events:
+        if event.kind == KIND_MESSAGE:
+            identity = event_ledger.message_identity_for(
+                event,
+                source_cluster_id=applier.source_cluster_id,
+                source_timeline=applier.source_timeline,
+                require_strong=applier.strict_event_identity,
+            )
+            prepared.append(
+                StagedEvent(
+                    event=event,
+                    event_id=identity.event_id,
+                    target=logical_messages.target_table(applier.dataset),
+                    seq=event.total_order or event.lsn or 0,
+                )
+            )
+            continue
         if not event.schema or not event.table:
             continue
         _enrich_descriptors(applier, event)
