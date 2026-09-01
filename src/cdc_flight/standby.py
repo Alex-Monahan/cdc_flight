@@ -162,6 +162,40 @@ def assert_supported(observation: StandbyObservation) -> StandbyObservation:
     return observation
 
 
+def local_slot_recovery_reasons(
+    observation: StandbyObservation,
+) -> tuple[str, ...]:
+    """Return only failures that can be repaired on the local slot owner.
+
+    This narrow admission exception is used by acquisition recovery to *observe*
+    a missing/invalidated standby slot and preserve its recovery obligation.  It
+    never permits a bad receiver, identity, or primary configuration to proceed.
+    """
+    reasons = unsupported_reasons(observation)
+    return tuple(
+        reason
+        for reason in reasons
+        if reason.startswith("local slot ")
+        or reason.startswith("a synchronized failover slot")
+        or reason.startswith("a failover slot ")
+    )
+
+
+def assert_supported_for_recovery(
+    observation: StandbyObservation,
+) -> StandbyObservation:
+    """Allow acquisition to continue only to repair a local slot.
+
+    The returned observation is still unsupported for streaming.  The caller must
+    run the ordinary strict check again before constructing Debezium.
+    """
+    reasons = unsupported_reasons(observation)
+    local_reasons = local_slot_recovery_reasons(observation)
+    if reasons and len(local_reasons) == len(reasons):
+        return observation
+    return assert_supported(observation)
+
+
 def _scalar(conn, sql: str, params: list[Any] | tuple[Any, ...] = ()):
     row = conn.execute(sql, params).fetchone()
     return None if row is None else row[0]
@@ -185,6 +219,7 @@ def inspect(
     physical_slot_name: str | None = None,
     connect_timeout: int = 5,
     statement_timeout_ms: int = 4000,
+    allow_local_slot_recovery: bool = False,
 ) -> StandbyObservation:
     """Collect standby and primary capability facts using read-only sessions.
 
@@ -295,6 +330,8 @@ def inspect(
             int(primary_timeline_id) if primary_timeline_id is not None else None
         ),
     )
+    if allow_local_slot_recovery:
+        return assert_supported_for_recovery(observation)
     return assert_supported(observation)
 
 
@@ -304,6 +341,8 @@ __all__ = [
     "StandbyCapabilityError",
     "StandbyObservation",
     "assert_supported",
+    "assert_supported_for_recovery",
     "inspect",
+    "local_slot_recovery_reasons",
     "unsupported_reasons",
 ]

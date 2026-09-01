@@ -315,8 +315,12 @@ def run(
                 physical_slot_name=source.physical_slot_name,
                 connect_timeout=run_cfg.jdbc_connect_timeout_seconds,
                 statement_timeout_ms=run_cfg.jdbc_socket_timeout_seconds * 1000,
+                allow_local_slot_recovery=True,
             )
             summary_extra["standby_capability"] = standby.as_dict()
+            summary_extra["standby_local_slot_recovery_reasons"] = (
+                standby_mod.local_slot_recovery_reasons(standby)
+            )
             log.info(
                 "validated recovery-mode standby source: system=%s timeline=%s "
                 "local_slot=%s physical_slot=%s",
@@ -1316,6 +1320,18 @@ def _record_run_failure_alert(
             if exc.offset_row is not None
             else OccurrenceKey.from_run(run_state, pipeline=dest.pipeline_name)
         )
+    elif summary.get("local_slot_failure"):
+        witness = dict(summary["local_slot_failure"])
+        kind = str(witness.get("kind") or "invalidated")
+        code = "local_slot_lost" if kind == "lost" else "local_slot_invalidated"
+        severity = "critical"
+        condition_key = (
+            f"{code}:{witness.get('slot_name')}:{witness.get('wal_status')}"
+            f":{witness.get('invalidation_reason')}"
+        )
+        occurrence_key = OccurrenceKey.from_run(
+            run_state, pipeline=dest.pipeline_name
+        )
     elif summary.get("slot_check"):
         code = str(summary["slot_check"].get("decision") or "slot_check_failed")
         severity = "critical"
@@ -1429,6 +1445,7 @@ def _record_run_failure_alert(
                         if isinstance(source_health_episode, EpisodeReceipt)
                         else source_health_episode
                     ),
+                    "local_slot_failure": summary.get("local_slot_failure"),
                 },
             )
             if not raised and not dest_mod.alert_identity_exists(

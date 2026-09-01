@@ -84,7 +84,9 @@ SELECT (s.restart_lsn - '0/0')::bigint,
        ((CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn()
               ELSE pg_current_wal_lsn() END) - '0/0')::bigint,
        (SELECT system_identifier::text FROM pg_control_system()),
-       (SELECT timeline_id FROM pg_control_checkpoint())
+       (SELECT timeline_id FROM pg_control_checkpoint()),
+       s.wal_status,
+       to_jsonb(s)->>'invalidation_reason'
 FROM (SELECT 1) one
 LEFT JOIN pg_replication_slots s ON s.slot_name = %s
 """
@@ -107,6 +109,8 @@ class SlotObservation:
     current_wal_lsn: int | None = None
     system_identifier: str | None = None
     timeline_id: int | None = None
+    wal_status: str | None = None
+    invalidation_reason: str | None = None
     error: str | None = None
 
     @property
@@ -122,6 +126,8 @@ class SlotObservation:
             "current_wal_lsn": self.current_wal_lsn,
             "system_identifier": self.system_identifier,
             "timeline_id": self.timeline_id,
+            "wal_status": self.wal_status,
+            "invalidation_reason": self.invalidation_reason,
             "error": self.error,
         }
 
@@ -147,7 +153,7 @@ def observe_slot(dsn: str, slot_name: str, *, connect_timeout: int = 10) -> Slot
         return SlotObservation(error=f"{type(exc).__name__}: {exc}")
     if row is None:  # pragma: no cover - the LEFT JOIN always returns one row
         return SlotObservation(error="no row from pg_replication_slots")
-    restart, confirmed, active, current, system_id, timeline = row
+    restart, confirmed, active, current, system_id, timeline, wal_status, invalidation = row
     return SlotObservation(
         slot_exists=restart is not None or confirmed is not None or bool(active),
         active=bool(active),
@@ -156,6 +162,10 @@ def observe_slot(dsn: str, slot_name: str, *, connect_timeout: int = 10) -> Slot
         current_wal_lsn=int(current) if current is not None else None,
         system_identifier=str(system_id) if system_id is not None else None,
         timeline_id=int(timeline) if timeline is not None else None,
+        wal_status=str(wal_status) if wal_status is not None else None,
+        invalidation_reason=(
+            str(invalidation) if invalidation is not None else None
+        ),
     )
 
 
@@ -165,6 +175,7 @@ def observe_slot(dsn: str, slot_name: str, *, connect_timeout: int = 10) -> Slot
 RESNAPSHOT_DECISIONS = (
     "slot_ahead_of_destination",
     "slot_missing",
+    "slot_invalidated",
     "slot_recreated",
     "source_identity_changed",
     "source_timeline_changed",
@@ -354,6 +365,25 @@ def check_slot(
                 "source's history"
             ),
             context=context | {"previous_timeline_id": int(prev_timeline)},
+        )
+
+    if observation.invalidation_reason or (observation.wal_status or "").lower() in {
+        "lost",
+        "unreserved",
+    }:
+        status = observation.wal_status or "invalidated"
+        reason = observation.invalidation_reason or "PostgreSQL reports the slot WAL is unusable"
+        return SlotVerdict(
+            "slot_invalidated",
+            ok=False,
+            resnapshot=True,
+            message=(
+                f"the local logical slot is invalidated (wal_status={status!r}, "
+                f"reason={reason!r}); stop before acknowledgement, repair the local "
+                "standby slot, and perform a fenced full resnapshot. The primary "
+                "logical slot is never a fallback"
+            ),
+            context=context,
         )
 
     if (

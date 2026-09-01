@@ -554,6 +554,7 @@ def run(
             primary_dsn=routes.source_write_dsn,
             source_write_dsn=routes.source_write_dsn,
             standby_heartbeat=routes.role == "standby",
+            detect_local_slot_failure=routes.role == "standby",
         ).start()
         ownership.activate(applier)
         try:

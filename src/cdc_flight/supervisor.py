@@ -246,6 +246,7 @@ def run_engine_bounded(
     source_dark_after: float | None = None
     engine_thread_alive_at_source_dark = False
     source_unobservable_after: float | None = None
+    local_slot_failure: dict | None = None
     live_queue_probe = getattr(engine, "probe_live_queue", None)
     live_queue_metrics: dict | None = None
     # The effective connector configuration is validated while the stock engine is
@@ -265,6 +266,22 @@ def run_engine_bounded(
     commit_to_slot_observed_at: float | None = None
     commit_to_slot_confirmed = False
     shutdown_sequence = ShutdownSequence()
+
+    def _record_local_slot_failure() -> bool:
+        """Stop on a proven standby-slot loss before any final acknowledgement."""
+        nonlocal local_slot_failure
+        witness = getattr(health, "local_slot_failure", None) if health is not None else None
+        if witness is None:
+            return False
+        local_slot_failure = dict(witness)
+        log.error(
+            "local logical slot %r is %s; stopping before acknowledgement and "
+            "retaining the local repair/full-resnapshot obligation",
+            local_slot_failure.get("slot_name"),
+            local_slot_failure.get("kind"),
+        )
+        outcome.record("engine_error")
+        return True
     next_service_recheck = started + float(
         getattr(service_context, "invariant_check_seconds", 30.0)
     ) if service_mode else None
@@ -326,6 +343,8 @@ def run_engine_bounded(
                     engine_thread_alive=thread.is_alive(),
                     quiet_source_ready=health.service_quiet_ready,
                 )
+                if _record_local_slot_failure():
+                    break
                 if (
                     run.source_dark_seconds > 0
                     and health.ever_sampled
@@ -548,6 +567,8 @@ def run_engine_bounded(
             if elapsed >= run.max_seconds:
                 outcome.record("max_seconds")
                 break
+            if _record_local_slot_failure():
+                break
             if error_box or engine.failure is not None:
                 outcome.record("engine_error")
                 break
@@ -647,7 +668,12 @@ def run_engine_bounded(
                         "further acknowledgement",
                         health.slot_name,
                     )
-                if not service_context.drain_requested and health is not None:
+                _record_local_slot_failure()
+                if (
+                    local_slot_failure is None
+                    and not service_context.drain_requested
+                    and health is not None
+                ):
                     signal = service_context.engine_liveness_signal()
                     sample = health.last
                     source_status = health.service_status(
@@ -720,6 +746,7 @@ def run_engine_bounded(
             and health.ever_sampled
             and not getattr(getattr(handler, "cfg", None), "resnapshot", False)
             and outcome.value not in {"source_dark", "hung"}
+            and outcome.value != "engine_error"
             and not (service_mode and (service_context.lease_lost or service_context.stalled))
         )
         if final_ack_required:
@@ -986,6 +1013,8 @@ def run_engine_bounded(
         summary["source_unobservable_after_sec"] = source_unobservable_after
     if health is not None:
         summary.update(health.summary())
+    if local_slot_failure is not None:
+        summary["local_slot_failure"] = local_slot_failure
     if service_recheck_result is not None:
         summary["service_invariant_recheck"] = service_recheck_result
     if acknowledgement_timeout is not None:
@@ -1023,6 +1052,15 @@ def run_engine_bounded(
             f"{source_unobservable_after:.1f}s of engine startup (bound="
             f"{source_probe_bound:.1f}s); an unobserved source "
             "cannot be called idle or complete",
+            summary,
+        )
+    if local_slot_failure is not None:
+        raise EngineFailure(
+            "the standby's local logical slot was lost or invalidated after a live "
+            "stream was observed; destination state was preserved and no source "
+            "acknowledgement was attempted. Repair the local standby slot, then run "
+            "the fenced full resnapshot recovery. A primary logical slot is never a "
+            "fallback",
             summary,
         )
     if not applier_quiesced:

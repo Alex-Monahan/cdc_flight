@@ -1061,6 +1061,7 @@ SLOT_VERDICTS = Domain(
         "source_unobservable",
         "slot_ahead_of_destination",
         "slot_missing",
+        "slot_invalidated",
         "slot_recreated",
         "source_identity_changed",
         "source_timeline_changed",

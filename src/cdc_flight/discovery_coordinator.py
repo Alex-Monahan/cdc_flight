@@ -201,6 +201,7 @@ class LiveDiscoveryCoordinator:
                     primary_dsn=self.routes.source_write_dsn,
                     source_write_dsn=self.routes.source_write_dsn,
                     standby_heartbeat=self.routes.role == "standby",
+                    detect_local_slot_failure=self.routes.role == "standby",
                     source_marker=(
                         getattr(self.watcher, "marker", None)
                         or SourceMarker(

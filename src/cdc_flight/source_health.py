@@ -144,6 +144,19 @@ LEFT JOIN pg_stat_activity a ON a.pid = s.active_pid
 LEFT JOIN pg_stat_replication r ON r.pid = s.active_pid
 """
 
+# ``wal_status`` is present on the supported PostgreSQL versions.  The
+# invalidation-reason column was added later, so read it through the view row's
+# JSON representation: on an older supported server the key is simply absent
+# and returns NULL.  This is deliberately a second, standby-only probe rather
+# than a change to either hot path's tuple shape; the finite-run sampler and its
+# compatibility fakes continue to have the same delivery fields.
+_LOCAL_SLOT_STATUS_SQL = """
+SELECT s.wal_status,
+       to_jsonb(s)->>'invalidation_reason' AS invalidation_reason
+FROM pg_replication_slots AS s
+WHERE s.slot_name = %s
+"""
+
 _PUBLICATION_HAS_TABLES_SQL = """
 SELECT EXISTS (
     SELECT 1
@@ -229,6 +242,10 @@ class SlotSample:
     lag_bytes: int | None = None
     confirmed_pos: int | None = None
     restart_pos: int | None = None
+    #: PostgreSQL slot health is a source-position safety fact, not a liveness
+    #: clock. ``lost``/``unreserved`` means WAL required by this slot is gone.
+    wal_status: str | None = None
+    invalidation_reason: str | None = None
     error: str | None = None
     #: Wall-clock time near the SQL result. ``at`` remains monotonic for duration
     #: clocks; this value makes the persisted operator sample attributable to a time.
@@ -245,6 +262,14 @@ class SlotSample:
     def streaming(self) -> bool:
         """True when a walsender is attached to our slot right now."""
         return self.exists and self.active
+
+    @property
+    def invalidated(self) -> bool:
+        """Whether PostgreSQL has declared this logical slot unusable."""
+        return bool(
+            self.invalidation_reason
+            or (self.wal_status or "").lower() in {"lost", "unreserved"}
+        )
 
     @property
     def identity_context(self) -> str:
@@ -313,6 +338,10 @@ class SourceHealth:
     #: Flight-owned bounded writer emits the protected logical heartbeat on the
     #: source-write route after a live stream has been observed.
     standby_heartbeat: bool = False
+    #: Standby-only live loss/invalidation witness.  Keeping it opt-in preserves
+    #: the primary sampler's inexpensive tuple path while making a local replica
+    #: slot failure a first-class stop condition.
+    detect_local_slot_failure: bool = False
     heartbeat_interval: float = 5.0
     source_marker: SourceMarker | None = None
     max_lag_bytes: int = DEFAULT_MAX_IDLE_LAG_BYTES
@@ -554,6 +583,19 @@ class SourceHealth:
                 sql = _SLOT_SQL if self.identity_required else _SLOT_SQL_FAST
                 assert_recovery_safe_wal_sql(sql)
                 row = conn.execute(sql, (self.slot_name,)).fetchone()
+                wal_status = None
+                invalidation_reason = None
+                if self.detect_local_slot_failure:
+                    status_row = conn.execute(
+                        _LOCAL_SLOT_STATUS_SQL, (self.slot_name,)
+                    ).fetchone()
+                    if status_row is not None:
+                        wal_status = (
+                            str(status_row[0]) if status_row[0] is not None else None
+                        )
+                        invalidation_reason = (
+                            str(status_row[1]) if status_row[1] is not None else None
+                        )
                 publication_has_tables = None
                 publication_has_configured_tables = None
                 if self.publication_name is not None:
@@ -586,6 +628,8 @@ class SourceHealth:
             return SlotSample(
                 at=now,
                 exists=False,
+                wal_status=wal_status,
+                invalidation_reason=invalidation_reason,
                 publication_has_tables=publication_has_tables,
                 publication_has_configured_tables=publication_has_configured_tables,
                 observed_at=datetime.now(UTC),
@@ -599,6 +643,8 @@ class SourceHealth:
                 active_pid=(int(active_pid) if active_pid is not None else None),
                 confirmed_pos=(int(confirmed_pos) if has_confirmed else None),
                 restart_pos=(int(restart_pos) if restart_pos is not None else None),
+                wal_status=wal_status,
+                invalidation_reason=invalidation_reason,
                 lag_bytes=int(lag) if has_confirmed else None,
                 publication_has_tables=publication_has_tables,
                 publication_has_configured_tables=publication_has_configured_tables,
@@ -642,6 +688,8 @@ class SourceHealth:
             ),
             confirmed_pos=(int(confirmed_pos) if has_confirmed else None),
             restart_pos=(int(restart_pos) if restart_pos is not None else None),
+            wal_status=wal_status,
+            invalidation_reason=invalidation_reason,
             lag_bytes=int(lag) if has_confirmed else None,
             publication_has_tables=publication_has_tables,
             publication_has_configured_tables=publication_has_configured_tables,
@@ -736,6 +784,46 @@ class SourceHealth:
         """True once a walsender has actually been observed on this slot."""
         with self._lock:
             return self._ever_streamed
+
+    @property
+    def local_slot_failure(self) -> dict | None:
+        """Return a durable-stop witness for a lost or invalidated standby slot.
+
+        A brief detach is ordinary Debezium retry/backoff and remains governed by
+        the existing source-dark fold.  This witness is stricter: it is enabled
+        only for the standby route, only after this run observed a real stream,
+        and only for a successful catalog sample that says the local slot is gone
+        or PostgreSQL has marked its retained WAL unusable.  The supervisor checks
+        it before final acknowledgement, so no primary logical slot can become an
+        accidental recovery path.
+        """
+        with self._lock:
+            sample = self._last
+            ever_streamed = self._ever_streamed
+        if not self.detect_local_slot_failure or not ever_streamed:
+            return None
+        if sample is None or sample.unknown:
+            return None
+        if not sample.exists:
+            kind = "lost"
+        elif sample.invalidated:
+            kind = "invalidated"
+        else:
+            return None
+        return {
+            "kind": kind,
+            "slot_name": self.slot_name,
+            "slot_exists": sample.exists,
+            "slot_active": sample.active,
+            "wal_status": sample.wal_status,
+            "invalidation_reason": sample.invalidation_reason,
+            "confirmed_pos": sample.confirmed_pos,
+            "restart_pos": sample.restart_pos,
+            "observed_at": (
+                sample.observed_at.isoformat() if sample.observed_at is not None else None
+            ),
+            "recovery_required": "local_slot_repair_and_fenced_full_resnapshot",
+        }
 
     @property
     def lag_steady_for(self) -> float:
@@ -1350,6 +1438,9 @@ class SourceHealth:
                 "slot_retrying_for_sec": round(self.retrying_for, 1),
                 "slot_stream_interruptions": self.stream_interruptions,
                 "slot_recovered_after_interruption": self.recovered_after_interruption,
+                "slot_wal_status": sample.wal_status,
+                "slot_invalidation_reason": sample.invalidation_reason,
+                "local_slot_failure": self.local_slot_failure,
                 "source_publication": self.publication_name,
                 "source_publication_has_tables": sample.publication_has_tables,
                 "source_publication_has_configured_tables": (
@@ -1390,6 +1481,9 @@ class SourceHealth:
             "slot_lag_steady_for_sec": round(self.lag_steady_for, 1),
             "slot_stream_interruptions": self.stream_interruptions,
             "slot_recovered_after_interruption": self.recovered_after_interruption,
+            "slot_wal_status": sample.wal_status,
+            "slot_invalidation_reason": sample.invalidation_reason,
+            "local_slot_failure": self.local_slot_failure,
             "source_publication": self.publication_name,
             "source_publication_has_tables": sample.publication_has_tables,
             "source_publication_has_configured_tables": (

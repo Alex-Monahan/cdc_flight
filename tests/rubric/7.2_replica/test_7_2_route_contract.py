@@ -321,6 +321,34 @@ def test_standby_wal_sql_has_no_unconditional_current_lsn():
         assert_recovery_safe_wal_sql("SELECT pg_current_wal_lsn()")
 
 
+def test_local_slot_loss_is_a_stop_witness_after_a_real_stream_only():
+    health = SourceHealth(
+        dsn=REPLICA,
+        slot_name="local_slot",
+        detect_local_slot_failure=True,
+    )
+    health._ingest(
+        SlotSample(at=1, exists=True, active=True, confirmed_pos=100)
+    )
+    assert health.local_slot_failure is None
+    health._ingest(SlotSample(at=2, exists=False, active=False))
+    witness = health.local_slot_failure
+    assert witness is not None
+    assert witness["kind"] == "lost"
+    assert witness["recovery_required"] == "local_slot_repair_and_fenced_full_resnapshot"
+
+    health._ingest(
+        SlotSample(
+            at=3,
+            exists=True,
+            active=False,
+            wal_status="lost",
+            invalidation_reason="rows_removed",
+        )
+    )
+    assert health.local_slot_failure["kind"] == "invalidated"
+
+
 def test_shutdown_order_seals_then_quiesces_then_retires_before_close():
     events: list[str] = []
 
