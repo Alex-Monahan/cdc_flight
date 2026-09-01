@@ -24,6 +24,7 @@ import duckdb
 import psycopg
 
 from cdc_flight.config import SourceConfig
+from cdc_flight.source_marker import SourceMarker
 from cdc_flight.standby import StandbyObservation, assert_supported, inspect
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
@@ -444,6 +445,20 @@ class StandbyTopology:
         if row is None or row[0] is None:
             raise RuntimeError("primary DML did not expose a WAL position")
         return int(row[0])
+
+    def primary_marker_with_wal(self, label: str) -> int:
+        """Write one bounded internal fence after a test DML sentinel."""
+        marker = SourceMarker(prefix="cdcf", max_writes=1)
+        with self._admin(self.primary.dsn) as conn:
+            if not marker.emit(
+                conn,
+                SourceMarker.HEARTBEAT,
+                {"test_fence": label},
+            ):
+                raise RuntimeError(f"primary test fence was not emitted: {label}")
+        if marker.last_lsn is None:
+            raise RuntimeError(f"primary test fence did not return an LSN: {label}")
+        return marker.last_lsn
 
     def standby_query(self, statement: str, params: tuple | None = None) -> list[tuple]:
         with self._admin(self.standby_dsn) as conn:

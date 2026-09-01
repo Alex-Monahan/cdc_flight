@@ -257,7 +257,8 @@ def test_real_standby_stream_invalidation_and_common_shutdown(
         clean_armed = _arm_stream(case, topology, process, baseline, "clean")
         clean_sentinel, clean_lsn = _insert_sentinel(topology, "p72_clean")
         sentinel_names.append(clean_sentinel)
-        _wait_for_post_arm_ack(topology, process, clean_lsn)
+        clean_fence_lsn = topology.primary_marker_with_wal("clean")
+        _wait_for_post_arm_ack(topology, process, clean_fence_lsn)
         rc = case.terminate(process, timeout=120)
         assert rc == 0, {"returncode": rc, "summary": case.last_summary()}
         process = None
@@ -333,7 +334,8 @@ def test_real_standby_stream_invalidation_and_common_shutdown(
         loss_armed = _arm_stream(case, topology, loss_process, baseline, "loss")
         loss_sentinel, loss_lsn = _insert_sentinel(topology, "p72_loss")
         sentinel_names.append(loss_sentinel)
-        _wait_for_post_arm_ack(topology, loss_process, loss_lsn)
+        loss_fence_lsn = topology.primary_marker_with_wal("loss")
+        _wait_for_post_arm_ack(topology, loss_process, loss_fence_lsn)
         topology.drop_local_slot()
         assert topology.local_slot_status() is None
         loss_rc = loss_process.wait(timeout=150)
