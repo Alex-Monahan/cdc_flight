@@ -325,6 +325,7 @@ def test_real_standby_stream_invalidation_and_common_shutdown(
             [callback_sentinel],
         ), callback_summary
         topology.wait_for_slot_inactive(timeout=60)
+        case.wait_for_lease_available(timeout=120)
 
         # Local-slot loss is exercised while a fresh production service is live.
         # The already confirmed row remains durable; loss must stop before another

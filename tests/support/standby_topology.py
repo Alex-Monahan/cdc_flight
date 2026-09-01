@@ -713,6 +713,28 @@ class StandbyCase:
         path = self.state_dir / "last_run.json"
         return json.loads(path.read_text()) if path.exists() else {}
 
+    def wait_for_lease_available(self, *, timeout: float = 120) -> None:
+        """Wait for the destination's server-clock lease fence to be reclaimable."""
+
+        def available() -> bool:
+            try:
+                rows = self.duck_query(
+                    "SELECT state, expires_at <= current_timestamp "
+                    "FROM _cdc_flight.lease LIMIT 1"
+                )
+            except duckdb.Error:
+                return False
+            if not rows:
+                return True
+            state, expired = rows[0]
+            return str(state or "held") == "released" or bool(expired)
+
+        self._wait_until(
+            available,
+            timeout=timeout,
+            description="destination service lease release or expiry",
+        )
+
     def fired_fault(self) -> dict | None:
         """Return the fsynced fault anchor written by the service child."""
         from cdc_flight import faults
