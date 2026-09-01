@@ -8,7 +8,6 @@ modules beside this file.
 
 from __future__ import annotations
 
-import threading
 from dataclasses import replace
 
 import pytest
@@ -21,20 +20,17 @@ from cdc_flight.debezium_props import (
     STANDBY_HEARTBEAT_DISABLED_PROPERTY,
     build_properties,
 )
-from cdc_flight.engine import SupervisedDebeziumEngine
 from cdc_flight.errors import UnsafeDebeziumProperty
 from cdc_flight.pipeline import run_engine_bounded
 from cdc_flight.source_health import (
-    SlotSample,
-    SourceHealth,
     _SLOT_SQL,
     _SLOT_SQL_FAST,
+    SlotSample,
+    SourceHealth,
     assert_recovery_safe_wal_sql,
 )
 from cdc_flight.source_marker import SourceMarker
 from cdc_flight.source_routes import SourceRoutePolicy
-from cdc_flight.supervisor import ShutdownSequence
-
 
 PRIMARY = "postgresql://primary:15432/cdc_source"
 REPLICA = "postgresql://postgres:postgres@standby:15435/cdc_source"

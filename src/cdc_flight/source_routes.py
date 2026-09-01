@@ -34,7 +34,7 @@ class SourceRoutePolicy:
         return "standby" if self.role == "standby" else "primary"
 
     @classmethod
-    def from_source(cls, source: SourceConfig) -> "SourceRoutePolicy":
+    def from_source(cls, source: SourceConfig) -> SourceRoutePolicy:
         """Resolve all three routes before any pipeline side effect is allowed."""
         role = source.role
         read_dsn = str(source.dsn).strip()

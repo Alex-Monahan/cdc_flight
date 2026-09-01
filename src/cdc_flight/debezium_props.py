@@ -14,8 +14,8 @@ from .config import ReplicationConfig, SourceConfig
 from .errors import UnsafeDebeziumProperty
 from .logical_messages import MessagePrefixPolicy
 from .snapshot_completion import notification_topic
-from .toast import UNAVAILABLE_VALUE_PLACEHOLDER
 from .source_routes import SourceRoutePolicy
+from .toast import UNAVAILABLE_VALUE_PLACEHOLDER
 
 # Re-exported for configuration callers.  The value is owned by ``toast.py`` so
 # the connector property and the decoder cannot drift apart.

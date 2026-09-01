@@ -67,7 +67,6 @@ from . import (
 )
 from . import source_marker as marker_mod
 from .catalog_lifecycle import CatalogLifecycleMixin
-from .source_routes import SourceRoutePolicy
 from .machines import (
     ADMISSION_ADMITTED,
     ADMISSION_EXTERNAL,
@@ -75,6 +74,7 @@ from .machines import (
     CHANGE_DUE,
     SCHEMA_VISIBLE,
 )
+from .source_routes import SourceRoutePolicy
 
 SourceRelation = catalog_state.SourceRelation
 CatalogChange = catalog_state.CatalogChange

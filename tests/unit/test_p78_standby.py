@@ -5,8 +5,8 @@ from dataclasses import replace
 import pytest
 
 from cdc_flight.config import SourceConfig
-from cdc_flight.source_routes import SourceRoutePolicy
 from cdc_flight.source_health import _SLOT_SQL, _SLOT_SQL_FAST
+from cdc_flight.source_routes import SourceRoutePolicy
 from cdc_flight.standby import (
     StandbyCapabilityError,
     StandbyObservation,
