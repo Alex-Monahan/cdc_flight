@@ -253,17 +253,22 @@ def _wait_md_committed(
 
 
 def _service_env(service_id: str) -> dict[str, str]:
+    # MotherDuck's independent consistency reads can take longer than the local
+    # DuckDB service's liveness budget.  Keep the same fail-closed ordering, but
+    # give this remote destination a bounded budget that is still below the lease
+    # expiry; these values do not refresh liveness and do not weaken the callback
+    # or commit guards.
     return {
         "CDC_SERVICE_ID": service_id,
-        "CDC_SERVICE_LEASE_TTL": "60",
-        "CDC_SERVICE_LEASE_RENEW_SECONDS": "10",
-        "CDC_SERVICE_HEARTBEAT_BOUND_SECONDS": "30",
-        "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "20",
-        "CDC_SERVICE_STALL_EXIT_GRACE_SECONDS": "5",
-        "CDC_SERVICE_COMMIT_TIMEOUT": "30",
-        "CDC_SERVICE_CLOSE_TIMEOUT": "30",
-        "CDC_CLOSE_TIMEOUT": "30",
-        "CDC_ENGINE_THREAD_TIMEOUT": "30",
+        "CDC_SERVICE_LEASE_TTL": "180",
+        "CDC_SERVICE_LEASE_RENEW_SECONDS": "20",
+        "CDC_SERVICE_HEARTBEAT_BOUND_SECONDS": "60",
+        "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "120",
+        "CDC_SERVICE_STALL_EXIT_GRACE_SECONDS": "10",
+        "CDC_SERVICE_COMMIT_TIMEOUT": "90",
+        "CDC_SERVICE_CLOSE_TIMEOUT": "60",
+        "CDC_CLOSE_TIMEOUT": "60",
+        "CDC_ENGINE_THREAD_TIMEOUT": "60",
     }
 
 
