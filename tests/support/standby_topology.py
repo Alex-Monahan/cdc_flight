@@ -755,4 +755,4 @@ class StandbyCase:
             output += process.stdout.read() or ""
         if process.stderr is not None:
             output += process.stderr.read() or ""
-        return output[-12000:]
+        return output

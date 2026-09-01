@@ -237,10 +237,16 @@ def _wait_md_committed(
         nonlocal result
         if process.poll() is not None:
             output = case.close_output(process)
+            try:
+                server_log = topology.log_path.read_text(encoding="utf-8")[-12000:]
+            except OSError as exc:
+                server_log = f"<standby log unavailable: {exc}>"
+            print("MOTHERDUCK CHILD OUTPUT:\n" + output, flush=True)
+            print("STANDBY SERVER LOG TAIL:\n" + server_log, flush=True)
             raise AssertionError(
                 "NEVER_ARMED: the standby MotherDuck child exited before the "
                 f"durable row/state/ledger/resume tuple for {sentinel!r} "
-                f"(returncode={process.returncode})\n{output}"
+                f"(returncode={process.returncode})\n{output}\n{server_log}"
             )
         result = _md_receipt(md, case, sentinel)
         if result is None:
