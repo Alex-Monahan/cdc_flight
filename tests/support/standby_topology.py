@@ -397,6 +397,15 @@ class StandbyTopology:
             "invalidation_reason": facts[6],
         }
 
+    def local_slot_confirmed_lsn(self) -> int | None:
+        """Return the local standby slot's confirmed flush position as an integer."""
+        rows = self.standby_query(
+            "SELECT (confirmed_flush_lsn - '0/0')::bigint "
+            "FROM pg_replication_slots WHERE slot_name = %s",
+            (self.local_slot,),
+        )
+        return None if not rows or rows[0][0] is None else int(rows[0][0])
+
     def wait_for_slot_active(
         self, *, process: subprocess.Popen | None = None, timeout: float = 60
     ) -> None:
@@ -422,6 +431,19 @@ class StandbyTopology:
     def primary_sql(self, statement: str, params: tuple | None = None) -> None:
         with self._admin(self.primary.dsn) as conn:
             conn.execute(statement, params)
+
+    def primary_sql_with_wal(
+        self, statement: str, params: tuple | None = None
+    ) -> int:
+        """Commit one primary DML statement and return a primary WAL witness."""
+        with self._admin(self.primary.dsn) as conn:
+            conn.execute(statement, params)
+            row = conn.execute(
+                "SELECT (pg_current_wal_lsn() - '0/0')::bigint"
+            ).fetchone()
+        if row is None or row[0] is None:
+            raise RuntimeError("primary DML did not expose a WAL position")
+        return int(row[0])
 
     def standby_query(self, statement: str, params: tuple | None = None) -> list[tuple]:
         with self._admin(self.standby_dsn) as conn:
@@ -461,6 +483,8 @@ class StandbyTopology:
             ).fetchone()
             if active and active[0] is not None:
                 conn.execute("SELECT pg_terminate_backend(%s)", (active[0],))
+        self.wait_for_slot_inactive(timeout=30)
+        with self._admin(self.standby_dsn) as conn:
             conn.execute(
                 "SELECT pg_drop_replication_slot(slot_name) "
                 "FROM pg_replication_slots WHERE slot_name = %s",
