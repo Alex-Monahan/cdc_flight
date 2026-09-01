@@ -206,7 +206,12 @@ CONTROL_DDL = [
             relation_generation VARCHAR,
             commit_lsn     BIGINT,
             policy_epoch   BIGINT,
-            policy_digest  VARCHAR
+            policy_digest  VARCHAR,
+            message_prefix VARCHAR,
+            message_content BLOB,
+            message_transactional BOOLEAN,
+            source_sequence VARCHAR,
+            event_ts_ms BIGINT
         )""",
     # rubric 1.5. The audit trail for everything that happens to a table rather than
     # to a row: TRUNCATE, DROP, a drop-and-recreate, leaving or joining the
@@ -312,6 +317,30 @@ CONTROL_DDL = [
             snapshot_epoch       BIGINT,
             applied_at           TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (pipeline, target_table, event_id)
+        )""",
+    # Value-free logical-message observations.  The public consumer relation holds
+    # exact bytes only for application messages; this audit surface keeps internal
+    # heartbeat/marker routing and replay/rejection facts queryable without ever
+    # copying their payload into diagnostics.
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.logical_message_audit (
+            pipeline             VARCHAR NOT NULL,
+            target_table         VARCHAR NOT NULL,
+            message_id           VARCHAR NOT NULL,
+            prefix               VARCHAR NOT NULL,
+            byte_length          BIGINT NOT NULL,
+            is_transactional     BOOLEAN NOT NULL,
+            source_cluster_id    VARCHAR,
+            source_timeline      BIGINT,
+            source_lsn           BIGINT,
+            source_sequence      VARCHAR,
+            txn_id               VARCHAR,
+            total_order          BIGINT,
+            commit_lsn           BIGINT,
+            destination_commit_id BIGINT,
+            status               VARCHAR NOT NULL,
+            rejection_reason     VARCHAR,
+            observed_at          TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (pipeline, target_table, message_id)
         )""",
     # Delete effects have a distinct ledger because a delete's physical effect is
     # mode-sensitive while the shared event ledger remains the replay fence for
@@ -659,6 +688,11 @@ def _migrate_spill_events(con, control_schema: str | None = None) -> None:
         ("commit_lsn", "BIGINT"),
         ("policy_epoch", "BIGINT"),
         ("policy_digest", "VARCHAR"),
+        ("message_prefix", "VARCHAR"),
+        ("message_content", "BLOB"),
+        ("message_transactional", "BOOLEAN"),
+        ("source_sequence", "VARCHAR"),
+        ("event_ts_ms", "BIGINT"),
     ):
         if name not in existing:
             con.execute(

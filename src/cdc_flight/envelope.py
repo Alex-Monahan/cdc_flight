@@ -30,6 +30,8 @@ after §5.1's decode-throughput measurement.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 from dataclasses import dataclass, field
 from typing import Any
@@ -105,6 +107,13 @@ class PendingRecord:
     #: configured ``<marker-prefix>_<reason>`` namespace; retaining it lets the
     #: applier report exactly which marker records crossed callback admission.
     message_prefix: str | None = None
+    #: Exact bytes carried by ``message.content`` after strict base64 decoding.
+    #: Logical messages are not text and may be empty or non-UTF-8.
+    message_content: bytes | None = None
+    #: True for Debezium's transactional message shape and False for its
+    #: non-transactional shape. None is retained for hand-built compatibility
+    #: records; the assembler resolves it from the transaction facts.
+    message_transactional: bool | None = None
     schema: str | None = None
     table: str | None = None
     lsn: int | None = None
@@ -133,7 +142,11 @@ class PendingRecord:
     #: It is consumed by the policy gate and never written to diagnostics.
     output_texts: dict[str, Any] = field(default_factory=dict)
     data_collection_order: int | None = None
+    #: Stock ``source.sequence`` is metadata, not a transaction ordinal. Keep it
+    #: for non-transactional message identity fallback and the consumer.
+    source_sequence: str | None = None
     source_ts_ms: int | None = None
+    event_ts_ms: int | None = None
     snapshot: str | None = None
     key: dict[str, Any] | None = None
     before: dict[str, Any] | None = None
@@ -407,7 +420,12 @@ def decode(raw: Any, *, topic_prefix: str, want_offsets: bool = False) -> Pendin
     )
     rec.schema = source.get("schema")
     rec.table = source.get("table")
-    rec.lsn = source.get("lsn") or _offset_lsn(rec.source_offset)
+    source_lsn = source.get("lsn")
+    rec.lsn = (
+        _as_int(source_lsn)
+        if source_lsn is not None
+        else _offset_lsn(rec.source_offset)
+    )
     rec.source_cluster_id = _as_str(
         source.get("system_identifier", source.get("system_id", source.get("cluster_id")))
     )
@@ -418,7 +436,9 @@ def decode(raw: Any, *, topic_prefix: str, want_offsets: bool = False) -> Pendin
         source.get("relation_generation", source.get("relation_gen"))
     )
     rec.commit_lsn = _as_int(source.get("commit_lsn"))
-    rec.source_ts_ms = source.get("ts_ms")
+    rec.source_sequence = _as_str(source.get("sequence"))
+    rec.source_ts_ms = _as_int(source.get("ts_ms"))
+    rec.event_ts_ms = _as_int(payload.get("ts_ms"))
     rec.snapshot = _as_str(source.get("snapshot"))
     rec.value_schema = value_schema
     rec.before_schema = _schema_for_field(value_schema, "before")
@@ -451,6 +471,25 @@ def decode(raw: Any, *, topic_prefix: str, want_offsets: bool = False) -> Pendin
         rec.data_collection_order = txn.get("data_collection_order")
     if source.get("txId") is not None:
         rec.txn_id = _as_str(source.get("txId"))
+
+    if rec.op == OP_MESSAGE:
+        if not isinstance(message, dict):
+            raise EnvelopeDecodeError(
+                f"logical message on {topic} has no nested message object; refusing "
+                "to guess its prefix or content"
+            )
+        if not rec.message_prefix:
+            raise EnvelopeDecodeError(
+                f"logical message on {topic} has no non-empty prefix; refusing to "
+                "route an unclassified source message"
+            )
+        rec.message_content = _decode_message_content(message.get("content"), topic)
+        rec.message_transactional = isinstance(txn, dict) and rec.txn_id is not None
+        if isinstance(txn, dict) and rec.message_transactional is False:
+            raise EnvelopeDecodeError(
+                f"logical message on {topic} has transaction metadata without a "
+                "stable transaction id"
+            )
 
     key_text = raw.key()
     if key_text is not None:
@@ -492,6 +531,27 @@ def decode(raw: Any, *, topic_prefix: str, want_offsets: bool = False) -> Pendin
 
 def _as_str(value: Any) -> str | None:
     return None if value is None else str(value)
+
+
+def _decode_message_content(value: Any, topic: str) -> bytes:
+    """Strictly decode stock Debezium's base64 message content.
+
+    ``base64.b64decode(..., validate=True)`` rejects whitespace, non-alphabet
+    characters, and malformed padding.  An empty string intentionally decodes to
+    ``b""``; no UTF-8 decode/encode round trip is ever performed.
+    """
+    if not isinstance(value, str):
+        raise EnvelopeDecodeError(
+            f"logical message on {topic} has non-string base64 content; refusing "
+            "to synthesize a text representation"
+        )
+    try:
+        return base64.b64decode(value.encode("ascii"), validate=True)
+    except (UnicodeEncodeError, binascii.Error, ValueError) as exc:
+        raise EnvelopeDecodeError(
+            f"logical message on {topic} has invalid base64 content; refusing to "
+            "acknowledge bytes that were not decoded exactly"
+        ) from exc
 
 
 def _txn_id(value: Any) -> str | None:

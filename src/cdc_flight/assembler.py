@@ -77,14 +77,15 @@ log = logging.getLogger("cdc_flight.assembler")
 UNIT_TXN = "txn"
 UNIT_SNAPSHOT_CHUNK = "snapshot_chunk"
 UNIT_CONTROL = "control"
+UNIT_MESSAGE = "message"
 
 
 @dataclass
 class CompleteUnit:
-    """A whole PG transaction, a whole snapshot chunk, or a control unit."""
+    """A whole PG transaction, snapshot chunk, control unit, or message event."""
 
     kind: str
-    #: data events only, in source order
+    #: materializable events in source order, including logical messages
     events: list[PendingRecord] = field(default_factory=list)
     #: every record of the unit, in arrival order - what gets acknowledged
     records: list[PendingRecord] = field(default_factory=list)
@@ -613,33 +614,92 @@ class TransactionAssembler:
                 )
 
     def _feed_control(self, rec: PendingRecord) -> list[CompleteUnit]:
+        if rec.kind == KIND_MESSAGE:
+            transactional = rec.message_transactional
+            if transactional is None:
+                # Existing embedders construct PendingRecords directly. Their
+                # transaction facts are still authoritative for routing; this is
+                # not a text/content inference.
+                transactional = rec.txn_id is not None or rec.total_order is not None
+            if transactional:
+                return self._feed_transactional_message(rec)
+            if self._txn is not None:
+                raise TransactionAssemblyError(
+                    f"non-transactional logical message on {rec.topic} arrived while "
+                    f"transaction {self._txn.txn_id} is open; it cannot be attached "
+                    "to adjacent PostgreSQL DML"
+                )
+            return [self._message_unit(rec)]
         if self._txn is not None:
             # ADR §3.2: a control record inside an open transaction is carried by
             # that transaction, never emitted on its own - otherwise a heartbeat
             # would advance the resume point past a half-buffered transaction.
             self._retain(self._txn, rec)
             self._txn.nbytes += rec.nbytes
-            if rec.kind == KIND_MESSAGE:
-                # VERIFIED against vendored Debezium 3.6:
-                # `LogicalDecodingMessageMonitor.java:106` calls
-                # `transactionMonitor.dataEvent(...)`, so a transactional logical
-                # message IS counted in `END.event_count`, occupies a
-                # `total_order` ordinal, and gets its own `data_collections`
-                # pseudo-entry. Not counting it made a transaction containing one
-                # fatal - which matters because ADR D9's source heartbeat is
-                # specified as exactly this mechanism (Opus M-5). It carries no
-                # row of ours, so it is counted and not applied.
-                order = self._validate_ordinal(rec)
-                if order in self._txn.orders:
-                    raise TransactionAssemblyError(
-                        f"transaction {rec.txn_id} declared total_order {order} twice "
-                        "(logical-decoding message)"
-                    )
-                self._txn.orders.add(order)
-                self._txn.count += 1
-                self._txn.message_count += 1
             return []
         return [self._control_unit(rec)]
+
+    def _feed_transactional_message(self, rec: PendingRecord) -> list[CompleteUnit]:
+        """Count and retain one message in the same whole PG transaction."""
+        if rec.txn_id is None:
+            raise TransactionAssemblyError(
+                f"transactional logical message on {rec.topic} has no transaction id"
+            )
+        order = self._validate_ordinal(rec)
+        if self._txn is None:
+            # Debezium can restore transaction context from its offset without
+            # repeating BEGIN. The END/count proof still makes this safe.
+            self.implicit_txn_opens += 1
+            log.debug(
+                "opening transaction %s implicitly for a logical message (no BEGIN)",
+                rec.txn_id,
+            )
+            self._txn = _OpenTxn(rec.txn_id, begin_seen=False)
+        elif self._txn.txn_id != rec.txn_id:
+            raise TransactionAssemblyError(
+                f"transaction id changed from {self._txn.txn_id} to {rec.txn_id} "
+                "without an END marker while admitting a logical message"
+            )
+        if order in self._txn.orders:
+            raise TransactionAssemblyError(
+                f"transaction {rec.txn_id} declared total_order {order} twice "
+                "(logical-decoding message)"
+            )
+        self._txn.orders.add(order)
+        rec.total_order = order
+        rec.message_transactional = True
+        self._txn.count += 1
+        self._txn.message_count += 1
+        if rec.admission_refusal is not None:
+            self._txn.admission_refusals.append(rec.admission_refusal)
+        # Messages are source activity, not delivered application data. They
+        # therefore never increment delivery_events or the liveness high-water.
+        self._retain(self._txn, rec)
+        self._txn.nbytes += rec.nbytes
+        self._txn.last_lsn = max(self._txn.last_lsn, rec.lsn or 0)
+        if not self.discard_streaming:
+            self._txn.events.append(rec)
+            self._txn.mem_bytes += rec.nbytes
+            self._maybe_spill_txn()
+        return []
+
+    def _message_unit(self, rec: PendingRecord) -> CompleteUnit:
+        """Represent a non-transactional message as its own source event."""
+        rec.message_transactional = False
+        return CompleteUnit(
+            kind=UNIT_MESSAGE,
+            events=[rec],
+            records=[rec],
+            last_lsn=rec.lsn or 0,
+            commit_lsn=rec.lsn,
+            nbytes=rec.nbytes,
+            delivery_events=0,
+            admission_refusals=(
+                [rec.admission_refusal]
+                if rec.admission_refusal is not None
+                else []
+            ),
+        )
 
     def _control_unit(self, rec: PendingRecord) -> CompleteUnit:
         return CompleteUnit(

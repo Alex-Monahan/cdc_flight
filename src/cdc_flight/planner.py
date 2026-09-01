@@ -32,18 +32,21 @@ from . import (
     destination,
     event_ledger,
     failure_containment,
+    faults,
+    logical_messages,
     naming,
     scd2,
     table_work,
     table_writer,
 )
-from .assembler import UNIT_CONTROL, UNIT_SNAPSHOT_CHUNK, CompleteUnit
+from .assembler import UNIT_CONTROL, UNIT_MESSAGE, UNIT_SNAPSHOT_CHUNK, CompleteUnit
 from .config import TRUNCATE_IGNORE, TRUNCATE_REPLICATE
 from .destination_failure import DestinationDataRejection
-from .envelope import KIND_TRUNCATE, PendingRecord
+from .envelope import KIND_MESSAGE, KIND_TRUNCATE, PendingRecord
 from .errors import (
     AdmissionError,
     DestinationExecutionFailure,
+    LogicalMessageRejected,
     SchemaEvolutionRefused,
     TableWriteFailure,
     ToastBaseMissing,
@@ -93,6 +96,7 @@ class GroupPlan:
         history_modes: dict[str, str] | None = None,
         delete_policy=None,
         policy_gate=None,
+        message_prefix_policy=None,
     ):
         self.con = con
         self.commit_id = commit_id
@@ -122,6 +126,7 @@ class GroupPlan:
         self.strict_event_identity = bool(strict_event_identity)
         self.delete_policy = delete_policy
         self.policy_gate = policy_gate
+        self.message_prefix_policy = message_prefix_policy or logical_messages.MessagePrefixPolicy()
         self.policy_alerts: list[dict] = []
         self.history_modes = {
             str(name): str(mode).lower() for name, mode in (history_modes or {}).items()
@@ -158,6 +163,11 @@ class GroupPlan:
         ) if self.pipeline else None
         self.scd2_events: list[scd2.SCD2Event] = []
         self.scd2_bundles: dict[str, scd2.SCD2RelationBundle] = {}
+        #: Public application-message rows and value-free audit observations are
+        #: both written by ``write`` inside the caller's one open destination
+        #: transaction. Internal Flight heartbeats/markers create no public row.
+        self._message_rows: list[dict] = []
+        self._message_audit: list[dict] = []
 
         self.work: dict[str, TableWork] = {}
         self.stats: dict = {
@@ -171,6 +181,12 @@ class GroupPlan:
             "quarantined_events": 0,
             "contained_events": 0,
             "contained_tables": set(),
+            "logical_messages_received": 0,
+            "logical_messages_delivered": 0,
+            "logical_messages_replayed": 0,
+            "logical_messages_internal": 0,
+            "logical_messages_rejected": 0,
+            "logical_message_observations": [],
         }
         #: `_cdc_flight.table_events` rows this plan produced, in source order
         self.table_events: list[dict] = []
@@ -239,6 +255,13 @@ class GroupPlan:
 
         unit_succeeded = False
         try:
+            if unit.kind == UNIT_MESSAGE or any(
+                event.kind == KIND_MESSAGE for event in unit.events
+            ):
+                # A direct GroupPlan embedding may not have gone through pipeline
+                # setup. Creating the relation here is still inside the same open
+                # destination transaction as the message row/ledger/offset.
+                logical_messages.ensure_table(self.con, self.registry.dataset)
             if unit.spill_unit_seq is not None:
                 self.staged_units = True
                 for staged in self.spill.load(
@@ -366,6 +389,9 @@ class GroupPlan:
         was staged and must not be recomputed — that is what gave a replay a different
         identity, Codex 4) and derived here otherwise.
         """
+        if event.kind == KIND_MESSAGE:
+            self._collect_message(event, target=target, event_id=event_id)
+            return
         if not event.schema or not event.table:
             return
         if event.qualified_table in getattr(self, "ignored_tables", ()):
@@ -657,6 +683,174 @@ class GroupPlan:
                 )
             )
         self.source_tables.add(f"{event.schema}.{event.table}")
+
+    def _collect_message(
+        self,
+        event: PendingRecord,
+        *,
+        target: str | None = None,
+        event_id: str | None = None,
+    ) -> None:
+        """Fold one logical message into the durable consumer/ledger plan."""
+        content = event.message_content
+        if not isinstance(content, (bytes, bytearray, memoryview)):
+            raise LogicalMessageRejected(
+                "logical message content is not an exact decoded byte value; refusing "
+                "to synthesize text",
+                prefix=event.message_prefix,
+            )
+        content = bytes(content)
+        # This is a test-only durable rendezvous when the real crash-matrix child
+        # is armed.  It records that the stock connector callback reached message
+        # planning, without recording payload bytes or touching any liveness
+        # clock.  The public runtime path is an inert context update.
+        faults.runtime_state(
+            MESSAGE_CALLBACK_ENTERED=True,
+            MESSAGE_LAST_PREFIX=event.message_prefix,
+            MESSAGE_LAST_BYTE_LENGTH=len(content),
+        )
+        route = self.message_prefix_policy.classify(event.message_prefix)
+        self._count_event(event)
+        self.stats["logical_messages_received"] += 1
+        if route == "rejected":
+            self.stats["logical_messages_rejected"] += 1
+            self.stats["logical_message_observations"].append(
+                {
+                    "prefix": event.message_prefix,
+                    "byte_length": len(content),
+                    "is_transactional": bool(event.message_transactional),
+                    "source_lsn": event.lsn,
+                    "status": "rejected",
+                    "reason": "prefix_not_allowlisted",
+                }
+            )
+            raise LogicalMessageRejected(
+                f"logical message prefix {event.message_prefix!r} is not in the "
+                "configured application allowlist and is not a Flight-owned "
+                "internal prefix",
+                prefix=event.message_prefix,
+                byte_length=len(content),
+            )
+
+        transactional = event.message_transactional
+        if transactional is None:
+            transactional = event.txn_id is not None or event.total_order is not None
+        transactional = bool(transactional)
+        event.message_transactional = transactional
+        active_commit_lsn = self._active_commit_lsn
+        message_target = logical_messages.target_table(self.registry.dataset)
+        if target is not None and target != message_target:
+            raise destination.DestinationIdentityCollision(
+                f"logical message was staged for target {target!r}, expected "
+                f"{message_target!r}",
+                target=message_target,
+            )
+        identity = event_ledger.message_identity_for(
+            event,
+            event_id=event_id,
+            source_cluster_id=self.source_cluster_id,
+            source_timeline=self.source_timeline,
+            commit_lsn=active_commit_lsn,
+            policy_epoch=event.policy_epoch,
+            require_strong=self.strict_event_identity,
+            digest=event_ledger.payload_digest(event),
+        )
+        if self.pipeline and not identity.ledger_eligible:
+            raise destination.DestinationIdentityCollision(
+                "logical message identity is not strong enough for the shared "
+                "replay ledger; refusing to guess a source identity",
+                target=message_target,
+            )
+        faults.runtime_state(
+            MESSAGE_SEEN=True,
+            MESSAGE_ID=identity.event_id,
+            MESSAGE_ROUTE=route,
+        )
+        replayed = False
+        if self.pipeline:
+            replayed = destination.claim_event_ledger(
+                self.con,
+                identity,
+                pipeline=self.pipeline,
+                target_table=message_target,
+                source_lsn=event.lsn,
+                control_schema=self._control_schema,
+                ledger=self._event_ledger,
+                state="internal" if route == "internal" else "applied",
+            )
+        expected = {
+            "dataset": self.registry.dataset,
+            "pipeline": self.pipeline,
+            "message_id": identity.event_id,
+            "prefix": str(event.message_prefix),
+            "content": content,
+            "is_transactional": transactional,
+            "source_schema": event.schema or None,
+            "source_table": event.table or None,
+            "source_cluster_id": identity.source_cluster_id,
+            "source_timeline": identity.source_timeline,
+            "source_lsn": identity.source_lsn,
+            "source_sequence": event.source_sequence,
+            "txn_id": identity.txn_id,
+            "total_order": identity.total_order,
+            "commit_lsn": identity.commit_lsn,
+            "source_ts_ms": event.source_ts_ms,
+            "event_ts_ms": event.event_ts_ms,
+            "destination_commit_id": self.commit_id,
+            "delivery_state": "delivered",
+        }
+        if replayed:
+            if route == "application":
+                logical_messages.assert_row_matches(
+                    logical_messages.read_row(
+                        self.con,
+                        dataset=self.registry.dataset,
+                        pipeline=self.pipeline,
+                        message_id=identity.event_id,
+                    ),
+                    expected,
+                )
+                self.stats["logical_messages_replayed"] += 1
+            else:
+                self.stats["logical_messages_internal"] += 1
+                self.stats["logical_messages_replayed"] += 1
+            status = "replayed"
+        elif route == "internal":
+            # Internal heartbeats and source markers remain offset/ledger control
+            # records. They are never exposed through the application relation.
+            self.stats["logical_messages_internal"] += 1
+            status = "internal"
+        else:
+            self.stats["logical_messages_delivered"] += 1
+            self._message_rows.append(expected)
+            self.stats["tables"].add(logical_messages.LOGICAL_MESSAGE_TABLE)
+            self.table_counts[logical_messages.LOGICAL_MESSAGE_TABLE] = (
+                self.table_counts.get(logical_messages.LOGICAL_MESSAGE_TABLE, 0) + 1
+            )
+            status = "delivered"
+        audit = dict(expected)
+        audit.update(
+            {
+                "target_table": message_target,
+                "status": status,
+                "rejection_reason": None,
+                "observed_at": destination.now(),
+            }
+        )
+        self._message_audit.append(audit)
+        self.stats["logical_message_observations"].append(
+            {
+                "message_id": identity.event_id,
+                "prefix": event.message_prefix,
+                "byte_length": len(content),
+                "is_transactional": transactional,
+                "source_lsn": identity.source_lsn,
+                "commit_lsn": identity.commit_lsn,
+                "txn_id": identity.txn_id,
+                "total_order": identity.total_order,
+                "status": status,
+            }
+        )
 
     def _collect_contained(
         self,
@@ -1148,6 +1342,19 @@ class GroupPlan:
         # discards this batch together with the data/state transaction.
         if self._event_ledger is not None:
             self._event_ledger.flush()
+        # Logical messages are ordinary effects of this plan.  The public relation
+        # and value-free audit observations must be written on the same open
+        # destination transaction as the shared ledger and the source resume point.
+        # In particular, do not move either write into a callback or a second
+        # connection: a crash before COMMIT must replay both the row and its claim.
+        logical_messages.insert_rows(
+            self.con, self.registry.dataset, self._message_rows
+        )
+        logical_messages.write_audit_rows(
+            self.con,
+            control_schema=self._control_schema,
+            rows=self._message_audit,
+        )
         for event in self.scd2_events:
             result = scd2.apply_event(
                 self.con,

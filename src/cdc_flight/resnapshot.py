@@ -523,6 +523,7 @@ def run(
             binary_handling_mode=props.get("binary.handling.mode", "base64"),
             hstore_handling_mode=props.get("hstore.handling.mode", "map"),
             control_schema=control_schema,
+            message_prefix_allowlist=replication.message_prefix_allowlist,
         )
         ownership.attach(applier)
         # Keep the historical pipeline seam: tests and embedding callers replace

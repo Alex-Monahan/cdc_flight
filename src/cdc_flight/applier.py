@@ -51,6 +51,7 @@ from . import (
     commit_protocol,
     destination,
     failure_containment,
+    logical_messages,
     schema_epoch,
     self_heal,
     spill_protocol,
@@ -71,6 +72,7 @@ from .delete_modes import DeleteModeResolver
 from .destination import AlertSink, Lease, OccurrenceKey, ResumePoint
 from .envelope import (
     KIND_HEARTBEAT,
+    KIND_MESSAGE,
     KIND_SNAPSHOT_BOUNDARY,
     PendingRecord,
     decode,
@@ -177,6 +179,7 @@ class Applier:
         source_cluster_id: str | None = None,
         source_timeline: int | None = None,
         strict_event_identity: bool = False,
+        message_prefix_allowlist: tuple[str, ...] | None = None,
     ):
         self.con = con
         self.pipeline = pipeline
@@ -201,6 +204,16 @@ class Applier:
         self.source_cluster_id = source_cluster_id
         self.source_timeline = source_timeline
         self.strict_event_identity = bool(strict_event_identity)
+        self.message_prefix_policy = logical_messages.MessagePrefixPolicy(
+            application_patterns=(
+                message_prefix_allowlist
+                if message_prefix_allowlist is not None
+                else logical_messages.DEFAULT_APPLICATION_PREFIX_ALLOWLIST
+            ),
+            marker_prefixes=tuple(
+                dict.fromkeys(("cdcf", *tuple(marker_prefixes or ())))
+            ),
+        )
         self.delete_policy = config.delete_policy
         self._pending_delete_policy: DeleteModeResolver | None = None
         self.policy_gate = PolicyGate(config.pii_policy)
@@ -447,6 +460,14 @@ class Applier:
         #: events dropped because their transaction is already inside a table's image
         self.watermark_fenced_events = 0
         self.table_counts: dict[str, int] = {}
+        self.logical_message_counts = {
+            "logical_messages_received": 0,
+            "logical_messages_delivered": 0,
+            "logical_messages_replayed": 0,
+            "logical_messages_internal": 0,
+            "logical_messages_rejected": 0,
+        }
+        self.logical_message_observations: list[dict] = []
         self.last_commit_id = resume_point.commit_id
         #: Set immediately after the destination COMMIT for supervisor timing
         #: evidence; it is never used to authorize an acknowledgement.
@@ -582,6 +603,13 @@ class Applier:
             "callback_quiesced": self.callback_quiesced,
             "drain_requested": self._drain_requested,
             "source_marker_records_received": self.source_marker_records_received,
+            "logical_messages": dict(self.logical_message_counts),
+            # The observations contain metadata and byte lengths only.  Message
+            # payload bytes never enter the operational summary/log stream.
+            "logical_message_observations": list(self.logical_message_observations),
+            "message_prefix_allowlist": list(
+                self.message_prefix_policy.application_patterns
+            ),
             **self.catalog_coordinator.summary(),
             **(self.catalog.summary() if self.catalog is not None else {}),
         }
@@ -980,6 +1008,14 @@ class Applier:
                 if provider is not None and record.qualified_table:
                     context = provider(record.qualified_table)
                 self.policy_gate.sanitize(record, context)
+                if record.kind == KIND_MESSAGE:
+                    # Logical-message bytes have no row image for the PII policy
+                    # compiler to transform. Mark only the policy boundary facts so
+                    # a message may cross the existing spill gate without ever
+                    # being coerced to text or routed through a row policy.
+                    record.policy_epoch = int(self.policy_gate.policy.epoch)
+                    record.policy_digest = self.policy_gate.policy.digest
+                    record.sanitized = True
             except AdmissionError as error:
                 self._seal_policy_refusal(record, error)
             return record

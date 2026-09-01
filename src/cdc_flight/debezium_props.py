@@ -12,6 +12,7 @@ import os
 
 from .config import ReplicationConfig, SourceConfig
 from .errors import UnsafeDebeziumProperty
+from .logical_messages import MessagePrefixPolicy
 from .snapshot_completion import notification_topic
 from .toast import UNAVAILABLE_VALUE_PLACEHOLDER
 
@@ -191,6 +192,17 @@ HEARTBEAT_ACTION_QUERY = (
 )
 JDBC_SOCKET_TIMEOUT_SECONDS = "60"
 JDBC_CONNECT_TIMEOUT_SECONDS = "5"
+MESSAGE_PREFIX_PROPERTY = "message.prefix.include.list"
+
+
+def message_prefix_policy(replication: ReplicationConfig) -> MessagePrefixPolicy:
+    """Build the source/message routing policy shared by config and the applier."""
+    configured_marker = os.environ.get("CDC_CATALOG_MARKER_PREFIX", "cdcf").strip()
+    return MessagePrefixPolicy(
+        application_patterns=replication.message_prefix_allowlist,
+        marker_prefixes=("cdcf", configured_marker),
+        heartbeat_prefix="cdc_flight_heartbeat",
+    )
 
 
 def build_properties(
@@ -216,6 +228,7 @@ def build_properties(
     """
     replication.state_dir.mkdir(parents=True, exist_ok=True)
     snapshot = snapshot_mode or replication.snapshot_mode
+    logical_message_policy = message_prefix_policy(replication)
     protected = {
         **INVARIANT_O_PINS,
         # These are correctness/configuration pins too, even though only the first
@@ -239,6 +252,7 @@ def build_properties(
             if jdbc_connect_timeout_seconds is not None
             else JDBC_CONNECT_TIMEOUT_SECONDS
         ),
+        MESSAGE_PREFIX_PROPERTY: logical_message_policy.include_list(),
     }
     protected_reasons = {
         **INVARIANT_O_REASONS,
@@ -272,6 +286,11 @@ def build_properties(
         ),
         "driver.connectTimeout": (
             "stock pgjdbc must bound source connection establishment"
+        ),
+        MESSAGE_PREFIX_PROPERTY: (
+            "the stock connector must retain every configured application logical "
+            "message and every Flight-owned marker/heartbeat; changing the route "
+            "would silently remove a source boundary or a user message"
         ),
     }
     for key, value in (overrides or {}).items():
@@ -324,6 +343,12 @@ def build_properties(
         "publication.autocreate.mode": "disabled",
         "topic.prefix": replication.topic_prefix,
         "snapshot.mode": snapshot,
+        # Verified against the installed stock Debezium 3.6 artifact:
+        # PostgresConnectorConfig names this property exactly
+        # ``message.prefix.include.list``.  The source connector receives the
+        # allowlist, while the Python MessagePrefixPolicy keeps Flight markers on
+        # the internal path instead of exposing them to the application consumer.
+        MESSAGE_PREFIX_PROPERTY: logical_message_policy.include_list(),
         # Stock Debezium incremental snapshots are requested through this
         # source-side signal table.  The signal row is a control request, not a
         # destination data table; its topic is consumed by the incremental

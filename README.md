@@ -192,6 +192,28 @@ transaction), `lease` (single-writer, rubric 4.2), `table_state`, `spill_events`
 `oid`, `relfilenode`, and row-type token)
 and `alerts`.
 
+### Logical-message consumer
+
+`pg_logical_emit_message` application messages are materialized in
+`cdc_raw.cdcflight_logical_messages` (or the configured dataset), with a stable
+`message_id`, prefix, exact `BLOB` `content`, transactional flag, source ordering,
+and Debezium source/commit metadata. The supported reader is
+`cdc_flight.logical_messages.read_logical_messages(connection, dataset=..., pipeline=...)`;
+its returned `content` values are Python `bytes`, so consumers can act on empty or
+non-UTF-8 payloads without a text round trip. Configure application prefixes with
+`CDC_MESSAGE_PREFIX_ALLOWLIST` (comma-separated regular expressions; default
+`app_.*`). Flight heartbeats and catalog/completion markers use their internal
+prefixes and remain value-free records in `_cdc_flight.logical_message_audit`; they
+are never exposed as application messages.
+
+Transactional messages are delivered in the same destination transaction as their
+whole PostgreSQL transaction, ledger claim, resume state, and offset. A
+non-transactional message is its own ordered source event and has no invented
+PostgreSQL transaction id. The shared ledger makes a committed replay a no-op and
+refuses an identity collision. Message receipt never counts as delivered source
+data for liveness; the internal transactional heartbeat still advances the slot on
+a quiet source.
+
 **The fold models physical rows, not keys (rubric 1.4).** A key is not a row: inside one
 Postgres transaction a *deferred* unique constraint lets several rows wear one key at
 once, and across the transactions of one commit group a key can be freed and re-taken. So

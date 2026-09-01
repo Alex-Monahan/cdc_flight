@@ -23,6 +23,12 @@ from .errors import (  # noqa: F401
     DestinationIdentityCollision,
     OffsetUnusable,
 )
+from .logical_messages import (
+    ensure_table as ensure_logical_message_table,
+)
+from .logical_messages import (
+    read_logical_messages,
+)
 from .machines import (
     KEYLESS_EVENT,
     KEYLESS_EVENT_APPLIED,
@@ -46,7 +52,12 @@ from .source_relations import (  # noqa: F401
     upsert_source_relation,
 )
 
-__all__ = ["CONTROL_DDL", "ensure_control_schema"]
+__all__ = [
+    "CONTROL_DDL",
+    "ensure_control_schema",
+    "ensure_logical_message_table",
+    "read_logical_messages",
+]
 
 log = logging.getLogger("cdc_flight.destination")
 
@@ -995,14 +1006,17 @@ class EventLedgerBatch:
         self._loaded_targets.add(target_table)
 
     @staticmethod
-    def _pending_row(identity, *, pipeline: str, target_table: str, source_lsn: int | None):
+    def _pending_row(
+        identity, *, pipeline: str, target_table: str, source_lsn: int | None,
+        state: str = "applied",
+    ):
         return [
             pipeline,
             target_table,
             identity.event_id,
             identity.operation,
             identity.payload_digest,
-            "applied",
+            state,
             identity.source_schema,
             identity.source_table,
             identity.source_cluster_id,
@@ -1020,8 +1034,10 @@ class EventLedgerBatch:
             now(),
         ]
 
-    def claim(self, identity, *, target_table: str, source_lsn: int | None = None,
-              snapshot: bool = False) -> bool:
+    def claim(
+        self, identity, *, target_table: str, source_lsn: int | None = None,
+        snapshot: bool = False, state: str = "applied",
+    ) -> bool:
         """Return whether an exact identity was already applied."""
         from .event_ledger import assert_same_identity
 
@@ -1036,7 +1052,7 @@ class EventLedgerBatch:
                 except DestinationIdentityCollision as collision:
                     collision.target = target_table
                     raise
-                return str(observed["state"]) == "applied"
+                return str(observed["state"]) in {"applied", "internal", "replayed"}
             # An identity already pending in this transaction has the same
             # semantics as an applied row once the transaction commits.  Check it
             # before suppressing the duplicate operation.
@@ -1062,13 +1078,13 @@ class EventLedgerBatch:
                 except DestinationIdentityCollision as collision:
                     collision.target = target_table
                     raise
-                return str(existing["state"]) == "applied"
+                return str(existing["state"]) in {"applied", "internal", "replayed"}
 
         # Store the identity-shaped mapping as the pending value so a repeated
         # event in one group receives the same collision validation as a durable
         # replay.  `as_dict()` contains every field checked by the oracle.
         pending = identity.as_dict()
-        pending["state"] = "applied"
+        pending["state"] = state
         self._known[key] = pending
         self._pending.append(
             self._pending_row(
@@ -1076,6 +1092,7 @@ class EventLedgerBatch:
                 pipeline=self.pipeline,
                 target_table=target_table,
                 source_lsn=source_lsn,
+                state=state,
             )
         )
         return False
@@ -1111,6 +1128,7 @@ def claim_event_ledger(
     control_schema: str | None = None,
     ledger: EventLedgerBatch | None = None,
     snapshot: bool = False,
+    state: str = "applied",
 ) -> bool:
     """Claim an event in the current data transaction.
 
@@ -1124,6 +1142,7 @@ def claim_event_ledger(
             target_table=target_table,
             source_lsn=source_lsn,
             snapshot=snapshot,
+            state=state,
         )
 
     from .event_ledger import assert_same_identity
@@ -1141,7 +1160,7 @@ def claim_event_ledger(
         except DestinationIdentityCollision as collision:
             collision.target = target_table
             raise
-        return str(existing["state"]) == "applied"
+        return str(existing["state"]) in {"applied", "internal", "replayed"}
 
     con.execute(
         f"INSERT INTO {_control_table(control_schema, 'event_ledger')} "
@@ -1157,7 +1176,7 @@ def claim_event_ledger(
             identity.event_id,
             identity.operation,
             identity.payload_digest,
-            "applied",
+            state,
             identity.source_schema,
             identity.source_table,
             identity.source_cluster_id,
