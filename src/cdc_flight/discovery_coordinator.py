@@ -109,6 +109,14 @@ class LiveDiscoveryCoordinator:
             for table in captured_tables
             if f"{table[0]}.{table[1]}" != signal_collection
         )
+        # Recovery journaling owns the complete `(schema, table, target)` tuples,
+        # while SourceHealth's PostgreSQL route probe binds a text[] of qualified
+        # source names.  Keep those two representations explicit at this boundary;
+        # passing the tuples to `::text[]` makes a healthy publication look like a
+        # route mismatch and eventually trips source-dark.
+        self.capture_table_names = tuple(
+            f"{schema}.{table}" for schema, table, _target in self.capture_tables
+        )
 
         self.applier = None
         self.health = None
@@ -258,7 +266,9 @@ class LiveDiscoveryCoordinator:
                         else None
                     ),
                     capture_tables=(
-                        self.capture_tables if self.service_context is not None else None
+                        self.capture_table_names
+                        if self.service_context is not None
+                        else None
                     ),
                     primary_dsn=self.routes.source_write_dsn,
                     source_write_dsn=self.routes.source_write_dsn,
