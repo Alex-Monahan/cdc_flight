@@ -236,10 +236,11 @@ def _wait_md_committed(
     def committed() -> bool:
         nonlocal result
         if process.poll() is not None:
+            output = case.close_output(process)
             raise AssertionError(
                 "NEVER_ARMED: the standby MotherDuck child exited before the "
                 f"durable row/state/ledger/resume tuple for {sentinel!r} "
-                f"(returncode={process.returncode})"
+                f"(returncode={process.returncode})\n{output}"
             )
         result = _md_receipt(md, case, sentinel)
         if result is None:
@@ -321,6 +322,7 @@ def test_standby_motherduck_commit_ack_and_replay_boundary(
         process = case.spawn_service(
             destination="motherduck",
             extra_env={**md_env, **_service_env("p72-md-first")},
+            capture=True,
         )
         first_armed = _arm_stream(case, topology, md, process, baseline, "md_first")
         first_sentinel, first_lsn = _insert_sentinel(topology, "p72_md_first")
