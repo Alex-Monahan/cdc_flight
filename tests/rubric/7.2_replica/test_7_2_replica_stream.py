@@ -149,12 +149,18 @@ def _wait_for_post_arm_ack(
     )
 
 
-def _await_duck_row(case: StandbyCase, sentinel: str) -> list[tuple]:
+def _await_duck_row(
+    case: StandbyCase,
+    sentinel: str,
+    *,
+    process: subprocess.Popen | None = None,
+) -> list[tuple]:
     rows = case.wait_for_destination(
         'SELECT id, name, email, cdcf_event_id, cdcf_commit_id, dbz_lsn '
         'FROM "cdc_raw"."cdcflight_app_customers" WHERE name = ?',
         [sentinel],
         predicate=lambda result: len(result) == 1,
+        process=process,
         timeout=90,
     )
     assert len(rows) == 1, rows
