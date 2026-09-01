@@ -278,6 +278,12 @@ def _ensure_toast_policies(
 
         updated[qualified] = relation
         if (
+            # Direct callers of this low-level helper predate the policy-aware
+            # watcher and deliberately pass the write connection explicitly. Keep
+            # their transaction/revalidation contract; the production watcher
+            # always supplies routes and takes the change-driven path below.
+            getattr(watcher, "routes", None) is not None
+            and
             same_complete_generation
             and current_full
             and previous_boundary is not None

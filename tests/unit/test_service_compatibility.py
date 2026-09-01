@@ -14,6 +14,7 @@ from cdc_flight import offsets
 from cdc_flight.destination import ResumePoint
 from cdc_flight.destination_lease import Lease
 from cdc_flight.errors import EngineFailure, LeaseLost, OffsetUnusable
+from cdc_flight.source_routes import SourceRoutePolicy
 
 
 def _legacy_lease_table(con) -> None:
@@ -131,6 +132,12 @@ def test_service_recheck_invariant_o_guard_is_mutation_sensitive(tmp_path, monke
     coordinator = object.__new__(LiveDiscoveryCoordinator)
     coordinator.service_context = context
     coordinator.source = SimpleNamespace(dsn="postgresql://source")
+    coordinator.routes = SourceRoutePolicy(
+        role="primary",
+        read_replication_dsn="postgresql://source",
+        source_write_dsn="postgresql://source",
+        slot_owner_dsn="postgresql://source",
+    )
     coordinator.replication = SimpleNamespace(
         slot_name="service-slot",
         offset_file=tmp_path / "offsets.dat",
