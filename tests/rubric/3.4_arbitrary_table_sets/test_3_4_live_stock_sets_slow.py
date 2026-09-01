@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from collections import Counter
 
 import duckdb
@@ -373,12 +374,24 @@ def test_live_queued_stock_requests_coalesce_into_one_successor_signal(sandbox):
 
     second = _run_signal(sandbox, (QUEUE_A, QUEUE_B, QUEUE_C))
     assert second["stop_reason"] in {"idle", "engine_finished"}, second
-    completed = sandbox.duck_query(
-        "SELECT source_table, state, effective_mode, signal_id "
-        f"FROM {_control_schema(sandbox)}.backfill_runs "
-        "WHERE source_table IN ('p3b_queue_a', 'p3b_queue_b', 'p3b_queue_c') "
-        "ORDER BY source_table"
-    )
+    deadline = time.monotonic() + 120.0
+    poll_delay = 0.1
+    while True:
+        completed = sandbox.duck_query(
+            "SELECT source_table, state, effective_mode, signal_id "
+            f"FROM {_control_schema(sandbox)}.backfill_runs "
+            "WHERE source_table IN ('p3b_queue_a', 'p3b_queue_b', 'p3b_queue_c') "
+            "ORDER BY source_table"
+        )
+        if len(completed) == 3 and all(row[1] == "complete" for row in completed):
+            break
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                "queued successor runs did not reach complete before deadline; "
+                f"observed states={[(row[0], row[1]) for row in completed]!r}"
+            )
+        time.sleep(poll_delay)
+        poll_delay = min(poll_delay * 2, 2.0)
     assert completed[0][0:3] == ("p3b_queue_a", "complete", "incremental")
     assert completed[1][0:3] == ("p3b_queue_b", "complete", "incremental")
     assert completed[2][0:3] == ("p3b_queue_c", "complete", "incremental")
