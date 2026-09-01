@@ -698,6 +698,15 @@ class StandbyCase:
         path = self.state_dir / "last_run.json"
         return json.loads(path.read_text()) if path.exists() else {}
 
+    def fired_fault(self) -> dict | None:
+        """Return the fsynced fault anchor written by the service child."""
+        from cdc_flight import faults
+
+        return faults.read_fired_record(self.state_dir)
+
+    def clear_fired_fault(self) -> None:
+        (self.state_dir / "fault_fired.json").unlink(missing_ok=True)
+
     def terminate(self, process: subprocess.Popen, *, timeout: float = 90) -> int:
         if process.poll() is None:
             process.send_signal(signal.SIGTERM)
