@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -191,10 +192,10 @@ def _service_env(service_id: str) -> dict[str, str]:
 def _stop_after_failure(case: StandbyCase, process) -> None:
     if process is None or process.poll() is not None:
         return
-        process.send_signal(signal.SIGTERM)
+    process.send_signal(signal.SIGTERM)
     try:
         process.wait(timeout=30)
-    except TimeoutError:
+    except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=30)
 
@@ -251,11 +252,11 @@ def test_real_standby_stream_invalidation_and_common_shutdown(
         clean_sentinel, clean_lsn = _insert_sentinel(topology, "p72_clean")
         sentinel_names.append(clean_sentinel)
         _wait_for_post_arm_ack(topology, process, clean_lsn)
+        _await_duck_row(case, clean_sentinel, process=process)
         rc = case.terminate(process, timeout=120)
         assert rc == 0, {"returncode": rc, "summary": case.last_summary()}
         process = None
         _mark_fired(clean_armed, sentinel=clean_sentinel, source_lsn=clean_lsn)
-        _await_duck_row(case, clean_sentinel)
         clean_summary = case.last_summary()
         _assert_clean_shutdown(clean_summary)
         assert clean_summary["source_routes"]["slot_owner_dsn"] == topology.standby_dsn
@@ -327,13 +328,17 @@ def test_real_standby_stream_invalidation_and_common_shutdown(
         loss_sentinel, loss_lsn = _insert_sentinel(topology, "p72_loss")
         sentinel_names.append(loss_sentinel)
         _wait_for_post_arm_ack(topology, loss_process, loss_lsn)
+        _await_duck_row(case, loss_sentinel, process=loss_process)
         topology.drop_local_slot()
         assert topology.local_slot_status() is None
         loss_rc = loss_process.wait(timeout=150)
         assert loss_rc != 0, {"returncode": loss_rc, "summary": case.last_summary()}
         loss_process = None
         _mark_fired(loss_armed, sentinel=loss_sentinel, source_lsn=loss_lsn)
-        _await_duck_row(case, loss_sentinel)
+        assert case.duck_query(
+            'SELECT 1 FROM "cdc_raw"."cdcflight_app_customers" WHERE name = ?',
+            [loss_sentinel],
+        )
         loss_summary = case.last_summary()
         assert loss_summary.get("local_slot_failure"), loss_summary
         assert loss_summary["local_slot_failure"]["kind"] in {"lost", "invalidated"}, loss_summary
