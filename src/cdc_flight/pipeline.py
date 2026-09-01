@@ -517,6 +517,11 @@ def run(
                 physical_slot_name=source.physical_slot_name,
                 connect_timeout=run_cfg.jdbc_connect_timeout_seconds,
                 statement_timeout_ms=run_cfg.jdbc_socket_timeout_seconds * 1000,
+                # An explicit operator reset intentionally removed the local
+                # slot above.  Admit only that narrow, local repair window so
+                # stock Debezium can recreate it on ``routes.slot_owner_dsn``
+                # (the standby); an unexpected loss must remain fail-closed.
+                allow_local_slot_recovery=reset_state,
             )
             summary_extra["standby_capability_after_acquisition"] = standby.as_dict()
 
