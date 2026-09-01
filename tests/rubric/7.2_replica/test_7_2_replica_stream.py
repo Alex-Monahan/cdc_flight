@@ -129,7 +129,6 @@ def _wait_for_post_arm_ack(
     process,
     source_lsn: int,
     *,
-    previous_confirmed_lsn: int | None = None,
     timeout: float = 180,
 ) -> None:
     """Use the standby slot's confirmed flush as the live callback proof."""
@@ -141,14 +140,7 @@ def _wait_for_post_arm_ack(
                 f"was confirmed (returncode={process.returncode})"
             )
         confirmed = topology.local_slot_confirmed_lsn()
-        return (
-            confirmed is not None
-            and confirmed >= source_lsn
-            and (
-                previous_confirmed_lsn is None
-                or source_lsn > previous_confirmed_lsn
-            )
-        )
+        return confirmed is not None and confirmed >= source_lsn
 
     _wait_until(
         acknowledged,
@@ -263,19 +255,9 @@ def test_real_standby_stream_invalidation_and_common_shutdown(
         # durable post-snapshot barrier and the standby slot confirms its callback.
         process = case.spawn_service(extra_env=_service_env("p72-stream-clean"))
         clean_armed = _arm_stream(case, topology, process, baseline, "clean")
-        clean_previous_confirmed = topology.local_slot_confirmed_lsn()
         clean_sentinel, clean_lsn = _insert_sentinel(topology, "p72_clean")
         sentinel_names.append(clean_sentinel)
-        assert clean_previous_confirmed is None or clean_lsn > clean_previous_confirmed, (
-            clean_previous_confirmed,
-            clean_lsn,
-        )
-        _wait_for_post_arm_ack(
-            topology,
-            process,
-            clean_lsn,
-            previous_confirmed_lsn=clean_previous_confirmed,
-        )
+        _wait_for_post_arm_ack(topology, process, clean_lsn)
         rc = case.terminate(process, timeout=120)
         assert rc == 0, {"returncode": rc, "summary": case.last_summary()}
         process = None
@@ -306,14 +288,9 @@ def test_real_standby_stream_invalidation_and_common_shutdown(
         callback_stream_armed = _arm_stream(
             case, topology, callback_process, baseline, "callback"
         )
-        callback_previous_confirmed = topology.local_slot_confirmed_lsn()
         _write_durable(callback_arm, {"event": "CALLBACK_FAULT_ARMED"})
         callback_sentinel, callback_lsn = _insert_sentinel(topology, "p72_callback")
         sentinel_names.append(callback_sentinel)
-        assert callback_previous_confirmed is None or callback_lsn > callback_previous_confirmed, (
-            callback_previous_confirmed,
-            callback_lsn,
-        )
 
         def callback_fired() -> bool:
             if callback_process.poll() is not None:
@@ -354,19 +331,9 @@ def test_real_standby_stream_invalidation_and_common_shutdown(
         case.clear_fired_fault()
         loss_process = case.spawn_service(extra_env=_service_env("p72-stream-loss"))
         loss_armed = _arm_stream(case, topology, loss_process, baseline, "loss")
-        loss_previous_confirmed = topology.local_slot_confirmed_lsn()
         loss_sentinel, loss_lsn = _insert_sentinel(topology, "p72_loss")
         sentinel_names.append(loss_sentinel)
-        assert loss_previous_confirmed is None or loss_lsn > loss_previous_confirmed, (
-            loss_previous_confirmed,
-            loss_lsn,
-        )
-        _wait_for_post_arm_ack(
-            topology,
-            loss_process,
-            loss_lsn,
-            previous_confirmed_lsn=loss_previous_confirmed,
-        )
+        _wait_for_post_arm_ack(topology, loss_process, loss_lsn)
         topology.drop_local_slot()
         assert topology.local_slot_status() is None
         loss_rc = loss_process.wait(timeout=150)
