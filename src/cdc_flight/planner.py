@@ -269,6 +269,12 @@ class GroupPlan:
                     unit_seq=unit.spill_unit_seq,
                     commit_lsn=source_commit_lsn,
                 ):
+                    if staged.event.kind == KIND_MESSAGE:
+                        # A transactional message may be the entire spilled
+                        # prefix, leaving no message in ``unit.events``. Create
+                        # its destination relation only after the staged event
+                        # has been recovered, still inside this commit transaction.
+                        logical_messages.ensure_table(self.con, self.registry.dataset)
                     if self._below_watermark(staged.event, commit_lsn, fence_below):
                         continue
                     self._collect_contained(

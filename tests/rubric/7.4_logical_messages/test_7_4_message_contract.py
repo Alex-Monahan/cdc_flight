@@ -38,6 +38,7 @@ from cdc_flight.envelope import (
 from cdc_flight.errors import (
     DestinationIdentityCollision,
     EnvelopeDecodeError,
+    SchemaEvolutionRefused,
     TransactionAssemblyError,
 )
 from cdc_flight.logical_messages import (
@@ -46,6 +47,8 @@ from cdc_flight.logical_messages import (
     message_prefix_include_list,
     read_logical_messages,
 )
+from cdc_flight.policy import AcknowledgementHandle
+from cdc_flight.spill import SpillBuffer, StagedEvent
 from cdc_flight.planner import GroupPlan
 
 TOPIC_PREFIX = "cdcflight"
@@ -441,6 +444,89 @@ def test_message_only_applier_commit_excludes_ordinary_data_accounting(tmp_path)
         # harness mode. The separate spill-boundary test covers the opaque handle
         # required before a message can be staged.
         assert box.committer.marked == 3
+    finally:
+        box.close()
+
+
+def test_transactional_message_spills_as_bytes_and_is_acknowledged(tmp_path):
+    """A message may cross spill without losing its bytes or ack token."""
+    box = ApplierLab(
+        tmp_path / "message-spill.duckdb",
+        pipeline="p74-message-spill",
+        unit_spill_events=1,
+        ack_every_record=True,
+    )
+    try:
+        content = b"\x00\xff\x80"
+        message = _message(
+            "spill-tx", 1, 2020, content,
+            prefix="app_spill", transactional=True,
+        )
+        message.source_cluster_id = "cluster-spill"
+        message.source_timeline = 1
+
+        box.feed(
+            [
+                lab_begin("spill-tx", 2010),
+                message,
+                lab_end("spill-tx", 1, 2030),
+            ]
+        )
+
+        assert box.applier.spilled_events == 1
+        assert box.scalar("SELECT count(*) FROM _cdc_flight.spill_events") == 1
+        assert isinstance(message.raw, AcknowledgementHandle)
+        assert box.q(
+            "SELECT message_content FROM _cdc_flight.spill_events"
+        ) == [(content,)]
+
+        box.commit()
+
+        row = box.q(
+            "SELECT content, prefix, is_transactional, txn_id, total_order, commit_lsn "
+            "FROM cdc_raw.cdcflight_logical_messages"
+        )
+        assert row == [(content, "app_spill", True, "spill-tx", 1, 2030)]
+        assert type(row[0][0]) is bytes
+        assert box.applier.applied_events == 0
+        assert box.applier.data_commit_groups == 0
+        assert box.committer.marked == 3
+        # The handle consumed by the post-COMMIT acknowledgement no longer owns the
+        # connector token; calling consume again is therefore harmless and empty.
+        assert message.raw.consume() is None
+    finally:
+        box.close()
+
+
+def test_spill_boundary_refuses_a_sanitized_message_with_raw_mapping(tmp_path):
+    """§8.3: sanitized metadata cannot bless a raw connector object."""
+    box = ApplierLab(tmp_path / "message-raw-refusal.duckdb")
+    try:
+        message = _message(None, None, 2040, b"secret", transactional=False)
+        message.raw = {"decoded": "source"}
+        message.sanitized = True
+        message.policy_digest = box.applier.policy_gate.policy.digest
+        assert not isinstance(message.raw, AcknowledgementHandle)
+
+        spill = SpillBuffer(
+            box.con,
+            policy_gate=box.applier.policy_gate,
+            require_sanitized=True,
+        )
+        with pytest.raises(SchemaEvolutionRefused, match="decoded source mapping"):
+            spill.stage(
+                commit_id=1,
+                unit_seq=1,
+                prepared=[
+                    StagedEvent(
+                        event=message,
+                        event_id="message-raw-refusal",
+                        target="cdc_raw.cdcflight_logical_messages",
+                        seq=1,
+                    )
+                ],
+            )
+        assert box.scalar("SELECT count(*) FROM _cdc_flight.spill_events") == 0
     finally:
         box.close()
 

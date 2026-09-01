@@ -1016,6 +1016,13 @@ class Applier:
                     record.policy_epoch = int(self.policy_gate.policy.epoch)
                     record.policy_digest = self.policy_gate.policy.digest
                     record.sanitized = True
+                    raw = getattr(record, "raw", None)
+                    if raw is not None and not isinstance(raw, AcknowledgementHandle):
+                        # The policy gate intentionally returns early for non-data
+                        # records. The message still crosses the same spill and
+                        # post-COMMIT acknowledgement boundaries as a data record,
+                        # so its connector token must be opaque before assembly.
+                        record.raw = AcknowledgementHandle(raw)
             except AdmissionError as error:
                 self._seal_policy_refusal(record, error)
             return record
