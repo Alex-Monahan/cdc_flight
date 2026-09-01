@@ -26,7 +26,8 @@ _BASELINE_SELECTED = {
     # The quiet-holder and stock-walsender retry proofs are MotherDuck-only real
     # process nodes; a local DuckDB file lock cannot exercise cloud takeover while
     # the old process retains its handle.
-    "motherduck": 62,
+    # The §7.2 streamed-replica durability/replay test adds one MD item.
+    "motherduck": 63,
 }
 
 
