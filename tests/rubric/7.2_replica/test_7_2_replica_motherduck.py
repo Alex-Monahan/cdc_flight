@@ -241,12 +241,35 @@ def _wait_md_committed(
                 server_log = topology.log_path.read_text(encoding="utf-8")[-12000:]
             except OSError as exc:
                 server_log = f"<standby log unavailable: {exc}>"
-            print("MOTHERDUCK CHILD OUTPUT:\n" + output, flush=True)
+            (case.root / "motherduck-child-output.log").write_text(
+                output, encoding="utf-8"
+            )
+            (case.root / "standby-server-log-tail.log").write_text(
+                server_log, encoding="utf-8"
+            )
+            interesting = "\n".join(
+                line
+                for line in output.splitlines()
+                if any(
+                    token in line
+                    for token in (
+                        "ERROR",
+                        "WARN",
+                        "Exception",
+                        "exception",
+                        "failed",
+                        "Failed",
+                        "disconnect",
+                        "timeout",
+                    )
+                )
+            )
+            print("MOTHERDUCK CHILD DIAGNOSTICS:\n" + interesting, flush=True)
             print("STANDBY SERVER LOG TAIL:\n" + server_log, flush=True)
             raise AssertionError(
                 "NEVER_ARMED: the standby MotherDuck child exited before the "
                 f"durable row/state/ledger/resume tuple for {sentinel!r} "
-                f"(returncode={process.returncode})\n{output}\n{server_log}"
+                f"(returncode={process.returncode})\n{interesting}\n{server_log}"
             )
         result = _md_receipt(md, case, sentinel)
         if result is None:
