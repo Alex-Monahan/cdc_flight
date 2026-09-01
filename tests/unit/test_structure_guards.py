@@ -21,7 +21,8 @@ _BASELINE_SELECTED = {
     # Four §7.4 contract tests and the §7.2 route-contract/p78 additions are
     # included in the default lane. The latter add twelve selected tests.
     "not motherduck and not slow": 2422,
-    "slow and not motherduck": 248,
+    # The §7.2 production standby stream adds one slow-lane test.
+    "slow and not motherduck": 249,
     # The quiet-holder and stock-walsender retry proofs are MotherDuck-only real
     # process nodes; a local DuckDB file lock cannot exercise cloud takeover while
     # the old process retains its handle.
