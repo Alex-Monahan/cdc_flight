@@ -16,6 +16,7 @@ import pytest
 from support.applier_lab import Lab as ApplierLab
 from support.applier_lab import begin as lab_begin
 from support.applier_lab import end as lab_end
+from support.applier_lab import keyed as lab_keyed
 
 from cdc_flight import event_ledger
 from cdc_flight.assembler import (
@@ -444,6 +445,37 @@ def test_message_only_applier_commit_excludes_ordinary_data_accounting(tmp_path)
         # harness mode. The separate spill-boundary test covers the opaque handle
         # required before a message can be staged.
         assert box.committer.marked == 3
+    finally:
+        box.close()
+
+
+def test_message_plus_row_counts_only_the_ordinary_row(tmp_path):
+    """A mixed source transaction keeps message and data counters separate."""
+    box = ApplierLab(
+        tmp_path / "message-plus-row-accounting.duckdb",
+        pipeline="p74-mixed-accounting",
+    )
+    try:
+        message = _message(
+            "mixed", 2, 3020, b"message", prefix="app_accounting", transactional=True
+        )
+        message.source_cluster_id = "cluster-mixed"
+        message.source_timeline = 1
+        box.run(
+            [
+                lab_begin("mixed", 3010),
+                lab_keyed("mixed", 1, 3015, 1, "ordinary"),
+                message,
+                lab_end("mixed", 2, 3030, {"app.customers": 1}),
+            ]
+        )
+
+        assert box.applier.applied_events == 1
+        assert box.applier.data_commit_groups == 1
+        assert box.applier.snapshot_counts() == {"cdcflight_app_customers": 1}
+        assert box.q(
+            "SELECT event_count, tables_touched FROM _cdc_flight.commit_log"
+        ) == [(1, ["cdcflight_app_customers"])]
     finally:
         box.close()
 
