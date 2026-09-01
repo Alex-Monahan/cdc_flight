@@ -710,7 +710,11 @@ class GroupPlan:
             MESSAGE_LAST_BYTE_LENGTH=len(content),
         )
         route = self.message_prefix_policy.classify(event.message_prefix)
-        self._count_event(event)
+        # Keep the legacy applied-event count/data commit log free of internal
+        # heartbeat/marker traffic, while still recording this source LSN in the
+        # group's observability bounds. A newly materialized application message
+        # is counted below as a real consumer row.
+        self._count_event(event, count=False)
         self.stats["logical_messages_received"] += 1
         if route == "rejected":
             self.stats["logical_messages_rejected"] += 1
@@ -821,6 +825,7 @@ class GroupPlan:
             self.stats["logical_messages_internal"] += 1
             status = "internal"
         else:
+            self.stats["events"] += 1
             self.stats["logical_messages_delivered"] += 1
             self._message_rows.append(expected)
             self.stats["tables"].add(logical_messages.LOGICAL_MESSAGE_TABLE)
@@ -1164,7 +1169,7 @@ class GroupPlan:
                 TypedImage(tuple(sorted(typed_fields.items()))),
             )
 
-    def _count_event(self, event: PendingRecord) -> None:
+    def _count_event(self, event: PendingRecord, *, count: bool = True) -> None:
         """Group-level bookkeeping every event contributes to, whatever it is.
 
         Truncates included: the event happened whatever policy does with it, so it
@@ -1172,7 +1177,8 @@ class GroupPlan:
         this in one place is what stopped the staged path from under-reporting
         `table_counts` and `commit_log.max_source_ts` (Opus MINOR-1).
         """
-        self.stats["events"] += 1
+        if count:
+            self.stats["events"] += 1
         if event.lsn:
             self.stats["first_lsn"] = self.stats["first_lsn"] or event.lsn
             self.stats["last_lsn"] = event.lsn
