@@ -331,7 +331,12 @@ def test_real_standby_stream_invalidation_and_common_shutdown(
         # The already confirmed row remains durable; loss must stop before another
         # acknowledgement and must create a destination-owned recovery obligation.
         case.clear_fired_fault()
-        loss_process = case.spawn_service(extra_env=_service_env("p72-stream-loss"))
+        # Keep the bounded child log on the loss arm.  A fail-closed service must
+        # publish its durable local-slot witness, and the log is the only way to
+        # diagnose a pre-summary exception without weakening that assertion.
+        loss_process = case.spawn_service(
+            extra_env=_service_env("p72-stream-loss"), capture=True
+        )
         loss_armed = _arm_stream(case, topology, loss_process, baseline, "loss")
         loss_sentinel, loss_lsn = _insert_sentinel(topology, "p72_loss")
         sentinel_names.append(loss_sentinel)
@@ -340,7 +345,12 @@ def test_real_standby_stream_invalidation_and_common_shutdown(
         topology.drop_local_slot()
         assert topology.local_slot_status() is None
         loss_rc = loss_process.wait(timeout=150)
-        assert loss_rc != 0, {"returncode": loss_rc, "summary": case.last_summary()}
+        loss_output = case.close_output(loss_process)
+        assert loss_rc != 0, {
+            "returncode": loss_rc,
+            "summary": case.last_summary(),
+            "output": loss_output,
+        }
         loss_process = None
         _mark_fired(loss_armed, sentinel=loss_sentinel, source_lsn=loss_lsn)
         assert case.duck_query(
@@ -348,10 +358,24 @@ def test_real_standby_stream_invalidation_and_common_shutdown(
             [loss_sentinel],
         )
         loss_summary = case.last_summary()
-        assert loss_summary.get("local_slot_failure"), loss_summary
-        assert loss_summary["local_slot_failure"]["kind"] in {"lost", "invalidated"}, loss_summary
-        assert loss_summary["source_routes"]["slot_owner_dsn"] == topology.standby_dsn, loss_summary
-        assert loss_summary.get("final_ack_required") is not True, loss_summary
+        if not loss_summary.get("local_slot_failure"):
+            print("LOSS CHILD OUTPUT:\n" + loss_output, flush=True)
+        assert loss_summary.get("local_slot_failure"), {
+            "summary": loss_summary,
+            "output": loss_output,
+        }
+        assert loss_summary["local_slot_failure"]["kind"] in {"lost", "invalidated"}, {
+            "summary": loss_summary,
+            "output": loss_output,
+        }
+        assert loss_summary["source_routes"]["slot_owner_dsn"] == topology.standby_dsn, {
+            "summary": loss_summary,
+            "output": loss_output,
+        }
+        assert loss_summary.get("final_ack_required") is not True, {
+            "summary": loss_summary,
+            "output": loss_output,
+        }
         recovery_rows = case.duck_query(
             "SELECT decision, phase FROM _cdc_flight.recovery_state "
             "WHERE pipeline = ? AND namespace = ?",

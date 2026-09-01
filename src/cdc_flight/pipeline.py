@@ -1113,6 +1113,7 @@ def run(
             settings=settings,
             watcher=watcher,
             discovered=discovered,
+            captured_tables=captured_tables,
             catalog_cfg=catalog_cfg,
             phases=phases,
             lease=lease,

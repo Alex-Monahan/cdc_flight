@@ -53,6 +53,7 @@ class LiveDiscoveryCoordinator:
         settings: dict,
         watcher,
         discovered,
+        captured_tables: list[tuple[str, str, str]],
         catalog_cfg: CatalogConfig,
         phases: RunPhaseWriter,
         lease,
@@ -102,17 +103,11 @@ class LiveDiscoveryCoordinator:
         self.descriptor_provider = descriptor_provider
         self.catalog_flush_exclude = set(catalog_flush_exclude or ())
         self.service_context = service_context
-        configured_capture = str(self.props.get("table.include.list", ""))
-        capture_tables = tuple(
-            table.strip()
-            for table in configured_capture.split(",")
-            if table.strip()
-        )
-        if not capture_tables:
-            capture_tables = tuple(self.source.tables)
         signal_collection = self.props.get("signal.data.collection")
         self.capture_tables = tuple(
-            table for table in capture_tables if table != signal_collection
+            table
+            for table in captured_tables
+            if f"{table[0]}.{table[1]}" != signal_collection
         )
 
         self.applier = None
