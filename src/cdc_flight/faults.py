@@ -772,6 +772,7 @@ class FaultyConnection:
                 self._hang_seconds,
                 self._nth,
             )
+            record_callback_entered()
             sys.stdout.flush()
             time.sleep(self._hang_seconds)
         if self._point == "destination_write" and _is_data_statement(
@@ -830,6 +831,7 @@ class FaultyConnection:
 #: exercise the watchdog it exists for (Opus MAJOR-5).
 HANG_SECONDS_ENV = "CDC_FAULT_HANG_SECONDS"
 DEFAULT_HANG_SECONDS = 3600.0
+CALLBACK_ENTERED_ENV = "CDC_TEST_CALLBACK_ENTERED"
 
 
 def hang_seconds() -> float:
@@ -842,6 +844,34 @@ def hang_seconds() -> float:
         raise FaultSpecError(
             f"{HANG_SECONDS_ENV}: expected a number of seconds, got {raw!r}"
         ) from exc
+
+
+def record_callback_entered() -> None:
+    """Publish a test-only callback-held witness before an injected hang."""
+    path = os.environ.get(CALLBACK_ENTERED_ENV)
+    if not path:
+        return
+    try:
+        target = os.path.abspath(path)
+        parent = os.path.dirname(target)
+        os.makedirs(parent, exist_ok=True)
+        temporary = f"{target}.{os.getpid()}.tmp"
+        with open(temporary, "w") as handle:
+            json.dump(
+                {
+                    "event": "CALLBACK_ENTERED",
+                    "pid": os.getpid(),
+                    "group": current_group(),
+                    "at": time.time(),
+                },
+                handle,
+                sort_keys=True,
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    except Exception:  # pragma: no cover - the test witness must not mask the fault
+        log.debug("could not write callback-entered witness", exc_info=True)
 
 
 def wrap_destination(

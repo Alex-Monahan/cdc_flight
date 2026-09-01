@@ -16,6 +16,7 @@ from typing import Any
 from . import destination as dest_mod
 from . import naming, offsets
 from . import reconcile as reconcile_mod
+from . import recovery as recovery_mod
 from . import resnapshot as resnapshot_mod
 from .applier import Applier
 from .config import CatalogConfig, ReplicationConfig, RunConfig, SourceConfig
@@ -119,6 +120,72 @@ class LiveDiscoveryCoordinator:
         self.result: dict | None = None
         self.reported: dict | None = None
         self.run_ok = False
+
+    def _journal_local_slot_failure(self, summary: dict) -> None:
+        """Persist the standby repair obligation after a live-slot failure.
+
+        ``SourceHealth`` deliberately has no destination handle.  Once the common
+        supervisor has sealed and quiesced callbacks, this coordinator is the first
+        owner that can durably record the recovery while leaving the destination image
+        untouched.  The next acquisition resumes this journal, repairs the local slot
+        through ``routes.slot_owner_dsn``, and only then admits the fenced full
+        resnapshot.  In particular, this path never turns the primary write route into
+        a logical-slot owner.
+        """
+        witness = summary.get("local_slot_failure")
+        if not witness:
+            return
+        existing = recovery_mod.read(
+            self.con,
+            pipeline=self.destination.pipeline_name,
+            namespace=self.namespace,
+            control_schema=self.destination.control_schema,
+        )
+        if existing is not None:
+            summary["local_slot_recovery"] = existing.as_dict()
+            return
+
+        slot_receipt = dest_mod.read_slot_state(
+            self.con,
+            self.destination.pipeline_name,
+            self.replication.slot_name,
+            control_schema=self.destination.control_schema,
+        )
+        if slot_receipt is None:
+            raise EngineFailure(
+                "the standby local logical slot failed after streaming, but the last "
+                "slot observation was not durable; preserving the destination and "
+                "refusing to continue without a durable local-slot recovery owner",
+                summary,
+            )
+        kind = str(witness.get("kind") or "lost")
+        decision = "slot_invalidated" if kind == "invalidated" else "slot_missing"
+        record = recovery_mod.begin(
+            self.con,
+            pipeline=self.destination.pipeline_name,
+            namespace=self.namespace,
+            decision=decision,
+            message=(
+                "the standby's local logical slot was "
+                f"{kind} after a live stream; preserve the destination, repair the "
+                "local slot, and perform a fenced full resnapshot. The primary "
+                "logical slot is never a fallback"
+            ),
+            slot_name=self.replication.slot_name,
+            offset_path=self.replication.offset_file,
+            captured_tables=self.capture_tables,
+            forget_catalog=False,
+            slot_receipt=slot_receipt,
+            state_dir=self.replication.state_dir,
+            severity="critical",
+            context={
+                "slot_name": self.replication.slot_name,
+                "recovery_phase": recovery_mod.PHASE_REQUESTED,
+                "source_role": "standby",
+            },
+            control_schema=self.destination.control_schema,
+        )
+        summary["local_slot_recovery"] = record.as_dict()
 
     def run(self) -> dict:
         """Run engines until no newly admitted relation needs a hand-off."""
@@ -407,6 +474,8 @@ class LiveDiscoveryCoordinator:
             self.reported = report.summary
             return self.reported
         except EngineFailure as failure:
+            if failure.summary.get("local_slot_failure"):
+                self._journal_local_slot_failure(failure.summary)
             self.outcome.record(failure.summary.get("stop_reason") or "engine_error")
             self.reported = failure.summary
             raise

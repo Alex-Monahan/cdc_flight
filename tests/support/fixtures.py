@@ -98,6 +98,7 @@ from cdc_flight.config import (
 )
 from support import postgres_test_instance
 from support.motherduck_probe import _drop_database, _drop_schema, create_database
+from support.standby_topology import StandbyTopology
 
 POSTGRES_TEST_INSTANCE = postgres_test_instance.INSTANCE
 PG_SH = POSTGRES_TEST_INSTANCE.pg_sh
@@ -412,6 +413,18 @@ def fresh_seed(postgres_cluster: SourceConfig) -> SourceConfig:
     """Clone the canonical template so a test starts from a known row set."""
     _reset_test_database(postgres_cluster)
     return postgres_cluster
+
+
+@pytest.fixture(scope="session")
+def standby_topology(tmp_path_factory: pytest.TempPathFactory) -> Iterator[StandbyTopology]:
+    """Provision the derived primary/physical-standby topology for rubric 7.2."""
+    runtime_dir = tmp_path_factory.mktemp("p72_standby_runtime")
+    topology = StandbyTopology.from_environment(runtime_dir)
+    topology.provision()
+    try:
+        yield topology
+    finally:
+        topology.cleanup()
 
 
 # --------------------------------------------------------------------------- #
