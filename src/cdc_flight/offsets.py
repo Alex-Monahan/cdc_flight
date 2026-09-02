@@ -28,6 +28,7 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,47 @@ from .machines import RECONCILE_DECISIONS
 log = logging.getLogger("cdc_flight.offsets")
 
 _SEPARATORS = (",", ":")
+REPLAY_OFFSET_FILE_NAME = ".offsets.replay.dat"
+
+
+def replay_offset_path(state_dir: Path | str) -> Path:
+    """Return the disposable offset path used for a slot-replay recovery.
+
+    A destination commit can precede the connector's file/slot acknowledgement.  On
+    the next run the durable destination row is the truth, but giving that row back to
+    Debezium's normal WAL-position search can skip a non-transactional message between
+    the stored commit and the next transaction boundary.  A recovery therefore uses a
+    fresh file so stock Debezium starts at the slot's confirmed position and Flight's
+    durable fence/ledger handles the replay.
+    """
+    return Path(state_dir) / REPLAY_OFFSET_FILE_NAME
+
+
+def prepare_replay_offset(path: Path | str) -> Path:
+    """Remove any stale disposable replay file and return its path."""
+    target = Path(path)
+    target.unlink(missing_ok=True)
+    return target
+
+
+def install_replay_offset(source: Path | str, target: Path | str) -> bool:
+    """Atomically install a successfully flushed replay offset, if one exists."""
+    source_path = Path(source)
+    if not source_path.exists() or source_path.stat().st_size <= 0:
+        return False
+    if not read(source_path):
+        raise OffsetUnusable(
+            f"stock Debezium produced an unreadable replay offset file {source_path}"
+        )
+    target_path = Path(target)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target_path.with_name(f".{target_path.name}.replay.tmp")
+    temporary.unlink(missing_ok=True)
+    shutil.copyfile(source_path, temporary)
+    _fsync(temporary)
+    os.replace(temporary, target_path)
+    _fsync_dir(target_path.parent)
+    return True
 
 
 def encode_key(namespace: str, partition: dict[str, Any]) -> bytes:

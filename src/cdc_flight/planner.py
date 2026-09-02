@@ -97,6 +97,7 @@ class GroupPlan:
         delete_policy=None,
         policy_gate=None,
         message_prefix_policy=None,
+        suppress_replayed_message_audit: bool = False,
     ):
         self.con = con
         self.commit_id = commit_id
@@ -127,6 +128,7 @@ class GroupPlan:
         self.delete_policy = delete_policy
         self.policy_gate = policy_gate
         self.message_prefix_policy = message_prefix_policy or logical_messages.MessagePrefixPolicy()
+        self.suppress_replayed_message_audit = bool(suppress_replayed_message_audit)
         self.policy_alerts: list[dict] = []
         self.history_modes = {
             str(name): str(mode).lower() for name, mode in (history_modes or {}).items()
@@ -834,16 +836,6 @@ class GroupPlan:
             self.stats["logical_messages_delivered"] += 1
             self._message_rows.append(expected)
             status = "delivered"
-        audit = dict(expected)
-        audit.update(
-            {
-                "target_table": message_target,
-                "status": status,
-                "rejection_reason": None,
-                "observed_at": destination.now(),
-            }
-        )
-        self._message_audit.append(audit)
         self.stats["logical_message_observations"].append(
             {
                 "message_id": identity.event_id,
@@ -857,6 +849,18 @@ class GroupPlan:
                 "status": status,
             }
         )
+        if replayed and self.suppress_replayed_message_audit:
+            return
+        audit = dict(expected)
+        audit.update(
+            {
+                "target_table": message_target,
+                "status": status,
+                "rejection_reason": None,
+                "observed_at": destination.now(),
+            }
+        )
+        self._message_audit.append(audit)
 
     def _collect_contained(
         self,

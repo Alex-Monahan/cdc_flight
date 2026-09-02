@@ -109,11 +109,12 @@ def payload_digest(event: Any) -> str:
         # Message content is already exact bytes at the decoder boundary. The
         # digest must preserve that byte identity and the route metadata; a
         # textual round trip would make a same-ID non-UTF-8 collision invisible.
+        # ``event_ts_ms`` is connector arrival metadata, not a source fact: stock
+        # Debezium assigns a new value when the same WAL message is replayed.
         material["message_prefix"] = getattr(event, "message_prefix", None)
         material["message_content"] = getattr(event, "message_content", None)
         material["message_transactional"] = getattr(event, "message_transactional", None)
         material["source_sequence"] = getattr(event, "source_sequence", None)
-        material["event_ts_ms"] = getattr(event, "event_ts_ms", None)
     return hashlib.sha256(canonical_json(material).encode("utf-8")).hexdigest()
 
 

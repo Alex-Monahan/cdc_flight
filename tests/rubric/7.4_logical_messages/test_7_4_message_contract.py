@@ -581,6 +581,17 @@ def test_message_identity_is_source_based_and_digest_is_byte_sensitive():
     assert one.event_id == two.event_id
     assert one.payload_digest != two.payload_digest
 
+    replay = _message(None, None, 200, b"\x00", transactional=False)
+    replay.event_ts_ms = 987654321
+    replay_identity = event_ledger.message_identity_for(
+        replay,
+        source_cluster_id="cluster-contract",
+        source_timeline=1,
+        require_strong=True,
+    )
+    assert replay_identity.event_id == one.event_id
+    assert replay_identity.payload_digest == one.payload_digest
+
     with pytest.raises(DestinationIdentityCollision, match="missing stable"):
         event_ledger.message_identity_for(
             _message("tx", 1, 201, b"x", transactional=True),

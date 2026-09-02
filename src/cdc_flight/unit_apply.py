@@ -97,6 +97,7 @@ def apply_units(
         delete_policy=applier.delete_policy,
         policy_gate=applier.policy_gate,
         message_prefix_policy=applier.message_prefix_policy,
+        suppress_replayed_message_audit=applier.suppress_replayed_message_audit,
     )
     try:
         for unit in group:

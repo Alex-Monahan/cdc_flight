@@ -70,6 +70,8 @@ class LiveDiscoveryCoordinator:
         descriptor_provider=None,
         catalog_flush_exclude: set[str] | None = None,
         service_context=None,
+        offset_file=None,
+        suppress_replayed_message_audit: bool = False,
     ) -> None:
         self.con = con
         self.source = source
@@ -103,6 +105,8 @@ class LiveDiscoveryCoordinator:
         self.descriptor_provider = descriptor_provider
         self.catalog_flush_exclude = set(catalog_flush_exclude or ())
         self.service_context = service_context
+        self.offset_file = offset_file or self.replication.offset_file
+        self.suppress_replayed_message_audit = bool(suppress_replayed_message_audit)
         signal_collection = self.props.get("signal.data.collection")
         self.capture_tables = tuple(
             table
@@ -241,7 +245,7 @@ class LiveDiscoveryCoordinator:
                 engine = SupervisedDebeziumEngine(
                     properties=engine_props,
                     handler=self.applier,
-                    offset_file=self.replication.offset_file,
+                    offset_file=self.offset_file,
                     always_commit_offsets=engine_props.get("offset.flush.interval.ms") == "0",
                 )
                 if self.service_context is not None:
@@ -694,7 +698,7 @@ class LiveDiscoveryCoordinator:
                 self.catalog_cfg.marker_prefix,
                 "cdc_flight_heartbeat",
             ),
-            offset_path=self.replication.offset_file,
+            offset_path=self.offset_file,
             resume_point=self.main_resume,
             config=self.applier_cfg,
             lease=self.lease,
@@ -712,6 +716,7 @@ class LiveDiscoveryCoordinator:
             source_timeline=source_timeline,
             strict_event_identity=True,
             message_prefix_allowlist=self.replication.message_prefix_allowlist,
+            suppress_replayed_message_audit=self.suppress_replayed_message_audit,
         )
         self.ownership.attach(applier)
         return applier

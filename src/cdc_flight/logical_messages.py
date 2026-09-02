@@ -252,7 +252,7 @@ def assert_row_matches(
     for name in (
         "message_id", "prefix", "is_transactional", "source_cluster_id",
         "source_timeline", "source_lsn", "source_sequence", "txn_id",
-        "total_order", "commit_lsn", "source_ts_ms", "event_ts_ms",
+        "total_order", "commit_lsn", "source_ts_ms",
     ):
         if observed.get(name) != expected.get(name):
             raise DestinationIdentityCollision(

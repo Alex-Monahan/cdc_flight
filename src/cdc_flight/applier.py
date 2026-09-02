@@ -180,6 +180,7 @@ class Applier:
         source_timeline: int | None = None,
         strict_event_identity: bool = False,
         message_prefix_allowlist: tuple[str, ...] | None = None,
+        suppress_replayed_message_audit: bool = False,
     ):
         self.con = con
         self.pipeline = pipeline
@@ -204,6 +205,10 @@ class Applier:
         self.source_cluster_id = source_cluster_id
         self.source_timeline = source_timeline
         self.strict_event_identity = bool(strict_event_identity)
+        #: A slot-replay recovery re-reads the durable prefix to reach a standalone
+        #: message. Existing claims are idempotent no-ops and must not overwrite a
+        #: previously delivered audit observation with a synthetic replay row.
+        self.suppress_replayed_message_audit = bool(suppress_replayed_message_audit)
         self.message_prefix_policy = logical_messages.MessagePrefixPolicy(
             application_patterns=(
                 message_prefix_allowlist

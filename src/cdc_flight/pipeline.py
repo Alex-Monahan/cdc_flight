@@ -36,7 +36,7 @@ from pathlib import Path
 # different proven-safe pool; the production default is the Arrow system allocator.
 os.environ.setdefault("ARROW_DEFAULT_MEMORY_POOL", "system")
 
-from . import acquisition, naming
+from . import acquisition, naming, offsets
 from . import catalog as catalog_mod
 from . import catalog_baseline as baseline_mod
 from . import destination as dest_mod
@@ -268,6 +268,7 @@ def run(
     #: it AFTER the terminal phase transitions, rather than shipping a summary sampled
     #: while the run was still `draining`.
     reported: dict | None = None
+    replay_offset_file: Path | None = None
     try:
         if service_context is not None:
             destination_lease_key = dest.resolve_physical_lease_key(con)
@@ -539,6 +540,34 @@ def run(
         summary_extra["reconciliation"] = reconciliation.decision
         summary_extra["reconciliation_detail"] = reconciliation.message
         log.info("start-up reconciliation: %s (%s)", reconciliation.decision, reconciliation.message)
+
+        # A destination COMMIT can survive a process death before Debezium's
+        # markProcessed/markBatchFinished acknowledgement.  Feeding that rebuilt
+        # destination offset back into stock PostgreSQL resume search is unsafe for
+        # a standalone logical message immediately after the stored COMMIT: the
+        # connector's search starts at the COMMIT boundary, finds the next
+        # transaction boundary, and its replay filter can discard the intervening
+        # MESSAGE.  Keep the real offsets.dat behind as crash evidence, and use a
+        # fresh disposable store for this one recovery.  With no prior offset stock
+        # Debezium starts at the slot's confirmed position; the existing durable
+        # transaction fence and message ledger make the replay idempotent.
+        if reconciliation.decision == "file_behind_rebuilt":
+            replay_offset_file = offsets.prepare_replay_offset(
+                offsets.replay_offset_path(replication.state_dir)
+            )
+            props["offset.storage.file.filename"] = replay_offset_file.as_posix()
+            props["snapshot.mode"] = "no_data"
+            summary_extra.update(
+                {
+                    "source_replay_from_slot": True,
+                    "source_replay_offset_file": str(replay_offset_file),
+                    "source_replay_reason": "destination_commit_without_offset_ack",
+                }
+            )
+            log.warning(
+                "destination offset outran the connector acknowledgement; replaying "
+                "from the slot's confirmed position with a disposable offset file"
+            )
 
         # rubric 4.7 / Codex r1 BLOCKER-1: an operator who passed
         # `--accept-orphan-offsets` has authorised a rebuild, and the rebuild is now a
@@ -1130,9 +1159,17 @@ def run(
             descriptor_provider=descriptor_provider,
             catalog_flush_exclude=catalog_flush_exclude,
             service_context=service_context,
+            offset_file=replay_offset_file,
+            suppress_replayed_message_audit=replay_offset_file is not None,
         )
         try:
             reported = coordinator.run()
+            if replay_offset_file is not None:
+                summary_extra["source_replay_offset_installed"] = (
+                    offsets.install_replay_offset(
+                        replay_offset_file, replication.offset_file
+                    )
+                )
             run_ok = coordinator.run_ok
             return reported
         except EngineFailure as failure:
@@ -1197,6 +1234,8 @@ def run(
         raise
     finally:
         try:
+            if replay_offset_file is not None:
+                replay_offset_file.unlink(missing_ok=True)
             _teardown_destination(
                 con=con,
                 ownership=ownership,
