@@ -19,8 +19,9 @@ _BASELINE_SELECTED = {
     # Re-measured after the §8.1/§8.3 additions. The release invariant is that
     # this number may only move upward as rubric coverage grows.
     # The durable replay-intent unit and real-kill coverage are included in the
-    # default/slow lanes; the selected totals are 2439/257 including this guard.
-    "not motherduck and not slow": 2438,
+    # default/slow lanes; the selected totals are 2439/257 including this
+    # module's 11 default and one slow guard nodes.
+    "not motherduck and not slow": 2428,
     "slow and not motherduck": 256,
     # The quiet-holder and stock-walsender retry proofs are MotherDuck-only real
     # process nodes; a local DuckDB file lock cannot exercise cloud takeover while
