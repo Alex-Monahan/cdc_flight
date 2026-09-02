@@ -8,6 +8,7 @@ and the source messages were emitted, so a later failure is a delivery failure.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import time
 import uuid
@@ -15,6 +16,7 @@ import uuid
 import duckdb
 import psycopg
 import pytest
+from support.fixtures import Sandbox
 
 from cdc_flight.logical_messages import read_logical_messages
 
@@ -318,3 +320,234 @@ def test_stock_messages_are_exact_consumer_rows_and_do_not_become_liveness_data(
         "content" not in observation and "payload" not in observation
         for observation in summary.get("logical_message_observations", [])
     )
+
+
+def _prime_replay_marker(box: Sandbox) -> dict[str, object]:
+    """Create the real post-COMMIT/pre-ack survivor used by each replay cut."""
+    baseline = box.run(
+        reset_state=True,
+        max_seconds=180,
+        idle_seconds=6,
+        extra_env={"CDC_COMPLETION_WATERMARK": "0"},
+    )
+    assert baseline["returncode"] == 0, baseline
+    token = uuid.uuid4().hex
+    tx_prefix = f"app_p72_txn_{token}"
+    non_prefix = f"app_p72_non_txn_{token}"
+    tx_content = "p72-transactional"
+    emit_sql = (
+        "SELECT (pg_logical_emit_message(%s, %s, %s) - "
+        "'0/0'::pg_lsn)::bigint"
+    )
+    with psycopg.connect(box.source.dsn, autocommit=True) as conn, conn.transaction():
+        conn.execute(
+            "INSERT INTO app.customers (name, email) VALUES (%s, %s)",
+            (f"p72-data-{token}", f"{token}@example.com"),
+        )
+        tx_lsn = int(
+            conn.execute(emit_sql, (True, tx_prefix, tx_content)).fetchone()[0]
+        )
+    non_lsn = _emit_message(
+        box.source,
+        transactional=False,
+        prefix=non_prefix,
+        content="",
+    )
+    crashed = box.run(
+        max_seconds=180,
+        idle_seconds=8,
+        timeout=300,
+        expect_success=False,
+        extra_env={
+            "CDC_COMPLETION_WATERMARK": "0",
+            "CDC_FAULT_INJECT": "post_commit_pre_ack:1",
+        },
+    )
+    assert crashed["returncode"] == 137, crashed
+    return {
+        "tx_prefix": tx_prefix,
+        "non_prefix": non_prefix,
+        "tx_lsn": tx_lsn,
+        "non_lsn": non_lsn,
+        "data_name": f"p72-data-{token}",
+    }
+
+
+def _assert_replay_survivor(box: Sandbox, case: dict[str, object]) -> None:
+    pipeline = box.env["CDC_PIPELINE_NAME"]
+    prefixes = [case["non_prefix"], case["tx_prefix"]]
+    rows = box.duck_query(
+        "SELECT prefix, content, is_transactional FROM cdc_raw.cdcflight_logical_messages "
+        "WHERE pipeline = ? AND prefix IN (?, ?) ORDER BY prefix",
+        [pipeline, *prefixes],
+    )
+    assert len(rows) == 2, rows
+    assert [row[0] for row in rows] == prefixes, rows
+    assert rows[0][1] == b"" and rows[0][2] is False, rows
+    assert rows[1][1] == b"p72-transactional" and rows[1][2] is True, rows
+    assert box.duck_query(
+        "SELECT count(*) FROM cdc_raw.cdcflight_app_customers WHERE name = ?",
+        [case["data_name"]],
+    ) == [(1,)]
+    ledger = box.duck_query(
+        "SELECT count(*), count(DISTINCT event_id) FROM _cdc_flight.event_ledger "
+        "WHERE pipeline = ? AND target_table = 'cdc_raw.cdcflight_logical_messages' "
+        "AND event_id IN (SELECT message_id FROM cdc_raw.cdcflight_logical_messages "
+        "WHERE pipeline = ? AND prefix IN (?, ?))",
+        [pipeline, pipeline, *prefixes],
+    )
+    assert ledger == [(2, 2)], ledger
+    audit = box.duck_query(
+        "SELECT prefix, status, byte_length FROM _cdc_flight.logical_message_audit "
+        "WHERE pipeline = ? AND prefix IN (?, ?) ORDER BY prefix",
+        [pipeline, *prefixes],
+    )
+    assert audit == [
+        (prefixes[0], "delivered", 0),
+        (prefixes[1], "delivered", len(b"p72-transactional")),
+    ]
+
+    durable = int(
+        box.duck_query(
+            "SELECT last_lsn FROM _cdc_flight.debezium_offsets "
+            "WHERE pipeline = ? AND namespace = 'cdc-flight-engine'",
+            [pipeline],
+        )[0][0]
+    )
+    slot = box.pg_query(_SLOT_SQL, (box.slot,))[0][0]
+    assert slot is not None and int(slot) <= durable, {"slot": slot, "durable": durable}
+    assert not (box.state_dir / ".offsets.replay.intent").exists()
+    assert not (box.state_dir / ".offsets.replay.dat").exists()
+
+
+@pytest.mark.parametrize(
+    "cut",
+    [
+        "after_prepare",
+        "file_exists_before_first_md_commit",
+        "mid_replay_before_first_md_commit",
+        "after_md_commit_before_install",
+        "during_copy_before_fsync",
+        "at_os_replace",
+        "after_install_before_clear",
+    ],
+)
+def test_replay_intent_survives_real_process_death_at_every_interleaving(
+    tmp_path, postgres_cluster, cut
+):
+    """Kill real children at each replay edge and prove the next run self-heals."""
+    box = Sandbox(f"p72_replay_{cut}", tmp_path / cut, postgres_cluster)
+    try:
+        box.reseed()
+        case = _prime_replay_marker(box)
+        box.clear_fired_fault()
+        matrix_state = "p72_replay_matrix.json"
+        matrix_cut = {
+            "after_prepare": "source_replay_after_prepare",
+            "file_exists_before_first_md_commit": (
+                "source_replay_file_exists_before_first_md_commit"
+            ),
+            "mid_replay_before_first_md_commit": (
+                "source_replay_mid_replay_before_first_md_commit"
+            ),
+            "after_md_commit_before_install": (
+                "source_replay_after_md_commit_before_install"
+            ),
+            "during_copy_before_fsync": "source_replay_during_copy_before_fsync",
+            # The cut fires immediately before the atomic syscall. The old-or-new
+            # proof is therefore exercised at the replace boundary itself; this
+            # instance leaves the old complete canonical file for the retry.
+            "at_os_replace": "source_replay_at_os_replace",
+            "after_install_before_clear": "source_replay_after_install_before_clear",
+        }.get(cut)
+        fault_env = {
+            "CDC_COMPLETION_WATERMARK": "0",
+            "CDC_CRASH_MATRIX_STATE": matrix_state,
+        }
+        fault_env["CDC_CRASH_MATRIX_CUT"] = matrix_cut
+
+        if cut == "file_exists_before_first_md_commit":
+            # First make a complete replay file, then die before its successor
+            # prepares the next disposable path. No commit is made by that successor.
+            first = box.run(
+                max_seconds=180,
+                idle_seconds=8,
+                timeout=300,
+                expect_success=False,
+                matrix_arm=True,
+                extra_env={
+                    "CDC_COMPLETION_WATERMARK": "0",
+                    "CDC_CRASH_MATRIX_CUT": (
+                        "source_replay_after_md_commit_before_install"
+                    ),
+                    "CDC_CRASH_MATRIX_STATE": matrix_state,
+                },
+            )
+            assert first["returncode"] == 137, first
+            assert box.fired_fault()["point"] == "source_replay_after_md_commit_before_install"
+            replay_path = box.state_dir / ".offsets.replay.dat"
+            assert replay_path.exists() and replay_path.stat().st_size > 0
+            box.clear_fired_fault()
+
+        killed = box.run(
+            max_seconds=180,
+            idle_seconds=8,
+            timeout=300,
+            expect_success=False,
+            matrix_arm=True,
+            extra_env=fault_env,
+        )
+        assert killed["returncode"] == 137, killed
+        fired = box.fired_fault()
+        expected_point = matrix_cut or "begin"
+        assert fired and fired["point"] == expected_point, fired
+        state_path = box.state_dir / matrix_state
+        assert state_path.exists(), f"no durable kill witness for {cut}"
+        kill_state = json.loads(state_path.read_text())
+        resume_lsn = kill_state.get("context", {}).get("source_replay_resume_lsn")
+        assert resume_lsn is not None, kill_state
+
+        recovered = box.run(
+            max_seconds=180,
+            idle_seconds=8,
+            timeout=300,
+            extra_env={"CDC_COMPLETION_WATERMARK": "0"},
+        )
+        assert recovered["returncode"] == 0, recovered
+        _assert_replay_survivor(box, case)
+        if cut == "after_install_before_clear":
+            assert recovered.get("source_replay_intent_cleared_on_start") is True, recovered
+            assert recovered.get("source_replay_from_slot") is None, recovered
+            assert recovered.get("reconciliation") == "resume", recovered
+            recovered_resume_lsn = recovered.get("invariant_o_start", {}).get(
+                "durable_lsn"
+            )
+        else:
+            assert recovered.get("source_replay_from_slot") is True, recovered
+            recovered_resume_lsn = recovered.get("source_replay_resume_lsn")
+        assert (
+            isinstance(recovered_resume_lsn, int)
+            and recovered_resume_lsn >= resume_lsn
+        ), recovered
+        (box.state_dir / "p72_replay_recovered.json").write_text(
+            json.dumps(
+                {
+                    "cut": cut,
+                    "fired": fired,
+                    "kill_resume_lsn": resume_lsn,
+                    "recovered_resume_lsn": recovered_resume_lsn,
+                    "source_replay_from_slot": recovered.get("source_replay_from_slot"),
+                    "source_replay_intent_cleared_on_start": recovered.get(
+                        "source_replay_intent_cleared_on_start"
+                    ),
+                    "logical_message_rows": 2,
+                    "ledger_rows": 2,
+                    "customer_rows": 1,
+                    "invariant_o_end": recovered.get("invariant_o_end"),
+                },
+                sort_keys=True,
+            )
+        )
+    finally:
+        box.cleanup()
+        box.reseed()

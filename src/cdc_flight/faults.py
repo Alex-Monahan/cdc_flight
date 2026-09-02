@@ -282,6 +282,7 @@ ALL_POINTS = POINTS + DESTINATION_POINTS + RECOVERY_POINTS + SOURCE_POINTS
 MATRIX_POINTS = (
     "source_replay_after_prepare",
     "source_replay_file_exists_before_first_md_commit",
+    "source_replay_mid_replay_before_first_md_commit",
     "source_replay_during_copy_before_fsync",
     "source_replay_at_os_replace",
     "source_replay_after_os_replace",

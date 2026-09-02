@@ -232,6 +232,34 @@ def test_installing_intent_self_heals_after_atomic_install(tmp_path):
     assert offsets.read_replay_intent(intent_path) is None
 
 
+def test_installing_intent_rebinds_to_a_new_validated_retry_file(tmp_path):
+    point = _durable_point()
+    intent_path = offsets.replay_intent_path(tmp_path)
+    intent = offsets.arm_replay_intent(
+        intent_path,
+        pipeline="pipeline",
+        namespace=NAMESPACE,
+        durable_point=point,
+    )
+    first = offsets.mark_replay_installing(
+        intent_path,
+        intent,
+        source_size=10,
+        source_sha256="a" * 64,
+    )
+
+    second = offsets.mark_replay_installing(
+        intent_path,
+        first,
+        source_size=11,
+        source_sha256="b" * 64,
+    )
+
+    assert second.source_size == 11
+    assert second.source_sha256 == "b" * 64
+    assert offsets.read_replay_intent(intent_path) == second
+
+
 def test_replay_install_missing_or_empty_source_fails_closed(tmp_path):
     with pytest.raises(OffsetUnusable, match="usable replay offset"):
         offsets.install_replay_offset(

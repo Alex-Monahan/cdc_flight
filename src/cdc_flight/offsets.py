@@ -267,12 +267,15 @@ def mark_replay_installing(
         source_sha256=source_sha256,
     )
     if intent.phase == REPLAY_INTENT_INSTALLING:
-        if (
-            intent.source_size != source_size
-            or intent.source_sha256 != source_sha256
-        ):
-            raise OffsetUnusable("replay installation fingerprint changed after it was armed")
-        return intent
+        if intent.source_size == source_size and intent.source_sha256 == source_sha256:
+            return intent
+        # The previous installing attempt did not publish the canonical file.  A
+        # restarted stock engine is allowed to flush a byte-different, but still
+        # validated, representation of the same durable replay result (for example
+        # after a heartbeat advanced the disposable store).  Rebind the marker to
+        # that new complete source before attempting the next atomic install.
+        _atomic_json_write(Path(path), installing.as_dict())
+        return installing
     _atomic_json_write(Path(path), installing.as_dict())
     return installing
 
@@ -420,6 +423,7 @@ def install_replay_offset(
         # This is the real partial-install crash row: the temporary file exists but
         # the canonical path has not been replaced. A restart discards the sibling
         # temp and replays from the still-durable marker.
+        faults.runtime_state(source_replay_copy_temp=True)
         faults.matrix_crash("source_replay_during_copy_before_fsync")
         _fsync(temporary)
         if _file_fingerprint(temporary) != source_fingerprint:
@@ -430,6 +434,7 @@ def install_replay_offset(
         # file survives, or the new complete file does; neither state is torn.
         faults.matrix_crash("source_replay_at_os_replace")
         os.replace(temporary, target_path)
+        faults.runtime_state(source_replay_canonical_installed=True)
         faults.matrix_crash("source_replay_after_os_replace")
         _fsync_dir(target_path.parent)
     finally:

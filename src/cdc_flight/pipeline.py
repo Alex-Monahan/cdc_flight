@@ -563,6 +563,9 @@ def run(
                     # complete canonical file plus an installing marker. It is safe to
                     # discharge that marker now; pending markers are never discharged
                     # merely because the canonical file happens to agree.
+                    offsets.prepare_replay_offset(
+                        offsets.replay_offset_path(replication.state_dir)
+                    )
                     offsets.clear_replay_intent(replay_intent_path)
                     replay_intent = None
                     summary_extra["source_replay_intent_cleared_on_start"] = True
@@ -623,9 +626,18 @@ def run(
         # Debezium starts at the slot's confirmed position; the existing durable
         # transaction fence and message ledger make the replay idempotent.
         if replay_intent is not None:
-            replay_offset_file = offsets.prepare_replay_offset(
-                offsets.replay_offset_path(replication.state_dir)
-            )
+            replay_path = offsets.replay_offset_path(replication.state_dir)
+            if replay_path.exists():
+                # A previous replay process may have flushed the stock file and died
+                # before installing it. This is the restart row in which the file is
+                # already present but this process has not committed any replay data.
+                faults_mod.runtime_state(
+                    source_replay=True,
+                    source_replay_resume_lsn=verdict.context.get("confirmed_flush_lsn"),
+                    source_replay_intent_phase=replay_intent.phase,
+                )
+                faults_mod.matrix_crash("source_replay_file_exists_before_first_md_commit")
+            replay_offset_file = offsets.prepare_replay_offset(replay_path)
             props["offset.storage.file.filename"] = replay_offset_file.as_posix()
             props["snapshot.mode"] = "no_data"
             summary_extra.update(
@@ -638,6 +650,11 @@ def run(
                     ),
                     "source_replay_resume_basis": "slot.confirmed_flush_lsn",
                 }
+            )
+            faults_mod.runtime_state(
+                source_replay=True,
+                source_replay_resume_lsn=verdict.context.get("confirmed_flush_lsn"),
+                source_replay_intent_phase=replay_intent.phase,
             )
             faults_mod.matrix_crash("source_replay_after_prepare")
             log.warning(
@@ -1253,6 +1270,10 @@ def run(
                     source_size=source_fingerprint[0],
                     source_sha256=source_fingerprint[1],
                 )
+                faults_mod.runtime_state(
+                    source_replay_installing=True,
+                    source_replay_source_size=source_fingerprint[0],
+                )
                 durable_after_replay = dest_mod.read_resume_point(
                     con,
                     dest.pipeline_name,
@@ -1276,6 +1297,7 @@ def run(
                 # The marker remains until the canonical install is complete. A hard
                 # death before this line leaves either a pending or installing marker;
                 # a later start can therefore distinguish it from ordinary resume.
+                faults_mod.runtime_state(source_replay_canonical_installed=True)
                 faults_mod.matrix_crash("source_replay_after_install_before_clear")
                 offsets.clear_replay_intent(replay_intent_path)
                 replay_intent = None

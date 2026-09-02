@@ -118,6 +118,16 @@ def commit_group(self, trigger: str) -> CommitResult:
     if not self.group.txn_open:
         self.con.execute("BEGIN TRANSACTION")
         self.group.txn_open = True
+    if (
+        self.data_commit_groups == 0
+        and getattr(self.offset_path, "name", None)
+        == offsets.REPLAY_OFFSET_FILE_NAME
+    ):
+        # This is the first destination transaction opened by a slot replay. It is
+        # deliberately independent of ``has_data``: a logical-message-only group is
+        # still a real MotherDuck transaction, and the cut must cover its pre-COMMIT
+        # state as well as a row-bearing group.
+        matrix_crash("source_replay_mid_replay_before_first_md_commit")
     try:
         self._apply_backfill_notifications()
         # The service path fences the exact lease epoch inside the destination
