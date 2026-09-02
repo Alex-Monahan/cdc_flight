@@ -12,9 +12,14 @@ and values. They need a JVM (JPype) but no Postgres.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+import pytest
+
 from cdc_flight import offsets
+from cdc_flight.destination import ResumePoint
+from cdc_flight.errors import OffsetUnusable
 
 NAMESPACE = "cdc-flight-engine"
 PARTITION = {"server": "cdcflight"}
@@ -135,3 +140,105 @@ def test_the_write_is_atomic(tmp_path):
     offsets.write(path, entries)
     assert not (tmp_path / "offsets.dat.tmp").exists()
     assert offsets.read(path) == entries
+
+
+def _durable_point() -> ResumePoint:
+    return ResumePoint(
+        partition=dict(PARTITION),
+        offset=dict(OFFSET),
+        last_lsn=30105392,
+        commit_id=7,
+    )
+
+
+def test_replay_intent_is_durable_but_is_not_an_offset_record(tmp_path):
+    path = offsets.replay_intent_path(tmp_path)
+    point = _durable_point()
+
+    intent = offsets.arm_replay_intent(
+        path,
+        pipeline="pipeline",
+        namespace=NAMESPACE,
+        durable_point=point,
+    )
+
+    payload = json.loads(path.read_text())
+    assert offsets.read_replay_intent(path) == intent
+    assert payload["phase"] == "pending"
+    assert payload["durable_commit_id"] == point.commit_id
+    assert "offset" not in payload
+    assert "partition" not in payload
+    offsets.validate_replay_intent(
+        intent,
+        pipeline="pipeline",
+        namespace=NAMESPACE,
+        durable_point=point,
+    )
+
+
+def test_pending_intent_wins_even_when_canonical_file_agrees(tmp_path):
+    point = _durable_point()
+    target = tmp_path / "offsets.dat"
+    offsets.write(
+        target,
+        {offsets.encode_key(NAMESPACE, PARTITION): offsets.encode_value(OFFSET)},
+    )
+    intent = offsets.arm_replay_intent(
+        offsets.replay_intent_path(tmp_path),
+        pipeline="pipeline",
+        namespace=NAMESPACE,
+        durable_point=point,
+    )
+
+    assert offsets.replay_install_is_durable(
+        intent, target=target, durable_point=point
+    ) is False
+
+
+def test_installing_intent_self_heals_after_atomic_install(tmp_path):
+    point = _durable_point()
+    intent_path = offsets.replay_intent_path(tmp_path)
+    source = tmp_path / offsets.REPLAY_OFFSET_FILE_NAME
+    target = tmp_path / "offsets.dat"
+    entries = {
+        offsets.encode_key(NAMESPACE, PARTITION): offsets.encode_value(OFFSET)
+    }
+    offsets.write(source, entries)
+    intent = offsets.arm_replay_intent(
+        intent_path,
+        pipeline="pipeline",
+        namespace=NAMESPACE,
+        durable_point=point,
+    )
+    fingerprint = offsets.replay_offset_fingerprint(source)
+    installing = offsets.mark_replay_installing(
+        intent_path,
+        intent,
+        source_size=fingerprint[0],
+        source_sha256=fingerprint[1],
+    )
+    offsets.install_replay_offset(
+        source,
+        target,
+        expected_fingerprint=fingerprint,
+        durable_point=point,
+        namespace=NAMESPACE,
+    )
+
+    assert offsets.replay_install_is_durable(
+        installing, target=target, durable_point=point
+    ) is True
+    offsets.clear_replay_intent(intent_path)
+    assert offsets.read_replay_intent(intent_path) is None
+
+
+def test_replay_install_missing_or_empty_source_fails_closed(tmp_path):
+    with pytest.raises(OffsetUnusable, match="usable replay offset"):
+        offsets.install_replay_offset(
+            tmp_path / offsets.REPLAY_OFFSET_FILE_NAME,
+            tmp_path / "offsets.dat",
+        )
+    empty = tmp_path / offsets.REPLAY_OFFSET_FILE_NAME
+    empty.touch()
+    with pytest.raises(OffsetUnusable, match="usable replay offset"):
+        offsets.install_replay_offset(empty, tmp_path / "offsets.dat")

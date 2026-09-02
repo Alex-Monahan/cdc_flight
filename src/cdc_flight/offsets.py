@@ -25,14 +25,17 @@ same converter. Compact separators reproduce the key exactly.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import faults
 from .assembler import CompleteUnit
 from .destination import ResumePoint, raise_alert, read_offset_blobs
 from .envelope import PendingRecord
@@ -44,6 +47,315 @@ log = logging.getLogger("cdc_flight.offsets")
 
 _SEPARATORS = (",", ":")
 REPLAY_OFFSET_FILE_NAME = ".offsets.replay.dat"
+REPLAY_INTENT_FILE_NAME = ".offsets.replay.intent"
+REPLAY_INTENT_VERSION = 1
+REPLAY_INTENT_KIND = "cdc-flight-replay-intent"
+REPLAY_INTENT_PENDING = "pending"
+REPLAY_INTENT_INSTALLING = "installing"
+REPLAY_INTENT_PHASES = frozenset({REPLAY_INTENT_PENDING, REPLAY_INTENT_INSTALLING})
+
+
+@dataclass(frozen=True)
+class ReplayIntent:
+    """Durable *decision* to replay, deliberately without an offset value.
+
+    The sidecar is not another offset store.  It binds a replay to the destination
+    row that caused it, using that row's commit id and a digest of its resume JSON,
+    but it cannot tell Debezium where to resume.  The source slot and stock
+    Debezium's disposable file remain the only replay-position mechanism.
+    """
+
+    pipeline: str
+    namespace: str
+    durable_commit_id: int
+    durable_resume_digest: str
+    phase: str = REPLAY_INTENT_PENDING
+    source_size: int | None = None
+    source_sha256: str | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "kind": REPLAY_INTENT_KIND,
+            "version": REPLAY_INTENT_VERSION,
+            "pipeline": self.pipeline,
+            "namespace": self.namespace,
+            "durable_commit_id": self.durable_commit_id,
+            "durable_resume_digest": self.durable_resume_digest,
+            "phase": self.phase,
+            "source_size": self.source_size,
+            "source_sha256": self.source_sha256,
+        }
+
+
+def replay_intent_path(state_dir: Path | str) -> Path:
+    """Return the durable replay-decision sidecar inside the state directory."""
+    return Path(state_dir) / REPLAY_INTENT_FILE_NAME
+
+
+def _resume_digest(point: ResumePoint) -> str:
+    """Hash the durable row without placing its offset contents in the sidecar."""
+    return hashlib.sha256(point.to_json().encode("utf-8")).hexdigest()
+
+
+def _atomic_json_write(path: Path, payload: dict[str, object]) -> None:
+    """Publish a small sidecar with the same fsync/rename discipline as offsets.dat."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.unlink(missing_ok=True)
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True, separators=_SEPARATORS)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _fsync_dir(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _intent_from_payload(payload: object, path: Path) -> ReplayIntent:
+    if not isinstance(payload, dict):
+        raise OffsetUnusable(f"replay intent {path} is not a JSON object")
+    if payload.get("kind") != REPLAY_INTENT_KIND or payload.get("version") != REPLAY_INTENT_VERSION:
+        raise OffsetUnusable(f"replay intent {path} has an unknown kind or version")
+    pipeline = payload.get("pipeline")
+    namespace = payload.get("namespace")
+    commit_id = payload.get("durable_commit_id")
+    digest = payload.get("durable_resume_digest")
+    phase = payload.get("phase")
+    source_size = payload.get("source_size")
+    source_sha256 = payload.get("source_sha256")
+    if not isinstance(pipeline, str) or not pipeline:
+        raise OffsetUnusable(f"replay intent {path} has no pipeline identity")
+    if not isinstance(namespace, str) or not namespace:
+        raise OffsetUnusable(f"replay intent {path} has no namespace identity")
+    if isinstance(commit_id, bool) or not isinstance(commit_id, int) or commit_id < 0:
+        raise OffsetUnusable(f"replay intent {path} has an invalid durable commit id")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(char not in "0123456789abcdef" for char in digest)
+    ):
+        raise OffsetUnusable(f"replay intent {path} has an invalid durable-row digest")
+    if phase not in REPLAY_INTENT_PHASES:
+        raise OffsetUnusable(f"replay intent {path} has an invalid phase {phase!r}")
+    if phase == REPLAY_INTENT_PENDING:
+        if source_size is not None or source_sha256 is not None:
+            raise OffsetUnusable(
+                f"pending replay intent {path} must not carry an installed-file fingerprint"
+            )
+    else:
+        if (
+            isinstance(source_size, bool)
+            or not isinstance(source_size, int)
+            or source_size <= 0
+            or not isinstance(source_sha256, str)
+            or len(source_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in source_sha256)
+        ):
+            raise OffsetUnusable(
+                f"installing replay intent {path} has an invalid source fingerprint"
+            )
+    return ReplayIntent(
+        pipeline=pipeline,
+        namespace=namespace,
+        durable_commit_id=commit_id,
+        durable_resume_digest=digest,
+        phase=phase,
+        source_size=source_size,
+        source_sha256=source_sha256,
+    )
+
+
+def read_replay_intent(path: Path | str) -> ReplayIntent | None:
+    """Read the durable decision; malformed state fails closed rather than resuming."""
+    path = Path(path)
+    if not path.exists():
+        return None
+    if path.stat().st_size <= 0:
+        raise OffsetUnusable(f"replay intent {path} is empty")
+    try:
+        with path.open(encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise OffsetUnusable(f"replay intent {path} is unreadable: {exc}") from exc
+    return _intent_from_payload(payload, path)
+
+
+def validate_replay_intent(
+    intent: ReplayIntent,
+    *,
+    pipeline: str,
+    namespace: str,
+    durable_point: ResumePoint | None,
+) -> None:
+    """Bind a marker to the durable row before allowing it to select replay."""
+    if intent.pipeline != pipeline or intent.namespace != namespace:
+        raise OffsetUnusable(
+            "replay intent belongs to a different pipeline/namespace: "
+            f"{intent.pipeline!r}/{intent.namespace!r}"
+        )
+    if durable_point is None or not durable_point.offset:
+        raise OffsetUnusable(
+            "replay intent exists but its durable destination resume row is absent or empty"
+        )
+    if durable_point.commit_id < intent.durable_commit_id:
+        raise OffsetUnusable(
+            "replay intent names a durable commit newer than the destination resume row"
+        )
+    if (
+        durable_point.commit_id == intent.durable_commit_id
+        and _resume_digest(durable_point) != intent.durable_resume_digest
+    ):
+        raise OffsetUnusable(
+            "replay intent does not match the durable destination resume row"
+        )
+
+
+def arm_replay_intent(
+    path: Path | str,
+    *,
+    pipeline: str,
+    namespace: str,
+    durable_point: ResumePoint,
+) -> ReplayIntent:
+    """Durably arm replay before a canonical offset repair is attempted."""
+    if not durable_point.offset:
+        raise OffsetUnusable("cannot arm replay without a typed durable offset map")
+    path = Path(path)
+    existing = read_replay_intent(path)
+    candidate = ReplayIntent(
+        pipeline=pipeline,
+        namespace=namespace,
+        durable_commit_id=durable_point.commit_id,
+        durable_resume_digest=_resume_digest(durable_point),
+    )
+    if existing is not None:
+        validate_replay_intent(
+            existing,
+            pipeline=pipeline,
+            namespace=namespace,
+            durable_point=durable_point,
+        )
+        # An installing marker contains the only evidence that lets a restart
+        # distinguish a completed install from a pre-install crash. Never replace it
+        # with a weaker pending marker.
+        return existing
+    _atomic_json_write(path, candidate.as_dict())
+    return candidate
+
+
+def mark_replay_installing(
+    path: Path | str,
+    intent: ReplayIntent,
+    *,
+    source_size: int,
+    source_sha256: str,
+) -> ReplayIntent:
+    """Record the exact disposable file expected to be atomically installed."""
+    if intent.phase not in REPLAY_INTENT_PHASES:
+        raise OffsetUnusable(f"cannot advance replay intent from phase {intent.phase!r}")
+    if source_size <= 0 or len(source_sha256) != 64:
+        raise OffsetUnusable("cannot arm replay installation without a valid file fingerprint")
+    installing = ReplayIntent(
+        pipeline=intent.pipeline,
+        namespace=intent.namespace,
+        durable_commit_id=intent.durable_commit_id,
+        durable_resume_digest=intent.durable_resume_digest,
+        phase=REPLAY_INTENT_INSTALLING,
+        source_size=source_size,
+        source_sha256=source_sha256,
+    )
+    if intent.phase == REPLAY_INTENT_INSTALLING:
+        if (
+            intent.source_size != source_size
+            or intent.source_sha256 != source_sha256
+        ):
+            raise OffsetUnusable("replay installation fingerprint changed after it was armed")
+        return intent
+    _atomic_json_write(Path(path), installing.as_dict())
+    return installing
+
+
+def clear_replay_intent(path: Path | str) -> None:
+    """Remove the marker only after the canonical replay offset is installed."""
+    path = Path(path)
+    path.unlink(missing_ok=True)
+    _fsync_dir(path.parent)
+
+
+def _file_fingerprint(path: Path) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return path.stat().st_size, digest.hexdigest()
+
+
+def replay_offset_fingerprint(path: Path | str) -> tuple[int, str]:
+    """Validate and fingerprint a stock replay file; absence is a hard failure."""
+    path = Path(path)
+    if not path.exists() or path.stat().st_size <= 0:
+        raise OffsetUnusable(
+            f"stock Debezium did not leave a usable replay offset file at {path}"
+        )
+    entries = read(path)
+    if not entries or len(parse_offsets(entries)) != 1:
+        raise OffsetUnusable(f"stock Debezium produced an unreadable replay offset file {path}")
+    return _file_fingerprint(path)
+
+
+def _offset_file_is_not_ahead(
+    path: Path | str,
+    *,
+    namespace: str,
+    durable_point: ResumePoint,
+) -> bool:
+    """Return true only when a canonical candidate is durable or strictly older."""
+    entries = read(path)
+    if len(entries) != 1 or not durable_point.offset:
+        return False
+    expected_key = encode_key(namespace, durable_point.partition or {})
+    actual_key, actual_value = next(iter(entries.items()))
+    if actual_key != expected_key:
+        return False
+    decoded = parse_offsets({actual_key: actual_value})
+    if not decoded:
+        return False
+    _partition, actual = decoded[0]
+    actual_lsn = lsn_of(actual)
+    durable_lsn = lsn_of(durable_point.offset)
+    if actual_lsn is None or durable_lsn is None:
+        return actual == durable_point.offset
+    if actual_lsn > durable_lsn:
+        return False
+    if actual_lsn == durable_lsn:
+        return actual == durable_point.offset
+    return _offset_map_is_behind(actual, durable_point.offset)
+
+
+def replay_install_is_durable(
+    intent: ReplayIntent,
+    *,
+    target: Path | str,
+    durable_point: ResumePoint,
+) -> bool:
+    """Recognize an already-finished install after a kill before marker clearing."""
+    if intent.phase != REPLAY_INTENT_INSTALLING:
+        return False
+    try:
+        size, digest = replay_offset_fingerprint(target)
+    except OffsetUnusable:
+        return False
+    return (
+        size == intent.source_size
+        and digest == intent.source_sha256
+        and _offset_file_is_not_ahead(
+            target,
+            namespace=intent.namespace,
+            durable_point=durable_point,
+        )
+    )
 
 
 def replay_offset_path(state_dir: Path | str) -> Path:
@@ -66,23 +378,62 @@ def prepare_replay_offset(path: Path | str) -> Path:
     return target
 
 
-def install_replay_offset(source: Path | str, target: Path | str) -> bool:
-    """Atomically install a successfully flushed replay offset, if one exists."""
+def install_replay_offset(
+    source: Path | str,
+    target: Path | str,
+    *,
+    expected_fingerprint: tuple[int, str] | None = None,
+    durable_point: ResumePoint | None = None,
+    namespace: str | None = None,
+) -> bool:
+    """Atomically install a validated replay offset, or fail the run.
+
+    The old ``False`` result made a missing/empty source look like a successful
+    pipeline return.  That is unsafe: the next run then sees the canonical file
+    equal to MotherDuck and can take stock resume.  A replay install is therefore
+    fail-closed and returns ``True`` only for compatibility with existing callers.
+    """
     source_path = Path(source)
-    if not source_path.exists() or source_path.stat().st_size <= 0:
-        return False
-    if not read(source_path):
+    source_fingerprint = replay_offset_fingerprint(source_path)
+    if expected_fingerprint is not None and source_fingerprint != expected_fingerprint:
         raise OffsetUnusable(
-            f"stock Debezium produced an unreadable replay offset file {source_path}"
+            f"replay offset {source_path} changed before installation: "
+            f"expected {expected_fingerprint}, got {source_fingerprint}"
         )
+    if durable_point is not None:
+        if namespace is None:
+            raise ValueError("namespace is required when checking a durable replay point")
+        if not _offset_file_is_not_ahead(
+            source_path, namespace=namespace, durable_point=durable_point
+        ):
+            raise OffsetUnusable(
+                f"replay offset {source_path} is not at or behind durable destination "
+                f"commit {durable_point.commit_id}"
+            )
+
     target_path = Path(target)
     target_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = target_path.with_name(f".{target_path.name}.replay.tmp")
     temporary.unlink(missing_ok=True)
-    shutil.copyfile(source_path, temporary)
-    _fsync(temporary)
-    os.replace(temporary, target_path)
-    _fsync_dir(target_path.parent)
+    try:
+        shutil.copyfile(source_path, temporary)
+        # This is the real partial-install crash row: the temporary file exists but
+        # the canonical path has not been replaced. A restart discards the sibling
+        # temp and replays from the still-durable marker.
+        faults.matrix_crash("source_replay_during_copy_before_fsync")
+        _fsync(temporary)
+        if _file_fingerprint(temporary) != source_fingerprint:
+            raise OffsetUnusable(
+                f"replay offset temporary {temporary} did not match its validated source"
+            )
+        # The cut is immediately at the atomic boundary. Either the old canonical
+        # file survives, or the new complete file does; neither state is torn.
+        faults.matrix_crash("source_replay_at_os_replace")
+        os.replace(temporary, target_path)
+        faults.matrix_crash("source_replay_after_os_replace")
+        _fsync_dir(target_path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
     return True
 
 
@@ -257,6 +608,7 @@ def reconcile(
     offset_path: Path,
     accept_orphan: bool = False,
     repair: bool = True,
+    before_repair: Callable[[ResumePoint, str], None] | None = None,
     dsn: str | None = None,
     slot_name: str | None = None,
 ) -> Reconciliation:
@@ -321,7 +673,10 @@ def reconcile(
     # A destination row exists: it is the truth. Everything below only decides
     # whether the *file* needs repairing so Debezium starts where we say.
     if not file_present:
-        repaired = _repair(con, pipeline, namespace, offset_path, row, repair)
+        repaired = _repair_with_intent(
+            con, pipeline, namespace, offset_path, row, repair,
+            before_repair=before_repair, decision="file_missing_rebuilt",
+        )
         # MINOR-3: do not claim a rebuild that did not happen. With no offset map on
         # the durable row there is nothing to rebuild *from*, and an absent file then
         # silently means "start with no offset", i.e. a full re-snapshot.
@@ -334,7 +689,10 @@ def reconcile(
             else "offsets file is absent and was NOT rebuilt; Debezium starts with no offset",
         )
     if not file_decoded:
-        repaired = _repair(con, pipeline, namespace, offset_path, row, repair)
+        repaired = _repair_with_intent(
+            con, pipeline, namespace, offset_path, row, repair,
+            before_repair=before_repair, decision="file_corrupt_rebuilt",
+        )
         return Reconciliation("file_corrupt_rebuilt", row, None, repaired,
                               "offsets file was unreadable and was rebuilt")
 
@@ -346,17 +704,26 @@ def reconcile(
                 f"offset {row.last_lsn}; the extra offset was never durable"
             ),
         )
-        repaired = _repair(con, pipeline, namespace, offset_path, row, repair)
+        repaired = _repair_with_intent(
+            con, pipeline, namespace, offset_path, row, repair,
+            before_repair=before_repair, decision="file_ahead_rebuilt",
+        )
         return Reconciliation("file_ahead_rebuilt", row, file_lsn, repaired,
                               "offsets file was ahead of the destination")
     if file_lsn is not None and row.last_lsn and file_lsn < row.last_lsn:
-        repaired = _repair(con, pipeline, namespace, offset_path, row, repair)
+        repaired = _repair_with_intent(
+            con, pipeline, namespace, offset_path, row, repair,
+            before_repair=before_repair, decision="file_behind_rebuilt",
+        )
         return Reconciliation("file_behind_rebuilt", row, file_lsn, repaired,
                               "offsets file lagged the destination")
 
     difference = _offset_map_difference(entries, namespace, row)
     if difference is not None:
-        repaired = _repair(con, pipeline, namespace, offset_path, row, repair)
+        repaired = _repair_with_intent(
+            con, pipeline, namespace, offset_path, row, repair,
+            before_repair=before_repair, decision="file_offset_mismatch_rebuilt",
+        )
         return Reconciliation("file_offset_mismatch_rebuilt", row, file_lsn, repaired,
                               f"offsets file disagrees with the destination: {difference}")
     return Reconciliation("resume", row, file_lsn, False, "offsets file agrees")
@@ -400,6 +767,26 @@ def _offset_map_difference(
         ]
         return "; ".join(deltas)
     return None
+
+
+def _repair_with_intent(
+    con,
+    pipeline: str,
+    namespace: str,
+    offset_path: Path,
+    row: ResumePoint,
+    repair: bool,
+    *,
+    before_repair: Callable[[ResumePoint, str], None] | None,
+    decision: str,
+) -> bool:
+    """Arm any caller-owned recovery decision before touching ``offsets.dat``."""
+    if before_repair is not None and row.offset:
+        # This callback is deliberately before _repair, including when repair=False.
+        # A process can die after this decision and before a canonical write, and the
+        # restart must still select the slot-replay path rather than stock resume.
+        before_repair(row, decision)
+    return _repair(con, pipeline, namespace, offset_path, row, repair)
 
 
 def _offset_map_is_behind(actual: dict[str, Any], durable: dict[str, Any]) -> bool:

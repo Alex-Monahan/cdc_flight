@@ -145,6 +145,17 @@ def commit_group(self, trigger: str) -> CommitResult:
         )
         fault_enabled = has_data
         if has_data:
+            if (
+                self.data_commit_groups == 0
+                and getattr(self.offset_path, "name", None)
+                == offsets.REPLAY_OFFSET_FILE_NAME
+                and self.offset_path.exists()
+            ):
+                # The stock connector has created/flushed the disposable store, but
+                # this first replay group has not opened or committed a MotherDuck
+                # transaction yet. A real child death here must leave the durable
+                # replay marker to select the same slot path on restart.
+                matrix_crash("source_replay_file_exists_before_first_md_commit")
             maybe_crash("begin", fault_group)
         if has_incremental:
             maybe_crash("incremental_chunk_before_shadow_write", fault_group)

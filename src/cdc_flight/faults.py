@@ -280,6 +280,13 @@ ALL_POINTS = POINTS + DESTINATION_POINTS + RECOVERY_POINTS + SOURCE_POINTS
 #: state assignments made by a test: each one records the production object after its
 #: durable or lifecycle edge, then hard-exits the child.
 MATRIX_POINTS = (
+    "source_replay_after_prepare",
+    "source_replay_file_exists_before_first_md_commit",
+    "source_replay_during_copy_before_fsync",
+    "source_replay_at_os_replace",
+    "source_replay_after_os_replace",
+    "source_replay_after_md_commit_before_install",
+    "source_replay_after_install_before_clear",
     "ownership_available",
     "ownership_attached",
     "ownership_active",

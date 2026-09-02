@@ -269,6 +269,8 @@ def run(
     #: while the run was still `draining`.
     reported: dict | None = None
     replay_offset_file: Path | None = None
+    replay_intent_path = offsets.replay_intent_path(replication.state_dir)
+    replay_intent: offsets.ReplayIntent | None = None
     try:
         if service_context is not None:
             destination_lease_key = dest.resolve_physical_lease_key(con)
@@ -526,14 +528,83 @@ def run(
             )
             summary_extra["standby_capability_after_acquisition"] = standby.as_dict()
 
+        # A full slot recovery/reset supersedes a source-prefix replay.  The recovery
+        # journal is durable before it removes the old row/file, so clearing this
+        # sidecar here cannot turn that route into stock resume; it prevents an old
+        # replay decision from being applied to the newly created slot instead.
+        if journal is not None:
+            if replay_intent_path.exists():
+                offsets.clear_replay_intent(replay_intent_path)
+                summary_extra["source_replay_intent_superseded"] = "slot_recovery"
+            offsets.prepare_replay_offset(
+                offsets.replay_offset_path(replication.state_dir)
+            )
+        else:
+            replay_intent = offsets.read_replay_intent(replay_intent_path)
+            if replay_intent is not None:
+                durable_point = dest_mod.read_resume_point(
+                    con,
+                    dest.pipeline_name,
+                    namespace,
+                    control_schema=control_schema,
+                )
+                offsets.validate_replay_intent(
+                    replay_intent,
+                    pipeline=dest.pipeline_name,
+                    namespace=namespace,
+                    durable_point=durable_point,
+                )
+                if durable_point is not None and offsets.replay_install_is_durable(
+                    replay_intent,
+                    target=replication.offset_file,
+                    durable_point=durable_point,
+                ):
+                    # A kill after os.replace and before the normal finally left a
+                    # complete canonical file plus an installing marker. It is safe to
+                    # discharge that marker now; pending markers are never discharged
+                    # merely because the canonical file happens to agree.
+                    offsets.clear_replay_intent(replay_intent_path)
+                    replay_intent = None
+                    summary_extra["source_replay_intent_cleared_on_start"] = True
+                else:
+                    summary_extra.update(
+                        {
+                            "source_replay_intent_resumed": True,
+                            "source_replay_intent_phase": replay_intent.phase,
+                        }
+                    )
+
         phases.ensure(PHASE_RECONCILING)
+
+        def arm_replay_before_repair(point, decision: str) -> None:
+            nonlocal replay_intent
+            replay_intent = offsets.arm_replay_intent(
+                replay_intent_path,
+                pipeline=dest.pipeline_name,
+                namespace=namespace,
+                durable_point=point,
+            )
+            summary_extra.update(
+                {
+                    "source_replay_intent_armed": True,
+                    "source_replay_intent_phase": replay_intent.phase,
+                    "source_replay_intent_reason": decision,
+                }
+            )
+
         reconciliation = reconcile_mod.reconcile(
             con,
             pipeline=dest.pipeline_name,
             namespace=namespace,
             offset_path=replication.offset_file,
             accept_orphan=accept_orphan_offsets,
-            repair=applier_cfg.repair_offset_file,
+            # A pending/installing marker owns the restart decision. Do not let
+            # reconciliation rewrite the canonical file and accidentally make a
+            # restart look like an ordinary stock resume.
+            repair=applier_cfg.repair_offset_file and replay_intent is None,
+            before_repair=(
+                None if replay_intent is not None else arm_replay_before_repair
+            ),
             dsn=routes.read_dsn,
             slot_name=replication.slot_name,
         )
@@ -551,7 +622,7 @@ def run(
         # fresh disposable store for this one recovery.  With no prior offset stock
         # Debezium starts at the slot's confirmed position; the existing durable
         # transaction fence and message ledger make the replay idempotent.
-        if reconciliation.decision == "file_behind_rebuilt":
+        if replay_intent is not None:
             replay_offset_file = offsets.prepare_replay_offset(
                 offsets.replay_offset_path(replication.state_dir)
             )
@@ -562,8 +633,13 @@ def run(
                     "source_replay_from_slot": True,
                     "source_replay_offset_file": str(replay_offset_file),
                     "source_replay_reason": "destination_commit_without_offset_ack",
+                    "source_replay_resume_lsn": verdict.context.get(
+                        "confirmed_flush_lsn"
+                    ),
+                    "source_replay_resume_basis": "slot.confirmed_flush_lsn",
                 }
             )
+            faults_mod.matrix_crash("source_replay_after_prepare")
             log.warning(
                 "destination offset outran the connector acknowledgement; replaying "
                 "from the slot's confirmed position with a disposable offset file"
@@ -1165,11 +1241,44 @@ def run(
         try:
             reported = coordinator.run()
             if replay_offset_file is not None:
+                faults_mod.matrix_crash("source_replay_after_md_commit_before_install")
+                source_fingerprint = offsets.replay_offset_fingerprint(replay_offset_file)
+                if replay_intent is None:  # pragma: no cover - guarded above
+                    raise OffsetUnusable(
+                        "source replay completed without a durable replay intent"
+                    )
+                replay_intent = offsets.mark_replay_installing(
+                    replay_intent_path,
+                    replay_intent,
+                    source_size=source_fingerprint[0],
+                    source_sha256=source_fingerprint[1],
+                )
+                durable_after_replay = dest_mod.read_resume_point(
+                    con,
+                    dest.pipeline_name,
+                    namespace,
+                    control_schema=control_schema,
+                )
+                if durable_after_replay is None:
+                    raise OffsetUnusable(
+                        "source replay completed but the durable destination resume row "
+                        "is absent"
+                    )
                 summary_extra["source_replay_offset_installed"] = (
                     offsets.install_replay_offset(
-                        replay_offset_file, replication.offset_file
+                        replay_offset_file,
+                        replication.offset_file,
+                        expected_fingerprint=source_fingerprint,
+                        durable_point=durable_after_replay,
+                        namespace=namespace,
                     )
                 )
+                # The marker remains until the canonical install is complete. A hard
+                # death before this line leaves either a pending or installing marker;
+                # a later start can therefore distinguish it from ordinary resume.
+                faults_mod.matrix_crash("source_replay_after_install_before_clear")
+                offsets.clear_replay_intent(replay_intent_path)
+                replay_intent = None
             run_ok = coordinator.run_ok
             return reported
         except EngineFailure as failure:
