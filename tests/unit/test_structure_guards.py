@@ -18,15 +18,14 @@ import pytest
 _BASELINE_SELECTED = {
     # Re-measured after the §8.1/§8.3 additions. The release invariant is that
     # this number may only move upward as rubric coverage grows.
-    # Four §7.4 contract tests and the §7.2 route-contract/p78 additions are
-    # included in the default lane. The latter add twelve selected tests.
-    "not motherduck and not slow": 2422,
-    # The §7.2 production standby stream adds one slow-lane test.
-    "slow and not motherduck": 249,
+    # The durable replay-intent unit and real-kill coverage are included in the
+    # default/slow lanes; the selected totals are 2439/257 including this guard.
+    "not motherduck and not slow": 2438,
+    "slow and not motherduck": 256,
     # The quiet-holder and stock-walsender retry proofs are MotherDuck-only real
     # process nodes; a local DuckDB file lock cannot exercise cloud takeover while
     # the old process retains its handle.
-    # The §7.2 streamed-replica durability/replay test adds one MD item.
+    # The selected MotherDuck total is 64 including this guard.
     "motherduck": 63,
 }
 
