@@ -125,6 +125,7 @@ class _World:
             captured_tables=TABLES,
             forget_catalog=False,
             slot_receipt=slot_receipt,
+            logical_message_dataset="cdc_raw",
         )
 
     def resume(self, *, crash_before: str | None = None):
@@ -143,6 +144,7 @@ class _World:
             dsn="postgresql://unused",
             drop_slot=self.drop_slot,
             on_phase=_cut,
+            logical_message_dataset=DATASET,
         )
 
     def close(self):
@@ -408,6 +410,7 @@ def test_a_forgotten_catalog_is_part_of_the_same_transaction(world):
         captured_tables=TABLES,
         forget_catalog=True,
         slot_receipt=slot_receipt,
+        logical_message_dataset="cdc_raw",
     )
     remaining = world.con.execute(
         "SELECT count(*) FROM _cdc_flight.source_relations WHERE pipeline = ?",
@@ -534,6 +537,7 @@ def _armed_journal(world, *, decision: str, captured: list[tuple[str, str, str]]
         captured_tables=captured,
         forget_catalog=False,
         slot_receipt=slot_receipt,
+        logical_message_dataset="cdc_raw",
     )
     world.con.execute(
         "UPDATE _cdc_flight.recovery_state SET phase = 'armed' WHERE pipeline = ?",

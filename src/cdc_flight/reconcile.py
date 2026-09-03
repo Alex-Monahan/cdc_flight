@@ -529,6 +529,7 @@ def recover_by_full_resnapshot(
     *,
     pipeline: str,
     namespace: str,
+    logical_message_dataset: str,
     dsn: str,
     slot_name: str,
     offset_path: Path,
@@ -571,6 +572,7 @@ def recover_by_full_resnapshot(
         captured_tables=captured_tables,
         forget_catalog=forget_catalog,
         slot_receipt=slot_receipt,
+        logical_message_dataset=logical_message_dataset,
         context=verdict.as_dict(),
         control_schema=control_schema,
     )
@@ -581,6 +583,7 @@ def recover_by_full_resnapshot(
         record=record,
         dsn=dsn,
         on_phase=on_phase,
+        logical_message_dataset=logical_message_dataset,
         control_schema=control_schema,
     )
 

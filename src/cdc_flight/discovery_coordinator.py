@@ -183,6 +183,7 @@ class LiveDiscoveryCoordinator:
             captured_tables=self.capture_tables,
             forget_catalog=False,
             slot_receipt=slot_receipt,
+            logical_message_dataset=self.destination.dataset_name,
             state_dir=self.replication.state_dir,
             severity="critical",
             context={

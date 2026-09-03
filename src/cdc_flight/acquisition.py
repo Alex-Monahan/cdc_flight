@@ -122,6 +122,7 @@ def resume_any_journalled_recovery(
         # slot is physically local, so its owner is the standby—not the primary
         # source-write route.
         dsn=routes.slot_owner_dsn,
+        logical_message_dataset=dest.dataset_name,
         control_schema=dest.control_schema,
     )
     return record, result
@@ -270,6 +271,7 @@ def check_the_slot(
             con,
             pipeline=dest.pipeline_name,
             namespace=namespace,
+            logical_message_dataset=dest.dataset_name,
             # The recovery journal owns slot deletion.  Route that operation to
             # the physical local-slot owner; source writes and slot ownership are
             # deliberately different concepts in standby mode.
@@ -364,6 +366,7 @@ def journal_the_reset(
         slot_name=replication.slot_name,
         offset_path=replication.offset_file,
         captured_tables=captured,
+        logical_message_dataset=dest.dataset_name,
         # A reset re-reads the source from scratch, so the recorded oids are about to be
         # meaningless; keeping them makes the catalog watcher call every table
         # dropped-and-recreated, which the mass-drop breaker then refuses.
@@ -381,6 +384,7 @@ def journal_the_reset(
         # --reset-state administers the local logical slot.  It must follow the
         # slot-owner route even though catalog/marker writes use the primary.
         dsn=routes.slot_owner_dsn,
+        logical_message_dataset=dest.dataset_name,
         control_schema=dest.control_schema,
     )
     log.info("--reset-state is journalled and armed: %s", result)

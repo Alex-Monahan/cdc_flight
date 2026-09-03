@@ -18,12 +18,35 @@ from typing import Any
 
 from . import apply_sql
 from .config import resolve_control_schema
-from .errors import DestinationIdentityCollision
+from .errors import DestinationIdentityCollision, LogicalMessageObligationUnresolved
 from .naming import control_table, quote
 
 LOGICAL_MESSAGE_TABLE = "cdcflight_logical_messages"
 LOGICAL_MESSAGE_HEARTBEAT_PREFIX = "cdc_flight_heartbeat"
 DEFAULT_APPLICATION_PREFIX_ALLOWLIST = ("app_.*",)
+
+
+@dataclass(frozen=True)
+class MessageDeliveryState:
+    """The durable message certificate used by acquisition recovery.
+
+    A local replay sidecar can be lost with a state directory or superseded by a
+    newly-created source slot.  The message claim, consumer row, and audit row live
+    in MotherDuck instead, so recovery derives this state from the destination every
+    time.  ``certified_message_ids`` are complete atomic deliveries; ``obligations``
+    are split or inconsistent certificates that must stop a destructive recovery.
+    """
+
+    certified_message_ids: tuple[str, ...] = ()
+    obligations: tuple[dict[str, Any], ...] = ()
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "certified_message_ids": list(self.certified_message_ids),
+            "certified_count": len(self.certified_message_ids),
+            "obligations": [dict(item) for item in self.obligations],
+            "obligation_count": len(self.obligations),
+        }
 
 
 def normalize_prefix_allowlist(patterns: str | Iterable[str]) -> tuple[str, ...]:
@@ -305,6 +328,228 @@ def write_audit_rows(con, *, control_schema: str, rows: list[dict[str, Any]]) ->
     )
 
 
+def read_delivery_state(
+    con,
+    *,
+    dataset: str,
+    pipeline: str,
+    control_schema: str | None = None,
+) -> MessageDeliveryState:
+    """Derive message obligations from the durable ledger/consumer certificate.
+
+    The three rows are one logical delivery certificate: the application consumer
+    row, its non-internal ``event_ledger`` claim, and the matching audit row.  The
+    query deliberately uses a full join, so a claim without a consumer row and a
+    consumer row without a claim are both visible.  A full recovery may preserve a
+    complete certificate, but it must stop before removing source/replay evidence
+    when the certificate is split.
+
+    Internal Flight messages are excluded from the application certificate.  They
+    intentionally have a ledger/audit pair but no public consumer row.
+    """
+    control = resolve_control_schema(control_schema)
+    message_target = target_table(dataset)
+    consumer_exists = con.execute(
+        "SELECT 1 FROM information_schema.tables "
+        "WHERE table_schema = ? AND table_name = ?",
+        [dataset, LOGICAL_MESSAGE_TABLE],
+    ).fetchone()
+    if consumer_exists:
+        consumer_source = f"""
+            SELECT message_id, prefix, is_transactional, source_cluster_id,
+                   source_timeline, source_lsn, source_sequence, txn_id,
+                   total_order, commit_lsn, destination_commit_id,
+                   delivery_state
+            FROM {qualified_table(dataset)}
+            WHERE pipeline = ?
+        """
+        consumer_params: list[Any] = [pipeline]
+    else:
+        # Destination setup creates this relation in production, but keeping the
+        # derived query total makes it safe for a first recovery on an older database.
+        consumer_source = """
+            SELECT CAST(NULL AS VARCHAR) AS message_id,
+                   CAST(NULL AS VARCHAR) AS prefix,
+                   CAST(NULL AS BOOLEAN) AS is_transactional,
+                   CAST(NULL AS VARCHAR) AS source_cluster_id,
+                   CAST(NULL AS BIGINT) AS source_timeline,
+                   CAST(NULL AS BIGINT) AS source_lsn,
+                   CAST(NULL AS VARCHAR) AS source_sequence,
+                   CAST(NULL AS VARCHAR) AS txn_id,
+                   CAST(NULL AS BIGINT) AS total_order,
+                   CAST(NULL AS BIGINT) AS commit_lsn,
+                   CAST(NULL AS BIGINT) AS destination_commit_id,
+                   CAST(NULL AS VARCHAR) AS delivery_state
+            WHERE FALSE
+        """
+        consumer_params = []
+
+    query = f"""
+        WITH claims AS (
+            SELECT event_id, state, source_cluster_id, source_timeline,
+                   source_lsn, txn_id, total_order, commit_lsn
+            FROM {control_table(control, 'event_ledger')}
+            WHERE pipeline = ?
+              AND target_table = ?
+              AND state <> 'internal'
+        ), consumers AS (
+            {consumer_source}
+        ), audits AS (
+            SELECT message_id, prefix, is_transactional, source_cluster_id,
+                   source_timeline, source_lsn, source_sequence, txn_id,
+                   total_order, commit_lsn, destination_commit_id, status
+            FROM {control_table(control, 'logical_message_audit')}
+            WHERE pipeline = ?
+              AND target_table = ?
+              AND status <> 'internal'
+        ), joined AS (
+            SELECT
+                coalesce(claims.event_id, consumers.message_id, audits.message_id)
+                    AS message_id,
+                claims.event_id IS NOT NULL AS has_ledger,
+                consumers.message_id IS NOT NULL AS has_consumer,
+                audits.message_id IS NOT NULL AS has_audit,
+                claims.state AS ledger_state,
+                consumers.delivery_state,
+                audits.status AS audit_status,
+                consumers.prefix AS consumer_prefix,
+                audits.prefix AS audit_prefix,
+                consumers.is_transactional AS consumer_transactional,
+                audits.is_transactional AS audit_transactional,
+                claims.source_cluster_id AS ledger_cluster,
+                consumers.source_cluster_id AS consumer_cluster,
+                audits.source_cluster_id AS audit_cluster,
+                claims.source_timeline AS ledger_timeline,
+                consumers.source_timeline AS consumer_timeline,
+                audits.source_timeline AS audit_timeline,
+                claims.source_lsn AS ledger_lsn,
+                consumers.source_lsn AS consumer_lsn,
+                audits.source_lsn AS audit_lsn,
+                claims.txn_id AS ledger_txn_id,
+                consumers.txn_id AS consumer_txn_id,
+                audits.txn_id AS audit_txn_id,
+                claims.total_order AS ledger_total_order,
+                consumers.total_order AS consumer_total_order,
+                audits.total_order AS audit_total_order,
+                claims.commit_lsn AS ledger_commit_lsn,
+                consumers.commit_lsn AS consumer_commit_lsn,
+                audits.commit_lsn AS audit_commit_lsn,
+                consumers.destination_commit_id AS consumer_commit_id,
+                audits.destination_commit_id AS audit_commit_id
+            FROM claims
+            FULL OUTER JOIN consumers
+              ON claims.event_id = consumers.message_id
+            FULL OUTER JOIN audits
+              ON coalesce(claims.event_id, consumers.message_id) = audits.message_id
+        )
+        SELECT *,
+            (
+                has_ledger
+                AND has_consumer
+                AND has_audit
+                AND ledger_state IN ('applied', 'replayed')
+                AND delivery_state IN ('delivered', 'replayed')
+                AND audit_status IN ('delivered', 'replayed')
+                AND consumer_prefix IS NOT DISTINCT FROM audit_prefix
+                AND consumer_transactional IS NOT DISTINCT FROM audit_transactional
+                AND ledger_cluster IS NOT DISTINCT FROM consumer_cluster
+                AND consumer_cluster IS NOT DISTINCT FROM audit_cluster
+                AND ledger_timeline IS NOT DISTINCT FROM consumer_timeline
+                AND consumer_timeline IS NOT DISTINCT FROM audit_timeline
+                AND ledger_lsn IS NOT DISTINCT FROM consumer_lsn
+                AND consumer_lsn IS NOT DISTINCT FROM audit_lsn
+                AND ledger_txn_id IS NOT DISTINCT FROM consumer_txn_id
+                AND consumer_txn_id IS NOT DISTINCT FROM audit_txn_id
+                AND ledger_total_order IS NOT DISTINCT FROM consumer_total_order
+                AND consumer_total_order IS NOT DISTINCT FROM audit_total_order
+                AND ledger_commit_lsn IS NOT DISTINCT FROM consumer_commit_lsn
+                AND consumer_commit_lsn IS NOT DISTINCT FROM audit_commit_lsn
+                AND consumer_commit_id IS NOT DISTINCT FROM audit_commit_id
+            ) AS certified
+        FROM joined
+        ORDER BY message_id
+    """
+    rows = con.execute(
+        query,
+        [pipeline, message_target, *consumer_params, pipeline, message_target],
+    ).fetchall()
+    certified: list[str] = []
+    obligations: list[dict[str, Any]] = []
+    for row in rows:
+        values = dict(zip(
+            (
+                "message_id", "has_ledger", "has_consumer", "has_audit",
+                "ledger_state", "delivery_state", "audit_status",
+                "consumer_prefix", "audit_prefix", "consumer_transactional",
+                "audit_transactional", "ledger_cluster", "consumer_cluster",
+                "audit_cluster", "ledger_timeline", "consumer_timeline",
+                "audit_timeline", "ledger_lsn", "consumer_lsn", "audit_lsn",
+                "ledger_txn_id", "consumer_txn_id", "audit_txn_id",
+                "ledger_total_order", "consumer_total_order", "audit_total_order",
+                "ledger_commit_lsn", "consumer_commit_lsn", "audit_commit_lsn",
+                "consumer_commit_id", "audit_commit_id", "certified",
+            ),
+            row,
+            strict=True,
+        ))
+        message_id = str(values["message_id"])
+        if values["certified"]:
+            certified.append(message_id)
+            continue
+        issues: list[str] = []
+        if not values["has_ledger"]:
+            issues.append("consumer_or_audit_without_ledger")
+        if not values["has_consumer"]:
+            issues.append("ledger_or_audit_without_consumer")
+        if not values["has_audit"]:
+            issues.append("ledger_or_consumer_without_audit")
+        if values["has_ledger"] and values["ledger_state"] not in {"applied", "replayed"}:
+            issues.append("ledger_not_applied")
+        if values["has_consumer"] and values["delivery_state"] not in {"delivered", "replayed"}:
+            issues.append("consumer_not_delivered")
+        if values["has_audit"] and values["audit_status"] not in {"delivered", "replayed"}:
+            issues.append("audit_not_delivered")
+        if not issues:
+            issues.append("certificate_identity_mismatch")
+        obligations.append(
+            {
+                "message_id": message_id,
+                "issues": issues,
+                "has_ledger": bool(values["has_ledger"]),
+                "has_consumer": bool(values["has_consumer"]),
+                "has_audit": bool(values["has_audit"]),
+            }
+        )
+    return MessageDeliveryState(tuple(certified), tuple(obligations))
+
+
+def require_recovery_message_certificate(
+    con,
+    *,
+    dataset: str,
+    pipeline: str,
+    control_schema: str | None = None,
+) -> MessageDeliveryState:
+    """Refuse a full recovery when a durable message certificate is split."""
+    state = read_delivery_state(
+        con,
+        dataset=dataset,
+        pipeline=pipeline,
+        control_schema=control_schema,
+    )
+    if state.obligations:
+        details = "; ".join(
+            f"{item['message_id']}: {','.join(item['issues'])}"
+            for item in state.obligations
+        )
+        raise LogicalMessageObligationUnresolved(
+            "full source recovery refused: durable logical-message delivery "
+            f"certificate is incomplete ({details})",
+            obligations=state.obligations,
+        )
+    return state
+
+
 def read_logical_messages(
     con, *, dataset: str = "cdc_raw", pipeline: str | None = None,
     prefix: str | None = None,
@@ -342,6 +587,7 @@ __all__ = [
     "DEFAULT_APPLICATION_PREFIX_ALLOWLIST",
     "LOGICAL_MESSAGE_HEARTBEAT_PREFIX",
     "LOGICAL_MESSAGE_TABLE",
+    "MessageDeliveryState",
     "MessagePrefixPolicy",
     "assert_row_matches",
     "ensure_table",
@@ -349,8 +595,10 @@ __all__ = [
     "message_prefix_include_list",
     "normalize_prefix_allowlist",
     "qualified_table",
+    "read_delivery_state",
     "read_logical_messages",
     "read_row",
+    "require_recovery_message_certificate",
     "target_table",
     "write_audit_rows",
 ]

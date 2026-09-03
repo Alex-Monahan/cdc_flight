@@ -70,6 +70,7 @@ def main(argv: list[str]) -> int:
                 captured_tables=TABLES,
                 forget_catalog=False,
                 slot_receipt=slot_receipt,
+                logical_message_dataset="cdc_raw",
             )
         elif step == "baseline":
             # rubric 1.9's catalog-baseline machine has two crash cuts of its own, and
@@ -96,6 +97,7 @@ def main(argv: list[str]) -> int:
                 record=record,
                 dsn="postgresql://unused",
                 drop_slot=drop_slot,
+                logical_message_dataset="cdc_raw",
             )
     finally:
         con.close()

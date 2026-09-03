@@ -288,6 +288,7 @@ MATRIX_POINTS = (
     "source_replay_after_os_replace",
     "source_replay_after_md_commit_before_install",
     "source_replay_after_install_before_clear",
+    "source_replay_after_intent_clear_before_cleanup",
     "ownership_available",
     "ownership_attached",
     "ownership_active",

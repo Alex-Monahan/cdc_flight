@@ -18,7 +18,7 @@ from support.applier_lab import begin as lab_begin
 from support.applier_lab import end as lab_end
 from support.applier_lab import keyed as lab_keyed
 
-from cdc_flight import event_ledger
+from cdc_flight import event_ledger, offsets, reconcile, recovery
 from cdc_flight.assembler import (
     UNIT_MESSAGE,
     UNIT_TXN,
@@ -27,7 +27,7 @@ from cdc_flight.assembler import (
 )
 from cdc_flight.commit_protocol import _unit_has_delivery_data
 from cdc_flight.control_schema import ensure_control_schema
-from cdc_flight.destination import ensure_dataset
+from cdc_flight.destination import ResumePoint, ensure_dataset, write_slot_state
 from cdc_flight.envelope import (
     KIND_DATA,
     KIND_MESSAGE,
@@ -39,6 +39,7 @@ from cdc_flight.envelope import (
 from cdc_flight.errors import (
     DestinationIdentityCollision,
     EnvelopeDecodeError,
+    LogicalMessageObligationUnresolved,
     SchemaEvolutionRefused,
     TransactionAssemblyError,
 )
@@ -46,7 +47,9 @@ from cdc_flight.logical_messages import (
     LOGICAL_MESSAGE_HEARTBEAT_PREFIX,
     MessagePrefixPolicy,
     message_prefix_include_list,
+    read_delivery_state,
     read_logical_messages,
+    require_recovery_message_certificate,
 )
 from cdc_flight.planner import GroupPlan
 from cdc_flight.policy import AcknowledgementHandle
@@ -407,6 +410,174 @@ def test_consumer_materialization_is_exact_and_replay_is_a_noop_with_collision_g
                 _apply_message_plan(con, [collision], 3)
             finally:
                 con.execute("ROLLBACK")
+    finally:
+        con.close()
+
+
+def _durable_message_certificate(*, lsn: int) -> tuple[duckdb.DuckDBPyConnection, str]:
+    con = _plan_connection()
+    message = _message(None, None, lsn, b"certificate", transactional=False)
+    _apply_message_plan(con, [message], lsn)
+    message_id = con.execute(
+        "SELECT event_id FROM _cdc_flight.event_ledger "
+        "WHERE pipeline = ? AND target_table = ?",
+        [PIPELINE, f"{DATASET}.cdcflight_logical_messages"],
+    ).fetchone()[0]
+    return con, str(message_id)
+
+
+def test_recovery_certificate_sees_both_ledger_consumer_boundaries():
+    """A split durable certificate is an obligation, not a successful delivery."""
+    ledger_only, ledger_only_id = _durable_message_certificate(lsn=250)
+    consumer_only, consumer_only_id = _durable_message_certificate(lsn=251)
+    try:
+        complete = read_delivery_state(
+            ledger_only, dataset=DATASET, pipeline=PIPELINE
+        )
+        assert complete.certified_message_ids == (ledger_only_id,)
+        assert complete.obligations == ()
+
+        ledger_only.execute(
+            f"DELETE FROM {DATASET}.cdcflight_logical_messages "
+            "WHERE pipeline = ? AND message_id = ?",
+            [PIPELINE, ledger_only_id],
+        )
+        state = read_delivery_state(
+            ledger_only, dataset=DATASET, pipeline=PIPELINE
+        )
+        assert state.certified_message_ids == ()
+        assert state.obligations == ({
+            "message_id": ledger_only_id,
+            "issues": ["ledger_or_audit_without_consumer"],
+            "has_ledger": True,
+            "has_consumer": False,
+            "has_audit": True,
+        },)
+        with pytest.raises(LogicalMessageObligationUnresolved):
+            require_recovery_message_certificate(
+                ledger_only, dataset=DATASET, pipeline=PIPELINE
+            )
+
+        consumer_only.execute(
+            "DELETE FROM _cdc_flight.event_ledger "
+            "WHERE pipeline = ? AND target_table = ? AND event_id = ?",
+            [PIPELINE, f"{DATASET}.cdcflight_logical_messages", consumer_only_id],
+        )
+        state = read_delivery_state(
+            consumer_only, dataset=DATASET, pipeline=PIPELINE
+        )
+        assert state.certified_message_ids == ()
+        assert state.obligations == ({
+            "message_id": consumer_only_id,
+            "issues": ["consumer_or_audit_without_ledger"],
+            "has_ledger": False,
+            "has_consumer": True,
+            "has_audit": True,
+        },)
+        with pytest.raises(LogicalMessageObligationUnresolved):
+            require_recovery_message_certificate(
+                consumer_only, dataset=DATASET, pipeline=PIPELINE
+            )
+    finally:
+        ledger_only.close()
+        consumer_only.close()
+
+
+def test_full_recovery_guard_is_before_any_destructive_journal_step(tmp_path):
+    """The mutation target: removing the guard makes this test fail."""
+    con, message_id = _durable_message_certificate(lsn=260)
+    marker = tmp_path / offsets.REPLAY_INTENT_FILE_NAME
+    try:
+        con.execute(
+            f"DELETE FROM {DATASET}.cdcflight_logical_messages "
+            "WHERE pipeline = ? AND message_id = ?",
+            [PIPELINE, message_id],
+        )
+        receipt = write_slot_state(
+            con,
+            pipeline=PIPELINE,
+            slot_name="certificate-slot",
+            observation={},
+            verdict="slot_missing",
+            verdict_message="test split certificate",
+        )
+        offsets.arm_replay_intent(
+            marker,
+            pipeline=PIPELINE,
+            namespace="certificate-ns",
+            durable_point=ResumePoint(
+                partition={"server": "certificate"},
+                offset={"lsn": 260},
+                last_lsn=260,
+                commit_id=1,
+            ),
+        )
+        with pytest.raises(LogicalMessageObligationUnresolved):
+            recovery.begin(
+                con,
+                pipeline=PIPELINE,
+                namespace="certificate-ns",
+                decision="slot_missing",
+                message="slot is missing",
+                slot_name="certificate-slot",
+                offset_path=tmp_path / "offsets.dat",
+                captured_tables=[],
+                forget_catalog=False,
+                slot_receipt=receipt,
+                logical_message_dataset=DATASET,
+            )
+        assert recovery.read(
+            con, pipeline=PIPELINE, namespace="certificate-ns"
+        ) is None
+        assert marker.exists()
+    finally:
+        con.close()
+
+
+FULL_RECOVERY_ROUTES = (*reconcile.RESNAPSHOT_DECISIONS, recovery.RESET_DECISION)
+
+
+@pytest.mark.parametrize("decision", FULL_RECOVERY_ROUTES)
+def test_every_full_recovery_route_uses_the_same_certificate_guard(
+    tmp_path, decision
+):
+    """Route choice cannot create a second way to forget a split certificate."""
+    con, message_id = _durable_message_certificate(lsn=300 + len(decision))
+    try:
+        con.execute(
+            f"DELETE FROM {DATASET}.cdcflight_logical_messages "
+            "WHERE pipeline = ? AND message_id = ?",
+            [PIPELINE, message_id],
+        )
+        receipt = write_slot_state(
+            con,
+            pipeline=PIPELINE,
+            slot_name="route-slot",
+            observation={},
+            verdict="fresh_start" if decision == recovery.RESET_DECISION else decision,
+            verdict_message="split certificate route test",
+        )
+        with pytest.raises(LogicalMessageObligationUnresolved):
+            recovery.begin(
+                con,
+                pipeline=PIPELINE,
+                namespace=f"route-{decision}",
+                decision=decision,
+                message="full recovery route",
+                slot_name="route-slot",
+                offset_path=tmp_path / f"{decision}.offsets.dat",
+                captured_tables=[],
+                forget_catalog=decision in {
+                    "source_identity_changed",
+                    "source_timeline_changed",
+                    "source_lsn_regressed",
+                },
+                slot_receipt=receipt,
+                logical_message_dataset=DATASET,
+            )
+        assert recovery.read(
+            con, pipeline=PIPELINE, namespace=f"route-{decision}"
+        ) is None
     finally:
         con.close()
 

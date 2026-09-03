@@ -456,6 +456,21 @@ class RecoveryFailed(RuntimeError):
     """
 
 
+class LogicalMessageObligationUnresolved(RecoveryFailed):
+    """A logical-message delivery certificate is split across durable relations.
+
+    The event ledger claim and the application consumer row are written in the same
+    MotherDuck transaction.  If either side is absent (or its audit certificate is
+    absent), a full source recovery must not discard the source-replay hint and claim
+    that recovery succeeded.  The durable relations are the authority; a filesystem
+    marker is only a local replay hint.
+    """
+
+    def __init__(self, message: str, *, obligations: tuple[dict, ...] = ()):
+        super().__init__(message)
+        self.obligations = obligations
+
+
 class LeaseLost(RuntimeError):
     """Another runner owns `_cdc_flight.lease` for this pipeline (rubric 4.2)."""
 

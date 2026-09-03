@@ -136,6 +136,40 @@ PHASES = (PHASE_REQUESTED, PHASE_FILE_DELETED, PHASE_ROW_DELETED, PHASE_ARMED)
 FORCED_SNAPSHOT_MODE = "initial"
 
 
+def discharge_replay_intent_for_recovery(
+    con,
+    *,
+    pipeline: str,
+    dataset: str,
+    replay_intent_path: Path,
+    control_schema: str | None = None,
+) -> dict:
+    """Remove a replay hint only after deriving its durable message certificate.
+
+    A full source recovery may make the old source position unusable, but it must
+    not turn that fact into a lost application message.  The sidecar is therefore
+    only a hint: the destination's ledger/consumer/audit certificate is the
+    authority, and this is the recovery-owned operation that removes the hint.  A
+    split certificate raises before the unlink, leaving the journal and hint
+    available for the automatic replay path on the next acquisition.
+    """
+    from . import logical_messages, offsets
+
+    state = logical_messages.require_recovery_message_certificate(
+        con,
+        dataset=dataset,
+        pipeline=pipeline,
+        control_schema=control_schema,
+    )
+    cleared = replay_intent_path.exists()
+    if cleared:
+        offsets.clear_replay_intent(replay_intent_path)
+    return {
+        **state.as_dict(),
+        "replay_intent_cleared": cleared,
+    }
+
+
 #: Rubric 1.7's `<nth>` for the recovery anchors: a recovery normally happens once per
 #: run, so `<nth>` is 1, but a run that arms a *second* recovery after resuming a first
 #: one reaches the same boundary twice and a test must be able to name which.
@@ -394,6 +428,7 @@ def begin(
     captured_tables: list[tuple[str, str, str]],
     forget_catalog: bool,
     slot_receipt: SlotStateReceipt,
+    logical_message_dataset: str,
     context: dict | None = None,
     state_dir: Path | None = None,
     severity: str = "critical",
@@ -456,6 +491,19 @@ def begin(
             "slot_receipt is stale; the recovery must use the current committed "
             "slot observation"
         )
+    # The replay sidecar is only a local hint.  Before this journal can authorize
+    # deleting the old resume point/slot, derive the durable logical-message
+    # certificate from MotherDuck.  A complete ledger + consumer + audit certificate
+    # is carried by the destination unchanged; a split certificate is an unresolved
+    # obligation and stops the recovery before any destructive step.
+    from . import logical_messages
+
+    message_state = logical_messages.require_recovery_message_certificate(
+        con,
+        dataset=logical_message_dataset,
+        pipeline=pipeline,
+        control_schema=control_schema,
+    )
     prejournal_key = _prejournal_occurrence(
         slot_receipt, pipeline=pipeline, slot_name=slot_name
     )
@@ -468,6 +516,9 @@ def begin(
         control_schema=control_schema,
     )
     context["recovery_id"] = record.recovery_id
+    context["logical_message_certificate_count"] = len(
+        message_state.certified_message_ids
+    )
     con.execute("BEGIN TRANSACTION")
     try:
         if decision in RESET_TABLE_DECISIONS:
@@ -621,6 +672,7 @@ def resume(
     dsn: str,
     drop_slot=None,
     on_phase=None,
+    logical_message_dataset: str,
     control_schema: str | None = None,
 ) -> dict:
     """Run the recovery forward from whatever phase the journal records. Idempotent.
@@ -632,15 +684,24 @@ def resume(
     durable effect and before the phase is recorded, which is where the crash-at-every-
     step tests cut. It is not reachable from configuration.
     """
+    from . import logical_messages, offsets
     from . import reconcile as reconcile_mod
 
     drop_slot = drop_slot or reconcile_mod.drop_slot
+    message_state = logical_messages.require_recovery_message_certificate(
+        con,
+        dataset=logical_message_dataset,
+        pipeline=pipeline,
+        control_schema=control_schema,
+    )
     result = {
         "recovery_id": record.recovery_id,
         "decision": record.decision,
         "resumed_from": record.phase,
         "tables_marked": record.tables_marked,
         "message": record.message,
+        "logical_message_certificate": message_state.as_dict(),
+        "replay_intent_cleared": False,
     }
     runtime_state(recovery_phase=record.phase)
     offset_path = Path(record.offset_path) if record.offset_path else None
@@ -659,10 +720,13 @@ def resume(
             # is idempotent: a crash between the two leaves no directory, which the next
             # run's `state_dir.mkdir(parents=True, exist_ok=True)` restores.
             directory = Path(record.state_dir)
+            replay_intent_path = directory / offsets.REPLAY_INTENT_FILE_NAME
+            replay_intent_present = replay_intent_path.exists()
             removed = offset_path is not None and offset_path.exists()
             shutil.rmtree(directory, ignore_errors=True)
             directory.mkdir(parents=True, exist_ok=True)
             result["state_dir"] = "cleared"
+            result["replay_intent_cleared"] = replay_intent_present
         elif offset_path is not None:
             removed = offset_path.exists()
             offset_path.unlink(missing_ok=True)

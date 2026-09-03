@@ -430,6 +430,7 @@ def _assert_replay_survivor(box: Sandbox, case: dict[str, object]) -> None:
         "during_copy_before_fsync",
         "at_os_replace",
         "after_install_before_clear",
+        "after_intent_clear_before_cleanup",
     ],
 )
 def test_replay_intent_survives_real_process_death_at_every_interleaving(
@@ -459,6 +460,9 @@ def test_replay_intent_survives_real_process_death_at_every_interleaving(
             # instance leaves the old complete canonical file for the retry.
             "at_os_replace": "source_replay_at_os_replace",
             "after_install_before_clear": "source_replay_after_install_before_clear",
+            "after_intent_clear_before_cleanup": (
+                "source_replay_after_intent_clear_before_cleanup"
+            ),
         }.get(cut)
         fault_env = {
             "CDC_COMPLETION_WATERMARK": "0",
@@ -515,8 +519,12 @@ def test_replay_intent_survives_real_process_death_at_every_interleaving(
         )
         assert recovered["returncode"] == 0, recovered
         _assert_replay_survivor(box, case)
-        if cut == "after_install_before_clear":
-            assert recovered.get("source_replay_intent_cleared_on_start") is True, recovered
+        if cut in {"after_install_before_clear", "after_intent_clear_before_cleanup"}:
+            if cut == "after_intent_clear_before_cleanup":
+                assert recovered.get("source_replay_orphan_reclaimed") is True, recovered
+                assert recovered.get("source_replay_intent_cleared_on_start") is None, recovered
+            else:
+                assert recovered.get("source_replay_intent_cleared_on_start") is True, recovered
             assert recovered.get("source_replay_from_slot") is None, recovered
             assert recovered.get("reconciliation") == "resume", recovered
             recovered_resume_lsn = recovered.get("invariant_o_start", {}).get(
@@ -548,6 +556,79 @@ def test_replay_intent_survives_real_process_death_at_every_interleaving(
                 sort_keys=True,
             )
         )
+    finally:
+        box.cleanup()
+        box.reseed()
+
+
+@pytest.mark.parametrize("route", ["slot_missing", "operator_reset"])
+def test_full_recovery_preserves_the_pre_ack_message_certificate(
+    tmp_path, postgres_cluster, route
+):
+    """B1 sequence: durable commit, pre-ack death, pending replay, full recovery."""
+    box = Sandbox(f"p72_full_recovery_{route}", tmp_path / route, postgres_cluster)
+    try:
+        box.reseed()
+        case = _prime_replay_marker(box)
+
+        # The first successor durably owns source replay, but dies before it can
+        # consume the slot. This is the pending/installing state that the full
+        # recovery route must derive from MotherDuck rather than forget.
+        pending = box.run(
+            max_seconds=180,
+            idle_seconds=8,
+            timeout=300,
+            expect_success=False,
+            matrix_arm=True,
+            extra_env={
+                "CDC_COMPLETION_WATERMARK": "0",
+                "CDC_CRASH_MATRIX_CUT": "source_replay_after_prepare",
+                "CDC_CRASH_MATRIX_STATE": "p72_full_recovery_matrix.json",
+            },
+        )
+        assert pending["returncode"] == 137, pending
+        assert box.fired_fault()["point"] == "source_replay_after_prepare"
+        assert (box.state_dir / ".offsets.replay.intent").exists()
+
+        if route == "slot_missing":
+            box.drop_slot()
+            recovered = box.run(
+                max_seconds=180,
+                idle_seconds=8,
+                timeout=300,
+                extra_env={"CDC_COMPLETION_WATERMARK": "0"},
+            )
+        else:
+            recovered = box.run(
+                reset_state=True,
+                max_seconds=180,
+                idle_seconds=8,
+                timeout=300,
+                extra_env={"CDC_COMPLETION_WATERMARK": "0"},
+            )
+        assert recovered["returncode"] == 0, recovered
+        _assert_replay_survivor(box, case)
+
+        certificate = recovered.get("logical_message_recovery")
+        assert isinstance(certificate, dict), recovered
+        assert certificate["certified_count"] == 2, recovered
+        assert len(set(certificate["certified_message_ids"])) == 2, recovered
+        assert certificate["obligations"] == []
+        assert certificate["obligation_count"] == 0
+        if route == "slot_missing":
+            assert certificate["replay_intent_cleared"] is True
+            assert recovered.get("source_replay_intent_superseded") == "slot_recovery", recovered
+        else:
+            reset_certificate = recovered.get("reset_state", {}).get(
+                "logical_message_certificate"
+            )
+            assert isinstance(reset_certificate, dict), recovered
+            assert reset_certificate["certified_count"] == 2, recovered
+            assert recovered.get("reset_state", {}).get("replay_intent_cleared") is True, recovered
+        if route == "slot_missing":
+            assert recovered.get("slot_check", {}).get("decision") == "slot_missing", recovered
+        else:
+            assert recovered.get("reset_state", {}).get("decision") == "operator_reset", recovered
     finally:
         box.cleanup()
         box.reseed()

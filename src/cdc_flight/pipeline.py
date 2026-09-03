@@ -533,14 +533,31 @@ def run(
         # sidecar here cannot turn that route into stock resume; it prevents an old
         # replay decision from being applied to the newly created slot instead.
         if journal is not None:
-            if replay_intent_path.exists():
-                offsets.clear_replay_intent(replay_intent_path)
+            summary_extra["logical_message_recovery"] = (
+                recovery_mod.discharge_replay_intent_for_recovery(
+                    con,
+                    pipeline=dest.pipeline_name,
+                    dataset=dest.dataset_name,
+                    replay_intent_path=replay_intent_path,
+                    control_schema=control_schema,
+                )
+            )
+            if summary_extra["logical_message_recovery"]["replay_intent_cleared"]:
                 summary_extra["source_replay_intent_superseded"] = "slot_recovery"
             offsets.prepare_replay_offset(
                 offsets.replay_offset_path(replication.state_dir)
             )
         else:
             replay_intent = offsets.read_replay_intent(replay_intent_path)
+            if replay_intent is None:
+                # A hard kill after the canonical install and marker unlink can
+                # precede the outer cleanup. The source replay file is disposable;
+                # reclaim it on the next start so the probe's post-recovery invariant
+                # describes actual state rather than a stale local artifact.
+                replay_path = offsets.replay_offset_path(replication.state_dir)
+                if replay_path.exists():
+                    offsets.prepare_replay_offset(replay_path)
+                    summary_extra["source_replay_orphan_reclaimed"] = True
             if replay_intent is not None:
                 durable_point = dest_mod.read_resume_point(
                     con,
@@ -706,6 +723,7 @@ def run(
                 captured_tables=captured_tables,
                 forget_catalog=False,
                 slot_receipt=slot_receipt,
+                logical_message_dataset=dest.dataset_name,
                 context={"file_lsn": reconciliation.file_lsn},
                 control_schema=control_schema,
             )
@@ -716,6 +734,7 @@ def run(
                 namespace=namespace,
                 record=journal,
                 dsn=routes.slot_owner_dsn,
+                logical_message_dataset=dest.dataset_name,
                 control_schema=control_schema,
             )
         if (
@@ -1300,6 +1319,9 @@ def run(
                 faults_mod.runtime_state(source_replay_canonical_installed=True)
                 faults_mod.matrix_crash("source_replay_after_install_before_clear")
                 offsets.clear_replay_intent(replay_intent_path)
+                faults_mod.matrix_crash(
+                    "source_replay_after_intent_clear_before_cleanup"
+                )
                 replay_intent = None
             run_ok = coordinator.run_ok
             return reported

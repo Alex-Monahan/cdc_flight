@@ -168,6 +168,7 @@ class _World:
             captured_tables=TABLES,
             forget_catalog=False,
             slot_receipt=slot_receipt,
+            logical_message_dataset="cdc_raw",
         )
 
     def resume(self):
@@ -176,6 +177,7 @@ class _World:
         return recovery_mod.resume(
             self.con, pipeline=PIPELINE, namespace=NAMESPACE, record=record,
             dsn="postgresql://unused", drop_slot=self.drop_slot,
+            logical_message_dataset="cdc_raw",
         )
 
     @property
