@@ -144,7 +144,7 @@ class CatalogDescriptorReader:
                 output_function_schema=fact["output_function_schema"] or None,
                 output_function_name=fact["output_function_name"] or None,
             )
-            building.remove(oid)
+            building.discard(oid)
             self.cache[oid] = descriptor
             return descriptor
 
