@@ -1100,10 +1100,14 @@ def test_slot_drop_primitive_requires_sealed_authorization():
 def test_seven_destructive_witness_forms_are_all_refused(monkeypatch):
     """Runtime reachability cannot bypass the primitive or its guarded SQL edge."""
 
-    def assert_refused(call):
-        with pytest.raises(LogicalMessageObligationUnresolved) as caught:
-            call()
-        return caught.value.obligations[0]["issues"][0]
+    def refusal_outcome(call):
+        try:
+            result = call()
+        except LogicalMessageObligationUnresolved as exc:
+            return exc.obligations[0]["issues"][0]
+        except Exception as exc:  # pragma: no cover - makes mutation output complete
+            return f"unexpected:{type(exc).__name__}"
+        return f"succeeded:{result}"
 
     class FakeResult:
         def __init__(self, rows=()):
@@ -1234,23 +1238,27 @@ except Exception as exc:
     assert child.returncode == 0, child.stderr
 
     refused = {
-        "aliased import": assert_refused(
+        "aliased import": refusal_outcome(
             lambda: aliased("source", "witness", authorization=authorization)
         ),
-        "dynamic getattr": assert_refused(
+        "dynamic getattr": refusal_outcome(
             lambda: dynamic("source", "witness", authorization=authorization)
         ),
-        "registry": assert_refused(
+        "registry": refusal_outcome(
             lambda: registry["drop_slot"]("source", "witness", authorization=authorization)
         ),
-        "adapter": assert_refused(Adapter().drop),
-        "partial/lambda": assert_refused(
+        "adapter": refusal_outcome(Adapter().drop),
+        "partial/lambda": refusal_outcome(
             lambda: functools.partial(
                 reconcile.drop_slot, "source", "witness", authorization=authorization
             )()
         ),
-        "dynamically assembled subprocess": child.stdout.strip().split(":", 1)[-1],
-        "assembled SQL": assert_refused(lambda: guarded.execute(assembled_sql)),
+        "dynamically assembled subprocess": (
+            child.stdout.strip().split(":", 1)[-1]
+            if child.stdout.strip()
+            else f"unexpected_subprocess_exit:{child.returncode}"
+        ),
+        "assembled SQL": refusal_outcome(lambda: guarded.execute(assembled_sql)),
     }
     assert refused == {
         "aliased import": "source_slot_application_message_unobserved",
