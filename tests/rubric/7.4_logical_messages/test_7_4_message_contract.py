@@ -1165,7 +1165,7 @@ def test_seven_destructive_witness_forms_are_all_refused(monkeypatch):
         ),
     )
 
-    aliased = reconcile.drop_slot
+    from cdc_flight.reconcile import drop_slot as aliased
     dynamic = getattr(reconcile, "drop_" + "slot")
     registry = {"drop_slot": reconcile.drop_slot}
 
@@ -1227,7 +1227,9 @@ try:
         "source", "witness", authorization=authorization
     )
 except Exception as exc:
-    print(type(exc).__name__ + ":" + exc.obligations[0]["issues"][0])
+    print(exc.obligations[0]["issues"][0])
+else:
+    print("succeeded:dropped")
 """.strip()
     child = subprocess.run(
         [sys.executable, "-c", script],
@@ -1254,13 +1256,13 @@ except Exception as exc:
             )()
         ),
         "dynamically assembled subprocess": (
-            child.stdout.strip().split(":", 1)[-1]
+            child.stdout.strip()
             if child.stdout.strip()
             else f"unexpected_subprocess_exit:{child.returncode}"
         ),
         "assembled SQL": refusal_outcome(lambda: guarded.execute(assembled_sql)),
     }
-    assert refused == {
+    expected = {
         "aliased import": "source_slot_application_message_unobserved",
         "dynamic getattr": "source_slot_application_message_unobserved",
         "registry": "source_slot_application_message_unobserved",
@@ -1269,6 +1271,7 @@ except Exception as exc:
         "dynamically assembled subprocess": "source_slot_application_message_unobserved",
         "assembled SQL": "raw_slot_drop_sql_bypasses_guard",
     }
+    assert refused == expected, refused
 
 
 @pytest.mark.parametrize("decision", FULL_RECOVERY_ROUTES)
