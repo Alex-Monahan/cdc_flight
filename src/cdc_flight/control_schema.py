@@ -538,6 +538,10 @@ CONTROL_DDL = [
             captured_json     VARCHAR,
             -- `--reset-state` only: the Debezium scratch directory the reset clears.
             state_dir         VARCHAR,
+            -- A source-slot emptiness proof made before the destructive ladder. It
+            -- survives a process death after the slot is dropped, when the source
+            -- can no longer be queried to reconstruct that proof.
+            logical_message_resolution VARCHAR,
             requested_at      TIMESTAMPTZ NOT NULL,
             updated_at        TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (pipeline, namespace)
@@ -745,6 +749,25 @@ def _migrate_event_ledger(con, control_schema: str | None = None) -> None:
             )
 
 
+def _migrate_recovery_state(con, control_schema: str | None = None) -> None:
+    """Add the durable source-proof column to a pre-combination journal."""
+    schema = resolve_control_schema(control_schema)
+    table = quote(schema) + ".recovery_state"
+    existing = {
+        str(row[0])
+        for row in con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = ? AND table_name = 'recovery_state'",
+            [schema],
+        ).fetchall()
+    }
+    if "logical_message_resolution" not in existing:
+        con.execute(
+            f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS "
+            f"{quote('logical_message_resolution')} VARCHAR"
+        )
+
+
 def ensure_control_schema(con, control_schema: str | None = None) -> None:
     """Create the current control schema and apply its additive lease migration."""
     con.execute("BEGIN TRANSACTION")
@@ -755,6 +778,7 @@ def ensure_control_schema(con, control_schema: str | None = None) -> None:
         _migrate_spill_events(con, control_schema)
         _migrate_policy_columns(con, control_schema)
         _migrate_event_ledger(con, control_schema)
+        _migrate_recovery_state(con, control_schema)
         con.execute("COMMIT")
     except BaseException:
         with contextlib.suppress(Exception):

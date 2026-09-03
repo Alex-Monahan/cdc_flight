@@ -15,6 +15,7 @@ import logging
 import os
 
 from . import destination as dest_mod
+from . import offsets
 from . import reconcile as reconcile_mod
 from . import recovery as recovery_mod
 from .config import resolve_control_schema
@@ -124,6 +125,11 @@ def resume_any_journalled_recovery(
         dsn=routes.slot_owner_dsn,
         logical_message_dataset=dest.dataset_name,
         control_schema=dest.control_schema,
+        replay_intent_path=offsets.replay_intent_path(replication.state_dir),
+        source_dsn=routes.slot_owner_dsn,
+        source_slot_name=replication.slot_name,
+        source_publication_name=replication.publication_name,
+        source_application_patterns=replication.message_prefix_allowlist,
     )
     return record, result
 
@@ -283,6 +289,11 @@ def check_the_slot(
             slot_receipt=slot_receipt,
             forget_catalog=verdict.decision in reconcile_mod.FORGET_CATALOG_DECISIONS,
             control_schema=dest.control_schema,
+            replay_intent_path=offsets.replay_intent_path(replication.state_dir),
+            source_dsn=routes.slot_owner_dsn,
+            source_slot_name=replication.slot_name,
+            source_publication_name=replication.publication_name,
+            source_application_patterns=replication.message_prefix_allowlist,
         )
     if observation.observable and recovery is not None:
         # The recovery dropped this slot. Keeping its LSNs as the baseline would make
@@ -375,6 +386,11 @@ def journal_the_reset(
         state_dir=replication.state_dir,
         severity="warning",
         control_schema=dest.control_schema,
+        replay_intent_path=offsets.replay_intent_path(replication.state_dir),
+        source_dsn=routes.slot_owner_dsn,
+        source_slot_name=replication.slot_name,
+        source_publication_name=replication.publication_name,
+        source_application_patterns=replication.message_prefix_allowlist,
     )
     result = recovery_mod.resume(
         con,
@@ -386,6 +402,11 @@ def journal_the_reset(
         dsn=routes.slot_owner_dsn,
         logical_message_dataset=dest.dataset_name,
         control_schema=dest.control_schema,
+        replay_intent_path=offsets.replay_intent_path(replication.state_dir),
+        source_dsn=routes.slot_owner_dsn,
+        source_slot_name=replication.slot_name,
+        source_publication_name=replication.publication_name,
+        source_application_patterns=replication.message_prefix_allowlist,
     )
     log.info("--reset-state is journalled and armed: %s", result)
     return result

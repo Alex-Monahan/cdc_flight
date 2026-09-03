@@ -539,6 +539,11 @@ def recover_by_full_resnapshot(
     forget_catalog: bool = False,
     on_phase=None,
     control_schema: str | None = None,
+    replay_intent_path: Path | None = None,
+    source_dsn: str | None = None,
+    source_slot_name: str | None = None,
+    source_publication_name: str | None = None,
+    source_application_patterns=("app_.*",),
 ) -> dict:
     """Rubric 1.8's automatic recovery: rebuild every captured table from the source.
 
@@ -575,6 +580,11 @@ def recover_by_full_resnapshot(
         logical_message_dataset=logical_message_dataset,
         context=verdict.as_dict(),
         control_schema=control_schema,
+        replay_intent_path=replay_intent_path,
+        source_dsn=source_dsn,
+        source_slot_name=source_slot_name,
+        source_publication_name=source_publication_name,
+        source_application_patterns=source_application_patterns,
     )
     return recovery_mod.resume(
         con,
@@ -585,6 +595,11 @@ def recover_by_full_resnapshot(
         on_phase=on_phase,
         logical_message_dataset=logical_message_dataset,
         control_schema=control_schema,
+        replay_intent_path=replay_intent_path,
+        source_dsn=source_dsn,
+        source_slot_name=source_slot_name,
+        source_publication_name=source_publication_name,
+        source_application_patterns=source_application_patterns,
     )
 
 

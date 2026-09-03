@@ -142,7 +142,13 @@ def discharge_replay_intent_for_recovery(
     pipeline: str,
     dataset: str,
     replay_intent_path: Path,
+    namespace: str | None = None,
     control_schema: str | None = None,
+    source_dsn: str | None = None,
+    source_slot_name: str | None = None,
+    source_publication_name: str | None = None,
+    source_application_patterns=("app_.*",),
+    known_message_state: dict | None = None,
 ) -> dict:
     """Remove a replay hint only after deriving its durable message certificate.
 
@@ -155,11 +161,24 @@ def discharge_replay_intent_for_recovery(
     """
     from . import logical_messages, offsets
 
+    known_source_evidence = (
+        known_message_state.get("source_evidence")
+        if isinstance(known_message_state, dict)
+        else None
+    )
     state = logical_messages.require_recovery_message_certificate(
         con,
         dataset=dataset,
         pipeline=pipeline,
         control_schema=control_schema,
+        replay_intent_path=replay_intent_path,
+        source_dsn=source_dsn,
+        source_slot_name=source_slot_name,
+        source_publication_name=source_publication_name,
+        source_application_patterns=source_application_patterns,
+        known_source_evidence=known_source_evidence,
+        known_message_state=known_message_state,
+        replay_intent_namespace=namespace,
     )
     cleared = replay_intent_path.exists()
     if cleared:
@@ -199,6 +218,9 @@ class RecoveryRecord:
     #: For `--reset-state`: the state directory the reset must clear. `offset_path`
     #: alone is not enough, because "start over" means the whole Debezium scratch area.
     state_dir: str | None = None
+    #: The message certificate/source proof that authorized this recovery. Persisting
+    #: it matters because the slot is intentionally dropped later in the ladder.
+    logical_message_resolution: dict | None = None
 
     def as_dict(self) -> dict:
         return {
@@ -211,6 +233,11 @@ class RecoveryRecord:
             "tables_marked": self.tables_marked,
             "captured": list(self.captured),
             "message": self.message,
+            "logical_message_resolution": (
+                dict(self.logical_message_resolution)
+                if self.logical_message_resolution is not None
+                else None
+            ),
         }
 
 
@@ -242,7 +269,8 @@ def read(
     """The recovery this pipeline is in the middle of, or None."""
     rows = con.execute(
         f"SELECT recovery_id, decision, phase, slot_name, offset_path, snapshot_mode, "
-        f"       forget_catalog, tables_marked, message, captured_json, state_dir "
+        f"       forget_catalog, tables_marked, message, captured_json, state_dir, "
+        f"       logical_message_resolution "
         f"FROM {control_table(resolve_control_schema(control_schema), 'recovery_state')} "
         "WHERE pipeline = ? AND namespace = ?",
         [pipeline, namespace],
@@ -250,7 +278,7 @@ def read(
     if not rows:
         return None
     (rid, decision, phase, slot, path, mode, forget, marked, message,
-     captured_json, state_dir) = rows[0]
+     captured_json, state_dir, logical_message_resolution) = rows[0]
     if str(phase) not in PHASES:
         # `PHASES` was declared and never enforced: `read()` accepted any string and
         # `resume()` then matched none of its branches, fell through every `if`, and
@@ -267,6 +295,20 @@ def read(
     except ValueError:  # pragma: no cover - a corrupted journal column
         log.error("recovery journal captured_json did not decode; treating as empty")
         captured = []
+    try:
+        message_resolution = (
+            json.loads(logical_message_resolution)
+            if logical_message_resolution
+            else None
+        )
+        if not isinstance(message_resolution, dict):
+            message_resolution = None
+    except (TypeError, ValueError):  # pragma: no cover - a corrupted journal column
+        log.error(
+            "recovery journal logical_message_resolution did not decode; "
+            "requiring a fresh source proof"
+        )
+        message_resolution = None
     return RecoveryRecord(
         recovery_id=str(rid),
         decision=str(decision),
@@ -279,6 +321,7 @@ def read(
         message=str(message or ""),
         captured=[str(c) for c in captured],
         state_dir=str(state_dir) if state_dir is not None else None,
+        logical_message_resolution=message_resolution,
     )
 
 
@@ -433,6 +476,11 @@ def begin(
     state_dir: Path | None = None,
     severity: str = "critical",
     control_schema: str | None = None,
+    replay_intent_path: Path | None = None,
+    source_dsn: str | None = None,
+    source_slot_name: str | None = None,
+    source_publication_name: str | None = None,
+    source_application_patterns=("app_.*",),
 ) -> RecoveryRecord:
     """Write the intent, atomically with the to-do list. NOTHING is destroyed here.
 
@@ -491,6 +539,11 @@ def begin(
             "slot_receipt is stale; the recovery must use the current committed "
             "slot observation"
         )
+    if replay_intent_path is None:
+        from . import offsets
+
+        replay_root = state_dir if state_dir is not None else Path(offset_path).parent
+        replay_intent_path = Path(replay_root) / offsets.REPLAY_INTENT_FILE_NAME
     # The replay sidecar is only a local hint.  Before this journal can authorize
     # deleting the old resume point/slot, derive the durable logical-message
     # certificate from MotherDuck.  A complete ledger + consumer + audit certificate
@@ -503,7 +556,13 @@ def begin(
         dataset=logical_message_dataset,
         pipeline=pipeline,
         control_schema=control_schema,
+        replay_intent_path=replay_intent_path,
+        source_dsn=source_dsn,
+        source_slot_name=source_slot_name,
+        source_publication_name=source_publication_name,
+        source_application_patterns=source_application_patterns,
     )
+    record.logical_message_resolution = message_state.as_dict()
     prejournal_key = _prejournal_occurrence(
         slot_receipt, pipeline=pipeline, slot_name=slot_name
     )
@@ -580,13 +639,16 @@ def begin(
         con.execute(
             f"INSERT INTO {control_table(resolve_control_schema(control_schema), 'recovery_state')} "
             "(pipeline, namespace, recovery_id, decision, phase, slot_name, "
-            " offset_path, snapshot_mode, forget_catalog, tables_marked, message, "
-            " captured_json, state_dir, requested_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " offset_path, snapshot_mode, forget_catalog, tables_marked, message, "
+            " captured_json, state_dir, logical_message_resolution, requested_at, "
+            " updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [
                 pipeline, namespace, record.recovery_id, decision, PHASE_REQUESTED,
                 slot_name, str(offset_path), FORCED_SNAPSHOT_MODE, forget_catalog,
-                marked, message, json.dumps(captured), record.state_dir, now(), now(),
+                marked, message, json.dumps(captured), record.state_dir,
+                json.dumps(record.logical_message_resolution),
+                now(), now(),
             ],
         )
         con.execute("COMMIT")
@@ -674,6 +736,11 @@ def resume(
     on_phase=None,
     logical_message_dataset: str,
     control_schema: str | None = None,
+    replay_intent_path: Path | None = None,
+    source_dsn: str | None = None,
+    source_slot_name: str | None = None,
+    source_publication_name: str | None = None,
+    source_application_patterns=("app_.*",),
 ) -> dict:
     """Run the recovery forward from whatever phase the journal records. Idempotent.
 
@@ -688,11 +755,33 @@ def resume(
     from . import reconcile as reconcile_mod
 
     drop_slot = drop_slot or reconcile_mod.drop_slot
+    if replay_intent_path is None:
+        replay_root = (
+            Path(record.state_dir)
+            if record.state_dir is not None
+            else Path(record.offset_path).parent
+            if record.offset_path is not None
+            else Path(".")
+        )
+        replay_intent_path = replay_root / offsets.REPLAY_INTENT_FILE_NAME
+    known_source_evidence = (
+        record.logical_message_resolution.get("source_evidence")
+        if isinstance(record.logical_message_resolution, dict)
+        else None
+    )
     message_state = logical_messages.require_recovery_message_certificate(
         con,
         dataset=logical_message_dataset,
         pipeline=pipeline,
         control_schema=control_schema,
+        replay_intent_path=replay_intent_path,
+        source_dsn=source_dsn,
+        source_slot_name=source_slot_name,
+        source_publication_name=source_publication_name,
+        source_application_patterns=source_application_patterns,
+        known_source_evidence=known_source_evidence,
+        known_message_state=record.logical_message_resolution,
+        replay_intent_namespace=namespace,
     )
     result = {
         "recovery_id": record.recovery_id,

@@ -192,6 +192,11 @@ class LiveDiscoveryCoordinator:
                 "source_role": "standby",
             },
             control_schema=self.destination.control_schema,
+            replay_intent_path=offsets.replay_intent_path(self.replication.state_dir),
+            source_dsn=self.routes.slot_owner_dsn,
+            source_slot_name=self.replication.slot_name,
+            source_publication_name=self.replication.publication_name,
+            source_application_patterns=self.replication.message_prefix_allowlist,
         )
         summary["local_slot_recovery"] = record.as_dict()
 

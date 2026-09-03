@@ -539,7 +539,17 @@ def run(
                     pipeline=dest.pipeline_name,
                     dataset=dest.dataset_name,
                     replay_intent_path=replay_intent_path,
+                    namespace=namespace,
                     control_schema=control_schema,
+                    source_dsn=routes.slot_owner_dsn,
+                    source_slot_name=replication.slot_name,
+                    source_publication_name=replication.publication_name,
+                    source_application_patterns=replication.message_prefix_allowlist,
+                    known_message_state=(
+                        journal.logical_message_resolution
+                        if journal is not None
+                        else None
+                    ),
                 )
             )
             if summary_extra["logical_message_recovery"]["replay_intent_cleared"]:
@@ -726,6 +736,11 @@ def run(
                 logical_message_dataset=dest.dataset_name,
                 context={"file_lsn": reconciliation.file_lsn},
                 control_schema=control_schema,
+                replay_intent_path=replay_intent_path,
+                source_dsn=routes.slot_owner_dsn,
+                source_slot_name=replication.slot_name,
+                source_publication_name=replication.publication_name,
+                source_application_patterns=replication.message_prefix_allowlist,
             )
             summary_extra["recovery_journal"] = journal.as_dict()
             summary_extra["orphan_recovery"] = recovery_mod.resume(
@@ -736,6 +751,11 @@ def run(
                 dsn=routes.slot_owner_dsn,
                 logical_message_dataset=dest.dataset_name,
                 control_schema=control_schema,
+                replay_intent_path=replay_intent_path,
+                source_dsn=routes.slot_owner_dsn,
+                source_slot_name=replication.slot_name,
+                source_publication_name=replication.publication_name,
+                source_application_patterns=replication.message_prefix_allowlist,
             )
         if (
             journal is not None

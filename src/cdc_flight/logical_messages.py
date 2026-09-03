@@ -11,19 +11,24 @@ observations.
 from __future__ import annotations
 
 import re
+import struct
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
 from . import apply_sql
-from .config import resolve_control_schema
+from .config import resolve_control_schema, source_connection_kwargs
 from .errors import DestinationIdentityCollision, LogicalMessageObligationUnresolved
 from .naming import control_table, quote
 
 LOGICAL_MESSAGE_TABLE = "cdcflight_logical_messages"
 LOGICAL_MESSAGE_HEARTBEAT_PREFIX = "cdc_flight_heartbeat"
 DEFAULT_APPLICATION_PREFIX_ALLOWLIST = ("app_.*",)
+SOURCE_MESSAGE_PROBE_VERSION = 1
+SOURCE_MESSAGE_PROBE_STATUS_EMPTY = "no_application_message"
+SOURCE_MESSAGE_PROBE_STATUS_PRESENT = "application_message_present"
+SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True)
@@ -39,6 +44,16 @@ class MessageDeliveryState:
 
     certified_message_ids: tuple[str, ...] = ()
     obligations: tuple[dict[str, Any], ...] = ()
+    #: A pending replay marker was present when this state was derived. This is
+    #: deliberately separate from obligations: an empty join plus a marker is
+    #: an unknown state, not an empty obligation set.
+    replay_intent_present: bool = False
+    #: Evidence from the bounded source-slot probe, when an empty destination join
+    #: needed to be resolved before a destructive route could proceed.
+    source_evidence: dict[str, Any] | None = None
+    #: True only when the source probe completed and positively found no
+    #: application message after the durable destination point.
+    unknown_resolved: bool = False
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -46,7 +61,211 @@ class MessageDeliveryState:
             "certified_count": len(self.certified_message_ids),
             "obligations": [dict(item) for item in self.obligations],
             "obligation_count": len(self.obligations),
+            "replay_intent_present": self.replay_intent_present,
+            "source_evidence": (
+                dict(self.source_evidence) if self.source_evidence is not None else None
+            ),
+            "unknown_resolved": self.unknown_resolved,
         }
+
+
+@dataclass(frozen=True)
+class SourceMessageEvidence:
+    """Bounded source-side evidence for an empty durable message join.
+
+    A destination join can only name messages Flight has already observed. When a
+    replay marker exists and that join is empty, this probe asks PostgreSQL's stock
+    pgoutput slot to peek without consuming it. no_application_message is the
+    only result that resolves the unknown state; a present message, a missing
+    slot, a malformed pgoutput record, or a timeout is fail-closed.
+    """
+
+    status: str
+    slot_name: str | None = None
+    plugin: str | None = None
+    after_lsn: int | None = None
+    confirmed_flush_lsn: int | None = None
+    scanned_records: int = 0
+    application_messages: tuple[dict[str, Any], ...] = ()
+    error: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "probe_version": SOURCE_MESSAGE_PROBE_VERSION,
+            "status": self.status,
+            "slot_name": self.slot_name,
+            "plugin": self.plugin,
+            "after_lsn": self.after_lsn,
+            "confirmed_flush_lsn": self.confirmed_flush_lsn,
+            "scanned_records": self.scanned_records,
+            "application_messages": [dict(item) for item in self.application_messages],
+            "error": self.error,
+        }
+
+
+def _decode_pgoutput_message(data: object) -> dict[str, Any] | None:
+    """Decode only pgoutput's logical-message record, without consuming the slot."""
+    raw = bytes(data)
+    if not raw or raw[0] != ord("M"):
+        return None
+    if len(raw) < 15:
+        raise ValueError("pgoutput logical-message record is truncated")
+    flags = raw[1]
+    source_lsn = struct.unpack(">Q", raw[2:10])[0]
+    prefix_end = raw.find(b"\0", 10)
+    if prefix_end < 0:
+        raise ValueError("pgoutput logical-message record has no prefix terminator")
+    try:
+        prefix = raw[10:prefix_end].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("pgoutput logical-message prefix is not UTF-8") from exc
+    content_length_at = prefix_end + 1
+    if len(raw) < content_length_at + 4:
+        raise ValueError("pgoutput logical-message record has no content length")
+    content_length = struct.unpack(
+        ">I", raw[content_length_at:content_length_at + 4]
+    )[0]
+    content_at = content_length_at + 4
+    if len(raw) != content_at + content_length:
+        raise ValueError("pgoutput logical-message content length does not match record")
+    return {
+        "source_lsn": source_lsn,
+        "prefix": prefix,
+        "byte_length": content_length,
+        "is_transactional": bool(flags & 1),
+    }
+
+
+def peek_source_message_evidence(
+    dsn: str | None,
+    *,
+    slot_name: str | None,
+    publication_name: str | None,
+    after_lsn: int | None,
+    application_patterns: Iterable[str] = DEFAULT_APPLICATION_PREFIX_ALLOWLIST,
+    connect_timeout: int = 5,
+    statement_timeout_ms: int = 4000,
+) -> SourceMessageEvidence:
+    """Peek for an unobserved application message without advancing PostgreSQL.
+
+    The server statement timeout and client TCP timeout bound the whole operation.
+    There is intentionally no upto_nchanges truncation: stopping after a small
+    prefix could call a live obligation absent merely because it was later in the
+    slot. The query is read-only and returns unknown on every transport, slot,
+    plugin, or decode failure, so an unavailable source can never authorize a
+    destructive route.
+    """
+    if not dsn or not slot_name or not publication_name or after_lsn is None:
+        return SourceMessageEvidence(
+            status=SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+            slot_name=slot_name,
+            after_lsn=after_lsn,
+            error="source slot probe is missing its DSN, slot, publication, or durable LSN",
+        )
+    try:
+        policy = MessagePrefixPolicy(application_patterns=tuple(application_patterns))
+        import psycopg
+
+        with psycopg.connect(
+            dsn,
+            autocommit=True,
+            **source_connection_kwargs(
+                connect_timeout=connect_timeout,
+                socket_timeout_seconds=max(1, statement_timeout_ms / 1000),
+                statement_timeout_ms=statement_timeout_ms,
+            ),
+        ) as conn:
+            slot = conn.execute(
+                "SELECT plugin, (confirmed_flush_lsn - '0/0'::pg_lsn)::bigint "
+                "FROM pg_replication_slots WHERE slot_name = %s",
+                (slot_name,),
+            ).fetchone()
+            if slot is None:
+                return SourceMessageEvidence(
+                    status=SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+                    slot_name=slot_name,
+                    after_lsn=after_lsn,
+                    error="source slot is absent; its old WAL cannot be inspected",
+                )
+            plugin = str(slot[0]) if slot[0] is not None else None
+            confirmed = int(slot[1]) if slot[1] is not None else None
+            if plugin != "pgoutput":
+                return SourceMessageEvidence(
+                    status=SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+                    slot_name=slot_name,
+                    plugin=plugin,
+                    after_lsn=after_lsn,
+                    confirmed_flush_lsn=confirmed,
+                    error=f"source slot plugin {plugin!r} is not stock pgoutput",
+                )
+            rows = conn.execute(
+                """
+                SELECT (changes.lsn - '0/0'::pg_lsn)::bigint, changes.data
+                FROM pg_logical_slot_peek_binary_changes(
+                    %s, NULL, NULL,
+                    'proto_version', '1',
+                    'publication_names', %s,
+                    'messages', 'true'
+                ) AS changes
+                """,
+                (slot_name, publication_name),
+            ).fetchall()
+    except Exception as exc:
+        return SourceMessageEvidence(
+            status=SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+            slot_name=slot_name,
+            after_lsn=after_lsn,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    application_messages: list[dict[str, Any]] = []
+    for lsn, data in rows:
+        source_lsn = int(lsn)
+        if source_lsn <= after_lsn:
+            continue
+        try:
+            message = _decode_pgoutput_message(data)
+        except ValueError as exc:
+            return SourceMessageEvidence(
+                status=SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+                slot_name=slot_name,
+                plugin="pgoutput",
+                after_lsn=after_lsn,
+                confirmed_flush_lsn=confirmed,
+                scanned_records=len(rows),
+                error=str(exc),
+            )
+        if message is None:
+            continue
+        # The LSN in the pgoutput payload is the message's source position. Keep the
+        # row LSN as the authoritative ordering value as well; a disagreement is
+        # malformed evidence, not a reason to guess.
+        if message["source_lsn"] != source_lsn:
+            return SourceMessageEvidence(
+                status=SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+                slot_name=slot_name,
+                plugin="pgoutput",
+                after_lsn=after_lsn,
+                confirmed_flush_lsn=confirmed,
+                scanned_records=len(rows),
+                error="pgoutput message LSN disagrees with its slot record LSN",
+            )
+        if policy.classify(message["prefix"]) == "application":
+            application_messages.append(message)
+
+    return SourceMessageEvidence(
+        status=(
+            SOURCE_MESSAGE_PROBE_STATUS_PRESENT
+            if application_messages
+            else SOURCE_MESSAGE_PROBE_STATUS_EMPTY
+        ),
+        slot_name=slot_name,
+        plugin="pgoutput",
+        after_lsn=after_lsn,
+        confirmed_flush_lsn=confirmed,
+        scanned_records=len(rows),
+        application_messages=tuple(application_messages),
+    )
 
 
 def normalize_prefix_allowlist(patterns: str | Iterable[str]) -> tuple[str, ...]:
@@ -529,8 +748,27 @@ def require_recovery_message_certificate(
     dataset: str,
     pipeline: str,
     control_schema: str | None = None,
+    replay_intent_path=None,
+    source_dsn: str | None = None,
+    source_slot_name: str | None = None,
+    source_publication_name: str | None = None,
+    source_application_patterns: Iterable[str] = DEFAULT_APPLICATION_PREFIX_ALLOWLIST,
+    known_source_evidence: dict[str, Any] | None = None,
+    known_message_state: dict[str, Any] | None = None,
+    replay_intent_namespace: str | None = None,
 ) -> MessageDeliveryState:
-    """Refuse a full recovery when a durable message certificate is split."""
+    """Refuse recovery unless a marker is positively discharged.
+
+    The durable join is authoritative for messages Flight observed. Its empty result
+    is not authoritative for messages that never arrived. When a replay marker is
+    present and the join is empty, a bounded read-only pgoutput peek resolves that
+    unknown state: only a completed scan with no application message permits the
+    destructive route. A source message, a missing slot, or any probe failure raises
+    before the recovery journal or its destructive ladder can proceed.
+    """
+    from . import destination as dest_mod
+    from . import offsets
+
     state = read_delivery_state(
         con,
         dataset=dataset,
@@ -547,7 +785,140 @@ def require_recovery_message_certificate(
             f"certificate is incomplete ({details})",
             obligations=state.obligations,
         )
-    return state
+    if replay_intent_path is None:
+        return state
+
+    intent = offsets.read_replay_intent(replay_intent_path)
+    if intent is None:
+        return state
+    durable_point = dest_mod.read_resume_point(
+        con,
+        pipeline,
+        intent.namespace,
+        control_schema=control_schema,
+    )
+    expected_namespace = replay_intent_namespace or intent.namespace
+    if (
+        durable_point is None
+        and isinstance(known_message_state, dict)
+        and known_message_state.get("replay_intent_present") is True
+        and (
+            state.certified_message_ids
+            or (
+                isinstance(known_message_state.get("source_evidence"), dict)
+                and known_message_state["source_evidence"].get("probe_version")
+                == SOURCE_MESSAGE_PROBE_VERSION
+                and known_message_state["source_evidence"].get("status")
+                == SOURCE_MESSAGE_PROBE_STATUS_EMPTY
+                and not known_message_state["source_evidence"].get(
+                    "application_messages"
+                )
+                and not known_message_state["source_evidence"].get("error")
+            )
+        )
+    ):
+        # The recovery journal deliberately deletes the destination resume row before
+        # dropping the source slot. Its persisted certificate/probe is the proof that
+        # lets a later phase clear the marker without trying to validate against a row
+        # that this same recovery has already removed.
+        if intent.pipeline != pipeline or intent.namespace != expected_namespace:
+            raise LogicalMessageObligationUnresolved(
+                "recovery replay marker identity no longer matches its journal",
+                obligations=(
+                    {
+                        "message_id": f"source-slot:{intent.namespace}",
+                        "issues": ["replay_intent_identity_mismatch"],
+                        "has_ledger": False,
+                        "has_consumer": False,
+                        "has_audit": False,
+                    },
+                ),
+            )
+        if not state.certified_message_ids:
+            state = replace(
+                state,
+                source_evidence=dict(known_message_state["source_evidence"]),
+                unknown_resolved=True,
+            )
+    else:
+        offsets.validate_replay_intent(
+            intent,
+            pipeline=pipeline,
+            namespace=expected_namespace,
+            durable_point=durable_point,
+        )
+    state = replace(state, replay_intent_present=True)
+
+    # A complete three-way certificate is positive proof for the observed message
+    # obligation. This path intentionally remains usable when the old source slot has
+    # already disappeared: the certificate is in MotherDuck, not in that slot.
+    if state.certified_message_ids:
+        return state
+    if (
+        state.unknown_resolved
+        and isinstance(state.source_evidence, dict)
+        and state.source_evidence.get("status") == SOURCE_MESSAGE_PROBE_STATUS_EMPTY
+    ):
+        return state
+
+    evidence = None
+    if known_source_evidence is not None:
+        expected_lsn = durable_point.last_lsn if durable_point is not None else None
+        evidence_slot = known_source_evidence.get("slot_name")
+        evidence_lsn = known_source_evidence.get("after_lsn")
+        if (
+            known_source_evidence.get("probe_version") == SOURCE_MESSAGE_PROBE_VERSION
+            and known_source_evidence.get("status") == SOURCE_MESSAGE_PROBE_STATUS_EMPTY
+            and known_source_evidence.get("plugin") == "pgoutput"
+            and evidence_slot == source_slot_name
+            and evidence_lsn == expected_lsn
+            and not known_source_evidence.get("application_messages")
+            and not known_source_evidence.get("error")
+        ):
+            evidence = dict(known_source_evidence)
+
+    if evidence is None:
+        after_lsn = durable_point.last_lsn if durable_point is not None else None
+        if after_lsn is None or after_lsn <= 0:
+            offset_lsn = (
+                durable_point.offset.get("lsn") if durable_point is not None else None
+            )
+            after_lsn = int(offset_lsn) if offset_lsn is not None else None
+        evidence = peek_source_message_evidence(
+            source_dsn,
+            slot_name=source_slot_name,
+            publication_name=source_publication_name,
+            after_lsn=after_lsn,
+            application_patterns=source_application_patterns,
+        ).as_dict()
+
+    if evidence.get("status") != SOURCE_MESSAGE_PROBE_STATUS_EMPTY:
+        probe_obligation = {
+            "message_id": f"source-slot:{source_slot_name or 'unknown'}",
+            "issues": [
+                (
+                    "source_slot_application_message_unobserved"
+                    if evidence.get("status") == SOURCE_MESSAGE_PROBE_STATUS_PRESENT
+                    else "source_slot_evidence_unknown"
+                )
+            ],
+            "has_ledger": False,
+            "has_consumer": False,
+            "has_audit": False,
+            "source_evidence": evidence,
+        }
+        raise LogicalMessageObligationUnresolved(
+            "full source recovery refused: the pending replay marker has no "
+            "positive destination certificate and the source-slot probe did not "
+            f"prove it empty ({evidence.get('status')}, "
+            f"{probe_obligation['message_id']})",
+            obligations=(probe_obligation,),
+        )
+    return replace(
+        state,
+        source_evidence=evidence,
+        unknown_resolved=True,
+    )
 
 
 def read_logical_messages(
@@ -589,11 +960,13 @@ __all__ = [
     "LOGICAL_MESSAGE_TABLE",
     "MessageDeliveryState",
     "MessagePrefixPolicy",
+    "SourceMessageEvidence",
     "assert_row_matches",
     "ensure_table",
     "insert_rows",
     "message_prefix_include_list",
     "normalize_prefix_allowlist",
+    "peek_source_message_evidence",
     "qualified_table",
     "read_delivery_state",
     "read_logical_messages",
