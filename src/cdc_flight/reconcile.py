@@ -984,9 +984,21 @@ def drop_slot(
                 ):
                     after_lsn = int(target[1])
 
+                # A throwaway slot is allowed to run ahead while it builds the image;
+                # that is expected and does not make it the retention authority.  The
+                # named main slot is the copy whose WAL was not consumed by the
+                # resnapshot, so probe that slot for the live obligation.  Probing the
+                # target here would report ``confirmed > after_lsn`` as unknown even
+                # though the independent retention slot still holds the complete
+                # interval and can answer the question.  Main-slot recovery has no
+                # retention slot and therefore continues to probe its own slot.
+                probe_slot_name = (
+                    authorization.retention_slot_name
+                    or authorization.slot_name
+                )
                 evidence = logical_messages._probe_source_message_evidence_connection(
                     conn,
-                    slot_name=authorization.slot_name,
+                    slot_name=probe_slot_name,
                     publication_name=authorization.publication_name,
                     after_lsn=after_lsn,
                     application_patterns=authorization.application_patterns,
@@ -1090,12 +1102,22 @@ def recover_by_full_resnapshot(
     slot drop lost the forced snapshot mode entirely. See `cdc_flight.recovery` for the
     phases and ADR 0001 §19/A53 for the corrected claim.
     """
+    # The prior identity is the *reason* this recovery was requested, not the
+    # identity the replacement slot is expected to have.  A restored/repointed
+    # source is precisely the route that changes it.  The guarded primitive must
+    # bind its source probe to the live identity observed in this verdict; carrying
+    # ``previous_*`` into the probe would turn a legitimate full resnapshot into an
+    # ``unknown`` refusal before the journal could ever complete.
     expected_source_identity = {
-        "system_identifier": verdict.context.get(
-            "previous_system_identifier", slot_receipt.state.system_identifier
+        "system_identifier": (
+            verdict.context.get("system_identifier")
+            if verdict.context.get("system_identifier") is not None
+            else slot_receipt.state.system_identifier
         ),
-        "timeline_id": verdict.context.get(
-            "previous_timeline_id", slot_receipt.state.timeline_id
+        "timeline_id": (
+            verdict.context.get("timeline_id")
+            if verdict.context.get("timeline_id") is not None
+            else slot_receipt.state.timeline_id
         ),
     }
     record = recovery_mod.begin(
