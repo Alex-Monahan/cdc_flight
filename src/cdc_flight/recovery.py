@@ -73,6 +73,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import catalog_baseline, table_lifecycle
+from . import destination as dest_mod
 from .config import resolve_control_schema
 from .destination import now, raise_alert_once, read_slot_state, request_snapshot
 from .errors import RecoveryFailed
@@ -571,7 +572,32 @@ def begin(
             }
         ),
     )
-    record.logical_message_resolution = message_state.as_dict()
+    resolution = message_state.as_dict()
+    # The resume row may be deleted before the guarded slot effect. Keep the exact
+    # source fence and lineage with the journal so a process that resumes from
+    # ``resume_point_deleted`` can issue the same sealed capability without inventing
+    # an offset from the filesystem.
+    durable_point = dest_mod.read_resume_point(
+        con, pipeline, namespace, control_schema=control_schema
+    )
+    source_evidence = resolution.get("source_evidence")
+    source_fence_lsn = (
+        source_evidence.get("after_lsn")
+        if isinstance(source_evidence, dict)
+        else None
+    )
+    if source_fence_lsn is None and durable_point is not None:
+        source_fence_lsn = durable_point.last_lsn
+        if source_fence_lsn is None or source_fence_lsn <= 0:
+            offset_lsn = durable_point.offset.get("lsn")
+            source_fence_lsn = int(offset_lsn) if offset_lsn is not None else None
+    resolution["source_fence_lsn"] = source_fence_lsn
+    resolution["expected_source_identity"] = (
+        dict(expected_source_identity)
+        if isinstance(expected_source_identity, dict)
+        else expected_source_identity
+    )
+    record.logical_message_resolution = resolution
     prejournal_key = _prejournal_occurrence(
         slot_receipt, pipeline=pipeline, slot_name=slot_name
     )
@@ -764,6 +790,7 @@ def resume(
     from . import logical_messages, offsets
     from . import reconcile as reconcile_mod
 
+    supplied_drop_slot = drop_slot
     drop_slot = drop_slot or reconcile_mod.drop_slot
     if replay_intent_path is None:
         replay_root = (
@@ -779,6 +806,10 @@ def resume(
         if isinstance(record.logical_message_resolution, dict)
         else None
     )
+    if expected_source_identity is None and isinstance(record.logical_message_resolution, dict):
+        expected_source_identity = record.logical_message_resolution.get(
+            "expected_source_identity"
+        )
     message_state = logical_messages.require_recovery_message_certificate(
         con,
         dataset=logical_message_dataset,
@@ -794,6 +825,45 @@ def resume(
         expected_source_identity=expected_source_identity,
         replay_intent_namespace=namespace,
     )
+    drop_authorization = None
+    if supplied_drop_slot is None:
+        resolution = record.logical_message_resolution or {}
+        source_fence_lsn = resolution.get("source_fence_lsn")
+        if source_fence_lsn is None and message_state.source_evidence is not None:
+            source_fence_lsn = message_state.source_evidence.get("after_lsn")
+        if source_fence_lsn is None:
+            durable_point = dest_mod.read_resume_point(
+                con, pipeline, namespace, control_schema=control_schema
+            )
+            if durable_point is not None:
+                source_fence_lsn = durable_point.last_lsn
+                if source_fence_lsn is None or source_fence_lsn <= 0:
+                    offset_lsn = durable_point.offset.get("lsn")
+                    source_fence_lsn = (
+                        int(offset_lsn) if offset_lsn is not None else None
+                    )
+        authorization_identity = expected_source_identity
+        if (
+            record.decision == RESET_DECISION
+            and isinstance(authorization_identity, dict)
+            and (
+                authorization_identity.get("system_identifier") is None
+                or authorization_identity.get("timeline_id") is None
+            )
+        ):
+            # An operator reset is allowed to establish the first source identity for
+            # a state directory that had no prior slot receipt. The primitive still
+            # checks the live slot and its logical-message fence; there simply is no
+            # old lineage to compare in this explicit "start over" route.
+            authorization_identity = None
+        drop_authorization = reconcile_mod._recovery_slot_drop_authorization(
+            dsn=dsn,
+            slot_name=record.slot_name or "",
+            publication_name=source_publication_name,
+            application_patterns=source_application_patterns,
+            expected_source_identity=authorization_identity,
+            after_lsn=source_fence_lsn,
+        )
     result = {
         "recovery_id": record.recovery_id,
         "decision": record.decision,
@@ -869,7 +939,11 @@ def resume(
 
     if record.phase == PHASE_ROW_DELETED:
         slot_action = _drop_the_slot_or_fail(
-            drop_slot, dsn=dsn, slot_name=record.slot_name, record=record
+            drop_slot,
+            dsn=dsn,
+            slot_name=record.slot_name,
+            record=record,
+            authorization=drop_authorization,
         )
         result["slot"] = slot_action
         if on_phase is not None:
@@ -1018,7 +1092,14 @@ def complete_if_ready(
     )
 
 
-def _drop_the_slot_or_fail(drop_slot, *, dsn: str, slot_name: str | None, record) -> str:
+def _drop_the_slot_or_fail(
+    drop_slot,
+    *,
+    dsn: str,
+    slot_name: str | None,
+    record,
+    authorization=None,
+) -> str:
     """`dropped` or `absent`, or `RecoveryFailed`. There is no third outcome.
 
     See the module docstring: a re-snapshot started against a surviving slot has an
@@ -1029,7 +1110,14 @@ def _drop_the_slot_or_fail(drop_slot, *, dsn: str, slot_name: str | None, record
     if not slot_name:  # pragma: no cover - the journal always records one
         return "not attempted"
     try:
-        action = drop_slot(dsn, slot_name)
+        if authorization is None:
+            # The injectable callback is retained solely for the in-memory crash
+            # harnesses. Production's default is the sealed primitive above; an alias
+            # or adapter around that primitive receives no authorization and is refused
+            # by construction.
+            action = drop_slot(dsn, slot_name)
+        else:
+            action = drop_slot(dsn, slot_name, authorization=authorization)
     except Exception as exc:
         raise RecoveryFailed(
             f"the replication slot {slot_name!r} could not be dropped ({exc}), so "

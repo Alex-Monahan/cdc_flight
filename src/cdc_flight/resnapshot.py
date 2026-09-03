@@ -336,21 +336,26 @@ def slot_name_for(base: str) -> str:
     return f"{base[: 63 - len(SLOT_SUFFIX)]}{SLOT_SUFFIX}"
 
 
-def sweep_stale_slot(dsn: str, base_slot_name: str) -> str:
+def sweep_stale_slot(
+    dsn: str,
+    base_slot_name: str,
+    *,
+    authorization=None,
+) -> str:
     """Drop OUR throwaway slot if a previous run left one behind (Opus MAJOR-2).
 
     A leaked `_rs` slot holds WAL on the source for ever and counts against
-    `max_replication_slots`; two independent review sessions leaked one on the shared
-    development cluster in a single day. Called unconditionally at start-up, so the
-    slot is reclaimed on the next run of the pipeline that created it whether or not
-    another re-snapshot is due.
+    `max_replication_slots`. It is reclaimed on the next run only after the main slot
+    has been observed healthy and supplied as the independent retention proof. If the
+    main slot is gone or otherwise unsafe, the primitive refuses and leaves `_rs`
+    untouched so it cannot destroy the last recoverable logical message.
 
     Only ever the name this pipeline derives from its own slot: sweeping by suffix
     would delete another pipeline's in-flight re-snapshot slot.
     """
     slot = slot_name_for(base_slot_name)
     try:
-        action = reconcile_mod.drop_slot(dsn, slot)
+        action = reconcile_mod.drop_slot(dsn, slot, authorization=authorization)
     except Exception as exc:  # pragma: no cover - the slot may be held right now
         log.warning("could not sweep the stale re-snapshot slot %r: %s", slot, exc)
         return f"sweep_failed: {exc}"
@@ -433,12 +438,25 @@ def run(
     recovery = InterruptionRecovery.prepare(
         state_dir, pipeline=pipeline, tables=tables
     )
+    # The main slot is the retention proof for a stale throwaway slot. The primitive
+    # re-checks that slot, its lineage, and its confirmed position on the same source
+    # connection immediately before the guarded drop; no pre-check here is an authority
+    # that can go stale.
+    drop_authorization = reconcile_mod.retention_slot_drop_authorization(
+        dsn=routes.slot_owner_dsn,
+        slot_name=slot,
+        retention_slot_name=replication.slot_name,
+        publication_name=replication.publication_name,
+        application_patterns=replication.message_prefix_allowlist,
+    )
     # A leftover slot from an interrupted re-snapshot would make Debezium take the
     # pre-existing-slot path, which is exactly the path that does not export a snapshot.
     # Slot removal is local logical-slot administration.  In standby mode the
     # slot physically belongs to the decoder endpoint, so it must never be sent
     # through the primary source-write route.
-    reconcile_mod.drop_slot(routes.slot_owner_dsn, slot)
+    reconcile_mod.drop_slot(
+        routes.slot_owner_dsn, slot, authorization=drop_authorization
+    )
 
     resnap_replication = dataclasses.replace(
         replication, slot_name=slot, state_dir=state_dir
@@ -748,7 +766,11 @@ def run(
             # ownership token proves every destination user has left AND a safe owner
             # has discharged the durable recovery obligation.
             # Terminal throwaway-slot retirement is also source administration.
-            recovery.retire_terminal_resources(dsn=routes.slot_owner_dsn, slot=slot)
+            recovery.retire_terminal_resources(
+                dsn=routes.slot_owner_dsn,
+                slot=slot,
+                authorization=drop_authorization,
+            )
 
 
 def reassert_owed(

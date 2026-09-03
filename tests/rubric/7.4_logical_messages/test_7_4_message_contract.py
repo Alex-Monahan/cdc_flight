@@ -8,13 +8,13 @@ claiming a live round trip.
 
 from __future__ import annotations
 
-import ast
 import base64
+import functools
 import json
 import struct
+import subprocess
 import sys
 import uuid
-from pathlib import Path
 from types import SimpleNamespace
 
 import duckdb
@@ -25,7 +25,14 @@ from support.applier_lab import begin as lab_begin
 from support.applier_lab import end as lab_end
 from support.applier_lab import keyed as lab_keyed
 
-from cdc_flight import event_ledger, logical_messages, offsets, reconcile, recovery
+from cdc_flight import (
+    event_ledger,
+    logical_messages,
+    offsets,
+    reconcile,
+    recovery,
+    resnapshot,
+)
 from cdc_flight.assembler import (
     UNIT_MESSAGE,
     UNIT_TXN,
@@ -844,6 +851,146 @@ def test_real_message_after_begin_probe_blocks_destructive_resume(
         con.close()
 
 
+def test_real_message_after_in_primitive_probe_blocks_slot_drop(
+    postgres_cluster, monkeypatch
+):
+    """A commit between the primitive's probe and effect edge leaves the slot alive."""
+    source = postgres_cluster
+    slot_name = f"p72_b1_primitive_{uuid.uuid4().hex}"[:63]
+    emitted: list[int] = []
+
+    try:
+        with psycopg.connect(source.dsn, autocommit=True) as source_con:
+            created = source_con.execute(
+                "SELECT slot_name, (lsn - '0/0'::pg_lsn)::bigint "
+                "FROM pg_create_logical_replication_slot(%s, 'pgoutput')",
+                (slot_name,),
+            ).fetchone()
+            assert created is not None
+            created_lsn = int(created[1])
+
+        observation = reconcile.observe_slot(source.dsn, slot_name)
+        assert observation.observable, observation.error
+        fence_lsn = observation.confirmed_flush_lsn or created_lsn
+        identity = {
+            "system_identifier": observation.system_identifier,
+            "timeline_id": observation.timeline_id,
+        }
+        assert peek_source_message_evidence(
+            source.dsn,
+            slot_name=slot_name,
+            publication_name="cdc_flight_pub",
+            after_lsn=fence_lsn,
+            expected_source_identity=identity,
+        ).status == logical_messages.SOURCE_MESSAGE_PROBE_STATUS_EMPTY
+        authorization = reconcile._recovery_slot_drop_authorization(
+            dsn=source.dsn,
+            slot_name=slot_name,
+            publication_name="cdc_flight_pub",
+            application_patterns=("app_.*",),
+            expected_source_identity=identity,
+            after_lsn=fence_lsn,
+        )
+
+        original_high_water = reconcile._source_wal_high_water
+
+        def high_water_then_emit(conn):
+            value = original_high_water(conn)
+            if not emitted:
+                with psycopg.connect(source.dsn, autocommit=True) as source_con:
+                    lsn = source_con.execute(
+                        "SELECT (pg_logical_emit_message(%s, %s, %s) - "
+                        "'0/0'::pg_lsn)::bigint",
+                        (False, "app_b1_primitive", "emitted-after-in-primitive-probe"),
+                    ).fetchone()[0]
+                    source_con.execute("CHECKPOINT")
+                emitted.append(int(lsn))
+            return value
+
+        monkeypatch.setattr(reconcile, "_source_wal_high_water", high_water_then_emit)
+        with pytest.raises(LogicalMessageObligationUnresolved) as caught:
+            reconcile.drop_slot(
+                source.dsn,
+                slot_name,
+                authorization=authorization,
+            )
+        assert emitted, "the real source message was not emitted at the effect edge"
+        assert caught.value.obligations[0]["issues"] == [
+            "source_slot_application_message_unobserved"
+        ]
+        assert reconcile.observe_slot(source.dsn, slot_name).slot_exists
+        evidence = peek_source_message_evidence(
+            source.dsn,
+            slot_name=slot_name,
+            publication_name="cdc_flight_pub",
+            after_lsn=fence_lsn,
+            expected_source_identity=identity,
+        )
+        assert evidence.status == logical_messages.SOURCE_MESSAGE_PROBE_STATUS_PRESENT
+        assert evidence.application_messages[0]["prefix"] == "app_b1_primitive"
+    finally:
+        with psycopg.connect(source.dsn, autocommit=True) as source_con:
+            source_con.execute(
+                "SELECT pg_drop_replication_slot(slot_name) "
+                "FROM pg_replication_slots WHERE slot_name = %s",
+                (slot_name,),
+            )
+
+
+def test_main_slot_loss_defers_stale_sweep_and_preserves_only_retention_slot(
+    postgres_cluster,
+):
+    """The startup sweep cannot drop `_rs` when it is the only retained copy."""
+    source = postgres_cluster
+    base_slot = f"p72_b2_main_{uuid.uuid4().hex}"[:55]
+    main_slot = base_slot
+    stale_slot = resnapshot.slot_name_for(base_slot)
+    created_lsns: dict[str, int] = {}
+
+    try:
+        with psycopg.connect(source.dsn, autocommit=True) as source_con:
+            for slot_name in (main_slot, stale_slot):
+                created = source_con.execute(
+                    "SELECT slot_name, (lsn - '0/0'::pg_lsn)::bigint "
+                    "FROM pg_create_logical_replication_slot(%s, 'pgoutput')",
+                    (slot_name,),
+                ).fetchone()
+                assert created is not None
+                created_lsns[slot_name] = int(created[1])
+            source_con.execute(
+                "SELECT pg_drop_replication_slot(slot_name) "
+                "FROM pg_replication_slots WHERE slot_name = %s",
+                (main_slot,),
+            )
+            emitted = source_con.execute(
+                "SELECT (pg_logical_emit_message(%s, %s, %s) - "
+                "'0/0'::pg_lsn)::bigint",
+                (False, "app_b2_retention", "only-the-derived-slot-retains-this"),
+            ).fetchone()[0]
+            source_con.execute("CHECKPOINT")
+
+        result = resnapshot.sweep_stale_slot(source.dsn, base_slot)
+        assert result.startswith("sweep_failed:"), result
+        assert "slot_drop_guard_missing" in result
+        assert reconcile.observe_slot(source.dsn, stale_slot).slot_exists
+        evidence = peek_source_message_evidence(
+            source.dsn,
+            slot_name=stale_slot,
+            publication_name="cdc_flight_pub",
+            after_lsn=created_lsns[stale_slot],
+        )
+        assert evidence.status == logical_messages.SOURCE_MESSAGE_PROBE_STATUS_PRESENT
+        assert evidence.application_messages[0]["prefix"] == "app_b2_retention"
+        assert int(emitted) > created_lsns[stale_slot]
+    finally:
+        with psycopg.connect(source.dsn, autocommit=True) as source_con:
+            source_con.execute(
+                "SELECT pg_drop_replication_slot(slot_name) "
+                "FROM pg_replication_slots WHERE slot_name = %s",
+                (stale_slot,),
+            )
+
+
 def test_missing_source_probe_inputs_never_authorize_an_empty_marker(tmp_path):
     con = _plan_connection()
     marker = tmp_path / offsets.REPLAY_INTENT_FILE_NAME
@@ -942,304 +1089,88 @@ FULL_RECOVERY_ROUTES = (
     recovery.ORPHAN_DECISION,
 )
 
-# This is an auditable ownership manifest, not a route allowlist. The inventory below
-# is derived from the destructive primitive callsites themselves and includes their
-# exact source line. A new direct drop/recreate, marker/offset removal, or snapshot
-# request therefore has to be declared here before the structural test can pass.
-DECLARED_DESTRUCTIVE_EFFECT_SITES = frozenset(
-    {
-        ("acquisition", "resume_any_journalled_recovery", "resume", 117),
-        ("acquisition", "journal_the_reset", "begin", 367),
-        ("acquisition", "journal_the_reset", "resume", 395),
-        ("backfill", "ResumableBackfillLab.run_clean", "unlink", 2265),
-        ("catalog_baseline", "mark_unconfirmed", "request_snapshot", 455),
-        ("destination", "write_resume_point", "delete_resume_point", 388),
-        ("destination_alerts", "AlertSink.request_snapshot", "request_snapshot", 444),
-        ("destination_alerts", "_write_fallback_alert_episode", "unlink", 718),
-        (
-            "discovery_coordinator",
-            "LiveDiscoveryCoordinator._journal_local_slot_failure",
-            "begin",
-            170,
+
+def test_slot_drop_primitive_requires_sealed_authorization():
+    """The effect itself refuses an unproven destructive call."""
+    with pytest.raises(LogicalMessageObligationUnresolved) as caught:
+        reconcile.drop_slot("postgresql://source", "slot")
+    assert caught.value.obligations[0]["issues"] == ["slot_drop_guard_missing"]
+
+
+def test_seven_destructive_witness_forms_are_all_refused():
+    """Runtime reachability cannot bypass the primitive or its guarded SQL edge."""
+
+    def assert_refused(call):
+        with pytest.raises(LogicalMessageObligationUnresolved) as caught:
+            call()
+        return caught.value.obligations[0]["issues"][0]
+
+    aliased = reconcile.drop_slot
+    dynamic = getattr(reconcile, "drop_" + "slot")
+    registry = {"drop_slot": reconcile.drop_slot}
+
+    class Adapter:
+        def drop(self):
+            return reconcile.drop_slot("source", "witness")
+
+    authorization = reconcile.retention_slot_drop_authorization(
+        dsn="source",
+        slot_name="witness_rs",
+        retention_slot_name="witness_main",
+        publication_name="cdc_flight_pub",
+        application_patterns=("app_.*",),
+    )
+
+    class FakeConnection:
+        def execute(self, *_args, **_kwargs):
+            raise AssertionError("raw SQL should be refused before the fake executes")
+
+        def cursor(self, *_args, **_kwargs):
+            raise AssertionError("raw SQL should be refused before the fake cursors")
+
+    guarded = reconcile._GuardedSlotConnection(FakeConnection(), authorization)
+    assembled_sql = "SELECT " + "pg_drop_replication_slot" + "(slot_name)"
+    script = (
+        "from cdc_flight import reconcile\n"
+        "try:\n"
+        "    getattr(reconcile, 'drop_slot')('source', 'witness')\n"
+        "except Exception as exc:\n"
+        "    print(type(exc).__name__ + ':' + exc.obligations[0]['issues'][0])\n"
+    )
+    child = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert child.returncode == 0, child.stderr
+
+    refused = {
+        "aliased import": assert_refused(
+            lambda: aliased("source", "witness")
         ),
-        ("discovery_coordinator", "LiveDiscoveryCoordinator.run", "request_snapshot", 419),
-        ("faults", "runtime_state", "unlink", 613),
-        ("offsets", "_atomic_json_write", "unlink", 104),
-        ("offsets", "_atomic_json_write", "unlink", 113),
-        ("offsets", "clear_replay_intent", "unlink", 286),
-        ("offsets", "prepare_replay_offset", "unlink", 380),
-        ("offsets", "install_replay_offset", "unlink", 420),
-        ("offsets", "install_replay_offset", "unlink", 441),
-        ("pipeline", "run", "prepare_replay_offset", 564),
-        ("pipeline", "run", "prepare_replay_offset", 576),
-        ("pipeline", "run", "prepare_replay_offset", 600),
-        ("pipeline", "run", "clear_replay_intent", 603),
-        ("pipeline", "run", "prepare_replay_offset", 674),
-        ("pipeline", "run", "begin", 728),
-        ("pipeline", "run", "resume", 753),
-        ("pipeline", "run", "request_snapshot", 937),
-        ("pipeline", "run", "install_replay_offset", 1335),
-        ("pipeline", "run", "clear_replay_intent", 1348),
-        ("pipeline", "run", "unlink", 1418),
-        ("reconcile", "drop_slot", "pg_drop_replication_slot", 527),
-        ("reconcile", "recover_by_full_resnapshot", "begin", 584),
-        ("reconcile", "recover_by_full_resnapshot", "resume", 605),
-        ("recovery", "discharge_replay_intent_for_recovery", "clear_replay_intent", 185),
-        ("recovery", "begin", "request_snapshot", 612),
-        ("recovery", "resume", "rmtree", 826),
-        ("recovery", "resume", "unlink", 832),
-        ("recovery", "resume", "delete_resume_point", 851),
-        ("recovery", "_drop_the_slot_or_fail", "drop_slot", 1032),
-        ("resnapshot", "sweep_stale_slot", "drop_slot", 353),
-        ("resnapshot", "run", "drop_slot", 441),
-        ("resnapshot", "reassert_owed", "request_snapshot", 780),
-        ("resnapshot_recovery", "discard_consumed_interruption_marker", "rmtree", 119),
-        ("resnapshot_recovery", "requeue_interrupted", "request_snapshot", 165),
-        ("resnapshot_recovery", "InterruptionRecovery.prepare", "rmtree", 219),
-        (
-            "resnapshot_recovery",
-            "InterruptionRecovery.retire_terminal_resources",
-            "drop_slot",
-            253,
+        "dynamic getattr": assert_refused(
+            lambda: dynamic("source", "witness")
         ),
-        ("self_heal", "request_resnapshot_for", "request_snapshot", 72),
-        ("spill_refusal", "handle", "request_snapshot", 118),
+        "registry": assert_refused(
+            lambda: registry["drop_slot"]("source", "witness")
+        ),
+        "adapter": assert_refused(Adapter().drop),
+        "partial/lambda": assert_refused(
+            lambda: functools.partial(reconcile.drop_slot, "source", "witness")()
+        ),
+        "dynamically assembled subprocess": child.stdout.strip().split(":", 1)[-1],
+        "assembled SQL": assert_refused(lambda: guarded.execute(assembled_sql)),
     }
-)
-
-
-def _dotted_name(node):
-    parts = []
-    while isinstance(node, ast.Attribute):
-        parts.append(node.attr)
-        node = node.value
-    if isinstance(node, ast.Name):
-        parts.append(node.id)
-        return ".".join(reversed(parts))
-    return None
-
-
-def _ast_recovery_inventory():
-    """Derive route/caller edges and destructive effects from production source."""
-    source_root = Path(recovery.__file__).resolve().parent
-    files = tuple(sorted(source_root.glob("*.py")))
-    route_callers = {}
-    callsites = []
-    effect_sites = []
-    effects = {
-        "begin",
-        "resume",
-        "drop_slot",
-        "pg_drop_replication_slot",
-        "rmtree",
-        "unlink",
-        "remove",
-        "clear_replay_intent",
-        "prepare_replay_offset",
-        "install_replay_offset",
-        "request_snapshot",
-        "delete_resume_point",
-        "pg_create_logical_replication_slot",
+    assert refused == {
+        "aliased import": "slot_drop_guard_missing",
+        "dynamic getattr": "slot_drop_guard_missing",
+        "registry": "slot_drop_guard_missing",
+        "adapter": "slot_drop_guard_missing",
+        "partial/lambda": "slot_drop_guard_missing",
+        "dynamically assembled subprocess": "slot_drop_guard_missing",
+        "assembled SQL": "raw_slot_drop_sql_bypasses_guard",
     }
-
-    class Visitor(ast.NodeVisitor):
-        def __init__(self, module):
-            self.module = module
-            self.stack = []
-            self.function_nodes = []
-            self.source = ""
-
-        @property
-        def qualname(self):
-            return ".".join(self.stack)
-
-        def visit_ClassDef(self, node):
-            self.stack.append(node.name)
-            self.generic_visit(node)
-            self.stack.pop()
-
-        def visit_FunctionDef(self, node):
-            name = (
-                self.qualname + "." + node.name
-                if self.qualname
-                else node.name
-            )
-            self.function_nodes.append((name, node))
-            self.stack.append(node.name)
-            self.generic_visit(node)
-            self.stack.pop()
-
-        visit_AsyncFunctionDef = visit_FunctionDef
-
-        def visit_Call(self, node):
-            dotted = _dotted_name(node.func)
-            leaf = dotted.rsplit(".", 1)[-1] if dotted else None
-            if leaf in effects:
-                effect_sites.append((self.module, self.qualname, leaf, node.lineno))
-            if dotted not in {"recovery_mod.begin", "recovery_mod.resume"}:
-                self.generic_visit(node)
-                return
-            local_caller = self.qualname
-            caller = f"{self.module}.{local_caller}"
-            if dotted.endswith(".begin"):
-                decision = next(
-                    (keyword.value for keyword in node.keywords if keyword.arg == "decision"),
-                    None,
-                )
-                if decision is None:
-                    raise AssertionError(
-                        f"{self.module}:{caller} has a recovery.begin without decision="
-                    )
-                route_values = self._route_values(decision, local_caller)
-                if not route_values:
-                    raise AssertionError(
-                        f"{self.module}:{caller} has an unresolved recovery route"
-                    )
-            else:
-                route_values = set(route_callers.get(caller, ()))
-                if not route_values:
-                    if local_caller.endswith("resume_any_journalled_recovery"):
-                        route_values = set(FULL_RECOVERY_ROUTES)
-                    else:
-                        raise AssertionError(
-                            f"{self.module}:{caller} has a recovery.resume with no "
-                            "code-derived recovery.begin edge"
-                        )
-            route_callers.setdefault(caller, set()).update(route_values)
-            callsites.append((self.module, caller, dotted, tuple(sorted(route_values))))
-            self.generic_visit(node)
-
-        def visit_Constant(self, node):
-            if not isinstance(node.value, str):
-                self.generic_visit(node)
-                return
-            if "pg_drop_replication_slot" in node.value:
-                effect_sites.append(
-                    (self.module, self.qualname, "pg_drop_replication_slot", node.lineno)
-                )
-            if "pg_create_logical_replication_slot" in node.value:
-                effect_sites.append(
-                    (
-                        self.module,
-                        self.qualname,
-                        "pg_create_logical_replication_slot",
-                        node.lineno,
-                    )
-                )
-            self.generic_visit(node)
-
-        def visit_JoinedStr(self, node):
-            source = ast.get_source_segment(self.source, node) or ast.unparse(node)
-            lowered = source.lower()
-            if "delete from" in lowered and "debezium_offsets" in lowered:
-                effect_sites.append(
-                    (self.module, self.qualname, "delete_resume_point", node.lineno)
-                )
-            if "pg_create_logical_replication_slot" in lowered:
-                effect_sites.append(
-                    (
-                        self.module,
-                        self.qualname,
-                        "pg_create_logical_replication_slot",
-                        node.lineno,
-                    )
-                )
-            self.generic_visit(node)
-
-        def _route_values(self, node, caller):
-            dotted = _dotted_name(node)
-            if dotted == "recovery_mod.RESET_DECISION":
-                return {recovery.RESET_DECISION}
-            if dotted == "recovery_mod.ORPHAN_DECISION":
-                return {recovery.ORPHAN_DECISION}
-            if dotted == "verdict.decision":
-                return set(reconcile.RESNAPSHOT_DECISIONS)
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                return {node.value}
-            if isinstance(node, ast.IfExp):
-                return self._route_values(node.body, caller) | self._route_values(
-                    node.orelse, caller
-                )
-            if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
-                values = set()
-                for element in node.elts:
-                    values.update(self._route_values(element, caller))
-                return values
-            if isinstance(node, ast.Name):
-                values = set()
-                for function_name, function_node in self.function_nodes:
-                    if function_name != caller:
-                        continue
-                    for statement in ast.walk(function_node):
-                        if isinstance(statement, (ast.Assign, ast.AnnAssign)):
-                            targets = (
-                                statement.targets
-                                if isinstance(statement, ast.Assign)
-                                else (statement.target,)
-                            )
-                            if any(
-                                isinstance(target, ast.Name) and target.id == node.id
-                                for target in targets
-                            ):
-                                value = statement.value
-                                values.update(self._route_values(value, caller))
-                return values
-            return set()
-
-    for path in files:
-        visitor = Visitor(path.stem)
-        visitor.source = path.read_text()
-        visitor.visit(ast.parse(visitor.source, filename=str(path)))
-    return {
-        "route_callers": {name: frozenset(routes) for name, routes in route_callers.items()},
-        "callsites": tuple(callsites),
-        "effect_sites": tuple(effect_sites),
-    }
-
-
-def test_code_derived_destructive_recovery_inventory_is_declared():
-    """Every code path into slot/offset/snapshot destruction names its route."""
-    inventory = _ast_recovery_inventory()
-    derived = set().union(*inventory["route_callers"].values())
-    undeclared = derived - set(FULL_RECOVERY_ROUTES)
-    assert not undeclared, (
-        "production recovery caller(s) use undeclared destructive route(s): "
-        f"{sorted(undeclared)}; callers={inventory['route_callers']}"
-    )
-    assert recovery.ORPHAN_DECISION in derived
-    assert {
-        "acquisition.resume_any_journalled_recovery",
-        "acquisition.journal_the_reset",
-        "discovery_coordinator.LiveDiscoveryCoordinator._journal_local_slot_failure",
-        "pipeline.run",
-        "reconcile.recover_by_full_resnapshot",
-    } <= set(inventory["route_callers"])
-    undeclared_effects = (
-        set(inventory["effect_sites"]) - DECLARED_DESTRUCTIVE_EFFECT_SITES
-    )
-    assert not undeclared_effects, (
-        "production destructive primitive callsite(s) are undeclared: "
-        f"{sorted(undeclared_effects)}"
-    )
-    stale_declarations = (
-        DECLARED_DESTRUCTIVE_EFFECT_SITES - set(inventory["effect_sites"])
-    )
-    assert not stale_declarations, (
-        "destructive ownership manifest contains stale callsite(s): "
-        f"{sorted(stale_declarations)}"
-    )
-    effect_names = {leaf for _module, _caller, leaf, _line in inventory["effect_sites"]}
-    assert {
-        "begin",
-        "resume",
-        "drop_slot",
-        "rmtree",
-        "unlink",
-        "clear_replay_intent",
-        "prepare_replay_offset",
-        "install_replay_offset",
-        "request_snapshot",
-    } <= effect_names
 
 
 @pytest.mark.parametrize("decision", FULL_RECOVERY_ROUTES)

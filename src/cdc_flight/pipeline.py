@@ -422,14 +422,6 @@ def run(
             lease.acquire(con)
             lease_held = True
 
-        # rubric 4.7: a throwaway `_rs` slot left behind by an interrupted re-snapshot
-        # holds WAL on the source for ever and counts against `max_replication_slots`.
-        # Swept unconditionally, by the one name this pipeline derives from its own slot
-        # (Opus MAJOR-2, observed leaking twice on the shared cluster in one day).
-        summary_extra["stale_resnapshot_slot"] = resnapshot_mod.sweep_stale_slot(
-            routes.slot_owner_dsn, replication.slot_name
-        )
-
         captured_tables = acquisition.captured_tables(
             con,
             dest.pipeline_name,
@@ -481,6 +473,32 @@ def run(
             ),
         )
         summary_extra["slot_check"] = verdict.as_dict()
+        # A stale throwaway slot may be retired only while the main slot is the
+        # independently checked retention copy. In particular, the startup sweep is
+        # deferred when the main slot is missing/invalid/ahead; `_rs` may then be the
+        # only source-side retention for an undelivered logical message.
+        if verdict.ok and recovery is None:
+            stale_authorization = reconcile_mod.retention_slot_drop_authorization(
+                dsn=routes.slot_owner_dsn,
+                slot_name=resnapshot_mod.slot_name_for(replication.slot_name),
+                retention_slot_name=replication.slot_name,
+                publication_name=replication.publication_name,
+                application_patterns=replication.message_prefix_allowlist,
+                expected_source_identity={
+                    "system_identifier": verdict.context.get("system_identifier"),
+                    "timeline_id": verdict.context.get("timeline_id"),
+                },
+                after_lsn=verdict.context.get("durable_lsn"),
+            )
+            summary_extra["stale_resnapshot_slot"] = resnapshot_mod.sweep_stale_slot(
+                routes.slot_owner_dsn,
+                replication.slot_name,
+                authorization=stale_authorization,
+            )
+        else:
+            summary_extra["stale_resnapshot_slot"] = (
+                "deferred_until_main_slot_is_safe"
+            )
         if recovery is not None:
             phases.to(PHASE_RECOVERING, detail=verdict.decision)
             summary_extra["slot_recovery"] = recovery

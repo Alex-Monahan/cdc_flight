@@ -20,14 +20,17 @@ What lives where now:
 from __future__ import annotations
 
 import logging
+import re
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import destination as dest_mod
 from . import recovery as recovery_mod
-from .config import resolve_control_schema
+from .config import resolve_control_schema, source_connection_kwargs
 from .destination import raise_alert
 from .errors import (
+    LogicalMessageObligationUnresolved,
     NoDurableDestinationRow,
     SlotAheadOfDestination,
 )
@@ -39,6 +42,247 @@ from .offsets import Reconciliation, reconcile
 __all__ = ["Reconciliation", "reconcile"]
 
 log = logging.getLogger("cdc_flight.reconcile")
+
+
+# --------------------------------------------------------------------------- #
+# The slot-drop capability and its guarded source connection
+# --------------------------------------------------------------------------- #
+#
+# A caller list is not a safety boundary.  Python can reach a function through an
+# alias, getattr, a registry, an adapter, a partial, a lambda, or a subprocess.  The
+# only useful boundary is the effect itself: the slot-drop primitive receives a sealed
+# capability and performs the logical-message proof on the same source connection that
+# performs the drop.  An unsealed call has no destructive authority at all.
+_SLOT_DROP_SEAL = object()
+_DROP_SQL = re.compile(r"\bpg_drop_replication_slot\s*\(", re.IGNORECASE)
+_SLOT_DROP_GUARD_ATTEMPTS = 3
+
+
+@dataclass(frozen=True, slots=True)
+class SlotDropAuthorization:
+    """Opaque authority issued only after recovery has derived its obligation state.
+
+    The object is deliberately not a Boolean ``allow`` flag.  It binds the effect to
+    the exact DSN, slot, source fence, publication, and source lineage being checked.
+    ``drop_slot`` still performs the source check; this object only carries the facts it
+    must check and, for a throwaway slot, the independent retention slot that must remain.
+    """
+
+    _seal: object
+    dsn: str
+    slot_name: str
+    after_lsn: int | None
+    publication_name: str
+    application_patterns: tuple[str, ...]
+    expected_source_identity: Mapping[str, object] | tuple[object, object] | None
+    retention_slot_name: str | None = None
+
+    def is_sealed(self) -> bool:
+        return self._seal is _SLOT_DROP_SEAL
+
+
+def _recovery_slot_drop_authorization(
+    *,
+    dsn: str,
+    slot_name: str,
+    publication_name: str | None,
+    application_patterns: Iterable[str],
+    expected_source_identity,
+    after_lsn: int | None,
+) -> SlotDropAuthorization:
+    """Issue the capability for the main recovery slot after its certificate passed."""
+    if not dsn or not slot_name or not publication_name:
+        raise LogicalMessageObligationUnresolved(
+            "replication slot drop refused: a recovery slot lacks the exact source "
+            "DSN, publication, or durable LSN needed to discharge logical-message "
+            "obligations",
+            obligations=(
+                {
+                    "message_id": f"source-slot:{slot_name or 'unknown'}",
+                    "issues": ["slot_drop_guard_incomplete"],
+                    "has_ledger": False,
+                    "has_consumer": False,
+                    "has_audit": False,
+                },
+            ),
+        )
+    return SlotDropAuthorization(
+        _seal=_SLOT_DROP_SEAL,
+        dsn=str(dsn),
+        slot_name=str(slot_name),
+        after_lsn=int(after_lsn) if after_lsn is not None else None,
+        publication_name=str(publication_name),
+        application_patterns=tuple(application_patterns),
+        expected_source_identity=expected_source_identity,
+    )
+
+
+def retention_slot_drop_authorization(
+    *,
+    dsn: str,
+    slot_name: str,
+    retention_slot_name: str,
+    publication_name: str | None,
+    application_patterns: Iterable[str],
+    expected_source_identity=None,
+    after_lsn: int | None = None,
+) -> SlotDropAuthorization:
+    """Issue authority to retire a throwaway slot while another slot retains its WAL.
+
+    The retention slot is checked again inside ``drop_slot``.  In particular, this
+    capability cannot be used to sweep ``_rs`` when the main slot has disappeared: the
+    operation refuses before the target slot can be dropped.
+    """
+    if not retention_slot_name or retention_slot_name == slot_name:
+        raise ValueError("a throwaway slot must name a distinct retention slot")
+    if not dsn or not slot_name or not publication_name:
+        raise LogicalMessageObligationUnresolved(
+            "throwaway slot drop refused: its source retention proof is incomplete",
+            obligations=(
+                {
+                    "message_id": f"source-slot:{slot_name or 'unknown'}",
+                    "issues": ["slot_retention_guard_incomplete"],
+                    "has_ledger": False,
+                    "has_consumer": False,
+                    "has_audit": False,
+                },
+            ),
+        )
+    return SlotDropAuthorization(
+        _seal=_SLOT_DROP_SEAL,
+        dsn=str(dsn),
+        slot_name=str(slot_name),
+        after_lsn=int(after_lsn) if after_lsn is not None else None,
+        publication_name=str(publication_name),
+        application_patterns=tuple(application_patterns),
+        expected_source_identity=expected_source_identity,
+        retention_slot_name=str(retention_slot_name),
+    )
+
+
+class _GuardedSlotConnection:
+    """The only production connection wrapper on which slot-drop SQL is possible."""
+
+    __slots__ = ("_authorization", "_connection")
+
+    def __init__(self, connection, authorization: SlotDropAuthorization):
+        self._connection = connection
+        self._authorization = authorization
+
+    def execute(self, query, params=None):
+        if _DROP_SQL.search(str(query)):
+            raise LogicalMessageObligationUnresolved(
+                "raw replication-slot drop SQL is refused: execute the sealed "
+                "slot-drop primitive so its source proof and drop share one critical "
+                "section",
+                obligations=(
+                    {
+                        "message_id": f"source-slot:{self._authorization.slot_name}",
+                        "issues": ["raw_slot_drop_sql_bypasses_guard"],
+                        "has_ledger": False,
+                        "has_consumer": False,
+                        "has_audit": False,
+                    },
+                ),
+            )
+        if params is None:
+            return self._connection.execute(query)
+        return self._connection.execute(query, params)
+
+    def cursor(self, *args, **kwargs):
+        return _GuardedSlotCursor(
+            self._connection.cursor(*args, **kwargs), self._authorization
+        )
+
+    def transaction(self, *args, **kwargs):
+        return self._connection.transaction(*args, **kwargs)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return self._connection.__exit__(exc_type, exc_value, traceback)
+
+    def _execute_drop(self, query, params):
+        """Private effect edge used only after the in-primitive guard succeeds."""
+        if not self._authorization.is_sealed() or not _DROP_SQL.search(str(query)):
+            raise RuntimeError("invalid guarded slot-drop effect")
+        return self._connection.execute(query, params)
+
+
+class _GuardedSlotCursor:
+    """Apply the same raw-SQL barrier to cursor-based adapters."""
+
+    __slots__ = ("_authorization", "_cursor")
+
+    def __init__(self, cursor, authorization: SlotDropAuthorization):
+        self._cursor = cursor
+        self._authorization = authorization
+
+    def execute(self, query, params=None):
+        if _DROP_SQL.search(str(query)):
+            raise LogicalMessageObligationUnresolved(
+                "raw replication-slot drop SQL is refused on a guarded cursor",
+                obligations=(
+                    {
+                        "message_id": f"source-slot:{self._authorization.slot_name}",
+                        "issues": ["raw_slot_drop_sql_bypasses_guard"],
+                        "has_ledger": False,
+                        "has_consumer": False,
+                        "has_audit": False,
+                    },
+                ),
+            )
+        if params is None:
+            return self._cursor.execute(query)
+        return self._cursor.execute(query, params)
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+def _guarded_source_connection(authorization: SlotDropAuthorization):
+    """Open the guarded transaction-scoped source connection.
+
+    The raw psycopg connection is deliberately wrapped before it leaves this factory.
+    The slot-drop primitive alone can reach the private effect edge on the wrapper;
+    every ordinary ``execute``/``cursor`` path rejects slot-drop SQL.
+    """
+    import psycopg
+
+    raw = psycopg.connect(
+        authorization.dsn,
+        autocommit=False,
+        **source_connection_kwargs(
+            connect_timeout=5,
+            socket_timeout_seconds=5,
+            statement_timeout_ms=4000,
+        ),
+    )
+    return _GuardedSlotConnection(raw, authorization)
+
+
+def guarded_slot_connection(authorization: SlotDropAuthorization):
+    """Return the guarded source connection for non-destructive source work.
+
+    This is the only Flight-owned connection factory that may be used by code which
+    has a slot-drop authorization.  Raw slot-drop SQL remains unavailable on both its
+    connection and cursor; the private effect edge is used by :func:`drop_slot` only.
+    """
+    if not isinstance(authorization, SlotDropAuthorization) or not authorization.is_sealed():
+        raise LogicalMessageObligationUnresolved(
+            "guarded source connection refused: no sealed slot-drop authorization",
+            obligations=(
+                {
+                    "message_id": "source-slot:unknown",
+                    "issues": ["slot_drop_guard_missing"],
+                    "has_ledger": False,
+                    "has_consumer": False,
+                    "has_audit": False,
+                },
+            ),
+        )
+    return _guarded_source_connection(authorization)
 
 
 # --------------------------------------------------------------------------- #
@@ -491,44 +735,268 @@ def check_slot(
     return SlotVerdict("ok", ok=True, context=context)
 
 
-def drop_slot(dsn: str, slot_name: str) -> str:
-    """Drop the slot so the next start creates a fresh one. Returns what happened.
+def _source_wal_high_water(conn) -> int | None:
+    """Read a WAL high-water mark on either the primary or the standby slot owner."""
+    row = conn.execute(
+        "SELECT ((CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn() "
+        "ELSE pg_current_wal_lsn() END) - '0/0'::pg_lsn)::bigint"
+    ).fetchone()
+    return int(row[0]) if row and row[0] is not None else None
 
-    The re-snapshot **needs** a slot Debezium creates itself, and this is why. Debezium
-    only uses Postgres's exported snapshot - `CREATE_REPLICATION_SLOT` returning a
-    `consistent_point` plus a `snapshot_name`, then `SET TRANSACTION SNAPSHOT` - when it
-    creates the slot as part of the same start-up (`PostgresSnapshotChangeEventSource.
-    getTransactionStartLsn`: "if any SQL operations occur mid-snapshot ... otherwise
-    they'll be lost"). With a pre-existing slot it falls back to an ordinary snapshot
-    plus a role-appropriate source WAL upper-bound sample, and the snapshot/stream
-    boundary is then only as exact
-    as that pairing happens to be. VERIFIED in the engine log: a fresh slot gets
-    `SET TRANSACTION SNAPSHOT '…'`, a pre-existing one does not.
 
-    Keeping the stale slot would also be wrong for a different reason: its
-    `confirmed_flush_lsn` is by definition *ahead* of what we can account for, so a
-    stream resumed from it starts past the snapshot's consistent point and the window
-    in between is lost twice over.
+def _slot_row(conn, slot_name: str):
+    return conn.execute(
+        "SELECT plugin, (confirmed_flush_lsn - '0/0'::pg_lsn)::bigint, "
+        "       (restart_lsn - '0/0'::pg_lsn)::bigint, "
+        "       (SELECT system_identifier::text FROM pg_control_system()), "
+        "       (SELECT timeline_id FROM pg_control_checkpoint()) "
+        "FROM pg_replication_slots WHERE slot_name = %s",
+        (slot_name,),
+    ).fetchone()
+
+
+def _slot_drop_obligation(evidence, *, slot_name: str, issue: str | None = None):
+    if issue is None:
+        issue = (
+            "source_slot_application_message_unobserved"
+            if evidence.status == "application_message_present"
+            else "source_slot_evidence_unknown"
+        )
+    return LogicalMessageObligationUnresolved(
+        "replication slot drop refused: the in-primitive source check did not "
+        f"discharge the logical-message obligation ({evidence.status}; {issue})",
+        obligations=(
+            {
+                "message_id": f"source-slot:{slot_name}",
+                "issues": [issue],
+                "has_ledger": False,
+                "has_consumer": False,
+                "has_audit": False,
+                "source_evidence": evidence.as_dict(),
+            },
+        ),
+    )
+
+
+def _guarded_drop_sql(authorization: SlotDropAuthorization, high_water: int):
+    """Return the conditional drop statement at the end of the critical section."""
+    return (
+        "SELECT pg_drop_replication_slot(slot_name) "
+        "FROM pg_replication_slots "
+        "WHERE slot_name = %s "
+        "AND ((CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn() "
+        "ELSE pg_current_wal_lsn() END) - '0/0'::pg_lsn)::bigint = %s",
+        (authorization.slot_name, int(high_water)),
+    )
+
+
+def drop_slot(
+    dsn: str,
+    slot_name: str,
+    *,
+    authorization: SlotDropAuthorization | None = None,
+) -> str:
+    """Drop a slot only after this primitive discharges its source obligation.
+
+    There is deliberately no unguarded compatibility path. Every caller form reaches
+    this function or a ``_GuardedSlotConnection`` and therefore encounters the same
+    check. The source probe, WAL high-water fence, and conditional drop share one
+    transaction-scoped connection. A main recovery refuses on a present/unknown
+    message result; a throwaway slot additionally requires its named retention slot to
+    remain present at the effect edge.
     """
-    import psycopg
+    if not isinstance(authorization, SlotDropAuthorization) or not authorization.is_sealed():
+        raise LogicalMessageObligationUnresolved(
+            "replication slot drop refused: no sealed in-primitive logical-message "
+            "discharge was supplied (slot_drop_guard_missing)",
+            obligations=(
+                {
+                    "message_id": f"source-slot:{slot_name or 'unknown'}",
+                    "issues": ["slot_drop_guard_missing"],
+                    "has_ledger": False,
+                    "has_consumer": False,
+                    "has_audit": False,
+                },
+            ),
+        )
+    if str(dsn) != authorization.dsn or str(slot_name) != authorization.slot_name:
+        raise LogicalMessageObligationUnresolved(
+            "replication slot drop refused: the authorization is bound to a different "
+            "source DSN or slot",
+            obligations=(
+                {
+                    "message_id": f"source-slot:{slot_name or 'unknown'}",
+                    "issues": ["slot_drop_guard_identity_mismatch"],
+                    "has_ledger": False,
+                    "has_consumer": False,
+                    "has_audit": False,
+                },
+            ),
+        )
 
-    with psycopg.connect(
-        dsn,
-        autocommit=True,
-        connect_timeout=5,
-        options="-c statement_timeout=4000",
-        keepalives=1,
-        keepalives_idle=1,
-        keepalives_interval=1,
-        keepalives_count=2,
-        tcp_user_timeout=4000,
-    ) as conn:
-        rows = conn.execute(
-            "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
-            "WHERE slot_name = %s",
-            (slot_name,),
-        ).fetchall()
-    return "dropped" if rows else "absent"
+    from . import logical_messages
+
+    with _guarded_source_connection(authorization) as conn, conn.transaction():
+            # This advisory lock serializes guarded Flight slot effects for this source
+            # and slot. The high-water predicate below also rejects source WAL that
+            # changed outside Flight, including a concurrent logical message.
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"cdc_flight:slot-drop:{authorization.slot_name}",),
+            )
+            for _attempt in range(_SLOT_DROP_GUARD_ATTEMPTS):
+                target = _slot_row(conn, authorization.slot_name)
+                if target is None:
+                    return "absent"
+
+                if authorization.retention_slot_name is not None:
+                    retention = _slot_row(conn, authorization.retention_slot_name)
+                    if retention is None:
+                        raise _slot_drop_obligation(
+                            logical_messages.SourceMessageEvidence(
+                                status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+                                slot_name=authorization.retention_slot_name,
+                                error=(
+                                    "the retention slot disappeared before the "
+                                    "throwaway slot could be retired"
+                                ),
+                            ),
+                            slot_name=authorization.slot_name,
+                            issue="retention_slot_missing",
+                        )
+                    target_identity = (
+                        target[3], int(target[4]) if target[4] is not None else None
+                    )
+                    retention_identity = (
+                        retention[3], int(retention[4]) if retention[4] is not None else None
+                    )
+                    if target_identity != retention_identity:
+                        raise _slot_drop_obligation(
+                            logical_messages.SourceMessageEvidence(
+                                status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+                                slot_name=authorization.slot_name,
+                                plugin=str(target[0]) if target[0] is not None else None,
+                                system_identifier=target[3],
+                                timeline_id=target[4],
+                                error="target and retention slots have different source identity",
+                            ),
+                            slot_name=authorization.slot_name,
+                            issue="source_identity_changed",
+                        )
+                    retention_confirmed = retention[1]
+                    if retention_confirmed is None:
+                        raise _slot_drop_obligation(
+                            logical_messages.SourceMessageEvidence(
+                                status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+                                slot_name=authorization.retention_slot_name,
+                                error="retention slot has no confirmed_flush_lsn",
+                            ),
+                            slot_name=authorization.slot_name,
+                            issue="retention_slot_evidence_unknown",
+                        )
+                    after_lsn = (
+                        authorization.after_lsn
+                        if authorization.after_lsn is not None
+                        else int(retention_confirmed)
+                    )
+                    if int(retention_confirmed) > after_lsn:
+                        raise _slot_drop_obligation(
+                            logical_messages.SourceMessageEvidence(
+                                status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+                                slot_name=authorization.retention_slot_name,
+                                confirmed_flush_lsn=int(retention_confirmed),
+                                after_lsn=after_lsn,
+                                system_identifier=retention[3],
+                                timeline_id=retention[4],
+                                error="retention slot is ahead of the durable fence",
+                            ),
+                            slot_name=authorization.slot_name,
+                            issue="retention_slot_ahead_of_destination",
+                        )
+                else:
+                    # An operator reset may intentionally have no destination resume
+                    # row. In that one case the live slot's confirmed position is the
+                    # only durable fence available; it is still checked again by the
+                    # source probe below. A slot with no confirmed position remains
+                    # unknown and therefore cannot be dropped.
+                    after_lsn = (
+                        int(authorization.after_lsn)
+                        if authorization.after_lsn is not None
+                        else int(target[1]) if target[1] is not None else None
+                    )
+                    if after_lsn is None:
+                        raise _slot_drop_obligation(
+                            logical_messages.SourceMessageEvidence(
+                                status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+                                slot_name=authorization.slot_name,
+                                error="the recovery slot has no confirmed source fence",
+                            ),
+                            slot_name=authorization.slot_name,
+                            issue="slot_drop_guard_incomplete",
+                        )
+
+                evidence = logical_messages._probe_source_message_evidence_connection(
+                    conn,
+                    slot_name=authorization.slot_name,
+                    publication_name=authorization.publication_name,
+                    after_lsn=after_lsn,
+                    application_patterns=authorization.application_patterns,
+                    expected_source_identity=authorization.expected_source_identity,
+                )
+                if evidence.status != logical_messages.SOURCE_MESSAGE_PROBE_STATUS_EMPTY:
+                    if (
+                        authorization.retention_slot_name is not None
+                        and evidence.status
+                        == logical_messages.SOURCE_MESSAGE_PROBE_STATUS_PRESENT
+                    ):
+                        # The named retention slot was checked on this same connection;
+                        # the message remains recoverable there, so retiring only the
+                        # derived copy cannot destroy the last source evidence.
+                        pass
+                    else:
+                        issue = (
+                            "source_slot_application_message_unobserved"
+                            if evidence.status
+                            == logical_messages.SOURCE_MESSAGE_PROBE_STATUS_PRESENT
+                            else "source_slot_evidence_unknown"
+                        )
+                        raise _slot_drop_obligation(
+                            evidence, slot_name=authorization.slot_name, issue=issue
+                        )
+
+                high_water = _source_wal_high_water(conn)
+                if high_water is None:
+                    raise _slot_drop_obligation(
+                        logical_messages.SourceMessageEvidence(
+                            status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+                            slot_name=authorization.slot_name,
+                            after_lsn=after_lsn,
+                            error="source WAL high-water is unavailable",
+                        ),
+                        slot_name=authorization.slot_name,
+                        issue="source_wal_high_water_unknown",
+                    )
+                rows = conn._execute_drop(
+                    *_guarded_drop_sql(authorization, high_water)
+                ).fetchall()
+                if rows:
+                    return "dropped"
+                # A source transaction, including a standalone logical message,
+                # committed after the probe. Re-run the complete probe on this same
+                # connection; exhausting the bounded retry fails closed with the slot
+                # untouched.
+                if _slot_row(conn, authorization.slot_name) is None:
+                    return "absent"
+            raise _slot_drop_obligation(
+                logical_messages.SourceMessageEvidence(
+                    status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+                    slot_name=authorization.slot_name,
+                    after_lsn=after_lsn,
+                    error="source WAL changed during the guarded slot-drop critical section",
+                ),
+                slot_name=authorization.slot_name,
+                issue="source_changed_during_slot_drop",
+            )
 
 
 def recover_by_full_resnapshot(

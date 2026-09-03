@@ -193,130 +193,98 @@ def _decode_pgoutput_message(data: object) -> dict[str, Any] | None:
     }
 
 
-def peek_source_message_evidence(
-    dsn: str | None,
+def _probe_source_message_evidence_connection(
+    conn,
     *,
-    slot_name: str | None,
-    publication_name: str | None,
-    after_lsn: int | None,
+    slot_name: str,
+    publication_name: str,
+    after_lsn: int,
     application_patterns: Iterable[str] = DEFAULT_APPLICATION_PREFIX_ALLOWLIST,
     expected_source_identity: Mapping[str, object] | tuple[object, object] | None = None,
-    connect_timeout: int = 5,
-    statement_timeout_ms: int = 4000,
 ) -> SourceMessageEvidence:
-    """Peek for an unobserved application message without advancing PostgreSQL.
+    """Probe one already-open source connection.
 
-    The server statement timeout and client TCP timeout bound the whole operation.
-    There is intentionally no upto_nchanges truncation: stopping after a small
-    prefix could call a live obligation absent merely because it was later in the
-    slot. The query is read-only and returns unknown on every transport, slot,
-    plugin, or decode failure, so an unavailable source can never authorize a
-    destructive route.
+    This is intentionally separate from :func:`peek_source_message_evidence`.  The
+    ordinary recovery certificate uses a short-lived read-only connection, while the
+    slot-drop primitive must perform the same probe and the drop on one guarded source
+    connection.  Keeping the decoder here prevents the destructive primitive from
+    falling back to a second, independently-timed probe.
     """
-    if not dsn or not slot_name or not publication_name or after_lsn is None:
+    policy = MessagePrefixPolicy(application_patterns=tuple(application_patterns))
+    slot = conn.execute(
+        "SELECT plugin, (confirmed_flush_lsn - '0/0'::pg_lsn)::bigint, "
+        "(SELECT system_identifier::text FROM pg_control_system()), "
+        "(SELECT timeline_id FROM pg_control_checkpoint()) "
+        "FROM pg_replication_slots WHERE slot_name = %s",
+        (slot_name,),
+    ).fetchone()
+    if slot is None:
         return SourceMessageEvidence(
             status=SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
             slot_name=slot_name,
             after_lsn=after_lsn,
-            error="source slot probe is missing its DSN, slot, publication, or durable LSN",
+            error="source slot is absent; its old WAL cannot be inspected",
         )
-    try:
-        policy = MessagePrefixPolicy(application_patterns=tuple(application_patterns))
-        import psycopg
-
-        with psycopg.connect(
-            dsn,
-            autocommit=True,
-            **source_connection_kwargs(
-                connect_timeout=connect_timeout,
-                socket_timeout_seconds=max(1, statement_timeout_ms / 1000),
-                statement_timeout_ms=statement_timeout_ms,
-            ),
-        ) as conn:
-            slot = conn.execute(
-                "SELECT plugin, (confirmed_flush_lsn - '0/0'::pg_lsn)::bigint, "
-                "(SELECT system_identifier::text FROM pg_control_system()), "
-                "(SELECT timeline_id FROM pg_control_checkpoint()) "
-                "FROM pg_replication_slots WHERE slot_name = %s",
-                (slot_name,),
-            ).fetchone()
-            if slot is None:
-                return SourceMessageEvidence(
-                    status=SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
-                    slot_name=slot_name,
-                    after_lsn=after_lsn,
-                    error="source slot is absent; its old WAL cannot be inspected",
-                )
-            plugin = str(slot[0]) if slot[0] is not None else None
-            confirmed = int(slot[1]) if slot[1] is not None else None
-            source_system_identifier = (
-                str(slot[2]) if slot[2] is not None else None
+    plugin = str(slot[0]) if slot[0] is not None else None
+    confirmed = int(slot[1]) if slot[1] is not None else None
+    source_system_identifier = str(slot[2]) if slot[2] is not None else None
+    source_timeline_id = int(slot[3]) if slot[3] is not None else None
+    actual_source_identity = (source_system_identifier, source_timeline_id)
+    if expected_source_identity is not None:
+        expected = _source_identity(expected_source_identity)
+        identity_error = (
+            "source_identity_changed: the expected source identity is incomplete"
+            if expected is None
+            else _source_identity_error(expected, actual_source_identity)
+        )
+        if identity_error is not None:
+            return SourceMessageEvidence(
+                status=SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+                slot_name=slot_name,
+                plugin=plugin,
+                system_identifier=source_system_identifier,
+                timeline_id=source_timeline_id,
+                after_lsn=after_lsn,
+                confirmed_flush_lsn=confirmed,
+                error=identity_error,
             )
-            source_timeline_id = int(slot[3]) if slot[3] is not None else None
-            actual_source_identity = (source_system_identifier, source_timeline_id)
-            if expected_source_identity is not None:
-                expected = _source_identity(expected_source_identity)
-                identity_error = (
-                    "source_identity_changed: the expected source identity is incomplete"
-                    if expected is None
-                    else _source_identity_error(expected, actual_source_identity)
-                )
-                if identity_error is not None:
-                    return SourceMessageEvidence(
-                        status=SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
-                        slot_name=slot_name,
-                        plugin=plugin,
-                        system_identifier=source_system_identifier,
-                        timeline_id=source_timeline_id,
-                        after_lsn=after_lsn,
-                        confirmed_flush_lsn=confirmed,
-                        error=identity_error,
-                    )
-            if plugin != "pgoutput":
-                return SourceMessageEvidence(
-                    status=SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
-                    slot_name=slot_name,
-                    plugin=plugin,
-                    system_identifier=source_system_identifier,
-                    timeline_id=source_timeline_id,
-                    after_lsn=after_lsn,
-                    confirmed_flush_lsn=confirmed,
-                    error=f"source slot plugin {plugin!r} is not stock pgoutput",
-                )
-            if confirmed is None or confirmed > after_lsn:
-                return SourceMessageEvidence(
-                    status=SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
-                    slot_name=slot_name,
-                    plugin="pgoutput",
-                    system_identifier=source_system_identifier,
-                    timeline_id=source_timeline_id,
-                    after_lsn=after_lsn,
-                    confirmed_flush_lsn=confirmed,
-                    error=(
-                        "source slot has already acknowledged beyond the durable "
-                        "destination LSN; its peek cannot prove the intervening WAL "
-                        "was delivered"
-                    ),
-                )
-            rows = conn.execute(
-                """
-                SELECT (changes.lsn - '0/0'::pg_lsn)::bigint, changes.data
-                FROM pg_logical_slot_peek_binary_changes(
-                    %s, NULL, NULL,
-                    'proto_version', '1',
-                    'publication_names', %s,
-                    'messages', 'true'
-                ) AS changes
-                """,
-                (slot_name, publication_name),
-            ).fetchall()
-    except Exception as exc:
+    if plugin != "pgoutput":
         return SourceMessageEvidence(
             status=SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
             slot_name=slot_name,
+            plugin=plugin,
+            system_identifier=source_system_identifier,
+            timeline_id=source_timeline_id,
             after_lsn=after_lsn,
-            error=f"{type(exc).__name__}: {exc}",
+            confirmed_flush_lsn=confirmed,
+            error=f"source slot plugin {plugin!r} is not stock pgoutput",
         )
+    if confirmed is None or confirmed > after_lsn:
+        return SourceMessageEvidence(
+            status=SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+            slot_name=slot_name,
+            plugin="pgoutput",
+            system_identifier=source_system_identifier,
+            timeline_id=source_timeline_id,
+            after_lsn=after_lsn,
+            confirmed_flush_lsn=confirmed,
+            error=(
+                "source slot has already acknowledged beyond the durable destination "
+                "LSN; its peek cannot prove the intervening WAL was delivered"
+            ),
+        )
+    rows = conn.execute(
+        """
+        SELECT (changes.lsn - '0/0'::pg_lsn)::bigint, changes.data
+        FROM pg_logical_slot_peek_binary_changes(
+            %s, NULL, NULL,
+            'proto_version', '1',
+            'publication_names', %s,
+            'messages', 'true'
+        ) AS changes
+        """,
+        (slot_name, publication_name),
+    ).fetchall()
 
     application_messages: list[dict[str, Any]] = []
     for lsn, data in rows:
@@ -372,6 +340,62 @@ def peek_source_message_evidence(
         scanned_records=len(rows),
         application_messages=tuple(application_messages),
     )
+
+
+def peek_source_message_evidence(
+    dsn: str | None,
+    *,
+    slot_name: str | None,
+    publication_name: str | None,
+    after_lsn: int | None,
+    application_patterns: Iterable[str] = DEFAULT_APPLICATION_PREFIX_ALLOWLIST,
+    expected_source_identity: Mapping[str, object] | tuple[object, object] | None = None,
+    connect_timeout: int = 5,
+    statement_timeout_ms: int = 4000,
+) -> SourceMessageEvidence:
+    """Peek for an unobserved application message without advancing PostgreSQL.
+
+    The server statement timeout and client TCP timeout bound the whole operation.
+    There is intentionally no upto_nchanges truncation: stopping after a small
+    prefix could call a live obligation absent merely because it was later in the
+    slot. The query is read-only and returns unknown on every transport, slot,
+    plugin, or decode failure, so an unavailable source can never authorize a
+    destructive route.
+    """
+    if not dsn or not slot_name or not publication_name or after_lsn is None:
+        return SourceMessageEvidence(
+            status=SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+            slot_name=slot_name,
+            after_lsn=after_lsn,
+            error="source slot probe is missing its DSN, slot, publication, or durable LSN",
+        )
+    try:
+        import psycopg
+
+        with psycopg.connect(
+            dsn,
+            autocommit=True,
+            **source_connection_kwargs(
+                connect_timeout=connect_timeout,
+                socket_timeout_seconds=max(1, statement_timeout_ms / 1000),
+                statement_timeout_ms=statement_timeout_ms,
+            ),
+        ) as conn:
+            return _probe_source_message_evidence_connection(
+                conn,
+                slot_name=slot_name,
+                publication_name=publication_name,
+                after_lsn=after_lsn,
+                application_patterns=application_patterns,
+                expected_source_identity=expected_source_identity,
+            )
+    except Exception as exc:
+        return SourceMessageEvidence(
+            status=SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+            slot_name=slot_name,
+            after_lsn=after_lsn,
+            error=f"{type(exc).__name__}: {exc}",
+        )
 
 
 def normalize_prefix_allowlist(patterns: str | Iterable[str]) -> tuple[str, ...]:
