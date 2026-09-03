@@ -8,8 +8,13 @@ claiming a live round trip.
 
 from __future__ import annotations
 
+import ast
 import base64
 import json
+import struct
+import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import duckdb
 import pytest
@@ -27,7 +32,12 @@ from cdc_flight.assembler import (
 )
 from cdc_flight.commit_protocol import _unit_has_delivery_data
 from cdc_flight.control_schema import ensure_control_schema
-from cdc_flight.destination import ResumePoint, ensure_dataset, write_slot_state
+from cdc_flight.destination import (
+    ResumePoint,
+    ensure_dataset,
+    write_resume_point,
+    write_slot_state,
+)
 from cdc_flight.envelope import (
     KIND_DATA,
     KIND_MESSAGE,
@@ -426,6 +436,59 @@ def _durable_message_certificate(*, lsn: int) -> tuple[duckdb.DuckDBPyConnection
     return con, str(message_id)
 
 
+def _arm_empty_replay_marker(con, path, *, namespace="empty-ns", lsn=400):
+    point = ResumePoint(
+        partition={"server": TOPIC_PREFIX},
+        offset={"lsn": lsn},
+        last_lsn=lsn,
+        commit_id=1,
+    )
+    write_resume_point(
+        con,
+        pipeline=PIPELINE,
+        namespace=namespace,
+        point=point,
+        commit_id=1,
+        offset_blob=b"offset",
+        offset_key_blob=b"key",
+    )
+    intent = offsets.arm_replay_intent(
+        path,
+        pipeline=PIPELINE,
+        namespace=namespace,
+        durable_point=point,
+    )
+    return point, intent
+
+
+class _FakeSourceResult:
+    def __init__(self, rows):
+        self.rows = list(rows)
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
+    def fetchall(self):
+        return list(self.rows)
+
+
+class _FakeSourceConnection:
+    def __init__(self, rows, *, slot=("pgoutput", 900)):
+        self.rows = rows
+        self.slot = slot
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def execute(self, sql, _params):
+        if "pg_logical_slot_peek_binary_changes" in sql:
+            return _FakeSourceResult(self.rows)
+        return _FakeSourceResult([self.slot])
+
+
 def test_recovery_certificate_sees_both_ledger_consumer_boundaries():
     """A split durable certificate is an obligation, not a successful delivery."""
     ledger_only, ledger_only_id = _durable_message_certificate(lsn=250)
@@ -483,6 +546,128 @@ def test_recovery_certificate_sees_both_ledger_consumer_boundaries():
         consumer_only.close()
 
 
+def test_empty_marker_requires_source_slot_probe_and_keeps_unknown_fail_closed(
+    tmp_path, monkeypatch
+):
+    """An empty derived join is unknown until the source slot positively says empty."""
+    con = _plan_connection()
+    connect_calls = []
+
+    def connect(dsn, **kwargs):
+        connect_calls.append((dsn, kwargs))
+        return _FakeSourceConnection([])
+
+    monkeypatch.setitem(
+        sys.modules,
+        "psycopg",
+        SimpleNamespace(connect=connect),
+    )
+    marker = tmp_path / offsets.REPLAY_INTENT_FILE_NAME
+    _arm_empty_replay_marker(con, marker)
+    try:
+        state = require_recovery_message_certificate(
+            con,
+            dataset=DATASET,
+            pipeline=PIPELINE,
+            replay_intent_path=marker,
+            source_dsn="postgresql://source",
+            source_slot_name="source-slot",
+            source_publication_name="cdc_flight_pub",
+        )
+        assert state.certified_message_ids == ()
+        assert state.replay_intent_present is True
+        assert state.unknown_resolved is True
+        assert state.source_evidence["status"] == "no_application_message"
+        assert connect_calls[0][0] == "postgresql://source"
+        assert connect_calls[0][1]["options"] == "-c statement_timeout=4000"
+        assert connect_calls[0][1]["tcp_user_timeout"] == 4000
+    finally:
+        con.close()
+
+
+def test_source_slot_application_message_blocks_and_marker_remains(tmp_path, monkeypatch):
+    """A real pgoutput M record is evidence of an undelivered obligation."""
+    con = _plan_connection()
+    source_lsn = 450
+    payload = (
+        struct.pack(">BBQ", ord("M"), 0, source_lsn)
+        + b"app_unobserved\0"
+        + struct.pack(">I", 5)
+        + b"hello"
+    )
+
+    def connect(_dsn, **_kwargs):
+        return _FakeSourceConnection([(source_lsn, payload)])
+
+    monkeypatch.setitem(sys.modules, "psycopg", SimpleNamespace(connect=connect))
+    marker = tmp_path / offsets.REPLAY_INTENT_FILE_NAME
+    _arm_empty_replay_marker(con, marker, lsn=400)
+    try:
+        with pytest.raises(
+            LogicalMessageObligationUnresolved,
+            match="source-slot:",
+        ) as caught:
+            require_recovery_message_certificate(
+                con,
+                dataset=DATASET,
+                pipeline=PIPELINE,
+                replay_intent_path=marker,
+                source_dsn="postgresql://source",
+                source_slot_name="source-slot",
+                source_publication_name="cdc_flight_pub",
+            )
+        assert caught.value.obligations[0]["issues"] == [
+            "source_slot_application_message_unobserved"
+        ]
+        assert caught.value.obligations[0]["source_evidence"][
+            "application_messages"
+        ][0]["prefix"] == "app_unobserved"
+        assert marker.exists()
+    finally:
+        con.close()
+
+
+def test_missing_source_probe_inputs_never_authorize_an_empty_marker(tmp_path):
+    con = _plan_connection()
+    marker = tmp_path / offsets.REPLAY_INTENT_FILE_NAME
+    _arm_empty_replay_marker(con, marker)
+    try:
+        with pytest.raises(LogicalMessageObligationUnresolved) as caught:
+            require_recovery_message_certificate(
+                con,
+                dataset=DATASET,
+                pipeline=PIPELINE,
+                replay_intent_path=marker,
+            )
+        assert caught.value.obligations[0]["issues"] == ["source_slot_evidence_unknown"]
+        assert marker.exists()
+    finally:
+        con.close()
+
+
+def test_complete_derived_certificate_is_the_positive_marker_proof(tmp_path):
+    """The positive derivation path discharges without needing the old slot."""
+    con, message_id = _durable_message_certificate(lsn=480)
+    marker = tmp_path / offsets.REPLAY_INTENT_FILE_NAME
+    point, _intent = _arm_empty_replay_marker(
+        con, marker, namespace="positive-ns", lsn=480
+    )
+    try:
+        state = require_recovery_message_certificate(
+            con,
+            dataset=DATASET,
+            pipeline=PIPELINE,
+            replay_intent_path=marker,
+        )
+        assert state.certified_message_ids == (message_id,)
+        assert state.replay_intent_present is True
+        assert state.unknown_resolved is False
+        assert state.source_evidence is None
+        assert point.last_lsn == 480
+    finally:
+        con.close()
+
+
 def test_full_recovery_guard_is_before_any_destructive_journal_step(tmp_path):
     """The mutation target: removing the guard makes this test fail."""
     con, message_id = _durable_message_certificate(lsn=260)
@@ -534,7 +719,189 @@ def test_full_recovery_guard_is_before_any_destructive_journal_step(tmp_path):
         con.close()
 
 
-FULL_RECOVERY_ROUTES = (*reconcile.RESNAPSHOT_DECISIONS, recovery.RESET_DECISION)
+FULL_RECOVERY_ROUTES = (
+    *reconcile.RESNAPSHOT_DECISIONS,
+    recovery.RESET_DECISION,
+    recovery.ORPHAN_DECISION,
+)
+
+
+def _dotted_name(node):
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        return ".".join(reversed(parts))
+    return None
+
+
+def _ast_recovery_inventory():
+    """Derive route/caller edges and destructive effects from production source."""
+    source_root = Path(recovery.__file__).resolve().parent
+    files = tuple(sorted(source_root.glob("*.py")))
+    route_callers = {}
+    callsites = []
+    effect_sites = []
+    effects = {
+        "begin",
+        "resume",
+        "drop_slot",
+        "pg_drop_replication_slot",
+        "rmtree",
+        "unlink",
+        "clear_replay_intent",
+        "prepare_replay_offset",
+        "install_replay_offset",
+        "request_snapshot",
+    }
+
+    class Visitor(ast.NodeVisitor):
+        def __init__(self, module):
+            self.module = module
+            self.stack = []
+            self.function_nodes = []
+
+        @property
+        def qualname(self):
+            return ".".join(self.stack)
+
+        def visit_ClassDef(self, node):
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def visit_FunctionDef(self, node):
+            name = (
+                self.qualname + "." + node.name
+                if self.qualname
+                else node.name
+            )
+            self.function_nodes.append((name, node))
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Call(self, node):
+            dotted = _dotted_name(node.func)
+            leaf = dotted.rsplit(".", 1)[-1] if dotted else None
+            if leaf in effects:
+                effect_sites.append((self.module, self.qualname, leaf))
+            if dotted not in {"recovery_mod.begin", "recovery_mod.resume"}:
+                self.generic_visit(node)
+                return
+            local_caller = self.qualname
+            caller = f"{self.module}.{local_caller}"
+            if dotted.endswith(".begin"):
+                decision = next(
+                    (keyword.value for keyword in node.keywords if keyword.arg == "decision"),
+                    None,
+                )
+                if decision is None:
+                    raise AssertionError(
+                        f"{self.module}:{caller} has a recovery.begin without decision="
+                    )
+                route_values = self._route_values(decision, local_caller)
+                if not route_values:
+                    raise AssertionError(
+                        f"{self.module}:{caller} has an unresolved recovery route"
+                    )
+            else:
+                route_values = set(route_callers.get(caller, ()))
+                if not route_values:
+                    if local_caller.endswith("resume_any_journalled_recovery"):
+                        route_values = set(FULL_RECOVERY_ROUTES)
+                    else:
+                        raise AssertionError(
+                            f"{self.module}:{caller} has a recovery.resume with no "
+                            "code-derived recovery.begin edge"
+                        )
+            route_callers.setdefault(caller, set()).update(route_values)
+            callsites.append((self.module, caller, dotted, tuple(sorted(route_values))))
+            self.generic_visit(node)
+
+        def _route_values(self, node, caller):
+            dotted = _dotted_name(node)
+            if dotted == "recovery_mod.RESET_DECISION":
+                return {recovery.RESET_DECISION}
+            if dotted == "recovery_mod.ORPHAN_DECISION":
+                return {recovery.ORPHAN_DECISION}
+            if dotted == "verdict.decision":
+                return set(reconcile.RESNAPSHOT_DECISIONS)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return {node.value}
+            if isinstance(node, ast.IfExp):
+                return self._route_values(node.body, caller) | self._route_values(
+                    node.orelse, caller
+                )
+            if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+                values = set()
+                for element in node.elts:
+                    values.update(self._route_values(element, caller))
+                return values
+            if isinstance(node, ast.Name):
+                values = set()
+                for function_name, function_node in self.function_nodes:
+                    if function_name != caller:
+                        continue
+                    for statement in ast.walk(function_node):
+                        if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                            targets = (
+                                statement.targets
+                                if isinstance(statement, ast.Assign)
+                                else (statement.target,)
+                            )
+                            if any(
+                                isinstance(target, ast.Name) and target.id == node.id
+                                for target in targets
+                            ):
+                                value = statement.value
+                                values.update(self._route_values(value, caller))
+                return values
+            return set()
+
+    for path in files:
+        visitor = Visitor(path.stem)
+        visitor.visit(ast.parse(path.read_text(), filename=str(path)))
+    return {
+        "route_callers": {name: frozenset(routes) for name, routes in route_callers.items()},
+        "callsites": tuple(callsites),
+        "effect_sites": tuple(effect_sites),
+    }
+
+
+def test_code_derived_destructive_recovery_inventory_is_declared():
+    """Every code path into slot/offset/snapshot destruction names its route."""
+    inventory = _ast_recovery_inventory()
+    derived = set().union(*inventory["route_callers"].values())
+    undeclared = derived - set(FULL_RECOVERY_ROUTES)
+    assert not undeclared, (
+        "production recovery caller(s) use undeclared destructive route(s): "
+        f"{sorted(undeclared)}; callers={inventory['route_callers']}"
+    )
+    assert recovery.ORPHAN_DECISION in derived
+    assert {
+        "acquisition.resume_any_journalled_recovery",
+        "acquisition.journal_the_reset",
+        "discovery_coordinator.LiveDiscoveryCoordinator._journal_local_slot_failure",
+        "pipeline.run",
+        "reconcile.recover_by_full_resnapshot",
+    } <= set(inventory["route_callers"])
+    effect_names = {leaf for _module, _caller, leaf in inventory["effect_sites"]}
+    assert {
+        "begin",
+        "resume",
+        "drop_slot",
+        "rmtree",
+        "unlink",
+        "clear_replay_intent",
+        "prepare_replay_offset",
+        "install_replay_offset",
+        "request_snapshot",
+    } <= effect_names
 
 
 @pytest.mark.parametrize("decision", FULL_RECOVERY_ROUTES)
@@ -554,7 +921,15 @@ def test_every_full_recovery_route_uses_the_same_certificate_guard(
             pipeline=PIPELINE,
             slot_name="route-slot",
             observation={},
-            verdict="fresh_start" if decision == recovery.RESET_DECISION else decision,
+            verdict=(
+                "fresh_start"
+                if decision == recovery.RESET_DECISION
+                else (
+                    "no_durable_destination_row"
+                    if decision == recovery.ORPHAN_DECISION
+                    else decision
+                )
+            ),
             verdict_message="split certificate route test",
         )
         with pytest.raises(LogicalMessageObligationUnresolved):

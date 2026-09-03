@@ -18,7 +18,12 @@ import psycopg
 import pytest
 from support.fixtures import Sandbox
 
-from cdc_flight.logical_messages import read_logical_messages
+from cdc_flight import offsets
+from cdc_flight.destination import ResumePoint
+from cdc_flight.logical_messages import (
+    peek_source_message_evidence,
+    read_logical_messages,
+)
 
 pytestmark = [pytest.mark.slow, pytest.mark.e2e]
 
@@ -27,6 +32,7 @@ _SLOT_SQL = (
     "       (restart_lsn - '0/0'::pg_lsn)::bigint "
     "FROM pg_replication_slots WHERE slot_name = %s"
 )
+_RECOVERY_NAMESPACE = "cdc-flight-engine"
 
 
 def _child_tail(process) -> tuple[str, str]:
@@ -100,6 +106,62 @@ def _emit_message(source, *, transactional: bool, prefix: str, content: str) -> 
             with conn.transaction():
                 return int(conn.execute(sql, (True, prefix, content)).fetchone()[0])
         return int(conn.execute(sql, (False, prefix, content)).fetchone()[0])
+
+
+def _arm_real_replay_intent(box: Sandbox) -> ResumePoint:
+    """Arm the production marker against the baseline's durable resume row."""
+    pipeline = box.env["CDC_PIPELINE_NAME"]
+    row = box.duck_query(
+        "SELECT resume_json, commit_id, last_lsn FROM _cdc_flight.debezium_offsets "
+        "WHERE pipeline = ? AND namespace = ?",
+        [pipeline, _RECOVERY_NAMESPACE],
+    )
+    assert len(row) == 1, row
+    point = ResumePoint.from_json(str(row[0][0]), commit_id=int(row[0][1]))
+    point.last_lsn = int(row[0][2])
+    offsets.arm_replay_intent(
+        offsets.replay_intent_path(box.state_dir),
+        pipeline=pipeline,
+        namespace=_RECOVERY_NAMESPACE,
+        durable_point=point,
+    )
+    return point
+
+
+def _create_witness_slot(box: Sandbox) -> str:
+    """Create a read-only proof slot before a deliberately missing main slot."""
+    slot = f"p72_witness_{uuid.uuid4().hex}"
+    rows = box.pg_query(
+        "SELECT slot_name FROM pg_create_logical_replication_slot(%s, 'pgoutput')",
+        (slot,),
+    )
+    assert rows == [(slot,)], rows
+    return slot
+
+
+def _drop_named_slot(box: Sandbox, slot: str | None) -> None:
+    if slot is None:
+        return
+    box.pg_query(
+        "SELECT pg_drop_replication_slot(slot_name) "
+        "FROM pg_replication_slots WHERE slot_name = %s",
+        (slot,),
+    )
+
+
+def _emit_unobserved_message(box: Sandbox, *, prefix: str) -> int:
+    """Emit a non-transactional message and force its WAL into the source slot."""
+    lsn = _emit_message(
+        box.source,
+        transactional=False,
+        prefix=prefix,
+        content="p72-unobserved",
+    )
+    # pg_logical_emit_message(false, ...) is WAL-visible but not a transaction
+    # commit. CHECKPOINT makes the source-side probe's retained slot output a
+    # deterministic witness without involving the Flight child.
+    box.sql("CHECKPOINT")
+    return lsn
 
 
 def _wait_for_confirmed(sandbox, process, target: int, *, timeout: float) -> int:
@@ -629,6 +691,128 @@ def test_full_recovery_preserves_the_pre_ack_message_certificate(
             assert recovered.get("slot_check", {}).get("decision") == "slot_missing", recovered
         else:
             assert recovered.get("reset_state", {}).get("decision") == "operator_reset", recovered
+    finally:
+        box.cleanup()
+        box.reseed()
+
+
+@pytest.mark.parametrize("route", ["slot_missing", "operator_reset"])
+def test_unobserved_real_message_blocks_both_full_recovery_routes(
+    tmp_path, postgres_cluster, route
+):
+    """A source message outside Flight's join survives a refused destructive route."""
+    box = Sandbox(f"p72_unobserved_{route}", tmp_path / route, postgres_cluster)
+    witness_slot = None
+    try:
+        box.reseed()
+        baseline = box.run(
+            reset_state=True,
+            max_seconds=180,
+            idle_seconds=6,
+            extra_env={"CDC_COMPLETION_WATERMARK": "0"},
+        )
+        assert baseline["returncode"] == 0, baseline
+        durable_point = _arm_real_replay_intent(box)
+        pipeline = box.env["CDC_PIPELINE_NAME"]
+        prefix = f"app_p72_unobserved_{uuid.uuid4().hex}"
+        if route == "slot_missing":
+            # The witness starts at the same durable boundary as the main slot. It
+            # proves the source message is still retained after an external main-slot
+            # loss, when that missing slot can no longer answer the probe itself.
+            witness_slot = _create_witness_slot(box)
+        message_lsn = _emit_unobserved_message(box, prefix=prefix)
+        source_slot = witness_slot or box.slot
+        before = peek_source_message_evidence(
+            box.source.dsn,
+            slot_name=source_slot,
+            publication_name="cdc_flight_pub",
+            after_lsn=durable_point.last_lsn,
+        )
+        assert before.status == "application_message_present", before
+        assert before.application_messages[0]["prefix"] == prefix, before
+        assert before.application_messages[0]["source_lsn"] == message_lsn, before
+
+        if route == "slot_missing":
+            box.drop_slot()
+            recovered = box.run(
+                max_seconds=180,
+                idle_seconds=8,
+                timeout=300,
+                expect_success=False,
+                extra_env={"CDC_COMPLETION_WATERMARK": "0"},
+            )
+        else:
+            recovered = box.run(
+                reset_state=True,
+                max_seconds=180,
+                idle_seconds=8,
+                timeout=300,
+                expect_success=False,
+                extra_env={"CDC_COMPLETION_WATERMARK": "0"},
+            )
+        assert recovered["returncode"] != 0, recovered
+        assert "source-slot:" in recovered.get("output", ""), recovered
+        assert offsets.replay_intent_path(box.state_dir).exists()
+        assert box.duck_query(
+            "SELECT count(*) FROM cdc_raw.cdcflight_logical_messages "
+            "WHERE pipeline = ? AND prefix = ?",
+            [pipeline, prefix],
+        ) == [(0,)]
+        assert box.duck_query(
+            "SELECT count(*) FROM _cdc_flight.recovery_state "
+            "WHERE pipeline = ? AND namespace = ?",
+            [pipeline, _RECOVERY_NAMESPACE],
+        ) == [(0,)]
+
+        after = peek_source_message_evidence(
+            box.source.dsn,
+            slot_name=source_slot,
+            publication_name="cdc_flight_pub",
+            after_lsn=durable_point.last_lsn,
+        )
+        assert after.status == "application_message_present", after
+        assert after.application_messages[0]["prefix"] == prefix, after
+        assert after.application_messages[0]["source_lsn"] == message_lsn, after
+    finally:
+        _drop_named_slot(box, witness_slot)
+        box.cleanup()
+        box.reseed()
+
+
+def test_empty_marker_source_probe_allows_automatic_full_resnapshot(
+    tmp_path, postgres_cluster
+):
+    """A completed empty source proof preserves the automatic recovery path."""
+    box = Sandbox("p72_empty_probe_resnapshot", tmp_path, postgres_cluster)
+    try:
+        box.reseed()
+        baseline = box.run(
+            reset_state=True,
+            max_seconds=180,
+            idle_seconds=6,
+            extra_env={"CDC_COMPLETION_WATERMARK": "0"},
+        )
+        assert baseline["returncode"] == 0, baseline
+        _arm_real_replay_intent(box)
+        recovered = box.run(
+            reset_state=True,
+            max_seconds=180,
+            idle_seconds=8,
+            timeout=300,
+            extra_env={"CDC_COMPLETION_WATERMARK": "0"},
+        )
+        assert recovered["returncode"] == 0, recovered
+        certificate = recovered.get("reset_state", {}).get(
+            "logical_message_certificate"
+        )
+        assert certificate["certified_count"] == 0, recovered
+        assert certificate["obligation_count"] == 0, recovered
+        assert certificate["replay_intent_present"] is True, recovered
+        assert certificate["unknown_resolved"] is True, recovered
+        assert certificate["source_evidence"]["status"] == "no_application_message", recovered
+        assert certificate["source_evidence"]["probe_version"] == 1, recovered
+        assert recovered.get("reset_state", {}).get("replay_intent_cleared") is True, recovered
+        assert not offsets.replay_intent_path(box.state_dir).exists()
     finally:
         box.cleanup()
         box.reseed()
