@@ -705,6 +705,10 @@ def test_unobserved_real_message_blocks_both_full_recovery_routes(
     witness_slot = None
     try:
         box.reseed()
+        if route == "slot_missing":
+            # The witness must predate the baseline so its confirmed position stays
+            # at or before the durable point whose subsequent WAL it proves.
+            witness_slot = _create_witness_slot(box)
         baseline = box.run(
             reset_state=True,
             max_seconds=180,
@@ -715,11 +719,6 @@ def test_unobserved_real_message_blocks_both_full_recovery_routes(
         durable_point = _arm_real_replay_intent(box)
         pipeline = box.env["CDC_PIPELINE_NAME"]
         prefix = f"app_p72_unobserved_{uuid.uuid4().hex}"
-        if route == "slot_missing":
-            # The witness starts at the same durable boundary as the main slot. It
-            # proves the source message is still retained after an external main-slot
-            # loss, when that missing slot can no longer answer the probe itself.
-            witness_slot = _create_witness_slot(box)
         message_lsn = _emit_unobserved_message(box, prefix=prefix)
         source_slot = witness_slot or box.slot
         before = peek_source_message_evidence(

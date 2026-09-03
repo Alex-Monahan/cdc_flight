@@ -473,7 +473,7 @@ class _FakeSourceResult:
 
 
 class _FakeSourceConnection:
-    def __init__(self, rows, *, slot=("pgoutput", 900)):
+    def __init__(self, rows, *, slot=("pgoutput", 400)):
         self.rows = rows
         self.slot = slot
 
@@ -581,6 +581,31 @@ def test_empty_marker_requires_source_slot_probe_and_keeps_unknown_fail_closed(
         assert connect_calls[0][0] == "postgresql://source"
         assert connect_calls[0][1]["options"] == "-c statement_timeout=4000"
         assert connect_calls[0][1]["tcp_user_timeout"] == 4000
+
+        def connect_ahead(_dsn, **_kwargs):
+            return _FakeSourceConnection([], slot=("pgoutput", 401))
+
+        monkeypatch.setitem(
+            sys.modules,
+            "psycopg",
+            SimpleNamespace(connect=connect_ahead),
+        )
+        ahead_marker = tmp_path / "ahead" / offsets.REPLAY_INTENT_FILE_NAME
+        _arm_empty_replay_marker(con, ahead_marker)
+        with pytest.raises(LogicalMessageObligationUnresolved) as caught:
+            require_recovery_message_certificate(
+                con,
+                dataset=DATASET,
+                pipeline=PIPELINE,
+                replay_intent_path=ahead_marker,
+                source_dsn="postgresql://source",
+                source_slot_name="source-slot",
+                source_publication_name="cdc_flight_pub",
+            )
+        assert caught.value.obligations[0]["issues"] == [
+            "source_slot_evidence_unknown"
+        ]
+        assert ahead_marker.exists()
     finally:
         con.close()
 

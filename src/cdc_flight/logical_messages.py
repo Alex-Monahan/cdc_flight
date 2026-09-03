@@ -198,6 +198,19 @@ def peek_source_message_evidence(
                     confirmed_flush_lsn=confirmed,
                     error=f"source slot plugin {plugin!r} is not stock pgoutput",
                 )
+            if confirmed is None or confirmed > after_lsn:
+                return SourceMessageEvidence(
+                    status=SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+                    slot_name=slot_name,
+                    plugin="pgoutput",
+                    after_lsn=after_lsn,
+                    confirmed_flush_lsn=confirmed,
+                    error=(
+                        "source slot has already acknowledged beyond the durable "
+                        "destination LSN; its peek cannot prove the intervening WAL "
+                        "was delivered"
+                    ),
+                )
             rows = conn.execute(
                 """
                 SELECT (changes.lsn - '0/0'::pg_lsn)::bigint, changes.data

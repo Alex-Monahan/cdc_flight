@@ -639,7 +639,7 @@ def begin(
         con.execute(
             f"INSERT INTO {control_table(resolve_control_schema(control_schema), 'recovery_state')} "
             "(pipeline, namespace, recovery_id, decision, phase, slot_name, "
-        " offset_path, snapshot_mode, forget_catalog, tables_marked, message, "
+            " offset_path, snapshot_mode, forget_catalog, tables_marked, message, "
             " captured_json, state_dir, logical_message_resolution, requested_at, "
             " updated_at) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
