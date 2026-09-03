@@ -322,6 +322,13 @@ def check_slot(
         )
 
     previous = previous or {}
+    context.update(
+        {
+            f"previous_{field}": previous[field]
+            for field in ("system_identifier", "timeline_id")
+            if field in previous
+        }
+    )
     prev_system = previous.get("system_identifier")
     if (
         prev_system
@@ -566,6 +573,14 @@ def recover_by_full_resnapshot(
     slot drop lost the forced snapshot mode entirely. See `cdc_flight.recovery` for the
     phases and ADR 0001 §19/A53 for the corrected claim.
     """
+    expected_source_identity = {
+        "system_identifier": verdict.context.get(
+            "previous_system_identifier", slot_receipt.state.system_identifier
+        ),
+        "timeline_id": verdict.context.get(
+            "previous_timeline_id", slot_receipt.state.timeline_id
+        ),
+    }
     record = recovery_mod.begin(
         con,
         pipeline=pipeline,
@@ -585,6 +600,7 @@ def recover_by_full_resnapshot(
         source_slot_name=source_slot_name,
         source_publication_name=source_publication_name,
         source_application_patterns=source_application_patterns,
+        expected_source_identity=expected_source_identity,
     )
     return recovery_mod.resume(
         con,
@@ -600,6 +616,7 @@ def recover_by_full_resnapshot(
         source_slot_name=source_slot_name,
         source_publication_name=source_publication_name,
         source_application_patterns=source_application_patterns,
+        expected_source_identity=expected_source_identity,
     )
 
 

@@ -85,6 +85,7 @@ from .naming import control_table
 from .ownership import DestinationOwnership
 from .run_state import RunOutcome, RunPhaseWriter
 from .snapshot_completion import SnapshotCompletion
+from .state_directory_lease import StateDirectoryLease
 from .supervisor import run_engine_bounded  # noqa: F401 - compatibility re-export
 
 log = logging.getLogger("cdc_flight.pipeline")
@@ -271,7 +272,13 @@ def run(
     replay_offset_file: Path | None = None
     replay_intent_path = offsets.replay_intent_path(replication.state_dir)
     replay_intent: offsets.ReplayIntent | None = None
+    state_directory_lease = StateDirectoryLease(replication.state_dir)
     try:
+        # The destination lease below protects the physical destination. This local
+        # sidecar protects the other half of Invariant O: offsets, replay markers,
+        # recovery state, and the disposable resnapshot tree. Both leases are required
+        # because different destinations can still be configured with one state path.
+        state_directory_lease.acquire()
         if service_context is not None:
             destination_lease_key = dest.resolve_physical_lease_key(con)
             lease = service_context.lease or Lease(
@@ -1424,6 +1431,7 @@ def run(
         finally:
             if service_context is not None:
                 service_context.close()
+            state_directory_lease.release()
 
 
 def _record_run_failure_alert(

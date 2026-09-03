@@ -481,6 +481,7 @@ def begin(
     source_slot_name: str | None = None,
     source_publication_name: str | None = None,
     source_application_patterns=("app_.*",),
+    expected_source_identity=None,
 ) -> RecoveryRecord:
     """Write the intent, atomically with the to-do list. NOTHING is destroyed here.
 
@@ -561,6 +562,14 @@ def begin(
         source_slot_name=source_slot_name,
         source_publication_name=source_publication_name,
         source_application_patterns=source_application_patterns,
+        expected_source_identity=(
+            expected_source_identity
+            if expected_source_identity is not None
+            else {
+                "system_identifier": slot_receipt.state.system_identifier,
+                "timeline_id": slot_receipt.state.timeline_id,
+            }
+        ),
     )
     record.logical_message_resolution = message_state.as_dict()
     prejournal_key = _prejournal_occurrence(
@@ -741,6 +750,7 @@ def resume(
     source_slot_name: str | None = None,
     source_publication_name: str | None = None,
     source_application_patterns=("app_.*",),
+    expected_source_identity=None,
 ) -> dict:
     """Run the recovery forward from whatever phase the journal records. Idempotent.
 
@@ -781,6 +791,7 @@ def resume(
         source_application_patterns=source_application_patterns,
         known_source_evidence=known_source_evidence,
         known_message_state=record.logical_message_resolution,
+        expected_source_identity=expected_source_identity,
         replay_intent_namespace=namespace,
     )
     result = {

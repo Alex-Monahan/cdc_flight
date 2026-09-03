@@ -13,17 +13,19 @@ import base64
 import json
 import struct
 import sys
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
 import duckdb
+import psycopg
 import pytest
 from support.applier_lab import Lab as ApplierLab
 from support.applier_lab import begin as lab_begin
 from support.applier_lab import end as lab_end
 from support.applier_lab import keyed as lab_keyed
 
-from cdc_flight import event_ledger, offsets, reconcile, recovery
+from cdc_flight import event_ledger, logical_messages, offsets, reconcile, recovery
 from cdc_flight.assembler import (
     UNIT_MESSAGE,
     UNIT_TXN,
@@ -57,6 +59,7 @@ from cdc_flight.logical_messages import (
     LOGICAL_MESSAGE_HEARTBEAT_PREFIX,
     MessagePrefixPolicy,
     message_prefix_include_list,
+    peek_source_message_evidence,
     read_delivery_state,
     read_logical_messages,
     require_recovery_message_certificate,
@@ -473,7 +476,7 @@ class _FakeSourceResult:
 
 
 class _FakeSourceConnection:
-    def __init__(self, rows, *, slot=("pgoutput", 400)):
+    def __init__(self, rows, *, slot=("pgoutput", 400, "source-system", 1)):
         self.rows = rows
         self.slot = slot
 
@@ -583,7 +586,9 @@ def test_empty_marker_requires_source_slot_probe_and_keeps_unknown_fail_closed(
         assert connect_calls[0][1]["tcp_user_timeout"] == 4000
 
         def connect_ahead(_dsn, **_kwargs):
-            return _FakeSourceConnection([], slot=("pgoutput", 401))
+            return _FakeSourceConnection(
+                [], slot=("pgoutput", 401, "source-system", 1)
+            )
 
         monkeypatch.setitem(
             sys.modules,
@@ -649,6 +654,193 @@ def test_source_slot_application_message_blocks_and_marker_remains(tmp_path, mon
         ][0]["prefix"] == "app_unobserved"
         assert marker.exists()
     finally:
+        con.close()
+
+
+def test_source_fence_fails_closed_across_replacement_timeline(tmp_path, monkeypatch):
+    """An LSN below an old fence is not comparable on a replacement timeline."""
+    con = _plan_connection()
+    source_lsn = 350
+    payload = (
+        struct.pack(">BBQ", ord("M"), 0, source_lsn)
+        + b"app_replacement\0"
+        + struct.pack(">I", 5)
+        + b"hello"
+    )
+
+    def connect(_dsn, **_kwargs):
+        return _FakeSourceConnection(
+            [(source_lsn, payload)],
+            slot=("pgoutput", 400, "source-system", 2),
+        )
+
+    monkeypatch.setitem(sys.modules, "psycopg", SimpleNamespace(connect=connect))
+    marker = tmp_path / offsets.REPLAY_INTENT_FILE_NAME
+    _arm_empty_replay_marker(con, marker, lsn=400)
+    try:
+        evidence = peek_source_message_evidence(
+            "postgresql://source",
+            slot_name="source-slot",
+            publication_name="cdc_flight_pub",
+            after_lsn=400,
+            expected_source_identity={
+                "system_identifier": "source-system",
+                "timeline_id": 1,
+            },
+        )
+        assert evidence.status == "unknown"
+        assert evidence.error.startswith("source_timeline_changed:")
+        with pytest.raises(LogicalMessageObligationUnresolved) as caught:
+            require_recovery_message_certificate(
+                con,
+                dataset=DATASET,
+                pipeline=PIPELINE,
+                replay_intent_path=marker,
+                source_dsn="postgresql://source",
+                source_slot_name="source-slot",
+                source_publication_name="cdc_flight_pub",
+                expected_source_identity={
+                    "system_identifier": "source-system",
+                    "timeline_id": 1,
+                },
+            )
+        assert caught.value.obligations[0]["issues"] == [
+            "source_timeline_changed"
+        ]
+        assert marker.exists()
+    finally:
+        con.close()
+
+
+def test_real_message_after_begin_probe_blocks_destructive_resume(
+    tmp_path, postgres_cluster, monkeypatch
+):
+    """A source message emitted after begin's probe survives the resume gate."""
+    source = postgres_cluster
+    slot_name = f"p72_b1_gap_{uuid.uuid4().hex}"[:63]
+    namespace = "real-b1-gap"
+    con = _plan_connection()
+    marker = tmp_path / offsets.REPLAY_INTENT_FILE_NAME
+    emitted: list[int] = []
+    dropped: list[str] = []
+
+    try:
+        with psycopg.connect(source.dsn, autocommit=True) as source_con:
+            created = source_con.execute(
+                "SELECT slot_name, (lsn - '0/0'::pg_lsn)::bigint "
+                "FROM pg_create_logical_replication_slot(%s, 'pgoutput')",
+                (slot_name,),
+            ).fetchone()
+            assert created is not None
+            consistent_lsn = int(created[1])
+
+        observation = reconcile.observe_slot(source.dsn, slot_name)
+        assert observation.observable, observation.error
+        fence_lsn = observation.confirmed_flush_lsn or consistent_lsn
+        identity = {
+            "system_identifier": observation.system_identifier,
+            "timeline_id": observation.timeline_id,
+        }
+        point = ResumePoint(
+            partition={"server": "real-b1"},
+            offset={"lsn": fence_lsn},
+            last_lsn=fence_lsn,
+            commit_id=1,
+        )
+        write_resume_point(
+            con,
+            pipeline=PIPELINE,
+            namespace=namespace,
+            point=point,
+            commit_id=1,
+            offset_blob=b"offset",
+            offset_key_blob=b"key",
+        )
+        offsets.arm_replay_intent(
+            marker,
+            pipeline=PIPELINE,
+            namespace=namespace,
+            durable_point=point,
+        )
+        receipt = write_slot_state(
+            con,
+            pipeline=PIPELINE,
+            slot_name=slot_name,
+            observation=observation.as_dict(),
+            verdict="slot_missing",
+            verdict_message="real B1 interleaving",
+        )
+
+        original_probe = logical_messages.require_recovery_message_certificate
+
+        def probe_then_emit(*args, **kwargs):
+            state = original_probe(*args, **kwargs)
+            if not emitted:
+                with psycopg.connect(source.dsn, autocommit=True) as source_con:
+                    lsn = source_con.execute(
+                        "SELECT (pg_logical_emit_message(%s, %s, %s) - "
+                        "'0/0'::pg_lsn)::bigint",
+                        (False, "app_b1_gap", "emitted-after-begin-probe"),
+                    ).fetchone()[0]
+                    source_con.execute("CHECKPOINT")
+                emitted.append(int(lsn))
+            return state
+
+        monkeypatch.setattr(
+            logical_messages,
+            "require_recovery_message_certificate",
+            probe_then_emit,
+        )
+        record = recovery.begin(
+            con,
+            pipeline=PIPELINE,
+            namespace=namespace,
+            decision="slot_missing",
+            message="real B1 interleaving",
+            slot_name=slot_name,
+            offset_path=tmp_path / "offsets.dat",
+            captured_tables=[],
+            forget_catalog=False,
+            slot_receipt=receipt,
+            state_dir=tmp_path / "state",
+            logical_message_dataset=DATASET,
+            replay_intent_path=marker,
+            source_dsn=source.dsn,
+            source_slot_name=slot_name,
+            source_publication_name="cdc_flight_pub",
+            expected_source_identity=identity,
+        )
+
+        with pytest.raises(LogicalMessageObligationUnresolved) as caught:
+            recovery.resume(
+                con,
+                pipeline=PIPELINE,
+                namespace=namespace,
+                record=record,
+                dsn=source.dsn,
+                drop_slot=lambda _dsn, name: dropped.append(name) or "dropped",
+                logical_message_dataset=DATASET,
+                replay_intent_path=marker,
+                source_dsn=source.dsn,
+                source_slot_name=slot_name,
+                source_publication_name="cdc_flight_pub",
+            )
+        assert emitted, "the real source message was not emitted into the gap"
+        assert dropped == [], "destructive slot drop ran after the gap message"
+        assert caught.value.obligations[0]["issues"] == [
+            "source_slot_application_message_unobserved"
+        ]
+        assert caught.value.obligations[0]["source_evidence"][
+            "application_messages"
+        ][0]["prefix"] == "app_b1_gap"
+        assert marker.exists()
+    finally:
+        with psycopg.connect(source.dsn, autocommit=True) as source_con:
+            source_con.execute(
+                "SELECT pg_drop_replication_slot(slot_name) "
+                "FROM pg_replication_slots WHERE slot_name = %s",
+                (slot_name,),
+            )
         con.close()
 
 
@@ -750,6 +942,71 @@ FULL_RECOVERY_ROUTES = (
     recovery.ORPHAN_DECISION,
 )
 
+# This is an auditable ownership manifest, not a route allowlist. The inventory below
+# is derived from the destructive primitive callsites themselves and includes their
+# exact source line. A new direct drop/recreate, marker/offset removal, or snapshot
+# request therefore has to be declared here before the structural test can pass.
+DECLARED_DESTRUCTIVE_EFFECT_SITES = frozenset(
+    {
+        ("acquisition", "resume_any_journalled_recovery", "resume", 117),
+        ("acquisition", "journal_the_reset", "begin", 367),
+        ("acquisition", "journal_the_reset", "resume", 395),
+        ("backfill", "ResumableBackfillLab.run_clean", "unlink", 2265),
+        ("catalog_baseline", "mark_unconfirmed", "request_snapshot", 455),
+        ("destination", "write_resume_point", "delete_resume_point", 388),
+        ("destination_alerts", "AlertSink.request_snapshot", "request_snapshot", 444),
+        ("destination_alerts", "_write_fallback_alert_episode", "unlink", 718),
+        (
+            "discovery_coordinator",
+            "LiveDiscoveryCoordinator._journal_local_slot_failure",
+            "begin",
+            170,
+        ),
+        ("discovery_coordinator", "LiveDiscoveryCoordinator.run", "request_snapshot", 419),
+        ("faults", "runtime_state", "unlink", 613),
+        ("offsets", "_atomic_json_write", "unlink", 104),
+        ("offsets", "_atomic_json_write", "unlink", 113),
+        ("offsets", "clear_replay_intent", "unlink", 286),
+        ("offsets", "prepare_replay_offset", "unlink", 380),
+        ("offsets", "install_replay_offset", "unlink", 420),
+        ("offsets", "install_replay_offset", "unlink", 441),
+        ("pipeline", "run", "prepare_replay_offset", 564),
+        ("pipeline", "run", "prepare_replay_offset", 576),
+        ("pipeline", "run", "prepare_replay_offset", 600),
+        ("pipeline", "run", "clear_replay_intent", 603),
+        ("pipeline", "run", "prepare_replay_offset", 674),
+        ("pipeline", "run", "begin", 728),
+        ("pipeline", "run", "resume", 753),
+        ("pipeline", "run", "request_snapshot", 937),
+        ("pipeline", "run", "install_replay_offset", 1335),
+        ("pipeline", "run", "clear_replay_intent", 1348),
+        ("pipeline", "run", "unlink", 1418),
+        ("reconcile", "drop_slot", "pg_drop_replication_slot", 527),
+        ("reconcile", "recover_by_full_resnapshot", "begin", 584),
+        ("reconcile", "recover_by_full_resnapshot", "resume", 605),
+        ("recovery", "discharge_replay_intent_for_recovery", "clear_replay_intent", 185),
+        ("recovery", "begin", "request_snapshot", 612),
+        ("recovery", "resume", "rmtree", 826),
+        ("recovery", "resume", "unlink", 832),
+        ("recovery", "resume", "delete_resume_point", 851),
+        ("recovery", "_drop_the_slot_or_fail", "drop_slot", 1032),
+        ("resnapshot", "sweep_stale_slot", "drop_slot", 353),
+        ("resnapshot", "run", "drop_slot", 441),
+        ("resnapshot", "reassert_owed", "request_snapshot", 780),
+        ("resnapshot_recovery", "discard_consumed_interruption_marker", "rmtree", 119),
+        ("resnapshot_recovery", "requeue_interrupted", "request_snapshot", 165),
+        ("resnapshot_recovery", "InterruptionRecovery.prepare", "rmtree", 219),
+        (
+            "resnapshot_recovery",
+            "InterruptionRecovery.retire_terminal_resources",
+            "drop_slot",
+            253,
+        ),
+        ("self_heal", "request_resnapshot_for", "request_snapshot", 72),
+        ("spill_refusal", "handle", "request_snapshot", 118),
+    }
+)
+
 
 def _dotted_name(node):
     parts = []
@@ -776,10 +1033,13 @@ def _ast_recovery_inventory():
         "pg_drop_replication_slot",
         "rmtree",
         "unlink",
+        "remove",
         "clear_replay_intent",
         "prepare_replay_offset",
         "install_replay_offset",
         "request_snapshot",
+        "delete_resume_point",
+        "pg_create_logical_replication_slot",
     }
 
     class Visitor(ast.NodeVisitor):
@@ -787,6 +1047,7 @@ def _ast_recovery_inventory():
             self.module = module
             self.stack = []
             self.function_nodes = []
+            self.source = ""
 
         @property
         def qualname(self):
@@ -814,7 +1075,7 @@ def _ast_recovery_inventory():
             dotted = _dotted_name(node.func)
             leaf = dotted.rsplit(".", 1)[-1] if dotted else None
             if leaf in effects:
-                effect_sites.append((self.module, self.qualname, leaf))
+                effect_sites.append((self.module, self.qualname, leaf, node.lineno))
             if dotted not in {"recovery_mod.begin", "recovery_mod.resume"}:
                 self.generic_visit(node)
                 return
@@ -846,6 +1107,43 @@ def _ast_recovery_inventory():
                         )
             route_callers.setdefault(caller, set()).update(route_values)
             callsites.append((self.module, caller, dotted, tuple(sorted(route_values))))
+            self.generic_visit(node)
+
+        def visit_Constant(self, node):
+            if not isinstance(node.value, str):
+                self.generic_visit(node)
+                return
+            if "pg_drop_replication_slot" in node.value:
+                effect_sites.append(
+                    (self.module, self.qualname, "pg_drop_replication_slot", node.lineno)
+                )
+            if "pg_create_logical_replication_slot" in node.value:
+                effect_sites.append(
+                    (
+                        self.module,
+                        self.qualname,
+                        "pg_create_logical_replication_slot",
+                        node.lineno,
+                    )
+                )
+            self.generic_visit(node)
+
+        def visit_JoinedStr(self, node):
+            source = ast.get_source_segment(self.source, node) or ast.unparse(node)
+            lowered = source.lower()
+            if "delete from" in lowered and "debezium_offsets" in lowered:
+                effect_sites.append(
+                    (self.module, self.qualname, "delete_resume_point", node.lineno)
+                )
+            if "pg_create_logical_replication_slot" in lowered:
+                effect_sites.append(
+                    (
+                        self.module,
+                        self.qualname,
+                        "pg_create_logical_replication_slot",
+                        node.lineno,
+                    )
+                )
             self.generic_visit(node)
 
         def _route_values(self, node, caller):
@@ -890,7 +1188,8 @@ def _ast_recovery_inventory():
 
     for path in files:
         visitor = Visitor(path.stem)
-        visitor.visit(ast.parse(path.read_text(), filename=str(path)))
+        visitor.source = path.read_text()
+        visitor.visit(ast.parse(visitor.source, filename=str(path)))
     return {
         "route_callers": {name: frozenset(routes) for name, routes in route_callers.items()},
         "callsites": tuple(callsites),
@@ -915,7 +1214,21 @@ def test_code_derived_destructive_recovery_inventory_is_declared():
         "pipeline.run",
         "reconcile.recover_by_full_resnapshot",
     } <= set(inventory["route_callers"])
-    effect_names = {leaf for _module, _caller, leaf in inventory["effect_sites"]}
+    undeclared_effects = (
+        set(inventory["effect_sites"]) - DECLARED_DESTRUCTIVE_EFFECT_SITES
+    )
+    assert not undeclared_effects, (
+        "production destructive primitive callsite(s) are undeclared: "
+        f"{sorted(undeclared_effects)}"
+    )
+    stale_declarations = (
+        DECLARED_DESTRUCTIVE_EFFECT_SITES - set(inventory["effect_sites"])
+    )
+    assert not stale_declarations, (
+        "destructive ownership manifest contains stale callsite(s): "
+        f"{sorted(stale_declarations)}"
+    )
+    effect_names = {leaf for _module, _caller, leaf, _line in inventory["effect_sites"]}
     assert {
         "begin",
         "resume",

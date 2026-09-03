@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 import struct
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
@@ -83,6 +83,8 @@ class SourceMessageEvidence:
     status: str
     slot_name: str | None = None
     plugin: str | None = None
+    system_identifier: str | None = None
+    timeline_id: int | None = None
     after_lsn: int | None = None
     confirmed_flush_lsn: int | None = None
     scanned_records: int = 0
@@ -95,12 +97,67 @@ class SourceMessageEvidence:
             "status": self.status,
             "slot_name": self.slot_name,
             "plugin": self.plugin,
+            "system_identifier": self.system_identifier,
+            "timeline_id": self.timeline_id,
             "after_lsn": self.after_lsn,
             "confirmed_flush_lsn": self.confirmed_flush_lsn,
             "scanned_records": self.scanned_records,
             "application_messages": [dict(item) for item in self.application_messages],
             "error": self.error,
         }
+
+
+def _source_identity(value: object) -> tuple[str | None, int | None] | None:
+    """Return a source lineage pair, preserving an incomplete pair as unknown."""
+    if isinstance(value, SourceMessageEvidence):
+        return value.system_identifier, value.timeline_id
+    if isinstance(value, Mapping):
+        if "system_identifier" not in value or "timeline_id" not in value:
+            return None
+        system_identifier = value.get("system_identifier")
+        timeline_id = value.get("timeline_id")
+    elif isinstance(value, (tuple, list)) and len(value) == 2:
+        system_identifier, timeline_id = value
+    else:
+        return None
+    try:
+        normalized_timeline = int(timeline_id) if timeline_id is not None else None
+    except (TypeError, ValueError):
+        normalized_timeline = None
+    return (
+        str(system_identifier) if system_identifier is not None else None,
+        normalized_timeline,
+    )
+
+
+def _source_identity_error(
+    expected: tuple[str | None, int | None],
+    actual: tuple[str | None, int | None],
+) -> str | None:
+    """Classify a lineage mismatch with reconcile.py's existing route vocabulary."""
+    expected_system, expected_timeline = expected
+    actual_system, actual_timeline = actual
+    if expected_system is None or actual_system is None:
+        return (
+            "source_identity_changed: the source system_identifier is unavailable "
+            f"(expected={expected_system!r}, actual={actual_system!r})"
+        )
+    if expected_system != actual_system:
+        return (
+            "source_identity_changed: source system_identifier changed "
+            f"from {expected_system!r} to {actual_system!r}"
+        )
+    if expected_timeline is None or actual_timeline is None:
+        return (
+            "source_timeline_changed: the source timeline_id is unavailable "
+            f"(expected={expected_timeline!r}, actual={actual_timeline!r})"
+        )
+    if expected_timeline != actual_timeline:
+        return (
+            "source_timeline_changed: source timeline_id changed "
+            f"from {expected_timeline} to {actual_timeline}"
+        )
+    return None
 
 
 def _decode_pgoutput_message(data: object) -> dict[str, Any] | None:
@@ -143,6 +200,7 @@ def peek_source_message_evidence(
     publication_name: str | None,
     after_lsn: int | None,
     application_patterns: Iterable[str] = DEFAULT_APPLICATION_PREFIX_ALLOWLIST,
+    expected_source_identity: Mapping[str, object] | tuple[object, object] | None = None,
     connect_timeout: int = 5,
     statement_timeout_ms: int = 4000,
 ) -> SourceMessageEvidence:
@@ -176,7 +234,9 @@ def peek_source_message_evidence(
             ),
         ) as conn:
             slot = conn.execute(
-                "SELECT plugin, (confirmed_flush_lsn - '0/0'::pg_lsn)::bigint "
+                "SELECT plugin, (confirmed_flush_lsn - '0/0'::pg_lsn)::bigint, "
+                "(SELECT system_identifier::text FROM pg_control_system()), "
+                "(SELECT timeline_id FROM pg_control_checkpoint()) "
                 "FROM pg_replication_slots WHERE slot_name = %s",
                 (slot_name,),
             ).fetchone()
@@ -189,11 +249,36 @@ def peek_source_message_evidence(
                 )
             plugin = str(slot[0]) if slot[0] is not None else None
             confirmed = int(slot[1]) if slot[1] is not None else None
+            source_system_identifier = (
+                str(slot[2]) if slot[2] is not None else None
+            )
+            source_timeline_id = int(slot[3]) if slot[3] is not None else None
+            actual_source_identity = (source_system_identifier, source_timeline_id)
+            if expected_source_identity is not None:
+                expected = _source_identity(expected_source_identity)
+                identity_error = (
+                    "source_identity_changed: the expected source identity is incomplete"
+                    if expected is None
+                    else _source_identity_error(expected, actual_source_identity)
+                )
+                if identity_error is not None:
+                    return SourceMessageEvidence(
+                        status=SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+                        slot_name=slot_name,
+                        plugin=plugin,
+                        system_identifier=source_system_identifier,
+                        timeline_id=source_timeline_id,
+                        after_lsn=after_lsn,
+                        confirmed_flush_lsn=confirmed,
+                        error=identity_error,
+                    )
             if plugin != "pgoutput":
                 return SourceMessageEvidence(
                     status=SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
                     slot_name=slot_name,
                     plugin=plugin,
+                    system_identifier=source_system_identifier,
+                    timeline_id=source_timeline_id,
                     after_lsn=after_lsn,
                     confirmed_flush_lsn=confirmed,
                     error=f"source slot plugin {plugin!r} is not stock pgoutput",
@@ -203,6 +288,8 @@ def peek_source_message_evidence(
                     status=SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
                     slot_name=slot_name,
                     plugin="pgoutput",
+                    system_identifier=source_system_identifier,
+                    timeline_id=source_timeline_id,
                     after_lsn=after_lsn,
                     confirmed_flush_lsn=confirmed,
                     error=(
@@ -243,6 +330,8 @@ def peek_source_message_evidence(
                 status=SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
                 slot_name=slot_name,
                 plugin="pgoutput",
+                system_identifier=source_system_identifier,
+                timeline_id=source_timeline_id,
                 after_lsn=after_lsn,
                 confirmed_flush_lsn=confirmed,
                 scanned_records=len(rows),
@@ -258,6 +347,8 @@ def peek_source_message_evidence(
                 status=SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
                 slot_name=slot_name,
                 plugin="pgoutput",
+                system_identifier=source_system_identifier,
+                timeline_id=source_timeline_id,
                 after_lsn=after_lsn,
                 confirmed_flush_lsn=confirmed,
                 scanned_records=len(rows),
@@ -274,6 +365,8 @@ def peek_source_message_evidence(
         ),
         slot_name=slot_name,
         plugin="pgoutput",
+        system_identifier=source_system_identifier,
+        timeline_id=source_timeline_id,
         after_lsn=after_lsn,
         confirmed_flush_lsn=confirmed,
         scanned_records=len(rows),
@@ -768,6 +861,7 @@ def require_recovery_message_certificate(
     source_application_patterns: Iterable[str] = DEFAULT_APPLICATION_PREFIX_ALLOWLIST,
     known_source_evidence: dict[str, Any] | None = None,
     known_message_state: dict[str, Any] | None = None,
+    expected_source_identity: Mapping[str, object] | tuple[object, object] | None = None,
     replay_intent_namespace: str | None = None,
 ) -> MessageDeliveryState:
     """Refuse recovery unless a marker is positively discharged.
@@ -831,9 +925,10 @@ def require_recovery_message_certificate(
         )
     ):
         # The recovery journal deliberately deletes the destination resume row before
-        # dropping the source slot. Its persisted certificate/probe is the proof that
-        # lets a later phase clear the marker without trying to validate against a row
-        # that this same recovery has already removed.
+        # dropping the source slot. Its persisted journal identity is the proof that
+        # lets a later phase validate the marker without trying to validate against a
+        # row that this same recovery has already removed. It is not a source-message
+        # certificate: the source probe below is intentionally fresh on every entry.
         if intent.pipeline != pipeline or intent.namespace != expected_namespace:
             raise LogicalMessageObligationUnresolved(
                 "recovery replay marker identity no longer matches its journal",
@@ -846,12 +941,6 @@ def require_recovery_message_certificate(
                         "has_audit": False,
                     },
                 ),
-            )
-        if not state.certified_message_ids:
-            state = replace(
-                state,
-                source_evidence=dict(known_message_state["source_evidence"]),
-                unknown_resolved=True,
             )
     else:
         offsets.validate_replay_intent(
@@ -867,43 +956,34 @@ def require_recovery_message_certificate(
     # already disappeared: the certificate is in MotherDuck, not in that slot.
     if state.certified_message_ids:
         return state
-    if (
-        state.unknown_resolved
-        and isinstance(state.source_evidence, dict)
-        and state.source_evidence.get("status") == SOURCE_MESSAGE_PROBE_STATUS_EMPTY
-    ):
-        return state
-
-    evidence = None
-    if known_source_evidence is not None:
-        expected_lsn = durable_point.last_lsn if durable_point is not None else None
-        evidence_slot = known_source_evidence.get("slot_name")
-        evidence_lsn = known_source_evidence.get("after_lsn")
-        if (
-            known_source_evidence.get("probe_version") == SOURCE_MESSAGE_PROBE_VERSION
-            and known_source_evidence.get("status") == SOURCE_MESSAGE_PROBE_STATUS_EMPTY
-            and known_source_evidence.get("plugin") == "pgoutput"
-            and evidence_slot == source_slot_name
-            and evidence_lsn == expected_lsn
-            and not known_source_evidence.get("application_messages")
-            and not known_source_evidence.get("error")
-        ):
-            evidence = dict(known_source_evidence)
-
-    if evidence is None:
-        after_lsn = durable_point.last_lsn if durable_point is not None else None
-        if after_lsn is None or after_lsn <= 0:
-            offset_lsn = (
-                durable_point.offset.get("lsn") if durable_point is not None else None
-            )
-            after_lsn = int(offset_lsn) if offset_lsn is not None else None
-        evidence = peek_source_message_evidence(
-            source_dsn,
-            slot_name=source_slot_name,
-            publication_name=source_publication_name,
-            after_lsn=after_lsn,
-            application_patterns=source_application_patterns,
-        ).as_dict()
+    # An empty source result is a point-in-time observation, never a reusable
+    # certificate. In particular, recovery.resume() receives the result recorded by
+    # recovery.begin(), but must probe again at this destructive entry. When the
+    # previous recovery phase has already deleted the durable row, the old evidence
+    # supplies only the source position and lineage against which to re-probe.
+    if expected_source_identity is None and known_source_evidence is not None:
+        expected_source_identity = {
+            "system_identifier": known_source_evidence.get("system_identifier"),
+            "timeline_id": known_source_evidence.get("timeline_id"),
+        }
+    after_lsn = durable_point.last_lsn if durable_point is not None else None
+    if after_lsn is None or after_lsn <= 0:
+        offset_lsn = (
+            durable_point.offset.get("lsn") if durable_point is not None else None
+        )
+        after_lsn = int(offset_lsn) if offset_lsn is not None else None
+    if after_lsn is None and known_source_evidence is not None:
+        known_after_lsn = known_source_evidence.get("after_lsn")
+        if known_after_lsn is not None:
+            after_lsn = int(known_after_lsn)
+    evidence = peek_source_message_evidence(
+        source_dsn,
+        slot_name=source_slot_name,
+        publication_name=source_publication_name,
+        after_lsn=after_lsn,
+        application_patterns=source_application_patterns,
+        expected_source_identity=expected_source_identity,
+    ).as_dict()
 
     if evidence.get("status") != SOURCE_MESSAGE_PROBE_STATUS_EMPTY:
         probe_obligation = {
@@ -912,7 +992,19 @@ def require_recovery_message_certificate(
                 (
                     "source_slot_application_message_unobserved"
                     if evidence.get("status") == SOURCE_MESSAGE_PROBE_STATUS_PRESENT
-                    else "source_slot_evidence_unknown"
+                    else (
+                        "source_identity_changed"
+                        if str(evidence.get("error", "")).startswith(
+                            "source_identity_changed:"
+                        )
+                        else (
+                            "source_timeline_changed"
+                            if str(evidence.get("error", "")).startswith(
+                                "source_timeline_changed:"
+                            )
+                            else "source_slot_evidence_unknown"
+                        )
+                    )
                 )
             ],
             "has_ledger": False,
