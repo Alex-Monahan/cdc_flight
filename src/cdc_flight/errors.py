@@ -456,14 +456,17 @@ class RecoveryFailed(RuntimeError):
     """
 
 
-class LogicalMessageObligationUnresolved(RecoveryFailed):
+class LogicalMessageObligationUnresolved(RecoveryFailed, AdmissionError):
     """A logical-message delivery certificate is split across durable relations.
 
     The event ledger claim and the application consumer row are written in the same
     MotherDuck transaction.  If either side is absent (or its audit certificate is
     absent), a full source recovery must not discard the source-replay hint and claim
     that recovery succeeded.  The durable relations are the authority; a filesystem
-    marker is only a local replay hint.
+    marker is only a local replay hint.  It remains a ``RecoveryFailed`` for the
+    journal/state-machine boundary and is also an ``AdmissionError`` because the
+    incomplete durable certificate is a value/state admission refusal, not a new
+    recovery class that can bypass the common refusal boundary.
     """
 
     def __init__(self, message: str, *, obligations: tuple[dict, ...] = ()):
