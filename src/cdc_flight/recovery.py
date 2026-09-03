@@ -577,8 +577,17 @@ def begin(
     # source fence and lineage with the journal so a process that resumes from
     # ``resume_point_deleted`` can issue the same sealed capability without inventing
     # an offset from the filesystem.
-    durable_point = dest_mod.read_resume_point(
-        con, pipeline, namespace, control_schema=control_schema
+    # An explicit operator reset is the one recovery whose contract is to delete the
+    # old resume row, including a malformed one.  It has no old destination fence to
+    # preserve; ``resume()`` derives the guarded primitive's floor from the live slot.
+    # Every other decision must parse and retain the durable point before it can make
+    # the destructive capability.
+    durable_point = (
+        None
+        if decision == RESET_DECISION
+        else dest_mod.read_resume_point(
+            con, pipeline, namespace, control_schema=control_schema
+        )
     )
     source_evidence = resolution.get("source_evidence")
     source_fence_lsn = (
