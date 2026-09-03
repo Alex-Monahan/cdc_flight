@@ -1097,7 +1097,7 @@ def test_slot_drop_primitive_requires_sealed_authorization():
     assert caught.value.obligations[0]["issues"] == ["slot_drop_guard_missing"]
 
 
-def test_seven_destructive_witness_forms_are_all_refused():
+def test_seven_destructive_witness_forms_are_all_refused(monkeypatch):
     """Runtime reachability cannot bypass the primitive or its guarded SQL edge."""
 
     def assert_refused(call):
@@ -1105,38 +1105,126 @@ def test_seven_destructive_witness_forms_are_all_refused():
             call()
         return caught.value.obligations[0]["issues"][0]
 
+    class FakeResult:
+        def __init__(self, rows=()):
+            self.rows = list(rows)
+
+        def fetchall(self):
+            return self.rows
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+    class PrimitiveConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def transaction(self):
+            return self
+
+        def execute(self, *_args, **_kwargs):
+            return FakeResult()
+
+        def _execute_drop(self, *_args, **_kwargs):
+            return FakeResult([("dropped",)])
+
+    authorization = reconcile._recovery_slot_drop_authorization(
+        dsn="source",
+        slot_name="witness",
+        publication_name="cdc_flight_pub",
+        application_patterns=("app_.*",),
+        expected_source_identity=None,
+        after_lsn=10,
+    )
+    monkeypatch.setattr(
+        reconcile,
+        "_guarded_source_connection",
+        lambda _authorization: PrimitiveConnection(),
+    )
+    monkeypatch.setattr(
+        reconcile,
+        "_slot_row",
+        lambda _connection, _slot: ("pgoutput", 10, 5, "source-system", 1),
+    )
+    monkeypatch.setattr(reconcile, "_source_wal_high_water", lambda _connection: 100)
+    monkeypatch.setattr(
+        logical_messages,
+        "_probe_source_message_evidence_connection",
+        lambda *_args, **_kwargs: logical_messages.SourceMessageEvidence(
+            status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_PRESENT,
+            slot_name="witness",
+            after_lsn=10,
+            application_messages=({"prefix": "app_live"},),
+        ),
+    )
+
     aliased = reconcile.drop_slot
     dynamic = getattr(reconcile, "drop_" + "slot")
     registry = {"drop_slot": reconcile.drop_slot}
 
     class Adapter:
         def drop(self):
-            return reconcile.drop_slot("source", "witness")
+            return reconcile.drop_slot("source", "witness", authorization=authorization)
 
-    authorization = reconcile.retention_slot_drop_authorization(
-        dsn="source",
-        slot_name="witness_rs",
-        retention_slot_name="witness_main",
-        publication_name="cdc_flight_pub",
-        application_patterns=("app_.*",),
-    )
-
-    class FakeConnection:
+    class RawConnection:
         def execute(self, *_args, **_kwargs):
             raise AssertionError("raw SQL should be refused before the fake executes")
 
         def cursor(self, *_args, **_kwargs):
             raise AssertionError("raw SQL should be refused before the fake cursors")
 
-    guarded = reconcile._GuardedSlotConnection(FakeConnection(), authorization)
-    assembled_sql = "SELECT " + "pg_drop_replication_slot" + "(slot_name)"
-    script = (
-        "from cdc_flight import reconcile\n"
-        "try:\n"
-        "    getattr(reconcile, 'drop_slot')('source', 'witness')\n"
-        "except Exception as exc:\n"
-        "    print(type(exc).__name__ + ':' + exc.obligations[0]['issues'][0])\n"
+    raw_sql_authorization = reconcile.retention_slot_drop_authorization(
+        dsn="source",
+        slot_name="witness_rs",
+        retention_slot_name="witness_main",
+        publication_name="cdc_flight_pub",
+        application_patterns=("app_.*",),
     )
+    guarded = reconcile._GuardedSlotConnection(RawConnection(), raw_sql_authorization)
+    assembled_sql = "SELECT " + "pg_drop_replication_slot" + "(slot_name)"
+    script = """
+from cdc_flight import logical_messages, reconcile
+
+class Result:
+    def fetchall(self):
+        return [("dropped",)]
+
+class Connection:
+    def __enter__(self):
+        return self
+    def __exit__(self, *_args):
+        return False
+    def transaction(self):
+        return self
+    def execute(self, *_args, **_kwargs):
+        return Result()
+    def _execute_drop(self, *_args, **_kwargs):
+        return Result()
+
+authorization = reconcile._recovery_slot_drop_authorization(
+    dsn="source", slot_name="witness", publication_name="cdc_flight_pub",
+    application_patterns=("app_.*",), expected_source_identity=None, after_lsn=10,
+)
+reconcile._guarded_source_connection = lambda _authorization: Connection()
+reconcile._slot_row = lambda _connection, _slot: ("pgoutput", 10, 5, "source-system", 1)
+reconcile._source_wal_high_water = lambda _connection: 100
+logical_messages._probe_source_message_evidence_connection = (
+    lambda *_args, **_kwargs: logical_messages.SourceMessageEvidence(
+        status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_PRESENT,
+        slot_name="witness", after_lsn=10,
+        application_messages=({"prefix": "app_live"},),
+    )
+)
+try:
+    getattr(reconcile, "drop_" + "slot")(
+        "source", "witness", authorization=authorization
+    )
+except Exception as exc:
+    print(type(exc).__name__ + ":" + exc.obligations[0]["issues"][0])
+""".strip()
     child = subprocess.run(
         [sys.executable, "-c", script],
         check=False,
@@ -1147,28 +1235,30 @@ def test_seven_destructive_witness_forms_are_all_refused():
 
     refused = {
         "aliased import": assert_refused(
-            lambda: aliased("source", "witness")
+            lambda: aliased("source", "witness", authorization=authorization)
         ),
         "dynamic getattr": assert_refused(
-            lambda: dynamic("source", "witness")
+            lambda: dynamic("source", "witness", authorization=authorization)
         ),
         "registry": assert_refused(
-            lambda: registry["drop_slot"]("source", "witness")
+            lambda: registry["drop_slot"]("source", "witness", authorization=authorization)
         ),
         "adapter": assert_refused(Adapter().drop),
         "partial/lambda": assert_refused(
-            lambda: functools.partial(reconcile.drop_slot, "source", "witness")()
+            lambda: functools.partial(
+                reconcile.drop_slot, "source", "witness", authorization=authorization
+            )()
         ),
         "dynamically assembled subprocess": child.stdout.strip().split(":", 1)[-1],
         "assembled SQL": assert_refused(lambda: guarded.execute(assembled_sql)),
     }
     assert refused == {
-        "aliased import": "slot_drop_guard_missing",
-        "dynamic getattr": "slot_drop_guard_missing",
-        "registry": "slot_drop_guard_missing",
-        "adapter": "slot_drop_guard_missing",
-        "partial/lambda": "slot_drop_guard_missing",
-        "dynamically assembled subprocess": "slot_drop_guard_missing",
+        "aliased import": "source_slot_application_message_unobserved",
+        "dynamic getattr": "source_slot_application_message_unobserved",
+        "registry": "source_slot_application_message_unobserved",
+        "adapter": "source_slot_application_message_unobserved",
+        "partial/lambda": "source_slot_application_message_unobserved",
+        "dynamically assembled subprocess": "source_slot_application_message_unobserved",
         "assembled SQL": "raw_slot_drop_sql_bypasses_guard",
     }
 
