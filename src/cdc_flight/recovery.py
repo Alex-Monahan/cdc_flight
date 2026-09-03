@@ -863,6 +863,9 @@ def resume(
             application_patterns=source_application_patterns,
             expected_source_identity=authorization_identity,
             after_lsn=source_fence_lsn,
+            allow_advanced_slot_recovery=(
+                record.decision == "slot_ahead_of_destination"
+            ),
         )
     result = {
         "recovery_id": record.recovery_id,

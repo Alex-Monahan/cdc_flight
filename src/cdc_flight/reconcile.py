@@ -76,6 +76,7 @@ class SlotDropAuthorization:
     application_patterns: tuple[str, ...]
     expected_source_identity: Mapping[str, object] | tuple[object, object] | None
     retention_slot_name: str | None = None
+    allow_advanced_slot_recovery: bool = False
 
     def is_sealed(self) -> bool:
         return self._seal is _SLOT_DROP_SEAL
@@ -89,6 +90,7 @@ def _recovery_slot_drop_authorization(
     application_patterns: Iterable[str],
     expected_source_identity,
     after_lsn: int | None,
+    allow_advanced_slot_recovery: bool = False,
 ) -> SlotDropAuthorization:
     """Issue the capability for the main recovery slot after its certificate passed."""
     if not dsn or not slot_name or not publication_name:
@@ -114,6 +116,7 @@ def _recovery_slot_drop_authorization(
         publication_name=str(publication_name),
         application_patterns=tuple(application_patterns),
         expected_source_identity=expected_source_identity,
+        allow_advanced_slot_recovery=allow_advanced_slot_recovery,
     )
 
 
@@ -237,7 +240,37 @@ class _GuardedSlotCursor:
             return self._cursor.execute(query)
         return self._cursor.execute(query, params)
 
+    def executemany(self, query, params_seq):
+        if _DROP_SQL.search(str(query)):
+            raise LogicalMessageObligationUnresolved(
+                "raw replication-slot drop SQL is refused on a guarded cursor",
+                obligations=(
+                    {
+                        "message_id": f"source-slot:{self._authorization.slot_name}",
+                        "issues": ["raw_slot_drop_sql_bypasses_guard"],
+                        "has_ledger": False,
+                        "has_consumer": False,
+                        "has_audit": False,
+                    },
+                ),
+            )
+        return self._cursor.executemany(query, params_seq)
+
     def __getattr__(self, name):
+        if name in {"copy", "copy_expert", "execute_batch", "execute_values"}:
+            raise LogicalMessageObligationUnresolved(
+                "raw replication-slot effect adapters are unavailable on a guarded "
+                "cursor; execute the sealed slot-drop primitive",
+                obligations=(
+                    {
+                        "message_id": f"source-slot:{self._authorization.slot_name}",
+                        "issues": ["raw_slot_drop_sql_bypasses_guard"],
+                        "has_ledger": False,
+                        "has_consumer": False,
+                        "has_audit": False,
+                    },
+                ),
+            )
         return getattr(self._cursor, name)
 
 
@@ -934,6 +967,22 @@ def drop_slot(
                             slot_name=authorization.slot_name,
                             issue="slot_drop_guard_incomplete",
                         )
+
+                # A slot-ahead recovery is different from a live replay-marker
+                # obligation: an external actor has already moved the slot beyond the
+                # destination fence before Flight entered this primitive. The skipped
+                # prefix is no longer retained by PostgreSQL and cannot be probed. For
+                # this one sealed recovery capability, move the probe floor to the
+                # target's current confirmed position *inside this same transaction*.
+                # This does not bless a stale pre-check: a normal authorization still
+                # refuses confirmed > after_lsn, and the current slot row is re-read
+                # here before the probe and conditional drop.
+                if (
+                    authorization.allow_advanced_slot_recovery
+                    and target[1] is not None
+                    and int(target[1]) > after_lsn
+                ):
+                    after_lsn = int(target[1])
 
                 evidence = logical_messages._probe_source_message_evidence_connection(
                     conn,
