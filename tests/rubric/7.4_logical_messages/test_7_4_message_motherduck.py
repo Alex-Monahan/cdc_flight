@@ -85,6 +85,70 @@ def _wait_for_md_sentinel(
     )
 
 
+def _wait_for_md_message_certificate(
+    sandbox,
+    process,
+    con,
+    *,
+    dataset: str,
+    control_schema: str,
+    pipeline: str,
+    prefix: str,
+    timeout: float,
+) -> None:
+    """Prove one logical message has its complete durable MD certificate."""
+    message_table = f"{quote(dataset)}.cdcflight_logical_messages"
+    control = quote(control_schema)
+    target_table = f"{dataset}.cdcflight_logical_messages"
+    query = (
+        f"SELECT m.message_id, l.state, a.status "
+        f"FROM {message_table} AS m "
+        f"JOIN {control}.event_ledger AS l "
+        "  ON l.event_id = m.message_id "
+        " AND l.pipeline = m.pipeline "
+        f" AND l.target_table = ? "
+        f"JOIN {control}.logical_message_audit AS a "
+        "  ON a.message_id = m.message_id "
+        " AND a.pipeline = m.pipeline "
+        f" AND a.target_table = ? "
+        "WHERE m.pipeline = ? AND m.prefix = ?"
+    )
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            stdout, stderr = _child_tail(process)
+            raise AssertionError(
+                "NEVER_ARMED: child exited before the logical-message certificate "
+                f"for {prefix!r} was durable in MotherDuck "
+                f"(returncode={process.returncode}); summary={sandbox.last_summary()}"
+                f"\nstdout={stdout}\nstderr={stderr}"
+            )
+        try:
+            con.execute("FORCE CHECKPOINT")
+            rows = con.execute(
+                query,
+                [target_table, target_table, pipeline, prefix],
+            ).fetchall()
+            if rows and all(
+                row[1] in {"applied", "replayed"}
+                and row[2] in {"delivered", "replayed"}
+                for row in rows
+            ):
+                return
+        except duckdb.Error:
+            # The child can commit before MotherDuck's catalog refresh exposes the
+            # joined tables to this independent connection.
+            pass
+        time.sleep(0.5)
+    stdout, stderr = _stop_child(process)
+    raise AssertionError(
+        "NEVER_ARMED: the child did not make the complete logical-message "
+        f"certificate for {prefix!r} visible in MotherDuck within {timeout:.1f}s; "
+        f"returncode={process.returncode}, summary={sandbox.last_summary()}"
+        f"\nstdout={stdout}\nstderr={stderr}"
+    )
+
+
 def _wait_for_context(sandbox, process, *, filename: str, key: str, timeout: float):
     """Wait for one persisted production callback edge, never an arbitrary sleep."""
     path = sandbox.state_dir / filename
@@ -136,6 +200,20 @@ def _emit_non_transactional_message(source, *, prefix: str, content: bytes) -> i
         return int(
             conn.execute(sql, (False, prefix, psycopg.Binary(content))).fetchone()[0]
         )
+
+
+def _emit_non_transactional_message_with_following_data(
+    source, *, prefix: str, content: bytes
+) -> int:
+    """Emit a message, then source data so the post-commit cut is armed."""
+    lsn = _emit_non_transactional_message(source, prefix=prefix, content=content)
+    token = uuid.uuid4().hex
+    with psycopg.connect(source.dsn, autocommit=True) as conn:
+        conn.execute(
+            "INSERT INTO app.customers (name, email) VALUES (%s, %s)",
+            (f"p74-md-cut-{token}", f"{token}@example.com"),
+        )
+    return lsn
 
 
 def _md_snapshot(con, *, dataset: str, control_schema: str, pipeline: str, prefixes: tuple[str, str]):
@@ -229,20 +307,34 @@ def test_messages_are_atomic_and_replay_safe_in_motherduck(
                 sentinel=sentinel,
                 timeout=150,
             )
-        try:
-            precondition_process.wait(timeout=120)
-        except subprocess.TimeoutExpired as exc:
-            stdout, stderr = _stop_child(precondition_process)
-            raise AssertionError(
-                "NEVER_ARMED: sentinel child did not complete its bounded clean "
-                f"run (returncode={precondition_process.returncode}); "
-                f"summary={sandbox.last_summary()}\nstdout={stdout}\nstderr={stderr}"
-            ) from exc
-        assert precondition_process.returncode == 0, (
-            "NEVER_ARMED: sentinel was visible but its child did not complete "
-            f"cleanly: {sandbox.last_summary()}"
+        # Keep this clean child armed for one more source unit.  It commits the
+        # transactional message and its ordinary row before the fault-injected child
+        # is started, so the later crash cut can be exclusively non-transactional.
+        tx_content = b"\x00\xff\x80motherduck"
+        tx_lsn = _emit_transactional_message(
+            sandbox.source, prefix=tx_prefix, content=tx_content
         )
+        with duckdb.connect(dsn) as md:
+            _wait_for_md_message_certificate(
+                sandbox,
+                precondition_process,
+                md,
+                dataset=dataset,
+                control_schema=control_schema,
+                pipeline=pipeline,
+                prefix=tx_prefix,
+                timeout=150,
+            )
 
+        # The first child is intentionally stopped only after the transactional
+        # certificate is durably visible.  Its slot acknowledgement is now behind
+        # that certificate; the fault-injected successor will handle only the next
+        # source unit.
+        _stop_child(precondition_process)
+        assert precondition_process.returncode is not None, (
+            "NEVER_ARMED: transactional message was durable but its clean child "
+            "did not release the source slot"
+        )
         (sandbox.state_dir / "last_run.json").unlink(missing_ok=True)
         (sandbox.state_dir / "message_handshake.json").unlink(missing_ok=True)
         sandbox.clear_fired_fault()
@@ -273,11 +365,10 @@ def test_messages_are_atomic_and_replay_safe_in_motherduck(
                 [sentinel],
             ).fetchall(), "NEVER_ARMED: durable sentinel disappeared before crash arm"
 
-        tx_content = b"\x00\xff\x80motherduck"
-        tx_lsn = _emit_transactional_message(
-            sandbox.source, prefix=tx_prefix, content=tx_content
-        )
-        non_lsn = _emit_non_transactional_message(
+        # This is the post-commit/pre-ack cut.  The transactional message is already
+        # certified above; this standalone message must be certified by the crash
+        # commit before recovery is allowed to run.
+        non_lsn = _emit_non_transactional_message_with_following_data(
             sandbox.source, prefix=non_prefix, content=b""
         )
 
@@ -366,10 +457,35 @@ def test_messages_are_atomic_and_replay_safe_in_motherduck(
             # message.  commit_log.event_count is the ordinary-data count; the
             # message remains represented by its own consumer/ledger/audit rows.
             assert commit and int(commit[0]) == commit_id and int(commit[1]) == 1
-            assert offset and int(offset[0]) == commit_id and int(offset[1]) >= int(commit[2])
             assert table_state and table_state[0] in {"none", "complete"}
             assert customer and int(customer[0]) == commit_id
             assert any(row[0] == tx_prefix and row[1] == "delivered" for row in audit)
+            non_rows = [row for row in messages if row[1] == non_prefix]
+            assert len(non_rows) == 1, (
+                "FIRED: MD_COMMITTED handshake failed; non-transactional consumer "
+                f"row is not exactly once: {messages}"
+            )
+            non_row = non_rows[0]
+            assert non_row[3] is False
+            assert non_row[4] is not None and int(non_row[4]) >= non_lsn
+            assert any(row[0] == non_row[0] and row[1] == "applied" for row in ledger), (
+                "FIRED: MD_COMMITTED handshake failed; non-transactional consumer "
+                f"row has no applied ledger claim: {ledger}"
+            )
+            assert any(row[0] == non_prefix and row[1] == "delivered" for row in audit)
+            non_commit_id = int(non_row[8])
+            non_commit = md.execute(
+                f"SELECT commit_id, event_count, last_lsn FROM {control}.commit_log "
+                f"WHERE pipeline = ? AND commit_id = ?",
+                [pipeline, non_commit_id],
+            ).fetchone()
+            # The corrected precondition deliberately has two destination commits:
+            # the clean child certifies the transactional message, then the crash
+            # child certifies the standalone message alongside the arming data row.
+            # The current offset must therefore be at the latter commit, not the
+            # earlier transactional one.
+            assert non_commit and int(non_commit[0]) == non_commit_id
+            assert offset and int(offset[0]) == non_commit_id and int(offset[1]) >= int(non_commit[2])
             assert any(row[0] == "cdc_flight_heartbeat" and row[1] == "internal" for row in md.execute(
                 f"SELECT prefix, status FROM {control}.logical_message_audit WHERE pipeline = ?",
                 [pipeline],
@@ -418,6 +534,13 @@ def test_messages_are_atomic_and_replay_safe_in_motherduck(
             assert sum(row[1] == non_prefix for row in messages) == 1
             assert len(ledger) == 2 and len({row[0] for row in ledger}) == 2
             assert all(row[1] in {"applied", "internal", "replayed"} for row in ledger)
+            print(
+                "§7.4 MD final row counts: "
+                f"messages={len(messages)} "
+                f"transactional={sum(row[1] == tx_prefix for row in messages)} "
+                f"non_transactional={sum(row[1] == non_prefix for row in messages)} "
+                f"ledger={len(ledger)} ledger_distinct={len({row[0] for row in ledger})}"
+            )
             assert sorted(audit) == sorted(
                 [(non_prefix, "delivered", 0), (tx_prefix, "delivered", len(tx_content))]
             )
