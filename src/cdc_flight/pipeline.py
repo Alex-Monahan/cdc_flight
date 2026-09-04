@@ -1354,7 +1354,9 @@ def run(
             catalog_flush_exclude=catalog_flush_exclude,
             service_context=service_context,
             offset_file=replay_offset_file,
-            suppress_replayed_message_audit=replay_offset_file is not None,
+            suppress_replayed_message_audit=(
+                replay_offset_file is not None or recovery_slot_retained
+            ),
         )
         try:
             reported = coordinator.run()
