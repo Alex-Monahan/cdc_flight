@@ -29,8 +29,9 @@ _BASELINE_SELECTED = {
     # The quiet-holder and stock-walsender retry proofs are MotherDuck-only real
     # process nodes; a local DuckDB file lock cannot exercise cloud takeover while
     # the old process retains its handle.
-    # The selected MotherDuck total is 64 including this guard.
-    "motherduck": 63,
+    # The selected MotherDuck total is 65 including this guard after the permanent
+    # retained-recovery MotherDuck proof was added.
+    "motherduck": 64,
 }
 
 
