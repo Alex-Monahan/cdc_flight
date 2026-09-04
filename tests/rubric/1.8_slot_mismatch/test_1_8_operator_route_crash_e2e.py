@@ -5,7 +5,7 @@ when something has already gone wrong. Both used to be multi-step durable mutati
 nothing journalled *before* they started destroying evidence, and the last review round
 proved that costs the same thing twice (Codex r1 BLOCKER-1 and MAJOR-4):
 
-* orphan acceptance dropped the slot and unlinked `offsets.dat` and only then wrote the
+* orphan acceptance retired the source slot and unlinked `offsets.dat` and only then wrote the
   recovery journal. A hard exit in that gap left no resume row, no offsets file, no slot
   and no journal — which the next run reads as an ordinary `fresh_start`. Under a
   configured non-data `snapshot.mode` it then streams onto a destination nobody rebuilt:
@@ -13,7 +13,7 @@ proved that costs the same thing twice (Codex r1 BLOCKER-1 and MAJOR-4):
 * `--reset-state` was argued convergent without a journal. It is not: with the resume
   row deleted and a positioned slot over a populated destination, the next run's slot
   check returns the deliberate `no_durable_destination_row` refusal *before*
-  `will_snapshot_everything` is computed, and repeating the flag does not drop that slot.
+  `will_snapshot_everything` is computed, and repeating the flag does not retire that slot.
   The forced `snapshot.mode='initial'` was process-local too.
 
 Both are journalled recoveries now, and this file is the evidence: a real `cdc-flight`
@@ -302,7 +302,7 @@ def test_a_reset_of_an_entirely_empty_source_clears_in_one_run(
     discharged by verified-empty evidence on this run.
 
     So the steady state for a source that stays entirely empty is a recovery **per run**:
-    each one drops the slot, lets Debezium create its own, snapshots nothing, verifies
+    each one retains the main slot, snapshots nothing through the throwaway path, verifies
     empty and clears. That is asserted below, because it is the behaviour rather than an
     accident, and it is what makes the boundary exact (A45). The moment one row exists,
     an ordinary commit group writes a real resume point and the churn stops.

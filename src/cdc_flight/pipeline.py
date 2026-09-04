@@ -370,7 +370,7 @@ def run(
         # declare unusable.
         #
         # The lease is taken first: this path mutates destination state (marks tables,
-        # deletes the resume point, drops the slot), and a second runner doing that
+        # deletes the resume point, establishes main-slot retirement), and a second runner doing that
         # concurrently is exactly what rubric 4.2 exists to prevent.
         if service_context is not None:
             if service_context.lease_key != destination_lease_key:
@@ -734,14 +734,14 @@ def run(
         # `--accept-orphan-offsets` has authorised a rebuild, and the rebuild is now a
         # journalled recovery like every other one — **journal first, destroy second**.
         #
-        # It used to be the other way round. `offsets` dropped the slot and
+        # It used to be the other way round. `offsets` retired the source slot and
         # unlinked the file and only then did this block record why, which put a crash
         # window between destroying the evidence and writing the obligation: a hard exit
         # there left no row, no file, no slot and no journal, the next run called that an
         # ordinary `fresh_start`, and a configured non-data `snapshot.mode` streamed onto
         # a destination nobody had rebuilt. `reconcile()` now classifies and nothing
         # more; `begin()` makes the intent and the table obligation durable together;
-        # `resume()` performs the file / row / slot ladder, idempotently, from whatever
+        # `resume()` performs the file / row / source-retirement ladder, idempotently, from whatever
         # phase survives.
         if reconciliation.decision == "orphan_accepted_resnapshot" and journal is None:
             previous_slot = dest_mod.read_slot_state(

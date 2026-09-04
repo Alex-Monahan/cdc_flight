@@ -8,7 +8,8 @@ tidy up — none of which a `SIGKILL` does (Codex r1 MAJOR-6).
 
 `os._exit` inside pytest would take the test runner with it, so the cut happens here, in
 a child process, against the same DuckDB file and the same offsets file the parent owns.
-It costs milliseconds: no JVM, no Postgres, and the slot drop is a JSON file.
+It costs milliseconds: no JVM, no Postgres, and the main-slot retirement observation is
+a JSON file.
 
     python tests/support/recovery_crash_driver.py <duckdb> <offsets> <slots.json> begin|resume|baseline
 

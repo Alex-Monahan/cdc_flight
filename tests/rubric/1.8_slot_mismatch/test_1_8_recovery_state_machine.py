@@ -65,8 +65,8 @@ class _World:
         self.offset_path = tmp_path / "offsets.dat"
         self.offset_path.write_bytes(b"\x00not-a-real-offset-map")
         self.slots = {"cdc_slot"} if slot_present else set()
-        self.drop_calls = 0
-        self.drop_raises: Exception | None = None
+        self.retirement_calls = 0
+        self.retirement_raises: Exception | None = None
         for schema, table, target in TABLES:
             self.con.execute(
                 "INSERT INTO _cdc_flight.table_state (pipeline, source_schema, "
@@ -82,9 +82,9 @@ class _World:
 
     # -- the injectable main-slot retirement observation ------------------ #
     def retire_slot(self, dsn: str, slot_name: str) -> str:
-        self.drop_calls += 1
-        if self.drop_raises is not None:
-            raise self.drop_raises
+        self.retirement_calls += 1
+        if self.retirement_raises is not None:
+            raise self.retirement_raises
         if slot_name in self.slots:
             return "retained"
         return "absent"
@@ -285,10 +285,10 @@ def test_a_crash_at_any_phase_boundary_is_resumable(world, cut):
 def test_resuming_twice_changes_nothing(world):
     world.begin()
     first = world.resume()
-    calls = world.drop_calls
+    calls = world.retirement_calls
     second = world.resume()
     assert first["phase"] == second["phase"] == PHASE_ARMED
-    assert world.drop_calls == calls, "an armed recovery does not re-drop the slot"
+    assert world.retirement_calls == calls, "an armed recovery does not re-retire the slot"
     assert world.durable_rows == 0
 
 
@@ -388,7 +388,7 @@ def test_a_slot_whose_retirement_state_is_unobservable_fails_the_recovery(world)
     which is the loss window rubric 1.8 exists to close.
     """
     world.begin()
-    world.drop_raises = RuntimeError('replication slot "cdc_slot" is active for PID 42')
+    world.retirement_raises = RuntimeError('replication slot "cdc_slot" is unobservable')
     with pytest.raises(RecoveryFailed) as raised:
         world.resume()
     assert "cdc_slot" in str(raised.value)
@@ -399,7 +399,7 @@ def test_a_slot_whose_retirement_state_is_unobservable_fails_the_recovery(world)
     assert world.slots == {"cdc_slot"}
 
     # ... and it does, once the source-side state is observable again.
-    world.drop_raises = None
+    world.retirement_raises = None
     result = world.resume()
     assert result["phase"] == PHASE_ARMED
     assert world.slots == {"cdc_slot"}

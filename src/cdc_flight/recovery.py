@@ -8,12 +8,14 @@ be rebuilt, and how that survives a crash at any point.**
 
 ## Why a journal
 
-The recovery mutates four independent durable things:
+The recovery mutates three independent durable things and records one source-side
+state transition:
 
 1. the durable to-do list (`table_state.snapshot_state = 'awaiting_snapshot'`);
 2. `offsets.dat` on disk;
 3. the durable resume point (`_cdc_flight.debezium_offsets`);
-4. the replication slot on the source.
+4. the main replication slot's retirement state on the source. The source slot is
+   observed and retained; it is not physically dropped by this recovery.
 
 Nothing outside a single destination transaction can make two of those atomic, so the
 question is not "how do we avoid an intermediate state" but "**can the Flight recognise
@@ -50,17 +52,17 @@ journal is what makes the claim structural rather than lucky.
 (where the decision calls for it) the catalog invalidation, so "a recovery is owed" and
 "here is what it owes" become true together or not at all.
 
-## The one step that may not be stepped over
+## Main-slot retirement is a state transition, not a drop
 
-Dropping the slot. A45 measured that Debezium only pairs the snapshot with an exact WAL
-position when it creates the slot **itself**; a re-snapshot that runs against a surviving
-slot resumes the stream from a `confirmed_flush_lsn` we cannot account for, past the
-snapshot's consistent point, which is the loss window rubric 1.8 exists to close. A drop
-that neither succeeds nor proves the slot absent therefore raises `RecoveryFailed` with
-the journal intact, and the next run retries from the same phase. It used to be caught,
-recorded as the string `drop_failed: ...`, and stepped straight over — while the caller
-*also* erased the recorded LSN baseline, destroying the evidence that would have caught
-it next time (Codex B4).
+PostgreSQL has no lock that arbitrary application sessions must acquire before committing
+to WAL. Therefore no predicate can make "no unobserved application message" atomic with
+`pg_drop_replication_slot`. The main recovery does not attempt that impossible drop.
+It records a retirement transition while retaining the main slot as the WAL authority,
+builds the fresh image through the separate `_rs` slot, and starts the main connector
+with `snapshot.mode=no_data` only after the image is complete. A source slot that has
+already disappeared is an explicit `absent` outcome; an unobservable state raises
+`RecoveryFailed` with the journal intact. The old behavior caught a failed drop, recorded
+`drop_failed: ...`, and stepped over it while also erasing the LSN baseline (Codex B4).
 """
 
 from __future__ import annotations
@@ -98,7 +100,7 @@ from .occurrence import (
 log = logging.getLogger("cdc_flight.recovery")
 
 #: The decision an operator's `--accept-orphan-offsets` writes. It is a recovery like
-#: any other now (Codex r1 BLOCKER-1): `offsets` used to drop the slot and
+#: any other now (Codex r1 BLOCKER-1): `offsets` used to retire the source slot and
 #: unlink the file and only *then* journal what it had done, so a hard exit in that gap
 #: lost the durable obligation to rebuild and the next run called the leftovers an
 #: ordinary fresh start - the exact B3/A53 state the journal exists to prevent.
@@ -220,7 +222,8 @@ class RecoveryRecord:
     #: alone is not enough, because "start over" means the whole Debezium scratch area.
     state_dir: str | None = None
     #: The message certificate/source proof that authorized this recovery. Persisting
-    #: it matters because the slot is intentionally dropped later in the ladder.
+    #: it matters because recovery can be interrupted before its source-side retirement
+    #: observation is recorded in the journal phase.
     logical_message_resolution: dict | None = None
 
     def as_dict(self) -> dict:
@@ -341,7 +344,7 @@ def _write_phase(
     `resume()` then matched none of its branches, fell through every `if`, and logged
     "recovery is ARMED" having done nothing at all. The domain check landed in the
     1.6-1.8 fix round; rubric 1.9 adds the *edges*, so a future caller cannot jump from
-    `requested` straight to `armed` and claim a slot was dropped that never was.
+    `requested` straight to `armed` and claim source-side retirement that never was.
     """
     ACQUISITION_RECOVERY.check(frm, phase)
     con.execute(

@@ -237,8 +237,9 @@ DESTINATION_POINTS = (
 #:   `requested`. A53's benign cut: `file absent / row present` -> rebuilt.
 #: * `recovery_resume_point_deleted`  - the durable resume point is gone, the slot is
 #:   not. The next run re-runs the drop from `offsets_file_deleted`.
-#: * `recovery_armed`                 - the slot is dropped and the journal has not
-#:   recorded it. The dangerous one: the forced `snapshot.mode` lives only in the row.
+#: * `recovery_armed`                 - main-slot retention is established and the
+#:   journal has not recorded it. The dangerous one: the forced `snapshot.mode` lives
+#:   only in the row.
 #: * `table_rebuild_queued`           - the durable to-do list is genuinely MID-WRITE:
 #:   the first captured table has taken its `-> awaiting_snapshot` edge inside
 #:   `recovery.begin()`'s transaction and the rest have not. It used to fire before the

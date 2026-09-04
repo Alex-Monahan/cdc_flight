@@ -179,7 +179,7 @@ def test_an_alert_records_the_loss_and_the_repair(advanced):
 # --------------------------------------------------------------------------- #
 @pytest.fixture(scope="module")
 def dropped(tmp_path_factory, postgres_cluster):
-    """The slot is dropped while the pipeline is down.
+    """An external actor drops the slot while the pipeline is down.
 
     Left to Debezium this is silent and total: it creates a new slot at the *current*
     WAL position, so everything written in between is simply never decoded. The

@@ -620,7 +620,7 @@ def reconcile(
     """Classify. **This function destroys nothing** (Codex r1 BLOCKER-1).
 
     `dsn` and `slot_name` are accepted and ignored; they were the parameters the
-    orphan-acceptance slot drop needed, and the signature is kept so that a caller
+    orphan-acceptance slot-retirement path needed, and the signature is kept so that a caller
     passing them is not silently mis-wired.
     """
     from .destination import read_resume_point
@@ -652,7 +652,7 @@ def reconcile(
             # The caller now writes the recovery intent and the full table obligation
             # FIRST, with `recovery.begin()`, and lets the one idempotent
             # `recovery.resume()` ladder remove the file, delete the (already absent)
-            # row and drop the slot - each step anchored, each step re-entrant, each
+            # row and establish the main-slot retirement state - each step anchored, each
             # step recognisable from durable state alone after a crash.
             return Reconciliation(
                 "orphan_accepted_resnapshot", ResumePoint(), file_lsn, False,

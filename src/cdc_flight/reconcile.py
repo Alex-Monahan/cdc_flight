@@ -12,7 +12,8 @@ What lives where now:
   file is never a source of truth; that module's docstring is the decision table.
 * `cdc_flight.recovery` — the acquisition-recovery state machine (A53).
 * **here** — observing the slot and the cluster it lives in, the pure `check_slot`
-  decision table (A50/A54), `drop_slot`, and the start-up/shutdown Invariant-O guard.
+  decision table (A50/A54), the retention-backed disposable-slot `drop_slot` primitive,
+  the main-slot retirement observation, and the start-up/shutdown Invariant-O guard.
 
 `reconcile()` is re-exported so callers and tests keep one import site.
 """
@@ -94,7 +95,12 @@ def _recovery_slot_drop_authorization(
     allow_advanced_slot_recovery: bool = False,
     certified_source_lsns: Iterable[int] = (),
 ) -> SlotDropAuthorization:
-    """Issue the capability for the main recovery slot after its certificate passed."""
+    """Build the legacy no-retention capability used by negative-path tests.
+
+    A main recovery slot cannot be physically dropped safely without an independent
+    retention slot, so ``drop_slot`` rejects this capability rather than treating it as
+    authority. Production main-slot retirement uses ``slot_retirement_status``.
+    """
     if not dsn or not slot_name or not publication_name:
         raise LogicalMessageObligationUnresolved(
             "replication slot drop refused: a recovery slot lacks the exact source "
@@ -1114,7 +1120,8 @@ def recover_by_full_resnapshot(
     claim that their *order* made every intermediate state recoverable was false in both
     directions: `row-gone + file-present` is the `orphan_offset_file` refusal (a
     permanent human-only state, reproduced across three restarts), and a crash after the
-    slot drop lost the forced snapshot mode entirely. See `cdc_flight.recovery` for the
+    source-slot retirement lost the forced snapshot mode entirely. See
+    `cdc_flight.recovery` for the
     phases and ADR 0001 §19/A53 for the corrected claim.
     """
     # The prior identity is the *reason* this recovery was requested, not the

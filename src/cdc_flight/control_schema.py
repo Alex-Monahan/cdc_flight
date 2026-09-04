@@ -517,7 +517,7 @@ CONTROL_DDL = [
     # idempotent and re-entrant from whatever phase this row records.
     #
     # It also carries the forced snapshot mode. That used to live only in a local
-    # variable, so a crash after the slot was dropped lost the fact that a data-reading
+    # variable, so a crash during source-slot retirement lost the fact that a data-reading
     # snapshot was owed and the next run saw an ordinary fresh start (Codex B3).
     f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.recovery_state (
             pipeline          VARCHAR     NOT NULL,
@@ -539,7 +539,7 @@ CONTROL_DDL = [
             -- `--reset-state` only: the Debezium scratch directory the reset clears.
             state_dir         VARCHAR,
             -- A source-slot emptiness proof made before the destructive ladder. It
-            -- survives a process death after the slot is dropped, when the source
+            -- survives a process death after source-slot retirement, when the source
             -- can no longer be queried to reconstruct that proof.
             logical_message_resolution VARCHAR,
             requested_at      TIMESTAMPTZ NOT NULL,
