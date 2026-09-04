@@ -1068,6 +1068,7 @@ SLOT_VERDICTS = Domain(
         "source_lsn_regressed",
         "no_durable_destination_row",
         "no_durable_row_full_snapshot",
+        "recovery_retained",
     ),
     purpose="What did the last acquisition conclude about the slot?",
 )

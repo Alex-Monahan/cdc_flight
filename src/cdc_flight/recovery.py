@@ -799,8 +799,12 @@ def resume(
     from . import logical_messages, offsets
     from . import reconcile as reconcile_mod
 
-    supplied_drop_slot = drop_slot
-    drop_slot = drop_slot or reconcile_mod.drop_slot
+    # `drop_slot` is retained as a name for the in-memory fault harnesses and callers
+    # that inject a source-side test seam. Production recovery never calls the physical
+    # drop primitive for the main slot: retirement is a durable state transition, and
+    # the existing main slot remains the WAL retention authority while the fresh image
+    # is built.
+    retire_slot = drop_slot or reconcile_mod.slot_retirement_status
     if replay_intent_path is None:
         replay_root = (
             Path(record.state_dir)
@@ -834,54 +838,6 @@ def resume(
         expected_source_identity=expected_source_identity,
         replay_intent_namespace=namespace,
     )
-    drop_authorization = None
-    if supplied_drop_slot is None:
-        resolution = record.logical_message_resolution or {}
-        source_fence_lsn = resolution.get("source_fence_lsn")
-        if source_fence_lsn is None and message_state.source_evidence is not None:
-            source_fence_lsn = message_state.source_evidence.get("after_lsn")
-        # An operator reset intentionally discards the old resume row.  It has no
-        # durable destination fence to recover here; the guarded slot primitive
-        # derives its fail-closed floor from the live slot instead.  Parsing the
-        # row at this point would make malformed reset state unrecoverable even
-        # though the next step is about to delete that row.
-        if source_fence_lsn is None and record.decision != RESET_DECISION:
-            durable_point = dest_mod.read_resume_point(
-                con, pipeline, namespace, control_schema=control_schema
-            )
-            if durable_point is not None:
-                source_fence_lsn = durable_point.last_lsn
-                if source_fence_lsn is None or source_fence_lsn <= 0:
-                    offset_lsn = durable_point.offset.get("lsn")
-                    source_fence_lsn = (
-                        int(offset_lsn) if offset_lsn is not None else None
-                    )
-        authorization_identity = expected_source_identity
-        if (
-            record.decision == RESET_DECISION
-            and isinstance(authorization_identity, dict)
-            and (
-                authorization_identity.get("system_identifier") is None
-                or authorization_identity.get("timeline_id") is None
-            )
-        ):
-            # An operator reset is allowed to establish the first source identity for
-            # a state directory that had no prior slot receipt. The primitive still
-            # checks the live slot and its logical-message fence; there simply is no
-            # old lineage to compare in this explicit "start over" route.
-            authorization_identity = None
-        drop_authorization = reconcile_mod._recovery_slot_drop_authorization(
-            dsn=dsn,
-            slot_name=record.slot_name or "",
-            publication_name=source_publication_name,
-            application_patterns=source_application_patterns,
-            expected_source_identity=authorization_identity,
-            after_lsn=source_fence_lsn,
-            allow_advanced_slot_recovery=(
-                record.decision == "slot_ahead_of_destination"
-            ),
-            certified_source_lsns=message_state.certified_source_lsns,
-        )
     result = {
         "recovery_id": record.recovery_id,
         "decision": record.decision,
@@ -956,19 +912,19 @@ def resume(
         matrix_crash("recovery_resume_point_deleted_recorded")
 
     if record.phase == PHASE_ROW_DELETED:
-        slot_action = _drop_the_slot_or_fail(
-            drop_slot,
+        slot_action = _retire_the_slot_or_fail(
+            retire_slot,
             dsn=dsn,
             slot_name=record.slot_name,
             record=record,
-            authorization=drop_authorization,
         )
         result["slot"] = slot_action
         if on_phase is not None:
             on_phase(PHASE_ARMED)
-        # rubric 1.7: the slot is dropped and the journal has not recorded it. The
-        # dangerous one: a next run that could not tell would re-snapshot against a
-        # surviving slot, or lose the forced snapshot mode entirely (Codex B3).
+        # rubric 1.7: retirement is acknowledged while the main slot remains present.
+        # That retained slot is the durable WAL handoff for the fresh image; the
+        # recovery journal is still required so a crash cannot make the in-progress
+        # table rebuild look like an ordinary start (Codex B3).
         maybe_crash("recovery_armed", _reached(PHASE_ARMED))
         _write_phase(
             con, pipeline=pipeline, namespace=namespace,
@@ -985,11 +941,11 @@ def resume(
             f"{record.phase!r}); refusing to report an armed recovery that is not armed"
         )
     result["phase"] = record.phase
-    result.setdefault("slot", "already dropped by an earlier attempt")
+    result.setdefault("slot", "already retained by an earlier attempt")
     result.setdefault("offset_file", "already removed by an earlier attempt")
     log.warning(
         "rubric 1.8 recovery %s is ARMED (%s): %s table(s) awaiting a snapshot, resume "
-        "point deleted, offsets file %s, slot %s",
+        "point deleted, offsets file %s, main slot %s",
         record.recovery_id, record.decision, record.tables_marked,
         result["offset_file"], result["slot"],
     )
@@ -1003,6 +959,7 @@ def complete_if_ready(
     namespace: str,
     record: RecoveryRecord,
     verified_empty: list[str] | tuple[str, ...] = (),
+    retained_slot: bool = False,
     control_schema: str | None = None,
 ) -> Completion:
     """Has the rebuild this journal demanded actually happened? Clear it if so.
@@ -1061,17 +1018,19 @@ def complete_if_ready(
     #
     # And it is deliberately NOT patched with a synthetic resume row. The first attempt
     # wrote one with an empty offset map, which is not an offset the connector can resume
-    # from: the next run started with no offset at all, took an `initial` snapshot
-    # against the SURVIVING slot, and delivered concurrently-written rows twice — once as
-    # `r` and once as `c` (Codex r4 BLOCKER-1, reproduced). With no resume row the next
-    # run is an honest `fresh_start`: the slot check sees an empty destination, arms a
-    # recovery, and that recovery DROPS the slot, so Debezium creates its own and the
-    # snapshot/stream boundary is exact (A45). Noisier, and correct.
+    # from. A retained main slot is the real handoff for this design: it continues to
+    # hold the source WAL while the throwaway snapshot builds the image, and the main
+    # engine resumes with `snapshot.mode=no_data` only after that image is complete.
+    # Therefore a recovery can finish without inventing a destination offset, including
+    # the all-empty case.
     empty_discharged = bool(obligation) and set(obligation) <= set(verified_empty)
-    if still_owed or not (has_resume or empty_discharged):
+    if still_owed or not (has_resume or empty_discharged or retained_slot):
         reason = (
             f"{len(still_owed)} captured table(s) are not `complete` "
             f"({', '.join(still_owed)})" if still_owed
+            else "the retained main slot is not yet recorded as a stream handoff and "
+                 "the destination has no resume point"
+            if not retained_slot
             else "the destination has no resume point, so the rebuilt image was never "
                  "handed over to a stream"
         )
@@ -1093,6 +1052,9 @@ def complete_if_ready(
     )
     handoff = (
         "the destination has a resume point again" if has_resume
+        else "the main replication slot remains retained as the durable stream handoff "
+             "while the rebuilt image is used by the no-data main stream"
+        if retained_slot
         else "every captured relation was PROVEN empty at the source, so there is no "
              "resume point and none can exist: the per-relation snapshot_lsn fence is "
              "the handoff evidence, and the next run is an honest fresh start"
@@ -1110,46 +1072,37 @@ def complete_if_ready(
     )
 
 
-def _drop_the_slot_or_fail(
-    drop_slot,
+def _retire_the_slot_or_fail(
+    retire_slot,
     *,
     dsn: str,
     slot_name: str | None,
     record,
-    authorization=None,
 ) -> str:
-    """`dropped` or `absent`, or `RecoveryFailed`. There is no third outcome.
+    """Return `retained` or `absent`, or leave the journal armed on failure.
 
-    See the module docstring: a re-snapshot started against a surviving slot has an
-    uncoordinated image/stream boundary, which is the exact loss window rubric 1.8
-    exists to close, so "the drop failed, carry on" is not available. Raising leaves
-    the journal at `resume_point_deleted`, which the next acquisition resumes from.
+    The main slot is not physically dropped. `retained` means the source-side slot was
+    observed and remains the WAL handoff while the destination rebuilds its tables;
+    `absent` means an external actor already removed it, so stock Debezium may create a
+    replacement at the snapshot boundary. Neither result pretends that a source
+    producer was serialized. A callback that still returns `dropped` is rejected so a
+    test seam cannot silently reintroduce the unsafe contract.
     """
     if not slot_name:  # pragma: no cover - the journal always records one
-        return "not attempted"
+        return "absent"
     try:
-        if authorization is None:
-            # The injectable callback is retained solely for the in-memory crash
-            # harnesses. Production's default is the sealed primitive above; an alias
-            # or adapter around that primitive receives no authorization and is refused
-            # by construction.
-            action = drop_slot(dsn, slot_name)
-        else:
-            action = drop_slot(dsn, slot_name, authorization=authorization)
+        action = retire_slot(dsn, slot_name)
     except Exception as exc:
         raise RecoveryFailed(
-            f"the replication slot {slot_name!r} could not be dropped ({exc}), so "
-            f"recovery {record.recovery_id} ({record.decision}) cannot continue. "
-            "Debezium only pairs a snapshot with an exact WAL position when it creates "
-            "the slot itself (ADR 0001 §19/A45), so re-snapshotting against the "
-            "surviving slot would resume the stream past the snapshot's consistent "
-            "point - the loss window rubric 1.8 exists to close. The recovery journal "
-            "is intact and the next run retries this step; the usual cause is another "
-            "backend still holding the slot."
+            f"the main replication slot {slot_name!r} could not establish its retirement "
+            f"state ({exc}), so recovery {record.recovery_id} ({record.decision}) cannot "
+            "continue. The existing slot is the WAL retention handoff for the fresh "
+            "snapshot; the recovery journal is intact and the next run retries this "
+            "step."
         ) from exc
-    if action not in ("dropped", "absent"):  # pragma: no cover - defensive
+    if action not in ("retained", "absent"):  # pragma: no cover - defensive
         raise RecoveryFailed(
-            f"dropping {slot_name!r} returned {action!r}, which is neither 'dropped' "
-            "nor 'absent', so the slot cannot be shown to be gone"
+            f"retiring {slot_name!r} returned {action!r}, which is neither 'retained' "
+            "nor 'absent'; the recovery cannot establish its source-side handoff"
         )
     return action

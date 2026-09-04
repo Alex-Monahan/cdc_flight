@@ -98,7 +98,7 @@ CELLS = (
     ),
     Cell(
         "recovery_armed",
-        "the slot is gone only after the journal can resume the forced snapshot",
+        "the main slot is retained after the journal can resume the forced snapshot",
         "recovery_armed_recorded",
         "armed",
         "available",
@@ -1248,8 +1248,9 @@ def _assert_matrix_cell(result: dict, cell: Cell) -> None:
         assert not survivor["offset_file"], survivor
     if cell.recovery:
         if cell.expected_recovery == "armed":
-            assert survivor["slot"] is None, (
-                f"{cell.name} ({cell.proves}) recorded armed before dropping the slot: "
+            assert survivor["slot"] is not None, (
+                f"{cell.name} ({cell.proves}) lost the retained main slot before the "
+                "recovery journal was recorded: "
                 f"{survivor!r}"
             )
         else:

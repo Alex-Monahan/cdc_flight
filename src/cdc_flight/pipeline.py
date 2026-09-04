@@ -450,6 +450,9 @@ def run(
             con, source=source, replication=replication, dest=dest, namespace=namespace,
             phases=phases, routes=routes,
         )
+        recovery_slot_retained = bool(
+            isinstance(resumed, dict) and resumed.get("slot") == "retained"
+        )
         if resumed is not None:
             summary_extra["recovery_resumed"] = resumed
         if journal is not None:
@@ -471,6 +474,10 @@ def run(
                 replication.offset_file.exists()
                 and replication.offset_file.stat().st_size > 0
             ),
+            recovery_in_progress=journal is not None,
+        )
+        recovery_slot_retained = recovery_slot_retained or (
+            verdict.decision == "recovery_retained"
         )
         summary_extra["slot_check"] = verdict.as_dict()
         # A stale throwaway slot may be retired only while the main slot is the
@@ -502,6 +509,9 @@ def run(
         if recovery is not None:
             phases.to(PHASE_RECOVERING, detail=verdict.decision)
             summary_extra["slot_recovery"] = recovery
+            recovery_slot_retained = recovery_slot_retained or (
+                recovery.get("slot") == "retained"
+            )
             journal = recovery_mod.read(
                 con,
                 pipeline=dest.pipeline_name,
@@ -509,16 +519,15 @@ def run(
                 control_schema=control_schema,
             )
         if journal is not None:
-            # A recovery has deleted the resume point, so the run has to snapshot data
-            # whatever `snapshot.mode` said. `no_data` plus "every table is owed a
-            # snapshot" is a run that streams onto tables it knows are wrong.
-            #
-            # Read from the JOURNAL, not from a local variable: the intent has to
-            # outlive the process that formed it. A crash after the slot was dropped
-            # used to leave no row, no file and no slot, which the next run called an
-            # ordinary fresh start - and a fresh start under a configured `no_data` mode
-            # streams onto tables that were never rebuilt (Codex B3).
-            if props["snapshot.mode"] not in reconcile_mod.SNAPSHOT_MODES_WITH_DATA:
+            # A recovery with an absent main slot still needs the journal's durable
+            # data-reading override. When the main slot is retained, the throwaway
+            # snapshot already established the image and the main engine must use
+            # `no_data` so it resumes from that retained stream cursor rather than
+            # taking a second snapshot against a surviving slot.
+            if recovery_slot_retained:
+                props["snapshot.mode"] = "no_data"
+                summary_extra["recovery_stream_handoff"] = "retained_main_slot"
+            elif props["snapshot.mode"] not in reconcile_mod.SNAPSHOT_MODES_WITH_DATA:
                 log.warning(
                     "snapshot.mode=%s does not read table data; using %r for this "
                     "recovery run (journal %s)",
@@ -529,6 +538,13 @@ def run(
                 )
             summary_extra["recovery_journal"] = journal.as_dict()
             faults_mod.runtime_state(recovery_phase=journal.phase)
+        elif recovery_slot_retained:
+            # The recovery journal may have been cleared before the engine (the
+            # all-empty route is the important case). The durable slot-state verdict is
+            # still the contract for this run: stream from the retained main slot with
+            # no second snapshot.
+            props["snapshot.mode"] = "no_data"
+            summary_extra["recovery_stream_handoff"] = "retained_main_slot"
 
         if source.role == "standby":
             # Acquisition may deliberately drop a slot whose position outruns an
@@ -782,8 +798,12 @@ def run(
                 source_publication_name=replication.publication_name,
                 source_application_patterns=replication.message_prefix_allowlist,
             )
+            recovery_slot_retained = recovery_slot_retained or (
+                summary_extra["orphan_recovery"].get("slot") == "retained"
+            )
         if (
             journal is not None
+            and not recovery_slot_retained
             and props["snapshot.mode"] not in reconcile_mod.SNAPSHOT_MODES_WITH_DATA
         ):
             log.warning(
@@ -794,6 +814,9 @@ def run(
             props["snapshot.mode"] = (
                 journal.snapshot_mode or recovery_mod.FORCED_SNAPSHOT_MODE
             )
+        elif recovery_slot_retained:
+            props["snapshot.mode"] = "no_data"
+            summary_extra["recovery_stream_handoff"] = "retained_main_slot"
 
         # ADR §4.7 - the Invariant-O guard, at start-up. `snapshot_mode` is what
         # decides the "slot exists / no durable destination row" cell (Codex 3).
@@ -801,6 +824,7 @@ def run(
             con, pipeline=dest.pipeline_name, namespace=namespace,
             dsn=routes.read_dsn, slot_name=replication.slot_name,
             snapshot_mode=props["snapshot.mode"],
+            retained_slot=recovery_slot_retained,
             control_schema=control_schema,
         )
 
@@ -819,6 +843,7 @@ def run(
                 pipeline=dest.pipeline_name,
                 namespace=namespace,
                 record=journal,
+                retained_slot=recovery_slot_retained,
                 control_schema=control_schema,
             )
             if completion.cleared:
@@ -1051,6 +1076,7 @@ def run(
         if (
             owed
             and not will_snapshot_everything
+            and not recovery_slot_retained
             and acquisition.resnapshot_enabled()
             and reconciliation.resume_point.last_lsn == 0
         ):
@@ -1239,7 +1265,10 @@ def run(
         # but the recovery snapshot's callbacks are still required evidence. The
         # throwaway re-snapshot has its own required completion machine; an ordinary
         # streaming run remains `not_required` here.
-        snapshot_completion_required = will_snapshot_everything or journal is not None
+        snapshot_completion_required = (
+            will_snapshot_everything
+            or (journal is not None and not recovery_slot_retained)
+        )
         snapshot_completion = SnapshotCompletion.for_capture(
             snapshot_completion_required,
             schema=source.schema,
@@ -1262,6 +1291,7 @@ def run(
             outcome=outcome,
             base_summary=summary_extra,
             drop_mode=applier_cfg.drop_mode,
+            retained_slot=recovery_slot_retained,
         )
 
         from .discovery_coordinator import LiveDiscoveryCoordinator

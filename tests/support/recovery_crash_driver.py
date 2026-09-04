@@ -38,12 +38,11 @@ def main(argv: list[str]) -> int:
 
     slots_file = Path(slots_path)
 
-    def drop_slot(dsn: str, slot_name: str) -> str:
+    def retire_slot(dsn: str, slot_name: str) -> str:
         slots = set(json.loads(slots_file.read_text()))
         if slot_name in slots:
-            slots.discard(slot_name)
             slots_file.write_text(json.dumps(sorted(slots)))
-            return "dropped"
+            return "retained"
         return "absent"
 
     con = duckdb.connect(duckdb_path)
@@ -96,7 +95,7 @@ def main(argv: list[str]) -> int:
                 namespace=NAMESPACE,
                 record=record,
                 dsn="postgresql://unused",
-                drop_slot=drop_slot,
+                drop_slot=retire_slot,
                 logical_message_dataset="cdc_raw",
             )
     finally:

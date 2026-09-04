@@ -100,11 +100,10 @@ class _World:
             [PIPELINE, NAMESPACE],
         )
 
-    def drop_slot(self, dsn: str, slot_name: str) -> str:
+    def retire_slot(self, dsn: str, slot_name: str) -> str:
         if slot_name in self.slots:
-            self.slots.discard(slot_name)
             self._save_slots()
-            return "dropped"
+            return "retained"
         return "absent"
 
     # -- the hard-death seam ------------------------------------------------ #
@@ -176,7 +175,7 @@ class _World:
         assert record is not None
         return recovery_mod.resume(
             self.con, pipeline=PIPELINE, namespace=NAMESPACE, record=record,
-            dsn="postgresql://unused", drop_slot=self.drop_slot,
+            dsn="postgresql://unused", drop_slot=self.retire_slot,
             logical_message_dataset="cdc_raw",
         )
 
@@ -260,7 +259,7 @@ def test_a_hard_death_at_a_recovery_anchor_leaves_a_resumable_journal(world, poi
     assert surviving is not None, "the journal is the whole point"
     assert surviving.phase == ANCHOR_PHASE[point]
     # The forced snapshot mode survived the cut: it used to live only in a local
-    # variable, so a crash after the slot was dropped lost it (Codex B3).
+    # variable, so a crash during main-slot retirement lost it (Codex B3).
     assert surviving.snapshot_mode == recovery_mod.FORCED_SNAPSHOT_MODE
     # And the obligation itself, which is what the completion predicate is about.
     assert sorted(surviving.captured) == ["app.customers", "app.orders"]
@@ -270,7 +269,9 @@ def test_a_hard_death_at_a_recovery_anchor_leaves_a_resumable_journal(world, poi
     assert result["phase"] == PHASE_ARMED
     assert world.offset_path.exists() is False
     assert world.durable_rows == 0
-    assert world.slots == set(), "the slot must be gone before any snapshot starts"
+    assert world.slots == {"cdc_slot"}, (
+        "the main slot remains as the WAL-retention handoff while the image is rebuilt"
+    )
     assert world.owed == ["app.customers", "app.orders"]
 
 

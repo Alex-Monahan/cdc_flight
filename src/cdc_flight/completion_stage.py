@@ -53,6 +53,7 @@ class PostEngineCompletion:
     outcome: RunOutcome
     base_summary: Mapping[str, Any]
     drop_mode: str = DROP_LOG
+    retained_slot: bool = False
 
     def finish(self, engine_result: Mapping[str, Any]) -> CompletionReport:
         """Run the post-engine proof and return the final, publishable summary."""
@@ -65,6 +66,7 @@ class PostEngineCompletion:
             dsn=self.source_dsn,
             slot_name=self.slot_name,
             snapshot_mode=self.snapshot_mode,
+            retained_slot=self.retained_slot,
             control_schema=self.destination.control_schema,
         )
 
@@ -170,6 +172,7 @@ class PostEngineCompletion:
             namespace=self.namespace,
             record=self.journal,
             verified_empty=emptied,
+            retained_slot=self.retained_slot,
             control_schema=self.destination.control_schema,
         )
         if completion.cleared:
