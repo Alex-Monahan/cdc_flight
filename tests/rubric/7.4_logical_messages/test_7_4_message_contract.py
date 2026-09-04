@@ -1336,7 +1336,6 @@ authorization = reconcile._recovery_slot_drop_authorization(
 )
 reconcile._guarded_source_connection = lambda _authorization: Connection()
 reconcile._slot_row = lambda _connection, _slot: ("pgoutput", 10, 5, "source-system", 1)
-reconcile._source_wal_high_water = lambda _connection: 100
 logical_messages._probe_source_message_evidence_connection = (
     lambda *_args, **_kwargs: logical_messages.SourceMessageEvidence(
         status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_PRESENT,
