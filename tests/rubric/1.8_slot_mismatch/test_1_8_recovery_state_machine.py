@@ -32,6 +32,7 @@ import duckdb
 import pytest
 
 from cdc_flight import destination as dest_mod
+from cdc_flight import reconcile as reconcile_module
 from cdc_flight import recovery as recovery_mod
 from cdc_flight.errors import ReconciliationRefused, RecoveryFailed
 from cdc_flight.reconcile import reconcile
@@ -285,6 +286,36 @@ def test_resuming_twice_changes_nothing(world):
     second = world.resume()
     assert first["phase"] == second["phase"] == PHASE_ARMED
     assert world.drop_calls == calls, "an armed recovery does not re-drop the slot"
+    assert world.durable_rows == 0
+
+
+def test_operator_reset_resume_self_heals_a_malformed_durable_resume_row(
+    world, monkeypatch
+):
+    """A reset successor must not reparse the row that reset intentionally deletes."""
+    world.begin(decision=recovery_mod.RESET_DECISION)
+    world.con.execute(
+        "UPDATE _cdc_flight.debezium_offsets SET resume_json = ? WHERE pipeline = ?",
+        ["{malformed reset state", PIPELINE],
+    )
+
+    def drop(_dsn, _slot_name, *, authorization):
+        assert authorization.after_lsn is None
+        return "dropped"
+
+    monkeypatch.setattr(reconcile_module, "drop_slot", drop)
+    result = recovery_mod.resume(
+        world.con,
+        pipeline=PIPELINE,
+        namespace=NAMESPACE,
+        record=world.journal(),
+        dsn="postgresql://unused",
+        logical_message_dataset=DATASET,
+        source_publication_name="cdc_flight_pub",
+    )
+
+    assert result["phase"] == PHASE_ARMED
+    assert result["slot"] == "dropped"
     assert world.durable_rows == 0
 
 

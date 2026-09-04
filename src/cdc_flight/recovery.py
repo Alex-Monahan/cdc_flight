@@ -840,7 +840,12 @@ def resume(
         source_fence_lsn = resolution.get("source_fence_lsn")
         if source_fence_lsn is None and message_state.source_evidence is not None:
             source_fence_lsn = message_state.source_evidence.get("after_lsn")
-        if source_fence_lsn is None:
+        # An operator reset intentionally discards the old resume row.  It has no
+        # durable destination fence to recover here; the guarded slot primitive
+        # derives its fail-closed floor from the live slot instead.  Parsing the
+        # row at this point would make malformed reset state unrecoverable even
+        # though the next step is about to delete that row.
+        if source_fence_lsn is None and record.decision != RESET_DECISION:
             durable_point = dest_mod.read_resume_point(
                 con, pipeline, namespace, control_schema=control_schema
             )
