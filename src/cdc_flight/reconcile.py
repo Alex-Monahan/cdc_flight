@@ -984,6 +984,27 @@ def drop_slot(
                 ):
                     after_lsn = int(target[1])
 
+                # Establish the WAL high-water mark BEFORE the logical-message probe.
+                # This ordering closes the source-commit windows structurally: a
+                # message committed before or during the setup is visible to the probe
+                # that follows, while a message committed after the probe changes the
+                # current high-water predicate at the effect edge.  The predicate is
+                # re-read by the same SQL statement that invokes pg_drop_replication_slot;
+                # a changed value therefore yields no drop row and the next attempt
+                # probes again.  This is a fail-closed fence, not a timing retry.
+                high_water = _source_wal_high_water(conn)
+                if high_water is None:
+                    raise _slot_drop_obligation(
+                        logical_messages.SourceMessageEvidence(
+                            status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+                            slot_name=authorization.slot_name,
+                            after_lsn=after_lsn,
+                            error="source WAL high-water is unavailable",
+                        ),
+                        slot_name=authorization.slot_name,
+                        issue="source_wal_high_water_unknown",
+                    )
+
                 # A throwaway slot is allowed to run ahead while it builds the image;
                 # that is expected and does not make it the retention authority.  The
                 # named main slot is the copy whose WAL was not consumed by the
@@ -1025,18 +1046,6 @@ def drop_slot(
                             evidence, slot_name=authorization.slot_name, issue=issue
                         )
 
-                high_water = _source_wal_high_water(conn)
-                if high_water is None:
-                    raise _slot_drop_obligation(
-                        logical_messages.SourceMessageEvidence(
-                            status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
-                            slot_name=authorization.slot_name,
-                            after_lsn=after_lsn,
-                            error="source WAL high-water is unavailable",
-                        ),
-                        slot_name=authorization.slot_name,
-                        issue="source_wal_high_water_unknown",
-                    )
                 rows = conn._execute_drop(
                     *_guarded_drop_sql(authorization, high_water)
                 ).fetchall()

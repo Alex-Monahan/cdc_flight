@@ -937,6 +937,96 @@ def test_real_message_after_in_primitive_probe_blocks_slot_drop(
             )
 
 
+def test_real_message_between_primitive_probe_and_high_water_blocks_slot_drop(
+    postgres_cluster, monkeypatch
+):
+    """A commit after the primitive probe cannot be hidden by its high-water read."""
+    source = postgres_cluster
+    slot_name = f"p72_b1_probe_high_{uuid.uuid4().hex}"[:63]
+    emitted: list[int] = []
+
+    try:
+        with psycopg.connect(source.dsn, autocommit=True) as source_con:
+            created = source_con.execute(
+                "SELECT slot_name, (lsn - '0/0'::pg_lsn)::bigint "
+                "FROM pg_create_logical_replication_slot(%s, 'pgoutput')",
+                (slot_name,),
+            ).fetchone()
+            assert created is not None
+            created_lsn = int(created[1])
+
+        observation = reconcile.observe_slot(source.dsn, slot_name)
+        assert observation.observable, observation.error
+        fence_lsn = observation.confirmed_flush_lsn or created_lsn
+        identity = {
+            "system_identifier": observation.system_identifier,
+            "timeline_id": observation.timeline_id,
+        }
+        assert peek_source_message_evidence(
+            source.dsn,
+            slot_name=slot_name,
+            publication_name="cdc_flight_pub",
+            after_lsn=fence_lsn,
+            expected_source_identity=identity,
+        ).status == logical_messages.SOURCE_MESSAGE_PROBE_STATUS_EMPTY
+        authorization = reconcile._recovery_slot_drop_authorization(
+            dsn=source.dsn,
+            slot_name=slot_name,
+            publication_name="cdc_flight_pub",
+            application_patterns=("app_.*",),
+            expected_source_identity=identity,
+            after_lsn=fence_lsn,
+        )
+
+        original_probe = logical_messages._probe_source_message_evidence_connection
+
+        def probe_then_emit(conn, **kwargs):
+            evidence = original_probe(conn, **kwargs)
+            if not emitted:
+                with psycopg.connect(source.dsn, autocommit=True) as source_con:
+                    lsn = source_con.execute(
+                        "SELECT (pg_logical_emit_message(%s, %s, %s) - "
+                        "'0/0'::pg_lsn)::bigint",
+                        (False, "app_b1_probe_high", "emitted-after-probe"),
+                    ).fetchone()[0]
+                    source_con.execute("CHECKPOINT")
+                emitted.append(int(lsn))
+            return evidence
+
+        monkeypatch.setattr(
+            logical_messages,
+            "_probe_source_message_evidence_connection",
+            probe_then_emit,
+        )
+        with pytest.raises(LogicalMessageObligationUnresolved) as caught:
+            reconcile.drop_slot(
+                source.dsn,
+                slot_name,
+                authorization=authorization,
+            )
+        assert emitted, "the real source message was not emitted after the probe"
+        assert caught.value.obligations[0]["issues"] == [
+            "source_slot_application_message_unobserved"
+        ]
+        assert reconcile.observe_slot(source.dsn, slot_name).slot_exists
+        evidence = peek_source_message_evidence(
+            source.dsn,
+            slot_name=slot_name,
+            publication_name="cdc_flight_pub",
+            after_lsn=fence_lsn,
+            expected_source_identity=identity,
+        )
+        assert evidence.status == logical_messages.SOURCE_MESSAGE_PROBE_STATUS_PRESENT
+        assert evidence.application_messages[0]["prefix"] == "app_b1_probe_high"
+    finally:
+        with psycopg.connect(source.dsn, autocommit=True) as source_con:
+            source_con.execute(
+                "SELECT pg_drop_replication_slot(slot_name) "
+                "FROM pg_replication_slots WHERE slot_name = %s",
+                (slot_name,),
+            )
+
+
 def test_main_slot_loss_defers_stale_sweep_and_preserves_only_retention_slot(
     postgres_cluster,
 ):
