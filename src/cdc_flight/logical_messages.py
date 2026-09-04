@@ -43,6 +43,11 @@ class MessageDeliveryState:
     """
 
     certified_message_ids: tuple[str, ...] = ()
+    #: Source WAL positions for the complete certificates above.  These positions
+    #: are a narrow exception to the in-primitive source-message guard: an observed
+    #: message at one of these positions is already durable in all three destination
+    #: certificate rows and is therefore not an undischarged obligation.
+    certified_source_lsns: tuple[int, ...] = ()
     obligations: tuple[dict[str, Any], ...] = ()
     #: A pending replay marker was present when this state was derived. This is
     #: deliberately separate from obligations: an empty join plus a marker is
@@ -59,6 +64,7 @@ class MessageDeliveryState:
         return {
             "certified_message_ids": list(self.certified_message_ids),
             "certified_count": len(self.certified_message_ids),
+            "certified_source_lsns": list(self.certified_source_lsns),
             "obligations": [dict(item) for item in self.obligations],
             "obligation_count": len(self.obligations),
             "replay_intent_present": self.replay_intent_present,
@@ -823,6 +829,7 @@ def read_delivery_state(
         [pipeline, message_target, *consumer_params, pipeline, message_target],
     ).fetchall()
     certified: list[str] = []
+    certified_source_lsns: list[int] = []
     obligations: list[dict[str, Any]] = []
     for row in rows:
         values = dict(zip(
@@ -844,6 +851,8 @@ def read_delivery_state(
         message_id = str(values["message_id"])
         if values["certified"]:
             certified.append(message_id)
+            if values["consumer_lsn"] is not None:
+                certified_source_lsns.append(int(values["consumer_lsn"]))
             continue
         issues: list[str] = []
         if not values["has_ledger"]:
@@ -869,7 +878,11 @@ def read_delivery_state(
                 "has_audit": bool(values["has_audit"]),
             }
         )
-    return MessageDeliveryState(tuple(certified), tuple(obligations))
+    return MessageDeliveryState(
+        certified_message_ids=tuple(certified),
+        certified_source_lsns=tuple(certified_source_lsns),
+        obligations=tuple(obligations),
+    )
 
 
 def require_recovery_message_certificate(

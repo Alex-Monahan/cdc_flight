@@ -77,6 +77,7 @@ class SlotDropAuthorization:
     expected_source_identity: Mapping[str, object] | tuple[object, object] | None
     retention_slot_name: str | None = None
     allow_advanced_slot_recovery: bool = False
+    certified_source_lsns: tuple[int, ...] = ()
 
     def is_sealed(self) -> bool:
         return self._seal is _SLOT_DROP_SEAL
@@ -91,6 +92,7 @@ def _recovery_slot_drop_authorization(
     expected_source_identity,
     after_lsn: int | None,
     allow_advanced_slot_recovery: bool = False,
+    certified_source_lsns: Iterable[int] = (),
 ) -> SlotDropAuthorization:
     """Issue the capability for the main recovery slot after its certificate passed."""
     if not dsn or not slot_name or not publication_name:
@@ -117,6 +119,7 @@ def _recovery_slot_drop_authorization(
         application_patterns=tuple(application_patterns),
         expected_source_identity=expected_source_identity,
         allow_advanced_slot_recovery=allow_advanced_slot_recovery,
+        certified_source_lsns=tuple(int(lsn) for lsn in certified_source_lsns),
     )
 
 
@@ -1034,6 +1037,26 @@ def drop_slot(
                         # The named retention slot was checked on this same connection;
                         # the message remains recoverable there, so retiring only the
                         # derived copy cannot destroy the last source evidence.
+                        pass
+                    elif (
+                        evidence.status
+                        == logical_messages.SOURCE_MESSAGE_PROBE_STATUS_PRESENT
+                        and authorization.certified_source_lsns
+                        and evidence.application_messages
+                        and all(
+                            message.get("source_lsn") is not None
+                            and int(message["source_lsn"])
+                            in authorization.certified_source_lsns
+                            for message in evidence.application_messages
+                        )
+                    ):
+                        # A reset can intentionally delete the old resume row while
+                        # its complete message certificates remain in the destination.
+                        # The source probe still runs at the effect boundary; only
+                        # messages whose exact source LSN is already in all three
+                        # durable certificate rows are discharged here. Any other
+                        # message, including one arriving in this guarded window,
+                        # remains an unresolved obligation and fails closed below.
                         pass
                     else:
                         issue = (

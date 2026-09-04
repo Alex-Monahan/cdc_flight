@@ -880,6 +880,7 @@ def resume(
             allow_advanced_slot_recovery=(
                 record.decision == "slot_ahead_of_destination"
             ),
+            certified_source_lsns=message_state.certified_source_lsns,
         )
     result = {
         "recovery_id": record.recovery_id,
