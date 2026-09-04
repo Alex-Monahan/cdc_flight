@@ -1620,6 +1620,7 @@ def test_message_identity_is_source_based_and_digest_is_byte_sensitive():
 
     replay = _message(None, None, 200, b"\x00", transactional=False)
     replay.event_ts_ms = 987654321
+    replay.source_sequence = "replayed-by-stock-debezium"
     replay_identity = event_ledger.message_identity_for(
         replay,
         source_cluster_id="cluster-contract",
@@ -1628,6 +1629,38 @@ def test_message_identity_is_source_based_and_digest_is_byte_sensitive():
     )
     assert replay_identity.event_id == one.event_id
     assert replay_identity.payload_digest == one.payload_digest
+
+    logical_messages.assert_row_matches(
+        {
+            "message_id": one.event_id,
+            "prefix": "app_contract",
+            "is_transactional": False,
+            "source_cluster_id": "cluster-contract",
+            "source_timeline": 1,
+            "source_lsn": 200,
+            "source_sequence": "original-connector-cursor",
+            "txn_id": None,
+            "total_order": None,
+            "commit_lsn": 200,
+            "source_ts_ms": 1234,
+            "content": b"\x00",
+        },
+        {
+            "dataset": DATASET,
+            "message_id": one.event_id,
+            "prefix": "app_contract",
+            "is_transactional": False,
+            "source_cluster_id": "cluster-contract",
+            "source_timeline": 1,
+            "source_lsn": 200,
+            "source_sequence": "replayed-connector-cursor",
+            "txn_id": None,
+            "total_order": None,
+            "commit_lsn": 200,
+            "source_ts_ms": 1234,
+            "content": b"\x00",
+        },
+    )
 
     with pytest.raises(DestinationIdentityCollision, match="missing stable"):
         event_ledger.message_identity_for(

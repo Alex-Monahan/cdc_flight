@@ -627,9 +627,14 @@ def assert_row_matches(
             "but no materialized consumer row",
             target=target_table(str(expected["dataset"])),
         )
+    # ``source_sequence`` is retained in the consumer row for observability, but it
+    # is a connector cursor rendering rather than a stable source-event fact.  Stock
+    # Debezium can assign a different rendering when it replays the same WAL message;
+    # the ledger digest and the durable source identity already guard the bytes and
+    # event, so comparing this field would reject a valid replay certificate.
     for name in (
         "message_id", "prefix", "is_transactional", "source_cluster_id",
-        "source_timeline", "source_lsn", "source_sequence", "txn_id",
+        "source_timeline", "source_lsn", "txn_id",
         "total_order", "commit_lsn", "source_ts_ms",
     ):
         if observed.get(name) != expected.get(name):
