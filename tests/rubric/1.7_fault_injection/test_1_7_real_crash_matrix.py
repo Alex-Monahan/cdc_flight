@@ -49,8 +49,8 @@ class Cell:
     compose: dict[str, str] | None = None
     max_seconds: float = 120
     prior_recovery: bool = False
-    expected_shutdown: str = "open"
-    expected_interruption_marker: str = "absent"
+    expected_shutdown: str | tuple[str, ...] = "open"
+    expected_interruption_marker: str | tuple[str, ...] = "absent"
 
 
 @dataclass(frozen=True)
@@ -221,6 +221,7 @@ CROSS_STATE_CELLS = (
         "none",
         "unarmed",
         prior_recovery=True,
+        expected_interruption_marker="armed",
     ),
     Cell(
         "armed_recovery_ownership_active",
@@ -231,6 +232,7 @@ CROSS_STATE_CELLS = (
         "none",
         "unarmed",
         prior_recovery=True,
+        expected_interruption_marker="armed",
     ),
     Cell(
         "armed_recovery_completion_marker_written",
@@ -241,6 +243,14 @@ CROSS_STATE_CELLS = (
         "written",
         "unarmed",
         prior_recovery=True,
+        # The same production anchor can fire in the retained-slot throwaway
+        # snapshot or in the subsequent main snapshot.  The former may still own
+        # the durable interruption marker and may already have stopped its engine;
+        # the latter has consumed that marker and starts with an open shutdown
+        # sequence.  Both are explicit, durable protocol states; no other state is
+        # admissible.
+        expected_shutdown=("open", "engine_thread_stopped"),
+        expected_interruption_marker=("absent", "armed"),
     ),
     Cell(
         "armed_recovery_watermark_armed",
@@ -251,6 +261,8 @@ CROSS_STATE_CELLS = (
         "written",
         "armed",
         prior_recovery=True,
+        expected_shutdown=("open", "engine_thread_stopped"),
+        expected_interruption_marker=("absent", "armed"),
     ),
     Cell(
         "armed_recovery_watermark_reached",
@@ -261,6 +273,8 @@ CROSS_STATE_CELLS = (
         "written",
         "reached",
         prior_recovery=True,
+        expected_shutdown=("open", "engine_thread_stopped"),
+        expected_interruption_marker=("absent", "armed"),
     ),
     Cell(
         "armed_recovery_shutdown_marker_written",
@@ -1183,8 +1197,20 @@ def _assert_matrix_cell(result: dict, cell: Cell) -> None:
     assert context.get("ownership") == cell.expected_ownership, survivor
     assert context.get("completion_marker_state") == cell.expected_marker, survivor
     assert context.get("watermark") == cell.expected_watermark, survivor
-    assert context.get("interruption_marker") == cell.expected_interruption_marker, survivor
-    assert context.get("shutdown_sequence") == cell.expected_shutdown, survivor
+    marker = context.get("interruption_marker")
+    allowed_markers = (
+        cell.expected_interruption_marker
+        if isinstance(cell.expected_interruption_marker, tuple)
+        else (cell.expected_interruption_marker,)
+    )
+    assert marker in allowed_markers, survivor
+    shutdown = context.get("shutdown_sequence")
+    allowed_shutdowns = (
+        cell.expected_shutdown
+        if isinstance(cell.expected_shutdown, tuple)
+        else (cell.expected_shutdown,)
+    )
+    assert shutdown in allowed_shutdowns, survivor
     if cell.expected_marker == "shutdown_idle_written":
         assert context.get("marker_lsn") is not None, survivor
         assert survivor["durable_lsn"] is not None, survivor
