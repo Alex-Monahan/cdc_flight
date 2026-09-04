@@ -24,6 +24,49 @@ def summarize_passes(passes: list[dict]) -> dict:
     return summary
 
 
+def verified_empty_summary(passes: list[dict]) -> dict:
+    """Expose only resnapshot emptiness backed by its source-WAL fence.
+
+    The main-engine recovery path derives these two legacy summary keys while it
+    discharges the still-owed queue.  A retained-slot recovery has already completed
+    that queue in the blocking throwaway resnapshot, so it must carry the same facts
+    forward from the result instead of inventing them after the queue is empty.
+    """
+    fences_by_table: dict[str, int] = {}
+    for detail in passes:
+        emptied = [str(name) for name in (detail.get("resnapshot_emptied") or [])]
+        if not emptied:
+            continue
+        fence = detail.get("resnapshot_empty_check_lsn")
+        if fence is None:
+            raise ValueError(
+                "a resnapshot reports an emptied table without its source-WAL fence"
+            )
+        fence = int(fence)
+        for qualified in emptied:
+            previous = fences_by_table.get(qualified)
+            if previous is not None and previous != fence:
+                raise ValueError(
+                    f"resnapshot reports {qualified} empty at conflicting fences "
+                    f"{previous} and {fence}"
+                )
+            fences_by_table[qualified] = fence
+    if not fences_by_table:
+        return {}
+
+    summary = {
+        "verified_empty_after_snapshot": sorted(fences_by_table),
+    }
+    fences = set(fences_by_table.values())
+    if len(fences) == 1:
+        summary["verified_empty_fence_lsn"] = next(iter(fences))
+    else:
+        # A retry batch can have its own consistent point.  Do not collapse several
+        # earned per-table fences into one number that would claim a common proof.
+        summary["verified_empty_fence_lsns"] = dict(sorted(fences_by_table.items()))
+    return summary
+
+
 def run_owed(
     con,
     *,

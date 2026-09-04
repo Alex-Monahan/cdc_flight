@@ -1131,6 +1131,13 @@ def run(
             )
             summary_extra.update(latest_resnapshot)
             summary_extra.update(rbs.summarize_passes(resnapshot_passes))
+            if journal is not None and recovery_slot_retained:
+                # The retained recovery's throwaway snapshot has already discharged
+                # the owed lifecycle rows before the no-data main stream runs.  Carry
+                # its positive emptiness evidence into the aliases the old main-engine
+                # discharge path emitted; do not emit either key without both the
+                # emptied-table result and its source-WAL fence.
+                summary_extra.update(rbs.verified_empty_summary(resnapshot_passes))
             reconciliation.resume_point.snapshot_epoch = max(
                 reconciliation.resume_point.snapshot_epoch, snapshot_epoch
             )
