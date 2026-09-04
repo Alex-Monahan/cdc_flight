@@ -771,15 +771,6 @@ def check_slot(
     return SlotVerdict("ok", ok=True, context=context)
 
 
-def _source_wal_high_water(conn) -> int | None:
-    """Read a WAL high-water mark on either the primary or the standby slot owner."""
-    row = conn.execute(
-        "SELECT ((CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn() "
-        "ELSE pg_current_wal_lsn() END) - '0/0'::pg_lsn)::bigint"
-    ).fetchone()
-    return int(row[0]) if row and row[0] is not None else None
-
-
 def _slot_row(conn, slot_name: str):
     return conn.execute(
         "SELECT plugin, (confirmed_flush_lsn - '0/0'::pg_lsn)::bigint, "
@@ -814,16 +805,60 @@ def _slot_drop_obligation(evidence, *, slot_name: str, issue: str | None = None)
     )
 
 
-def _guarded_drop_sql(authorization: SlotDropAuthorization, high_water: int):
-    """Return the conditional drop statement at the end of the critical section."""
+def _retention_drop_sql(authorization: SlotDropAuthorization):
+    """Return the target-list effect used with independent retention only.
+
+    There is intentionally no WAL high-water predicate here. PostgreSQL evaluates a
+    relation filter before a target-list function, so that predicate cannot reserve the
+    source against an arbitrary producer. This effect is safe for a different reason:
+    the named retention slot has already been checked to retain the target's pending
+    range, and it remains in place while the target is retired.
+    """
     return (
         "SELECT pg_drop_replication_slot(slot_name) "
         "FROM pg_replication_slots "
-        "WHERE slot_name = %s "
-        "AND ((CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn() "
-        "ELSE pg_current_wal_lsn() END) - '0/0'::pg_lsn)::bigint = %s",
-        (authorization.slot_name, int(high_water)),
+        "WHERE slot_name = %s ",
+        (authorization.slot_name,),
     )
+
+
+def slot_retirement_status(dsn: str, slot_name: str) -> str:
+    """Read the source side of the main-slot retirement transition.
+
+    Recovery deliberately does not drop its only main slot. The destination journal
+    records the retirement state while the existing slot retains WAL during the fresh
+    throwaway snapshot. A slot already removed externally is reported as ``absent`` so
+    the caller can use stock Debezium's fresh-slot path.
+    """
+    if not dsn or not slot_name:
+        raise LogicalMessageObligationUnresolved(
+            "main-slot retirement could not establish its source state",
+            obligations=(
+                {
+                    "message_id": f"source-slot:{slot_name or 'unknown'}",
+                    "issues": ["source_slot_retirement_unknown"],
+                    "has_ledger": False,
+                    "has_consumer": False,
+                    "has_audit": False,
+                },
+            ),
+        )
+    observation = observe_slot(dsn, slot_name)
+    if not observation.observable:
+        raise LogicalMessageObligationUnresolved(
+            "main-slot retirement refused: the source slot state is unobservable",
+            obligations=(
+                {
+                    "message_id": f"source-slot:{slot_name}",
+                    "issues": ["source_slot_retirement_unknown"],
+                    "has_ledger": False,
+                    "has_consumer": False,
+                    "has_audit": False,
+                    "source_evidence": observation.as_dict(),
+                },
+            ),
+        )
+    return "retained" if observation.slot_exists else "absent"
 
 
 def drop_slot(
@@ -832,14 +867,15 @@ def drop_slot(
     *,
     authorization: SlotDropAuthorization | None = None,
 ) -> str:
-    """Drop a slot only after this primitive discharges its source obligation.
+    """Drop a disposable slot only while a separate slot retains its pending WAL.
 
-    There is deliberately no unguarded compatibility path. Every caller form reaches
-    this function or a ``_GuardedSlotConnection`` and therefore encounters the same
-    check. The source probe, WAL high-water fence, and conditional drop share one
-    transaction-scoped connection. A main recovery refuses on a present/unknown
-    message result; a throwaway slot additionally requires its named retention slot to
-    remain present at the effect edge.
+    There is deliberately no unguarded compatibility path. A main recovery uses
+    :func:`slot_retirement_status` instead: dropping its only slot cannot be made safe
+    against an arbitrary producer. This primitive is for throwaway slots only, such as
+    ``_rs``. It proves the retention slot's source identity and pending-range coverage,
+    probes only that slot's publication/application-message range, and then performs a
+    direct target-list drop. No cluster-wide WAL equality is consulted, so ordinary DML
+    and Flight heartbeats do not turn a legitimate retirement into a refusal.
     """
     if not isinstance(authorization, SlotDropAuthorization) or not authorization.is_sealed():
         raise LogicalMessageObligationUnresolved(
@@ -869,227 +905,174 @@ def drop_slot(
                 },
             ),
         )
+    if authorization.retention_slot_name is None:
+        raise LogicalMessageObligationUnresolved(
+            "replication slot drop refused: a physical drop requires an independent "
+            "named retention slot; use the main-slot retirement transition instead",
+            obligations=(
+                {
+                    "message_id": f"source-slot:{slot_name or 'unknown'}",
+                    "issues": ["slot_drop_requires_independent_retention"],
+                    "has_ledger": False,
+                    "has_consumer": False,
+                    "has_audit": False,
+                },
+            ),
+        )
 
     from . import logical_messages
 
     with _guarded_source_connection(authorization) as conn, conn.transaction():
-            # This advisory lock serializes guarded Flight slot effects for this source
-            # and slot. The high-water predicate below also rejects source WAL that
-            # changed outside Flight, including a concurrent logical message.
-            conn.execute(
-                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-                (f"cdc_flight:slot-drop:{authorization.slot_name}",),
-            )
-            for _attempt in range(_SLOT_DROP_GUARD_ATTEMPTS):
-                target = _slot_row(conn, authorization.slot_name)
-                if target is None:
-                    return "absent"
+        # This lock serializes Flight-owned slot effects. It is deliberately not
+        # described as a producer fence: arbitrary source sessions do not acquire it,
+        # and the correctness argument below does not depend on them doing so.
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (f"cdc_flight:slot-drop:{authorization.slot_name}",),
+        )
+        evidence = None
+        for _attempt in range(_SLOT_DROP_GUARD_ATTEMPTS):
+            target = _slot_row(conn, authorization.slot_name)
+            if target is None:
+                return "absent"
 
-                if authorization.retention_slot_name is not None:
-                    retention = _slot_row(conn, authorization.retention_slot_name)
-                    if retention is None:
-                        raise _slot_drop_obligation(
-                            logical_messages.SourceMessageEvidence(
-                                status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
-                                slot_name=authorization.retention_slot_name,
-                                error=(
-                                    "the retention slot disappeared before the "
-                                    "throwaway slot could be retired"
-                                ),
-                            ),
-                            slot_name=authorization.slot_name,
-                            issue="retention_slot_missing",
-                        )
-                    target_identity = (
-                        target[3], int(target[4]) if target[4] is not None else None
-                    )
-                    retention_identity = (
-                        retention[3], int(retention[4]) if retention[4] is not None else None
-                    )
-                    if target_identity != retention_identity:
-                        raise _slot_drop_obligation(
-                            logical_messages.SourceMessageEvidence(
-                                status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
-                                slot_name=authorization.slot_name,
-                                plugin=str(target[0]) if target[0] is not None else None,
-                                system_identifier=target[3],
-                                timeline_id=target[4],
-                                error="target and retention slots have different source identity",
-                            ),
-                            slot_name=authorization.slot_name,
-                            issue="source_identity_changed",
-                        )
-                    retention_confirmed = retention[1]
-                    if retention_confirmed is None:
-                        raise _slot_drop_obligation(
-                            logical_messages.SourceMessageEvidence(
-                                status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
-                                slot_name=authorization.retention_slot_name,
-                                error="retention slot has no confirmed_flush_lsn",
-                            ),
-                            slot_name=authorization.slot_name,
-                            issue="retention_slot_evidence_unknown",
-                        )
-                    after_lsn = (
-                        authorization.after_lsn
-                        if authorization.after_lsn is not None
-                        else int(retention_confirmed)
-                    )
-                    if int(retention_confirmed) > after_lsn:
-                        raise _slot_drop_obligation(
-                            logical_messages.SourceMessageEvidence(
-                                status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
-                                slot_name=authorization.retention_slot_name,
-                                confirmed_flush_lsn=int(retention_confirmed),
-                                after_lsn=after_lsn,
-                                system_identifier=retention[3],
-                                timeline_id=retention[4],
-                                error="retention slot is ahead of the durable fence",
-                            ),
-                            slot_name=authorization.slot_name,
-                            issue="retention_slot_ahead_of_destination",
-                        )
-                else:
-                    # An operator reset may intentionally have no destination resume
-                    # row. In that one case the live slot's confirmed position is the
-                    # only durable fence available; it is still checked again by the
-                    # source probe below. A slot with no confirmed position remains
-                    # unknown and therefore cannot be dropped.
-                    after_lsn = (
-                        int(authorization.after_lsn)
-                        if authorization.after_lsn is not None
-                        else int(target[1]) if target[1] is not None else None
-                    )
-                    if after_lsn is None:
-                        raise _slot_drop_obligation(
-                            logical_messages.SourceMessageEvidence(
-                                status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
-                                slot_name=authorization.slot_name,
-                                error="the recovery slot has no confirmed source fence",
-                            ),
-                            slot_name=authorization.slot_name,
-                            issue="slot_drop_guard_incomplete",
-                        )
-
-                # A slot-ahead recovery is different from a live replay-marker
-                # obligation: an external actor has already moved the slot beyond the
-                # destination fence before Flight entered this primitive. The skipped
-                # prefix is no longer retained by PostgreSQL and cannot be probed. For
-                # this one sealed recovery capability, move the probe floor to the
-                # target's current confirmed position *inside this same transaction*.
-                # This does not bless a stale pre-check: a normal authorization still
-                # refuses confirmed > after_lsn, and the current slot row is re-read
-                # here before the probe and conditional drop.
-                if (
-                    authorization.allow_advanced_slot_recovery
-                    and target[1] is not None
-                    and int(target[1]) > after_lsn
-                ):
-                    after_lsn = int(target[1])
-
-                # Establish the WAL high-water mark BEFORE the logical-message probe.
-                # This ordering closes the source-commit windows structurally: a
-                # message committed before or during the setup is visible to the probe
-                # that follows, while a message committed after the probe changes the
-                # current high-water predicate at the effect edge.  The predicate is
-                # re-read by the same SQL statement that invokes pg_drop_replication_slot;
-                # a changed value therefore yields no drop row and the next attempt
-                # probes again.  This is a fail-closed fence, not a timing retry.
-                high_water = _source_wal_high_water(conn)
-                if high_water is None:
-                    raise _slot_drop_obligation(
-                        logical_messages.SourceMessageEvidence(
-                            status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
-                            slot_name=authorization.slot_name,
-                            after_lsn=after_lsn,
-                            error="source WAL high-water is unavailable",
+            retention = _slot_row(conn, authorization.retention_slot_name)
+            if retention is None:
+                raise _slot_drop_obligation(
+                    logical_messages.SourceMessageEvidence(
+                        status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+                        slot_name=authorization.retention_slot_name,
+                        error=(
+                            "the retention slot disappeared before the throwaway "
+                            "slot could be retired"
                         ),
-                        slot_name=authorization.slot_name,
-                        issue="source_wal_high_water_unknown",
-                    )
-
-                # A throwaway slot is allowed to run ahead while it builds the image;
-                # that is expected and does not make it the retention authority.  The
-                # named main slot is the copy whose WAL was not consumed by the
-                # resnapshot, so probe that slot for the live obligation.  Probing the
-                # target here would report ``confirmed > after_lsn`` as unknown even
-                # though the independent retention slot still holds the complete
-                # interval and can answer the question.  Main-slot recovery has no
-                # retention slot and therefore continues to probe its own slot.
-                probe_slot_name = (
-                    authorization.retention_slot_name
-                    or authorization.slot_name
-                )
-                evidence = logical_messages._probe_source_message_evidence_connection(
-                    conn,
-                    slot_name=probe_slot_name,
-                    publication_name=authorization.publication_name,
-                    after_lsn=after_lsn,
-                    application_patterns=authorization.application_patterns,
-                    expected_source_identity=authorization.expected_source_identity,
-                )
-                if evidence.status != logical_messages.SOURCE_MESSAGE_PROBE_STATUS_EMPTY:
-                    if (
-                        authorization.retention_slot_name is not None
-                        and evidence.status
-                        == logical_messages.SOURCE_MESSAGE_PROBE_STATUS_PRESENT
-                    ):
-                        # The named retention slot was checked on this same connection;
-                        # the message remains recoverable there, so retiring only the
-                        # derived copy cannot destroy the last source evidence.
-                        pass
-                    elif (
-                        evidence.status
-                        == logical_messages.SOURCE_MESSAGE_PROBE_STATUS_PRESENT
-                        and authorization.certified_source_lsns
-                        and evidence.application_messages
-                        and all(
-                            message.get("source_lsn") is not None
-                            and int(message["source_lsn"])
-                            in authorization.certified_source_lsns
-                            for message in evidence.application_messages
-                        )
-                    ):
-                        # A reset can intentionally delete the old resume row while
-                        # its complete message certificates remain in the destination.
-                        # The source probe still runs at the effect boundary; only
-                        # messages whose exact source LSN is already in all three
-                        # durable certificate rows are discharged here. Any other
-                        # message, including one arriving in this guarded window,
-                        # remains an unresolved obligation and fails closed below.
-                        pass
-                    else:
-                        issue = (
-                            "source_slot_application_message_unobserved"
-                            if evidence.status
-                            == logical_messages.SOURCE_MESSAGE_PROBE_STATUS_PRESENT
-                            else "source_slot_evidence_unknown"
-                        )
-                        raise _slot_drop_obligation(
-                            evidence, slot_name=authorization.slot_name, issue=issue
-                        )
-
-                rows = conn._execute_drop(
-                    *_guarded_drop_sql(authorization, high_water)
-                ).fetchall()
-                if rows:
-                    return "dropped"
-                # A source transaction, including a standalone logical message,
-                # committed after the probe. Re-run the complete probe on this same
-                # connection; exhausting the bounded retry fails closed with the slot
-                # untouched.
-                if _slot_row(conn, authorization.slot_name) is None:
-                    return "absent"
-            raise _slot_drop_obligation(
-                logical_messages.SourceMessageEvidence(
-                    status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+                    ),
                     slot_name=authorization.slot_name,
-                    after_lsn=after_lsn,
-                    error="source WAL changed during the guarded slot-drop critical section",
-                ),
-                slot_name=authorization.slot_name,
-                issue="source_changed_during_slot_drop",
+                    issue="retention_slot_missing",
+                )
+
+            target_identity = (
+                target[3], int(target[4]) if target[4] is not None else None
             )
+            retention_identity = (
+                retention[3], int(retention[4]) if retention[4] is not None else None
+            )
+            if (
+                target_identity != retention_identity
+                or target_identity[0] is None
+                or target_identity[1] is None
+            ):
+                raise _slot_drop_obligation(
+                    logical_messages.SourceMessageEvidence(
+                        status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+                        slot_name=authorization.slot_name,
+                        plugin=str(target[0]) if target[0] is not None else None,
+                        system_identifier=target[3],
+                        timeline_id=target[4],
+                        error=(
+                            "target and retention slots do not have the same complete "
+                            "source identity"
+                        ),
+                    ),
+                    slot_name=authorization.slot_name,
+                    issue="source_identity_changed",
+                )
+
+            target_confirmed = target[1]
+            target_restart = target[2]
+            retention_confirmed = retention[1]
+            retention_restart = retention[2]
+            if any(
+                value is None
+                for value in (
+                    target_confirmed,
+                    target_restart,
+                    retention_confirmed,
+                    retention_restart,
+                )
+            ):
+                raise _slot_drop_obligation(
+                    logical_messages.SourceMessageEvidence(
+                        status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+                        slot_name=authorization.retention_slot_name,
+                        system_identifier=retention[3],
+                        timeline_id=retention[4],
+                        error=(
+                            "target or retention slot has no confirmed/restart LSN, "
+                            "so its pending range cannot be proved retained"
+                        ),
+                    ),
+                    slot_name=authorization.slot_name,
+                    issue="retention_slot_evidence_unknown",
+                )
+
+            target_confirmed = int(target_confirmed)
+            target_restart = int(target_restart)
+            retention_confirmed = int(retention_confirmed)
+            retention_restart = int(retention_restart)
+            if (
+                retention_restart > target_restart
+                or retention_confirmed > target_confirmed
+            ):
+                raise _slot_drop_obligation(
+                    logical_messages.SourceMessageEvidence(
+                        status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+                        slot_name=authorization.retention_slot_name,
+                        confirmed_flush_lsn=retention_confirmed,
+                        after_lsn=target_confirmed,
+                        system_identifier=retention[3],
+                        timeline_id=retention[4],
+                        error=(
+                            "the independent retention slot does not cover the "
+                            "throwaway slot's pending range"
+                        ),
+                    ),
+                    slot_name=authorization.slot_name,
+                    issue="retention_slot_does_not_cover_target_pending_range",
+                )
+
+            # Establish the scoped source-message probe below. There is no cluster-wide
+            # WAL high-water predicate: PostgreSQL cannot make such a predicate atomic
+            # with a target-list side effect for arbitrary writers. The probe floor is
+            # the target slot's own confirmed position, not an unrelated destination
+            # fence. It is scoped to the publication and application-prefix policy. A
+            # present application message is safe here because the independent retention
+            # slot still owns its WAL.
+            target_confirmed = int(target_confirmed)
+            evidence = logical_messages._probe_source_message_evidence_connection(
+                conn,
+                slot_name=authorization.retention_slot_name,
+                publication_name=authorization.publication_name,
+                after_lsn=target_confirmed,
+                application_patterns=authorization.application_patterns,
+                expected_source_identity=authorization.expected_source_identity,
+            )
+            if evidence.status == logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN:
+                raise _slot_drop_obligation(
+                    evidence,
+                    slot_name=authorization.slot_name,
+                    issue="source_slot_evidence_unknown",
+                )
+
+            rows = conn._execute_drop(*_retention_drop_sql(authorization)).fetchall()
+            if rows:
+                return "dropped"
+            # A concurrent Flight owner may have retired the target between the read
+            # and this effect. That is an idempotent absent state; no WAL correctness
+            # claim depends on a target-list snapshot staying current.
+            if _slot_row(conn, authorization.slot_name) is None:
+                return "absent"
+
+        raise _slot_drop_obligation(
+            evidence
+            or logical_messages.SourceMessageEvidence(
+                status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+                slot_name=authorization.slot_name,
+                error="the guarded throwaway-slot effect did not complete",
+            ),
+            slot_name=authorization.slot_name,
+            issue="slot_drop_effect_not_completed",
+        )
 
 
 def recover_by_full_resnapshot(
@@ -1207,6 +1190,7 @@ def check_invariant_o(
     slot_name: str,
     snapshot_mode: str | None = None,
     raise_on_violation: bool = True,
+    retained_slot: bool = False,
     control_schema: str | None = None,
 ) -> dict:
     """`slot.confirmed_flush_lsn <= debezium_offsets.last_lsn`, plus the cell it lacked.
@@ -1242,9 +1226,18 @@ def check_invariant_o(
         "slot_confirmed_flush_lsn": confirmed,
         "durable_lsn": durable,
         "snapshot_mode": snapshot_mode,
+        "retained_slot": retained_slot,
         "ok": True,
     }
     if durable is None and confirmed is not None:
+        if retained_slot:
+            result["decision"] = "recovery_retained"
+            log.info(
+                "Invariant-O: slot %s is retained as the recovery stream handoff; "
+                "no synthetic destination offset is required",
+                slot_name,
+            )
+            return result
         backfills = (snapshot_mode or "") in SNAPSHOT_MODES_WITH_DATA
         message = (
             f"replication slot {slot_name!r} exists with confirmed_flush_lsn={confirmed} "

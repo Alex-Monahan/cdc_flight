@@ -14,6 +14,8 @@ import json
 import struct
 import subprocess
 import sys
+import threading
+import time
 import uuid
 from types import SimpleNamespace
 
@@ -851,179 +853,257 @@ def test_real_message_after_begin_probe_blocks_destructive_resume(
         con.close()
 
 
-def test_real_message_after_in_primitive_probe_blocks_slot_drop(
+def test_target_list_interleaving_is_safe_with_independent_retention(
     postgres_cluster, monkeypatch
 ):
-    """A commit between the primitive's probe and effect edge leaves the slot alive."""
+    """The gate8 sleep shape cannot destroy the last copy of a message."""
     source = postgres_cluster
-    slot_name = f"p72_b1_primitive_{uuid.uuid4().hex}"[:63]
+    base = f"p72_b7_target_{uuid.uuid4().hex}"[:48]
+    retention_slot = f"{base}_main"
+    target_slot = f"{base}_rs"
     emitted: list[int] = []
+    producer_errors: list[BaseException] = []
 
     try:
         with psycopg.connect(source.dsn, autocommit=True) as source_con:
-            created = source_con.execute(
+            # Create the long-lived retention slot first, as production does. Its
+            # confirmed and restart positions must precede the throwaway slot's range.
+            retention_created = source_con.execute(
                 "SELECT slot_name, (lsn - '0/0'::pg_lsn)::bigint "
                 "FROM pg_create_logical_replication_slot(%s, 'pgoutput')",
-                (slot_name,),
+                (retention_slot,),
             ).fetchone()
-            assert created is not None
-            created_lsn = int(created[1])
+            target_created = source_con.execute(
+                "SELECT slot_name, (lsn - '0/0'::pg_lsn)::bigint "
+                "FROM pg_create_logical_replication_slot(%s, 'pgoutput')",
+                (target_slot,),
+            ).fetchone()
+            assert retention_created is not None and target_created is not None
+            target_created_lsn = int(target_created[1])
 
-        observation = reconcile.observe_slot(source.dsn, slot_name)
+        observation = reconcile.observe_slot(source.dsn, target_slot)
         assert observation.observable, observation.error
-        fence_lsn = observation.confirmed_flush_lsn or created_lsn
         identity = {
             "system_identifier": observation.system_identifier,
             "timeline_id": observation.timeline_id,
         }
-        assert peek_source_message_evidence(
-            source.dsn,
-            slot_name=slot_name,
-            publication_name="cdc_flight_pub",
-            after_lsn=fence_lsn,
-            expected_source_identity=identity,
-        ).status == logical_messages.SOURCE_MESSAGE_PROBE_STATUS_EMPTY
-        authorization = reconcile._recovery_slot_drop_authorization(
+        authorization = reconcile.retention_slot_drop_authorization(
             dsn=source.dsn,
-            slot_name=slot_name,
+            slot_name=target_slot,
+            retention_slot_name=retention_slot,
             publication_name="cdc_flight_pub",
             application_patterns=("app_.*",),
             expected_source_identity=identity,
-            after_lsn=fence_lsn,
         )
 
-        original_high_water = reconcile._source_wal_high_water
+        def sleeping_target_list(_authorization):
+            return (
+                "SELECT pg_sleep(1), pg_drop_replication_slot(slot_name) "
+                "FROM pg_replication_slots WHERE slot_name = %s",
+                (_authorization.slot_name,),
+            )
 
-        def high_water_then_emit(conn):
-            value = original_high_water(conn)
-            if not emitted:
+        monkeypatch.setattr(reconcile, "_retention_drop_sql", sleeping_target_list)
+
+        def emit_during_target_list():
+            try:
+                time.sleep(0.2)
                 with psycopg.connect(source.dsn, autocommit=True) as source_con:
                     lsn = source_con.execute(
                         "SELECT (pg_logical_emit_message(%s, %s, %s) - "
                         "'0/0'::pg_lsn)::bigint",
-                        (False, "app_b1_primitive", "emitted-after-in-primitive-probe"),
+                        (False, "app_b7_target_list", "committed-during-target-list-sleep"),
                     ).fetchone()[0]
                     source_con.execute("CHECKPOINT")
                 emitted.append(int(lsn))
-            return value
+            except BaseException as exc:  # assert the producer did not silently fail
+                producer_errors.append(exc)
 
-        monkeypatch.setattr(reconcile, "_source_wal_high_water", high_water_then_emit)
-        with pytest.raises(LogicalMessageObligationUnresolved) as caught:
-            reconcile.drop_slot(
-                source.dsn,
-                slot_name,
-                authorization=authorization,
-            )
-        assert emitted, "the real source message was not emitted at the effect edge"
-        assert caught.value.obligations[0]["issues"] == [
-            "source_slot_application_message_unobserved"
-        ]
-        assert reconcile.observe_slot(source.dsn, slot_name).slot_exists
+        producer = threading.Thread(target=emit_during_target_list, daemon=True)
+        producer.start()
+        result = reconcile.drop_slot(
+            source.dsn, target_slot, authorization=authorization
+        )
+        producer.join(timeout=5)
+
+        assert not producer.is_alive(), "the interleaving producer did not finish"
+        assert not producer_errors, producer_errors
+        assert result == "dropped"
+        assert emitted, "the standalone message did not commit during pg_sleep"
+        assert not reconcile.observe_slot(source.dsn, target_slot).slot_exists
+        assert reconcile.observe_slot(source.dsn, retention_slot).slot_exists
         evidence = peek_source_message_evidence(
             source.dsn,
-            slot_name=slot_name,
+            slot_name=retention_slot,
             publication_name="cdc_flight_pub",
-            after_lsn=fence_lsn,
+            after_lsn=target_created_lsn,
             expected_source_identity=identity,
         )
         assert evidence.status == logical_messages.SOURCE_MESSAGE_PROBE_STATUS_PRESENT
-        assert evidence.application_messages[0]["prefix"] == "app_b1_primitive"
+        assert evidence.application_messages[0]["prefix"] == "app_b7_target_list"
     finally:
         with psycopg.connect(source.dsn, autocommit=True) as source_con:
             source_con.execute(
                 "SELECT pg_drop_replication_slot(slot_name) "
-                "FROM pg_replication_slots WHERE slot_name = %s",
-                (slot_name,),
+                "FROM pg_replication_slots WHERE slot_name IN (%s, %s)",
+                (target_slot, retention_slot),
             )
 
 
-def test_real_message_between_primitive_probe_and_high_water_blocks_slot_drop(
-    postgres_cluster, monkeypatch
+def test_busy_source_traffic_does_not_refuse_throwaway_retirement(
+    postgres_cluster,
 ):
-    """A commit after the primitive probe cannot be hidden by its high-water read."""
+    """Unrelated DML and internal heartbeats do not trip a cluster-wide fence."""
     source = postgres_cluster
-    slot_name = f"p72_b1_probe_high_{uuid.uuid4().hex}"[:63]
-    emitted: list[int] = []
+    base = f"p72_m8_busy_{uuid.uuid4().hex}"[:48]
+    retention_slot = f"{base}_main"
+    target_slot = f"{base}_rs"
+    traffic_stop = threading.Event()
+    traffic_started = threading.Event()
+    traffic_errors: list[BaseException] = []
+    inserted_sensor_id = f"{base}_traffic"
 
     try:
         with psycopg.connect(source.dsn, autocommit=True) as source_con:
-            created = source_con.execute(
+            retention_created = source_con.execute(
                 "SELECT slot_name, (lsn - '0/0'::pg_lsn)::bigint "
                 "FROM pg_create_logical_replication_slot(%s, 'pgoutput')",
-                (slot_name,),
+                (retention_slot,),
             ).fetchone()
-            assert created is not None
-            created_lsn = int(created[1])
+            target_created = source_con.execute(
+                "SELECT slot_name, (lsn - '0/0'::pg_lsn)::bigint "
+                "FROM pg_create_logical_replication_slot(%s, 'pgoutput')",
+                (target_slot,),
+            ).fetchone()
+            assert retention_created is not None and target_created is not None
 
-        observation = reconcile.observe_slot(source.dsn, slot_name)
+        observation = reconcile.observe_slot(source.dsn, target_slot)
         assert observation.observable, observation.error
-        fence_lsn = observation.confirmed_flush_lsn or created_lsn
-        identity = {
-            "system_identifier": observation.system_identifier,
-            "timeline_id": observation.timeline_id,
-        }
-        assert peek_source_message_evidence(
-            source.dsn,
-            slot_name=slot_name,
-            publication_name="cdc_flight_pub",
-            after_lsn=fence_lsn,
-            expected_source_identity=identity,
-        ).status == logical_messages.SOURCE_MESSAGE_PROBE_STATUS_EMPTY
-        authorization = reconcile._recovery_slot_drop_authorization(
+        authorization = reconcile.retention_slot_drop_authorization(
             dsn=source.dsn,
-            slot_name=slot_name,
+            slot_name=target_slot,
+            retention_slot_name=retention_slot,
             publication_name="cdc_flight_pub",
             application_patterns=("app_.*",),
-            expected_source_identity=identity,
-            after_lsn=fence_lsn,
+            expected_source_identity={
+                "system_identifier": observation.system_identifier,
+                "timeline_id": observation.timeline_id,
+            },
         )
 
-        original_probe = logical_messages._probe_source_message_evidence_connection
-
-        def probe_then_emit(conn, **kwargs):
-            evidence = original_probe(conn, **kwargs)
-            if not emitted:
+        def keep_source_busy():
+            try:
                 with psycopg.connect(source.dsn, autocommit=True) as source_con:
-                    lsn = source_con.execute(
-                        "SELECT (pg_logical_emit_message(%s, %s, %s) - "
-                        "'0/0'::pg_lsn)::bigint",
-                        (False, "app_b1_probe_high", "emitted-after-probe"),
-                    ).fetchone()[0]
-                    source_con.execute("CHECKPOINT")
-                emitted.append(int(lsn))
-            return evidence
+                    for sequence in range(200):
+                        if traffic_stop.is_set():
+                            break
+                        source_con.execute(
+                            "INSERT INTO app.sensor_readings "
+                            "(sensor_id, value, unit) VALUES (%s, %s, %s)",
+                            (inserted_sensor_id, float(sequence), "C"),
+                        )
+                        source_con.execute(
+                            "SELECT pg_logical_emit_message(%s, %s, %s)",
+                            (False, "cdc_flight_heartbeat", f"busy-{sequence}"),
+                        )
+                        traffic_started.set()
+                        time.sleep(0.01)
+            except BaseException as exc:  # assert the busy arm did not silently fail
+                traffic_errors.append(exc)
 
-        monkeypatch.setattr(
-            logical_messages,
-            "_probe_source_message_evidence_connection",
-            probe_then_emit,
+        traffic = threading.Thread(target=keep_source_busy, daemon=True)
+        traffic.start()
+        assert traffic_started.wait(timeout=5), traffic_errors
+        result = reconcile.drop_slot(
+            source.dsn, target_slot, authorization=authorization
         )
+        traffic_stop.set()
+        traffic.join(timeout=5)
+
+        assert not traffic.is_alive(), "the busy-source producer did not finish"
+        assert not traffic_errors, traffic_errors
+        assert result == "dropped"
+        assert not reconcile.observe_slot(source.dsn, target_slot).slot_exists
+        assert reconcile.observe_slot(source.dsn, retention_slot).slot_exists
+    finally:
+        traffic_stop.set()
+        if "traffic" in locals():
+            traffic.join(timeout=5)
+        with psycopg.connect(source.dsn, autocommit=True) as source_con:
+            source_con.execute(
+                "DELETE FROM app.sensor_readings WHERE sensor_id = %s",
+                (inserted_sensor_id,),
+            )
+            source_con.execute(
+                "SELECT pg_drop_replication_slot(slot_name) "
+                "FROM pg_replication_slots WHERE slot_name IN (%s, %s)",
+                (target_slot, retention_slot),
+            )
+
+
+def test_broken_retention_coverage_goes_red_before_the_drop(
+    postgres_cluster, monkeypatch
+):
+    """The mutation proof: removing pending-range coverage must refuse, not drop."""
+    source = postgres_cluster
+    base = f"p72_m8_mutation_{uuid.uuid4().hex}"[:48]
+    retention_slot = f"{base}_main"
+    target_slot = f"{base}_rs"
+
+    try:
+        with psycopg.connect(source.dsn, autocommit=True) as source_con:
+            assert source_con.execute(
+                "SELECT slot_name FROM pg_create_logical_replication_slot(%s, 'pgoutput')",
+                (retention_slot,),
+            ).fetchone()
+            assert source_con.execute(
+                "SELECT slot_name FROM pg_create_logical_replication_slot(%s, 'pgoutput')",
+                (target_slot,),
+            ).fetchone()
+        observation = reconcile.observe_slot(source.dsn, target_slot)
+        assert observation.observable, observation.error
+        authorization = reconcile.retention_slot_drop_authorization(
+            dsn=source.dsn,
+            slot_name=target_slot,
+            retention_slot_name=retention_slot,
+            publication_name="cdc_flight_pub",
+            application_patterns=("app_.*",),
+            expected_source_identity={
+                "system_identifier": observation.system_identifier,
+                "timeline_id": observation.timeline_id,
+            },
+        )
+        original_slot_row = reconcile._slot_row
+        with psycopg.connect(source.dsn, autocommit=True) as slot_con:
+            target_row = original_slot_row(slot_con, target_slot)
+
+        def broken_retention_row(conn, name):
+            row = original_slot_row(conn, name)
+            if name == retention_slot:
+                return (
+                    row[0],
+                    int(target_row[1]) + 1,
+                    int(target_row[2]) + 1,
+                    row[3],
+                    row[4],
+                )
+            return row
+
+        monkeypatch.setattr(reconcile, "_slot_row", broken_retention_row)
         with pytest.raises(LogicalMessageObligationUnresolved) as caught:
             reconcile.drop_slot(
-                source.dsn,
-                slot_name,
-                authorization=authorization,
+                source.dsn, target_slot, authorization=authorization
             )
-        assert emitted, "the real source message was not emitted after the probe"
         assert caught.value.obligations[0]["issues"] == [
-            "source_slot_application_message_unobserved"
+            "retention_slot_does_not_cover_target_pending_range"
         ]
-        assert reconcile.observe_slot(source.dsn, slot_name).slot_exists
-        evidence = peek_source_message_evidence(
-            source.dsn,
-            slot_name=slot_name,
-            publication_name="cdc_flight_pub",
-            after_lsn=fence_lsn,
-            expected_source_identity=identity,
-        )
-        assert evidence.status == logical_messages.SOURCE_MESSAGE_PROBE_STATUS_PRESENT
-        assert evidence.application_messages[0]["prefix"] == "app_b1_probe_high"
+        assert reconcile.observe_slot(source.dsn, target_slot).slot_exists
     finally:
         with psycopg.connect(source.dsn, autocommit=True) as source_con:
             source_con.execute(
                 "SELECT pg_drop_replication_slot(slot_name) "
-                "FROM pg_replication_slots WHERE slot_name = %s",
-                (slot_name,),
+                "FROM pg_replication_slots WHERE slot_name IN (%s, %s)",
+                (target_slot, retention_slot),
             )
 
 
@@ -1187,7 +1267,7 @@ def test_slot_drop_primitive_requires_sealed_authorization():
     assert caught.value.obligations[0]["issues"] == ["slot_drop_guard_missing"]
 
 
-def test_seven_destructive_witness_forms_are_all_refused(monkeypatch):
+def test_seven_destructive_witness_forms_are_all_refused():
     """Runtime reachability cannot bypass the primitive or its guarded SQL edge."""
 
     def refusal_outcome(call):
@@ -1199,32 +1279,6 @@ def test_seven_destructive_witness_forms_are_all_refused(monkeypatch):
             return f"unexpected:{type(exc).__name__}"
         return f"succeeded:{result}"
 
-    class FakeResult:
-        def __init__(self, rows=()):
-            self.rows = list(rows)
-
-        def fetchall(self):
-            return self.rows
-
-        def fetchone(self):
-            return self.rows[0] if self.rows else None
-
-    class PrimitiveConnection:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def transaction(self):
-            return self
-
-        def execute(self, *_args, **_kwargs):
-            return FakeResult()
-
-        def _execute_drop(self, *_args, **_kwargs):
-            return FakeResult([("dropped",)])
-
     authorization = reconcile._recovery_slot_drop_authorization(
         dsn="source",
         slot_name="witness",
@@ -1233,28 +1287,6 @@ def test_seven_destructive_witness_forms_are_all_refused(monkeypatch):
         expected_source_identity=None,
         after_lsn=10,
     )
-    monkeypatch.setattr(
-        reconcile,
-        "_guarded_source_connection",
-        lambda _authorization: PrimitiveConnection(),
-    )
-    monkeypatch.setattr(
-        reconcile,
-        "_slot_row",
-        lambda _connection, _slot: ("pgoutput", 10, 5, "source-system", 1),
-    )
-    monkeypatch.setattr(reconcile, "_source_wal_high_water", lambda _connection: 100)
-    monkeypatch.setattr(
-        logical_messages,
-        "_probe_source_message_evidence_connection",
-        lambda *_args, **_kwargs: logical_messages.SourceMessageEvidence(
-            status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_PRESENT,
-            slot_name="witness",
-            after_lsn=10,
-            application_messages=({"prefix": "app_live"},),
-        ),
-    )
-
     from cdc_flight.reconcile import drop_slot as aliased
     dynamic = getattr(reconcile, "drop_" + "slot")
     registry = {"drop_slot": reconcile.drop_slot}
@@ -1353,12 +1385,12 @@ else:
         "assembled SQL": refusal_outcome(lambda: guarded.execute(assembled_sql)),
     }
     expected = {
-        "aliased import": "source_slot_application_message_unobserved",
-        "dynamic getattr": "source_slot_application_message_unobserved",
-        "registry": "source_slot_application_message_unobserved",
-        "adapter": "source_slot_application_message_unobserved",
-        "partial/lambda": "source_slot_application_message_unobserved",
-        "dynamically assembled subprocess": "source_slot_application_message_unobserved",
+        "aliased import": "slot_drop_requires_independent_retention",
+        "dynamic getattr": "slot_drop_requires_independent_retention",
+        "registry": "slot_drop_requires_independent_retention",
+        "adapter": "slot_drop_requires_independent_retention",
+        "partial/lambda": "slot_drop_requires_independent_retention",
+        "dynamically assembled subprocess": "slot_drop_requires_independent_retention",
         "assembled SQL": "raw_slot_drop_sql_bypasses_guard",
     }
     assert refused == expected, refused
