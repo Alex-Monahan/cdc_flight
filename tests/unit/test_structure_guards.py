@@ -20,9 +20,10 @@ _BASELINE_SELECTED = {
     # this number may only move upward as rubric coverage grows. The p72 source-slot
     # probe, state-directory lease, and in-primitive slot-drop witness coverage add
     # seven default-lane nodes. The durable replay-intent unit and real-kill coverage
-    # are included in the default/slow lanes; the selected totals are 2463/263
-    # including this module's guard nodes.
-    "not motherduck and not slow": 2452,
+    # are included in the default/slow lanes; the selected totals were 2463/263
+    # including this module's guard nodes before the two permanent p72 regression
+    # proofs were added. Those proofs add two default-lane nodes.
+    "not motherduck and not slow": 2454,
     "slow and not motherduck": 262,
     # The quiet-holder and stock-walsender retry proofs are MotherDuck-only real
     # process nodes; a local DuckDB file lock cannot exercise cloud takeover while
