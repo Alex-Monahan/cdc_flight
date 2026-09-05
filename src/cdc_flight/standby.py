@@ -52,6 +52,8 @@ class StandbyObservation:
     local_slot_invalidation_reason: str | None
     system_identifier: str | None
     timeline_id: int | None
+    primary_system_identifier: str | None = None
+    primary_timeline_id: int | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -125,6 +127,25 @@ def unsupported_reasons(
             "local logical slot is invalidated: "
             f"{observation.local_slot_invalidation_reason}"
         )
+    if (
+        observation.primary_system_identifier is not None
+        and observation.system_identifier is not None
+        and observation.primary_system_identifier != observation.system_identifier
+    ):
+        reasons.append(
+            "standby and primary system identifiers differ "
+            f"({observation.system_identifier!r} != "
+            f"{observation.primary_system_identifier!r})"
+        )
+    if (
+        observation.primary_timeline_id is not None
+        and observation.timeline_id is not None
+        and observation.primary_timeline_id != observation.timeline_id
+    ):
+        reasons.append(
+            "standby and primary timelines differ "
+            f"({observation.timeline_id!r} != {observation.primary_timeline_id!r})"
+        )
     return tuple(reasons)
 
 
@@ -139,6 +160,40 @@ def assert_supported(observation: StandbyObservation) -> StandbyObservation:
             + "; ".join(reasons)
         )
     return observation
+
+
+def local_slot_recovery_reasons(
+    observation: StandbyObservation,
+) -> tuple[str, ...]:
+    """Return only failures that can be repaired on the local slot owner.
+
+    This narrow admission exception is used by acquisition recovery to *observe*
+    a missing/invalidated standby slot and preserve its recovery obligation.  It
+    never permits a bad receiver, identity, or primary configuration to proceed.
+    """
+    reasons = unsupported_reasons(observation)
+    return tuple(
+        reason
+        for reason in reasons
+        if reason.startswith("local slot ")
+        or reason.startswith("a synchronized failover slot")
+        or reason.startswith("a failover slot ")
+    )
+
+
+def assert_supported_for_recovery(
+    observation: StandbyObservation,
+) -> StandbyObservation:
+    """Allow acquisition to continue only to repair a local slot.
+
+    The returned observation is still unsupported for streaming.  The caller must
+    run the ordinary strict check again before constructing Debezium.
+    """
+    reasons = unsupported_reasons(observation)
+    local_reasons = local_slot_recovery_reasons(observation)
+    if reasons and len(local_reasons) == len(reasons):
+        return observation
+    return assert_supported(observation)
 
 
 def _scalar(conn, sql: str, params: list[Any] | tuple[Any, ...] = ()):
@@ -164,6 +219,7 @@ def inspect(
     physical_slot_name: str | None = None,
     connect_timeout: int = 5,
     statement_timeout_ms: int = 4000,
+    allow_local_slot_recovery: bool = False,
 ) -> StandbyObservation:
     """Collect standby and primary capability facts using read-only sessions.
 
@@ -223,9 +279,17 @@ def inspect(
         timeline_id = _scalar(conn, "SELECT timeline_id FROM pg_control_checkpoint()")
 
     primary_wal_level = None
+    primary_system_identifier = None
+    primary_timeline_id = None
     if primary_dsn:
         with psycopg.connect(primary_dsn, **kwargs) as conn:
             primary_wal_level = str(_scalar(conn, "SHOW wal_level") or "").lower() or None
+            primary_system_identifier = _scalar(
+                conn, "SELECT system_identifier::text FROM pg_control_system()"
+            )
+            primary_timeline_id = _scalar(
+                conn, "SELECT timeline_id FROM pg_control_checkpoint()"
+            )
     elif not in_recovery:
         primary_wal_level = str(wal_level or "").lower() or None
 
@@ -257,7 +321,17 @@ def inspect(
         ),
         system_identifier=(str(system_identifier) if system_identifier is not None else None),
         timeline_id=int(timeline_id) if timeline_id is not None else None,
+        primary_system_identifier=(
+            str(primary_system_identifier)
+            if primary_system_identifier is not None
+            else None
+        ),
+        primary_timeline_id=(
+            int(primary_timeline_id) if primary_timeline_id is not None else None
+        ),
     )
+    if allow_local_slot_recovery:
+        return assert_supported_for_recovery(observation)
     return assert_supported(observation)
 
 
@@ -267,6 +341,8 @@ __all__ = [
     "StandbyCapabilityError",
     "StandbyObservation",
     "assert_supported",
+    "assert_supported_for_recovery",
     "inspect",
+    "local_slot_recovery_reasons",
     "unsupported_reasons",
 ]

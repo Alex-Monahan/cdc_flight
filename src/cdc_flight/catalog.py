@@ -74,6 +74,7 @@ from .machines import (
     CHANGE_DUE,
     SCHEMA_VISIBLE,
 )
+from .source_routes import SourceRoutePolicy
 
 SourceRelation = catalog_state.SourceRelation
 CatalogChange = catalog_state.CatalogChange
@@ -189,6 +190,7 @@ class CatalogWatcher(CatalogLifecycleMixin):
         *,
         dsn: str,
         primary_dsn: str | None = None,
+        routes: SourceRoutePolicy | None = None,
         publication: str,
         schema: str,
         include: set[str],
@@ -210,11 +212,21 @@ class CatalogWatcher(CatalogLifecycleMixin):
         binary_handling_mode: str = "base64",
         hstore_handling_mode: str = "map",
     ):
-        self.dsn = dsn
-        # Catalog queries may use a hot standby, but publication admission and
-        # transactional logical-decoding markers are writes and must use the
-        # configured primary.  The default preserves the primary-only topology.
-        self.primary_dsn = primary_dsn or dsn
+        if routes is not None:
+            self.dsn = routes.read_dsn
+            # Catalog queries may use a hot standby, but publication admission and
+            # transactional logical-decoding markers use the explicit source-write
+            # route.  This object never derives a write route from the read route
+            # when the three-route policy is supplied.
+            self.primary_dsn = routes.source_write_dsn
+            self.routes = routes
+        else:
+            # Compatibility for direct primary-only unit callers.  Production
+            # pipeline construction always supplies SourceRoutePolicy, which is
+            # the admission-time guard for standby deployments.
+            self.dsn = dsn
+            self.primary_dsn = primary_dsn if primary_dsn is not None else dsn
+            self.routes = None
         self.publication = publication
         self.schema = schema
         #: qualified names the configuration says we replicate (`table.include.list`)

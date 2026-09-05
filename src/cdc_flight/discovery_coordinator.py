@@ -16,6 +16,7 @@ from typing import Any
 from . import destination as dest_mod
 from . import naming, offsets
 from . import reconcile as reconcile_mod
+from . import recovery as recovery_mod
 from . import resnapshot as resnapshot_mod
 from .applier import Applier
 from .config import CatalogConfig, ReplicationConfig, RunConfig, SourceConfig
@@ -27,6 +28,7 @@ from .run_state import RunOutcome, RunPhaseWriter
 from .snapshot_completion import SnapshotCompletion
 from .source_health import SourceHealth
 from .source_marker import SourceMarker
+from .source_routes import SourceRoutePolicy
 from .supervisor import run_engine_bounded
 from .witness_contract import STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME
 
@@ -41,6 +43,7 @@ class LiveDiscoveryCoordinator:
         *,
         con,
         source: SourceConfig,
+        routes: SourceRoutePolicy | None = None,
         replication: ReplicationConfig,
         destination,
         namespace: str,
@@ -50,6 +53,7 @@ class LiveDiscoveryCoordinator:
         settings: dict,
         watcher,
         discovered,
+        captured_tables: list[tuple[str, str, str]],
         catalog_cfg: CatalogConfig,
         phases: RunPhaseWriter,
         lease,
@@ -66,9 +70,12 @@ class LiveDiscoveryCoordinator:
         descriptor_provider=None,
         catalog_flush_exclude: set[str] | None = None,
         service_context=None,
+        offset_file=None,
+        suppress_replayed_message_audit: bool = False,
     ) -> None:
         self.con = con
         self.source = source
+        self.routes = routes or source.route_policy
         self.replication = replication
         self.destination = destination
         self.namespace = namespace
@@ -98,17 +105,21 @@ class LiveDiscoveryCoordinator:
         self.descriptor_provider = descriptor_provider
         self.catalog_flush_exclude = set(catalog_flush_exclude or ())
         self.service_context = service_context
-        configured_capture = str(self.props.get("table.include.list", ""))
-        capture_tables = tuple(
-            table.strip()
-            for table in configured_capture.split(",")
-            if table.strip()
-        )
-        if not capture_tables:
-            capture_tables = tuple(self.source.tables)
+        self.offset_file = offset_file or self.replication.offset_file
+        self.suppress_replayed_message_audit = bool(suppress_replayed_message_audit)
         signal_collection = self.props.get("signal.data.collection")
         self.capture_tables = tuple(
-            table for table in capture_tables if table != signal_collection
+            table
+            for table in captured_tables
+            if f"{table[0]}.{table[1]}" != signal_collection
+        )
+        # Recovery journaling owns the complete `(schema, table, target)` tuples,
+        # while SourceHealth's PostgreSQL route probe binds a text[] of qualified
+        # source names.  Keep those two representations explicit at this boundary;
+        # passing the tuples to `::text[]` makes a healthy publication look like a
+        # route mismatch and eventually trips source-dark.
+        self.capture_table_names = tuple(
+            f"{schema}.{table}" for schema, table, _target in self.capture_tables
         )
 
         self.applier = None
@@ -116,6 +127,78 @@ class LiveDiscoveryCoordinator:
         self.result: dict | None = None
         self.reported: dict | None = None
         self.run_ok = False
+
+    def _journal_local_slot_failure(self, summary: dict) -> None:
+        """Persist the standby repair obligation after a live-slot failure.
+
+        ``SourceHealth`` deliberately has no destination handle.  Once the common
+        supervisor has sealed and quiesced callbacks, this coordinator is the first
+        owner that can durably record the recovery while leaving the destination image
+        untouched.  The next acquisition resumes this journal, repairs the local slot
+        through ``routes.slot_owner_dsn``, and only then admits the fenced full
+        resnapshot.  In particular, this path never turns the primary write route into
+        a logical-slot owner.
+        """
+        witness = summary.get("local_slot_failure")
+        if not witness:
+            return
+        existing = recovery_mod.read(
+            self.con,
+            pipeline=self.destination.pipeline_name,
+            namespace=self.namespace,
+            control_schema=self.destination.control_schema,
+        )
+        if existing is not None:
+            summary["local_slot_recovery"] = existing.as_dict()
+            return
+
+        slot_receipt = dest_mod.read_slot_state(
+            self.con,
+            self.destination.pipeline_name,
+            self.replication.slot_name,
+            control_schema=self.destination.control_schema,
+        )
+        if slot_receipt is None:
+            raise EngineFailure(
+                "the standby local logical slot failed after streaming, but the last "
+                "slot observation was not durable; preserving the destination and "
+                "refusing to continue without a durable local-slot recovery owner",
+                summary,
+            )
+        kind = str(witness.get("kind") or "lost")
+        decision = "slot_invalidated" if kind == "invalidated" else "slot_missing"
+        record = recovery_mod.begin(
+            self.con,
+            pipeline=self.destination.pipeline_name,
+            namespace=self.namespace,
+            decision=decision,
+            message=(
+                "the standby's local logical slot was "
+                f"{kind} after a live stream; preserve the destination, repair the "
+                "local slot, and perform a fenced full resnapshot. The primary "
+                "logical slot is never a fallback"
+            ),
+            slot_name=self.replication.slot_name,
+            offset_path=self.replication.offset_file,
+            captured_tables=self.capture_tables,
+            forget_catalog=False,
+            slot_receipt=slot_receipt,
+            logical_message_dataset=self.destination.dataset_name,
+            state_dir=self.replication.state_dir,
+            severity="critical",
+            context={
+                "slot_name": self.replication.slot_name,
+                "recovery_phase": recovery_mod.PHASE_REQUESTED,
+                "source_role": "standby",
+            },
+            control_schema=self.destination.control_schema,
+            replay_intent_path=offsets.replay_intent_path(self.replication.state_dir),
+            source_dsn=self.routes.slot_owner_dsn,
+            source_slot_name=self.replication.slot_name,
+            source_publication_name=self.replication.publication_name,
+            source_application_patterns=self.replication.message_prefix_allowlist,
+        )
+        summary["local_slot_recovery"] = record.as_dict()
 
     def run(self) -> dict:
         """Run engines until no newly admitted relation needs a hand-off."""
@@ -168,7 +251,7 @@ class LiveDiscoveryCoordinator:
                 engine = SupervisedDebeziumEngine(
                     properties=engine_props,
                     handler=self.applier,
-                    offset_file=self.replication.offset_file,
+                    offset_file=self.offset_file,
                     always_commit_offsets=engine_props.get("offset.flush.interval.ms") == "0",
                 )
                 if self.service_context is not None:
@@ -179,7 +262,7 @@ class LiveDiscoveryCoordinator:
                     self.service_context.rearm_process_signals()
                 self._wire_consumer(engine, self.applier)
                 self.health = SourceHealth(
-                    dsn=self.source.dsn,
+                    dsn=self.routes.read_dsn,
                     slot_name=self.replication.slot_name,
                     expected_application_name=(
                         STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME
@@ -193,9 +276,14 @@ class LiveDiscoveryCoordinator:
                         else None
                     ),
                     capture_tables=(
-                        self.capture_tables if self.service_context is not None else None
+                        self.capture_table_names
+                        if self.service_context is not None
+                        else None
                     ),
-                    primary_dsn=self.source.primary_dsn,
+                    primary_dsn=self.routes.source_write_dsn,
+                    source_write_dsn=self.routes.source_write_dsn,
+                    standby_heartbeat=self.routes.role == "standby",
+                    detect_local_slot_failure=self.routes.role == "standby",
                     source_marker=(
                         getattr(self.watcher, "marker", None)
                         or SourceMarker(
@@ -344,6 +432,7 @@ class LiveDiscoveryCoordinator:
                 resnap = resnapshot_mod.run(
                     self.con,
                     source=self.source,
+                    routes=self.routes,
                     replication=self.replication,
                     pipeline=self.destination.pipeline_name,
                     dataset=self.destination.dataset_name,
@@ -400,6 +489,8 @@ class LiveDiscoveryCoordinator:
             self.reported = report.summary
             return self.reported
         except EngineFailure as failure:
+            if failure.summary.get("local_slot_failure"):
+                self._journal_local_slot_failure(failure.summary)
             self.outcome.record(failure.summary.get("stop_reason") or "engine_error")
             self.reported = failure.summary
             raise
@@ -503,7 +594,7 @@ class LiveDiscoveryCoordinator:
                 if handler._callback_sealed:
                     return {"checked": False, "reason": "callback admission sealed"}
             observation = reconcile_mod.observe_slot(
-                self.source.dsn,
+                self.routes.read_dsn,
                 self.replication.slot_name,
                 connect_timeout=max(1, int(self.run_cfg.jdbc_connect_timeout_seconds)),
             )
@@ -613,7 +704,7 @@ class LiveDiscoveryCoordinator:
                 self.catalog_cfg.marker_prefix,
                 "cdc_flight_heartbeat",
             ),
-            offset_path=self.replication.offset_file,
+            offset_path=self.offset_file,
             resume_point=self.main_resume,
             config=self.applier_cfg,
             lease=self.lease,
@@ -631,6 +722,7 @@ class LiveDiscoveryCoordinator:
             source_timeline=source_timeline,
             strict_event_identity=True,
             message_prefix_allowlist=self.replication.message_prefix_allowlist,
+            suppress_replayed_message_audit=self.suppress_replayed_message_audit,
         )
         self.ownership.attach(applier)
         return applier

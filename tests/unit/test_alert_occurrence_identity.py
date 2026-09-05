@@ -496,6 +496,7 @@ def test_slot_receipt_rejects_foreign_pipeline_and_stale_cached_state(tmp_path):
                 captured_tables=[],
                 forget_catalog=False,
                 slot_receipt=old_receipt,
+                logical_message_dataset="cdc_raw",
             )
 
         fresh_receipt = destination_mod.write_slot_state(
@@ -517,6 +518,7 @@ def test_slot_receipt_rejects_foreign_pipeline_and_stale_cached_state(tmp_path):
                 captured_tables=[],
                 forget_catalog=False,
                 slot_receipt=old_receipt,
+                logical_message_dataset="cdc_raw",
             )
 
         record = recovery_mod.begin(
@@ -530,6 +532,7 @@ def test_slot_receipt_rejects_foreign_pipeline_and_stale_cached_state(tmp_path):
             captured_tables=[],
             forget_catalog=False,
             slot_receipt=fresh_receipt,
+            logical_message_dataset="cdc_raw",
         )
         assert record.recovery_id
     finally:

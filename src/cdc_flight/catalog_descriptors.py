@@ -144,7 +144,7 @@ class CatalogDescriptorReader:
                 output_function_schema=fact["output_function_schema"] or None,
                 output_function_name=fact["output_function_name"] or None,
             )
-            building.remove(oid)
+            building.discard(oid)
             self.cache[oid] = descriptor
             return descriptor
 
@@ -457,7 +457,7 @@ def source_relation_fingerprint(
         return True, None
 
 
-def provider_for_source(source) -> object:
+def provider_for_source(source, *, routes=None) -> object:
     """Build the bounded no-catalog provider from the source catalog once."""
     requested: list[tuple[str, str, str]] = []
     for qualified in source.tables:
@@ -470,13 +470,15 @@ def provider_for_source(source) -> object:
         requested.append((schema, table, ""))
     import psycopg
 
+    read_dsn = (routes or source.route_policy).read_dsn
+
     with psycopg.connect(
-        source.dsn,
+        read_dsn,
         autocommit=True,
         **source_connection_kwargs(),
     ) as descriptor_con:
         return RelationDescriptorProvider.from_tables(
-            descriptor_con, requested, source_dsn=source.dsn
+            descriptor_con, requested, source_dsn=read_dsn
         )
 
 

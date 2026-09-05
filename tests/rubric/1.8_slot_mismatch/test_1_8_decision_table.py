@@ -70,6 +70,18 @@ def test_a_missing_slot_triggers_a_resnapshot():
     assert verdict.resnapshot is True
 
 
+def test_an_invalidated_slot_requires_local_repair_before_a_full_resnapshot():
+    verdict = check_slot(
+        durable_lsn=1_000,
+        observation=obs(wal_status="lost", invalidation_reason="rows_removed"),
+        previous=None,
+    )
+    assert verdict.decision == "slot_invalidated"
+    assert verdict.resnapshot is True
+    assert "local standby slot" in verdict.message
+    assert "primary logical slot is never a fallback" in verdict.message
+
+
 def test_a_recreated_slot_is_caught_by_the_previous_observation():
     """Same name, ordinary position, but BOTH positions went backwards."""
     verdict = check_slot(
@@ -284,6 +296,11 @@ def test_every_resnapshot_decision_is_reachable(decision):
         "slot_missing": (
             1_000,
             obs(slot_exists=False, active=False, restart_lsn=None, confirmed_flush_lsn=None),
+            None,
+        ),
+        "slot_invalidated": (
+            1_000,
+            obs(wal_status="lost", invalidation_reason="wal_removed"),
             None,
         ),
         "slot_recreated": (

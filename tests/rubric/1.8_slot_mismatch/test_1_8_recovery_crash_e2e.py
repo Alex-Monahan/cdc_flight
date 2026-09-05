@@ -2,7 +2,7 @@
 
 The pairing for `tests/rubric/1.7_fault_injection/test_1_7_recovery_anchors.py`. That file
 proves each anchor is reachable and that the journal it leaves is resumable, in
-milliseconds, with an injectable slot drop; this one kills an actual `cdc-flight`
+milliseconds, with an injectable main-slot retirement observation; this one kills an actual `cdc-flight`
 process with `os._exit` at the anchor, against a real Postgres slot, and then checks the
 whole destination against the whole source.
 
@@ -14,7 +14,8 @@ does none of that. The claim under test is that durable state alone is enough, a
 a process that dies without running any of its own cleanup tests that claim.
 
 `recovery_armed` is the anchor chosen for the slow lane because it is the dangerous one:
-the replication slot has been dropped and the journal does not yet record it. Before the
+the main slot has been retained and the journal does not yet record that source-side
+state. Before the
 journal existed, a crash exactly there lost the forced `snapshot.mode='initial'` — it
 lived only in a local variable — and the next run saw no row, no file and no slot and
 called it an ordinary fresh start, streaming onto tables that were never rebuilt

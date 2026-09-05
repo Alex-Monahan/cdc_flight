@@ -51,6 +51,7 @@ class Cell:
     prior_recovery: bool = False
     expected_shutdown: str = "open"
     expected_interruption_marker: str = "absent"
+    expected_runtime_states: tuple[tuple[str, str], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -98,7 +99,7 @@ CELLS = (
     ),
     Cell(
         "recovery_armed",
-        "the slot is gone only after the journal can resume the forced snapshot",
+        "the main slot is retained after the journal can resume the forced snapshot",
         "recovery_armed_recorded",
         "armed",
         "available",
@@ -221,6 +222,7 @@ CROSS_STATE_CELLS = (
         "none",
         "unarmed",
         prior_recovery=True,
+        expected_interruption_marker="armed",
     ),
     Cell(
         "armed_recovery_ownership_active",
@@ -231,6 +233,7 @@ CROSS_STATE_CELLS = (
         "none",
         "unarmed",
         prior_recovery=True,
+        expected_interruption_marker="armed",
     ),
     Cell(
         "armed_recovery_completion_marker_written",
@@ -241,6 +244,17 @@ CROSS_STATE_CELLS = (
         "written",
         "unarmed",
         prior_recovery=True,
+        # The same production anchor can fire in the retained-slot throwaway
+        # snapshot or in the subsequent main snapshot.  The throwaway path may
+        # still own the durable interruption marker, or may consume it before its
+        # engine thread stops; the main path has consumed it and may still be at
+        # the open shutdown edge.  These are the three explicit durable protocol
+        # states reached by this anchor; invalid cross-pairs are not admissible.
+        expected_runtime_states=(
+            ("armed", "engine_thread_stopped"),
+            ("absent", "engine_thread_stopped"),
+            ("absent", "open"),
+        ),
     ),
     Cell(
         "armed_recovery_watermark_armed",
@@ -251,6 +265,11 @@ CROSS_STATE_CELLS = (
         "written",
         "armed",
         prior_recovery=True,
+        expected_runtime_states=(
+            ("armed", "engine_thread_stopped"),
+            ("absent", "engine_thread_stopped"),
+            ("absent", "open"),
+        ),
     ),
     Cell(
         "armed_recovery_watermark_reached",
@@ -261,6 +280,11 @@ CROSS_STATE_CELLS = (
         "written",
         "reached",
         prior_recovery=True,
+        expected_runtime_states=(
+            ("armed", "engine_thread_stopped"),
+            ("absent", "engine_thread_stopped"),
+            ("absent", "open"),
+        ),
     ),
     Cell(
         "armed_recovery_shutdown_marker_written",
@@ -1183,8 +1207,13 @@ def _assert_matrix_cell(result: dict, cell: Cell) -> None:
     assert context.get("ownership") == cell.expected_ownership, survivor
     assert context.get("completion_marker_state") == cell.expected_marker, survivor
     assert context.get("watermark") == cell.expected_watermark, survivor
-    assert context.get("interruption_marker") == cell.expected_interruption_marker, survivor
-    assert context.get("shutdown_sequence") == cell.expected_shutdown, survivor
+    marker = context.get("interruption_marker")
+    shutdown = context.get("shutdown_sequence")
+    if cell.expected_runtime_states is None:
+        assert marker == cell.expected_interruption_marker, survivor
+        assert shutdown == cell.expected_shutdown, survivor
+    else:
+        assert (marker, shutdown) in cell.expected_runtime_states, survivor
     if cell.expected_marker == "shutdown_idle_written":
         assert context.get("marker_lsn") is not None, survivor
         assert survivor["durable_lsn"] is not None, survivor
@@ -1248,8 +1277,9 @@ def _assert_matrix_cell(result: dict, cell: Cell) -> None:
         assert not survivor["offset_file"], survivor
     if cell.recovery:
         if cell.expected_recovery == "armed":
-            assert survivor["slot"] is None, (
-                f"{cell.name} ({cell.proves}) recorded armed before dropping the slot: "
+            assert survivor["slot"] is not None, (
+                f"{cell.name} ({cell.proves}) lost the retained main slot before the "
+                "recovery journal was recorded: "
                 f"{survivor!r}"
             )
         else:

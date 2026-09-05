@@ -45,7 +45,7 @@ from datetime import UTC, datetime
 
 from . import faults
 from .machines import SOURCE_HEALTH_STATES
-from .source_marker import IDLE_HEARTBEAT, SourceMarker
+from .source_marker import HEARTBEAT, IDLE_HEARTBEAT, SourceMarker
 from .witness_contract import (
     STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME,
     ServiceWitnessEvidence,
@@ -55,9 +55,8 @@ from .witness_contract import (
 log = logging.getLogger("cdc_flight.source_health")
 
 #: How far `confirmed_flush_lsn` may trail the source's available WAL position and
-#: still count as "caught up".  On a hot standby the primary-only
-#: ``pg_current_wal_lsn()`` function raises ``recovery is in progress``; the
-#: recovery-safe expression below uses the receive position instead.
+#: still count as "caught up". The role-conditional expression below uses the
+#: standby receive position during recovery and the current position on a primary.
 #:
 #: MEASURED (2026-07-30, 60 000-row stream into local DuckDB, per-batch offset
 #: flush). A healthy run settles at **328-384 bytes** of lag within a second of
@@ -85,6 +84,20 @@ CASE WHEN pg_is_in_recovery()
      ELSE pg_current_wal_lsn()
 END
 """
+
+
+def assert_recovery_safe_wal_sql(sql: str) -> None:
+    """Reject a standby WAL query that calls current-LSN unconditionally.
+
+    This is both a construction guard and a small static-test seam. A standby
+    connection may contain the primary branch in a role-conditional CASE, but it
+    must never execute a bare ``pg_current_wal_lsn()`` statement.
+    """
+    normalized = " ".join(str(sql).lower().split())
+    if "pg_current_wal_lsn()" in normalized and "case when pg_is_in_recovery()" not in normalized:
+        raise ValueError(
+            "standby WAL evidence must guard pg_current_wal_lsn() with pg_is_in_recovery()"
+        )
 
 # The finite-run sampler only needs the slot liveness and confirmed position. The
 # service watchdog opts into the identity join below; keeping that expensive,
@@ -129,6 +142,19 @@ FROM (SELECT %s::name AS slot_name) requested
 LEFT JOIN pg_replication_slots s ON s.slot_name = requested.slot_name
 LEFT JOIN pg_stat_activity a ON a.pid = s.active_pid
 LEFT JOIN pg_stat_replication r ON r.pid = s.active_pid
+"""
+
+# ``wal_status`` is present on the supported PostgreSQL versions.  The
+# invalidation-reason column was added later, so read it through the view row's
+# JSON representation: on an older supported server the key is simply absent
+# and returns NULL.  This is deliberately a second, standby-only probe rather
+# than a change to either hot path's tuple shape; the finite-run sampler and its
+# compatibility fakes continue to have the same delivery fields.
+_LOCAL_SLOT_STATUS_SQL = """
+SELECT s.wal_status,
+       to_jsonb(s)->>'invalidation_reason' AS invalidation_reason
+FROM pg_replication_slots AS s
+WHERE s.slot_name = %s
 """
 
 _PUBLICATION_HAS_TABLES_SQL = """
@@ -216,6 +242,10 @@ class SlotSample:
     lag_bytes: int | None = None
     confirmed_pos: int | None = None
     restart_pos: int | None = None
+    #: PostgreSQL slot health is a source-position safety fact, not a liveness
+    #: clock. ``lost``/``unreserved`` means WAL required by this slot is gone.
+    wal_status: str | None = None
+    invalidation_reason: str | None = None
     error: str | None = None
     #: Wall-clock time near the SQL result. ``at`` remains monotonic for duration
     #: clocks; this value makes the persisted operator sample attributable to a time.
@@ -232,6 +262,14 @@ class SlotSample:
     def streaming(self) -> bool:
         """True when a walsender is attached to our slot right now."""
         return self.exists and self.active
+
+    @property
+    def invalidated(self) -> bool:
+        """Whether PostgreSQL has declared this logical slot unusable."""
+        return bool(
+            self.invalidation_reason
+            or (self.wal_status or "").lower() in {"lost", "unreserved"}
+        )
 
     @property
     def identity_context(self) -> str:
@@ -293,6 +331,18 @@ class SourceHealth:
     #: not the Debezium replication connection; in a hot-standby topology this is
     #: the primary DSN.
     primary_dsn: str | None = None
+    #: Explicit source-write spelling. Production route policy supplies this
+    #: separately so a local slot owner cannot be mistaken for the write route.
+    source_write_dsn: str | None = None
+    #: In standby mode the stock connector write action is disabled. This
+    #: Flight-owned bounded writer emits the protected logical heartbeat on the
+    #: source-write route after a live stream has been observed.
+    standby_heartbeat: bool = False
+    #: Standby-only live loss/invalidation witness.  Keeping it opt-in preserves
+    #: the primary sampler's inexpensive tuple path while making a local replica
+    #: slot failure a first-class stop condition.
+    detect_local_slot_failure: bool = False
+    heartbeat_interval: float = 5.0
     source_marker: SourceMarker | None = None
     max_lag_bytes: int = DEFAULT_MAX_IDLE_LAG_BYTES
     interval: float = 0.5
@@ -350,6 +400,13 @@ class SourceHealth:
     _bound_walsender_pid: int | None = field(default=None, repr=False)
     _bound_walsender_backend_start: datetime | None = field(default=None, repr=False)
     _bound_walsender_ack_at: float | None = field(default=None, repr=False)
+    _standby_heartbeat_marker: SourceMarker | None = field(
+        default=None, repr=False
+    )
+    _next_standby_heartbeat_at: float | None = field(default=None, repr=False)
+    _heartbeat_attempts: int = field(default=0, repr=False)
+    _heartbeat_writes: int = field(default=0, repr=False)
+    _heartbeat_failures: int = field(default=0, repr=False)
 
     # -- lifecycle ---------------------------------------------------------- #
     def start(self) -> SourceHealth:
@@ -379,7 +436,39 @@ class SourceHealth:
     def _loop(self) -> None:
         while not self._stop.is_set():
             self._ingest(self.sample_once())
+            self._maybe_emit_standby_heartbeat()
             self._stop.wait(self.interval)
+
+    def _maybe_emit_standby_heartbeat(self) -> None:
+        """Emit the standby heartbeat through the primary at a bounded cadence.
+
+        This runs only after a real slot sample has observed streaming. Logical
+        messages are control records: they do not affect any source-data liveness
+        clock, and a failed primary write remains visible in the health summary.
+        """
+        if not self.standby_heartbeat or not self.ever_streamed:
+            return
+        now = time.monotonic()
+        if (
+            self._next_standby_heartbeat_at is not None
+            and now < self._next_standby_heartbeat_at
+        ):
+            return
+        self._next_standby_heartbeat_at = now + max(0.25, self.heartbeat_interval)
+        self._heartbeat_attempts += 1
+        if self._standby_heartbeat_marker is None:
+            self._standby_heartbeat_marker = SourceMarker(
+                prefix="cdc_flight", enabled=True
+            )
+        marker_lsn = self.emit_marker(
+            self._standby_heartbeat_marker,
+            HEARTBEAT,
+            {"slot": self.slot_name, "source_role": "standby"},
+        )
+        if marker_lsn is None:
+            self._heartbeat_failures += 1
+        else:
+            self._heartbeat_writes += 1
 
     def _ingest(self, sample: SlotSample) -> None:
         """Fold one observation into the derived clocks.
@@ -492,7 +581,21 @@ class SourceHealth:
                 tcp_user_timeout=self.query_timeout_ms,
             ) as conn:
                 sql = _SLOT_SQL if self.identity_required else _SLOT_SQL_FAST
+                assert_recovery_safe_wal_sql(sql)
                 row = conn.execute(sql, (self.slot_name,)).fetchone()
+                wal_status = None
+                invalidation_reason = None
+                if self.detect_local_slot_failure:
+                    status_row = conn.execute(
+                        _LOCAL_SLOT_STATUS_SQL, (self.slot_name,)
+                    ).fetchone()
+                    if status_row is not None:
+                        wal_status = (
+                            str(status_row[0]) if status_row[0] is not None else None
+                        )
+                        invalidation_reason = (
+                            str(status_row[1]) if status_row[1] is not None else None
+                        )
                 publication_has_tables = None
                 publication_has_configured_tables = None
                 if self.publication_name is not None:
@@ -525,6 +628,8 @@ class SourceHealth:
             return SlotSample(
                 at=now,
                 exists=False,
+                wal_status=wal_status,
+                invalidation_reason=invalidation_reason,
                 publication_has_tables=publication_has_tables,
                 publication_has_configured_tables=publication_has_configured_tables,
                 observed_at=datetime.now(UTC),
@@ -538,6 +643,8 @@ class SourceHealth:
                 active_pid=(int(active_pid) if active_pid is not None else None),
                 confirmed_pos=(int(confirmed_pos) if has_confirmed else None),
                 restart_pos=(int(restart_pos) if restart_pos is not None else None),
+                wal_status=wal_status,
+                invalidation_reason=invalidation_reason,
                 lag_bytes=int(lag) if has_confirmed else None,
                 publication_has_tables=publication_has_tables,
                 publication_has_configured_tables=publication_has_configured_tables,
@@ -581,6 +688,8 @@ class SourceHealth:
             ),
             confirmed_pos=(int(confirmed_pos) if has_confirmed else None),
             restart_pos=(int(restart_pos) if restart_pos is not None else None),
+            wal_status=wal_status,
+            invalidation_reason=invalidation_reason,
             lag_bytes=int(lag) if has_confirmed else None,
             publication_has_tables=publication_has_tables,
             publication_has_configured_tables=publication_has_configured_tables,
@@ -677,6 +786,46 @@ class SourceHealth:
             return self._ever_streamed
 
     @property
+    def local_slot_failure(self) -> dict | None:
+        """Return a durable-stop witness for a lost or invalidated standby slot.
+
+        A brief detach is ordinary Debezium retry/backoff and remains governed by
+        the existing source-dark fold.  This witness is stricter: it is enabled
+        only for the standby route, only after this run observed a real stream,
+        and only for a successful catalog sample that says the local slot is gone
+        or PostgreSQL has marked its retained WAL unusable.  The supervisor checks
+        it before final acknowledgement, so no primary logical slot can become an
+        accidental recovery path.
+        """
+        with self._lock:
+            sample = self._last
+            ever_streamed = self._ever_streamed
+        if not self.detect_local_slot_failure or not ever_streamed:
+            return None
+        if sample is None or sample.unknown:
+            return None
+        if not sample.exists:
+            kind = "lost"
+        elif sample.invalidated:
+            kind = "invalidated"
+        else:
+            return None
+        return {
+            "kind": kind,
+            "slot_name": self.slot_name,
+            "slot_exists": sample.exists,
+            "slot_active": sample.active,
+            "wal_status": sample.wal_status,
+            "invalidation_reason": sample.invalidation_reason,
+            "confirmed_pos": sample.confirmed_pos,
+            "restart_pos": sample.restart_pos,
+            "observed_at": (
+                sample.observed_at.isoformat() if sample.observed_at is not None else None
+            ),
+            "recovery_required": "local_slot_repair_and_fenced_full_resnapshot",
+        }
+
+    @property
     def lag_steady_for(self) -> float:
         """Seconds since the slot's observed backlog last changed."""
         with self._lock:
@@ -771,7 +920,7 @@ class SourceHealth:
         bounded timeouts the sampler uses, and an error that is an operational
         condition rather than a crash.
         """
-        dsn = self.primary_dsn
+        dsn = self.source_write_dsn or self.primary_dsn
         if marker is None or not dsn:
             return None
         try:
@@ -1080,10 +1229,11 @@ class SourceHealth:
     def outstanding_bytes(self, received_high_water: int | None) -> int | None:
         """OUR undelivered backlog, in bytes, or ``None`` when it cannot be read.
 
-        ``slot_lag_bytes`` is ``pg_wal_lsn_diff(pg_current_wal_lsn(),
-        confirmed_flush_lsn)`` — the WAL PostgreSQL must RETAIN, which is a
-        CLUSTER-wide quantity.  Another database in the same cluster moves
-        ``pg_current_wal_lsn()`` on every 0.5 s sample without a single byte of
+        ``slot_lag_bytes`` is the role-appropriate source-retained WAL distance
+        (receive high-water on a standby, current position on a primary) to
+        ``confirmed_flush_lsn`` — the WAL PostgreSQL must RETAIN, which is a
+        CLUSTER-wide quantity. Another database in the same cluster moves the
+        primary's current position on every 0.5 s sample without a single byte of
         it being ours, which is exactly how review r12 (R12-3) measured every
         bounded run burning its whole ``--max-seconds`` under an ordinary
         neighbour: 60.44 s with a co-tenant against 10.55 s without.
@@ -1223,8 +1373,8 @@ class SourceHealth:
         if self.streaming_for < min_seconds:
             return False
         # (2) And OUR backlog must be gone.  ROUND 13 (review r12, R12-3 and
-        #     R12-6).  Round 12 measured this against `pg_current_wal_lsn()`,
-        #     which is cluster-wide: the reviewer proved that one ordinary
+        #     R12-6). Round 12 measured this against a cluster-wide current-WAL
+        #     position, which made the reviewer prove that one ordinary
         #     co-tenant database writing WAL made this branch unsatisfiable and
         #     cost every bounded run its entire `--max-seconds` (60.44 s against
         #     10.55 s, one file swapped).  `outstanding_bytes` measures the
@@ -1257,6 +1407,14 @@ class SourceHealth:
         return self.lag_steady_for >= min_seconds
 
     def summary(self) -> dict:
+        heartbeat_summary = {
+            "standby_heartbeat_enabled": self.standby_heartbeat,
+            "standby_heartbeat_route": self.source_write_dsn or self.primary_dsn,
+            "standby_heartbeat_attempts": self._heartbeat_attempts,
+            "standby_heartbeat_writes": self._heartbeat_writes,
+            "standby_heartbeat_failures": self._heartbeat_failures,
+            "standby_heartbeat_interval_sec": self.heartbeat_interval,
+        }
         sample = self.last
         if sample is None:
             return {
@@ -1264,6 +1422,7 @@ class SourceHealth:
                 "source_publication": self.publication_name,
                 "source_publication_has_configured_tables": None,
                 "service_source_quiet_ready": False,
+                **heartbeat_summary,
             }
         if sample.unknown:
             return {
@@ -1279,12 +1438,16 @@ class SourceHealth:
                 "slot_retrying_for_sec": round(self.retrying_for, 1),
                 "slot_stream_interruptions": self.stream_interruptions,
                 "slot_recovered_after_interruption": self.recovered_after_interruption,
+                "slot_wal_status": sample.wal_status,
+                "slot_invalidation_reason": sample.invalidation_reason,
+                "local_slot_failure": self.local_slot_failure,
                 "source_publication": self.publication_name,
                 "source_publication_has_tables": sample.publication_has_tables,
                 "source_publication_has_configured_tables": (
                     sample.publication_has_configured_tables
                 ),
                 "service_source_quiet_ready": self.service_quiet_ready,
+                **heartbeat_summary,
             }
         return {
             "slot_health": self.state(),
@@ -1318,6 +1481,9 @@ class SourceHealth:
             "slot_lag_steady_for_sec": round(self.lag_steady_for, 1),
             "slot_stream_interruptions": self.stream_interruptions,
             "slot_recovered_after_interruption": self.recovered_after_interruption,
+            "slot_wal_status": sample.wal_status,
+            "slot_invalidation_reason": sample.invalidation_reason,
+            "local_slot_failure": self.local_slot_failure,
             "source_publication": self.publication_name,
             "source_publication_has_tables": sample.publication_has_tables,
             "source_publication_has_configured_tables": (
@@ -1340,4 +1506,5 @@ class SourceHealth:
                 if self.source_marker is not None
                 else {}
             ),
+            **heartbeat_summary,
         }

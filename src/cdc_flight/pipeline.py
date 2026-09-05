@@ -36,7 +36,7 @@ from pathlib import Path
 # different proven-safe pool; the production default is the Arrow system allocator.
 os.environ.setdefault("ARROW_DEFAULT_MEMORY_POOL", "system")
 
-from . import acquisition, naming
+from . import acquisition, naming, offsets
 from . import catalog as catalog_mod
 from . import catalog_baseline as baseline_mod
 from . import destination as dest_mod
@@ -85,6 +85,7 @@ from .naming import control_table
 from .ownership import DestinationOwnership
 from .run_state import RunOutcome, RunPhaseWriter
 from .snapshot_completion import SnapshotCompletion
+from .state_directory_lease import StateDirectoryLease
 from .supervisor import run_engine_bounded  # noqa: F401 - compatibility re-export
 
 log = logging.getLogger("cdc_flight.pipeline")
@@ -129,6 +130,10 @@ def run(
         log.warning("fault injection armed: point=%s group=%s action=%s", *fault_spec)
 
     source = SourceConfig()
+    # Resolve all three source endpoints before destination/state mutation.  In
+    # standby mode this deliberately raises when CDC_PRIMARY_DSN is absent; there
+    # is no late fallback to the read-only decoder endpoint.
+    routes = source.route_policy
     replication = ReplicationConfig()
     dest = DestinationConfig(**({"kind": destination} if destination else {}))
     control_schema = dest.control_schema
@@ -166,6 +171,7 @@ def run(
     props = build_properties(
         source,
         replication,
+        routes=routes,
         snapshot_mode=snapshot_mode,
         truncate_mode=settings["truncate_mode"],
         jdbc_socket_timeout_seconds=run_cfg.jdbc_socket_timeout_seconds,
@@ -228,7 +234,7 @@ def run(
         with contextlib.suppress(Exception):
             exc.summary = failure_summary
         raise
-    summary_extra: dict = {}
+    summary_extra: dict = {"source_routes": routes.as_dict()}
     lease: Lease | None = None
     lease_held = False
     phases: RunPhaseWriter | None = None
@@ -263,7 +269,16 @@ def run(
     #: it AFTER the terminal phase transitions, rather than shipping a summary sampled
     #: while the run was still `draining`.
     reported: dict | None = None
+    replay_offset_file: Path | None = None
+    replay_intent_path = offsets.replay_intent_path(replication.state_dir)
+    replay_intent: offsets.ReplayIntent | None = None
+    state_directory_lease = StateDirectoryLease(replication.state_dir)
     try:
+        # The destination lease below protects the physical destination. This local
+        # sidecar protects the other half of Invariant O: offsets, replay markers,
+        # recovery state, and the disposable resnapshot tree. Both leases are required
+        # because different destinations can still be configured with one state path.
+        state_directory_lease.acquire()
         if service_context is not None:
             destination_lease_key = dest.resolve_physical_lease_key(con)
             lease = service_context.lease or Lease(
@@ -304,14 +319,18 @@ def run(
             # is snapshot-only; do not construct a connector that would appear
             # healthy while its local logical slot is absent or invalid.
             standby = standby_mod.inspect(
-                source.dsn,
+                routes.read_dsn,
                 replication.slot_name,
-                primary_dsn=source.primary_dsn,
+                primary_dsn=routes.source_write_dsn,
                 physical_slot_name=source.physical_slot_name,
                 connect_timeout=run_cfg.jdbc_connect_timeout_seconds,
                 statement_timeout_ms=run_cfg.jdbc_socket_timeout_seconds * 1000,
+                allow_local_slot_recovery=True,
             )
             summary_extra["standby_capability"] = standby.as_dict()
+            summary_extra["standby_local_slot_recovery_reasons"] = (
+                standby_mod.local_slot_recovery_reasons(standby)
+            )
             log.info(
                 "validated recovery-mode standby source: system=%s timeline=%s "
                 "local_slot=%s physical_slot=%s",
@@ -351,7 +370,7 @@ def run(
         # declare unusable.
         #
         # The lease is taken first: this path mutates destination state (marks tables,
-        # deletes the resume point, drops the slot), and a second runner doing that
+        # deletes the resume point, establishes main-slot retirement), and a second runner doing that
         # concurrently is exactly what rubric 4.2 exists to prevent.
         if service_context is not None:
             if service_context.lease_key != destination_lease_key:
@@ -403,14 +422,6 @@ def run(
             lease.acquire(con)
             lease_held = True
 
-        # rubric 4.7: a throwaway `_rs` slot left behind by an interrupted re-snapshot
-        # holds WAL on the source for ever and counts against `max_replication_slots`.
-        # Swept unconditionally, by the one name this pipeline derives from its own slot
-        # (Opus MAJOR-2, observed leaking twice on the shared cluster in one day).
-        summary_extra["stale_resnapshot_slot"] = resnapshot_mod.sweep_stale_slot(
-            source.primary_dsn, replication.slot_name
-        )
-
         captured_tables = acquisition.captured_tables(
             con,
             dest.pipeline_name,
@@ -428,6 +439,7 @@ def run(
             summary_extra["reset_state"] = acquisition.journal_the_reset(
                 con, source=source, replication=replication, dest=dest,
                 namespace=namespace, captured=captured_tables, phases=phases,
+                routes=routes,
             )
 
         # A recovery an earlier process did not finish is resumed BEFORE the slot check
@@ -436,7 +448,10 @@ def run(
         # work as an operator error and refuse for ever (Codex B3 / Opus MAJOR-1).
         journal, resumed = acquisition.resume_any_journalled_recovery(
             con, source=source, replication=replication, dest=dest, namespace=namespace,
-            phases=phases,
+            phases=phases, routes=routes,
+        )
+        recovery_slot_retained = bool(
+            isinstance(resumed, dict) and resumed.get("slot") == "retained"
         )
         if resumed is not None:
             summary_extra["recovery_resumed"] = resumed
@@ -451,6 +466,7 @@ def run(
             dest=dest,
             namespace=namespace,
             captured=captured_tables,
+            routes=routes,
             # Deliberately independent of `--accept-orphan-offsets`: whether the file is
             # trusted, refused or deleted is reconciliation's decision, and it is the one
             # place that knows the difference. The slot check only has to stay out of it.
@@ -458,11 +474,44 @@ def run(
                 replication.offset_file.exists()
                 and replication.offset_file.stat().st_size > 0
             ),
+            recovery_in_progress=journal is not None,
+        )
+        recovery_slot_retained = recovery_slot_retained or (
+            verdict.decision == "recovery_retained"
         )
         summary_extra["slot_check"] = verdict.as_dict()
+        # A stale throwaway slot may be retired only while the main slot is the
+        # independently checked retention copy. In particular, the startup sweep is
+        # deferred when the main slot is missing/invalid/ahead; `_rs` may then be the
+        # only source-side retention for an undelivered logical message.
+        if verdict.ok and recovery is None:
+            stale_authorization = reconcile_mod.retention_slot_drop_authorization(
+                dsn=routes.slot_owner_dsn,
+                slot_name=resnapshot_mod.slot_name_for(replication.slot_name),
+                retention_slot_name=replication.slot_name,
+                publication_name=replication.publication_name,
+                application_patterns=replication.message_prefix_allowlist,
+                expected_source_identity={
+                    "system_identifier": verdict.context.get("system_identifier"),
+                    "timeline_id": verdict.context.get("timeline_id"),
+                },
+                after_lsn=verdict.context.get("durable_lsn"),
+            )
+            summary_extra["stale_resnapshot_slot"] = resnapshot_mod.sweep_stale_slot(
+                routes.slot_owner_dsn,
+                replication.slot_name,
+                authorization=stale_authorization,
+            )
+        else:
+            summary_extra["stale_resnapshot_slot"] = (
+                "deferred_until_main_slot_is_safe"
+            )
         if recovery is not None:
             phases.to(PHASE_RECOVERING, detail=verdict.decision)
             summary_extra["slot_recovery"] = recovery
+            recovery_slot_retained = recovery_slot_retained or (
+                recovery.get("slot") == "retained"
+            )
             journal = recovery_mod.read(
                 con,
                 pipeline=dest.pipeline_name,
@@ -470,16 +519,15 @@ def run(
                 control_schema=control_schema,
             )
         if journal is not None:
-            # A recovery has deleted the resume point, so the run has to snapshot data
-            # whatever `snapshot.mode` said. `no_data` plus "every table is owed a
-            # snapshot" is a run that streams onto tables it knows are wrong.
-            #
-            # Read from the JOURNAL, not from a local variable: the intent has to
-            # outlive the process that formed it. A crash after the slot was dropped
-            # used to leave no row, no file and no slot, which the next run called an
-            # ordinary fresh start - and a fresh start under a configured `no_data` mode
-            # streams onto tables that were never rebuilt (Codex B3).
-            if props["snapshot.mode"] not in reconcile_mod.SNAPSHOT_MODES_WITH_DATA:
+            # A recovery with an absent main slot still needs the journal's durable
+            # data-reading override. When the main slot is retained, the throwaway
+            # snapshot already established the image and the main engine must use
+            # `no_data` so it resumes from that retained stream cursor rather than
+            # taking a second snapshot against a surviving slot.
+            if recovery_slot_retained:
+                props["snapshot.mode"] = "no_data"
+                summary_extra["recovery_stream_handoff"] = "retained_main_slot"
+            elif props["snapshot.mode"] not in reconcile_mod.SNAPSHOT_MODES_WITH_DATA:
                 log.warning(
                     "snapshot.mode=%s does not read table data; using %r for this "
                     "recovery run (journal %s)",
@@ -490,6 +538,13 @@ def run(
                 )
             summary_extra["recovery_journal"] = journal.as_dict()
             faults_mod.runtime_state(recovery_phase=journal.phase)
+        elif recovery_slot_retained:
+            # The recovery journal may have been cleared before the engine (the
+            # all-empty route is the important case). The durable slot-state verdict is
+            # still the contract for this run: stream from the retained main slot with
+            # no second snapshot.
+            props["snapshot.mode"] = "no_data"
+            summary_extra["recovery_stream_handoff"] = "retained_main_slot"
 
         if source.role == "standby":
             # Acquisition may deliberately drop a slot whose position outruns an
@@ -500,42 +555,193 @@ def run(
             # check names the missing fact and fails before the callback lifecycle
             # exists, rather than treating a JDBC timeout as a standby proof.
             standby = standby_mod.inspect(
-                source.dsn,
+                routes.read_dsn,
                 replication.slot_name,
-                primary_dsn=source.primary_dsn,
+                primary_dsn=routes.source_write_dsn,
                 physical_slot_name=source.physical_slot_name,
                 connect_timeout=run_cfg.jdbc_connect_timeout_seconds,
                 statement_timeout_ms=run_cfg.jdbc_socket_timeout_seconds * 1000,
+                # An explicit operator reset intentionally removed the local
+                # slot above.  Admit only that narrow, local repair window so
+                # stock Debezium can recreate it on ``routes.slot_owner_dsn``
+                # (the standby); an unexpected loss must remain fail-closed.
+                allow_local_slot_recovery=reset_state,
             )
             summary_extra["standby_capability_after_acquisition"] = standby.as_dict()
 
+        # A full slot recovery/reset supersedes a source-prefix replay.  The recovery
+        # journal is durable before it removes the old row/file, so clearing this
+        # sidecar here cannot turn that route into stock resume; it prevents an old
+        # replay decision from being applied to the newly created slot instead.
+        if journal is not None:
+            summary_extra["logical_message_recovery"] = (
+                recovery_mod.discharge_replay_intent_for_recovery(
+                    con,
+                    pipeline=dest.pipeline_name,
+                    dataset=dest.dataset_name,
+                    replay_intent_path=replay_intent_path,
+                    namespace=namespace,
+                    control_schema=control_schema,
+                    source_dsn=routes.slot_owner_dsn,
+                    source_slot_name=replication.slot_name,
+                    source_publication_name=replication.publication_name,
+                    source_application_patterns=replication.message_prefix_allowlist,
+                    known_message_state=(
+                        journal.logical_message_resolution
+                        if journal is not None
+                        else None
+                    ),
+                )
+            )
+            if summary_extra["logical_message_recovery"]["replay_intent_cleared"]:
+                summary_extra["source_replay_intent_superseded"] = "slot_recovery"
+            offsets.prepare_replay_offset(
+                offsets.replay_offset_path(replication.state_dir)
+            )
+        else:
+            replay_intent = offsets.read_replay_intent(replay_intent_path)
+            if replay_intent is None:
+                # A hard kill after the canonical install and marker unlink can
+                # precede the outer cleanup. The source replay file is disposable;
+                # reclaim it on the next start so the probe's post-recovery invariant
+                # describes actual state rather than a stale local artifact.
+                replay_path = offsets.replay_offset_path(replication.state_dir)
+                if replay_path.exists():
+                    offsets.prepare_replay_offset(replay_path)
+                    summary_extra["source_replay_orphan_reclaimed"] = True
+            if replay_intent is not None:
+                durable_point = dest_mod.read_resume_point(
+                    con,
+                    dest.pipeline_name,
+                    namespace,
+                    control_schema=control_schema,
+                )
+                offsets.validate_replay_intent(
+                    replay_intent,
+                    pipeline=dest.pipeline_name,
+                    namespace=namespace,
+                    durable_point=durable_point,
+                )
+                if durable_point is not None and offsets.replay_install_is_durable(
+                    replay_intent,
+                    target=replication.offset_file,
+                    durable_point=durable_point,
+                ):
+                    # A kill after os.replace and before the normal finally left a
+                    # complete canonical file plus an installing marker. It is safe to
+                    # discharge that marker now; pending markers are never discharged
+                    # merely because the canonical file happens to agree.
+                    offsets.prepare_replay_offset(
+                        offsets.replay_offset_path(replication.state_dir)
+                    )
+                    offsets.clear_replay_intent(replay_intent_path)
+                    replay_intent = None
+                    summary_extra["source_replay_intent_cleared_on_start"] = True
+                else:
+                    summary_extra.update(
+                        {
+                            "source_replay_intent_resumed": True,
+                            "source_replay_intent_phase": replay_intent.phase,
+                        }
+                    )
+
         phases.ensure(PHASE_RECONCILING)
+
+        def arm_replay_before_repair(point, decision: str) -> None:
+            nonlocal replay_intent
+            replay_intent = offsets.arm_replay_intent(
+                replay_intent_path,
+                pipeline=dest.pipeline_name,
+                namespace=namespace,
+                durable_point=point,
+            )
+            summary_extra.update(
+                {
+                    "source_replay_intent_armed": True,
+                    "source_replay_intent_phase": replay_intent.phase,
+                    "source_replay_intent_reason": decision,
+                }
+            )
+
         reconciliation = reconcile_mod.reconcile(
             con,
             pipeline=dest.pipeline_name,
             namespace=namespace,
             offset_path=replication.offset_file,
             accept_orphan=accept_orphan_offsets,
-            repair=applier_cfg.repair_offset_file,
-            dsn=source.dsn,
+            # A pending/installing marker owns the restart decision. Do not let
+            # reconciliation rewrite the canonical file and accidentally make a
+            # restart look like an ordinary stock resume.
+            repair=applier_cfg.repair_offset_file and replay_intent is None,
+            before_repair=(
+                None if replay_intent is not None else arm_replay_before_repair
+            ),
+            dsn=routes.read_dsn,
             slot_name=replication.slot_name,
         )
         summary_extra["reconciliation"] = reconciliation.decision
         summary_extra["reconciliation_detail"] = reconciliation.message
         log.info("start-up reconciliation: %s (%s)", reconciliation.decision, reconciliation.message)
 
+        # A destination COMMIT can survive a process death before Debezium's
+        # markProcessed/markBatchFinished acknowledgement.  Feeding that rebuilt
+        # destination offset back into stock PostgreSQL resume search is unsafe for
+        # a standalone logical message immediately after the stored COMMIT: the
+        # connector's search starts at the COMMIT boundary, finds the next
+        # transaction boundary, and its replay filter can discard the intervening
+        # MESSAGE.  Keep the real offsets.dat behind as crash evidence, and use a
+        # fresh disposable store for this one recovery.  With no prior offset stock
+        # Debezium starts at the slot's confirmed position; the existing durable
+        # transaction fence and message ledger make the replay idempotent.
+        if replay_intent is not None:
+            replay_path = offsets.replay_offset_path(replication.state_dir)
+            if replay_path.exists():
+                # A previous replay process may have flushed the stock file and died
+                # before installing it. This is the restart row in which the file is
+                # already present but this process has not committed any replay data.
+                faults_mod.runtime_state(
+                    source_replay=True,
+                    source_replay_resume_lsn=verdict.context.get("confirmed_flush_lsn"),
+                    source_replay_intent_phase=replay_intent.phase,
+                )
+                faults_mod.matrix_crash("source_replay_file_exists_before_first_md_commit")
+            replay_offset_file = offsets.prepare_replay_offset(replay_path)
+            props["offset.storage.file.filename"] = replay_offset_file.as_posix()
+            props["snapshot.mode"] = "no_data"
+            summary_extra.update(
+                {
+                    "source_replay_from_slot": True,
+                    "source_replay_offset_file": str(replay_offset_file),
+                    "source_replay_reason": "destination_commit_without_offset_ack",
+                    "source_replay_resume_lsn": verdict.context.get(
+                        "confirmed_flush_lsn"
+                    ),
+                    "source_replay_resume_basis": "slot.confirmed_flush_lsn",
+                }
+            )
+            faults_mod.runtime_state(
+                source_replay=True,
+                source_replay_resume_lsn=verdict.context.get("confirmed_flush_lsn"),
+                source_replay_intent_phase=replay_intent.phase,
+            )
+            faults_mod.matrix_crash("source_replay_after_prepare")
+            log.warning(
+                "destination offset outran the connector acknowledgement; replaying "
+                "from the slot's confirmed position with a disposable offset file"
+            )
+
         # rubric 4.7 / Codex r1 BLOCKER-1: an operator who passed
         # `--accept-orphan-offsets` has authorised a rebuild, and the rebuild is now a
         # journalled recovery like every other one — **journal first, destroy second**.
         #
-        # It used to be the other way round. `offsets` dropped the slot and
+        # It used to be the other way round. `offsets` retired the source slot and
         # unlinked the file and only then did this block record why, which put a crash
         # window between destroying the evidence and writing the obligation: a hard exit
         # there left no row, no file, no slot and no journal, the next run called that an
         # ordinary `fresh_start`, and a configured non-data `snapshot.mode` streamed onto
         # a destination nobody had rebuilt. `reconcile()` now classifies and nothing
         # more; `begin()` makes the intent and the table obligation durable together;
-        # `resume()` performs the file / row / slot ladder, idempotently, from whatever
+        # `resume()` performs the file / row / source-retirement ladder, idempotently, from whatever
         # phase survives.
         if reconciliation.decision == "orphan_accepted_resnapshot" and journal is None:
             previous_slot = dest_mod.read_slot_state(
@@ -568,8 +774,14 @@ def run(
                 captured_tables=captured_tables,
                 forget_catalog=False,
                 slot_receipt=slot_receipt,
+                logical_message_dataset=dest.dataset_name,
                 context={"file_lsn": reconciliation.file_lsn},
                 control_schema=control_schema,
+                replay_intent_path=replay_intent_path,
+                source_dsn=routes.slot_owner_dsn,
+                source_slot_name=replication.slot_name,
+                source_publication_name=replication.publication_name,
+                source_application_patterns=replication.message_prefix_allowlist,
             )
             summary_extra["recovery_journal"] = journal.as_dict()
             summary_extra["orphan_recovery"] = recovery_mod.resume(
@@ -577,11 +789,21 @@ def run(
                 pipeline=dest.pipeline_name,
                 namespace=namespace,
                 record=journal,
-                dsn=source.primary_dsn,
+                dsn=routes.slot_owner_dsn,
+                logical_message_dataset=dest.dataset_name,
                 control_schema=control_schema,
+                replay_intent_path=replay_intent_path,
+                source_dsn=routes.slot_owner_dsn,
+                source_slot_name=replication.slot_name,
+                source_publication_name=replication.publication_name,
+                source_application_patterns=replication.message_prefix_allowlist,
+            )
+            recovery_slot_retained = recovery_slot_retained or (
+                summary_extra["orphan_recovery"].get("slot") == "retained"
             )
         if (
             journal is not None
+            and not recovery_slot_retained
             and props["snapshot.mode"] not in reconcile_mod.SNAPSHOT_MODES_WITH_DATA
         ):
             log.warning(
@@ -592,13 +814,17 @@ def run(
             props["snapshot.mode"] = (
                 journal.snapshot_mode or recovery_mod.FORCED_SNAPSHOT_MODE
             )
+        elif recovery_slot_retained:
+            props["snapshot.mode"] = "no_data"
+            summary_extra["recovery_stream_handoff"] = "retained_main_slot"
 
         # ADR §4.7 - the Invariant-O guard, at start-up. `snapshot_mode` is what
         # decides the "slot exists / no durable destination row" cell (Codex 3).
         summary_extra["invariant_o_start"] = reconcile_mod.check_invariant_o(
             con, pipeline=dest.pipeline_name, namespace=namespace,
-            dsn=source.dsn, slot_name=replication.slot_name,
+            dsn=routes.read_dsn, slot_name=replication.slot_name,
             snapshot_mode=props["snapshot.mode"],
+            retained_slot=recovery_slot_retained,
             control_schema=control_schema,
         )
 
@@ -617,6 +843,7 @@ def run(
                 pipeline=dest.pipeline_name,
                 namespace=namespace,
                 record=journal,
+                retained_slot=recovery_slot_retained,
                 control_schema=control_schema,
             )
             if completion.cleared:
@@ -700,8 +927,9 @@ def run(
         descriptor_provider = None
         if catalog_enabled:
             watcher = catalog_mod.CatalogWatcher(
-                dsn=source.dsn,
-                primary_dsn=source.primary_dsn,
+                dsn=routes.read_dsn,
+                primary_dsn=routes.source_write_dsn,
+                routes=routes,
                 publication=replication.publication_name,
                 schema=source.schema,
                 schemas=source.schemas,
@@ -818,7 +1046,7 @@ def run(
             from .catalog_descriptors import provider_for_source
 
             try:
-                descriptor_provider = provider_for_source(source)
+                descriptor_provider = provider_for_source(source, routes=routes)
             except ValueError as exc:
                 raise EngineFailure(str(exc), dict(summary_extra)) from exc
 
@@ -848,6 +1076,7 @@ def run(
         if (
             owed
             and not will_snapshot_everything
+            and not recovery_slot_retained
             and acquisition.resnapshot_enabled()
             and reconciliation.resume_point.last_lsn == 0
         ):
@@ -896,11 +1125,19 @@ def run(
                     new_relations={relation.qualified for relation in discovered},
                     drop_mode=applier_cfg.drop_mode,
                     control_schema=control_schema, catalog=watcher,
+                    routes=routes,
                     resnapshot_run=resnapshot_mod.run,
                 )
             )
             summary_extra.update(latest_resnapshot)
             summary_extra.update(rbs.summarize_passes(resnapshot_passes))
+            if journal is not None and recovery_slot_retained:
+                # The retained recovery's throwaway snapshot has already discharged
+                # the owed lifecycle rows before the no-data main stream runs.  Carry
+                # its positive emptiness evidence into the aliases the old main-engine
+                # discharge path emitted; do not emit either key without both the
+                # emptied-table result and its source-WAL fence.
+                summary_extra.update(rbs.verified_empty_summary(resnapshot_passes))
             reconciliation.resume_point.snapshot_epoch = max(
                 reconciliation.resume_point.snapshot_epoch, snapshot_epoch
             )
@@ -990,6 +1227,7 @@ def run(
                 con,
                 source=source,
                 replication=replication,
+                routes=routes,
                 pipeline=dest.pipeline_name,
                 dataset=dest.dataset_name,
                 tables=full_tables,
@@ -1034,7 +1272,10 @@ def run(
         # but the recovery snapshot's callbacks are still required evidence. The
         # throwaway re-snapshot has its own required completion machine; an ordinary
         # streaming run remains `not_required` here.
-        snapshot_completion_required = will_snapshot_everything or journal is not None
+        snapshot_completion_required = (
+            will_snapshot_everything
+            or (journal is not None and not recovery_slot_retained)
+        )
         snapshot_completion = SnapshotCompletion.for_capture(
             snapshot_completion_required,
             schema=source.schema,
@@ -1042,7 +1283,7 @@ def run(
         )
         completion_stage = PostEngineCompletion(
             con=con,
-            source_dsn=source.dsn,
+            source_dsn=routes.read_dsn,
             slot_name=replication.slot_name,
             pipeline=dest.pipeline_name,
             namespace=namespace,
@@ -1057,6 +1298,7 @@ def run(
             outcome=outcome,
             base_summary=summary_extra,
             drop_mode=applier_cfg.drop_mode,
+            retained_slot=recovery_slot_retained,
         )
 
         from .discovery_coordinator import LiveDiscoveryCoordinator
@@ -1084,6 +1326,7 @@ def run(
         coordinator = LiveDiscoveryCoordinator(
             con=con,
             source=source,
+            routes=routes,
             replication=replication,
             destination=dest,
             namespace=namespace,
@@ -1093,6 +1336,7 @@ def run(
             settings=settings,
             watcher=watcher,
             discovered=discovered,
+            captured_tables=captured_tables,
             catalog_cfg=catalog_cfg,
             phases=phases,
             lease=lease,
@@ -1109,9 +1353,60 @@ def run(
             descriptor_provider=descriptor_provider,
             catalog_flush_exclude=catalog_flush_exclude,
             service_context=service_context,
+            offset_file=replay_offset_file,
+            suppress_replayed_message_audit=(
+                replay_offset_file is not None or recovery_slot_retained
+            ),
         )
         try:
             reported = coordinator.run()
+            if replay_offset_file is not None:
+                faults_mod.matrix_crash("source_replay_after_md_commit_before_install")
+                source_fingerprint = offsets.replay_offset_fingerprint(replay_offset_file)
+                if replay_intent is None:  # pragma: no cover - guarded above
+                    raise OffsetUnusable(
+                        "source replay completed without a durable replay intent"
+                    )
+                replay_intent = offsets.mark_replay_installing(
+                    replay_intent_path,
+                    replay_intent,
+                    source_size=source_fingerprint[0],
+                    source_sha256=source_fingerprint[1],
+                )
+                faults_mod.runtime_state(
+                    source_replay_installing=True,
+                    source_replay_source_size=source_fingerprint[0],
+                )
+                durable_after_replay = dest_mod.read_resume_point(
+                    con,
+                    dest.pipeline_name,
+                    namespace,
+                    control_schema=control_schema,
+                )
+                if durable_after_replay is None:
+                    raise OffsetUnusable(
+                        "source replay completed but the durable destination resume row "
+                        "is absent"
+                    )
+                summary_extra["source_replay_offset_installed"] = (
+                    offsets.install_replay_offset(
+                        replay_offset_file,
+                        replication.offset_file,
+                        expected_fingerprint=source_fingerprint,
+                        durable_point=durable_after_replay,
+                        namespace=namespace,
+                    )
+                )
+                # The marker remains until the canonical install is complete. A hard
+                # death before this line leaves either a pending or installing marker;
+                # a later start can therefore distinguish it from ordinary resume.
+                faults_mod.runtime_state(source_replay_canonical_installed=True)
+                faults_mod.matrix_crash("source_replay_after_install_before_clear")
+                offsets.clear_replay_intent(replay_intent_path)
+                faults_mod.matrix_crash(
+                    "source_replay_after_intent_clear_before_cleanup"
+                )
+                replay_intent = None
             run_ok = coordinator.run_ok
             return reported
         except EngineFailure as failure:
@@ -1176,6 +1471,8 @@ def run(
         raise
     finally:
         try:
+            if replay_offset_file is not None:
+                replay_offset_file.unlink(missing_ok=True)
             _teardown_destination(
                 con=con,
                 ownership=ownership,
@@ -1191,6 +1488,7 @@ def run(
         finally:
             if service_context is not None:
                 service_context.close()
+            state_directory_lease.release()
 
 
 def _record_run_failure_alert(
@@ -1305,6 +1603,18 @@ def _record_run_failure_alert(
             if exc.offset_row is not None
             else OccurrenceKey.from_run(run_state, pipeline=dest.pipeline_name)
         )
+    elif summary.get("local_slot_failure"):
+        witness = dict(summary["local_slot_failure"])
+        kind = str(witness.get("kind") or "invalidated")
+        code = "local_slot_lost" if kind == "lost" else "local_slot_invalidated"
+        severity = "critical"
+        condition_key = (
+            f"{code}:{witness.get('slot_name')}:{witness.get('wal_status')}"
+            f":{witness.get('invalidation_reason')}"
+        )
+        occurrence_key = OccurrenceKey.from_run(
+            run_state, pipeline=dest.pipeline_name
+        )
     elif summary.get("slot_check"):
         code = str(summary["slot_check"].get("decision") or "slot_check_failed")
         severity = "critical"
@@ -1418,6 +1728,7 @@ def _record_run_failure_alert(
                         if isinstance(source_health_episode, EpisodeReceipt)
                         else source_health_episode
                     ),
+                    "local_slot_failure": summary.get("local_slot_failure"),
                 },
             )
             if not raised and not dest_mod.alert_identity_exists(

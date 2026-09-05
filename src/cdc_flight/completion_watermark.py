@@ -302,7 +302,10 @@ class CompletionWatermark:
             # even when the sampler cannot corroborate a watermark; a normal
             # streaming run always supplies the configured primary DSN and must
             # stay unarmed while the source is reconnecting.
-            and getattr(self.health, "primary_dsn", None) is not None
+            and (
+                getattr(self.health, "source_write_dsn", None)
+                or getattr(self.health, "primary_dsn", None)
+            ) is not None
         )
 
     def _ready_to_arm(self, handler) -> bool:

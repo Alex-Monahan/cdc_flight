@@ -9,16 +9,18 @@ could not:
   between left `row absent / file present` — which the Flight diagnoses as
   `orphan_offset_file` and refuses to start on, for ever, until a human passes a CLI
   flag. Opus reproduced three consecutive refusals.
-* a crash after the slot was dropped lost the forced `snapshot.mode='initial'`, because
-  it only ever lived in a local variable. The next run then saw no row, no file and no
-  slot and called it an ordinary fresh start (Codex B3).
+* a crash while slot retirement was only an in-memory fact lost the forced
+  `snapshot.mode='initial'`, because it only ever lived in a local variable. The next
+  run then saw no row, no file and no durable recovery handoff and called it an ordinary
+  fresh start (Codex B3).
 
 Both are now closed by a durable journal written **before** any mutation, with every
 step idempotent and re-entrant from the recorded phase. These tests cut at every phase
 boundary and prove the next attempt finishes the job.
 
-They are in the DEFAULT suite and cost milliseconds: `recovery.resume()` takes the slot
-drop as a parameter, so the whole state machine is exercisable without a live cluster.
+They are in the DEFAULT suite and cost milliseconds: `recovery.resume()` takes the source
+retirement observation as a parameter, so the whole state machine is exercisable without
+a live cluster.
 The end-to-end pairing (a real crash, a real Postgres slot) is
 `test_1_8_recovery_crash_e2e.py`.
 """
@@ -32,6 +34,7 @@ import duckdb
 import pytest
 
 from cdc_flight import destination as dest_mod
+from cdc_flight import reconcile as reconcile_module
 from cdc_flight import recovery as recovery_mod
 from cdc_flight.errors import ReconciliationRefused, RecoveryFailed
 from cdc_flight.reconcile import reconcile
@@ -62,8 +65,8 @@ class _World:
         self.offset_path = tmp_path / "offsets.dat"
         self.offset_path.write_bytes(b"\x00not-a-real-offset-map")
         self.slots = {"cdc_slot"} if slot_present else set()
-        self.drop_calls = 0
-        self.drop_raises: Exception | None = None
+        self.retirement_calls = 0
+        self.retirement_raises: Exception | None = None
         for schema, table, target in TABLES:
             self.con.execute(
                 "INSERT INTO _cdc_flight.table_state (pipeline, source_schema, "
@@ -77,14 +80,13 @@ class _World:
             [PIPELINE, NAMESPACE],
         )
 
-    # -- the injectable slot drop ---------------------------------------- #
-    def drop_slot(self, dsn: str, slot_name: str) -> str:
-        self.drop_calls += 1
-        if self.drop_raises is not None:
-            raise self.drop_raises
+    # -- the injectable main-slot retirement observation ------------------ #
+    def retire_slot(self, dsn: str, slot_name: str) -> str:
+        self.retirement_calls += 1
+        if self.retirement_raises is not None:
+            raise self.retirement_raises
         if slot_name in self.slots:
-            self.slots.discard(slot_name)
-            return "dropped"
+            return "retained"
         return "absent"
 
     # -- observation ------------------------------------------------------ #
@@ -125,6 +127,7 @@ class _World:
             captured_tables=TABLES,
             forget_catalog=False,
             slot_receipt=slot_receipt,
+            logical_message_dataset="cdc_raw",
         )
 
     def resume(self, *, crash_before: str | None = None):
@@ -141,8 +144,9 @@ class _World:
             namespace=NAMESPACE,
             record=record,
             dsn="postgresql://unused",
-            drop_slot=self.drop_slot,
+            drop_slot=self.retire_slot,
             on_phase=_cut,
+            logical_message_dataset=DATASET,
         )
 
     def close(self):
@@ -270,7 +274,9 @@ def test_a_crash_at_any_phase_boundary_is_resumable(world, cut):
     assert result["phase"] == PHASE_ARMED
     assert world.offset_path.exists() is False
     assert world.durable_rows == 0
-    assert world.slots == set(), "the slot must be gone before any snapshot starts"
+    assert world.slots == {"cdc_slot"}, (
+        "the main slot is the WAL-retention handoff and must remain through the rebuild"
+    )
     assert sorted(world.owed) == ["app.audit_log", "app.customers", "app.orders"]
     # The forced snapshot mode survived every cut.
     assert world.journal().snapshot_mode == recovery_mod.FORCED_SNAPSHOT_MODE
@@ -279,10 +285,39 @@ def test_a_crash_at_any_phase_boundary_is_resumable(world, cut):
 def test_resuming_twice_changes_nothing(world):
     world.begin()
     first = world.resume()
-    calls = world.drop_calls
+    calls = world.retirement_calls
     second = world.resume()
     assert first["phase"] == second["phase"] == PHASE_ARMED
-    assert world.drop_calls == calls, "an armed recovery does not re-drop the slot"
+    assert world.retirement_calls == calls, "an armed recovery does not re-retire the slot"
+    assert world.durable_rows == 0
+
+
+def test_operator_reset_resume_self_heals_a_malformed_durable_resume_row(
+    world, monkeypatch
+):
+    """A reset successor must not reparse the row that reset intentionally deletes."""
+    world.begin(decision=recovery_mod.RESET_DECISION)
+    world.con.execute(
+        "UPDATE _cdc_flight.debezium_offsets SET resume_json = ? WHERE pipeline = ?",
+        ["{malformed reset state", PIPELINE],
+    )
+
+    def retire(_dsn, _slot_name):
+        return "retained"
+
+    monkeypatch.setattr(reconcile_module, "slot_retirement_status", retire)
+    result = recovery_mod.resume(
+        world.con,
+        pipeline=PIPELINE,
+        namespace=NAMESPACE,
+        record=world.journal(),
+        dsn="postgresql://unused",
+        logical_message_dataset=DATASET,
+        source_publication_name="cdc_flight_pub",
+    )
+
+    assert result["phase"] == PHASE_ARMED
+    assert result["slot"] == "retained"
     assert world.durable_rows == 0
 
 
@@ -344,8 +379,8 @@ def test_the_old_order_is_what_produced_the_permanent_refusal(world):
 # --------------------------------------------------------------------------- #
 # the one step that may not be stepped over (Codex B4)
 # --------------------------------------------------------------------------- #
-def test_a_slot_that_will_not_drop_fails_the_recovery(world):
-    """It used to be recorded as the string `drop_failed: ...` and stepped over.
+def test_a_slot_whose_retirement_state_is_unobservable_fails_the_recovery(world):
+    """It used to be recorded as `drop_failed: ...` and stepped over.
 
     A45: Debezium only pairs the snapshot with an exact WAL position when it creates
     the slot itself. Re-snapshotting against a surviving slot resumes the stream from a
@@ -353,25 +388,25 @@ def test_a_slot_that_will_not_drop_fails_the_recovery(world):
     which is the loss window rubric 1.8 exists to close.
     """
     world.begin()
-    world.drop_raises = RuntimeError('replication slot "cdc_slot" is active for PID 42')
+    world.retirement_raises = RuntimeError('replication slot "cdc_slot" is unobservable')
     with pytest.raises(RecoveryFailed) as raised:
         world.resume()
     assert "cdc_slot" in str(raised.value)
-    assert "consistent point" in str(raised.value)
+    assert "retirement state" in str(raised.value)
 
     # The journal is intact at the phase that failed, so the next run retries it.
     assert world.journal().phase == PHASE_ROW_DELETED
     assert world.slots == {"cdc_slot"}
 
-    # ... and it does, once the slot is free.
-    world.drop_raises = None
+    # ... and it does, once the source-side state is observable again.
+    world.retirement_raises = None
     result = world.resume()
     assert result["phase"] == PHASE_ARMED
-    assert world.slots == set()
+    assert world.slots == {"cdc_slot"}
 
 
-def test_an_absent_slot_is_an_acceptable_drop_outcome(tmp_path):
-    """`absent` proves the slot is gone just as well as `dropped` does."""
+def test_an_absent_slot_is_an_acceptable_retirement_outcome(tmp_path):
+    """`absent` records that an external actor already removed the main slot."""
     world = _World(tmp_path, slot_present=False)
     try:
         world.begin()
@@ -408,6 +443,7 @@ def test_a_forgotten_catalog_is_part_of_the_same_transaction(world):
         captured_tables=TABLES,
         forget_catalog=True,
         slot_receipt=slot_receipt,
+        logical_message_dataset="cdc_raw",
     )
     remaining = world.con.execute(
         "SELECT count(*) FROM _cdc_flight.source_relations WHERE pipeline = ?",
@@ -534,6 +570,7 @@ def _armed_journal(world, *, decision: str, captured: list[tuple[str, str, str]]
         captured_tables=captured,
         forget_catalog=False,
         slot_receipt=slot_receipt,
+        logical_message_dataset="cdc_raw",
     )
     world.con.execute(
         "UPDATE _cdc_flight.recovery_state SET phase = 'armed' WHERE pipeline = ?",

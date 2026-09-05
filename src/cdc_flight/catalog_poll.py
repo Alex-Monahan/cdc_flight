@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import nullcontext
 from dataclasses import replace
 
 from . import catalog_support as observation_mod
@@ -193,6 +194,23 @@ def _ensure_toast_policies(
     first LSN after the old activation until an event-level LSN can provide a tighter
     boundary; it is never treated as an open FULL interval.
     """
+    # ``conn`` may be a lazy factory.  The standby route must not open a primary
+    # session for an ordinary catalog observation; it acquires one only when a
+    # residual-TOAST admission actually needs a bounded source transaction.
+    conn_factory = conn if callable(conn) else None
+    if conn_factory is not None:
+        conn = None
+
+    def source_write_conn():
+        nonlocal conn
+        if conn is None:
+            if conn_factory is None:
+                raise RuntimeError(
+                    "a source-write connection is required for TOAST admission"
+                )
+            conn = conn_factory()
+        return conn
+
     updated = dict(observed)
     for qualified, relation in observed.items():
         previous = getattr(watcher, "known", {}).get(qualified)
@@ -259,6 +277,25 @@ def _ensure_toast_policies(
             current_boundary = None
 
         updated[qualified] = relation
+        if (
+            # Direct callers of this low-level helper predate the policy-aware
+            # watcher and deliberately pass the write connection explicitly. Keep
+            # their transaction/revalidation contract; the production watcher
+            # always supplies routes and takes the change-driven path below.
+            getattr(watcher, "routes", None) is not None
+            and
+            same_complete_generation
+            and current_full
+            and previous_boundary is not None
+            and previous_invalidation is None
+            and current_boundary == previous_boundary
+        ):
+            # The replica has reported the same complete generation and the
+            # already-proven FULL interval. Re-locking it on every catalog poll
+            # would turn observation into a recurring primary workload; a new
+            # generation, downgrade, or event-level invalidation takes the path
+            # above and reopens a bounded admission transaction.
+            continue
         policy = classify_relation(
             qualified,
             relation.columns,
@@ -281,37 +318,38 @@ def _ensure_toast_policies(
                 and _positive_lsn(relation.full_activation_lsn) is not None
             )
             lock_mode = "ACCESS EXCLUSIVE" if needs_activation else "ACCESS SHARE"
-            conn.execute("BEGIN TRANSACTION")
-            conn.execute(
+            write_conn = source_write_conn()
+            write_conn.execute("BEGIN TRANSACTION")
+            write_conn.execute(
                 f"LOCK TABLE {quote(schema)}.{quote(table)} "
                 f"IN {lock_mode} MODE NOWAIT"
             )
             if not needs_activation:
-                locked_identity = conn.execute(
+                locked_identity = write_conn.execute(
                     "SELECT relreplident FROM pg_class WHERE oid = %s", [relation.oid]
                 ).fetchone()
                 if not locked_identity or str(locked_identity[0]).lower() != "f":
                     raise RuntimeError(
                         "source replica identity changed before the held-lock admission"
                     )
-                conn.execute("COMMIT")
+                write_conn.execute("COMMIT")
                 updated[qualified] = _post_commit_full_state(
-                    conn, relation, _positive_lsn(relation.full_activation_lsn)
+                    write_conn, relation, _positive_lsn(relation.full_activation_lsn)
                 )
                 continue
 
-            conn.execute(
+            write_conn.execute(
                 f"ALTER TABLE {quote(schema)}.{quote(table)} "
                 "REPLICA IDENTITY FULL"
             )
-            verified = conn.execute(
+            verified = write_conn.execute(
                 "SELECT relreplident FROM pg_class WHERE oid = %s", [relation.oid]
             ).fetchone()
             if not verified or str(verified[0]).lower() != "f":
                 raise RuntimeError(
                     f"source reported replica identity {verified[0] if verified else None!r}"
                 )
-            post_alter = conn.execute(observation_mod.ACTIVATION_LSN_SQL).fetchone()
+            post_alter = write_conn.execute(observation_mod.ACTIVATION_LSN_SQL).fetchone()
             boundary = _positive_lsn(post_alter[0] if post_alter else None)
             pre_alter = _positive_lsn(activation_lsn)
             if boundary is None or (pre_alter is not None and boundary <= pre_alter):
@@ -319,7 +357,7 @@ def _ensure_toast_policies(
                     f"post-ALTER WAL boundary {boundary!r} did not prove it follows "
                     f"the pre-ALTER sample {pre_alter!r}"
                 )
-            verified_after_sample = conn.execute(
+            verified_after_sample = write_conn.execute(
                 "SELECT relreplident FROM pg_class WHERE oid = %s", [relation.oid]
             ).fetchone()
             if (
@@ -330,9 +368,9 @@ def _ensure_toast_policies(
                     "source replica identity changed while sampling activation WAL; "
                     "discarding the boundary and requiring refetch"
                 )
-            conn.execute("COMMIT")
+            write_conn.execute("COMMIT")
             updated[qualified] = _post_commit_full_state(
-                conn,
+                write_conn,
                 replace(
                     relation,
                     replica_identity="f",
@@ -357,7 +395,8 @@ def _ensure_toast_policies(
                 )
         except Exception as exc:
             try:
-                conn.execute("ROLLBACK")
+                if conn is not None:
+                    conn.execute("ROLLBACK")
             except Exception:
                 log.debug("could not roll back source activation transaction", exc_info=True)
             log.warning(
@@ -552,27 +591,48 @@ def poll(watcher):
             watcher._snapshot_partitions = {
                 f"{row[0]}.{row[1]}" for row in partition_rows
             }
-    # Keep source writes off the catalog read connection.  In replica mode this
-    # route is the primary; in a primary-only deployment it is the same DSN as the
-    # read side.  The connection is opened only after the read transaction is closed.
-    with connect(watcher, dsn=watcher.primary_dsn) as write_conn:
+    # Keep source writes off the catalog read connection. A policy-aware watcher
+    # gets a lazy source-write connection: ordinary catalog polling remains replica
+    # read-only, while a real TOAST/publication/fence change opens one bounded
+    # primary transaction/session. Direct primary-only legacy test callers retain
+    # their explicit eager connection compatibility path.
+    legacy_write_context = (
+        connect(watcher, dsn=watcher.primary_dsn)
+        if getattr(watcher, "routes", None) is None
+        else nullcontext(None)
+    )
+    write_conn = None
+
+    def source_write_conn():
+        nonlocal write_conn
+        if write_conn is None:
+            write_conn = connect(watcher, dsn=watcher.primary_dsn)
+        return write_conn
+
+    with legacy_write_context as legacy_conn:
+        if legacy_conn is not None:
+            write_conn = legacy_conn
         # Reclassify this exact catalog epoch before `_compare` can admit its events.
         # A residual table is either verified FULL or remains explicitly on the
         # automatic refetch/resnapshot route; an unverified ALTER is never treated as
-        # success.
+        # success. The factory is evaluated only if an admission is needed.
         observed = _ensure_toast_policies(
-            watcher, write_conn, observed, activation_lsn=lsn
+            watcher, source_write_conn, observed, activation_lsn=lsn
         )
         added = watcher._compare(observed, lsn)
-        watcher._ensure_published(write_conn, observed, added)
+        watcher._ensure_published(source_write_conn, observed, added)
         with watcher._lock:
             watcher.successful_polls += 1
         unfenced = [change for change in watcher.pending() if change.kind in FENCED]
         if unfenced:
             watcher._emit_marker(
-                write_conn,
+                source_write_conn(),
                 [change for change in added if change.kind in FENCED] or unfenced,
             )
+    if legacy_conn is None and write_conn is not None:
+        close = getattr(write_conn, "close", None)
+        if close is not None:
+            close()
     if watcher.marker.last_error is None and not watcher._admission_errors:
         watcher.last_error = None
     return added

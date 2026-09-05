@@ -1,4 +1,4 @@
-"""Rubric 1.8 end to end — the slot really is advanced, dropped, and rewound.
+"""Rubric 1.8 end to end — an advanced slot is rebuilt without deleting the main slot.
 
 The baseline measurement for this item (`probes/p04_offset_mismatch.py`) was
 `pg_replication_slot_advance(slot, pg_current_wal_lsn())` followed by a run that
@@ -120,6 +120,7 @@ def test_the_advance_is_detected_and_named(advanced):
 
 def test_the_advance_triggers_an_automatic_resnapshot_of_every_captured_table(advanced):
     summary = advanced["recovered"]
+    box = advanced["box"]
     recovery = summary["slot_recovery"]
     assert recovery["decision"] == "slot_ahead_of_destination"
     # "all captured tables, unless provable otherwise" - and it is not provable
@@ -130,7 +131,10 @@ def test_the_advance_triggers_an_automatic_resnapshot_of_every_captured_table(ad
     from support.fixtures import CAPTURED_TABLES
 
     assert recovery["tables_marked"] == len(CAPTURED_TABLES), recovery
-    assert recovery["slot"] == "dropped", recovery
+    assert recovery["slot"] == "retained", recovery
+    assert box.pg_query(
+        "SELECT 1 FROM pg_replication_slots WHERE slot_name = %s", (box.slot,)
+    ) == [(1,)], "slot-mismatch recovery must retain the main WAL handoff"
     # The journal is the durable record of all that, and it is CLEARED once the rebuild
     # it asked for actually happened - a recovery that stays armed for ever would mean
     # the next run keeps forcing a snapshot mode nobody asked for.
@@ -175,7 +179,7 @@ def test_an_alert_records_the_loss_and_the_repair(advanced):
 # --------------------------------------------------------------------------- #
 @pytest.fixture(scope="module")
 def dropped(tmp_path_factory, postgres_cluster):
-    """The slot is dropped while the pipeline is down.
+    """An external actor drops the slot while the pipeline is down.
 
     Left to Debezium this is silent and total: it creates a new slot at the *current*
     WAL position, so everything written in between is simply never decoded. The

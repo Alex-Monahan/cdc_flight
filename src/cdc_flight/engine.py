@@ -29,6 +29,7 @@ from pathlib import Path
 from pydbzengine import BasePythonChangeHandler, DebeziumJsonEngine
 
 from .consumer import OffsetFlushVerifier, verifying_consumer_class
+from .debezium_props import STANDBY_HEARTBEAT_DISABLED_PROPERTY
 from .errors import EngineFailure
 
 __all__ = ["EngineFailure", "SupervisedDebeziumEngine"]
@@ -277,6 +278,8 @@ class SupervisedDebeziumEngine(DebeziumJsonEngine):
         interval_ms = int(connector_config.getHeartbeatInterval().toMillis())
         action_raw = config.getString("heartbeat.action.query")
         action_query = str(action_raw) if action_raw is not None else ""
+        disabled_raw = config.getString(STANDBY_HEARTBEAT_DISABLED_PROPERTY)
+        heartbeat_action_disabled = str(disabled_raw or "").strip().lower() == "true"
         jdbc_props = jpype.JClass("java.util.Properties")()
         for name in ("socketTimeout", "connectTimeout", "tcpKeepAlive"):
             value = config.getString(f"driver.{name}")
@@ -286,6 +289,7 @@ class SupervisedDebeziumEngine(DebeziumJsonEngine):
             "validation": "io.debezium.connector.postgresql.PostgresConnectorConfig",
             "heartbeat.interval.ms": interval_ms,
             "heartbeat.action.query": action_query,
+            "heartbeat_action_disabled": heartbeat_action_disabled,
             # Keep the stock connector's effective logical-message route in the
             # run evidence.  The Python policy and the Java filter must agree;
             # recording the value consumed by PostgresConnectorConfig makes a
@@ -323,9 +327,10 @@ class SupervisedDebeziumEngine(DebeziumJsonEngine):
                 f"{QUEUE_SIZE_IN_BYTES_PROPERTY}: {byte_bound}"
             )
         effective[QUEUE_SIZE_IN_BYTES_PROPERTY] = byte_bound
-        if interval_ms <= 0 or not action_query:
+        if interval_ms <= 0 or (not action_query and not heartbeat_action_disabled):
             raise EngineFailure(
-                "stock Debezium accepted no effective idle heartbeat interval/action query"
+                "stock Debezium accepted no effective idle heartbeat interval/action "
+                "query, and no explicit standby heartbeat split was present"
             )
         return effective
 

@@ -247,10 +247,12 @@ class InterruptionRecovery:
         summary["resnapshot_recovery_marker"] = str(self.marker)
         summary["destination_owner"] = "live_resnapshot_callback"
 
-    def retire_terminal_resources(self, *, dsn: str, slot: str) -> None:
+    def retire_terminal_resources(
+        self, *, dsn: str, slot: str, authorization=None
+    ) -> None:
         """Drop the throwaway slot and destroy terminal marker plus offset state."""
         try:
-            reconcile_mod.drop_slot(dsn, slot)
+            reconcile_mod.drop_slot(dsn, slot, authorization=authorization)
         except Exception:  # pragma: no cover - the source may be unreachable
             log.error(
                 "could not drop the throwaway re-snapshot slot %r; it is holding WAL "

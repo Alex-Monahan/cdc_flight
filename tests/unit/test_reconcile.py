@@ -125,6 +125,27 @@ def test_a_file_ahead_on_the_scalar_lsn_is_still_reported_as_ahead(con, tmp_path
     assert "offset_file_ahead" in codes
 
 
+def test_repair_callback_runs_before_the_canonical_write(con, tmp_path):
+    path = tmp_path / "offsets.dat"
+    point = {"lsn": 100, "lsn_proc": 1}
+    _write_row(con, point, 100)
+    observations = []
+
+    outcome = reconcile.reconcile(
+        con,
+        pipeline=PIPELINE,
+        namespace=NAMESPACE,
+        offset_path=path,
+        repair=True,
+        before_repair=lambda row, decision: observations.append(
+            (decision, path.exists(), row.commit_id)
+        ),
+    )
+
+    assert outcome.decision == "file_missing_rebuilt"
+    assert observations == [("file_missing_rebuilt", False, 1)]
+
+
 def test_a_decision_string_never_claims_a_rebuild_that_did_not_happen(con, tmp_path):
     """MINOR-3: with no offset map on the durable row there is nothing to rebuild
     *from*, and an absent file then silently means "re-snapshot"."""

@@ -237,8 +237,9 @@ DESTINATION_POINTS = (
 #:   `requested`. A53's benign cut: `file absent / row present` -> rebuilt.
 #: * `recovery_resume_point_deleted`  - the durable resume point is gone, the slot is
 #:   not. The next run re-runs the drop from `offsets_file_deleted`.
-#: * `recovery_armed`                 - the slot is dropped and the journal has not
-#:   recorded it. The dangerous one: the forced `snapshot.mode` lives only in the row.
+#: * `recovery_armed`                 - main-slot retention is established and the
+#:   journal has not recorded it. The dangerous one: the forced `snapshot.mode` lives
+#:   only in the row.
 #: * `table_rebuild_queued`           - the durable to-do list is genuinely MID-WRITE:
 #:   the first captured table has taken its `-> awaiting_snapshot` edge inside
 #:   `recovery.begin()`'s transaction and the rest have not. It used to fire before the
@@ -280,6 +281,15 @@ ALL_POINTS = POINTS + DESTINATION_POINTS + RECOVERY_POINTS + SOURCE_POINTS
 #: state assignments made by a test: each one records the production object after its
 #: durable or lifecycle edge, then hard-exits the child.
 MATRIX_POINTS = (
+    "source_replay_after_prepare",
+    "source_replay_file_exists_before_first_md_commit",
+    "source_replay_mid_replay_before_first_md_commit",
+    "source_replay_during_copy_before_fsync",
+    "source_replay_at_os_replace",
+    "source_replay_after_os_replace",
+    "source_replay_after_md_commit_before_install",
+    "source_replay_after_install_before_clear",
+    "source_replay_after_intent_clear_before_cleanup",
     "ownership_available",
     "ownership_attached",
     "ownership_active",
@@ -762,6 +772,12 @@ class FaultyConnection:
         lowered = statement.lstrip().lower()
         if (
             self._point == "destination_hang"
+            and os.environ.get(DESTINATION_FAULT_ARM_ENV)
+            and not os.path.exists(os.environ[DESTINATION_FAULT_ARM_ENV])
+        ):
+            return
+        if (
+            self._point == "destination_hang"
             and os.environ.get("CDC_FAULT_HANG_PHASE", "commit") == "pre_commit"
             and _is_data_statement(statement, self._control_schema)
         ):
@@ -772,6 +788,7 @@ class FaultyConnection:
                 self._hang_seconds,
                 self._nth,
             )
+            record_callback_entered()
             sys.stdout.flush()
             time.sleep(self._hang_seconds)
         if self._point == "destination_write" and _is_data_statement(
@@ -830,6 +847,13 @@ class FaultyConnection:
 #: exercise the watchdog it exists for (Opus MAJOR-5).
 HANG_SECONDS_ENV = "CDC_FAULT_HANG_SECONDS"
 DEFAULT_HANG_SECONDS = 3600.0
+CALLBACK_ENTERED_ENV = "CDC_TEST_CALLBACK_ENTERED"
+# Test-only arming barrier for a live callback-held destination fault.  The
+# destination wrapper is installed before the production child starts, but the
+# fault must not be allowed to fire during snapshot acquisition.  A test opens
+# this file only after it has durably observed the live streaming phase and before
+# it writes its post-arm source sentinel.
+DESTINATION_FAULT_ARM_ENV = "CDC_TEST_DESTINATION_FAULT_ARM"
 
 
 def hang_seconds() -> float:
@@ -842,6 +866,34 @@ def hang_seconds() -> float:
         raise FaultSpecError(
             f"{HANG_SECONDS_ENV}: expected a number of seconds, got {raw!r}"
         ) from exc
+
+
+def record_callback_entered() -> None:
+    """Publish a test-only callback-held witness before an injected hang."""
+    path = os.environ.get(CALLBACK_ENTERED_ENV)
+    if not path:
+        return
+    try:
+        target = os.path.abspath(path)
+        parent = os.path.dirname(target)
+        os.makedirs(parent, exist_ok=True)
+        temporary = f"{target}.{os.getpid()}.tmp"
+        with open(temporary, "w") as handle:
+            json.dump(
+                {
+                    "event": "CALLBACK_ENTERED",
+                    "pid": os.getpid(),
+                    "group": current_group(),
+                    "at": time.time(),
+                },
+                handle,
+                sort_keys=True,
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    except Exception:  # pragma: no cover - the test witness must not mask the fault
+        log.debug("could not write callback-entered witness", exc_info=True)
 
 
 def wrap_destination(

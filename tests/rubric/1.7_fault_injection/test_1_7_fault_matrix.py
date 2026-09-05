@@ -85,7 +85,7 @@ MATRIX: dict[str, tuple[str, str]] = {
         LOUD, "the process dies with the durable resume point gone and the slot still there"
     ),
     "recovery_armed": (
-        LOUD, "the process dies with the slot dropped and the journal not yet recording it"
+        LOUD, "the process dies with the main slot retained and the journal not yet recording it"
     ),
     "table_rebuild_queued": (
         LOUD, "the process dies while the durable to-do list is being written"

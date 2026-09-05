@@ -67,7 +67,8 @@ def ensure_published(watcher, conn, observed, changes) -> None:
             observed[change.qualified] = updated
             continue
         try:
-            conn.execute(
+            write_conn = conn() if callable(conn) else conn
+            write_conn.execute(
                 f"ALTER PUBLICATION {quote(watcher.publication)} ADD TABLE "
                 f"{quote(relation.schema)}.{quote(relation.table)}"
             )

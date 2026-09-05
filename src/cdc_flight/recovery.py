@@ -8,12 +8,14 @@ be rebuilt, and how that survives a crash at any point.**
 
 ## Why a journal
 
-The recovery mutates four independent durable things:
+The recovery mutates three independent durable things and records one source-side
+state transition:
 
 1. the durable to-do list (`table_state.snapshot_state = 'awaiting_snapshot'`);
 2. `offsets.dat` on disk;
 3. the durable resume point (`_cdc_flight.debezium_offsets`);
-4. the replication slot on the source.
+4. the main replication slot's retirement state on the source. The source slot is
+   observed and retained; it is not physically dropped by this recovery.
 
 Nothing outside a single destination transaction can make two of those atomic, so the
 question is not "how do we avoid an intermediate state" but "**can the Flight recognise
@@ -50,17 +52,17 @@ journal is what makes the claim structural rather than lucky.
 (where the decision calls for it) the catalog invalidation, so "a recovery is owed" and
 "here is what it owes" become true together or not at all.
 
-## The one step that may not be stepped over
+## Main-slot retirement is a state transition, not a drop
 
-Dropping the slot. A45 measured that Debezium only pairs the snapshot with an exact WAL
-position when it creates the slot **itself**; a re-snapshot that runs against a surviving
-slot resumes the stream from a `confirmed_flush_lsn` we cannot account for, past the
-snapshot's consistent point, which is the loss window rubric 1.8 exists to close. A drop
-that neither succeeds nor proves the slot absent therefore raises `RecoveryFailed` with
-the journal intact, and the next run retries from the same phase. It used to be caught,
-recorded as the string `drop_failed: ...`, and stepped straight over — while the caller
-*also* erased the recorded LSN baseline, destroying the evidence that would have caught
-it next time (Codex B4).
+PostgreSQL has no lock that arbitrary application sessions must acquire before committing
+to WAL. Therefore no predicate can make "no unobserved application message" atomic with
+`pg_drop_replication_slot`. The main recovery does not attempt that impossible drop.
+It records a retirement transition while retaining the main slot as the WAL authority,
+builds the fresh image through the separate `_rs` slot, and starts the main connector
+with `snapshot.mode=no_data` only after the image is complete. A source slot that has
+already disappeared is an explicit `absent` outcome; an unobservable state raises
+`RecoveryFailed` with the journal intact. The old behavior caught a failed drop, recorded
+`drop_failed: ...`, and stepped over it while also erasing the LSN baseline (Codex B4).
 """
 
 from __future__ import annotations
@@ -73,6 +75,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import catalog_baseline, table_lifecycle
+from . import destination as dest_mod
 from .config import resolve_control_schema
 from .destination import now, raise_alert_once, read_slot_state, request_snapshot
 from .errors import RecoveryFailed
@@ -97,7 +100,7 @@ from .occurrence import (
 log = logging.getLogger("cdc_flight.recovery")
 
 #: The decision an operator's `--accept-orphan-offsets` writes. It is a recovery like
-#: any other now (Codex r1 BLOCKER-1): `offsets` used to drop the slot and
+#: any other now (Codex r1 BLOCKER-1): `offsets` used to retire the source slot and
 #: unlink the file and only *then* journal what it had done, so a hard exit in that gap
 #: lost the durable obligation to rebuild and the next run called the leftovers an
 #: ordinary fresh start - the exact B3/A53 state the journal exists to prevent.
@@ -136,6 +139,59 @@ PHASES = (PHASE_REQUESTED, PHASE_FILE_DELETED, PHASE_ROW_DELETED, PHASE_ARMED)
 FORCED_SNAPSHOT_MODE = "initial"
 
 
+def discharge_replay_intent_for_recovery(
+    con,
+    *,
+    pipeline: str,
+    dataset: str,
+    replay_intent_path: Path,
+    namespace: str | None = None,
+    control_schema: str | None = None,
+    source_dsn: str | None = None,
+    source_slot_name: str | None = None,
+    source_publication_name: str | None = None,
+    source_application_patterns=("app_.*",),
+    known_message_state: dict | None = None,
+) -> dict:
+    """Remove a replay hint only after deriving its durable message certificate.
+
+    A full source recovery may make the old source position unusable, but it must
+    not turn that fact into a lost application message.  The sidecar is therefore
+    only a hint: the destination's ledger/consumer/audit certificate is the
+    authority, and this is the recovery-owned operation that removes the hint.  A
+    split certificate raises before the unlink, leaving the journal and hint
+    available for the automatic replay path on the next acquisition.
+    """
+    from . import logical_messages, offsets
+
+    known_source_evidence = (
+        known_message_state.get("source_evidence")
+        if isinstance(known_message_state, dict)
+        else None
+    )
+    state = logical_messages.require_recovery_message_certificate(
+        con,
+        dataset=dataset,
+        pipeline=pipeline,
+        control_schema=control_schema,
+        replay_intent_path=replay_intent_path,
+        source_dsn=source_dsn,
+        source_slot_name=source_slot_name,
+        source_publication_name=source_publication_name,
+        source_application_patterns=source_application_patterns,
+        known_source_evidence=known_source_evidence,
+        known_message_state=known_message_state,
+        replay_intent_namespace=namespace,
+    )
+    cleared = replay_intent_path.exists()
+    if cleared:
+        offsets.clear_replay_intent(replay_intent_path)
+    return {
+        **state.as_dict(),
+        "replay_intent_cleared": cleared,
+    }
+
+
 #: Rubric 1.7's `<nth>` for the recovery anchors: a recovery normally happens once per
 #: run, so `<nth>` is 1, but a run that arms a *second* recovery after resuming a first
 #: one reaches the same boundary twice and a test must be able to name which.
@@ -165,6 +221,10 @@ class RecoveryRecord:
     #: For `--reset-state`: the state directory the reset must clear. `offset_path`
     #: alone is not enough, because "start over" means the whole Debezium scratch area.
     state_dir: str | None = None
+    #: The message certificate/source proof that authorized this recovery. Persisting
+    #: it matters because recovery can be interrupted before its source-side retirement
+    #: observation is recorded in the journal phase.
+    logical_message_resolution: dict | None = None
 
     def as_dict(self) -> dict:
         return {
@@ -177,6 +237,11 @@ class RecoveryRecord:
             "tables_marked": self.tables_marked,
             "captured": list(self.captured),
             "message": self.message,
+            "logical_message_resolution": (
+                dict(self.logical_message_resolution)
+                if self.logical_message_resolution is not None
+                else None
+            ),
         }
 
 
@@ -208,7 +273,8 @@ def read(
     """The recovery this pipeline is in the middle of, or None."""
     rows = con.execute(
         f"SELECT recovery_id, decision, phase, slot_name, offset_path, snapshot_mode, "
-        f"       forget_catalog, tables_marked, message, captured_json, state_dir "
+        f"       forget_catalog, tables_marked, message, captured_json, state_dir, "
+        f"       logical_message_resolution "
         f"FROM {control_table(resolve_control_schema(control_schema), 'recovery_state')} "
         "WHERE pipeline = ? AND namespace = ?",
         [pipeline, namespace],
@@ -216,7 +282,7 @@ def read(
     if not rows:
         return None
     (rid, decision, phase, slot, path, mode, forget, marked, message,
-     captured_json, state_dir) = rows[0]
+     captured_json, state_dir, logical_message_resolution) = rows[0]
     if str(phase) not in PHASES:
         # `PHASES` was declared and never enforced: `read()` accepted any string and
         # `resume()` then matched none of its branches, fell through every `if`, and
@@ -233,6 +299,20 @@ def read(
     except ValueError:  # pragma: no cover - a corrupted journal column
         log.error("recovery journal captured_json did not decode; treating as empty")
         captured = []
+    try:
+        message_resolution = (
+            json.loads(logical_message_resolution)
+            if logical_message_resolution
+            else None
+        )
+        if not isinstance(message_resolution, dict):
+            message_resolution = None
+    except (TypeError, ValueError):  # pragma: no cover - a corrupted journal column
+        log.error(
+            "recovery journal logical_message_resolution did not decode; "
+            "requiring a fresh source proof"
+        )
+        message_resolution = None
     return RecoveryRecord(
         recovery_id=str(rid),
         decision=str(decision),
@@ -245,6 +325,7 @@ def read(
         message=str(message or ""),
         captured=[str(c) for c in captured],
         state_dir=str(state_dir) if state_dir is not None else None,
+        logical_message_resolution=message_resolution,
     )
 
 
@@ -263,7 +344,7 @@ def _write_phase(
     `resume()` then matched none of its branches, fell through every `if`, and logged
     "recovery is ARMED" having done nothing at all. The domain check landed in the
     1.6-1.8 fix round; rubric 1.9 adds the *edges*, so a future caller cannot jump from
-    `requested` straight to `armed` and claim a slot was dropped that never was.
+    `requested` straight to `armed` and claim source-side retirement that never was.
     """
     ACQUISITION_RECOVERY.check(frm, phase)
     con.execute(
@@ -394,10 +475,17 @@ def begin(
     captured_tables: list[tuple[str, str, str]],
     forget_catalog: bool,
     slot_receipt: SlotStateReceipt,
+    logical_message_dataset: str,
     context: dict | None = None,
     state_dir: Path | None = None,
     severity: str = "critical",
     control_schema: str | None = None,
+    replay_intent_path: Path | None = None,
+    source_dsn: str | None = None,
+    source_slot_name: str | None = None,
+    source_publication_name: str | None = None,
+    source_application_patterns=("app_.*",),
+    expected_source_identity=None,
 ) -> RecoveryRecord:
     """Write the intent, atomically with the to-do list. NOTHING is destroyed here.
 
@@ -456,6 +544,72 @@ def begin(
             "slot_receipt is stale; the recovery must use the current committed "
             "slot observation"
         )
+    if replay_intent_path is None:
+        from . import offsets
+
+        replay_root = state_dir if state_dir is not None else Path(offset_path).parent
+        replay_intent_path = Path(replay_root) / offsets.REPLAY_INTENT_FILE_NAME
+    # The replay sidecar is only a local hint.  Before this journal can authorize
+    # deleting the old resume point/slot, derive the durable logical-message
+    # certificate from MotherDuck.  A complete ledger + consumer + audit certificate
+    # is carried by the destination unchanged; a split certificate is an unresolved
+    # obligation and stops the recovery before any destructive step.
+    from . import logical_messages
+
+    message_state = logical_messages.require_recovery_message_certificate(
+        con,
+        dataset=logical_message_dataset,
+        pipeline=pipeline,
+        control_schema=control_schema,
+        replay_intent_path=replay_intent_path,
+        source_dsn=source_dsn,
+        source_slot_name=source_slot_name,
+        source_publication_name=source_publication_name,
+        source_application_patterns=source_application_patterns,
+        expected_source_identity=(
+            expected_source_identity
+            if expected_source_identity is not None
+            else {
+                "system_identifier": slot_receipt.state.system_identifier,
+                "timeline_id": slot_receipt.state.timeline_id,
+            }
+        ),
+    )
+    resolution = message_state.as_dict()
+    # The resume row may be deleted before the guarded slot effect. Keep the exact
+    # source fence and lineage with the journal so a process that resumes from
+    # ``resume_point_deleted`` can issue the same sealed capability without inventing
+    # an offset from the filesystem.
+    # An explicit operator reset is the one recovery whose contract is to delete the
+    # old resume row, including a malformed one.  It has no old destination fence to
+    # preserve; ``resume()`` derives the guarded primitive's floor from the live slot.
+    # Every other decision must parse and retain the durable point before it can make
+    # the destructive capability.
+    durable_point = (
+        None
+        if decision == RESET_DECISION
+        else dest_mod.read_resume_point(
+            con, pipeline, namespace, control_schema=control_schema
+        )
+    )
+    source_evidence = resolution.get("source_evidence")
+    source_fence_lsn = (
+        source_evidence.get("after_lsn")
+        if isinstance(source_evidence, dict)
+        else None
+    )
+    if source_fence_lsn is None and durable_point is not None:
+        source_fence_lsn = durable_point.last_lsn
+        if source_fence_lsn is None or source_fence_lsn <= 0:
+            offset_lsn = durable_point.offset.get("lsn")
+            source_fence_lsn = int(offset_lsn) if offset_lsn is not None else None
+    resolution["source_fence_lsn"] = source_fence_lsn
+    resolution["expected_source_identity"] = (
+        dict(expected_source_identity)
+        if isinstance(expected_source_identity, dict)
+        else expected_source_identity
+    )
+    record.logical_message_resolution = resolution
     prejournal_key = _prejournal_occurrence(
         slot_receipt, pipeline=pipeline, slot_name=slot_name
     )
@@ -468,6 +622,9 @@ def begin(
         control_schema=control_schema,
     )
     context["recovery_id"] = record.recovery_id
+    context["logical_message_certificate_count"] = len(
+        message_state.certified_message_ids
+    )
     con.execute("BEGIN TRANSACTION")
     try:
         if decision in RESET_TABLE_DECISIONS:
@@ -530,12 +687,15 @@ def begin(
             f"INSERT INTO {control_table(resolve_control_schema(control_schema), 'recovery_state')} "
             "(pipeline, namespace, recovery_id, decision, phase, slot_name, "
             " offset_path, snapshot_mode, forget_catalog, tables_marked, message, "
-            " captured_json, state_dir, requested_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " captured_json, state_dir, logical_message_resolution, requested_at, "
+            " updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [
                 pipeline, namespace, record.recovery_id, decision, PHASE_REQUESTED,
                 slot_name, str(offset_path), FORCED_SNAPSHOT_MODE, forget_catalog,
-                marked, message, json.dumps(captured), record.state_dir, now(), now(),
+                marked, message, json.dumps(captured), record.state_dir,
+                json.dumps(record.logical_message_resolution),
+                now(), now(),
             ],
         )
         con.execute("COMMIT")
@@ -621,7 +781,14 @@ def resume(
     dsn: str,
     drop_slot=None,
     on_phase=None,
+    logical_message_dataset: str,
     control_schema: str | None = None,
+    replay_intent_path: Path | None = None,
+    source_dsn: str | None = None,
+    source_slot_name: str | None = None,
+    source_publication_name: str | None = None,
+    source_application_patterns=("app_.*",),
+    expected_source_identity=None,
 ) -> dict:
     """Run the recovery forward from whatever phase the journal records. Idempotent.
 
@@ -632,15 +799,56 @@ def resume(
     durable effect and before the phase is recorded, which is where the crash-at-every-
     step tests cut. It is not reachable from configuration.
     """
+    from . import logical_messages, offsets
     from . import reconcile as reconcile_mod
 
-    drop_slot = drop_slot or reconcile_mod.drop_slot
+    # `drop_slot` is retained as a name for the in-memory fault harnesses and callers
+    # that inject a source-side test seam. Production recovery never calls the physical
+    # drop primitive for the main slot: retirement is a durable state transition, and
+    # the existing main slot remains the WAL retention authority while the fresh image
+    # is built.
+    retire_slot = drop_slot or reconcile_mod.slot_retirement_status
+    if replay_intent_path is None:
+        replay_root = (
+            Path(record.state_dir)
+            if record.state_dir is not None
+            else Path(record.offset_path).parent
+            if record.offset_path is not None
+            else Path(".")
+        )
+        replay_intent_path = replay_root / offsets.REPLAY_INTENT_FILE_NAME
+    known_source_evidence = (
+        record.logical_message_resolution.get("source_evidence")
+        if isinstance(record.logical_message_resolution, dict)
+        else None
+    )
+    if expected_source_identity is None and isinstance(record.logical_message_resolution, dict):
+        expected_source_identity = record.logical_message_resolution.get(
+            "expected_source_identity"
+        )
+    message_state = logical_messages.require_recovery_message_certificate(
+        con,
+        dataset=logical_message_dataset,
+        pipeline=pipeline,
+        control_schema=control_schema,
+        replay_intent_path=replay_intent_path,
+        source_dsn=source_dsn,
+        source_slot_name=source_slot_name,
+        source_publication_name=source_publication_name,
+        source_application_patterns=source_application_patterns,
+        known_source_evidence=known_source_evidence,
+        known_message_state=record.logical_message_resolution,
+        expected_source_identity=expected_source_identity,
+        replay_intent_namespace=namespace,
+    )
     result = {
         "recovery_id": record.recovery_id,
         "decision": record.decision,
         "resumed_from": record.phase,
         "tables_marked": record.tables_marked,
         "message": record.message,
+        "logical_message_certificate": message_state.as_dict(),
+        "replay_intent_cleared": False,
     }
     runtime_state(recovery_phase=record.phase)
     offset_path = Path(record.offset_path) if record.offset_path else None
@@ -659,10 +867,13 @@ def resume(
             # is idempotent: a crash between the two leaves no directory, which the next
             # run's `state_dir.mkdir(parents=True, exist_ok=True)` restores.
             directory = Path(record.state_dir)
+            replay_intent_path = directory / offsets.REPLAY_INTENT_FILE_NAME
+            replay_intent_present = replay_intent_path.exists()
             removed = offset_path is not None and offset_path.exists()
             shutil.rmtree(directory, ignore_errors=True)
             directory.mkdir(parents=True, exist_ok=True)
             result["state_dir"] = "cleared"
+            result["replay_intent_cleared"] = replay_intent_present
         elif offset_path is not None:
             removed = offset_path.exists()
             offset_path.unlink(missing_ok=True)
@@ -704,15 +915,19 @@ def resume(
         matrix_crash("recovery_resume_point_deleted_recorded")
 
     if record.phase == PHASE_ROW_DELETED:
-        slot_action = _drop_the_slot_or_fail(
-            drop_slot, dsn=dsn, slot_name=record.slot_name, record=record
+        slot_action = _retire_the_slot_or_fail(
+            retire_slot,
+            dsn=dsn,
+            slot_name=record.slot_name,
+            record=record,
         )
         result["slot"] = slot_action
         if on_phase is not None:
             on_phase(PHASE_ARMED)
-        # rubric 1.7: the slot is dropped and the journal has not recorded it. The
-        # dangerous one: a next run that could not tell would re-snapshot against a
-        # surviving slot, or lose the forced snapshot mode entirely (Codex B3).
+        # rubric 1.7: retirement is acknowledged while the main slot remains present.
+        # That retained slot is the durable WAL handoff for the fresh image; the
+        # recovery journal is still required so a crash cannot make the in-progress
+        # table rebuild look like an ordinary start (Codex B3).
         maybe_crash("recovery_armed", _reached(PHASE_ARMED))
         _write_phase(
             con, pipeline=pipeline, namespace=namespace,
@@ -729,11 +944,11 @@ def resume(
             f"{record.phase!r}); refusing to report an armed recovery that is not armed"
         )
     result["phase"] = record.phase
-    result.setdefault("slot", "already dropped by an earlier attempt")
+    result.setdefault("slot", "already retained by an earlier attempt")
     result.setdefault("offset_file", "already removed by an earlier attempt")
     log.warning(
         "rubric 1.8 recovery %s is ARMED (%s): %s table(s) awaiting a snapshot, resume "
-        "point deleted, offsets file %s, slot %s",
+        "point deleted, offsets file %s, main slot %s",
         record.recovery_id, record.decision, record.tables_marked,
         result["offset_file"], result["slot"],
     )
@@ -747,6 +962,7 @@ def complete_if_ready(
     namespace: str,
     record: RecoveryRecord,
     verified_empty: list[str] | tuple[str, ...] = (),
+    retained_slot: bool = False,
     control_schema: str | None = None,
 ) -> Completion:
     """Has the rebuild this journal demanded actually happened? Clear it if so.
@@ -805,17 +1021,19 @@ def complete_if_ready(
     #
     # And it is deliberately NOT patched with a synthetic resume row. The first attempt
     # wrote one with an empty offset map, which is not an offset the connector can resume
-    # from: the next run started with no offset at all, took an `initial` snapshot
-    # against the SURVIVING slot, and delivered concurrently-written rows twice — once as
-    # `r` and once as `c` (Codex r4 BLOCKER-1, reproduced). With no resume row the next
-    # run is an honest `fresh_start`: the slot check sees an empty destination, arms a
-    # recovery, and that recovery DROPS the slot, so Debezium creates its own and the
-    # snapshot/stream boundary is exact (A45). Noisier, and correct.
+    # from. A retained main slot is the real handoff for this design: it continues to
+    # hold the source WAL while the throwaway snapshot builds the image, and the main
+    # engine resumes with `snapshot.mode=no_data` only after that image is complete.
+    # Therefore a recovery can finish without inventing a destination offset, including
+    # the all-empty case.
     empty_discharged = bool(obligation) and set(obligation) <= set(verified_empty)
-    if still_owed or not (has_resume or empty_discharged):
+    if still_owed or not (has_resume or empty_discharged or retained_slot):
         reason = (
             f"{len(still_owed)} captured table(s) are not `complete` "
             f"({', '.join(still_owed)})" if still_owed
+            else "the retained main slot is not yet recorded as a stream handoff and "
+                 "the destination has no resume point"
+            if not retained_slot
             else "the destination has no resume point, so the rebuilt image was never "
                  "handed over to a stream"
         )
@@ -837,6 +1055,9 @@ def complete_if_ready(
     )
     handoff = (
         "the destination has a resume point again" if has_resume
+        else "the main replication slot remains retained as the durable stream handoff "
+             "while the rebuilt image is used by the no-data main stream"
+        if retained_slot
         else "every captured relation was PROVEN empty at the source, so there is no "
              "resume point and none can exist: the per-relation snapshot_lsn fence is "
              "the handoff evidence, and the next run is an honest fresh start"
@@ -854,32 +1075,37 @@ def complete_if_ready(
     )
 
 
-def _drop_the_slot_or_fail(drop_slot, *, dsn: str, slot_name: str | None, record) -> str:
-    """`dropped` or `absent`, or `RecoveryFailed`. There is no third outcome.
+def _retire_the_slot_or_fail(
+    retire_slot,
+    *,
+    dsn: str,
+    slot_name: str | None,
+    record,
+) -> str:
+    """Return `retained` or `absent`, or leave the journal armed on failure.
 
-    See the module docstring: a re-snapshot started against a surviving slot has an
-    uncoordinated image/stream boundary, which is the exact loss window rubric 1.8
-    exists to close, so "the drop failed, carry on" is not available. Raising leaves
-    the journal at `resume_point_deleted`, which the next acquisition resumes from.
+    The main slot is not physically dropped. `retained` means the source-side slot was
+    observed and remains the WAL handoff while the destination rebuilds its tables;
+    `absent` means an external actor already removed it, so stock Debezium may create a
+    replacement at the snapshot boundary. Neither result pretends that a source
+    producer was serialized. A callback that still returns `dropped` is rejected so a
+    test seam cannot silently reintroduce the unsafe contract.
     """
     if not slot_name:  # pragma: no cover - the journal always records one
-        return "not attempted"
+        return "absent"
     try:
-        action = drop_slot(dsn, slot_name)
+        action = retire_slot(dsn, slot_name)
     except Exception as exc:
         raise RecoveryFailed(
-            f"the replication slot {slot_name!r} could not be dropped ({exc}), so "
-            f"recovery {record.recovery_id} ({record.decision}) cannot continue. "
-            "Debezium only pairs a snapshot with an exact WAL position when it creates "
-            "the slot itself (ADR 0001 §19/A45), so re-snapshotting against the "
-            "surviving slot would resume the stream past the snapshot's consistent "
-            "point - the loss window rubric 1.8 exists to close. The recovery journal "
-            "is intact and the next run retries this step; the usual cause is another "
-            "backend still holding the slot."
+            f"the main replication slot {slot_name!r} could not establish its retirement "
+            f"state ({exc}), so recovery {record.recovery_id} ({record.decision}) cannot "
+            "continue. The existing slot is the WAL retention handoff for the fresh "
+            "snapshot; the recovery journal is intact and the next run retries this "
+            "step."
         ) from exc
-    if action not in ("dropped", "absent"):  # pragma: no cover - defensive
+    if action not in ("retained", "absent"):  # pragma: no cover - defensive
         raise RecoveryFailed(
-            f"dropping {slot_name!r} returned {action!r}, which is neither 'dropped' "
-            "nor 'absent', so the slot cannot be shown to be gone"
+            f"retiring {slot_name!r} returned {action!r}, which is neither 'retained' "
+            "nor 'absent'; the recovery cannot establish its source-side handoff"
         )
     return action

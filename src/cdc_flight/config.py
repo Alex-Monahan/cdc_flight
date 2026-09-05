@@ -13,6 +13,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .source_routes import SourceRoutePolicy
+
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_CONTROL_SCHEMA = "_cdc_flight"
 
@@ -219,6 +221,16 @@ class SourceConfig:
                 "refusing to use the read-only source DSN for administration or writes"
             )
         return self.dsn
+
+    @property
+    def route_policy(self) -> SourceRoutePolicy:
+        """Resolve the complete three-route policy at admission time."""
+        return SourceRoutePolicy.from_source(self)
+
+    @property
+    def routes(self) -> SourceRoutePolicy:
+        """Compatibility alias for callers that refer to source routes directly."""
+        return self.route_policy
 
     @property
     def tables(self) -> list[str]:
@@ -459,7 +471,8 @@ class RunConfig:
     watermark_quiet_seconds: float = field(
         default_factory=lambda: float(_env("CDC_WATERMARK_QUIET_SECONDS", "0.5"))
     )
-    #: How far the slot's `confirmed_flush_lsn` may trail `pg_current_wal_lsn()`
+    #: How far the slot's `confirmed_flush_lsn` may trail the role-appropriate
+    #: source WAL upper bound (receive LSN on a standby, current LSN on a primary)
     #: and still allow the supervisor to call a quiet stream "idle". A quiet
     #: stream with a large backlog means the connector is not streaming - most
     #: often Debezium's 10 s retriable-restart backoff, which is longer than the

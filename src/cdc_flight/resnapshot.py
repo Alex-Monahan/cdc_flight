@@ -143,6 +143,7 @@ from .resnapshot_source_policy import (
 from .resnapshot_source_policy import gather_emptiness_evidence as _gather_emptiness_evidence
 from .snapshot_completion import SnapshotCompletion
 from .source_health import SourceHealth
+from .source_routes import SourceRoutePolicy
 
 log = logging.getLogger("cdc_flight.resnapshot")
 OWNER = "resnapshot-protocol"
@@ -335,21 +336,26 @@ def slot_name_for(base: str) -> str:
     return f"{base[: 63 - len(SLOT_SUFFIX)]}{SLOT_SUFFIX}"
 
 
-def sweep_stale_slot(dsn: str, base_slot_name: str) -> str:
+def sweep_stale_slot(
+    dsn: str,
+    base_slot_name: str,
+    *,
+    authorization=None,
+) -> str:
     """Drop OUR throwaway slot if a previous run left one behind (Opus MAJOR-2).
 
     A leaked `_rs` slot holds WAL on the source for ever and counts against
-    `max_replication_slots`; two independent review sessions leaked one on the shared
-    development cluster in a single day. Called unconditionally at start-up, so the
-    slot is reclaimed on the next run of the pipeline that created it whether or not
-    another re-snapshot is due.
+    `max_replication_slots`. It is reclaimed on the next run only after the main slot
+    has been observed healthy and supplied as the independent retention proof. If the
+    main slot is gone or otherwise unsafe, the primitive refuses and leaves `_rs`
+    untouched so it cannot destroy the last recoverable logical message.
 
     Only ever the name this pipeline derives from its own slot: sweeping by suffix
     would delete another pipeline's in-flight re-snapshot slot.
     """
     slot = slot_name_for(base_slot_name)
     try:
-        action = reconcile_mod.drop_slot(dsn, slot)
+        action = reconcile_mod.drop_slot(dsn, slot, authorization=authorization)
     except Exception as exc:  # pragma: no cover - the slot may be held right now
         log.warning("could not sweep the stale re-snapshot slot %r: %s", slot, exc)
         return f"sweep_failed: {exc}"
@@ -367,6 +373,7 @@ def build_resnapshot_properties(
     *,
     tables: list[tuple[str, str, str]],
     truncate_mode: str,
+    routes: SourceRoutePolicy | None = None,
 ) -> dict[str, str]:
     """Build the throwaway connector properties for one exact source image.
 
@@ -378,6 +385,7 @@ def build_resnapshot_properties(
     props = build_properties(
         source,
         replication,
+        routes=routes or source.route_policy,
         snapshot_mode="initial",
         truncate_mode=truncate_mode,
     )
@@ -393,6 +401,7 @@ def run(
     *,
     source: SourceConfig,
     replication: ReplicationConfig,
+    routes: SourceRoutePolicy | None = None,
     pipeline: str,
     dataset: str,
     tables: list[tuple[str, str, str]],
@@ -422,17 +431,32 @@ def run(
     if not tables:
         return outcome
 
+    routes = routes or source.route_policy
+
     slot = slot_name_for(replication.slot_name)
     state_dir = replication.state_dir / "resnapshot"
     recovery = InterruptionRecovery.prepare(
         state_dir, pipeline=pipeline, tables=tables
     )
+    # The main slot is the retention proof for a stale throwaway slot. The primitive
+    # re-checks that slot, its lineage, and its confirmed position on the same source
+    # connection immediately before the guarded drop; no pre-check here is an authority
+    # that can go stale.
+    drop_authorization = reconcile_mod.retention_slot_drop_authorization(
+        dsn=routes.slot_owner_dsn,
+        slot_name=slot,
+        retention_slot_name=replication.slot_name,
+        publication_name=replication.publication_name,
+        application_patterns=replication.message_prefix_allowlist,
+    )
     # A leftover slot from an interrupted re-snapshot would make Debezium take the
     # pre-existing-slot path, which is exactly the path that does not export a snapshot.
-    # Slot removal is source administration, not a catalog read.  In standby mode
-    # the local recovery endpoint is read-only, so this must use the explicit
-    # primary route and fail closed when CDC_PRIMARY_DSN is absent.
-    reconcile_mod.drop_slot(source.primary_dsn, slot)
+    # Slot removal is local logical-slot administration.  In standby mode the
+    # slot physically belongs to the decoder endpoint, so it must never be sent
+    # through the primary source-write route.
+    reconcile_mod.drop_slot(
+        routes.slot_owner_dsn, slot, authorization=drop_authorization
+    )
 
     resnap_replication = dataclasses.replace(
         replication, slot_name=slot, state_dir=state_dir
@@ -442,6 +466,7 @@ def run(
         resnap_replication,
         tables=tables,
         truncate_mode=settings["truncate_mode"],
+        routes=routes,
     )
     include = props["table.include.list"].split(",")
 
@@ -460,7 +485,7 @@ def run(
         "RE-SNAPSHOT starting for %s (%s) via throwaway slot %r",
         ", ".join(include), reason, slot,
     )
-    watcher = _SlotWatcher(source.dsn, slot).start()
+    watcher = _SlotWatcher(routes.read_dsn, slot).start()
     health = None
     applier = None
     source_stopped = False
@@ -492,7 +517,7 @@ def run(
         from .catalog_descriptors import RelationDescriptorProvider
 
         descriptor_connection = psycopg.connect(
-            source.dsn,
+            routes.read_dsn,
             autocommit=True,
             **source_connection_kwargs(
                 connect_timeout=run_cfg.jdbc_connect_timeout_seconds,
@@ -500,7 +525,7 @@ def run(
             ),
         )
         descriptor_provider = RelationDescriptorProvider.from_tables(
-            descriptor_connection, tables, source_dsn=source.dsn
+            descriptor_connection, tables, source_dsn=routes.read_dsn
         )
         applier = Applier(
             con,
@@ -541,7 +566,13 @@ def run(
         applier.verifier = None
         engine.consumer  # noqa: B018 - builds the consumer and attaches the verifier
         health = SourceHealth(
-            dsn=source.dsn, slot_name=slot, max_lag_bytes=run_cfg.idle_max_lag_bytes
+            dsn=routes.read_dsn,
+            slot_name=slot,
+            max_lag_bytes=run_cfg.idle_max_lag_bytes,
+            primary_dsn=routes.source_write_dsn,
+            source_write_dsn=routes.source_write_dsn,
+            standby_heartbeat=routes.role == "standby",
+            detect_local_slot_failure=routes.role == "standby",
         ).start()
         ownership.activate(applier)
         try:
@@ -587,7 +618,7 @@ def run(
             )
         pending = [t for t in tables if f"{t[0]}.{t[1]}" not in set(outcome.swapped)]
         evidence = _gather_emptiness_evidence(
-            source.dsn,
+            routes.read_dsn,
             pending=pending,
             snapshot_phase_ended=outcome.snapshot_phase_ended,
             tables_seen=completion.tables_seen,
@@ -678,7 +709,7 @@ def run(
                     refused=refused,
                     pipeline=pipeline,
                     tables=tables,
-                    source_dsn=source.dsn,
+                    source_dsn=routes.read_dsn,
                     control_schema=control_schema,
                 )
             reassert_owed(
@@ -735,7 +766,11 @@ def run(
             # ownership token proves every destination user has left AND a safe owner
             # has discharged the durable recovery obligation.
             # Terminal throwaway-slot retirement is also source administration.
-            recovery.retire_terminal_resources(dsn=source.primary_dsn, slot=slot)
+            recovery.retire_terminal_resources(
+                dsn=routes.slot_owner_dsn,
+                slot=slot,
+                authorization=drop_authorization,
+            )
 
 
 def reassert_owed(
@@ -910,7 +945,7 @@ def finish_verified_empty_tables(
                 "the source relation was VERIFIED to hold no rows: the ordered "
                 "per-table and global snapshot callbacks completed, and no record "
                 "was produced for this table, and a REPEATABLE READ count taken after "
-                f"pg_current_wal_lsn()={consistent_lsn} returned zero. The "
+                f"source WAL upper bound={consistent_lsn} returned zero. The "
                 "destination table was emptied rather than swapped, and is fenced "
                 "at that LSN so every later transaction is applied on top."
             )

@@ -17,14 +17,21 @@ import pytest
 #: The expected values below subtract only this guard module.
 _BASELINE_SELECTED = {
     # Re-measured after the §8.1/§8.3 additions. The release invariant is that
-    # this number may only move upward as rubric coverage grows.
-    # Four §7.4 contract tests were added in this round.
-    "not motherduck and not slow": 2410,
-    "slow and not motherduck": 248,
+    # this number may only move upward as rubric coverage grows. The p72 source-slot
+    # probe, state-directory lease, and in-primitive slot-drop witness coverage add
+    # seven default-lane nodes. The durable replay-intent unit and real-kill coverage
+    # are included in the default/slow lanes; the selected totals were 2463/263
+    # including this module's guard nodes before the permanent p72 regression
+    # proofs were added. The current retained-slot interleaving coverage is included
+    # in the re-measured default-lane total below.
+    "not motherduck and not slow": 2456,
+    "slow and not motherduck": 262,
     # The quiet-holder and stock-walsender retry proofs are MotherDuck-only real
     # process nodes; a local DuckDB file lock cannot exercise cloud takeover while
     # the old process retains its handle.
-    "motherduck": 62,
+    # The selected MotherDuck total is 65 including this guard after the permanent
+    # retained-recovery MotherDuck proof was added.
+    "motherduck": 64,
 }
 
 

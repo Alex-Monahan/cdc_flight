@@ -119,7 +119,7 @@ def test_resnapshot_quiescence_failure_retains_every_owned_resource(monkeypatch,
     monkeypatch.setattr(resnapshot_mod, "_SlotWatcher", _StartedResource)
     monkeypatch.setattr(resnapshot_mod, "SourceHealth", _StartedResource)
     monkeypatch.setattr(
-        reconcile_mod, "drop_slot", lambda _dsn, slot: drop_calls.append(slot)
+        reconcile_mod, "drop_slot", lambda _dsn, slot, **_kwargs: drop_calls.append(slot)
     )
     monkeypatch.setattr(
         resnapshot_mod,
@@ -192,7 +192,7 @@ def test_summaryless_baseexception_failed_quiescence_is_fail_closed_end_to_end(
     monkeypatch.setattr(resnapshot_mod, "_SlotWatcher", _StartedResource)
     monkeypatch.setattr(resnapshot_mod, "SourceHealth", _StartedResource)
     monkeypatch.setattr(
-        reconcile_mod, "drop_slot", lambda _dsn, slot: drop_calls.append(slot)
+        reconcile_mod, "drop_slot", lambda _dsn, slot, **_kwargs: drop_calls.append(slot)
     )
     monkeypatch.setattr(
         resnapshot_mod,
@@ -302,7 +302,7 @@ def test_failed_quiescence_stays_callback_owned_if_callback_leaves_during_unwind
     monkeypatch.setattr(resnapshot_mod, "_SlotWatcher", _StartedResource)
     monkeypatch.setattr(resnapshot_mod, "SourceHealth", _StartedResource)
     monkeypatch.setattr(
-        reconcile_mod, "drop_slot", lambda _dsn, slot: drop_calls.append(slot)
+        reconcile_mod, "drop_slot", lambda _dsn, slot, **_kwargs: drop_calls.append(slot)
     )
     monkeypatch.setattr(
         resnapshot_mod,
