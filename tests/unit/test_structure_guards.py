@@ -23,8 +23,9 @@ _BASELINE_SELECTED = {
     # are included in the default/slow lanes; the selected totals were 2463/263
     # including this module's guard nodes before the permanent p72 regression
     # proofs were added. The current retained-slot interleaving coverage is included
-    # in the re-measured default-lane total below.
-    "not motherduck and not slow": 2456,
+    # in the re-measured default-lane total below. The decode-lag coverage adds two
+    # unit nodes and one live mutation node.
+    "not motherduck and not slow": 2459,
     "slow and not motherduck": 262,
     # The quiet-holder and stock-walsender retry proofs are MotherDuck-only real
     # process nodes; a local DuckDB file lock cannot exercise cloud takeover while
