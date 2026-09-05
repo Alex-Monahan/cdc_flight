@@ -1262,6 +1262,87 @@ def test_broken_retention_coverage_goes_red_before_the_drop(
             )
 
 
+def test_stale_resnapshot_requires_target_emptiness_when_main_is_ahead(postgres_cluster):
+    """Missing main-slot coverage is admissible only after the target proves empty."""
+    source = postgres_cluster
+    base = f"p72_stale_target_{uuid.uuid4().hex}"[:48]
+    target_slot = f"{base}_rs"
+    retention_slot = f"{base}_main"
+
+    try:
+        with psycopg.connect(source.dsn, autocommit=True) as source_con:
+            target_created = source_con.execute(
+                "SELECT slot_name, (lsn - '0/0'::pg_lsn)::bigint "
+                "FROM pg_create_logical_replication_slot(%s, 'pgoutput')",
+                (target_slot,),
+            ).fetchone()
+            assert target_created is not None
+            source_con.execute(
+                "SELECT pg_logical_emit_message(%s, %s, %s)",
+                (False, "cdc_flight_heartbeat", "advance-main-after-stale-target"),
+            )
+            retention_created = source_con.execute(
+                "SELECT slot_name, (lsn - '0/0'::pg_lsn)::bigint "
+                "FROM pg_create_logical_replication_slot(%s, 'pgoutput')",
+                (retention_slot,),
+            ).fetchone()
+            assert retention_created is not None
+
+        with psycopg.connect(source.dsn, autocommit=True) as source_con:
+            target_row = reconcile._slot_row(source_con, target_slot)
+            retention_row = reconcile._slot_row(source_con, retention_slot)
+        assert target_row is not None and retention_row is not None
+        assert (
+            int(retention_row[1]) > int(target_row[1])
+            or int(retention_row[2]) > int(target_row[2])
+        ), (target_row, retention_row)
+
+        observation = reconcile.observe_slot(source.dsn, target_slot)
+        assert observation.observable, observation.error
+        common = dict(
+            dsn=source.dsn,
+            slot_name=target_slot,
+            retention_slot_name=retention_slot,
+            publication_name="cdc_flight_pub",
+            application_patterns=("app_.*",),
+            allow_uncovered_retention=True,
+        )
+        unprovable = reconcile.retention_slot_drop_authorization(
+            **common,
+            expected_source_identity={
+                "system_identifier": f"wrong-{observation.system_identifier}",
+                "timeline_id": observation.timeline_id,
+            },
+        )
+        with pytest.raises(LogicalMessageObligationUnresolved) as caught:
+            reconcile.drop_slot(source.dsn, target_slot, authorization=unprovable)
+        assert caught.value.obligations[0]["issues"] == [
+            "source_slot_evidence_unknown"
+        ]
+        assert caught.value.obligations[0]["source_evidence"]["slot_name"] == target_slot
+        assert reconcile.observe_slot(source.dsn, target_slot).slot_exists
+
+        proven_empty = reconcile.retention_slot_drop_authorization(
+            **common,
+            expected_source_identity={
+                "system_identifier": observation.system_identifier,
+                "timeline_id": observation.timeline_id,
+            },
+        )
+        assert reconcile.drop_slot(source.dsn, target_slot, authorization=proven_empty) == (
+            "dropped"
+        )
+        assert not reconcile.observe_slot(source.dsn, target_slot).slot_exists
+        assert reconcile.observe_slot(source.dsn, retention_slot).slot_exists
+    finally:
+        with psycopg.connect(source.dsn, autocommit=True) as source_con:
+            source_con.execute(
+                "SELECT pg_drop_replication_slot(slot_name) "
+                "FROM pg_replication_slots WHERE slot_name IN (%s, %s)",
+                (target_slot, retention_slot),
+            )
+
+
 def test_main_slot_loss_defers_stale_sweep_and_preserves_only_retention_slot(
     postgres_cluster,
 ):
