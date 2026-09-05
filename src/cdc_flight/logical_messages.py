@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 import struct
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -29,6 +30,8 @@ SOURCE_MESSAGE_PROBE_VERSION = 1
 SOURCE_MESSAGE_PROBE_STATUS_EMPTY = "no_application_message"
 SOURCE_MESSAGE_PROBE_STATUS_PRESENT = "application_message_present"
 SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN = "unknown"
+SOURCE_MESSAGE_PROBE_COVERAGE_TIMEOUT_SECONDS = 5.0
+SOURCE_MESSAGE_PROBE_COVERAGE_POLL_SECONDS = 0.05
 
 
 @dataclass(frozen=True)
@@ -93,6 +96,9 @@ class SourceMessageEvidence:
     timeline_id: int | None = None
     after_lsn: int | None = None
     confirmed_flush_lsn: int | None = None
+    source_wal_high_water_lsn: int | None = None
+    source_wal_flush_lsn: int | None = None
+    decoded_through_lsn: int | None = None
     scanned_records: int = 0
     application_messages: tuple[dict[str, Any], ...] = ()
     error: str | None = None
@@ -107,6 +113,9 @@ class SourceMessageEvidence:
             "timeline_id": self.timeline_id,
             "after_lsn": self.after_lsn,
             "confirmed_flush_lsn": self.confirmed_flush_lsn,
+            "source_wal_high_water_lsn": self.source_wal_high_water_lsn,
+            "source_wal_flush_lsn": self.source_wal_flush_lsn,
+            "decoded_through_lsn": self.decoded_through_lsn,
             "scanned_records": self.scanned_records,
             "application_messages": [dict(item) for item in self.application_messages],
             "error": self.error,
@@ -199,6 +208,123 @@ def _decode_pgoutput_message(data: object) -> dict[str, Any] | None:
     }
 
 
+@dataclass(frozen=True, slots=True)
+class _SourceWalCoverage:
+    """A flushed source high-water through which a slot decode may be bounded."""
+
+    high_water_lsn: str | None = None
+    high_water: int | None = None
+    flush_lsn: int | None = None
+    error: str | None = None
+
+
+_SOURCE_WAL_HIGH_WATER_SQL = """
+    SELECT current_lsn::text,
+           (current_lsn - '0/0'::pg_lsn)::bigint,
+           insert_lsn::text,
+           (insert_lsn - '0/0'::pg_lsn)::bigint,
+           flush_lsn::text,
+           (flush_lsn - '0/0'::pg_lsn)::bigint
+    FROM (
+        SELECT pg_current_wal_lsn() AS current_lsn,
+               pg_current_wal_insert_lsn() AS insert_lsn,
+               pg_current_wal_flush_lsn() AS flush_lsn
+    ) AS wal
+"""
+_SOURCE_WAL_FLUSH_SQL = (
+    "SELECT pg_current_wal_flush_lsn()::text, "
+    "(pg_current_wal_flush_lsn() - '0/0'::pg_lsn)::bigint"
+)
+
+
+def _source_wal_coverage(conn, *, after_lsn: int) -> _SourceWalCoverage:
+    """Capture and wait for a flushed WAL boundary before claiming absence.
+
+    A logical-slot peek is non-consuming, but an empty peek can mean that the
+    decoder has not reached the end of the currently available WAL.  Capture the
+    source high-water before the decode, wait only for that exact position to be
+    flushed, and let the peek's ``upto_lsn`` bound be the coverage certificate.
+    If the source cannot establish that coverage before the monotonic deadline,
+    callers receive UNKNOWN and must fail closed.
+    """
+    try:
+        row = conn.execute(_SOURCE_WAL_HIGH_WATER_SQL, ()).fetchone()
+    except Exception as exc:
+        return _SourceWalCoverage(
+            error=f"source WAL high-water is unavailable: {type(exc).__name__}: {exc}"
+        )
+    if row is None or len(row) < 6 or row[0] is None or row[1] is None:
+        return _SourceWalCoverage(
+            error="source WAL high-water is unavailable; decoder coverage is unknown"
+        )
+    positions = [(int(row[1]), str(row[0]))]
+    if row[2] is not None and row[3] is not None:
+        positions.append((int(row[3]), str(row[2])))
+    high_water, high_water_lsn = max(positions, key=lambda item: item[0])
+    flush_lsn = int(row[5]) if row[5] is not None else None
+    if high_water < after_lsn:
+        return _SourceWalCoverage(
+            high_water_lsn=high_water_lsn,
+            high_water=high_water,
+            flush_lsn=flush_lsn,
+            error=(
+                "source WAL high-water is behind the durable destination LSN; "
+                "the asserted range is not comparable"
+            ),
+        )
+
+    deadline = time.monotonic() + SOURCE_MESSAGE_PROBE_COVERAGE_TIMEOUT_SECONDS
+    while flush_lsn is None or flush_lsn < high_water:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return _SourceWalCoverage(
+                high_water_lsn=high_water_lsn,
+                high_water=high_water,
+                flush_lsn=flush_lsn,
+                error=(
+                    "source WAL high-water was not flushed before the bounded "
+                    "decoder-coverage deadline"
+                ),
+            )
+        try:
+            time.sleep(min(SOURCE_MESSAGE_PROBE_COVERAGE_POLL_SECONDS, remaining))
+            flush_row = conn.execute(_SOURCE_WAL_FLUSH_SQL, ()).fetchone()
+        except Exception as exc:
+            return _SourceWalCoverage(
+                high_water_lsn=high_water_lsn,
+                high_water=high_water,
+                flush_lsn=flush_lsn,
+                error=(
+                    "source WAL flush coverage is unavailable: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
+        if flush_row is None or len(flush_row) < 2 or flush_row[1] is None:
+            return _SourceWalCoverage(
+                high_water_lsn=high_water_lsn,
+                high_water=high_water,
+                flush_lsn=None,
+                error="source WAL flush coverage is unavailable; decoder coverage is unknown",
+            )
+        flush_lsn = int(flush_row[1])
+        if flush_lsn >= high_water and time.monotonic() > deadline:
+            return _SourceWalCoverage(
+                high_water_lsn=high_water_lsn,
+                high_water=high_water,
+                flush_lsn=flush_lsn,
+                error=(
+                    "source WAL high-water was not flushed before the bounded "
+                    "decoder-coverage deadline"
+                ),
+            )
+
+    return _SourceWalCoverage(
+        high_water_lsn=high_water_lsn,
+        high_water=high_water,
+        flush_lsn=flush_lsn,
+    )
+
+
 def _probe_source_message_evidence_connection(
     conn,
     *,
@@ -279,18 +405,46 @@ def _probe_source_message_evidence_connection(
                 "LSN; its peek cannot prove the intervening WAL was delivered"
             ),
         )
-    rows = conn.execute(
-        """
-        SELECT (changes.lsn - '0/0'::pg_lsn)::bigint, changes.data
-        FROM pg_logical_slot_peek_binary_changes(
-            %s, NULL, NULL,
-            'proto_version', '1',
-            'publication_names', %s,
-            'messages', 'true'
-        ) AS changes
-        """,
-        (slot_name, publication_name),
-    ).fetchall()
+    coverage = _source_wal_coverage(conn, after_lsn=after_lsn)
+    if coverage.error is not None:
+        return SourceMessageEvidence(
+            status=SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+            slot_name=slot_name,
+            plugin="pgoutput",
+            system_identifier=source_system_identifier,
+            timeline_id=source_timeline_id,
+            after_lsn=after_lsn,
+            confirmed_flush_lsn=confirmed,
+            source_wal_high_water_lsn=coverage.high_water,
+            source_wal_flush_lsn=coverage.flush_lsn,
+            error=coverage.error,
+        )
+    try:
+        rows = conn.execute(
+            """
+            SELECT (changes.lsn - '0/0'::pg_lsn)::bigint, changes.data
+            FROM pg_logical_slot_peek_binary_changes(
+                %s, (%s::pg_lsn + 1), NULL,
+                'proto_version', '1',
+                'publication_names', %s,
+                'messages', 'true'
+            ) AS changes
+            """,
+            (slot_name, coverage.high_water_lsn, publication_name),
+        ).fetchall()
+    except Exception as exc:
+        return SourceMessageEvidence(
+            status=SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
+            slot_name=slot_name,
+            plugin="pgoutput",
+            system_identifier=source_system_identifier,
+            timeline_id=source_timeline_id,
+            after_lsn=after_lsn,
+            confirmed_flush_lsn=confirmed,
+            source_wal_high_water_lsn=coverage.high_water,
+            source_wal_flush_lsn=coverage.flush_lsn,
+            error=f"{type(exc).__name__}: {exc}",
+        )
 
     application_messages: list[dict[str, Any]] = []
     for lsn, data in rows:
@@ -308,6 +462,9 @@ def _probe_source_message_evidence_connection(
                 timeline_id=source_timeline_id,
                 after_lsn=after_lsn,
                 confirmed_flush_lsn=confirmed,
+                source_wal_high_water_lsn=coverage.high_water,
+                source_wal_flush_lsn=coverage.flush_lsn,
+                decoded_through_lsn=coverage.high_water,
                 scanned_records=len(rows),
                 error=str(exc),
             )
@@ -325,6 +482,9 @@ def _probe_source_message_evidence_connection(
                 timeline_id=source_timeline_id,
                 after_lsn=after_lsn,
                 confirmed_flush_lsn=confirmed,
+                source_wal_high_water_lsn=coverage.high_water,
+                source_wal_flush_lsn=coverage.flush_lsn,
+                decoded_through_lsn=coverage.high_water,
                 scanned_records=len(rows),
                 error="pgoutput message LSN disagrees with its slot record LSN",
             )
@@ -343,6 +503,9 @@ def _probe_source_message_evidence_connection(
         timeline_id=source_timeline_id,
         after_lsn=after_lsn,
         confirmed_flush_lsn=confirmed,
+        source_wal_high_water_lsn=coverage.high_water,
+        source_wal_flush_lsn=coverage.flush_lsn,
+        decoded_through_lsn=coverage.high_water,
         scanned_records=len(rows),
         application_messages=tuple(application_messages),
     )
@@ -364,9 +527,10 @@ def peek_source_message_evidence(
     The server statement timeout and client TCP timeout bound the whole operation.
     There is intentionally no upto_nchanges truncation: stopping after a small
     prefix could call a live obligation absent merely because it was later in the
-    slot. The query is read-only and returns unknown on every transport, slot,
-    plugin, or decode failure, so an unavailable source can never authorize a
-    destructive route.
+    slot. An empty result is scoped to the explicitly recorded, flushed WAL
+    high-water; the query is read-only and returns unknown on every transport,
+    slot, plugin, coverage, or decode failure, so an unavailable source can never
+    authorize a destructive route.
     """
     if not dsn or not slot_name or not publication_name or after_lsn is None:
         return SourceMessageEvidence(

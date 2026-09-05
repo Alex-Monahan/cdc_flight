@@ -485,9 +485,17 @@ class _FakeSourceResult:
 
 
 class _FakeSourceConnection:
-    def __init__(self, rows, *, slot=("pgoutput", 400, "source-system", 1)):
+    def __init__(
+        self,
+        rows,
+        *,
+        slot=("pgoutput", 400, "source-system", 1),
+        wal=(500, 500),
+    ):
         self.rows = rows
         self.slot = slot
+        self.wal = wal
+        self.queries = []
 
     def __enter__(self):
         return self
@@ -495,10 +503,85 @@ class _FakeSourceConnection:
     def __exit__(self, *_exc):
         return False
 
-    def execute(self, sql, _params):
+    def execute(self, sql, _params=()):
+        self.queries.append((sql, _params))
         if "pg_logical_slot_peek_binary_changes" in sql:
             return _FakeSourceResult(self.rows)
+        if "pg_current_wal_lsn" in sql:
+            high_water, flush_lsn = self.wal
+            return _FakeSourceResult(
+                [(
+                    "0/1F4",
+                    high_water,
+                    "0/1F4",
+                    high_water,
+                    "0/1F4",
+                    flush_lsn,
+                )]
+            )
+        if "pg_current_wal_flush_lsn" in sql:
+            return _FakeSourceResult([("0/1F4", self.wal[1])])
         return _FakeSourceResult([self.slot])
+
+
+def test_source_probe_fails_closed_when_wal_coverage_deadline_expires(monkeypatch):
+    """An unflushed source high-water never becomes an empty certificate."""
+    source = _FakeSourceConnection([], wal=(500, 499))
+    monkeypatch.setattr(
+        logical_messages,
+        "SOURCE_MESSAGE_PROBE_COVERAGE_TIMEOUT_SECONDS",
+        0.0,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "psycopg",
+        SimpleNamespace(connect=lambda _dsn, **_kwargs: source),
+    )
+
+    evidence = peek_source_message_evidence(
+        "postgresql://source",
+        slot_name="source-slot",
+        publication_name="cdc_flight_pub",
+        after_lsn=400,
+    )
+
+    assert evidence.status == logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN
+    assert "deadline" in evidence.error
+    assert evidence.source_wal_high_water_lsn == 500
+    assert evidence.source_wal_flush_lsn == 499
+    assert not any(
+        "pg_logical_slot_peek_binary_changes" in sql
+        for sql, _params in source.queries
+    )
+
+
+def test_source_probe_empty_certifies_only_the_captured_wal_range(monkeypatch):
+    """The empty result carries a flushed, explicit decode-through position."""
+    source = _FakeSourceConnection([], wal=(500, 500))
+    monkeypatch.setitem(
+        sys.modules,
+        "psycopg",
+        SimpleNamespace(connect=lambda _dsn, **_kwargs: source),
+    )
+
+    evidence = peek_source_message_evidence(
+        "postgresql://source",
+        slot_name="source-slot",
+        publication_name="cdc_flight_pub",
+        after_lsn=400,
+    )
+
+    assert evidence.status == logical_messages.SOURCE_MESSAGE_PROBE_STATUS_EMPTY
+    assert evidence.source_wal_high_water_lsn == 500
+    assert evidence.source_wal_flush_lsn == 500
+    assert evidence.decoded_through_lsn == 500
+    probe_sql, probe_params = next(
+        (sql, params)
+        for sql, params in source.queries
+        if "pg_logical_slot_peek_binary_changes" in sql
+    )
+    assert probe_params == ("source-slot", "0/1F4", "cdc_flight_pub")
+    assert "pg_lsn + 1" in " ".join(probe_sql.split())
 
 
 def test_recovery_certificate_sees_both_ledger_consumer_boundaries():
@@ -941,6 +1024,78 @@ def test_target_list_interleaving_is_safe_with_independent_retention(
         )
         assert evidence.status == logical_messages.SOURCE_MESSAGE_PROBE_STATUS_PRESENT
         assert evidence.application_messages[0]["prefix"] == "app_b7_target_list"
+    finally:
+        with psycopg.connect(source.dsn, autocommit=True) as source_con:
+            source_con.execute(
+                "SELECT pg_drop_replication_slot(slot_name) "
+                "FROM pg_replication_slots WHERE slot_name IN (%s, %s)",
+                (target_slot, retention_slot),
+            )
+
+
+def test_decode_lag_probe_refuses_before_throwaway_slot_drop(postgres_cluster):
+    """A committed message that initially decodes empty cannot authorize a drop."""
+    source = postgres_cluster
+    base = f"p72_fix17_decode_{uuid.uuid4().hex}"[:48]
+    retention_slot = f"{base}_main"
+    target_slot = f"{base}_rs"
+    message_prefix = "app_p16_decode_lag"
+
+    try:
+        with psycopg.connect(source.dsn, autocommit=True) as source_con:
+            for slot_name in (retention_slot, target_slot):
+                created = source_con.execute(
+                    "SELECT slot_name, (lsn - '0/0'::pg_lsn)::bigint "
+                    "FROM pg_create_logical_replication_slot(%s, 'pgoutput')",
+                    (slot_name,),
+                ).fetchone()
+                assert created is not None
+            target_row = source_con.execute(
+                "SELECT (confirmed_flush_lsn - '0/0'::pg_lsn)::bigint "
+                "FROM pg_replication_slots WHERE slot_name = %s",
+                (target_slot,),
+            ).fetchone()
+            assert target_row is not None
+            target_confirmed = int(target_row[0])
+
+        observation = reconcile.observe_slot(source.dsn, target_slot)
+        assert observation.observable, observation.error
+        with psycopg.connect(source.dsn, autocommit=True) as producer:
+            emitted = producer.execute(
+                "SELECT (pg_logical_emit_message(%s, %s, %s) - "
+                "'0/0'::pg_lsn)::bigint",
+                (False, message_prefix, "fix17 decode lag regression"),
+            ).fetchone()
+            assert emitted is not None
+            message_lsn = int(emitted[0])
+        assert message_lsn > target_confirmed
+
+        authorization = reconcile.retention_slot_drop_authorization(
+            dsn=source.dsn,
+            slot_name=target_slot,
+            retention_slot_name=retention_slot,
+            publication_name="cdc_flight_pub",
+            application_patterns=("app_.*",),
+            expected_source_identity={
+                "system_identifier": observation.system_identifier,
+                "timeline_id": observation.timeline_id,
+            },
+            after_lsn=target_confirmed,
+        )
+        with pytest.raises(LogicalMessageObligationUnresolved) as caught:
+            reconcile.drop_slot(source.dsn, target_slot, authorization=authorization)
+
+        assert caught.value.obligations[0]["issues"] == [
+            "source_slot_application_message_unobserved"
+        ]
+        evidence = caught.value.obligations[0]["source_evidence"]
+        assert evidence["status"] == logical_messages.SOURCE_MESSAGE_PROBE_STATUS_PRESENT
+        assert any(
+            message["prefix"] == message_prefix
+            and message["source_lsn"] == message_lsn
+            for message in evidence["application_messages"]
+        )
+        assert reconcile.observe_slot(source.dsn, target_slot).slot_exists
     finally:
         with psycopg.connect(source.dsn, autocommit=True) as source_con:
             source_con.execute(
