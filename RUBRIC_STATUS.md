@@ -720,7 +720,7 @@ correct assumptions in the notes below:
 | 6.1 | Detailed logs in MotherDuck incl. replication lag | **5** | `_cdc_flight.run_logs` is durable in the control schema with event/level/message, restart/confirmed LSNs and `replication_lag_bytes`; real healthy runs populate it, including the MotherDuck destination path. Logging is bounded/best-effort and outside the commit→ack window. |
 | 6.2 | Alerts and warnings | **5** | Real dropped-slot refusal, corrupt-offset, and MotherDuck concurrent-destination failures exit non-zero and persist severity-coded alerts; repeated offset failure is alert-deduplicated by a durable condition marker. |
 | 7.1 | No Postgres extension required | 5 | `plugin.name=pgoutput` with a version-controlled `PUBLICATION`. |
-| 7.2 | Read from a Postgres replica | ~~1~~ → **3** | Snapshot from a hot standby proven to work, but streaming was never exercised and the run hung on shutdown. |
+| 7.2 | Read from a Postgres replica | ~~1~~ ~~3~~ → **5** | MERGED 2026-09-05 (`p72_gate9`, 0 blocker / 0 major). All five gates pass: three-DSN route policy, live standby stream proven by a post-snapshot sentinel, bounded primary heartbeat workload, fail-closed slot invalidation, and drain→seal→quiesce→close shutdown. Retirement is retention-only: Flight never physically drops its only main slot. Accepted residual — external raw-privileged slot deletion (CLAUDE.md standing ruling 2). |
 | 7.3 | Partitioned tables handled gracefully | 3 | One logical table via `publish_via_partition_root`; DETACH/DROP PARTITION silently ignored; no per-partition or DuckLake option. |
 | 7.4 | Capture `pg_logical_emit_message` | ~~3~~ → ~~1~~ → **5** | The binary capability is now end-to-end: stock Debezium messages are strictly base64-decoded to exact BLOB bytes, prefix-filtered, classified to exclude internal heartbeats, metadata-bearing transactional and non-transactional messages are ledger-fenced and atomically materialized in `cdc_raw.cdcflight_logical_messages`, and a real MotherDuck consumer row is proven durable and replay-safe. The service liveness high-water remains ordinary delivered source data only; messages and heartbeat/signal writes never refresh it, while the existing heartbeat still advances `confirmed_flush_lsn` on a quiet source. See the FIX ROUND §7.4 closure below. |
 | 8.1 | Hard and soft delete options | ~~1~~ → **5** | Both modes selectable globally AND per fully qualified table (`90cea8e`). Hard physically deletes; soft records a tombstone hidden from the live view. Both replay-fenced; mid-stream mode changes boundary-fenced with no resurrection. Gate `reviews/p8_gate4.md` confirmed 5/5 independently (also confirmed at gates 1-3). |
@@ -2894,7 +2894,11 @@ whole test suite runs against a stock Homebrew `postgresql@18` with only
 **Keep it that way.** Do not let a later phase reach for `wal2json` to work
 around a type-mapping problem (2.4).
 
-### 7.2 Able to read from a Postgres replica — **1 / 5** (provisional)
+### 7.2 Able to read from a Postgres replica — **5 / 5** (MERGED 2026-09-05)
+
+⚠ The prose below this heading predates the merge and describes the 1/5 state. ⛔ The
+AUTHORITATIVE value is the summary table row for 7.2; cite that, not this section.
+
 
 `primary only=1, replica but disrupts primary=3, replica with light primary workload=5`
 
