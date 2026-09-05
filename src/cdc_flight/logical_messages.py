@@ -226,14 +226,39 @@ _SOURCE_WAL_HIGH_WATER_SQL = """
            flush_lsn::text,
            (flush_lsn - '0/0'::pg_lsn)::bigint
     FROM (
-        SELECT pg_current_wal_lsn() AS current_lsn,
-               pg_current_wal_insert_lsn() AS insert_lsn,
-               pg_current_wal_flush_lsn() AS flush_lsn
+        SELECT CASE WHEN pg_is_in_recovery()
+                    THEN COALESCE(
+                        pg_last_wal_receive_lsn(),
+                        pg_last_wal_replay_lsn(),
+                        '0/0'::pg_lsn
+                    )
+                    ELSE pg_current_wal_lsn()
+               END AS current_lsn,
+               CASE WHEN pg_is_in_recovery()
+                    THEN COALESCE(
+                        pg_last_wal_receive_lsn(),
+                        pg_last_wal_replay_lsn(),
+                        '0/0'::pg_lsn
+                    )
+                    ELSE pg_current_wal_insert_lsn()
+               END AS insert_lsn,
+               CASE WHEN pg_is_in_recovery()
+                    THEN COALESCE(
+                        pg_last_wal_receive_lsn(),
+                        pg_last_wal_replay_lsn(),
+                        '0/0'::pg_lsn
+                    )
+                    ELSE pg_current_wal_flush_lsn()
+               END AS flush_lsn
     ) AS wal
 """
 _SOURCE_WAL_FLUSH_SQL = (
-    "SELECT pg_current_wal_flush_lsn()::text, "
-    "(pg_current_wal_flush_lsn() - '0/0'::pg_lsn)::bigint"
+    "SELECT (CASE WHEN pg_is_in_recovery() THEN COALESCE("
+    "pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn(), '0/0'::pg_lsn) "
+    "ELSE pg_current_wal_flush_lsn() END)::text, "
+    "((CASE WHEN pg_is_in_recovery() THEN COALESCE("
+    "pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn(), '0/0'::pg_lsn) "
+    "ELSE pg_current_wal_flush_lsn() END) - '0/0'::pg_lsn)::bigint"
 )
 
 

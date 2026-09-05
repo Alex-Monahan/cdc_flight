@@ -496,6 +496,7 @@ def run(
                     "timeline_id": verdict.context.get("timeline_id"),
                 },
                 after_lsn=verdict.context.get("durable_lsn"),
+                allow_uncovered_retention=routes.role == "standby",
             )
             summary_extra["stale_resnapshot_slot"] = resnapshot_mod.sweep_stale_slot(
                 routes.slot_owner_dsn,
