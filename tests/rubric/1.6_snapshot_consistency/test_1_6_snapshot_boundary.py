@@ -42,7 +42,9 @@ def _lsn_value(lsn: str) -> int:
     return (int(high, 16) << 32) + int(low, 16)
 
 
-def _committed_customer_lsns(box, slot: str) -> dict[str, int]:
+def _committed_customer_lsns(
+    box, slot: str, expected: set[str] | None = None, timeout: float = 30.0
+) -> dict[str, int]:
     """Read the source-side commit LSN for each boundary row.
 
     The writer's list is deliberately only a statement-completion ledger: it proves
@@ -50,7 +52,27 @@ def _committed_customer_lsns(box, slot: str) -> dict[str, int]:
     transaction was before or after this bounded pipeline run's completion watermark.
     A throwaway ``test_decoding`` slot gives this fixture the exact source commit LSN
     needed to make that distinction without treating post-watermark work as loss.
+
+    The slot is polled with the non-consuming peek until every expected writer entry
+    has been decoded. ``pg_logical_slot_get_changes`` returns only what is already
+    decoded at call time, so a single read races the writer's final commits.
     """
+    if expected:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            peeked = box.pg_query(
+                "SELECT data FROM pg_logical_slot_peek_changes(%s, NULL, NULL)",
+                (slot,),
+            )
+            seen = {
+                match.group(1)
+                for (data,) in peeked
+                if (match := re.search(r"name\[text\]:'(boundary-\d+)'", str(data)))
+            }
+            if expected <= seen:
+                break
+            time.sleep(0.25)
+
     changes = box.pg_query(
         "SELECT lsn::text, xid::text, data "
         "FROM pg_logical_slot_get_changes(%s, NULL, NULL)",
@@ -145,7 +167,9 @@ def boundary(tmp_path_factory, postgres_cluster):
         returncode = proc.wait(timeout=240)
         summary = box.last_summary()
 
-        source_commit_lsns = _committed_customer_lsns(box, diagnostic_slot)
+        source_commit_lsns = _committed_customer_lsns(
+            box, diagnostic_slot, expected=set(writer.committed)
+        )
         missing_source_lsns = set(writer.committed) - set(source_commit_lsns)
         assert not missing_source_lsns, (
             "the source observer did not decode writer ledger entries: "
