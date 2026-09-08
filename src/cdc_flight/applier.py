@@ -66,6 +66,7 @@ from . import (
 from .assembler import UNIT_CONTROL, UNIT_SNAPSHOT_CHUNK, CompleteUnit, TransactionAssembler
 from .backfill import (
     BackfillCoordinator,
+    StockSignalWriter,
     decode_incremental_notification,
     decode_incremental_record,
 )
@@ -186,6 +187,7 @@ class Applier:
         strict_event_identity: bool = False,
         message_prefix_allowlist: tuple[str, ...] | None = None,
         suppress_replayed_message_audit: bool = False,
+        queued_signal_writer: StockSignalWriter | None = None,
     ):
         self.con = con
         self.pipeline = pipeline
@@ -214,6 +216,7 @@ class Applier:
         #: message. Existing claims are idempotent no-ops and must not overwrite a
         #: previously delivered audit observation with a synthetic replay row.
         self.suppress_replayed_message_audit = bool(suppress_replayed_message_audit)
+        self.queued_signal_writer = queued_signal_writer
         self.message_prefix_policy = logical_messages.MessagePrefixPolicy(
             application_patterns=(
                 message_prefix_allowlist
@@ -442,6 +445,10 @@ class Applier:
         #: source writer's commits fell between durable scan boundaries without
         #: calling a private handler or manufacturing a notification.
         self.backfill_notification_trace: list[dict[str, Any]] = []
+        #: The normal live applier owns queued-generation dispatch after a
+        #: destination commit/ack boundary.  This is persisted in the run summary
+        #: as production-owner evidence for the live queue contract.
+        self.backfill_queue_dispatches: list[dict[str, Any]] = []
         #: Re-snapshot streaming units are complete source observations but have no
         #: destination side. Keep only their acknowledgeable terminal handles until a
         #: preceding snapshot group is durable; they must never enter ``self.group``.
@@ -608,6 +615,7 @@ class Applier:
             ),
             "backfill_notifications_pending": len(self._pending_backfill_notifications),
             "backfill_notification_trace": list(self.backfill_notification_trace),
+            "backfill_queue_dispatches": list(self.backfill_queue_dispatches),
             **self.snapshot_completion.as_dict(),
             # Round 8 MAJOR-1: this is the callback/connection ownership proof. A late
             # callback after the seal is a recorded no-op and can never decode, write,
@@ -1059,6 +1067,26 @@ class Applier:
                 stream.write(json.dumps(entry, sort_keys=True) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
+
+    def dispatch_queued_backfills(self) -> None:
+        """Publish one queued successor from the normal post-commit owner path."""
+        if self.queued_signal_writer is None:
+            return
+        dispatched = self.backfill.dispatch_queued()
+        if dispatched is None:
+            return
+        signal, runs = dispatched
+        self.queued_signal_writer.insert(signal)
+        self.backfill_queue_dispatches.append(
+            {
+                "signal_id": signal.signal_id,
+                "tables": list(signal.tables),
+                "run_ids": [run.run_id for run in runs],
+                "request_id": runs[0].request_id if runs else None,
+                "source_signal_inserted": True,
+                "observed_at_monotonic_ns": time.monotonic_ns(),
+            }
+        )
 
     def _apply_backfill_notifications(self) -> None:
         """Apply queued stock state after commit_protocol has opened its transaction."""

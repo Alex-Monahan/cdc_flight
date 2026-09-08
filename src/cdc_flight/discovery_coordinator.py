@@ -19,6 +19,7 @@ from . import reconcile as reconcile_mod
 from . import recovery as recovery_mod
 from . import resnapshot as resnapshot_mod
 from .applier import Applier
+from .backfill import StockSignalWriter
 from .config import CatalogConfig, ReplicationConfig, RunConfig, SourceConfig
 from .errors import EngineFailure
 from .flight_worker import FlightWorker
@@ -692,6 +693,15 @@ class LiveDiscoveryCoordinator:
             if slot_state is not None and slot_state["timeline_id"] is not None
             else None
         )
+        signal_data_collection = self.props.get("signal.data.collection")
+        queued_signal_writer = (
+            StockSignalWriter(
+                self.routes.source_write_dsn,
+                data_collection=signal_data_collection,
+            )
+            if signal_data_collection
+            else None
+        )
         applier = Applier(
             self.con,
             pipeline=self.destination.pipeline_name,
@@ -723,6 +733,7 @@ class LiveDiscoveryCoordinator:
             strict_event_identity=True,
             message_prefix_allowlist=self.replication.message_prefix_allowlist,
             suppress_replayed_message_audit=self.suppress_replayed_message_audit,
+            queued_signal_writer=queued_signal_writer,
         )
         self.ownership.attach(applier)
         return applier
