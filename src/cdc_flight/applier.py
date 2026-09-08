@@ -1180,12 +1180,19 @@ class Applier:
 
     def completion_waiting_for_queued_backfill(self) -> bool:
         """Keep a reached run open until an owner-dispatched successor is terminal."""
-        if not self.backfill_queue_dispatches:
-            return False
-        return any(
-            run.state not in {"complete", "blocked"}
-            for run in self.backfill.active_runs()
-        )
+        # The completion-watermark poll runs on the supervisor thread while the
+        # Debezium callback owns the same DuckDB handle.  Join the applier's
+        # destination-operation gate before reading the durable successor state;
+        # otherwise DuckDB's connection-level pending-result slot can be replaced
+        # between a repository query and its fetch, or a live READ can observe a
+        # half-overwritten result and lose its admitted signal correlation.
+        with self._destination_operation_lock:
+            if not self.backfill_queue_dispatches:
+                return False
+            return any(
+                run.state not in {"complete", "blocked"}
+                for run in self.backfill.active_runs()
+            )
 
     def _apply_backfill_notifications(self) -> None:
         """Apply queued stock state after commit_protocol has opened its transaction."""

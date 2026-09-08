@@ -71,6 +71,19 @@ class BackfillInvariantError(BackfillError):
     """A commit/ack, identity, or whole-unit invariant was violated."""
 
 
+def _read_relation(con, statement: str, params: Iterable[Any] = ()):
+    """Materialize a read without sharing DuckDB's mutable last-result slot.
+
+    The applier callback and the completion-watermark poll can query the same
+    destination handle concurrently.  ``execute(...).fetch*()`` reads that
+    handle-wide result slot, so another operation can replace it between the two
+    calls.  ``sql`` returns an independent relation snapshot while retaining this
+    connection's transaction visibility for repository reads inside an atomic
+    commit.
+    """
+    return con.sql(statement, params=list(params))
+
+
 def _now_iso() -> str:
     return datetime.now().astimezone().isoformat()
 
@@ -834,7 +847,7 @@ class BackfillRepository:
         )
 
     def get(self, run_id: str) -> BackfillRun | None:
-        row = self.con.execute(
+        row = _read_relation(self.con,
             f"SELECT {self._COLUMNS} FROM {self.table} "
             "WHERE pipeline = ? AND run_id = ?",
             [self.pipeline, run_id],
@@ -843,7 +856,7 @@ class BackfillRepository:
 
     def active(self, schema: str, table: str) -> BackfillRun | None:
         states = tuple(sorted(ACTIVE_RUN_STATES))
-        row = self.con.execute(
+        row = _read_relation(self.con,
             f"SELECT {self._COLUMNS} FROM {self.table} "
             "WHERE pipeline = ? AND source_schema = ? AND source_table = ? "
             f"AND state IN ({','.join('?' for _ in states)}) "
@@ -857,7 +870,7 @@ class BackfillRepository:
         active = self.active(schema, table)
         if active is not None:
             return active
-        row = self.con.execute(
+        row = _read_relation(self.con,
             f"SELECT {self._COLUMNS} FROM {self.table} "
             "WHERE pipeline = ? AND source_schema = ? AND source_table = ? "
             "AND state = 'complete' ORDER BY updated_at DESC LIMIT 1",
@@ -876,7 +889,7 @@ class BackfillRepository:
         if not include_blocked:
             states.discard("blocked")
         ordered_states = tuple(sorted(states))
-        rows = self.con.execute(
+        rows = _read_relation(self.con,
             f"SELECT {self._COLUMNS} FROM {self.table} "
             f"WHERE pipeline = ? AND state IN ({','.join('?' for _ in ordered_states)}) "
             "ORDER BY created_at, run_id",
@@ -885,7 +898,7 @@ class BackfillRepository:
         return [self._row(row) for row in rows]
 
     def by_signal(self, signal_id: str) -> list[BackfillRun]:
-        rows = self.con.execute(
+        rows = _read_relation(self.con,
             f"SELECT {self._COLUMNS} FROM {self.table} "
             "WHERE pipeline = ? AND signal_id = ? ORDER BY source_schema, source_table, run_id",
             [self.pipeline, signal_id],
@@ -1114,7 +1127,7 @@ class BackfillSignalIntentRepository:
         )
 
     def get(self, signal_id: str) -> BackfillSignalIntent | None:
-        row = self.con.execute(
+        row = _read_relation(self.con,
             f"SELECT signal_id, tables_json, kind, state FROM {self.table} "
             "WHERE pipeline = ? AND signal_id = ?",
             [self.pipeline, signal_id],
@@ -1122,7 +1135,7 @@ class BackfillSignalIntentRepository:
         return None if row is None else self._decode(row)
 
     def pending(self) -> list[BackfillSignalIntent]:
-        rows = self.con.execute(
+        rows = _read_relation(self.con,
             f"SELECT signal_id, tables_json, kind, state FROM {self.table} "
             "WHERE pipeline = ? AND state = 'pending' ORDER BY created_at, signal_id",
             [self.pipeline],
@@ -1186,7 +1199,7 @@ class BackfillSignalQueueRepository:
         )
 
     def get(self, request_id: str) -> QueuedSignalRequest | None:
-        row = self.con.execute(
+        row = _read_relation(self.con,
             f"SELECT request_id, signal_id, tables_json, trigger_reason, state, "
             f"dispatch_signal_id FROM {self.table} WHERE pipeline = ? AND request_id = ?",
             [self.pipeline, request_id],
@@ -1194,7 +1207,7 @@ class BackfillSignalQueueRepository:
         return None if row is None else self._decode(row)
 
     def queued(self) -> list[QueuedSignalRequest]:
-        rows = self.con.execute(
+        rows = _read_relation(self.con,
             f"SELECT request_id, signal_id, tables_json, trigger_reason, state, "
             f"dispatch_signal_id FROM {self.table} WHERE pipeline = ? AND state = 'queued' "
             "ORDER BY created_at, request_id",
@@ -1275,7 +1288,7 @@ class ShadowClaimRepository:
         )
 
     def state(self, schema: str, table: str) -> tuple[str, str, str] | None:
-        row = self.con.execute(
+        row = _read_relation(self.con,
             f"SELECT claim_state, owner_kind, owner_id FROM {self.table} "
             "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
             [self.pipeline, schema, table],
@@ -1364,7 +1377,7 @@ class RefreshPolicyRepository:
         return policy
 
     def get(self, schema: str, table: str) -> RefreshPolicy | None:
-        row = self.con.execute(
+        row = _read_relation(self.con,
             f"SELECT mode, enabled, interval_seconds, next_due_at, size_threshold_bytes, "
             f"time_threshold_ms, retry_initial_seconds, retry_max_seconds FROM {self.table} "
             "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
@@ -1431,16 +1444,7 @@ class BackfillCoordinator:
         replay into an acknowledgeable control unit instead of routing it into the
         new live table.
         """
-        active = self.repository.active(schema, table)
-        if active is not None:
-            return active
-        row = self.con.execute(
-            f"SELECT {self.repository._COLUMNS} FROM {self.repository.table} "
-            "WHERE pipeline = ? AND source_schema = ? AND source_table = ? "
-            "AND state = 'complete' ORDER BY updated_at DESC, created_at DESC LIMIT 1",
-            [self.pipeline, schema, table],
-        ).fetchone()
-        return None if row is None else self.repository._row(row)
+        return self.repository.progress_owner(schema, table)
 
     def active_runs(self) -> list[BackfillRun]:
         return self.repository.active_all(include_blocked=True)
