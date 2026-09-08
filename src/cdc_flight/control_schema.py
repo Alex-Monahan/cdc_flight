@@ -155,6 +155,23 @@ CONTROL_DDL = [
             updated_at        TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (pipeline, request_id)
         )""",
+    # A source signal is a separate PostgreSQL effect from the destination-side
+    # run/queue transaction.  Keep the exact signal payload as a durable intent so
+    # the next owner can repeat the idempotent source INSERT after a process death
+    # between those stores.  ``published`` is an acknowledgement of that effect,
+    # not the source of truth for the run; a crash before it is written is safe to
+    # replay because the source writer keys the INSERT by signal_id.
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.backfill_signal_intents (
+            pipeline          VARCHAR NOT NULL,
+            signal_id         VARCHAR NOT NULL,
+            tables_json       VARCHAR NOT NULL,
+            kind              VARCHAR NOT NULL,
+            state             VARCHAR NOT NULL,
+            created_at        TIMESTAMPTZ NOT NULL,
+            updated_at        TIMESTAMPTZ NOT NULL,
+            published_at      TIMESTAMPTZ,
+            PRIMARY KEY (pipeline, signal_id)
+        )""",
     # Exactly one replacement owner may mutate a table's shared shadow.
     f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.shadow_claims (
             pipeline        VARCHAR NOT NULL,

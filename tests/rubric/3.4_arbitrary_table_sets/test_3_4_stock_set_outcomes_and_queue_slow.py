@@ -284,6 +284,7 @@ def test_live_set_isolates_empty_failed_and_healthy_tables(sandbox):
         assert len(source_commits) == 2
         assert len({fact.xid for fact in source_commits.values()}) == 2
 
+        harness.release_scan_boundary()
         healthy_terminal = _terminal_entry(
             harness.live_state_path, signal_id, HEALTHY_TABLE, process=process
         )
@@ -424,6 +425,9 @@ def test_live_set_isolates_empty_failed_and_healthy_tables(sandbox):
     finally:
         if process is not None and process.poll() is None:
             with contextlib.suppress(Exception):
+                harness.release_scan_boundary()
+        if process is not None and process.poll() is None:
+            with contextlib.suppress(Exception):
                 process.terminate()
             with contextlib.suppress(Exception):
                 process.communicate(timeout=120)
@@ -527,6 +531,7 @@ def test_live_queued_sets_coalesce_and_dispatch(sandbox):
         )
         assert ledger.consuming_reads == 1
 
+        first_harness.release_scan_boundary()
         first_terminal = _terminal_entry(
             first_harness.live_state_path,
             first_signal_id,
@@ -665,6 +670,9 @@ def test_live_queued_sets_coalesce_and_dispatch(sandbox):
             )
         )
     finally:
+        if process is not None and process.poll() is None:
+            with contextlib.suppress(Exception):
+                first_harness.release_scan_boundary()
         if process is not None and process.poll() is None:
             with contextlib.suppress(Exception):
                 process.terminate()

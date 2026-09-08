@@ -449,6 +449,28 @@ class Applier:
         #: destination commit/ack boundary.  This is persisted in the run summary
         #: as production-owner evidence for the live queue contract.
         self.backfill_queue_dispatches: list[dict[str, Any]] = []
+        #: Evidence for source effects completed from a durable intent during startup.
+        #: Queued dispatch recoveries also enter the normal dispatch list so the
+        #: completion guard keeps the successor owner alive.
+        self.backfill_signal_recoveries: list[dict[str, Any]] = []
+        if self.queued_signal_writer is not None:
+            for intent, runs in self.backfill.recover_signal_intents(
+                self.queued_signal_writer
+            ):
+                recovery = {
+                    "signal_id": intent.signal_id,
+                    "tables": list(intent.tables),
+                    "kind": intent.kind,
+                    "run_ids": [run.run_id for run in runs],
+                    "request_id": runs[0].request_id if runs else None,
+                    "source_signal_inserted": True,
+                    "observed_at_monotonic_ns": time.monotonic_ns(),
+                }
+                self.backfill_signal_recoveries.append(recovery)
+                if intent.kind == "queued_dispatch":
+                    self.backfill_queue_dispatches.append(
+                        {**recovery, "recovered": True}
+                    )
         #: Re-snapshot streaming units are complete source observations but have no
         #: destination side. Keep only their acknowledgeable terminal handles until a
         #: preceding snapshot group is durable; they must never enter ``self.group``.
@@ -616,6 +638,7 @@ class Applier:
             "backfill_notifications_pending": len(self._pending_backfill_notifications),
             "backfill_notification_trace": list(self.backfill_notification_trace),
             "backfill_queue_dispatches": list(self.backfill_queue_dispatches),
+            "backfill_signal_recoveries": list(self.backfill_signal_recoveries),
             **self.snapshot_completion.as_dict(),
             # Round 8 MAJOR-1: this is the callback/connection ownership proof. A late
             # callback after the seal is a recorded no-op and can never decode, write,
@@ -1067,6 +1090,73 @@ class Applier:
                 stream.write(json.dumps(entry, sort_keys=True) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
+        self._await_live_scan_boundary(entries)
+
+    @staticmethod
+    def _write_boundary_marker(path: Path, payload: dict[str, Any]) -> None:
+        """Atomically publish one fsynced test-only boundary witness."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(payload, stream, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+
+    def _await_live_scan_boundary(self, entries: list[dict[str, Any]]) -> None:
+        """Hold the test child at a positive durable scan seam when requested.
+
+        The harness sets this environment variable only for the live Stock proof.
+        The child first fsyncs the durable notification sidecar (above), then
+        publishes a separate READY witness and waits for the harness's fsynced
+        RELEASE witness. The release file is the synchronization predicate; the
+        bounded poll cadence is not the proof and cannot let a fast scan outrun the
+        seam observation.
+        """
+        barrier_text = os.environ.get("CDC_BACKFILL_BOUNDARY_BARRIER_PATH")
+        if not barrier_text or not any(
+            entry.get("observation") in {"STARTED", "IN_PROGRESS"}
+            for entry in entries
+        ):
+            return
+        base = Path(barrier_text)
+        ready = Path(f"{base}.ready")
+        release = Path(f"{base}.release")
+        self._write_boundary_marker(
+            ready,
+            {
+                "event": "BACKFILL_SCAN_BOUNDARY_READY",
+                "pid": os.getpid(),
+                "pipeline": self.pipeline,
+                "signals": sorted(
+                    {str(entry["signal_id"]) for entry in entries if entry.get("signal_id")}
+                ),
+                "tables": sorted(
+                    {str(entry["table"]) for entry in entries if entry.get("table")}
+                ),
+                "observed_at_monotonic_ns": time.monotonic_ns(),
+            },
+        )
+        raw_timeout = os.environ.get("CDC_BACKFILL_BOUNDARY_BARRIER_TIMEOUT", "120")
+        try:
+            timeout = float(raw_timeout)
+        except ValueError as exc:
+            raise RuntimeError(
+                "CDC_BACKFILL_BOUNDARY_BARRIER_TIMEOUT must be numeric"
+            ) from exc
+        if timeout <= 0:
+            raise RuntimeError(
+                "CDC_BACKFILL_BOUNDARY_BARRIER_TIMEOUT must be positive"
+            )
+        deadline = time.monotonic() + timeout
+        while not release.exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "the live Stock boundary barrier was not durably released"
+                )
+            # This is only the bounded wait for the fsynced RELEASE state; the
+            # admission proof is the READY/RELEASE handshake, not this cadence.
+            time.sleep(0.02)
 
     def dispatch_queued_backfills(self) -> None:
         """Publish one queued successor from the normal post-commit owner path."""
@@ -1076,7 +1166,7 @@ class Applier:
         if dispatched is None:
             return
         signal, runs = dispatched
-        self.queued_signal_writer.insert(signal)
+        self.backfill.publish_signal(signal, self.queued_signal_writer)
         self.backfill_queue_dispatches.append(
             {
                 "signal_id": signal.signal_id,

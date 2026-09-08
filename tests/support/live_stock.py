@@ -18,6 +18,7 @@ import uuid
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 
@@ -304,6 +305,7 @@ class LiveStockHarness:
         self.data_collection = data_collection
         self.process = None
         self.live_state_path = self.box.dir / "backfill_live_state.jsonl"
+        self.boundary_barrier_path = self.box.dir / "backfill_scan_boundary_barrier"
 
     @property
     def _runs_table(self) -> str:
@@ -334,18 +336,23 @@ class LiveStockHarness:
                 request_id=self.request_id,
                 signal_id=self.signal_id,
             )
-        if signal.signal_id != self.signal_id:
-            raise AssertionError(signal)
-        StockSignalWriter(
-            self.box.source.dsn,
-            data_collection=self.data_collection,
-        ).insert(signal)
-        self.run_ids = tuple(run.run_id for run in runs)
+            if signal.signal_id != self.signal_id:
+                raise AssertionError(signal)
+            coordinator.publish_signal(
+                signal,
+                StockSignalWriter(
+                    self.box.source.dsn,
+                    data_collection=self.data_collection,
+                ),
+            )
+            self.run_ids = tuple(run.run_id for run in runs)
         return signal.signal_id, self.run_ids
 
     def start_normal_stock(self, *, captured_tables: str, timeout: float = 60.0) -> None:
         """Start the ordinary stock process and wait for its real source slot."""
         self.live_state_path.unlink(missing_ok=True)
+        Path(f"{self.boundary_barrier_path}.ready").unlink(missing_ok=True)
+        Path(f"{self.boundary_barrier_path}.release").unlink(missing_ok=True)
         self.process = self.box.spawn(
             max_seconds=240,
             idle_seconds=90,
@@ -353,6 +360,7 @@ class LiveStockHarness:
                 "CDC_AUTO_DISCOVERY": "0",
                 "CDC_TABLES": captured_tables,
                 "CDC_BACKFILL_LIVE_STATE_PATH": str(self.live_state_path),
+                "CDC_BACKFILL_BOUNDARY_BARRIER_PATH": str(self.boundary_barrier_path),
             },
             capture=True,
         )
@@ -404,6 +412,7 @@ class LiveStockHarness:
                     run_state == "loading"
                     and notification_status in {"STARTED", "IN_PROGRESS"}
                     and lifecycle == "in_progress"
+                    and Path(f"{self.boundary_barrier_path}.ready").exists()
                 ):
                     return DurableBackfillObservation(
                         state=run_state,
@@ -426,6 +435,27 @@ class LiveStockHarness:
                     f"{timeout:.1f}s; last_state={state}"
                 )
             time.sleep(poll_seconds)
+
+    def release_scan_boundary(self) -> None:
+        """Durably release the child after the harness has admitted the seam."""
+        ready = Path(f"{self.boundary_barrier_path}.ready")
+        if not ready.exists():
+            raise AssertionError("cannot release a live scan boundary before READY")
+        release = Path(f"{self.boundary_barrier_path}.release")
+        temporary = release.with_name(f".{release.name}.{os.getpid()}.tmp")
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(
+                {
+                    "event": "BACKFILL_SCAN_BOUNDARY_RELEASED",
+                    "pid": os.getpid(),
+                    "released_at_monotonic_ns": time.monotonic_ns(),
+                },
+                stream,
+                sort_keys=True,
+            )
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, release)
 
     def wait_for_terminal(
         self,
