@@ -1180,6 +1180,13 @@ class Applier:
 
     def completion_waiting_for_queued_backfill(self) -> bool:
         """Keep a reached run open until an owner-dispatched successor is terminal."""
+        # The initial live scan seam deliberately pauses a callback while the
+        # harness admits the boundary.  No queued successor exists then, so do
+        # not even contend for the callback's operation gate; taking it here
+        # would make the supervisor wait behind the paused callback and prevent
+        # the harness from observing/releasing the durable READY witness.
+        if not self.backfill_queue_dispatches:
+            return False
         # The completion-watermark poll runs on the supervisor thread while the
         # Debezium callback owns the same DuckDB handle.  Join the applier's
         # destination-operation gate before reading the durable successor state;
