@@ -45,6 +45,7 @@ import logging
 import os
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -932,6 +933,18 @@ class Applier:
         # Queue state with the source notification. The commit protocol applies
         # it after its one BEGIN and before row DML, so notification state,
         # shadow rows, progress, and the resume point share one transaction.
+        if notification.signal_id is None and notification.table:
+            if "." in notification.table:
+                schema, table = notification.table.split(".", 1)
+            else:
+                schema, table = notification.table, notification.table
+            active = self.backfill.active(schema, table)
+            if active is not None and active.signal_id:
+                # Stock's notification payload identifies the table but does not
+                # echo the source signal id.  Resolve that generation while its
+                # durable run is still active; later queued generations must not
+                # be inferred from a latest-by-table query at sidecar time.
+                notification = replace(notification, signal_id=active.signal_id)
         self._pending_backfill_notifications.append(notification)
         decoded = decode(raw, topic_prefix=self.topic_prefix, want_offsets=True)
         self.backfill_notification_trace.append(
@@ -1000,12 +1013,20 @@ class Applier:
                 schema, table_name = table.split(".", 1)
             else:
                 schema, table_name = table, table
+            # Correlate the sidecar to the notification's stock signal before
+            # selecting a run.  Selecting only by pipeline/source table lets a
+            # later queued generation win the query even while this notification
+            # belongs to the active generation; the live harness then observes
+            # the wrong durable state.  The signal id is the source-visible
+            # generation key available at this post-commit boundary.
+            if not notification.signal_id:
+                continue
             run = self.con.execute(
                 f"SELECT run_id, request_id, state, notification_status, row_count, "
                 f"chunk_count, shadow_table FROM {self.backfill.repository.table} "
                 "WHERE pipeline = ? AND source_schema = ? AND source_table = ? "
-                "ORDER BY updated_at DESC LIMIT 1",
-                [self.pipeline, schema, table_name],
+                "AND signal_id = ? ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+                [self.pipeline, schema, table_name, notification.signal_id],
             ).fetchone()
             if run is None:
                 continue

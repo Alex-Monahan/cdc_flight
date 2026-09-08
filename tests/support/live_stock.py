@@ -79,10 +79,19 @@ class BoundedSourceCommitLedger:
         self._closed = False
 
     @classmethod
-    def open(cls, box) -> BoundedSourceCommitLedger:
-        """Create a throwaway ``test_decoding`` slot at the writer boundary."""
+    def open(
+        cls, box, *, slot_prefix: str = "p3a_ledger"
+    ) -> BoundedSourceCommitLedger:
+        """Create a throwaway ``test_decoding`` slot at the writer boundary.
+
+        The prefix is part of the shared A/B harness surface.  Keeping it
+        caller-selectable makes the diagnostic slot name identify the scenario
+        that owns it while preserving Round A's default.
+        """
         lower = str(box.pg_query("SELECT pg_current_wal_flush_lsn()::text")[0][0])
-        slot = f"p3a_ledger_{os.getpid()}_{uuid.uuid4().hex[:12]}"
+        if not slot_prefix:
+            raise ValueError("slot_prefix must not be empty")
+        slot = f"{slot_prefix}_{os.getpid()}_{uuid.uuid4().hex[:12]}"
         created = box.pg_query(
             "SELECT slot_name, lsn::text FROM "
             "pg_create_logical_replication_slot(%s, 'test_decoding')",
@@ -237,13 +246,18 @@ class BoundedSourceCommitLedger:
 class SourceTransactionWriter:
     """Commit named source DML in separate, complete PostgreSQL transactions."""
 
-    def __init__(self, dsn: str):
+    def __init__(self, dsn: str, *, label_prefix: str = "p3a-"):
         self.dsn = dsn
+        if not label_prefix:
+            raise ValueError("label_prefix must not be empty")
+        self.label_prefix = label_prefix
         self.commits: list[SourceCommit] = []
 
     def commit(self, label: str, operation: str, statement: str, params: Sequence[Any] = ()) -> SourceCommit:
-        if not label.startswith("p3a-"):
-            raise ValueError("Round A source labels must be p3a-prefixed")
+        if not label.startswith(self.label_prefix):
+            raise ValueError(
+                f"source labels must start with {self.label_prefix!r}"
+            )
         import psycopg
 
         with psycopg.connect(self.dsn) as conn, conn.transaction():
@@ -286,6 +300,7 @@ class LiveStockHarness:
         self.signal_tables = tuple(signal_tables)
         self.request_id = request_id
         self.signal_id = signal_id
+        self.run_ids: tuple[str, ...] = ()
         self.data_collection = data_collection
         self.process = None
         self.live_state_path = self.box.dir / "backfill_live_state.jsonl"
@@ -325,7 +340,8 @@ class LiveStockHarness:
             self.box.source.dsn,
             data_collection=self.data_collection,
         ).insert(signal)
-        return signal.signal_id, tuple(run.run_id for run in runs)
+        self.run_ids = tuple(run.run_id for run in runs)
+        return signal.signal_id, self.run_ids
 
     def start_normal_stock(self, *, captured_tables: str, timeout: float = 60.0) -> None:
         """Start the ordinary stock process and wait for its real source slot."""
@@ -354,7 +370,9 @@ class LiveStockHarness:
             for entry in observations
             if entry.get("pipeline") == self.pipeline
             and entry.get("request_id") == self.request_id
+            and entry.get("signal_id") == self.signal_id
             and entry.get("table") == f"app.{self.source_table}"
+            and (not self.run_ids or entry.get("run_id") in self.run_ids)
         ]
         if not matching:
             return None
