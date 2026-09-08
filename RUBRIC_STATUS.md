@@ -711,7 +711,7 @@ correct assumptions in the notes below:
 | 4.3 | Recover from problematic WAL / offset state | **5** | Malformed durable resume JSON raises `OffsetUnusable`; the real process exits non-zero with `ok:false`, emits one critical `offset_unusable` alert, and repeats without multiplying the alert. |
 | 4.4 | Idle-slot heartbeat | **5** | Stock Debezium receives `heartbeat.interval.ms=5000` and a transactional `pg_logical_emit_message` action. A real idle PostgreSQL source advances `confirmed_flush_lsn` without changing application rows. |
 | 4.5 | Errors must not hang or lock | ~~4~~ → **5** | Every engine, source, catalog, destination-retirement, phase-sink, and commit wait has an explicit bound and failure outcome; the real concurrent and idle probes complete. A complete adversarial hang matrix for every individual wait remains unproven. |
-| 4.6 | Detect silently-dead Postgres connection | **4** | The source sampler uses bounded connect/query/TCP keepalive waits, Debezium uses effective pgjdbc connect/socket bounds, and heartbeat is enabled. Real idle proof passes. A real blackholed source process exits non-zero with a durable critical `source_dark` alert in an isolated run and in the final contended two-worker lane; source-dark precedence now survives a later connector shutdown error. A dedicated JDBC-only blackhole probe against the new 60-second socket bound remains unproven. |
+| 4.6 | Detect silently-dead Postgres connection | **5** | The source sampler uses bounded connect/query/TCP keepalive waits, Debezium uses effective pgjdbc connect/socket bounds, and heartbeat is enabled. Real idle proof passes. A real blackholed source process exits non-zero with a durable critical `source_dark` alert in an isolated run and in the final contended two-worker lane; source-dark precedence now survives a later connector shutdown error. A dedicated stock-Debezium JDBC-only blackhole probe now confirms the shipped `driver.socketTimeout=60`: the engine handler receives a real logical-message record before blackholing, six cold default runs pass at 61.24–61.35 s, a 3 s mutation still fails the unchanged lower bound, and the node passes in the full 2-worker/264-test slow lane with `60 <= elapsed < 85` unchanged. |
 | 4.7 | Self-heal without human intervention | **1** | The inventory now resolves all former undefined cases: **70 rows, 47 AUTO / 23 MANUAL / 0 UNDEFINED**. The >2 manual ceiling remains, honestly limiting this item to 1; the remaining manual cases and reasons are enumerated in ADR §19/A51. |
 | 5.1 | CDC fast on large changes | **3** | 50 k-row transaction absorbed at ~3.5 k rows/s into local DuckDB; no failure, but a full `dlt.run()` per 2048-row batch is the ceiling. |
 | 5.2 | Low latency on small changes | ~~1~~ → **5** | Capture latency is 83 ms, but the deliverable is a bounded batch job with no defined cadence — end-to-end latency is the schedule interval. |
@@ -2597,7 +2597,9 @@ updated by the engine, watched by the supervisor), bounded socket-level timeouts
 on the Postgres connection, and a non-zero exit whenever the watchdog rather than
 a clean shutdown ends the process.
 
-### 4.6 Detect failure of a Postgres node with a silently-dead connection — ~~1~~ **3 / 5**
+### 4.6 Detect failure of a Postgres node with a silently-dead connection — historical ~~1~~ **3 / 5** (superseded)
+
+> **Superseded.** The authoritative current score and evidence are in the 4.6 TABLE row above (**5 / 5**). This retained section records the pre-sequencing gap; its former “Gap to 5” statements are historical, not the current ruling.
 
 `unable to detect=1, TCP keepalives under 30 min=3, full heartbeat under 1 h=5`
 
