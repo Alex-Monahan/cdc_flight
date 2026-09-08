@@ -100,6 +100,7 @@ def commit_group(self, trigger: str) -> CommitResult:
         self.snapshot_completion.will_complete_after_commit(group)
     )
     commit_id = self.group.spill_commit_id or self._next_commit_id
+    durable_backfill_notifications = list(self._pending_backfill_notifications)
     opened_at = destination.now()
     # Tell the destination-fault wrapper which data group this is, so a
     # `destination_*` fault fires at the group the spec names rather than at one
@@ -397,6 +398,10 @@ def commit_group(self, trigger: str) -> CommitResult:
     except BaseException:
         self._rollback_quietly()
         raise
+    # The sidecar is test-only evidence and is written after COMMIT_ACK as well as
+    # after the destination COMMIT. It can therefore never become an alternate
+    # acknowledgement or a source of liveness.
+    self._record_durable_backfill_notifications(durable_backfill_notifications)
     if fault_enabled:
         maybe_crash("post_ack", fault_group)
     # next poll() -> performCommit() -> flushLsn(new)  ── nothing between ──

@@ -700,7 +700,7 @@ correct assumptions in the notes below:
 | 2.6 | TOAST columns handled well | **4** | Sparse physical-row folding, durable NULL-vs-JSONB-root-null ambiguity refusal, and a bounded relation-lock activation fence close the soundness defects. The real-owner matrix is non-circular. Stock Debezium still lacks a marker-preserving efficient channel, so the policy ceiling remains 4. |
 | 3.1 | Backfill scalable / parallelized | **3** | Stock `snapshot.max.threads=4`, bounded incremental chunks, one destination writer, and a 10M-row bounded measurement are implemented. A material stock 1-vs-4 large-table speedup and MotherDuck server-memory result remain unproven. |
 | 3.2 | Backfills atomic | **5** | Existing shadow-table loading plus one transactional rename/state publication keeps a separate MotherDuck reader on old/old or new/new only; rollback and pre/post-rename faults preserve the old image. |
-| 3.3 | Existing tables keep receiving CDC during snapshot | **4** | Stock incremental signal records and ordinary CDC share one retained shadow; the real stock test compares source/destination identities and value multisets for selected tables. A real DELETE-during-scan and every notification interleaving remain unproven. |
+| 3.3 | Existing tables keep receiving CDC during snapshot | **5** | Stock incremental signal records and ordinary CDC share one retained shadow; the new slow-lane stock proof commits separate real PostgreSQL update/delete/insert transactions inside a durable IN_PROGRESS scan window while unrelated CDC continues, then verifies exact identities, value multisets, multiplicities, one final image, no duplicate physical rows, and no stale shadow. The node is green in 3/3 cold runs and in the full 2-worker slow lane; a deliberate delete-propagation mutation makes it RED. |
 | 3.4 | Snapshot an arbitrary set of tables | **4** | One stock signal carries a non-contiguous set and creates independent per-table runs; failed peers do not overwrite completed outcomes. Live per-table failure/empty coverage and queued coalescing are not fully exercised end to end. |
 | 3.5 | Per-table CDC / full refresh / incremental refresh | **4** | Durable `cdc`, `full`, and `incremental` modes, policy changes, cursor preservation, and a scheduler are implemented. A full live schedule/restart matrix and mixed modes in one stock signal are not proven. |
 | 3.6 | Backfill when CDC falls too far behind | **4** | Size OR oldest-pending-age predicates, durable `bytes`/`time`/`both` reasons, unknown-age refusal, coalescing, and no slot ownership are tested. Wiring to a live slot/source-health sampling run is not end-to-end proven. |
@@ -730,9 +730,9 @@ correct assumptions in the notes below:
 **Baseline average: 66 / 40 = 1.65 out of 5.** Items at 5 in the baseline:
 **1 of 40** (7.1).
 
-**Current average (this branch): 141 / 42 = 3.36 out of 5.** Items at 5: **20 of 42**.
+**Current average (this branch): 142 / 42 = 3.38 out of 5.** Items at 5: **21 of 42**.
 Rubric 1.7 remains 3 while 1.9 is 5. Distribution: 13 at 1, 1 at 2, 6 at 3,
-2 at 4, 20 at 5. Distance to target: **69 rubric points**.
+1 at 4, 21 at 5. Distance to target: **68 rubric points**.
 
 **Correction (2026-07-31).** This paragraph previously read `100 / 41 = 2.44` with a
 distribution of `21/3/8/0/9`, and neither matched the summary table above it — the block
@@ -2404,7 +2404,9 @@ fence in process-local runs. Each broken seam fails its production assertion;
 each restored method passes again. This is defense against regressions in the
 actual publication path, not only a protocol fixture.
 
-### 3.3 Existing tables continue to receive CDC during a healthy snapshot — **4 / 5**
+### 3.3 Existing tables continue to receive CDC during a healthy snapshot — historical **4 / 5** (superseded)
+
+> **Superseded.** The authoritative current score and evidence are in the 3.3 TABLE row above (**5 / 5**). This retained section records the pre-Round-A gap; its former “Gap to 5” statements are historical, not the current ruling.
 
 Stock `signal.data.collection` and incremental notifications are decoded into
 bounded units. Once STARTED is durable, incremental READs and ordinary CDC for a
