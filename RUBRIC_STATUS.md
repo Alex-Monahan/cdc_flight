@@ -701,7 +701,7 @@ correct assumptions in the notes below:
 | 3.1 | Backfill scalable / parallelized | **3** | Stock `snapshot.max.threads=4`, bounded incremental chunks, one destination writer, and a 10M-row bounded measurement are implemented. A material stock 1-vs-4 large-table speedup and MotherDuck server-memory result remain unproven. |
 | 3.2 | Backfills atomic | **5** | Existing shadow-table loading plus one transactional rename/state publication keeps a separate MotherDuck reader on old/old or new/new only; rollback and pre/post-rename faults preserve the old image. |
 | 3.3 | Existing tables keep receiving CDC during snapshot | **5** | Stock incremental signal records and ordinary CDC share one retained shadow; the new slow-lane stock proof commits separate real PostgreSQL update/delete/insert transactions inside a durable IN_PROGRESS scan window while unrelated CDC continues, then verifies exact identities, value multisets, multiplicities, one final image, no duplicate physical rows, and no stale shadow. The node is green in 3/3 cold runs and in the full 2-worker slow lane; a deliberate delete-propagation mutation makes it RED. |
-| 3.4 | Snapshot an arbitrary set of tables | **4** | One stock signal carries a non-contiguous set and creates independent per-table runs; failed peers do not overwrite completed outcomes. Live per-table failure/empty coverage and queued coalescing are not fully exercised end to end. |
+| 3.4 | Snapshot an arbitrary set of tables | **5** | Two real stock/Debezium slow-lane nodes now prove the non-contiguous set's healthy, empty, and contained-failure outcomes plus peer CDC isolation, and prove two queued public requests coalesce into one successor signal/run set dispatched by the live production owner. Both nodes are 3/3 cold-green, green in the full 2-worker slow lane, and both mutation proofs go red. Full evidence: `codex_logs/p3b_impl_summary.md`. |
 | 3.5 | Per-table CDC / full refresh / incremental refresh | **4** | Durable `cdc`, `full`, and `incremental` modes, policy changes, cursor preservation, and a scheduler are implemented. A full live schedule/restart matrix and mixed modes in one stock signal are not proven. |
 | 3.6 | Backfill when CDC falls too far behind | **4** | Size OR oldest-pending-age predicates, durable `bytes`/`time`/`both` reasons, unknown-age refusal, coalescing, and no slot ownership are tested. Wiring to a live slot/source-health sampling run is not end-to-end proven. |
 | 3.7 | Failed backfill resumes midway | **4** | A real source-tree crash child kills a keyed chunk load; durable cursor/shadow survives and resume matches clean identity/value sets with zero duplicates. Composite/UUID stock cases and every crash point remain unproven; keyless stock deliberately falls back to full. |
@@ -2422,18 +2422,24 @@ stock table-scan interval. The 24 notification permutations are in-process
 ordering evidence rather than PostgreSQL/stock-Debezium runs, so they do not
 prove that race live. Those gaps keep the honest score at 4.
 
-### 3.4 Snapshot an arbitrary set of tables while others keep streaming — **4 / 5**
+### 3.4 Snapshot an arbitrary set of tables while others keep streaming — **5 / 5**
+
+This section supersedes the earlier 4/5 detail; the authoritative score and current
+evidence are the 3.4 table row above and `codex_logs/p3b_impl_summary.md`.
 
 One stock execute-snapshot signal accepts a non-contiguous set and creates one
 durable `BACKFILL_RUN` per table with one request/signal identity. Empty sets are
 true no-ops; per-table outcomes preserve a failed peer's shadow while successful
 peers complete; a second active signal is refused rather than ambiguously
-correlated. The real stock run exercised the two-table set and both final images.
-
-The live suite executes the empty publication, but the decisive error-peer case
-does not assert that the healthy peer published in the same stock run. Additional
-requests are durably coalesced for a later retry rather than proven in a full
-live queue scenario. Score: 4.
+correlated. Round B adds two real stock-process proofs: one signal selects the
+non-contiguous healthy/empty/contained-failure set and verifies every durable run,
+signal correlation, table state, claim, image, and peer CDC result; a failed peer
+cannot overwrite or delay the already terminal healthy peer. A second proof admits
+two public queued requests during an active durable run, verifies their coalesced
+successor set, and observes the production owner publish exactly one successor
+stock signal and one successor run per table after the first run reaches terminal
+state. Both new nodes are 3/3 cold-green, green in the full 2-worker slow lane,
+and each deliberate isolation/dispatch mutation is red.
 
 ### 3.5 Per-table CDC / scheduled full refresh / scheduled incremental refresh — **4 / 5**
 
