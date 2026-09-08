@@ -40,9 +40,12 @@ second path had grown alongside the first.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from . import (
@@ -87,6 +90,7 @@ from .errors import (
 )
 from .faults import matrix_crash, maybe_crash
 from .marker_accounting import SourceMarkerReceiptCounter
+from .naming import control_table
 from .occurrence import _commit_reservation
 from .policy import AcknowledgementHandle, PolicyGate
 from .snapshot import SnapshotCoordinator
@@ -432,6 +436,11 @@ class Applier:
         self.snapshot_notification_count = 0
         self._pending_snapshot_notifications: list[Any] = []
         self._pending_backfill_notifications: list[Any] = []
+        #: Value-free evidence of the actual stock incremental notification callbacks.
+        #: The callback ordinal and monotonic receipt instant let live tests prove the
+        #: source writer's commits fell between durable scan boundaries without
+        #: calling a private handler or manufacturing a notification.
+        self.backfill_notification_trace: list[dict[str, Any]] = []
         #: Re-snapshot streaming units are complete source observations but have no
         #: destination side. Keep only their acknowledgeable terminal handles until a
         #: preceding snapshot group is durable; they must never enter ``self.group``.
@@ -597,6 +606,7 @@ class Applier:
                 self._pending_snapshot_notifications
             ),
             "backfill_notifications_pending": len(self._pending_backfill_notifications),
+            "backfill_notification_trace": list(self.backfill_notification_trace),
             **self.snapshot_completion.as_dict(),
             # Round 8 MAJOR-1: this is the callback/connection ownership proof. A late
             # callback after the seal is a recorded no-op and can never decode, write,
@@ -924,6 +934,19 @@ class Applier:
         # shadow rows, progress, and the resume point share one transaction.
         self._pending_backfill_notifications.append(notification)
         decoded = decode(raw, topic_prefix=self.topic_prefix, want_offsets=True)
+        self.backfill_notification_trace.append(
+            {
+                "ordinal": len(self.backfill_notification_trace) + 1,
+                "observation": notification.observation,
+                "table": notification.table,
+                "status": notification.status,
+                "rows": notification.rows,
+                "chunk_id": notification.chunk_id,
+                "signal_id": notification.signal_id,
+                "source_lsn": decoded.lsn,
+                "observed_at_monotonic_ns": time.monotonic_ns(),
+            }
+        )
         decoded.kind = KIND_HEARTBEAT
         decoded.schema = None
         decoded.table = None
@@ -952,6 +975,69 @@ class Applier:
                 commit_lsn=decoded.lsn,
             )
         self._add_unit(unit)
+
+    def _record_durable_backfill_notifications(self, notifications) -> None:
+        """Publish test-only observations after the destination transaction commits.
+
+        A live DuckDB writer intentionally excludes a second process from opening the
+        database file.  The bounded live-stock harness therefore observes this small
+        fsynced sidecar instead.  It is written only after the same commit that made
+        the ``BACKFILL_RUN``/table lifecycle state durable; it is not a callback,
+        signal, or alternate source owner.  Production runs do not create the sidecar
+        unless the test-support path explicitly supplies its environment variable.
+        """
+        path_text = os.environ.get("CDC_BACKFILL_LIVE_STATE_PATH")
+        if not path_text or not notifications:
+            return
+        path = Path(path_text)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        entries: list[dict[str, Any]] = []
+        for notification in notifications:
+            table = notification.table
+            if not table:
+                continue
+            if "." in table:
+                schema, table_name = table.split(".", 1)
+            else:
+                schema, table_name = table, table
+            run = self.con.execute(
+                f"SELECT run_id, request_id, state, notification_status, row_count, "
+                f"chunk_count, shadow_table FROM {self.backfill.repository.table} "
+                "WHERE pipeline = ? AND source_schema = ? AND source_table = ? "
+                "ORDER BY updated_at DESC LIMIT 1",
+                [self.pipeline, schema, table_name],
+            ).fetchone()
+            if run is None:
+                continue
+            lifecycle = self.con.execute(
+                f"SELECT snapshot_state FROM {control_table(self.control_schema, 'table_state')} "
+                "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+                [self.pipeline, schema, table_name],
+            ).fetchone()
+            entries.append(
+                {
+                    "pipeline": self.pipeline,
+                    "run_id": str(run[0]),
+                    "request_id": str(run[1]),
+                    "signal_id": notification.signal_id,
+                    "table": f"{schema}.{table_name}",
+                    "observation": notification.observation,
+                    "state": str(run[2]),
+                    "notification_status": str(run[3]),
+                    "row_count": int(run[4] or 0),
+                    "chunk_count": int(run[5] or 0),
+                    "shadow_table": None if run[6] is None else str(run[6]),
+                    "table_state": None if lifecycle is None else str(lifecycle[0]),
+                    "observed_at_monotonic_ns": time.monotonic_ns(),
+                }
+            )
+        if not entries:
+            return
+        with path.open("a", encoding="utf-8") as stream:
+            for entry in entries:
+                stream.write(json.dumps(entry, sort_keys=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
 
     def _apply_backfill_notifications(self) -> None:
         """Apply queued stock state after commit_protocol has opened its transaction."""
