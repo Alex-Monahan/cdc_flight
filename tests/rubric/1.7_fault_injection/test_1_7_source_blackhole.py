@@ -293,6 +293,12 @@ def test_stock_jdbc_shipped_socket_timeout_fires_on_blackhole(
         def handleJsonBatch(self, records):
             return None
 
+        def handle_batch(self, records, committer):
+            for record in records:
+                committer.markProcessed(record)
+            if records:
+                committer.markBatchFinished()
+
     slot = f"{TEST_SLOT_PREFIX}jdbc_default_blackhole_{os.getpid()}"[:63]
     state = tmp_path / "jdbc_default_state"
     relay_source = SourceConfig(
@@ -344,8 +350,8 @@ def test_stock_jdbc_shipped_socket_timeout_fires_on_blackhole(
         )
         with psycopg.connect(postgres_cluster.dsn, autocommit=True) as direct:
             direct.execute("SELECT 1")
-            relay.blackhole()
             blackholed_at = time.monotonic()
+            relay.blackhole()
             deadline = blackholed_at + 85
             while time.monotonic() < deadline and engine.failure is None:
                 direct.execute("SELECT 1")
