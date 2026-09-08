@@ -27,7 +27,7 @@ _BASELINE_SELECTED = {
     # unit nodes and one live mutation node; the standby stale-target contract adds
     # one live two-sided retirement node.
     "not motherduck and not slow": 2460,
-    "slow and not motherduck": 262,
+    "slow and not motherduck": 263,
     # The quiet-holder and stock-walsender retry proofs are MotherDuck-only real
     # process nodes; a local DuckDB file lock cannot exercise cloud takeover while
     # the old process retains its handle.
