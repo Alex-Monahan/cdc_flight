@@ -74,9 +74,8 @@ def test_stock_dml_commits_inside_scan_boundary_and_publishes_one_image(sandbox)
     assert baseline["stop_reason"] in {"idle", "engine_finished"}, baseline
 
     # Keep the setup run short, then seed the large real source image while the
-    # pipeline is stopped.  The subsequent stock run therefore opens its actual
-    # incremental table scan over all rows without paying for a 30k-row initial
-    # 5k-row snapshot first.
+    # pipeline is stopped. The subsequent stock run therefore opens its actual
+    # incremental table scan over all 5,000 rows.
     sandbox.sql(
         [
             f"INSERT INTO app.{SELECTED_TABLE} (id, marker, value) "
