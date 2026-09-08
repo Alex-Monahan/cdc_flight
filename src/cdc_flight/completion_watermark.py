@@ -213,6 +213,12 @@ class CompletionWatermark:
     # -- the question ------------------------------------------------------- #
     def reached(self, handler, elapsed: float) -> bool:
         """True only when this run has a *completed delivery it can prove*."""
+        queued_backfill_wait = getattr(
+            handler, "completion_waiting_for_queued_backfill", None
+        )
+        if queued_backfill_wait is not None and queued_backfill_wait():
+            self._idle_candidate_since = None
+            return False
         if self._state == WATERMARK_REACHED:
             return True
         if not self._may_stop(handler):

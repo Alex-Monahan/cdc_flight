@@ -1088,6 +1088,15 @@ class Applier:
             }
         )
 
+    def completion_waiting_for_queued_backfill(self) -> bool:
+        """Keep a reached run open until an owner-dispatched successor is terminal."""
+        if not self.backfill_queue_dispatches:
+            return False
+        return any(
+            run.state not in {"complete", "blocked"}
+            for run in self.backfill.active_runs()
+        )
+
     def _apply_backfill_notifications(self) -> None:
         """Apply queued stock state after commit_protocol has opened its transaction."""
         for notification in self._pending_backfill_notifications:
