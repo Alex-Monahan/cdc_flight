@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 import time
 from contextlib import suppress
 
@@ -289,6 +290,8 @@ def test_stock_jdbc_shipped_socket_timeout_fires_on_blackhole(
     from cdc_flight.debezium_props import build_properties
     from cdc_flight.engine import SupervisedDebeziumEngine
 
+    streaming_ready = threading.Event()
+
     class NoopHandler(BasePythonChangeHandler):
         def handleJsonBatch(self, records):
             return None
@@ -298,6 +301,7 @@ def test_stock_jdbc_shipped_socket_timeout_fires_on_blackhole(
                 committer.markProcessed(record)
             if records:
                 committer.markBatchFinished()
+                streaming_ready.set()
 
     slot = f"{TEST_SLOT_PREFIX}jdbc_default_blackhole_{os.getpid()}"[:63]
     state = tmp_path / "jdbc_default_state"
@@ -315,6 +319,9 @@ def test_stock_jdbc_shipped_socket_timeout_fires_on_blackhole(
         replication,
         snapshot_mode="no_data",
         jdbc_connect_timeout_seconds=2,
+        # Surface the established streaming socket's timeout instead of letting
+        # stock Debezium restart the connector after the producer I/O failure.
+        overrides={"errors.max.retries": "0"},
     )
     _drop(postgres_cluster.dsn, slot)
     engine = SupervisedDebeziumEngine(
@@ -345,10 +352,15 @@ def test_stock_jdbc_shipped_socket_timeout_fires_on_blackhole(
         assert _wait_for(lambda: relay.connections > 0, timeout=30), (
             "stock Debezium never opened the relay connection"
         )
-        assert _wait_for(lambda: relay.bytes_relayed > 100, timeout=30), (
-            "stock Debezium never exchanged bytes through the relay"
-        )
         with psycopg.connect(postgres_cluster.dsn, autocommit=True) as direct:
+            direct.execute("SELECT 1")
+            direct.execute(
+                "SELECT pg_logical_emit_message(false, %s, %s)",
+                (f"app_jdbc_probe_{os.getpid()}", "streaming-ready"),
+            )
+            assert streaming_ready.wait(timeout=30), (
+                "stock Debezium never delivered source data to its handler"
+            )
             direct.execute("SELECT 1")
             blackholed_at = time.monotonic()
             relay.blackhole()
