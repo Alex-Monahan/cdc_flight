@@ -77,6 +77,10 @@ class SlotDropAuthorization:
     application_patterns: tuple[str, ...]
     expected_source_identity: Mapping[str, object] | tuple[object, object] | None
     retention_slot_name: str | None = None
+    #: A stale standby throwaway slot can predate a repaired main slot.  In that
+    #: state the main slot's LSNs are not a coverage certificate; the target slot
+    #: itself must provide the bounded message-absence evidence.
+    allow_uncovered_retention: bool = False
     allow_advanced_slot_recovery: bool = False
     certified_source_lsns: tuple[int, ...] = ()
 
@@ -138,6 +142,7 @@ def retention_slot_drop_authorization(
     application_patterns: Iterable[str],
     expected_source_identity=None,
     after_lsn: int | None = None,
+    allow_uncovered_retention: bool = False,
 ) -> SlotDropAuthorization:
     """Issue authority to retire a throwaway slot while another slot retains its WAL.
 
@@ -169,6 +174,7 @@ def retention_slot_drop_authorization(
         application_patterns=tuple(application_patterns),
         expected_source_identity=expected_source_identity,
         retention_slot_name=str(retention_slot_name),
+        allow_uncovered_retention=allow_uncovered_retention,
     )
 
 
@@ -881,7 +887,10 @@ def drop_slot(
     ``_rs``. It proves the retention slot's source identity and pending-range coverage,
     probes only that slot's publication/application-message range, and then performs a
     direct target-list drop. No cluster-wide WAL equality is consulted, so ordinary DML
-    and Flight heartbeats do not turn a legitimate retirement into a refusal.
+    and Flight heartbeats do not turn a legitimate retirement into a refusal. A present
+    application message is still an unresolved obligation: retention makes it
+    recoverable, but does not make the absence probe true, so this primitive refuses
+    the drop.
     """
     if not isinstance(authorization, SlotDropAuthorization) or not authorization.is_sealed():
         raise LogicalMessageObligationUnresolved(
@@ -1016,10 +1025,11 @@ def drop_slot(
             target_restart = int(target_restart)
             retention_confirmed = int(retention_confirmed)
             retention_restart = int(retention_restart)
-            if (
+            retention_covers_target = not (
                 retention_restart > target_restart
                 or retention_confirmed > target_confirmed
-            ):
+            )
+            if not retention_covers_target and not authorization.allow_uncovered_retention:
                 raise _slot_drop_obligation(
                     logical_messages.SourceMessageEvidence(
                         status=logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN,
@@ -1038,26 +1048,37 @@ def drop_slot(
                 )
 
             # Establish the scoped source-message probe below. There is no cluster-wide
-            # WAL high-water predicate: PostgreSQL cannot make such a predicate atomic
-            # with a target-list side effect for arbitrary writers. The probe floor is
-            # the target slot's own confirmed position, not an unrelated destination
-            # fence. It is scoped to the publication and application-prefix policy. A
-            # present application message is safe here because the independent retention
-            # slot still owns its WAL.
+            # WAL equality fence: PostgreSQL cannot make such a predicate atomic with a
+            # target-list side effect for arbitrary writers. When the independent slot
+            # covers the target, it is the best source of pending-range evidence. A
+            # stale standby target may predate a repaired main slot, however, so the
+            # target itself is the only honest probe when that coverage is absent.
+            # Either route still requires the bounded probe to certify emptiness; a
+            # present application message or UNKNOWN result remains a refusal.
             target_confirmed = int(target_confirmed)
+            probe_slot_name = (
+                authorization.retention_slot_name
+                if retention_covers_target
+                else authorization.slot_name
+            )
             evidence = logical_messages._probe_source_message_evidence_connection(
                 conn,
-                slot_name=authorization.retention_slot_name,
+                slot_name=probe_slot_name,
                 publication_name=authorization.publication_name,
                 after_lsn=target_confirmed,
                 application_patterns=authorization.application_patterns,
                 expected_source_identity=authorization.expected_source_identity,
             )
-            if evidence.status == logical_messages.SOURCE_MESSAGE_PROBE_STATUS_UNKNOWN:
+            if evidence.status != logical_messages.SOURCE_MESSAGE_PROBE_STATUS_EMPTY:
                 raise _slot_drop_obligation(
                     evidence,
                     slot_name=authorization.slot_name,
-                    issue="source_slot_evidence_unknown",
+                    issue=(
+                        "source_slot_application_message_unobserved"
+                        if evidence.status
+                        == logical_messages.SOURCE_MESSAGE_PROBE_STATUS_PRESENT
+                        else "source_slot_evidence_unknown"
+                    ),
                 )
 
             rows = conn._execute_drop(*_retention_drop_sql(authorization)).fetchall()

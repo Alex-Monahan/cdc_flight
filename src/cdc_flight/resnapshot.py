@@ -448,6 +448,7 @@ def run(
         retention_slot_name=replication.slot_name,
         publication_name=replication.publication_name,
         application_patterns=replication.message_prefix_allowlist,
+        allow_uncovered_retention=routes.role == "standby",
     )
     # A leftover slot from an interrupted re-snapshot would make Debezium take the
     # pre-existing-slot path, which is exactly the path that does not export a snapshot.
