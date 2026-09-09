@@ -39,6 +39,10 @@ def _service_env() -> dict[str, str]:
         "CDC_SERVICE_LEASE_TTL": "90",
         "CDC_SERVICE_LEASE_RENEW_SECONDS": "5",
         "CDC_SERVICE_HEARTBEAT_BOUND_SECONDS": "15",
+        # The service remains intentionally quiet while the restart assertions
+        # observe durable recovery. Keep the existing source-dark failure mode
+        # enabled, but give this bounded observation enough room to finish.
+        "CDC_SOURCE_DARK_SECONDS": "120",
         # The test observes source publication while the normal owner holds the
         # DuckDB file lock; keep the service alive through the bounded restart
         # observation, then stop it explicitly.
@@ -420,8 +424,9 @@ def test_service_itself_selects_due_modes_and_recovers_restart_matrix(sandbox):
         try:
             _wait_for(lambda: len(_signal_rows(sandbox)) == 1, sandbox=sandbox, process=process, timeout=120)
             # DuckDB's single-owner lock prevents a second connection from reading
-            # run rows while the service is live. The wait is bounded below the test
-            # stall watchdog; the durable assertions follow owner release.
+            # run rows while the service is live. The wait is bounded below the
+            # configured source-dark watchdog; the durable assertions follow owner
+            # release.
             time.sleep(60)
             summary_text = _stop_service(process)
             summary = sandbox.last_summary()
