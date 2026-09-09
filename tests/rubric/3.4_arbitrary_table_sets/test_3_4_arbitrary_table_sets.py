@@ -203,6 +203,72 @@ def test_second_active_signal_is_durably_coalesced_for_the_next_request(monkeypa
         con.close()
 
 
+def test_queued_request_reconciles_after_ack_before_next_poll():
+    """A queued row left after source ACK is recovered by the owner chokepoint."""
+    backfill = require_backfill()
+    con = duckdb.connect(":memory:")
+    try:
+        ensure_control_schema(con)
+        coordinator = backfill.BackfillCoordinator(con, pipeline="ack-gap")
+        first, _first_runs = coordinator.request_tables(
+            ("app.customers",), signal_id="signal-1", request_id="request-1"
+        )
+        coordinator.mark_signal_published(first.signal_id)
+        queued, runs = coordinator.request_tables(
+            ("app.orders",), signal_id="signal-2", request_id="request-2"
+        )
+        assert queued.queued is True
+        assert runs == ()
+
+        coordinator.prepare(coordinator.active("app", "customers"))
+        coordinator.complete_swap(
+            SimpleNamespace(schema="app", table="customers"),
+            snapshot_lsn=17,
+            commit_id=1,
+        )
+        assert coordinator.repository.active_all() == []
+        assert con.execute(
+            "SELECT state, dispatch_signal_id FROM _cdc_flight.backfill_signal_queue "
+            "WHERE request_id = 'request-2'"
+        ).fetchall() == [("queued", None)]
+        assert coordinator.signal_intents.pending() == []
+
+        class RecordingSignalWriter:
+            def __init__(self):
+                self.signals = []
+
+            def insert(self, signal):
+                self.signals.append(signal)
+                return signal.signal_id
+
+        writer = RecordingSignalWriter()
+        effects = coordinator.reconcile_signal_effects(writer, dispatch_queued=True)
+
+        assert len(effects) == 1
+        effect = effects[0]
+        assert effect.intent.kind == "queued_dispatch"
+        assert effect.intent.tables == ("app.orders",)
+        assert effect.dispatched is True
+        assert effect.recovered is False
+        assert [signal.signal_id for signal in writer.signals] == [
+            effect.intent.signal_id
+        ]
+        assert coordinator.signal_intents.pending() == []
+        assert con.execute(
+            "SELECT state, dispatch_signal_id FROM _cdc_flight.backfill_signal_queue "
+            "WHERE request_id = 'request-2'"
+        ).fetchall() == [("dispatched", effect.intent.signal_id)]
+        assert con.execute(
+            "SELECT source_table, signal_id, state FROM _cdc_flight.backfill_runs "
+            "WHERE pipeline = 'ack-gap' ORDER BY source_table"
+        ).fetchall() == [
+            ("customers", "signal-1", "complete"),
+            ("orders", effect.intent.signal_id, "requested"),
+        ]
+    finally:
+        con.close()
+
+
 def test_live_empty_incremental_scan_publishes_an_empty_shadow(tmp_path):
     """A zero-READ terminal outcome replaces the old image, rather than no-oping."""
     backfill = require_backfill()
