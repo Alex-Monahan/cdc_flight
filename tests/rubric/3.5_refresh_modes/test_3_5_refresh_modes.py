@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import duckdb
 import psycopg
 import pytest
 from support.backfill_lab import require_backfill
 
 from cdc_flight.backfill import BackfillCoordinator, RefreshScheduler, StockSignalWriter
+
+
+def _scheduler_clock() -> datetime:
+    return datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
 
 
 def test_each_refresh_mode_is_a_closed_per_table_domain():
@@ -152,6 +158,86 @@ def test_scheduler_policy_and_successor_work_survive_process_restart(tmp_path):
         assert second.signal_queue.queued()[0].request_id == "queued-after-restart"
     finally:
         reopened.close()
+
+
+def test_public_due_owner_selects_coalesces_and_never_acknowledges_source():
+    """The durable clock drives all three policy outcomes at the owner boundary."""
+    from cdc_flight.control_schema import ensure_control_schema
+
+    backfill = require_backfill()
+    now = _scheduler_clock()
+    con = duckdb.connect(":memory:")
+
+    class RecordingWriter:
+        def __init__(self):
+            self.inserted = []
+
+        def insert(self, signal):
+            self.inserted.append(signal)
+            return signal.signal_id
+
+    writer = RecordingWriter()
+    try:
+        ensure_control_schema(con)
+        coordinator = BackfillCoordinator(con, pipeline="due-owner")
+        scheduler = RefreshScheduler(coordinator, signal_writer=writer)
+        due = now.isoformat()
+        scheduler.configure(
+            backfill.RefreshPolicy(
+                "app", "customers", mode="incremental", interval_seconds=60, next_due_at=due
+            )
+        )
+        scheduler.configure(
+            backfill.RefreshPolicy(
+                "app", "orders", mode="full", interval_seconds=60, next_due_at=due
+            )
+        )
+        scheduler.configure(
+            backfill.RefreshPolicy(
+                "app", "audit_log", mode="cdc", interval_seconds=60, next_due_at=due
+            )
+        )
+        scheduler.configure(
+            backfill.RefreshPolicy(
+                "app", "documents", mode="incremental", interval_seconds=60
+            )
+        )
+
+        assert scheduler.has_due_or_pending_intent(now=now) is True
+        first = scheduler.poll_due(now=now, owner="contract-owner")
+
+        assert set(first.selected) == {"app.customers", "app.orders"}
+        assert first.cdc_skipped == ("app.audit_log",)
+        assert first.rejected_unknown_age == ("app.documents",)
+        assert len(first.full_run_ids) == 1
+        assert len(first.incremental_run_ids) == 1
+        assert first.published_signal_ids == (first.signal_ids[0],)
+        assert [signal.signal_id for signal in writer.inserted] == list(first.signal_ids)
+        assert coordinator.active("app", "audit_log") is None
+        assert coordinator.active("app", "customers").state == "requested"
+        assert coordinator.active("app", "orders").effective_mode == "full"
+        assert coordinator.signal_intents.pending() == []
+
+        # Re-fire the same durable schedule while the first incremental generation is
+        # active. It is a coalesced self-edge, not a second run or source signal.
+        scheduler.configure(
+            backfill.RefreshPolicy(
+                "app", "customers", mode="incremental", interval_seconds=60, next_due_at=due
+            )
+        )
+        second = scheduler.poll_due(now=now, owner="contract-owner")
+        assert second.coalesced == ("app.customers",)
+        assert len(coordinator.active_runs()) == 2
+        assert len(writer.inserted) == 1
+        assert coordinator.signal_queue.queued() == []
+
+        next_due = coordinator.policies.get("app", "customers").next_due_at
+        assert next_due is not None
+        assert datetime.fromisoformat(next_due) == now + timedelta(seconds=60)
+        assert coordinator.policies.get("app", "documents").next_due_at is None
+        assert scheduler.has_due_or_pending_intent(now=now) is False
+    finally:
+        con.close()
 
 
 @pytest.mark.slow

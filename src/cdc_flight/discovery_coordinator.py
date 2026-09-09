@@ -19,7 +19,7 @@ from . import reconcile as reconcile_mod
 from . import recovery as recovery_mod
 from . import resnapshot as resnapshot_mod
 from .applier import Applier
-from .backfill import StockSignalWriter
+from .backfill import RefreshScheduler, StockSignalWriter
 from .config import CatalogConfig, ReplicationConfig, RunConfig, SourceConfig
 from .errors import EngineFailure
 from .flight_worker import FlightWorker
@@ -34,6 +34,12 @@ from .supervisor import run_engine_bounded
 from .witness_contract import STOCK_DEBEZIUM_REPLICATION_APPLICATION_NAME
 
 log = logging.getLogger("cdc_flight.discovery_coordinator")
+
+# Policy polling is durable control-plane work, not an invariant heartbeat.  Keep
+# it slower than the five-second service recheck so an empty policy table does not
+# repeatedly touch the MotherDuck destination.  The first service recheck remains
+# immediate so work admitted during startup is dispatched without waiting.
+SERVICE_REFRESH_POLL_SECONDS = 25.0
 
 
 class LiveDiscoveryCoordinator:
@@ -106,6 +112,7 @@ class LiveDiscoveryCoordinator:
         self.descriptor_provider = descriptor_provider
         self.catalog_flush_exclude = set(catalog_flush_exclude or ())
         self.service_context = service_context
+        self._next_refresh_poll_at = 0.0
         self.offset_file = offset_file or self.replication.offset_file
         self.suppress_replayed_message_audit = bool(suppress_replayed_message_audit)
         signal_collection = self.props.get("signal.data.collection")
@@ -666,6 +673,62 @@ class LiveDiscoveryCoordinator:
                 "durable_lsn": durable.last_lsn if durable is not None else None,
                 "offset": offset_result,
             }
+            # The policy poll is part of this existing serialized destination owner.
+            # It is not a SourceHealth callback, a second worker, a slot owner, or an
+            # acknowledgement path.  A full request is handed to the next normal
+            # startup, where pipeline.py runs the existing blocking resnapshot.
+            #
+            # Keep the empty recheck outside the operation/watchdog boundary.  The
+            # preflight is one durable EXISTS read; poll_due() remains the
+            # authoritative selector once it says there is work.  Policy polling
+            # has its own slower cadence: the invariant loop stays at five seconds,
+            # while a new durable policy is observed within one refresh period plus
+            # one invariant interval (at most 30 seconds with the shipped defaults).
+            refresh_now = time.monotonic()
+            if refresh_now < self._next_refresh_poll_at:
+                result["scheduled_refresh"] = {
+                    "checked": False,
+                    "reason": "refresh policy poll cadence",
+                }
+            else:
+                self._next_refresh_poll_at = (
+                    refresh_now + SERVICE_REFRESH_POLL_SECONDS
+                )
+                scheduler = RefreshScheduler(handler.backfill)
+                if not scheduler.has_due_or_pending_intent():
+                    result["scheduled_refresh"] = {
+                        "checked": False,
+                        "reason": "no due policy or pending signal intent",
+                    }
+                else:
+                    context.operation_started()
+                    try:
+                        scheduler = RefreshScheduler(
+                            handler.backfill,
+                            signal_writer=(
+                                StockSignalWriter(
+                                    self.routes.source_write_dsn,
+                                    data_collection=self.props.get("signal.data.collection"),
+                                )
+                                if self.props.get("signal.data.collection")
+                                else None
+                            ),
+                        )
+                        scheduled_poll = scheduler.poll_due(owner="service-destination-owner")
+                        published_signal_ids = scheduler.publish_pending()
+                    finally:
+                        context.operation_finished(progressed=False)
+                    scheduled_poll_summary = scheduled_poll.as_dict()
+                    scheduled_poll_summary["published_signal_ids"] = sorted(
+                        set(scheduled_poll_summary["published_signal_ids"])
+                        | set(published_signal_ids)
+                    )
+                    self.summary_extra.setdefault("scheduled_refresh_polls", []).append(
+                        scheduled_poll_summary
+                    )
+                    result["scheduled_refresh_poll"] = scheduled_poll_summary
+                    if scheduled_poll.full_requested:
+                        context.request_drain()
         context.assert_writable()
         self.summary_extra["service_invariant_recheck"] = result
         return result

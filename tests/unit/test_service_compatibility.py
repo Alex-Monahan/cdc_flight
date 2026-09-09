@@ -199,3 +199,118 @@ def test_service_recheck_invariant_o_guard_is_mutation_sensitive(tmp_path, monke
             coordinator._service_recheck(Handler())
     finally:
         con.close()
+
+
+def test_empty_service_recheck_skips_operation_and_reconciliation(tmp_path, monkeypatch):
+    """An empty durable schedule does not enter the watchdog operation boundary."""
+    from cdc_flight import reconcile
+    from cdc_flight.backfill import BackfillCoordinator
+    from cdc_flight.discovery_coordinator import LiveDiscoveryCoordinator
+
+    con = duckdb.connect(str(tmp_path / "service-empty-refresh.duckdb"))
+
+    class Context:
+        def __init__(self):
+            self.operation_starts = 0
+            self.operation_finishes = 0
+
+        def assert_writable(self):
+            return None
+
+        def operation_started(self):
+            self.operation_starts += 1
+
+        def operation_finished(self, *, progressed=False):
+            del progressed
+            self.operation_finishes += 1
+
+        def request_drain(self):  # pragma: no cover - the empty path must not call it
+            raise AssertionError("an empty schedule requested a service drain")
+
+    context = Context()
+    coordinator = object.__new__(LiveDiscoveryCoordinator)
+    coordinator.service_context = context
+    coordinator.routes = SourceRoutePolicy(
+        role="primary",
+        read_replication_dsn="postgresql://source",
+        source_write_dsn="postgresql://source",
+        slot_owner_dsn="postgresql://source",
+    )
+    coordinator.replication = SimpleNamespace(
+        slot_name="service-slot",
+        offset_file=tmp_path / "offsets.dat",
+    )
+    coordinator.run_cfg = SimpleNamespace(jdbc_connect_timeout_seconds=1)
+    coordinator.con = con
+    coordinator.destination = SimpleNamespace(
+        pipeline_name="service-empty-refresh",
+        control_schema="_cdc_flight",
+    )
+    coordinator.namespace = "cdc-flight-engine"
+    coordinator.props = {"signal.data.collection": "app.cdc_flight_signal"}
+    coordinator.summary_extra = {}
+    coordinator._next_refresh_poll_at = 0.0
+
+    class Handler:
+        _destination_operation_lock = threading.RLock()
+        _quiescence = threading.Condition(_destination_operation_lock)
+        _callback_sealed = False
+
+    from cdc_flight import destination as destination_module
+    from cdc_flight.control_schema import ensure_control_schema
+
+    ensure_control_schema(con, "_cdc_flight")
+    coordinator_backfill = BackfillCoordinator(
+        con, pipeline="service-empty-refresh", control_schema="_cdc_flight"
+    )
+    Handler.backfill = coordinator_backfill
+    point = ResumePoint(
+        partition={"server": "cdcflight"},
+        offset={"lsn": 100},
+        last_lsn=100,
+        commit_id=1,
+    )
+    destination_module.write_resume_point(
+        con,
+        pipeline="service-empty-refresh",
+        namespace="cdc-flight-engine",
+        point=point,
+        commit_id=1,
+        offset_blob=None,
+        offset_key_blob=None,
+        control_schema="_cdc_flight",
+    )
+    monkeypatch.setattr(
+        reconcile,
+        "observe_slot",
+        lambda *_args, **_kwargs: reconcile.SlotObservation(
+            slot_exists=True,
+            active=True,
+            confirmed_flush_lsn=100,
+            restart_lsn=90,
+            system_identifier="system",
+            timeline_id=1,
+        ),
+    )
+    monkeypatch.setattr(destination_module, "read_slot_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "cdc_flight.discovery_coordinator.offsets.verify_service_offset",
+        lambda *_args, **_kwargs: {"verified": True},
+    )
+    monkeypatch.setattr(
+        BackfillCoordinator,
+        "reconcile_signal_effects",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("empty recheck entered reconciliation")
+        ),
+    )
+    try:
+        result = coordinator._service_recheck(Handler())
+        assert result["scheduled_refresh"] == {
+            "checked": False,
+            "reason": "no due policy or pending signal intent",
+        }
+        assert context.operation_starts == 0
+        assert context.operation_finishes == 0
+    finally:
+        con.close()
