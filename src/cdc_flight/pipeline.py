@@ -47,7 +47,7 @@ from . import resnapshot as resnapshot_mod
 from . import resnapshot_batches as rbs
 from . import resnapshot_recovery as resnapshot_recovery_mod
 from . import standby as standby_mod
-from .backfill import BackfillCoordinator
+from .backfill import BackfillCoordinator, RefreshScheduler, StockSignalWriter
 from .completion_stage import PostEngineCompletion
 from .config import (
     ApplierConfig,
@@ -1051,6 +1051,26 @@ def run(
             except ValueError as exc:
                 raise EngineFailure(str(exc), dict(summary_extra)) from exc
 
+        # A live incremental backfill owns its shadow and durable cursor.  The
+        # ordinary table-lifecycle recovery below still promotes interrupted
+        # snapshot work, but an active incremental table must not be sent through
+        # that blocking resnapshot queue on restart.  Capture this set before the
+        # lifecycle promotion so the existing owner can reattach it later.
+        backfill = BackfillCoordinator(
+            con,
+            pipeline=dest.pipeline_name,
+            control_schema=control_schema,
+            topic_prefix=replication.topic_prefix,
+        )
+        preserved_incremental_tables = {
+            run.qualified_table
+            for run in backfill.active_runs()
+            if run.effective_mode == "incremental"
+            and run.state in {
+                "loading", "ready_to_swap", "swapping", "retry_wait", "blocked",
+            }
+        }
+
         interrupted_resnapshot = resnapshot_recovery_mod.requeue_interrupted(
             con,
             pipeline=dest.pipeline_name,
@@ -1067,6 +1087,18 @@ def run(
         owed = dest_mod.tables_awaiting_snapshot(
             con, dest.pipeline_name, control_schema=control_schema
         )
+        owed_for_resnapshot = [
+            row for row in owed
+            if f"{row[0]}.{row[1]}" not in preserved_incremental_tables
+        ]
+        if preserved_incremental_tables & {
+            f"{schema}.{table}" for schema, table, _target in owed
+        }:
+            summary_extra["interrupted_incremental_runs_preserved"] = sorted(
+                preserved_incremental_tables & {
+                    f"{schema}.{table}" for schema, table, _target in owed
+                }
+            )
         will_snapshot_everything = (
             props["snapshot.mode"] == "always"
             or (
@@ -1075,7 +1107,7 @@ def run(
             )
         )
         if (
-            owed
+            owed_for_resnapshot
             and not will_snapshot_everything
             and not recovery_slot_retained
             and acquisition.resnapshot_enabled()
@@ -1094,7 +1126,7 @@ def run(
             # because the journal forces a data-reading mode precisely so that the main
             # engine's own coordinated snapshot IS the rebuild.
             raise EngineFailure(
-                f"{len(owed)} table(s) owe a snapshot and there is no durable resume "
+                f"{len(owed_for_resnapshot)} table(s) owe a snapshot and there is no durable resume "
                 f"point, but snapshot.mode={props['snapshot.mode']!r} does not read "
                 "table data. A throwaway re-snapshot here would leave no slot retaining "
                 "WAL between the image and the main stream, so a transaction committing "
@@ -1105,8 +1137,8 @@ def run(
                 ),
                 dict(summary_extra),
             )
-        if owed and not will_snapshot_everything and acquisition.resnapshot_enabled():
-            phases.to(PHASE_SNAPSHOTTING, detail=f"{len(owed)} table(s) owed")
+        if owed_for_resnapshot and not will_snapshot_everything and acquisition.resnapshot_enabled():
+            phases.to(PHASE_SNAPSHOTTING, detail=f"{len(owed_for_resnapshot)} table(s) owed")
             resnapshot_passes, latest_resnapshot, snapshot_epoch = (
                 rbs.run_owed(
                     con,
@@ -1114,7 +1146,7 @@ def run(
                     replication=replication,
                     pipeline=dest.pipeline_name,
                     dataset=dest.dataset_name,
-                    owed=owed,
+                    owed=owed_for_resnapshot,
                     settings=settings,
                     run_cfg=run_cfg,
                     lease=lease,
@@ -1146,16 +1178,16 @@ def run(
                 watcher.complete_discoveries(
                     {relation.qualified for relation in discovered}
                 )
-        elif owed:
+        elif owed_for_resnapshot:
             log.warning(
                 "%s table(s) are marked awaiting_snapshot and are NOT being "
                 "re-snapshotted on this run (%s): %s",
-                len(owed),
+                len(owed_for_resnapshot),
                 "the run snapshots everything anyway" if will_snapshot_everything
                 else "CDC_RESNAPSHOT=0",
-                ", ".join(f"{s}.{t}" for s, t, _ in owed),
+                ", ".join(f"{s}.{t}" for s, t, _ in owed_for_resnapshot),
             )
-            unhandled = [f"{s}.{t}" for s, t, _ in owed]
+            unhandled = [f"{s}.{t}" for s, t, _ in owed_for_resnapshot]
             summary_extra["tables_awaiting_snapshot_unhandled"] = unhandled
             # Asked of DURABLE STATE (`include_owed=True`), not of what this run
             # remembers marking: the run that discovers a relation refuses, and so does
@@ -1200,11 +1232,25 @@ def run(
         # swap callback, so a restart sees either the old active run or the fully
         # published image. This is deliberately startup consumption: a live main-
         # engine polling loop would create a second source owner.
-        backfill = BackfillCoordinator(
-            con,
-            pipeline=dest.pipeline_name,
-            control_schema=control_schema,
-            topic_prefix=replication.topic_prefix,
+        refresh_scheduler = RefreshScheduler(
+            backfill,
+            signal_writer=(
+                StockSignalWriter(
+                    routes.source_write_dsn,
+                    data_collection=signal_data_collection,
+                )
+                if signal_data_collection
+                else None
+            ),
+        )
+        scheduled_poll = refresh_scheduler.poll_due(
+            owner="service-destination-owner" if service_context is not None else "pipeline-owner",
+            # When a due poll admits both modes, the existing blocking full
+            # hand-off must finish before the stock signal is inserted.  The
+            # request/intent transaction is still committed by poll_due; the
+            # deferred effect below uses the same reconcile chokepoint.
+            publish_signals=False,
+            defer_incremental=service_context is not None,
         )
         scheduled_full = [
             run for run in backfill.active_runs()
@@ -1256,6 +1302,17 @@ def run(
                 reconciliation.resume_point.snapshot_epoch,
                 scheduled_result.snapshot_epoch,
             )
+
+        published_signal_ids = (
+            refresh_scheduler.publish_pending(signal_ids=scheduled_poll.signal_ids)
+            if service_context is None
+            else ()
+        )
+        scheduled_poll_summary = scheduled_poll.as_dict()
+        scheduled_poll_summary["published_signal_ids"] = list(published_signal_ids)
+        summary_extra.setdefault("scheduled_refresh_polls", []).append(
+            scheduled_poll_summary
+        )
 
         # The refusal above is intentionally before the coordinator's
         # `phases.to(PHASE_STREAMING)` transition.
@@ -1361,6 +1418,12 @@ def run(
         )
         try:
             reported = coordinator.run()
+            # The coordinator owns the live service recheck, while this outer
+            # pipeline owns the terminal summary.  Project the coordinator's
+            # shared summary extras on the successful path as well as the
+            # fail-closed path so due-selection evidence is not lost at the
+            # service boundary.
+            reported.update(summary_extra)
             if replay_offset_file is not None:
                 faults_mod.matrix_crash("source_replay_after_md_commit_before_install")
                 source_fingerprint = offsets.replay_offset_fingerprint(replay_offset_file)
@@ -1616,7 +1679,14 @@ def _record_run_failure_alert(
         occurrence_key = OccurrenceKey.from_run(
             run_state, pipeline=dest.pipeline_name
         )
-    elif summary.get("slot_check"):
+    elif (
+        summary.get("slot_check")
+        and summary["slot_check"].get("decision") not in {"ok", "fresh_start"}
+    ):
+        # A successful startup slot observation is present in every normal run.
+        # It must not become the alert code for a later engine failure; doing so
+        # asks the alert state machine to persist the non-failure verdict ``ok``
+        # and hides the actual restart error behind AlertPersistenceFailure.
         code = str(summary["slot_check"].get("decision") or "slot_check_failed")
         severity = "critical"
         slot_check = summary["slot_check"]

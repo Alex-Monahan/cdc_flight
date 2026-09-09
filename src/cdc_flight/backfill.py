@@ -88,6 +88,36 @@ def _now_iso() -> str:
     return datetime.now().astimezone().isoformat()
 
 
+def _durable_utc(value: datetime | str | None, *, field: str) -> datetime:
+    """Decode a scheduler timestamp without guessing an unknown timezone."""
+    if value is None:
+        raise ValueError(f"{field} is missing")
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        raw = str(value).strip()
+        if raw.endswith("Z"):
+            raw = f"{raw[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError as exc:
+            raise ValueError(f"{field} is not an ISO-8601 timestamp: {value!r}") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{field} has unknown timezone/age: {value!r}")
+    return parsed.astimezone(UTC)
+
+
+def _durable_clock(value: datetime | str | None) -> datetime:
+    """Return one timezone-aware UTC instant for a due-policy poll."""
+    if value is None:
+        return datetime.now(UTC)
+    return _durable_utc(value, field="refresh poll clock")
+
+
+def _timestamp_text(value: datetime) -> str:
+    return value.astimezone(UTC).isoformat()
+
+
 def _stable_json(value: Any) -> Any:
     """Turn a delivered runtime value into a type-preserving JSON tree.
 
@@ -689,6 +719,10 @@ class RefreshPolicy:
     def __post_init__(self) -> None:
         if self.mode not in REFRESH_MODES:
             raise ValueError(f"refresh mode must be one of {REFRESH_MODES}")
+
+    @property
+    def qualified_table(self) -> str:
+        return f"{self.source_schema}.{self.source_table}"
 
 
 @dataclass(frozen=True)
@@ -1367,6 +1401,8 @@ class RefreshPolicyRepository:
         self.table = control_table(self.control_schema, "refresh_policy")
 
     def upsert(self, policy: RefreshPolicy) -> RefreshPolicy:
+        if policy.interval_seconds is not None and float(policy.interval_seconds) <= 0:
+            raise ValueError("refresh interval_seconds must be positive")
         self.con.execute(
             f"INSERT INTO {self.table} "
             "(pipeline, source_schema, source_table, mode, enabled, interval_seconds, next_due_at, "
@@ -1386,6 +1422,33 @@ class RefreshPolicyRepository:
         )
         return policy
 
+    @staticmethod
+    def _decode(row) -> RefreshPolicy:
+        return RefreshPolicy(
+            str(row[0]),
+            str(row[1]),
+            mode=str(row[2]),
+            enabled=bool(row[3]),
+            interval_seconds=row[4],
+            next_due_at=None if row[5] is None else str(row[5]),
+            size_threshold_bytes=row[6],
+            time_threshold_ms=row[7],
+            retry_initial_seconds=float(row[8]),
+            retry_max_seconds=float(row[9]),
+        )
+
+    def all(self) -> list[RefreshPolicy]:
+        """Read the durable policy set in stable table order."""
+        rows = _read_relation(
+            self.con,
+            f"SELECT source_schema, source_table, mode, enabled, interval_seconds, "
+            f"next_due_at, size_threshold_bytes, time_threshold_ms, "
+            f"retry_initial_seconds, retry_max_seconds FROM {self.table} "
+            "WHERE pipeline = ? ORDER BY source_schema, source_table",
+            [self.pipeline],
+        ).fetchall()
+        return [self._decode(row) for row in rows]
+
     def get(self, schema: str, table: str) -> RefreshPolicy | None:
         row = _read_relation(self.con,
             f"SELECT mode, enabled, interval_seconds, next_due_at, size_threshold_bytes, "
@@ -1395,17 +1458,16 @@ class RefreshPolicyRepository:
         ).fetchone()
         if row is None:
             return None
-        return RefreshPolicy(
-            schema,
-            table,
-            mode=str(row[0]),
-            enabled=bool(row[1]),
-            interval_seconds=row[2],
-            next_due_at=None if row[3] is None else str(row[3]),
-            size_threshold_bytes=row[4],
-            time_threshold_ms=row[5],
-            retry_initial_seconds=float(row[6]),
-            retry_max_seconds=float(row[7]),
+        return self._decode((schema, table, *row))
+
+    def set_next_due_at(
+        self, schema: str, table: str, next_due_at: str | None
+    ) -> None:
+        """Advance only the durable schedule cursor inside the caller's transaction."""
+        self.con.execute(
+            f"UPDATE {self.table} SET next_due_at = ?, updated_at = ? "
+            "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+            [next_due_at, datetime.now(UTC), self.pipeline, schema, table],
         )
 
 
@@ -1553,6 +1615,7 @@ class BackfillCoordinator:
         reason: str = "scheduled",
         request_id: str | None = None,
         signal_id: str | None = None,
+        in_transaction: bool = False,
     ) -> tuple[IncrementalSignal, tuple[BackfillRun, ...]]:
         """Admit one arbitrary stock signal set and one run per table.
 
@@ -1635,8 +1698,9 @@ class BackfillCoordinator:
                 faults.maybe_crash("before_request_md_commit", 1)
                 return queued_signal, ()
 
-            result = self.repository.transaction(enqueue)
-            faults.maybe_crash("after_request_commit_before_signal", 1)
+            result = enqueue() if in_transaction else self.repository.transaction(enqueue)
+            if not in_transaction:
+                faults.maybe_crash("after_request_commit_before_signal", 1)
             return result
 
         def admit() -> tuple[IncrementalSignal, tuple[BackfillRun, ...]]:
@@ -1661,8 +1725,9 @@ class BackfillCoordinator:
             faults.maybe_crash("before_request_md_commit", 1)
             return signal, tuple(runs)
 
-        result = self.repository.transaction(admit)
-        faults.maybe_crash("after_request_commit_before_signal", 1)
+        result = admit() if in_transaction else self.repository.transaction(admit)
+        if not in_transaction:
+            faults.maybe_crash("after_request_commit_before_signal", 1)
         return result
 
     def dispatch_queued(self) -> tuple[IncrementalSignal, tuple[BackfillRun, ...]] | None:
@@ -2003,6 +2068,44 @@ class BackfillCoordinator:
         )
 
 
+@dataclass(frozen=True)
+class RefreshPollResult:
+    """Durable evidence returned by one due-policy owner poll."""
+
+    owner: str
+    now: str
+    selected: tuple[str, ...] = ()
+    coalesced: tuple[str, ...] = ()
+    cdc_skipped: tuple[str, ...] = ()
+    rejected_unknown_age: tuple[str, ...] = ()
+    full_run_ids: tuple[str, ...] = ()
+    incremental_run_ids: tuple[str, ...] = ()
+    signal_ids: tuple[str, ...] = ()
+    queued_signal_ids: tuple[str, ...] = ()
+    published_signal_ids: tuple[str, ...] = ()
+
+    @property
+    def full_requested(self) -> bool:
+        return bool(self.full_run_ids)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "owner": self.owner,
+            "now": self.now,
+            "selected": list(self.selected),
+            "coalesced": list(self.coalesced),
+            "cdc_skipped": list(self.cdc_skipped),
+            "rejected_unknown_age": list(self.rejected_unknown_age),
+            "full_run_ids": list(self.full_run_ids),
+            "incremental_run_ids": list(self.incremental_run_ids),
+            "signal_ids": list(self.signal_ids),
+            "queued_signal_ids": list(self.queued_signal_ids),
+            "published_signal_ids": list(self.published_signal_ids),
+            "source_effect_route": "reconcile_signal_effects",
+            "source_signal_inserted_directly": False,
+        }
+
+
 class RefreshScheduler:
     """Schedule one of the three table modes without becoming an ack owner.
 
@@ -2049,6 +2152,7 @@ class RefreshScheduler:
         reason: str = "scheduled",
         request_id: str | None = None,
         signal_id: str | None = None,
+        _in_transaction: bool = False,
     ) -> tuple[IncrementalSignal | None, tuple[BackfillRun, ...]]:
         if mode not in REFRESH_MODES:
             raise ValueError(mode)
@@ -2061,8 +2165,14 @@ class RefreshScheduler:
                 reason=reason,
                 request_id=request_id,
                 signal_id=signal_id,
+                in_transaction=_in_transaction,
             )
-            if self.signal_writer is not None and not signal.is_noop and not signal.queued:
+            if (
+                not _in_transaction
+                and self.signal_writer is not None
+                and not signal.is_noop
+                and not signal.queued
+            ):
                 # This is deliberately outside the MD transaction and outside the
                 # commit-to-ack window. The durable intent makes a process death in
                 # this gap retryable, while the source writer's signal_id conflict
@@ -2086,7 +2196,186 @@ class RefreshScheduler:
                 for schema, table in [qualified.split(".", 1)]
             )
 
-        return None, self.coordinator.repository.transaction(admit_full)
+        return None, (
+            admit_full()
+            if _in_transaction
+            else self.coordinator.repository.transaction(admit_full)
+        )
+
+    def poll_due(
+        self,
+        *,
+        now: datetime | str | None = None,
+        owner: str = "destination-owner",
+        publish_signals: bool = True,
+        defer_incremental: bool = False,
+    ) -> RefreshPollResult:
+        """Select and admit due policies through the existing destination owner.
+
+        The policy/run transaction is committed before this method asks the shared
+        coordinator to reconcile a stock source effect.  Full work is only admitted
+        here; the existing blocking resnapshot consumes it at the next startup
+        boundary.  CDC policies advance no backfill state.
+        """
+        if not owner:
+            raise ValueError("refresh poll owner must not be empty")
+        clock = _durable_clock(now)
+        due_full: list[tuple[RefreshPolicy, datetime]] = []
+        due_incremental: list[tuple[RefreshPolicy, datetime]] = []
+        due_cdc: list[tuple[RefreshPolicy, datetime]] = []
+        rejected_unknown_age: list[str] = []
+
+        for policy in self.coordinator.policies.all():
+            if not policy.enabled:
+                continue
+            scheduled = policy.next_due_at is not None or policy.interval_seconds is not None
+            if not scheduled:
+                continue
+            try:
+                due_at = _durable_utc(
+                    policy.next_due_at,
+                    field=f"refresh policy {policy.source_schema}.{policy.source_table} next_due_at",
+                )
+            except ValueError:
+                rejected_unknown_age.append(policy.qualified_table)
+                continue
+            if policy.interval_seconds is not None and float(policy.interval_seconds) <= 0:
+                rejected_unknown_age.append(policy.qualified_table)
+                continue
+            if due_at > clock:
+                continue
+            if defer_incremental and policy.mode == "incremental":
+                # A live service starts its main stock engine before the first
+                # incremental signal.  The existing service-owner recheck then
+                # selects this still-due policy and publishes it while the stock
+                # signal processor is already running.  Full work remains
+                # eligible for the blocking startup hand-off below.
+                continue
+            if policy.mode == "cdc":
+                due_cdc.append((policy, due_at))
+            elif policy.mode == "full":
+                due_full.append((policy, due_at))
+            elif policy.mode == "incremental":
+                due_incremental.append((policy, due_at))
+            else:  # pragma: no cover - RefreshPolicy validates the domain
+                rejected_unknown_age.append(policy.qualified_table)
+
+        due_full.sort(key=lambda item: item[0].qualified_table)
+        due_incremental.sort(key=lambda item: item[0].qualified_table)
+        due_cdc.sort(key=lambda item: item[0].qualified_table)
+        selected_policies = due_full + due_incremental
+        selected = tuple(policy.qualified_table for policy, _due_at in selected_policies)
+        cdc_skipped = tuple(policy.qualified_table for policy, _due_at in due_cdc)
+        coalesced = tuple(
+            policy.qualified_table
+            for policy, _due_at in selected_policies
+            if self.coordinator.active(policy.source_schema, policy.source_table) is not None
+        )
+
+        full_run_ids: list[str] = []
+        incremental_run_ids: list[str] = []
+        signal_ids: list[str] = []
+        queued_signal_ids: list[str] = []
+
+        def advance(policy: RefreshPolicy, due_at: datetime) -> None:
+            interval = policy.interval_seconds
+            if interval is None:
+                next_due = None
+            else:
+                next_due_at = due_at + timedelta(seconds=float(interval))
+                while next_due_at <= clock:
+                    next_due_at += timedelta(seconds=float(interval))
+                next_due = _timestamp_text(next_due_at)
+            self.coordinator.policies.set_next_due_at(
+                policy.source_schema, policy.source_table, next_due
+            )
+
+        def admit_due() -> None:
+            for policy, due_at in due_cdc:
+                advance(policy, due_at)
+
+            if due_full:
+                full_signal, runs = self.request_tables(
+                    [policy.qualified_table for policy, _due_at in due_full],
+                    mode="full",
+                    reason="scheduled",
+                    request_id=f"scheduled-full-{uuid.uuid4().hex}",
+                    _in_transaction=True,
+                )
+                if full_signal is not None:  # pragma: no cover - full has no signal
+                    raise BackfillInvariantError("full refresh unexpectedly produced a stock signal")
+                # A policy transition to full while an incremental run is already
+                # loading preserves that active run/cursor.  It is not a new full
+                # request, and must not make the service drain into a second
+                # snapshot engine.
+                full_run_ids.extend(
+                    run.run_id for run in runs if run.effective_mode == "full"
+                )
+                for policy, due_at in due_full:
+                    advance(policy, due_at)
+
+            if due_incremental:
+                signal, runs = self.request_tables(
+                    [policy.qualified_table for policy, _due_at in due_incremental],
+                    mode="incremental",
+                    reason="scheduled",
+                    request_id=f"scheduled-incremental-{uuid.uuid4().hex}",
+                    _in_transaction=True,
+                )
+                if signal.is_noop:  # pragma: no cover - the selected set is non-empty
+                    raise BackfillInvariantError("incremental refresh unexpectedly produced a no-op")
+                signal_ids.append(signal.signal_id)
+                if signal.queued:
+                    queued_signal_ids.append(signal.signal_id)
+                incremental_run_ids.extend(run.run_id for run in runs)
+                for policy, due_at in due_incremental:
+                    advance(policy, due_at)
+
+        if due_full or due_incremental or due_cdc:
+            self.coordinator.repository.transaction(admit_due)
+
+        # A source effect is never inserted in the policy/run transaction.  This is
+        # deliberately the inherited chokepoint: its only production INSERT caller is
+        # ``_publish_signal_intent`` and retries remain idempotent by signal_id.
+        published = (
+            self.publish_pending(signal_ids=signal_ids)
+            if publish_signals and signal_ids
+            else ()
+        )
+        return RefreshPollResult(
+            owner=owner,
+            now=_timestamp_text(clock),
+            selected=selected,
+            coalesced=coalesced,
+            cdc_skipped=cdc_skipped,
+            rejected_unknown_age=tuple(rejected_unknown_age),
+            full_run_ids=tuple(full_run_ids),
+            incremental_run_ids=tuple(incremental_run_ids),
+            signal_ids=tuple(signal_ids),
+            queued_signal_ids=tuple(queued_signal_ids),
+            published_signal_ids=published,
+        )
+
+    def publish_pending(self, *, signal_ids: Iterable[str] | None = None) -> tuple[str, ...]:
+        """Publish durable incremental intents through the inherited chokepoint.
+
+        A startup poll may defer this step until the existing blocking full
+        resnapshot has completed.  The source effect still happens only after
+        the policy/run transaction, and this method still reaches
+        ``reconcile_signal_effects`` rather than adding a source INSERT path.
+        """
+        if self.signal_writer is None:
+            return ()
+        allowed = None if signal_ids is None else set(signal_ids)
+        if allowed is not None and not allowed:
+            return ()
+        faults.maybe_crash("after_request_commit_before_signal", 1)
+        effects = self.coordinator.reconcile_signal_effects(self.signal_writer)
+        return tuple(
+            effect.intent.signal_id
+            for effect in effects
+            if allowed is None or effect.intent.signal_id in allowed
+        )
 
     def dispatch_queued(
         self,
@@ -2563,6 +2852,7 @@ __all__ = [
     "QueuedSignalRequest",
     "RefreshCoordinator",
     "RefreshPolicy",
+    "RefreshPollResult",
     "RefreshScheduler",
     "ResumableBackfillLab",
     "StockSignalWriter",

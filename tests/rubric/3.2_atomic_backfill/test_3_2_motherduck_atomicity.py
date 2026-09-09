@@ -19,7 +19,9 @@ def test_separate_motherduck_reader_sees_old_or_new_complete_image(motherduck_ca
     dsn = f"md:{database}?motherduck_token={token}"
     writer = duckdb.connect(dsn)
     reader = duckdb.connect(dsn)
-    observations: list[tuple[str, str]] = []
+    # Keep the owner regression in the same reader transaction: the published
+    # image, durable policy mode, and run state must never expose a mixed pair.
+    observations: list[tuple[str, str, str, str]] = []
     stop = threading.Event()
     thread: threading.Thread | None = None
 
@@ -36,15 +38,17 @@ def test_separate_motherduck_reader_sees_old_or_new_complete_image(motherduck_ca
                     rows = reader.execute(
                         f'SELECT id, value FROM "{schema}".live ORDER BY id'
                     ).fetchall()
-                    marker = reader.execute(
-                        f'SELECT marker FROM "{schema}".state'
-                    ).fetchone()[0]
+                    marker, policy_mode, run_state = reader.execute(
+                        f'SELECT marker, policy_mode, run_state FROM "{schema}".state'
+                    ).fetchone()
                 finally:
                     reader.execute("ROLLBACK")
                 image = "old" if rows == [(1, "old"), (2, "old")] else (
                     "new" if rows == [(1, "new"), (2, "new"), (3, "new")] else "partial"
                 )
-                observations.append((image, str(marker)))
+                observations.append(
+                    (image, str(marker), str(policy_mode), str(run_state))
+                )
             except duckdb.Error:
                 # The fixture is created before the observer starts; this only
                 # tolerates a transient catalog refresh and is not a success path.
@@ -62,8 +66,13 @@ def test_separate_motherduck_reader_sees_old_or_new_complete_image(motherduck_ca
         writer.execute(
             f'INSERT INTO "{schema}".shadow VALUES (1, \'new\'), (2, \'new\'), (3, \'new\')'
         )
-        writer.execute(f'CREATE TABLE "{schema}".state (marker VARCHAR)')
-        writer.execute(f'INSERT INTO "{schema}".state VALUES (\'old\')')
+        writer.execute(
+            f'CREATE TABLE "{schema}".state '
+            '(marker VARCHAR, policy_mode VARCHAR, run_state VARCHAR)'
+        )
+        writer.execute(
+            f'INSERT INTO "{schema}".state VALUES (\'old\', \'cdc\', \'requested\')'
+        )
         writer.execute("CHECKPOINT")
         thread = threading.Thread(target=observe, daemon=True)
         thread.start()
@@ -73,7 +82,10 @@ def test_separate_motherduck_reader_sees_old_or_new_complete_image(motherduck_ca
         time.sleep(0.2)
         writer.execute(f'ALTER TABLE "{schema}".shadow RENAME TO live')
         time.sleep(0.2)
-        writer.execute(f'UPDATE "{schema}".state SET marker = \'new\'')
+        writer.execute(
+            f'UPDATE "{schema}".state SET marker = \'new\', '
+            "policy_mode = \'incremental\', run_state = \'complete\'"
+        )
         time.sleep(0.2)
         writer.execute("COMMIT")
         deadline = time.monotonic() + 10
@@ -82,9 +94,12 @@ def test_separate_motherduck_reader_sees_old_or_new_complete_image(motherduck_ca
         stop.set()
         thread.join(timeout=10)
         assert not thread.is_alive()
-        assert ("old", "old") in observations
-        assert ("new", "new") in observations
-        assert set(observations) <= {("old", "old"), ("new", "new")}
+        assert ("old", "old", "cdc", "requested") in observations
+        assert ("new", "new", "incremental", "complete") in observations
+        assert set(observations) <= {
+            ("old", "old", "cdc", "requested"),
+            ("new", "new", "incremental", "complete"),
+        }
     finally:
         stop.set()
         if thread is not None:
