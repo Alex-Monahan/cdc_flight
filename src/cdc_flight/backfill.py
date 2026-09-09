@@ -71,6 +71,19 @@ class BackfillInvariantError(BackfillError):
     """A commit/ack, identity, or whole-unit invariant was violated."""
 
 
+def _read_relation(con, statement: str, params: Iterable[Any] = ()):
+    """Materialize a read without sharing DuckDB's mutable last-result slot.
+
+    The applier callback and the completion-watermark poll can query the same
+    destination handle concurrently.  ``execute(...).fetch*()`` reads that
+    handle-wide result slot, so another operation can replace it between the two
+    calls.  ``sql`` returns an independent relation snapshot while retaining this
+    connection's transaction visibility for repository reads inside an atomic
+    commit.
+    """
+    return con.sql(statement, params=list(params))
+
+
 def _now_iso() -> str:
     return datetime.now().astimezone().isoformat()
 
@@ -834,7 +847,7 @@ class BackfillRepository:
         )
 
     def get(self, run_id: str) -> BackfillRun | None:
-        row = self.con.execute(
+        row = _read_relation(self.con,
             f"SELECT {self._COLUMNS} FROM {self.table} "
             "WHERE pipeline = ? AND run_id = ?",
             [self.pipeline, run_id],
@@ -842,11 +855,13 @@ class BackfillRepository:
         return None if row is None else self._row(row)
 
     def active(self, schema: str, table: str) -> BackfillRun | None:
-        row = self.con.execute(
+        states = tuple(sorted(ACTIVE_RUN_STATES))
+        row = _read_relation(self.con,
             f"SELECT {self._COLUMNS} FROM {self.table} "
             "WHERE pipeline = ? AND source_schema = ? AND source_table = ? "
-            "AND state <> 'complete' ORDER BY created_at DESC LIMIT 1",
-            [self.pipeline, schema, table],
+            f"AND state IN ({','.join('?' for _ in states)}) "
+            "ORDER BY created_at DESC LIMIT 1",
+            [self.pipeline, schema, table, *states],
         ).fetchone()
         return None if row is None else self._row(row)
 
@@ -855,7 +870,7 @@ class BackfillRepository:
         active = self.active(schema, table)
         if active is not None:
             return active
-        row = self.con.execute(
+        row = _read_relation(self.con,
             f"SELECT {self._COLUMNS} FROM {self.table} "
             "WHERE pipeline = ? AND source_schema = ? AND source_table = ? "
             "AND state = 'complete' ORDER BY updated_at DESC LIMIT 1",
@@ -863,11 +878,30 @@ class BackfillRepository:
         ).fetchone()
         return None if row is None else self._row(row)
 
-    def active_all(self) -> list[BackfillRun]:
-        rows = self.con.execute(
+    def active_all(self, *, include_blocked: bool = False) -> list[BackfillRun]:
+        # ``blocked`` is a durable contained outcome: it retains the failed table's
+        # retry state, but it no longer owns a live Stock signal.  The dispatch idle
+        # predicate must therefore not strand unrelated queued work behind it.  The
+        # admission path asks for ``include_blocked=True`` so it remains conservative
+        # when correlating an already durable run and can never create a second run
+        # for that table.
+        states = set(ACTIVE_RUN_STATES)
+        if not include_blocked:
+            states.discard("blocked")
+        ordered_states = tuple(sorted(states))
+        rows = _read_relation(self.con,
             f"SELECT {self._COLUMNS} FROM {self.table} "
-            "WHERE pipeline = ? AND state <> 'complete' ORDER BY created_at, run_id",
-            [self.pipeline],
+            f"WHERE pipeline = ? AND state IN ({','.join('?' for _ in ordered_states)}) "
+            "ORDER BY created_at, run_id",
+            [self.pipeline, *ordered_states],
+        ).fetchall()
+        return [self._row(row) for row in rows]
+
+    def by_signal(self, signal_id: str) -> list[BackfillRun]:
+        rows = _read_relation(self.con,
+            f"SELECT {self._COLUMNS} FROM {self.table} "
+            "WHERE pipeline = ? AND signal_id = ? ORDER BY source_schema, source_table, run_id",
+            [self.pipeline, signal_id],
         ).fetchall()
         return [self._row(row) for row in rows]
 
@@ -1066,6 +1100,94 @@ class QueuedSignalRequest:
     dispatch_signal_id: str | None = None
 
 
+@dataclass(frozen=True)
+class BackfillSignalIntent:
+    signal_id: str
+    tables: tuple[str, ...]
+    kind: str
+    state: str
+
+
+@dataclass(frozen=True)
+class BackfillSignalEffect:
+    """One source-side effect completed by the durable-intent chokepoint."""
+
+    intent: BackfillSignalIntent
+    runs: tuple[BackfillRun, ...]
+    recovered: bool
+    dispatched: bool
+
+
+class BackfillSignalIntentRepository:
+    """Durable intent for the source-side INSERT that follows destination admission."""
+
+    def __init__(self, con, *, pipeline: str, control_schema: str | None = None):
+        self.con = con
+        self.pipeline = pipeline
+        self.control_schema = resolve_control_schema(control_schema)
+        self.table = control_table(self.control_schema, "backfill_signal_intents")
+
+    @staticmethod
+    def _decode(row) -> BackfillSignalIntent:
+        return BackfillSignalIntent(
+            signal_id=str(row[0]),
+            tables=tuple(json.loads(str(row[1]))),
+            kind=str(row[2]),
+            state=str(row[3]),
+        )
+
+    def get(self, signal_id: str) -> BackfillSignalIntent | None:
+        row = _read_relation(self.con,
+            f"SELECT signal_id, tables_json, kind, state FROM {self.table} "
+            "WHERE pipeline = ? AND signal_id = ?",
+            [self.pipeline, signal_id],
+        ).fetchone()
+        return None if row is None else self._decode(row)
+
+    def pending(self) -> list[BackfillSignalIntent]:
+        rows = _read_relation(self.con,
+            f"SELECT signal_id, tables_json, kind, state FROM {self.table} "
+            "WHERE pipeline = ? AND state = 'pending' ORDER BY created_at, signal_id",
+            [self.pipeline],
+        ).fetchall()
+        return [self._decode(row) for row in rows]
+
+    def record(self, signal: IncrementalSignal, *, kind: str) -> BackfillSignalIntent:
+        if signal.is_noop or signal.queued:
+            raise ValueError("only a published, non-empty signal can have a source intent")
+        if kind not in {"admission", "queued_dispatch"}:
+            raise ValueError(f"unknown source signal intent kind {kind!r}")
+        existing = self.get(signal.signal_id)
+        now = datetime.now(UTC)
+        if existing is not None:
+            if existing.tables != signal.tables or existing.kind != kind:
+                raise BackfillInvariantError(
+                    f"source signal intent {signal.signal_id} changed its durable payload"
+                )
+            return existing
+        self.con.execute(
+            f"INSERT INTO {self.table} "
+            "(pipeline, signal_id, tables_json, kind, state, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+            [
+                self.pipeline,
+                signal.signal_id,
+                json.dumps(signal.tables, separators=(",", ":")),
+                kind,
+                now,
+                now,
+            ],
+        )
+        return self.get(signal.signal_id)
+
+    def mark_published(self, signal_id: str) -> None:
+        self.con.execute(
+            f"UPDATE {self.table} SET state = 'published', published_at = ?, updated_at = ? "
+            "WHERE pipeline = ? AND signal_id = ? AND state = 'pending'",
+            [datetime.now(UTC), datetime.now(UTC), self.pipeline, signal_id],
+        )
+
+
 class BackfillSignalQueueRepository:
     """Durable successor requests for stock signal correlation."""
 
@@ -1087,7 +1209,7 @@ class BackfillSignalQueueRepository:
         )
 
     def get(self, request_id: str) -> QueuedSignalRequest | None:
-        row = self.con.execute(
+        row = _read_relation(self.con,
             f"SELECT request_id, signal_id, tables_json, trigger_reason, state, "
             f"dispatch_signal_id FROM {self.table} WHERE pipeline = ? AND request_id = ?",
             [self.pipeline, request_id],
@@ -1095,7 +1217,7 @@ class BackfillSignalQueueRepository:
         return None if row is None else self._decode(row)
 
     def queued(self) -> list[QueuedSignalRequest]:
-        rows = self.con.execute(
+        rows = _read_relation(self.con,
             f"SELECT request_id, signal_id, tables_json, trigger_reason, state, "
             f"dispatch_signal_id FROM {self.table} WHERE pipeline = ? AND state = 'queued' "
             "ORDER BY created_at, request_id",
@@ -1176,7 +1298,7 @@ class ShadowClaimRepository:
         )
 
     def state(self, schema: str, table: str) -> tuple[str, str, str] | None:
-        row = self.con.execute(
+        row = _read_relation(self.con,
             f"SELECT claim_state, owner_kind, owner_id FROM {self.table} "
             "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
             [self.pipeline, schema, table],
@@ -1265,7 +1387,7 @@ class RefreshPolicyRepository:
         return policy
 
     def get(self, schema: str, table: str) -> RefreshPolicy | None:
-        row = self.con.execute(
+        row = _read_relation(self.con,
             f"SELECT mode, enabled, interval_seconds, next_due_at, size_threshold_bytes, "
             f"time_threshold_ms, retry_initial_seconds, retry_max_seconds FROM {self.table} "
             "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
@@ -1308,6 +1430,9 @@ class BackfillCoordinator:
         self.signal_queue = BackfillSignalQueueRepository(
             con, pipeline=pipeline, control_schema=self.control_schema
         )
+        self.signal_intents = BackfillSignalIntentRepository(
+            con, pipeline=pipeline, control_schema=self.control_schema
+        )
         self.claims = ShadowClaimRepository(
             con, pipeline=pipeline, control_schema=self.control_schema
         )
@@ -1329,19 +1454,76 @@ class BackfillCoordinator:
         replay into an acknowledgeable control unit instead of routing it into the
         new live table.
         """
-        active = self.repository.active(schema, table)
-        if active is not None:
-            return active
-        row = self.con.execute(
-            f"SELECT {self.repository._COLUMNS} FROM {self.repository.table} "
-            "WHERE pipeline = ? AND source_schema = ? AND source_table = ? "
-            "AND state = 'complete' ORDER BY updated_at DESC, created_at DESC LIMIT 1",
-            [self.pipeline, schema, table],
-        ).fetchone()
-        return None if row is None else self.repository._row(row)
+        return self.repository.progress_owner(schema, table)
 
     def active_runs(self) -> list[BackfillRun]:
-        return self.repository.active_all()
+        return self.repository.active_all(include_blocked=True)
+
+    def mark_signal_published(self, signal_id: str) -> None:
+        """Acknowledge a source INSERT after its PostgreSQL transaction commits."""
+        self.repository.transaction(lambda: self.signal_intents.mark_published(signal_id))
+
+    def _publish_signal_intent(
+        self, intent: BackfillSignalIntent, writer: StockSignalWriter
+    ) -> tuple[BackfillRun, ...]:
+        """Apply one pending source effect, then acknowledge its intent."""
+        signal = IncrementalSignal(intent.signal_id, intent.tables)
+        writer.insert(signal)
+        # The source row is committed in PostgreSQL before this separate
+        # destination acknowledgement.  Repeating the same idempotent INSERT is
+        # safe if the owner dies in this interval.
+        faults.maybe_crash("after_recovery_signal_insert_before_intent_ack", 1)
+        self.mark_signal_published(intent.signal_id)
+        return tuple(self.repository.by_signal(intent.signal_id))
+
+    def reconcile_signal_effects(
+        self,
+        writer: StockSignalWriter,
+        *,
+        dispatch_queued: bool = False,
+    ) -> tuple[BackfillSignalEffect, ...]:
+        """Reconcile every durable transition with its independent source effect.
+
+        This is the sole production chokepoint for stock source effects.  It first
+        applies all pending intents, then (when the owner has crossed a completed
+        active-generation boundary) dispatches queued work.  The dispatch itself
+        records a new intent in the same MotherDuck transaction; the loop immediately
+        drains that intent through this method before returning.
+        """
+        initial_pending = {
+            intent.signal_id for intent in self.signal_intents.pending()
+        }
+        effects: list[BackfillSignalEffect] = []
+        while True:
+            pending = self.signal_intents.pending()
+            for intent in pending:
+                runs = self._publish_signal_intent(intent, writer)
+                effects.append(
+                    BackfillSignalEffect(
+                        intent=intent,
+                        runs=runs,
+                        recovered=intent.signal_id in initial_pending,
+                        dispatched=(intent.kind == "queued_dispatch"),
+                    )
+                )
+            if not dispatch_queued:
+                break
+            dispatched = self.dispatch_queued()
+            if dispatched is None:
+                break
+            _signal, _runs = dispatched
+            # ``dispatch_queued`` committed a new intent.  The next iteration
+            # publishes it through the same path before this call can return.
+        return tuple(effects)
+
+    def recover_signal_intents(
+        self, writer: StockSignalWriter
+    ) -> tuple[tuple[BackfillSignalIntent, tuple[BackfillRun, ...]], ...]:
+        """Compatibility view of the chokepoint's non-dispatching recovery pass."""
+        return tuple(
+            (effect.intent, effect.runs)
+            for effect in self.reconcile_signal_effects(writer)
+        )
 
     def request(
         self,
@@ -1389,7 +1571,7 @@ class BackfillCoordinator:
             # typed no-op keeps the arbitrary-set API total without creating a
             # signal row, run, claim, or source-offset obligation.
             return IncrementalSignal(signal_id or uuid.uuid4().hex, ()), ()
-        active_runs = self.repository.active_all()
+        active_runs = self.repository.active_all(include_blocked=True)
         active_signal_ids = {
             run.signal_id for run in active_runs if run.signal_id is not None
         }
@@ -1475,6 +1657,7 @@ class BackfillCoordinator:
                     )
                 run = self.repository.set_signal(run, signal.signal_id)
                 runs.append(run)
+            self.signal_intents.record(signal, kind="admission")
             faults.maybe_crash("before_request_md_commit", 1)
             return signal, tuple(runs)
 
@@ -1516,6 +1699,7 @@ class BackfillCoordinator:
             self.signal_queue.mark_dispatched(
                 (request.request_id for request in queued), signal.signal_id
             )
+            self.signal_intents.record(signal, kind="queued_dispatch")
             faults.maybe_crash("before_request_md_commit", 1)
             return signal, tuple(runs)
 
@@ -1880,9 +2064,10 @@ class RefreshScheduler:
             )
             if self.signal_writer is not None and not signal.is_noop and not signal.queued:
                 # This is deliberately outside the MD transaction and outside the
-                # commit-to-ack window: a failed source insert leaves the durable
-                # request retryable instead of inventing a second run.
-                self.signal_writer.insert(signal)
+                # commit-to-ack window. The durable intent makes a process death in
+                # this gap retryable, while the source writer's signal_id conflict
+                # handling keeps the retry from creating a second source row.
+                self.coordinator.reconcile_signal_effects(self.signal_writer)
             return signal, runs
 
         def admit_full() -> tuple[BackfillRun, ...]:
@@ -1907,12 +2092,16 @@ class RefreshScheduler:
         self,
     ) -> tuple[IncrementalSignal, tuple[BackfillRun, ...]] | None:
         """Publish one coalesced successor signal after the active run is done."""
-        result = self.coordinator.dispatch_queued()
-        if result is not None and self.signal_writer is not None:
-            signal, _runs = result
-            if not signal.is_noop:
-                self.signal_writer.insert(signal)
-        return result
+        if self.signal_writer is None:
+            return self.coordinator.dispatch_queued()
+        effects = self.coordinator.reconcile_signal_effects(
+            self.signal_writer,
+            dispatch_queued=True,
+        )
+        for effect in effects:
+            if effect.dispatched:
+                return IncrementalSignal(effect.intent.signal_id, effect.intent.tables), effect.runs
+        return None
 
 
 def fall_behind_reason(
@@ -2358,6 +2547,9 @@ __all__ = [
     "BackfillError",
     "BackfillInvariantError",
     "BackfillRun",
+    "BackfillSignalEffect",
+    "BackfillSignalIntent",
+    "BackfillSignalIntentRepository",
     "BackfillSignalQueueRepository",
     "BenchmarkResult",
     "CapabilityDecision",

@@ -149,6 +149,7 @@ POINTS = (
 BACKFILL_POINTS = (
     "before_request_md_commit",
     "after_request_commit_before_signal",
+    "after_recovery_signal_insert_before_intent_ack",
     "after_signal_before_started",
     "incremental_chunk_before_shadow_write",
     "incremental_chunk_after_shadow_write_before_progress",

@@ -95,14 +95,17 @@ def test_durable_request_tables_uses_one_signal_for_independent_runs():
         con.close()
 
 
-def test_second_active_signal_is_durably_coalesced_for_the_next_request():
-    """Stock correlation stays serialized while the successor request is retained."""
+def test_second_active_signal_is_durably_coalesced_for_the_next_request(monkeypatch):
+    """Stock correlation stays serialized and a post-commit crash is recoverable."""
     backfill = require_backfill()
     con = duckdb.connect(":memory:")
     try:
         ensure_control_schema(con)
         coordinator = backfill.BackfillCoordinator(con, pipeline="signals")
-        coordinator.request_tables(("app.customers",), signal_id="signal-1")
+        first, _first_runs = coordinator.request_tables(
+            ("app.customers",), signal_id="signal-1", request_id="request-1"
+        )
+        coordinator.mark_signal_published(first.signal_id)
         queued, runs = coordinator.request_tables(
             ("app.orders",), signal_id="signal-2", request_id="request-2"
         )
@@ -117,13 +120,151 @@ def test_second_active_signal_is_durably_coalesced_for_the_next_request():
             snapshot_lsn=17,
             commit_id=1,
         )
-        dispatched = coordinator.dispatch_queued()
-        assert dispatched is not None
-        successor, successor_runs = dispatched
+
+        fired: list[str] = []
+
+        def crash_after_dispatch_commit(point, _nth):
+            if point == "after_request_commit_before_signal":
+                fired.append(point)
+                raise RuntimeError(f"injected fault at {point}")
+
+        monkeypatch.setattr(backfill.faults, "maybe_crash", crash_after_dispatch_commit)
+        with pytest.raises(RuntimeError, match="after_request_commit_before_signal"):
+            coordinator.dispatch_queued()
+        assert fired == ["after_request_commit_before_signal"]
+
+        before_queue = con.execute(
+            "SELECT request_id, state, dispatch_signal_id "
+            "FROM _cdc_flight.backfill_signal_queue ORDER BY request_id"
+        ).fetchall()
+        before_runs = con.execute(
+            "SELECT source_table, signal_id, request_id, state "
+            "FROM _cdc_flight.backfill_runs WHERE pipeline = 'signals' "
+            "ORDER BY source_table, request_id"
+        ).fetchall()
+        retry = coordinator.dispatch_queued()
+        print("CRASH_RECOVERY_BEFORE")
+        print(f"queue = {before_queue}")
+        print(f"runs = {before_runs}")
+        print(f"retry = {retry}")
+        assert before_queue[0][1] == "dispatched"
+        assert before_runs[-1][3] == "requested"
+        assert retry is None
+
+        class RecordingSignalWriter:
+            def __init__(self):
+                self.signals = []
+
+            def insert(self, signal):
+                self.signals.append(signal)
+                return signal.signal_id
+
+        writer = RecordingSignalWriter()
+        recovered = coordinator.recover_signal_intents(writer)
+        assert len(recovered) == 1
+        intent, successor_runs = recovered[0]
+        successor = backfill.IncrementalSignal(intent.signal_id, intent.tables)
         assert successor.queued is False
         assert successor.tables == ("app.orders",)
         assert {run.signal_id for run in successor_runs} == {successor.signal_id}
+        assert len({run.run_id for run in successor_runs}) == len(successor_runs)
+        assert [signal.signal_id for signal in writer.signals] == [successor.signal_id]
         assert coordinator.signal_queue.queued() == []
+
+        for run in successor_runs:
+            current = run
+            for target in ("preparing", "loading", "ready_to_swap", "swapping", "complete"):
+                current = coordinator.repository.transition(current, target)
+
+        after_queue = con.execute(
+            "SELECT request_id, state, dispatch_signal_id "
+            "FROM _cdc_flight.backfill_signal_queue ORDER BY request_id"
+        ).fetchall()
+        after_runs = con.execute(
+            "SELECT source_table, signal_id, request_id, state "
+            "FROM _cdc_flight.backfill_runs WHERE pipeline = 'signals' "
+            "ORDER BY source_table, request_id"
+        ).fetchall()
+        print("CRASH_RECOVERY_AFTER")
+        print(f"queue = {after_queue}")
+        print(f"runs = {after_runs}")
+        print(f"published = {[(signal.signal_id, signal.tables) for signal in writer.signals]}")
+        print(f"pending = {coordinator.signal_intents.pending()}")
+        assert after_queue == [
+            ("request-2", "dispatched", successor.signal_id),
+        ]
+        assert after_runs[-1][1:] == (
+            successor.signal_id,
+            successor_runs[0].request_id,
+            "complete",
+        )
+        assert coordinator.signal_intents.pending() == []
+    finally:
+        con.close()
+
+
+def test_queued_request_reconciles_after_ack_before_next_poll():
+    """A queued row left after source ACK is recovered by the owner chokepoint."""
+    backfill = require_backfill()
+    con = duckdb.connect(":memory:")
+    try:
+        ensure_control_schema(con)
+        coordinator = backfill.BackfillCoordinator(con, pipeline="ack-gap")
+        first, _first_runs = coordinator.request_tables(
+            ("app.customers",), signal_id="signal-1", request_id="request-1"
+        )
+        coordinator.mark_signal_published(first.signal_id)
+        queued, runs = coordinator.request_tables(
+            ("app.orders",), signal_id="signal-2", request_id="request-2"
+        )
+        assert queued.queued is True
+        assert runs == ()
+
+        coordinator.prepare(coordinator.active("app", "customers"))
+        coordinator.complete_swap(
+            SimpleNamespace(schema="app", table="customers"),
+            snapshot_lsn=17,
+            commit_id=1,
+        )
+        assert coordinator.repository.active_all() == []
+        assert con.execute(
+            "SELECT state, dispatch_signal_id FROM _cdc_flight.backfill_signal_queue "
+            "WHERE request_id = 'request-2'"
+        ).fetchall() == [("queued", None)]
+        assert coordinator.signal_intents.pending() == []
+
+        class RecordingSignalWriter:
+            def __init__(self):
+                self.signals = []
+
+            def insert(self, signal):
+                self.signals.append(signal)
+                return signal.signal_id
+
+        writer = RecordingSignalWriter()
+        effects = coordinator.reconcile_signal_effects(writer, dispatch_queued=True)
+
+        assert len(effects) == 1
+        effect = effects[0]
+        assert effect.intent.kind == "queued_dispatch"
+        assert effect.intent.tables == ("app.orders",)
+        assert effect.dispatched is True
+        assert effect.recovered is False
+        assert [signal.signal_id for signal in writer.signals] == [
+            effect.intent.signal_id
+        ]
+        assert coordinator.signal_intents.pending() == []
+        assert con.execute(
+            "SELECT state, dispatch_signal_id FROM _cdc_flight.backfill_signal_queue "
+            "WHERE request_id = 'request-2'"
+        ).fetchall() == [("dispatched", effect.intent.signal_id)]
+        assert con.execute(
+            "SELECT source_table, signal_id, state FROM _cdc_flight.backfill_runs "
+            "WHERE pipeline = 'ack-gap' ORDER BY source_table"
+        ).fetchall() == [
+            ("customers", "signal-1", "complete"),
+            ("orders", effect.intent.signal_id, "requested"),
+        ]
     finally:
         con.close()
 

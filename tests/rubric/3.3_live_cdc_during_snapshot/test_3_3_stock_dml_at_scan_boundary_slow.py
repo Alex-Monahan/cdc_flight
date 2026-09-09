@@ -168,6 +168,7 @@ def test_stock_dml_commits_inside_scan_boundary_and_publishes_one_image(sandbox)
         assert len({fact.xid for fact in source_commits.values()}) == len(expected_labels)
         assert len({fact.commit_lsn for fact in source_commits.values()}) == len(expected_labels)
 
+        harness.release_scan_boundary()
         terminal = harness.wait_for_terminal()
         assert terminal.state == "complete"
         assert terminal.notification_status == "COMPLETED"
@@ -276,6 +277,9 @@ def test_stock_dml_commits_inside_scan_boundary_and_publishes_one_image(sandbox)
             )
         )
     finally:
+        if process is not None and process.poll() is None:
+            with contextlib.suppress(Exception):
+                harness.release_scan_boundary()
         if process is not None and process.poll() is None:
             with contextlib.suppress(Exception):
                 process.terminate()

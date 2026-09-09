@@ -402,6 +402,12 @@ def commit_group(self, trigger: str) -> CommitResult:
     # after the destination COMMIT. It can therefore never become an alternate
     # acknowledgement or a source of liveness.
     self._record_durable_backfill_notifications(durable_backfill_notifications)
+    # The live applier is the production owner of queued stock generations.  It
+    # dispatches only after this destination COMMIT and the source acknowledgement
+    # have both completed, so the successor signal cannot overtake the active
+    # generation's durable image or resume point.
+    if has_incremental:
+        self.dispatch_queued_backfills()
     if fault_enabled:
         maybe_crash("post_ack", fault_group)
     # next poll() -> performCommit() -> flushLsn(new)  ── nothing between ──

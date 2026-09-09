@@ -86,9 +86,14 @@ def test_stock_incremental_resume_handles_composite_and_uuid_keys(sandbox):
         )
         with psycopg.connect(sandbox.source.dsn, autocommit=True) as source:
             source.execute(
-                "INSERT INTO app.cdc_flight_signal (id, type, data) VALUES (%s, %s, %s)",
+                "INSERT INTO app.cdc_flight_signal (id, type, data) VALUES (%s, %s, %s) "
+                "ON CONFLICT (id) DO NOTHING",
                 ("p3-key-types-signal", "execute-snapshot", payload),
             )
+            assert source.execute(
+                "SELECT type, data FROM app.cdc_flight_signal WHERE id = %s",
+                ("p3-key-types-signal",),
+            ).fetchone() == ("execute-snapshot", payload)
         with psycopg.connect(sandbox.source.dsn) as source, source.transaction():
             source.execute(
                 "UPDATE app.p3_resume_composite SET payload = 'c-updated' "
