@@ -670,34 +670,45 @@ class LiveDiscoveryCoordinator:
             # It is not a SourceHealth callback, a second worker, a slot owner, or an
             # acknowledgement path.  A full request is handed to the next normal
             # startup, where pipeline.py runs the existing blocking resnapshot.
-            context.operation_started()
-            try:
-                scheduler = RefreshScheduler(
-                    handler.backfill,
-                    signal_writer=(
-                        StockSignalWriter(
-                            self.routes.source_write_dsn,
-                            data_collection=self.props.get("signal.data.collection"),
-                        )
-                        if self.props.get("signal.data.collection")
-                        else None
-                    ),
+            #
+            # Keep the empty recheck outside the operation/watchdog boundary.  The
+            # preflight is one durable EXISTS read; poll_due() remains the
+            # authoritative selector once it says there is work.
+            scheduler = RefreshScheduler(handler.backfill)
+            if not scheduler.has_due_or_pending_intent():
+                result["scheduled_refresh"] = {
+                    "checked": False,
+                    "reason": "no due policy or pending signal intent",
+                }
+            else:
+                context.operation_started()
+                try:
+                    scheduler = RefreshScheduler(
+                        handler.backfill,
+                        signal_writer=(
+                            StockSignalWriter(
+                                self.routes.source_write_dsn,
+                                data_collection=self.props.get("signal.data.collection"),
+                            )
+                            if self.props.get("signal.data.collection")
+                            else None
+                        ),
+                    )
+                    scheduled_poll = scheduler.poll_due(owner="service-destination-owner")
+                    published_signal_ids = scheduler.publish_pending()
+                finally:
+                    context.operation_finished(progressed=False)
+                scheduled_poll_summary = scheduled_poll.as_dict()
+                scheduled_poll_summary["published_signal_ids"] = sorted(
+                    set(scheduled_poll_summary["published_signal_ids"])
+                    | set(published_signal_ids)
                 )
-                scheduled_poll = scheduler.poll_due(owner="service-destination-owner")
-                published_signal_ids = scheduler.publish_pending()
-            finally:
-                context.operation_finished(progressed=False)
-            scheduled_poll_summary = scheduled_poll.as_dict()
-            scheduled_poll_summary["published_signal_ids"] = sorted(
-                set(scheduled_poll_summary["published_signal_ids"])
-                | set(published_signal_ids)
-            )
-            self.summary_extra.setdefault("scheduled_refresh_polls", []).append(
-                scheduled_poll_summary
-            )
-            result["scheduled_refresh_poll"] = scheduled_poll_summary
-            if scheduled_poll.full_requested:
-                context.request_drain()
+                self.summary_extra.setdefault("scheduled_refresh_polls", []).append(
+                    scheduled_poll_summary
+                )
+                result["scheduled_refresh_poll"] = scheduled_poll_summary
+                if scheduled_poll.full_requested:
+                    context.request_drain()
         context.assert_writable()
         self.summary_extra["service_invariant_recheck"] = result
         return result

@@ -203,6 +203,7 @@ def test_public_due_owner_selects_coalesces_and_never_acknowledges_source():
             )
         )
 
+        assert scheduler.has_due_or_pending_intent(now=now) is True
         first = scheduler.poll_due(now=now, owner="contract-owner")
 
         assert set(first.selected) == {"app.customers", "app.orders"}
@@ -234,6 +235,7 @@ def test_public_due_owner_selects_coalesces_and_never_acknowledges_source():
         assert next_due is not None
         assert datetime.fromisoformat(next_due) == now + timedelta(seconds=60)
         assert coordinator.policies.get("app", "documents").next_due_at is None
+        assert scheduler.has_due_or_pending_intent(now=now) is False
     finally:
         con.close()
 

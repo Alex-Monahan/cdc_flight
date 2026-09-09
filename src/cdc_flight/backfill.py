@@ -2256,6 +2256,38 @@ class RefreshScheduler:
             else self.coordinator.repository.transaction(admit_full)
         )
 
+    def has_due_or_pending_intent(
+        self, *, now: datetime | str | None = None
+    ) -> bool:
+        """Return whether the service owner has durable refresh work to process.
+
+        This is intentionally a read-only preflight.  It does not materialize
+        policies, inspect active runs, or touch the source; the caller can use a
+        false result to avoid opening a service operation altogether.  The full
+        due evaluation remains in :meth:`poll_due`, which is still authoritative
+        when this read finds work.
+        """
+        clock = _durable_clock(now)
+        intent_table = self.coordinator.signal_intents.table
+        policy_table = self.coordinator.policies.table
+        row = _read_relation(
+            self.coordinator.con,
+            f"""
+            SELECT EXISTS (
+                SELECT 1 FROM {intent_table}
+                WHERE pipeline = ? AND state = 'pending'
+            ) OR EXISTS (
+                SELECT 1 FROM {policy_table}
+                WHERE pipeline = ?
+                  AND enabled
+                  AND next_due_at IS NOT NULL
+                  AND next_due_at <= ?
+            )
+            """,
+            [self.coordinator.pipeline, self.coordinator.pipeline, clock],
+        ).fetchone()
+        return bool(row[0])
+
     def poll_due(
         self,
         *,
@@ -2422,6 +2454,12 @@ class RefreshScheduler:
             return ()
         allowed = None if signal_ids is None else set(signal_ids)
         if allowed is not None and not allowed:
+            return ()
+        # The live service calls this method after every invariant recheck.  A
+        # durable empty read must not enter reconciliation merely because a
+        # StockSignalWriter is configured; pending intents are the only source
+        # effect that reconciliation is allowed to process.
+        if not self.coordinator.signal_intents.pending():
             return ()
         faults.maybe_crash("after_request_commit_before_signal", 1)
         effects = self.coordinator.reconcile_signal_effects(self.signal_writer)
