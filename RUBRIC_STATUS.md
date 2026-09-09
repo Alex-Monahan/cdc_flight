@@ -702,7 +702,7 @@ correct assumptions in the notes below:
 | 3.2 | Backfills atomic | **5** | Existing shadow-table loading plus one transactional rename/state publication keeps a separate MotherDuck reader on old/old or new/new only; rollback and pre/post-rename faults preserve the old image. |
 | 3.3 | Existing tables keep receiving CDC during snapshot | **5** | Stock incremental signal records and ordinary CDC share one retained shadow; the new slow-lane stock proof commits separate real PostgreSQL update/delete/insert transactions inside a durable IN_PROGRESS scan window while unrelated CDC continues, then verifies exact identities, value multisets, multiplicities, one final image, no duplicate physical rows, and no stale shadow. The node is green in 3/3 cold runs and in the full 2-worker slow lane; a deliberate delete-propagation mutation makes it RED. |
 | 3.4 | Snapshot an arbitrary set of tables | **5** | Two real stock/Debezium slow-lane nodes now prove the non-contiguous set's healthy, empty, and contained-failure outcomes plus peer CDC isolation, and prove two queued public requests coalesce into one successor signal/run set dispatched by the live production owner. Both nodes are 3/3 cold-green, green in the full 2-worker slow lane, and both mutation proofs go red. Full evidence: `codex_logs/p3b_impl_summary.md`. |
-| 3.5 | Per-table CDC / full refresh / incremental refresh | **4** | Durable `cdc`, `full`, and `incremental` modes, policy changes, cursor preservation, and a scheduler are implemented. A full live schedule/restart matrix and mixed modes in one stock signal are not proven. |
+| 3.5 | Per-table CDC / full refresh / incremental refresh | **5** | Round C closes the +1: the normal service destination owner performs durable due selection for independent CDC-only, full, and incremental tables, coalesces and restarts work across three bounded crash phases, preserves the active cursor/run through a mode change, and publishes the full and incremental results through the existing paths. Full evidence: `codex_logs/p3c_impl_summary.md`. |
 | 3.6 | Backfill when CDC falls too far behind | **4** | Size OR oldest-pending-age predicates, durable `bytes`/`time`/`both` reasons, unknown-age refusal, coalescing, and no slot ownership are tested. Wiring to a live slot/source-health sampling run is not end-to-end proven. |
 | 3.7 | Failed backfill resumes midway | **4** | A real source-tree crash child kills a keyed chunk load; durable cursor/shadow survives and resume matches clean identity/value sets with zero duplicates. Composite/UUID stock cases and every crash point remain unproven; keyless stock deliberately falls back to full. |
 | 4.0 | Blast-radius containment for permanently unprocessable rows/tables | ~~5~~ ~~4~~ → **5** | A bad table becomes durable, observable quarantine; every affected run is NOT-OK and alerted once, healthy tables continue, both slot positions advance, and `quarantined → pending → complete` automatically re-snapshots current source state. Round 14 closes the remaining table-scoped materializer gap: four consecutive real PostgreSQL runs inject a builtin `ValueError` from the typed materializer, retain the original class/message in the refusal and alert, keep the peer's four rows, advance both slot positions, and measure bounded retained WAL (552, 2,512, 2,400, 2,056 B). The connector's pre-Python, no-relation failure remains an explicit boundary limitation: it is durably alerted by offset but cannot honestly be assigned to a table. The 5/5 score is for the rubric's literal table-scoped failure scenario; no relation is fabricated for an unrelatable connector failure. |
@@ -2441,21 +2441,16 @@ stock signal and one successor run per table after the first run reaches termina
 state. Both new nodes are 3/3 cold-green, green in the full 2-worker slow lane,
 and each deliberate isolation/dispatch mutation is red.
 
-### 3.5 Per-table CDC / scheduled full refresh / scheduled incremental refresh — **4 / 5**
+### 3.5 Per-table CDC / scheduled full refresh / scheduled incremental refresh — superseded by the TABLE row above (**5 / 5**)
 
-The durable mode domain is `cdc`, `full`, and `incremental`. `cdc` schedules no
-image acquisition; `full` reuses the blocking stock resnapshot path; and
-`incremental` uses the stock signal path. `RefreshScheduler` creates durable work
-without owning acknowledgements, and transactional mode changes preserve active
-run id, shadow, cursor, and rows. The keyless stock boundary selects full fallback
-without inventing an arrival-order cursor.
-
-The live restart hand-off consumes durable full and incremental requests, but
-those requests are admitted by the test/driver before restart. There is no
-normal production due/poll caller that turns `interval_seconds`/`next_due_at`
-into work automatically. One arbitrary stock signal is also intentionally
-single-mode because stock notification correlation is ambiguous for concurrent
-mixed-mode requests. Score: 4.
+Round C proves the durable due/poll contract at the public owner boundary and in
+the normal one-process service: `service-destination-owner` selects due policies,
+CDC creates no backfill, full hands work to the existing blocking stock
+resnapshot, and incremental commits its durable intent before the inherited stock
+signal chokepoint. The real three-table restart matrix and active-run mode change
+preserve the run, shadow, cursor, and exact images. “Mixed” is proved by separate
+tables with their supported independent requests/signals; no ambiguous single
+signal or correlation code was added. Full evidence: `codex_logs/p3c_impl_summary.md`.
 
 ### 3.6 Auto-backfill when CDC falls too far behind — **4 / 5**
 
