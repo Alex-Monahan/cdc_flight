@@ -50,7 +50,8 @@ def test_live_stock_keyless_signal_records_the_full_fallback_boundary(sandbox):
         sandbox.wait_for_slot_active(process=process, timeout=45)
         with psycopg.connect(sandbox.source.dsn, autocommit=True) as source:
             source.execute(
-                "INSERT INTO app.cdc_flight_signal (id, type, data) VALUES (%s, %s, %s)",
+                "INSERT INTO app.cdc_flight_signal (id, type, data) VALUES (%s, %s, %s) "
+                "ON CONFLICT (id) DO NOTHING",
                 (
                     "p3-keyless-signal",
                     "execute-snapshot",
@@ -59,7 +60,17 @@ def test_live_stock_keyless_signal_records_the_full_fallback_boundary(sandbox):
                         separators=(",", ":"),
                     ),
                 ),
-                )
+            )
+            assert source.execute(
+                "SELECT type, data FROM app.cdc_flight_signal WHERE id = %s",
+                ("p3-keyless-signal",),
+            ).fetchone() == (
+                "execute-snapshot",
+                json.dumps(
+                    {"data-collections": list(signal.tables), "type": "incremental"},
+                    separators=(",", ":"),
+                ),
+            )
         stdout, stderr = process.communicate(timeout=240)
         # Stock emits the keyless capability failure and the current production
         # handoff fails closed with the old image retained.  A non-zero bounded
