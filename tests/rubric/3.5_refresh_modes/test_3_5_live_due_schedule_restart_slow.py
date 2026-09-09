@@ -398,7 +398,7 @@ def test_service_itself_selects_due_modes_and_recovers_restart_matrix(sandbox):
 
         try:
             before_restart = _wait_for(
-                lambda: _new_run_rows(sandbox, prior_run_ids)
+                lambda prior_run_ids=prior_run_ids: _new_run_rows(sandbox, prior_run_ids)
                 if len(_new_run_rows(sandbox, prior_run_ids)) == 2
                 else None,
                 sandbox=sandbox,
