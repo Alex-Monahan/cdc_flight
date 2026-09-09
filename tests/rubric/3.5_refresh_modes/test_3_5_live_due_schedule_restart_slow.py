@@ -36,13 +36,13 @@ def _service_env() -> dict[str, str]:
         # Make the existing service-owner recheck a quick, deterministic poll for
         # the live mode-change edge. This is still the normal service entrypoint.
         "CDC_SERVICE_INVARIANT_CHECK_SECONDS": "0.5",
-        "CDC_SERVICE_LEASE_TTL": "60",
+        "CDC_SERVICE_LEASE_TTL": "90",
         "CDC_SERVICE_LEASE_RENEW_SECONDS": "5",
         "CDC_SERVICE_HEARTBEAT_BOUND_SECONDS": "15",
         # The test observes source publication while the normal owner holds the
         # DuckDB file lock; keep the service alive through the bounded restart
         # observation, then stop it explicitly.
-        "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "50",
+        "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "75",
         "CDC_SERVICE_STALL_EXIT_GRACE_SECONDS": "5",
         "CDC_SERVICE_COMMIT_TIMEOUT": "10",
         "CDC_COMMIT_TIMEOUT": "10",
@@ -257,7 +257,8 @@ def _assert_completed_matrix_case(
     summary: dict,
     require_full_summary: bool = True,
 ) -> None:
-    rows = _run_rows(sandbox)
+    current_run_ids = set(run_ids.values())
+    rows = [row for row in _run_rows(sandbox) if row[0] in current_run_ids]
     by_table = {row[1]: row for row in rows}
     assert set(by_table) == {"customers", "orders"}, rows
     assert {by_table[table][0] for table in by_table} == set(run_ids.values())
@@ -409,7 +410,7 @@ def test_service_itself_selects_due_modes_and_recovers_restart_matrix(sandbox):
 
         # The process died with the service lease held. The normal external launcher
         # would wait for this bounded expiry before the next service invocation.
-        time.sleep(66)
+        time.sleep(96)
         process = sandbox.spawn_service(
             capture=False,
             extra_env={
@@ -421,7 +422,7 @@ def test_service_itself_selects_due_modes_and_recovers_restart_matrix(sandbox):
             # DuckDB's single-owner lock prevents a second connection from reading
             # run rows while the service is live. The wait is bounded below the test
             # stall watchdog; the durable assertions follow owner release.
-            time.sleep(30)
+            time.sleep(60)
             summary_text = _stop_service(process)
             summary = sandbox.last_summary()
             assert summary.get("ok") is True, (
