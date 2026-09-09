@@ -454,23 +454,11 @@ class Applier:
         #: completion guard keeps the successor owner alive.
         self.backfill_signal_recoveries: list[dict[str, Any]] = []
         if self.queued_signal_writer is not None:
-            for intent, runs in self.backfill.recover_signal_intents(
-                self.queued_signal_writer
-            ):
-                recovery = {
-                    "signal_id": intent.signal_id,
-                    "tables": list(intent.tables),
-                    "kind": intent.kind,
-                    "run_ids": [run.run_id for run in runs],
-                    "request_id": runs[0].request_id if runs else None,
-                    "source_signal_inserted": True,
-                    "observed_at_monotonic_ns": time.monotonic_ns(),
-                }
-                self.backfill_signal_recoveries.append(recovery)
-                if intent.kind == "queued_dispatch":
-                    self.backfill_queue_dispatches.append(
-                        {**recovery, "recovered": True}
-                    )
+            effects = self.backfill.reconcile_signal_effects(
+                self.queued_signal_writer,
+                dispatch_queued=True,
+            )
+            self._record_backfill_signal_effects(effects)
         #: Re-snapshot streaming units are complete source observations but have no
         #: destination side. Keep only their acknowledgeable terminal handles until a
         #: preceding snapshot group is durable; they must never enter ``self.group``.
@@ -1158,25 +1146,36 @@ class Applier:
             # admission proof is the READY/RELEASE handshake, not this cadence.
             time.sleep(0.02)
 
-    def dispatch_queued_backfills(self) -> None:
-        """Publish one queued successor from the normal post-commit owner path."""
-        if self.queued_signal_writer is None:
-            return
-        dispatched = self.backfill.dispatch_queued()
-        if dispatched is None:
-            return
-        signal, runs = dispatched
-        self.backfill.publish_signal(signal, self.queued_signal_writer)
-        self.backfill_queue_dispatches.append(
-            {
-                "signal_id": signal.signal_id,
-                "tables": list(signal.tables),
+    def _record_backfill_signal_effects(self, effects) -> None:
+        """Persist observability for effects completed by the shared chokepoint."""
+        for effect in effects:
+            intent = effect.intent
+            runs = effect.runs
+            record = {
+                "signal_id": intent.signal_id,
+                "tables": list(intent.tables),
+                "kind": intent.kind,
                 "run_ids": [run.run_id for run in runs],
                 "request_id": runs[0].request_id if runs else None,
                 "source_signal_inserted": True,
                 "observed_at_monotonic_ns": time.monotonic_ns(),
             }
+            if effect.recovered:
+                self.backfill_signal_recoveries.append(record)
+            if effect.dispatched:
+                self.backfill_queue_dispatches.append(
+                    {**record, "recovered": effect.recovered}
+                )
+
+    def dispatch_queued_backfills(self) -> None:
+        """Reconcile queued work through the shared post-ack chokepoint."""
+        if self.queued_signal_writer is None:
+            return
+        effects = self.backfill.reconcile_signal_effects(
+            self.queued_signal_writer,
+            dispatch_queued=True,
         )
+        self._record_backfill_signal_effects(effects)
 
     def completion_waiting_for_queued_backfill(self) -> bool:
         """Keep a reached run open until an owner-dispatched successor is terminal."""

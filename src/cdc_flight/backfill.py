@@ -1108,6 +1108,16 @@ class BackfillSignalIntent:
     state: str
 
 
+@dataclass(frozen=True)
+class BackfillSignalEffect:
+    """One source-side effect completed by the durable-intent chokepoint."""
+
+    intent: BackfillSignalIntent
+    runs: tuple[BackfillRun, ...]
+    recovered: bool
+    dispatched: bool
+
+
 class BackfillSignalIntentRepository:
     """Durable intent for the source-side INSERT that follows destination admission."""
 
@@ -1453,29 +1463,67 @@ class BackfillCoordinator:
         """Acknowledge a source INSERT after its PostgreSQL transaction commits."""
         self.repository.transaction(lambda: self.signal_intents.mark_published(signal_id))
 
-    def publish_signal(self, signal: IncrementalSignal, writer: StockSignalWriter) -> None:
-        """Publish one durable signal intent and acknowledge it only after INSERT."""
-        if signal.is_noop or signal.queued:
-            return
+    def _publish_signal_intent(
+        self, intent: BackfillSignalIntent, writer: StockSignalWriter
+    ) -> tuple[BackfillRun, ...]:
+        """Apply one pending source effect, then acknowledge its intent."""
+        signal = IncrementalSignal(intent.signal_id, intent.tables)
         writer.insert(signal)
-        self.mark_signal_published(signal.signal_id)
+        # The source row is committed in PostgreSQL before this separate
+        # destination acknowledgement.  Repeating the same idempotent INSERT is
+        # safe if the owner dies in this interval.
+        faults.maybe_crash("after_recovery_signal_insert_before_intent_ack", 1)
+        self.mark_signal_published(intent.signal_id)
+        return tuple(self.repository.by_signal(intent.signal_id))
+
+    def reconcile_signal_effects(
+        self,
+        writer: StockSignalWriter,
+        *,
+        dispatch_queued: bool = False,
+    ) -> tuple[BackfillSignalEffect, ...]:
+        """Reconcile every durable transition with its independent source effect.
+
+        This is the sole production chokepoint for stock source effects.  It first
+        applies all pending intents, then (when the owner has crossed a completed
+        active-generation boundary) dispatches queued work.  The dispatch itself
+        records a new intent in the same MotherDuck transaction; the loop immediately
+        drains that intent through this method before returning.
+        """
+        initial_pending = {
+            intent.signal_id for intent in self.signal_intents.pending()
+        }
+        effects: list[BackfillSignalEffect] = []
+        while True:
+            pending = self.signal_intents.pending()
+            for intent in pending:
+                runs = self._publish_signal_intent(intent, writer)
+                effects.append(
+                    BackfillSignalEffect(
+                        intent=intent,
+                        runs=runs,
+                        recovered=intent.signal_id in initial_pending,
+                        dispatched=(intent.kind == "queued_dispatch"),
+                    )
+                )
+            if not dispatch_queued:
+                break
+            dispatched = self.dispatch_queued()
+            if dispatched is None:
+                break
+            _signal, _runs = dispatched
+            # ``dispatch_queued`` committed a new intent.  The next iteration
+            # publishes it through the same path before this call can return.
+        return tuple(effects)
 
     def recover_signal_intents(
         self, writer: StockSignalWriter
     ) -> tuple[tuple[BackfillSignalIntent, tuple[BackfillRun, ...]], ...]:
-        """Complete pending source effects without admitting any new destination run."""
-        recovered: list[tuple[BackfillSignalIntent, tuple[BackfillRun, ...]]] = []
-        for intent in self.signal_intents.pending():
-            signal = IncrementalSignal(intent.signal_id, intent.tables)
-            writer.insert(signal)
-            # The source row is committed in PostgreSQL before this separate
-            # destination acknowledgement.  If the process dies here, the next
-            # owner repeats the same idempotent signal_id INSERT and reaches this
-            # acknowledgement; no second run is ever requested.
-            faults.maybe_crash("after_recovery_signal_insert_before_intent_ack", 1)
-            self.mark_signal_published(intent.signal_id)
-            recovered.append((intent, tuple(self.repository.by_signal(intent.signal_id))))
-        return tuple(recovered)
+        """Compatibility view of the chokepoint's non-dispatching recovery pass."""
+        return tuple(
+            (effect.intent, effect.runs)
+            for effect in self.reconcile_signal_effects(writer)
+        )
 
     def request(
         self,
@@ -2019,7 +2067,7 @@ class RefreshScheduler:
                 # commit-to-ack window. The durable intent makes a process death in
                 # this gap retryable, while the source writer's signal_id conflict
                 # handling keeps the retry from creating a second source row.
-                self.coordinator.publish_signal(signal, self.signal_writer)
+                self.coordinator.reconcile_signal_effects(self.signal_writer)
             return signal, runs
 
         def admit_full() -> tuple[BackfillRun, ...]:
@@ -2044,12 +2092,16 @@ class RefreshScheduler:
         self,
     ) -> tuple[IncrementalSignal, tuple[BackfillRun, ...]] | None:
         """Publish one coalesced successor signal after the active run is done."""
-        result = self.coordinator.dispatch_queued()
-        if result is not None and self.signal_writer is not None:
-            signal, _runs = result
-            if not signal.is_noop:
-                self.coordinator.publish_signal(signal, self.signal_writer)
-        return result
+        if self.signal_writer is None:
+            return self.coordinator.dispatch_queued()
+        effects = self.coordinator.reconcile_signal_effects(
+            self.signal_writer,
+            dispatch_queued=True,
+        )
+        for effect in effects:
+            if effect.dispatched:
+                return IncrementalSignal(effect.intent.signal_id, effect.intent.tables), effect.runs
+        return None
 
 
 def fall_behind_reason(
@@ -2495,6 +2547,7 @@ __all__ = [
     "BackfillError",
     "BackfillInvariantError",
     "BackfillRun",
+    "BackfillSignalEffect",
     "BackfillSignalIntent",
     "BackfillSignalIntentRepository",
     "BackfillSignalQueueRepository",

@@ -338,12 +338,11 @@ class LiveStockHarness:
             )
             if signal.signal_id != self.signal_id:
                 raise AssertionError(signal)
-            coordinator.publish_signal(
-                signal,
+            coordinator.reconcile_signal_effects(
                 StockSignalWriter(
                     self.box.source.dsn,
                     data_collection=self.data_collection,
-                ),
+                )
             )
             self.run_ids = tuple(run.run_id for run in runs)
         return signal.signal_id, self.run_ids
