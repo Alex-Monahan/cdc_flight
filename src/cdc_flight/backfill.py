@@ -1578,6 +1578,60 @@ class BackfillCoordinator:
             # publishes it through the same path before this call can return.
         return tuple(effects)
 
+    def rearm_active_incremental_signals(self) -> tuple[str, ...]:
+        """Durably re-open an interrupted stock scan without replacing its run.
+
+        Debezium acknowledges the source signal/control record before it emits the
+        incremental READ stream.  If Flight dies after a destination chunk commit,
+        the old source row is therefore no longer a replayable acquisition trigger.
+        Preserve the active run, shadow, and monotone cursor, but create one new
+        durable source intent for the remaining generation.  The caller publishes
+        that intent through :meth:`reconcile_signal_effects`; this method never
+        touches PostgreSQL.
+        """
+        candidates = [
+            run
+            for run in self.active_runs()
+            if run.effective_mode == "incremental"
+            and run.state == "loading"
+            and run.signal_id
+            and run.last_processed_key_json is not None
+        ]
+        groups: dict[str, tuple[BackfillRun, ...]] = {}
+        for candidate in candidates:
+            intent = self.signal_intents.get(candidate.signal_id)
+            if intent is None or intent.state != "published":
+                continue
+            members = tuple(
+                run
+                for run in self.repository.by_signal(candidate.signal_id)
+                if run.effective_mode == "incremental"
+                and run.state in ACTIVE_RUN_STATES
+            )
+            if members:
+                groups[candidate.signal_id] = members
+        if not groups:
+            return ()
+
+        def rearm() -> tuple[str, ...]:
+            signal_ids: list[str] = []
+            for members in groups.values():
+                signal_id = f"recovery-{uuid.uuid4().hex}"
+                signal = IncrementalSignal(
+                    signal_id,
+                    tuple(sorted(run.qualified_table for run in members)),
+                )
+                for run in members:
+                    self.repository.set_signal(run.run_id, signal_id)
+                # This transaction is the durable request boundary.  The source
+                # INSERT is deliberately performed only after it commits by the
+                # inherited chokepoint below.
+                self.signal_intents.record(signal, kind="admission")
+                signal_ids.append(signal_id)
+            return tuple(signal_ids)
+
+        return self.repository.transaction(rearm)
+
     def recover_signal_intents(
         self, writer: StockSignalWriter
     ) -> tuple[tuple[BackfillSignalIntent, tuple[BackfillRun, ...]], ...]:

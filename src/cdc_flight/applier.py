@@ -454,6 +454,7 @@ class Applier:
         #: completion guard keeps the successor owner alive.
         self.backfill_signal_recoveries: list[dict[str, Any]] = []
         if self.queued_signal_writer is not None:
+            self.backfill.rearm_active_incremental_signals()
             effects = self.backfill.reconcile_signal_effects(
                 self.queued_signal_writer,
                 dispatch_queued=True,

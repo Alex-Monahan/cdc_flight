@@ -303,7 +303,9 @@ def _assert_completed_matrix_case(
         "WHERE pipeline = ? AND state <> 'published'",
         [sandbox.env["CDC_PIPELINE_NAME"]],
     ) == [(0,)]
-    assert len(_signal_rows(sandbox)) == 1
+    signals = _signal_rows(sandbox)
+    assert signals
+    assert len({row[0] for row in signals}) == len(signals), signals
     if require_full_summary:
         assert "scheduled_full_refresh" in summary
         assert "app.orders" in summary["scheduled_full_refresh"]["resnapshot_swapped"]
@@ -446,7 +448,7 @@ def test_service_itself_selects_due_modes_and_recovers_restart_matrix(sandbox):
             },
         )
         try:
-            _wait_for(lambda: len(_signal_rows(sandbox)) == 1, sandbox=sandbox, process=process, timeout=120)
+            _wait_for(lambda: len(_signal_rows(sandbox)) >= 1, sandbox=sandbox, process=process, timeout=120)
             # DuckDB's single-owner lock prevents a second connection from reading
             # run rows while the service is live. The production post-commit
             # sidecar is the existing live-stock observation boundary: it proves
@@ -478,6 +480,11 @@ def test_service_itself_selects_due_modes_and_recovers_restart_matrix(sandbox):
                 after_key = json.loads(recovered["customers"][4])["id"]["value"]
                 assert after_key >= before_key
                 assert recovered["customers"][0] == run_ids["customers"]
+                assert any(
+                    run_ids["customers"] in effect.get("run_ids", [])
+                    and effect.get("kind") == "admission"
+                    for effect in summary.get("backfill_signal_recoveries", [])
+                ), summary.get("backfill_signal_recoveries")
             _assert_completed_matrix_case(
                 sandbox,
                 run_ids=run_ids,
