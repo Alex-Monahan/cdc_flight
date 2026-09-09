@@ -1418,12 +1418,6 @@ def run(
         )
         try:
             reported = coordinator.run()
-            # The coordinator owns the live service recheck, while this outer
-            # pipeline owns the terminal summary.  Project the coordinator's
-            # shared summary extras on the successful path as well as the
-            # fail-closed path so due-selection evidence is not lost at the
-            # service boundary.
-            reported.update(summary_extra)
             if replay_offset_file is not None:
                 faults_mod.matrix_crash("source_replay_after_md_commit_before_install")
                 source_fingerprint = offsets.replay_offset_fingerprint(replay_offset_file)
