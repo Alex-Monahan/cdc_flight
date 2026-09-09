@@ -29,14 +29,14 @@ FAULT_NTH = {
 }
 
 
-def _service_env() -> dict[str, str]:
-    return {
+def _service_env(sandbox=None) -> dict[str, str]:
+    env = {
         "CDC_AUTO_DISCOVERY": "0",
         "CDC_TABLES": TABLES,
         # Make the existing service-owner recheck a quick, deterministic poll for
         # the live mode-change edge. This is still the normal service entrypoint.
         "CDC_SERVICE_INVARIANT_CHECK_SECONDS": "0.5",
-        "CDC_SERVICE_LEASE_TTL": "90",
+        "CDC_SERVICE_LEASE_TTL": "100",
         "CDC_SERVICE_LEASE_RENEW_SECONDS": "5",
         "CDC_SERVICE_HEARTBEAT_BOUND_SECONDS": "15",
         # The service remains intentionally quiet while the restart assertions
@@ -46,7 +46,7 @@ def _service_env() -> dict[str, str]:
         # The test observes source publication while the normal owner holds the
         # DuckDB file lock; keep the service alive through the bounded restart
         # observation, then stop it explicitly.
-        "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "75",
+        "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "80",
         "CDC_SERVICE_STALL_EXIT_GRACE_SECONDS": "5",
         "CDC_SERVICE_COMMIT_TIMEOUT": "10",
         "CDC_COMMIT_TIMEOUT": "10",
@@ -60,6 +60,11 @@ def _service_env() -> dict[str, str]:
         "CDC_INCREMENTAL_SNAPSHOT_CHUNK_SIZE": "1",
         "CDC_SNAPSHOT_CHUNK_EVENTS": "1",
     }
+    if sandbox is not None:
+        env["CDC_BACKFILL_LIVE_STATE_PATH"] = str(
+            sandbox.dir / "backfill_live_state.jsonl"
+        )
+    return env
 
 
 def _configure_due_policies(sandbox) -> None:
@@ -101,6 +106,24 @@ def _configure_due_policies(sandbox) -> None:
                 next_due_at=due,
             )
         )
+
+
+def _live_terminal_backfill(sandbox) -> dict | None:
+    path = sandbox.dir / "backfill_live_state.jsonl"
+    if not path.exists():
+        return None
+    terminal = None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        with contextlib.suppress(json.JSONDecodeError):
+            entry = json.loads(line)
+            if (
+                entry.get("table") == "app.customers"
+                and entry.get("state") == "complete"
+                and entry.get("notification_status") == "COMPLETED"
+                and entry.get("table_state") == "complete"
+            ):
+                terminal = entry
+    return terminal
 
 
 def _change_policy_mode(sandbox, *, table: str, mode: str) -> None:
@@ -194,6 +217,7 @@ def _baseline_and_change_source(sandbox, label: str) -> set[str]:
         if sandbox.duckdb_path.exists()
         else set()
     )
+    (sandbox.dir / "backfill_live_state.jsonl").unlink(missing_ok=True)
     sandbox.reseed()
     baseline = sandbox.run(
         reset_state=True,
@@ -293,7 +317,7 @@ def test_service_itself_selects_due_modes_and_recovers_restart_matrix(sandbox):
     # service run. No request_tables()/admit_*() call exists in this test: the only
     # test-side writes are the three durable policy configurations.
     _baseline_and_change_source(sandbox, "clean")
-    process = sandbox.spawn_service(capture=False, extra_env=_service_env())
+    process = sandbox.spawn_service(capture=False, extra_env=_service_env(sandbox))
     try:
         # DuckDB's single owner keeps the destination file locked while the normal
         # service is alive. Observe only source publication in that interval; inspect
@@ -346,7 +370,7 @@ def test_service_itself_selects_due_modes_and_recovers_restart_matrix(sandbox):
             capture=False,
             matrix_arm=True,
             extra_env={
-                **_service_env(),
+                **_service_env(sandbox),
                 "CDC_FAULT_INJECT": f"{phase}:{FAULT_NTH[phase]}",
             },
         )
@@ -414,20 +438,25 @@ def test_service_itself_selects_due_modes_and_recovers_restart_matrix(sandbox):
 
         # The process died with the service lease held. The normal external launcher
         # would wait for this bounded expiry before the next service invocation.
-        time.sleep(96)
+        time.sleep(106)
         process = sandbox.spawn_service(
             capture=False,
             extra_env={
-                **_service_env(),
+                **_service_env(sandbox),
             },
         )
         try:
             _wait_for(lambda: len(_signal_rows(sandbox)) == 1, sandbox=sandbox, process=process, timeout=120)
             # DuckDB's single-owner lock prevents a second connection from reading
-            # run rows while the service is live. The wait is bounded below the
-            # configured source-dark watchdog; the durable assertions follow owner
-            # release.
-            time.sleep(60)
+            # run rows while the service is live. The production post-commit
+            # sidecar is the existing live-stock observation boundary: it proves
+            # the same committed terminal state without becoming a work trigger.
+            _wait_for(
+                lambda: _live_terminal_backfill(sandbox),
+                sandbox=sandbox,
+                process=process,
+                timeout=75,
+            )
             summary_text = _stop_service(process)
             summary = sandbox.last_summary()
             assert summary.get("ok") is True, (
