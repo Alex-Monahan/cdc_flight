@@ -249,6 +249,7 @@ def test_empty_service_recheck_skips_operation_and_reconciliation(tmp_path, monk
     coordinator.namespace = "cdc-flight-engine"
     coordinator.props = {"signal.data.collection": "app.cdc_flight_signal"}
     coordinator.summary_extra = {}
+    coordinator._next_refresh_poll_at = 0.0
 
     class Handler:
         _destination_operation_lock = threading.RLock()
