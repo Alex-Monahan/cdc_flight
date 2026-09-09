@@ -27,7 +27,7 @@ _BASELINE_SELECTED = {
     # unit nodes and one live mutation node; the standby stale-target contract adds
     # one live two-sided retirement node.
     # The §3.4 post-ack queued-recovery proof adds one default-lane node.
-    "not motherduck and not slow": 2461,
+    "not motherduck and not slow": 2462,
     "slow and not motherduck": 267,
     # The quiet-holder and stock-walsender retry proofs are MotherDuck-only real
     # process nodes; a local DuckDB file lock cannot exercise cloud takeover while
