@@ -14,7 +14,7 @@ import duckdb
 import pytest
 from support.applier_lab import Lab, end, keyed
 
-from cdc_flight import commit_protocol, destination, faults
+from cdc_flight import commit_protocol, destination
 from cdc_flight.applier import Applier
 from cdc_flight.commit_group import CommitResult
 from cdc_flight.config import ServiceConfig
@@ -251,7 +251,7 @@ def test_outer_prearm_is_retired_after_a_known_rollback(tmp_path, mode):
 
 @pytest.mark.parametrize(
     "failure_mode",
-    ["before_apply", "post_inner_pre_commit"],
+    ["inner_arm", "post_inner_arm"],
     ids=["inner-commit-group", "post-inner-rollback"],
 )
 def test_inner_prearm_is_retired_after_a_known_rollback(
@@ -269,21 +269,27 @@ def test_inner_prearm_is_retired_after_a_known_rollback(
         end("1", 1, 11, {"app.customers": 1}),
     ]
     try:
-        if failure_mode == "before_apply":
+        if failure_mode == "inner_arm":
 
-            def fail_renew(_con):
-                raise RuntimeError("known rollback before apply")
+            original_arm = box.applier._arm_commit_timeout_alert
 
-            monkeypatch.setattr(box.applier.lease, "renew", fail_renew)
+            def arm_then_fail(commit_id):
+                original_arm(commit_id)
+                raise RuntimeError("known rollback after inner arm")
+
+            monkeypatch.setattr(
+                box.applier, "_arm_commit_timeout_alert", arm_then_fail
+            )
         else:
 
-            def fail_pre_commit(point, _nth):
-                if point == "pre_commit":
-                    raise faults.InjectedFault("known rollback after inner arm")
+            def fail_watchdog(_timeout, _commit_id):
+                raise RuntimeError("known rollback after inner watchdog arm")
 
-            monkeypatch.setattr(commit_protocol, "maybe_crash", fail_pre_commit)
+            monkeypatch.setattr(
+                commit_protocol.self_heal, "commit_watchdog", fail_watchdog
+            )
 
-        with pytest.raises((RuntimeError, faults.InjectedFault)):
+        with pytest.raises(RuntimeError):
             box.run(records)
         assert _commit_timeout_rows(box.con, pipeline) == []
     finally:
