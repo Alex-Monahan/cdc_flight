@@ -811,7 +811,10 @@ def _service_environment(
         arm = run_dir / "destination_fault.arm"
         environment.update(
             {
-                "CDC_FAULT_INJECT": "destination_hang:1",
+                # Group 1 is the initial snapshot and group 2 is the isolated
+                # post-snapshot warm-up transaction.  Group 3 is therefore the
+                # first measured source-data group after the external arm.
+                "CDC_FAULT_INJECT": "destination_hang:3",
                 "CDC_FAULT_HANG_PHASE": "pre_commit",
                 # The initial snapshot is a real destination commit too, so its
                 # bound must exceed the observed MotherDuck startup latency.  The
