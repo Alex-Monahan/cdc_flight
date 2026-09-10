@@ -100,6 +100,16 @@ def _write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True, default=_json_default) + "\n")
 
 
+def _read_json(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def _database_name(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"[:63]
 
@@ -162,6 +172,29 @@ def _database_stats(database: str) -> dict[str, int]:
     if row is None:
         raise RuntimeError(f"PostgreSQL did not expose pg_stat_database row for {database!r}")
     return {"xact_commit": int(row[0]), "tup_inserted": int(row[1])}
+
+
+def _postgres_database_exists(database: str) -> bool:
+    with _source_connect(SOURCE_ADMIN_DATABASE, application_name="p53-cleanup-check") as con:
+        con.autocommit = True
+        return bool(
+            con.execute(
+                "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = %s)",
+                (database,),
+            ).fetchone()[0]
+        )
+
+
+def _source_relation_exists(schema: str, table: str) -> bool:
+    with _source_connect(SOURCE_DATABASE, application_name="p53-cleanup-check") as con:
+        con.autocommit = True
+        return bool(
+            con.execute(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema = %s AND table_name = %s)",
+                (schema, table),
+            ).fetchone()[0]
+        )
 
 
 def _marker_facts(database: str, table: str) -> dict[str, Any]:
@@ -429,7 +462,9 @@ def _run_source_capability(
             "pg_stat_database.xact_commit delta"
         ),
     }
+    scratch_database: str | None = None
     with _scratch_postgres_database("cdc_p53_cap") as database:
+        scratch_database = database
         marker_table = f"commits_{uuid.uuid4().hex[:12]}"
         _create_marker_table(database, marker_table)
         before_stats = _database_stats(database)
@@ -458,6 +493,13 @@ def _run_source_capability(
         )
         result.update(facts)
         result["host_gate"] = sampler.verdict()
+    result["scratch_database"] = scratch_database
+    try:
+        result["scratch_database_left_after_cleanup"] = _postgres_database_exists(
+            scratch_database
+        )
+    except BaseException as exc:
+        result["scratch_database_cleanup_check_error"] = f"{type(exc).__name__}: {exc}"
     result["actual_source_tps"] = facts["source_tps_from_postgres_clock"]
     result["source_capability_pass"] = (
         result["host_gate"]["valid"]
@@ -497,6 +539,11 @@ def _drop_motherduck_database(token: str, database: str) -> None:
         con.execute(f"DROP DATABASE {_duck_identifier(database)}")
 
 
+def _motherduck_database_exists(token: str, database: str) -> bool:
+    with duckdb.connect(f"md:?motherduck_token={token}") as con:
+        return database in {str(row[0]) for row in con.execute("SHOW DATABASES").fetchall()}
+
+
 def _motherduck_count(token: str, database: str, dataset: str, prefix: str) -> int:
     try:
         with duckdb.connect(f"md:{database}?motherduck_token={token}") as con:
@@ -507,6 +554,15 @@ def _motherduck_count(token: str, database: str, dataset: str, prefix: str) -> i
                     [f"{prefix}-%"],
                 ).fetchone()[0]
             )
+    except Exception:
+        return 0
+
+
+def _motherduck_total_count(token: str, database: str, dataset: str) -> int:
+    try:
+        with duckdb.connect(f"md:{database}?motherduck_token={token}") as con:
+            table = f"{_duck_identifier(dataset)}.{_duck_identifier('cdcflight_app_customers')}"
+            return int(con.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
     except Exception:
         return 0
 
@@ -560,6 +616,18 @@ def _wait_for_warmup(
     warmup_prefix: str,
     timeout: float = 120.0,
 ) -> dict[str, Any]:
+    initial_deadline = time.monotonic() + timeout
+    while time.monotonic() < initial_deadline:
+        if process.poll() is not None:
+            raise RuntimeError(f"service exited during initial snapshot: {process.returncode}")
+        # cdc_source is the fixed, seeded source fixture.  Initial mode must
+        # first publish those five baseline rows; only then is the isolated
+        # warm-up row written and excluded from the measured prefix.
+        if _motherduck_total_count(token, database, dataset) >= 5:
+            break
+        time.sleep(0.5)
+    else:
+        raise TimeoutError("initial source snapshot did not publish the seeded customers")
     _insert_source_warmup(warmup_prefix)
     target_lsn = _source_lsn()
     deadline = time.monotonic() + timeout
@@ -697,6 +765,10 @@ def _drop_source_slot(slot: str) -> None:
         con.execute("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = %s", (slot,))
 
 
+def _source_slot_exists(slot: str) -> bool:
+    return bool(_slot_snapshot(slot).get("exists"))
+
+
 def _service_environment(
     run_dir: Path,
     *,
@@ -728,7 +800,7 @@ def _service_environment(
         "CDC_DATASET": dataset,
         "CDC_TABLES": "customers",
         "CDC_AUTO_DISCOVERY": "0",
-        "CDC_SNAPSHOT_MODE": "no_data",
+        "CDC_SNAPSHOT_MODE": "initial",
         "MAX_RUNTIME_SEC": "0",
         "motherduck_token": token,
         "MOTHERDUCK_TOKEN": token,
@@ -841,6 +913,13 @@ def _run_service_repetition(
         result["warmup"] = _wait_for_warmup(
             token, md_database, dataset, slot, process, warmup_prefix
         )
+        if stall:
+            arm_path = Path(environment["CDC_TEST_DESTINATION_FAULT_ARM"])
+            arm_path.touch()
+            result["destination_fault_arm"] = {
+                "path": str(arm_path),
+                "armed_after_warmup": True,
+            }
         lower_lsn = _source_lsn()
         source_started_box: dict[str, float] = {}
 
@@ -991,11 +1070,79 @@ def _run_service_repetition(
             result["service_stop"] = _stop_service(process)
         if log_handle is not None:
             log_handle.close()
+        service_summary_path = run_dir / "state" / "last_run.json"
+        service_summary = _read_json(service_summary_path)
+        if service_summary is not None:
+            result["service_summary"] = service_summary
         _drop_source_slot(slot)
         _source_cleanup(prefix)
         _source_cleanup(warmup_prefix)
         _drop_marker_table(SOURCE_DATABASE, marker_table)
         _drop_motherduck_database(token, md_database)
+        cleanup: dict[str, Any] = {}
+        try:
+            cleanup["slot_exists_after_cleanup"] = _source_slot_exists(slot)
+        except BaseException as exc:
+            cleanup["slot_cleanup_check_error"] = f"{type(exc).__name__}: {exc}"
+        try:
+            cleanup["source_prefix_rows_after_cleanup"] = len(_source_customer_rows(prefix))
+            cleanup["warmup_prefix_rows_after_cleanup"] = len(
+                _source_customer_rows(warmup_prefix)
+            )
+        except BaseException as exc:
+            cleanup["source_cleanup_check_error"] = f"{type(exc).__name__}: {exc}"
+        try:
+            cleanup["marker_table_exists_after_cleanup"] = _source_relation_exists(
+                "p53_measurement", marker_table
+            )
+        except BaseException as exc:
+            cleanup["marker_cleanup_check_error"] = f"{type(exc).__name__}: {exc}"
+        try:
+            cleanup["motherduck_database_exists_after_cleanup"] = _motherduck_database_exists(
+                token, md_database
+            )
+        except BaseException as exc:
+            cleanup["motherduck_cleanup_check_error"] = f"{type(exc).__name__}: {exc}"
+        result["cleanup"] = cleanup
+    if result.get("keep_up"):
+        service_summary = result.get("service_summary") or {}
+        service_stop = result.get("service_stop") or {}
+        if (
+            service_stop.get("returncode") != 0
+            or service_summary.get("service_mode") is not True
+            or service_summary.get("ok") is not True
+        ):
+            result["keep_up"] = False
+            result["valid_for_score"] = False
+            result["keep_up_rejection_reason"] = (
+                "service did not publish a successful service-mode summary after the "
+                "durable boundary"
+            )
+    if stall:
+        callback_path = run_dir / "callback_entered.json"
+        fault_path = run_dir / "state" / "fault_fired.json"
+        fault_record = _read_json(fault_path)
+        source = result.get("source") or {}
+        mutation_passed = bool(
+            source.get("committed_transactions") == transactions
+            and SOURCE_BAND_LOWER <= float(source.get("actual_source_tps", 0)) <= SOURCE_BAND_UPPER
+            and callback_path.exists()
+            and fault_record
+            and fault_record.get("point") == "destination_hang"
+            and not result.get("keep_up", False)
+        )
+        result["mutation_verdict"] = {
+            "passed": mutation_passed,
+            "source_commits_continued": source.get("committed_transactions") == transactions,
+            "source_actual_tps": source.get("actual_source_tps"),
+            "destination_stall_witness": callback_path.exists(),
+            "fault_record": fault_record,
+            "keep_up_check_rejected": not result.get("keep_up", False),
+            "reason": (
+                "destination was stalled while source marker commits continued; the "
+                "keep-up decision also requires an exact destination/oracle boundary"
+            ),
+        }
     if generator_error is not None and not result.get("stall_mutation"):
         # The caller records the failed product repetition and decides whether
         # the run is a product failure or an environmental discard.
