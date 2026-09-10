@@ -129,6 +129,18 @@ def _runs(sandbox, signal_id: str) -> list[tuple]:
     )
 
 
+def _service_completion_witness(path, signal_id: str) -> list[dict] | None:
+    """Return the service's completion-side notification, not a test-side event."""
+    rows = _live_state_for_signal(path, signal_id)
+    if any(
+        row.get("notification_status") == "COMPLETED"
+        and row.get("state") in {"complete", "ready_to_swap", "swapping"}
+        for row in rows
+    ):
+        return rows
+    return None
+
+
 def _live_state_for_signal(path, signal_id: str) -> list[dict]:
     """Read the service's append-only backfill witness without opening DuckDB."""
     if not path.exists():
@@ -289,16 +301,11 @@ def _run_subcase(
         payload = json.loads(payload)
         assert payload["data-collections"] == [f"app.{table}"]
 
+        # Wait for a notification emitted by the running destination owner. The
+        # sidecar is only a service-produced progress witness; the durable run is
+        # read after shutdown, when the service has released its DuckDB writer.
         _wait_for(
-            lambda: next(
-                (
-                    current
-                    for current in _live_state_for_signal(live_state, signal_id)
-                    if current.get("state") == "complete"
-                    and current.get("notification_status") == "COMPLETED"
-                ),
-                None,
-            ),
+            lambda: _service_completion_witness(live_state, signal_id),
             sandbox=sandbox,
             process=process,
             timeout=300,
