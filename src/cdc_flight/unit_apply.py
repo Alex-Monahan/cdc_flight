@@ -110,12 +110,30 @@ def apply_units(
                 applier.group.is_snapshot = True
             plan.add_unit(unit)
 
+        # Capture the value-free source boundary while staged prefixes are still
+        # present.  The facts are attached to the successful plan result below and
+        # are persisted by the commit protocol in this same destination transaction.
+        # SourceHealth never calls this function; this is ordinary destination-owned
+        # commit bookkeeping.
+        source_data_facts = destination.collect_source_data_facts(
+            applier.con,
+            group,
+            commit_id=commit_id,
+            ignored_source_tables=applier.ignored_source_tables,
+            control_schema=applier.control_schema,
+        )
+
         anchor = None
         if has_data:
             def anchor() -> None:
                 maybe_crash("mid_apply", applier.data_commit_groups + 1)
 
         stats = plan.write(after_first_table=anchor, clear_spill=clear_spill)
+        stats["source_data_facts"] = tuple(
+            fact
+            for fact in source_data_facts
+            if f"{fact['source_schema']}.{fact['source_table']}" in plan.source_tables
+        )
     except BaseException:
         _merge_message_stats(applier, plan.stats)
         raise

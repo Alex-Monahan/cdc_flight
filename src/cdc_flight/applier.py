@@ -505,6 +505,14 @@ class Applier:
         #: Set immediately after the destination COMMIT for supervisor timing
         #: evidence; it is never used to authorize an acknowledgement.
         self.last_commit_monotonic: float | None = None
+        #: Value-free proof of the existing Invariant-O order.  The source slot
+        #: can only observe feedback after ``markBatchFinished``; retaining the
+        #: destination commit and acknowledgement instants makes that boundary
+        #: inspectable by the callback-connected live lane.
+        self.last_ack_monotonic: float | None = None
+        self.last_commit_source_lsn: int | None = None
+        self.last_ack_source_lsn: int | None = None
+        self.destination_commit_ack_trace: list[dict[str, Any]] = []
         self.error: BaseException | None = None
         self._next_commit_id = destination.next_commit_id(
             con, pipeline, control_schema=self.control_schema
@@ -607,6 +615,11 @@ class Applier:
             "orphan_end_markers": self.assembler.orphan_end_markers,
             "implicit_txn_opens": self.assembler.implicit_txn_opens,
             "last_commit_id": self.last_commit_id,
+            "last_destination_commit_monotonic": self.last_commit_monotonic,
+            "last_destination_ack_monotonic": self.last_ack_monotonic,
+            "last_destination_commit_lsn": self.last_commit_source_lsn,
+            "last_destination_ack_lsn": self.last_ack_source_lsn,
+            "destination_commit_ack_trace": list(self.destination_commit_ack_trace),
             "durable_lsn": self.resume_point.last_lsn,
             "transactional_ddl": self.transactional_ddl,
             "alerts_out_of_transaction": self.alerts.independent,

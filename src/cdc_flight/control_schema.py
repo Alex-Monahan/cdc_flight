@@ -65,6 +65,44 @@ CONTROL_DDL = [
             tables_touched  VARCHAR[],
             PRIMARY KEY (pipeline, commit_id)
         )""",
+    # A committed source-data fact remains *pending* for fall-behind admission
+    # while its source LSN is above the slot's observed confirmed position.  This
+    # is deliberately derived from durable destination commits, not from the
+    # applier's last-applied timestamp: the latter would turn an already-applied
+    # row into a false age signal and would make an unknown queue age appear known.
+    # Facts are written in the same transaction as destination rows, resume state,
+    # and commit_log. Historical rows are harmless; the owner filters by the live
+    # slot observation and therefore never advances a source slot while reading it.
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.source_data_facts (
+            pipeline        VARCHAR     NOT NULL,
+            commit_id       BIGINT      NOT NULL,
+            source_schema   VARCHAR     NOT NULL,
+            source_table    VARCHAR     NOT NULL,
+            source_lsn      BIGINT      NOT NULL,
+            source_ts_ms    BIGINT,
+            recorded_at     TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (pipeline, commit_id, source_schema, source_table)
+        )""",
+    # One durable admission boundary per slot/table.  A fresh health sample can
+    # continue to report the same WAL backlog after its source signal has been
+    # published, so process-local observation identities are insufficient to
+    # prevent a second run.  The destination owner records the sampled confirmed
+    # boundary in the same transaction as the run and its source intent; a later
+    # sample at or behind that boundary is therefore a durable coalescing no-op.
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.source_health_admissions (
+            pipeline             VARCHAR     NOT NULL,
+            slot_name            VARCHAR     NOT NULL,
+            source_schema        VARCHAR     NOT NULL,
+            source_table         VARCHAR     NOT NULL,
+            confirmed_flush_lsn  BIGINT      NOT NULL,
+            current_wal_lsn      BIGINT,
+            observation_id       VARCHAR     NOT NULL,
+            signal_id            VARCHAR     NOT NULL,
+            trigger_reason       VARCHAR     NOT NULL,
+            source_data_lsn      BIGINT,
+            admitted_at          TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (pipeline, slot_name, source_schema, source_table)
+        )""",
     f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.lease (
             -- ``pipeline`` remains the compatibility column.  Its value is the
             -- resolved physical key, never a configured pipeline name.
@@ -785,6 +823,25 @@ def _migrate_recovery_state(con, control_schema: str | None = None) -> None:
         )
 
 
+def _migrate_source_health_admissions(con, control_schema: str | None = None) -> None:
+    """Add the per-table source-data high-water mark to health admission state."""
+    schema = resolve_control_schema(control_schema)
+    table = quote(schema) + ".source_health_admissions"
+    existing = {
+        str(row[0])
+        for row in con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = ? AND table_name = 'source_health_admissions'",
+            [schema],
+        ).fetchall()
+    }
+    if "source_data_lsn" not in existing:
+        con.execute(
+            f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS "
+            f"{quote('source_data_lsn')} BIGINT"
+        )
+
+
 def ensure_control_schema(con, control_schema: str | None = None) -> None:
     """Create the current control schema and apply its additive lease migration."""
     con.execute("BEGIN TRANSACTION")
@@ -796,6 +853,7 @@ def ensure_control_schema(con, control_schema: str | None = None) -> None:
         _migrate_policy_columns(con, control_schema)
         _migrate_event_ledger(con, control_schema)
         _migrate_recovery_state(con, control_schema)
+        _migrate_source_health_admissions(con, control_schema)
         con.execute("COMMIT")
     except BaseException:
         with contextlib.suppress(Exception):
