@@ -28,14 +28,14 @@ _BASELINE_SELECTED = {
     # one live two-sided retirement node.
     # The §3.4 post-ack queued-recovery proof and the empty service-recheck
     # regression proof each add one default-lane node.
-    "not motherduck and not slow": 2463,
-    "slow and not motherduck": 267,
+    "not motherduck and not slow": 2472,
+    "slow and not motherduck": 268,
     # The quiet-holder and stock-walsender retry proofs are MotherDuck-only real
     # process nodes; a local DuckDB file lock cannot exercise cloud takeover while
     # the old process retains its handle.
     # The selected MotherDuck total is 65 including this guard after the permanent
     # retained-recovery MotherDuck proof was added.
-    "motherduck": 64,
+    "motherduck": 65,
 }
 
 
