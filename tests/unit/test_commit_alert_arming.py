@@ -9,6 +9,7 @@ import pytest
 
 from cdc_flight import commit_protocol, destination
 from cdc_flight.applier import Applier
+from cdc_flight.commit_group import CommitResult
 from cdc_flight.config import ServiceConfig
 from cdc_flight.destination_fence import EpochFencedConnection
 from cdc_flight.destination_lease import Lease
@@ -143,10 +144,10 @@ def test_commit_alert_arm_waits_for_a_fenced_observability_writer(tmp_path, capl
 
         def commit_body(self, trigger):
             order.append(f"body:{trigger}")
-            return "committed"
+            return CommitResult.COMMITTED
 
         wrapped = commit_protocol._bounded_service_destination_operation(commit_body)
-        assert wrapped(WrapperSubject(), "resnapshot") == "committed"
+        assert wrapped(WrapperSubject(), "resnapshot") is CommitResult.COMMITTED
         assert order == ["arm:9", "body:resnapshot"]
     finally:
         release_holder.set()

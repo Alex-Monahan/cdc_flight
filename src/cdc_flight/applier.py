@@ -525,6 +525,11 @@ class Applier:
         )
         self._pending_offset_blob: bytes | None = None
         self._pending_offset_key_blob: bytes | None = None
+        #: Commit ids whose COMMIT call has begun. A later exception is ambiguous:
+        #: the destination may already be durable, so its pre-armed alert must stay
+        #: in the independent sink. This is process-local protocol state only; the
+        #: alert row remains the durable record across a hard exit.
+        self._commit_timeout_ambiguous_ids: set[int] = set()
 
         self._timer_stop = threading.Event()
         self._timer = threading.Thread(
@@ -1465,6 +1470,22 @@ class Applier:
         log.critical("%s", error)
         raise error
 
+    def _mark_commit_timeout_ambiguous(self, commit_id: int) -> None:
+        """Remember that this commit may already be durable after an exception."""
+        ambiguous = getattr(self, "_commit_timeout_ambiguous_ids", None)
+        if ambiguous is None:
+            ambiguous = set()
+            self._commit_timeout_ambiguous_ids = ambiguous
+        ambiguous.add(commit_id)
+
+    def _commit_timeout_is_ambiguous(self, commit_id: int) -> bool:
+        return commit_id in getattr(self, "_commit_timeout_ambiguous_ids", ())
+
+    def _retire_commit_timeout_alert_if_known(self, commit_id: int) -> None:
+        """Retire an arm only when this attempt is known not to have committed."""
+        if not self._commit_timeout_is_ambiguous(commit_id):
+            self._clear_commit_timeout_alert(commit_id)
+
     def _clear_commit_timeout_alert(self, commit_id: int) -> None:
         """Clear the conservative watchdog alert after COMMIT_ACK has closed."""
         self.alerts.clear_alert_once(
@@ -1475,6 +1496,9 @@ class Applier:
                 pipeline=self.pipeline,
             ),
         )
+        ambiguous = getattr(self, "_commit_timeout_ambiguous_ids", None)
+        if ambiguous is not None:
+            ambiguous.discard(commit_id)
 
     def hold_streaming_tail(self, tables) -> None:
         """Hold these relations' ordinary stream rows out of a retained image.
