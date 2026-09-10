@@ -301,7 +301,7 @@ def test_real_motherduck_health_callback_commits_data_state_and_cursor_before_sl
             process=process,
             timeout=360,
         )
-        final = _wait_for(
+            final = _wait_for(
             lambda: (
                 snapshot
                 if (
@@ -315,10 +315,14 @@ def test_real_motherduck_health_callback_commits_data_state_and_cursor_before_sl
                 else None
             ),
             sandbox=sandbox,
-            process=process,
-            timeout=360,
-        )
-        observer_stop.set()
+                process=process,
+                timeout=360,
+            )
+            # Preserve the independently-read terminal snapshot even when the
+            # periodic observer's next tick would fall after the service is
+            # stopped. This is still a separate MotherDuck reader snapshot.
+            observed.append(final)
+            observer_stop.set()
         watcher.join(timeout=20)
         assert not watcher.is_alive()
 
