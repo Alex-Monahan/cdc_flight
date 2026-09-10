@@ -530,6 +530,10 @@ class Applier:
         #: in the independent sink. This is process-local protocol state only; the
         #: alert row remains the durable record across a hard exit.
         self._commit_timeout_ambiguous_ids: set[int] = set()
+        #: Avoid issuing the same rollback retirement twice when both the inner
+        #: handler and its outer decorator observe one known failure. Only one
+        #: commit group is active at a time, so this does not grow with the run.
+        self._commit_timeout_retired_id: int | None = None
 
         self._timer_stop = threading.Event()
         self._timer = threading.Thread(
@@ -1449,6 +1453,7 @@ class Applier:
             time.sleep(0.01)
 
         if armed and self.alerts.independent:
+            self._commit_timeout_retired_id = None
             return
         if (
             self.alerts.independent
@@ -1462,6 +1467,7 @@ class Applier:
                 control_schema=self.control_schema,
             )
         ):
+            self._commit_timeout_retired_id = None
             return
         error = RuntimeError(
             f"could not durably arm the commit watchdog alert for commit_id={commit_id}; "
@@ -1483,12 +1489,15 @@ class Applier:
 
     def _retire_commit_timeout_alert_if_known(self, commit_id: int) -> None:
         """Retire an arm only when this attempt is known not to have committed."""
-        if not self._commit_timeout_is_ambiguous(commit_id):
+        if (
+            not self._commit_timeout_is_ambiguous(commit_id)
+            and getattr(self, "_commit_timeout_retired_id", None) != commit_id
+        ):
             self._clear_commit_timeout_alert(commit_id)
 
-    def _clear_commit_timeout_alert(self, commit_id: int) -> None:
+    def _clear_commit_timeout_alert(self, commit_id: int) -> bool:
         """Clear the conservative watchdog alert after COMMIT_ACK has closed."""
-        self.alerts.clear_alert_once(
+        cleared = self.alerts.clear_alert_once(
             code="commit_timeout",
             condition_key="commit_timeout",
             occurrence_key=OccurrenceKey.from_commit(
@@ -1496,9 +1505,12 @@ class Applier:
                 pipeline=self.pipeline,
             ),
         )
+        if cleared:
+            self._commit_timeout_retired_id = commit_id
         ambiguous = getattr(self, "_commit_timeout_ambiguous_ids", None)
         if ambiguous is not None:
             ambiguous.discard(commit_id)
+        return cleared
 
     def hold_streaming_tail(self, tables) -> None:
         """Hold these relations' ordinary stream rows out of a retained image.
