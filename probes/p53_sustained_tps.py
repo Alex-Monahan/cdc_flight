@@ -816,7 +816,12 @@ def _service_environment(
                 "CDC_FAULT_HANG_SECONDS": "12",
                 "CDC_SERVICE_COMMIT_TIMEOUT": "3",
                 "CDC_COMMIT_TIMEOUT": "3",
-                "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "5",
+                # MotherDuck admission and the initial snapshot are allowed to
+                # finish before the test arms the live data fault.  The
+                # destination-operation watchdog remains 3s once the fault is
+                # armed; a short service idle timeout here would kill startup
+                # before the source window existed.
+                "CDC_SERVICE_STALL_TIMEOUT_SECONDS": "30",
                 "CDC_CLOSE_TIMEOUT": "5",
                 "CDC_SERVICE_CLOSE_TIMEOUT": "5",
                 "CDC_TEST_DESTINATION_FAULT_ARM": str(arm),
