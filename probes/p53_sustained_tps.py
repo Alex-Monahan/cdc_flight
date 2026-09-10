@@ -476,6 +476,22 @@ def _create_motherduck_database(token: str, database: str) -> None:
         con.execute(f"CREATE DATABASE {_duck_identifier(database)}")
 
 
+def _prepare_motherduck_destination(token: str, database: str, dataset: str) -> None:
+    """Create the non-data schemas required before service admission.
+
+    ``SingleProcessFlight`` deliberately refuses to create destination state before
+    it owns a fencing epoch.  The test harness owns this one-time fixture setup;
+    every measured row and every state transition after admission still uses the
+    service's one fenced connection.
+    """
+    from cdc_flight.control_schema import ensure_control_schema
+    from cdc_flight.destination import ensure_dataset
+
+    with duckdb.connect(f"md:{database}?motherduck_token={token}") as con:
+        ensure_control_schema(con, "_cdc_flight")
+        ensure_dataset(con, dataset)
+
+
 def _drop_motherduck_database(token: str, database: str) -> None:
     with suppress(Exception), duckdb.connect(f"md:?motherduck_token={token}") as con:
         con.execute(f"DROP DATABASE {_duck_identifier(database)}")
@@ -807,6 +823,7 @@ def _run_service_repetition(
     generator_error: BaseException | None = None
     try:
         _create_motherduck_database(token, md_database)
+        _prepare_motherduck_destination(token, md_database, dataset)
         _create_marker_table(SOURCE_DATABASE, marker_table)
         environment = _service_environment(
             run_dir,
