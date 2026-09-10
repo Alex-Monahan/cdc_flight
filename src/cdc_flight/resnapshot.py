@@ -550,6 +550,7 @@ def run(
             hstore_handling_mode=props.get("hstore.handling.mode", "map"),
             control_schema=control_schema,
             message_prefix_allowlist=replication.message_prefix_allowlist,
+            prearm_commit_watchdog=True,
         )
         ownership.attach(applier)
         # Keep the historical pipeline seam: tests and embedding callers replace

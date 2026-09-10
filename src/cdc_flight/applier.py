@@ -95,6 +95,7 @@ from .marker_accounting import SourceMarkerReceiptCounter
 from .naming import control_table
 from .occurrence import _commit_reservation
 from .policy import AcknowledgementHandle, PolicyGate
+from .run_state import COMMIT_ACK
 from .snapshot import SnapshotCoordinator
 from .snapshot_completion import (
     SnapshotCompletion,
@@ -182,6 +183,7 @@ class Applier:
         binary_handling_mode: str = "base64", hstore_handling_mode: str = "map",
         control_schema: str | None = None,
         service_context=None,
+        prearm_commit_watchdog: bool = False,
         source_cluster_id: str | None = None,
         source_timeline: int | None = None,
         strict_event_identity: bool = False,
@@ -209,6 +211,10 @@ class Applier:
         # Service mode supplies the parent/epoch fence; batch callers leave this
         # unset and retain the finite adapter's exact callback surface.
         self.service_context = service_context
+        # A throwaway re-snapshot applier also shares the service's fenced
+        # destination handle but deliberately does not inherit the live service
+        # context. Its wrapper must therefore opt into the same pre-arm ordering.
+        self.prearm_commit_watchdog = bool(prearm_commit_watchdog)
         self.source_cluster_id = source_cluster_id
         self.source_timeline = source_timeline
         self.strict_event_identity = bool(strict_event_identity)
@@ -519,6 +525,15 @@ class Applier:
         )
         self._pending_offset_blob: bytes | None = None
         self._pending_offset_key_blob: bytes | None = None
+        #: Commit ids whose COMMIT call has begun. A later exception is ambiguous:
+        #: the destination may already be durable, so its pre-armed alert must stay
+        #: in the independent sink. This is process-local protocol state only; the
+        #: alert row remains the durable record across a hard exit.
+        self._commit_timeout_ambiguous_ids: set[int] = set()
+        #: Avoid issuing the same rollback retirement twice when both the inner
+        #: handler and its outer decorator observe one known failure. Only one
+        #: commit group is active at a time, so this does not grow with the run.
+        self._commit_timeout_retired_id: int | None = None
 
         self._timer_stop = threading.Event()
         self._timer = threading.Thread(
@@ -1398,37 +1413,91 @@ class Applier:
         place after a hard exit is the observable timeout; a successful group clears it
         only after the exclusion has closed.
         """
-        armed = self.alerts.raise_alert_once(
-            severity="critical",
-            code="commit_timeout",
-            message=(
-                f"commit group {commit_id} has an armed bounded commit watchdog; if "
-                "this alert remains, the commit or acknowledgement did not return "
-                "within the watchdog timeout. The commit is AMBIGUOUS and the "
-                "destination may already be durable, so the next run must reconcile "
-                "it before claiming success"
-            ),
-            condition_key="commit_timeout",
-            occurrence_key=OccurrenceKey.from_commit(
-                _commit_reservation(self.pipeline, commit_id),
-                pipeline=self.pipeline,
-            ),
-            context={
-                "commit_id": commit_id,
-                "armed_before_commit_ack_window": True,
-                "timeout_seconds": self.cfg.commit_timeout,
-                "runner_id": self.runner_id,
-            },
+        occurrence_key = OccurrenceKey.from_commit(
+            _commit_reservation(self.pipeline, commit_id),
+            pipeline=self.pipeline,
         )
-        if not armed:
-            log.critical(
-                "could not durably arm the commit watchdog alert for commit_id=%s",
-                commit_id,
-            )
+        message = (
+            f"commit group {commit_id} has an armed bounded commit watchdog; if "
+            "this alert remains, the commit or acknowledgement did not return "
+            "within the watchdog timeout. The commit is AMBIGUOUS and the "
+            "destination may already be durable, so the next run must reconcile "
+            "it before claiming success"
+        )
 
-    def _clear_commit_timeout_alert(self, commit_id: int) -> None:
+        # AlertSink's independent cursor is itself epoch-fenced.  Its lease UPDATE
+        # must share the commit->ack exclusion with the run-state writer; otherwise
+        # the two independent cursors can conflict on the lease row before the alert
+        # INSERT is reached.  If a prior commit watchdog already armed this identity,
+        # the idempotent second call is success, not an arming failure.
+        while True:
+            with COMMIT_ACK.excluded() as inside_window:
+                if not inside_window:
+                    armed = self.alerts.raise_alert_once(
+                        severity="critical",
+                        code="commit_timeout",
+                        message=message,
+                        condition_key="commit_timeout",
+                        occurrence_key=occurrence_key,
+                        context={
+                            "commit_id": commit_id,
+                            "armed_before_commit_ack_window": True,
+                            "timeout_seconds": self.cfg.commit_timeout,
+                            "runner_id": self.runner_id,
+                        },
+                    )
+                    break
+            # ``excluded`` deliberately drops ordinary telemetry while the window is
+            # active. Arming cannot be dropped, so wait for that window to close and
+            # acquire the gate again before doing any destination I/O.
+            time.sleep(0.01)
+
+        if armed and self.alerts.independent:
+            self._commit_timeout_retired_id = None
+            return
+        if (
+            self.alerts.independent
+            and self.alerts._sink is not None
+            and destination.alert_identity_exists(
+                self.alerts._sink,
+                pipeline=self.pipeline,
+                code="commit_timeout",
+                condition_key="commit_timeout",
+                occurrence_key=occurrence_key,
+                control_schema=self.control_schema,
+            )
+        ):
+            self._commit_timeout_retired_id = None
+            return
+        error = RuntimeError(
+            f"could not durably arm the commit watchdog alert for commit_id={commit_id}; "
+            "refusing to enter a watchdog without its durable timeout record"
+        )
+        log.critical("%s", error)
+        raise error
+
+    def _mark_commit_timeout_ambiguous(self, commit_id: int) -> None:
+        """Remember that this commit may already be durable after an exception."""
+        ambiguous = getattr(self, "_commit_timeout_ambiguous_ids", None)
+        if ambiguous is None:
+            ambiguous = set()
+            self._commit_timeout_ambiguous_ids = ambiguous
+        ambiguous.add(commit_id)
+
+    def _commit_timeout_is_ambiguous(self, commit_id: int) -> bool:
+        return commit_id in getattr(self, "_commit_timeout_ambiguous_ids", ())
+
+    def _retire_commit_timeout_alert_if_known(self, commit_id: int) -> None:
+        """Retire an arm only when this attempt is known not to have committed."""
+        if (
+            not self._commit_timeout_is_ambiguous(commit_id)
+            and getattr(self, "_commit_timeout_retired_id", None) != commit_id
+        ):
+            self._clear_commit_timeout_alert(commit_id)
+
+    def _clear_commit_timeout_alert(self, commit_id: int) -> bool:
         """Clear the conservative watchdog alert after COMMIT_ACK has closed."""
-        self.alerts.clear_alert_once(
+        cleared = self.alerts.clear_alert_once(
             code="commit_timeout",
             condition_key="commit_timeout",
             occurrence_key=OccurrenceKey.from_commit(
@@ -1436,6 +1505,12 @@ class Applier:
                 pipeline=self.pipeline,
             ),
         )
+        if cleared:
+            self._commit_timeout_retired_id = commit_id
+        ambiguous = getattr(self, "_commit_timeout_ambiguous_ids", None)
+        if ambiguous is not None:
+            ambiguous.discard(commit_id)
+        return cleared
 
     def hold_streaming_tail(self, tables) -> None:
         """Hold these relations' ordinary stream rows out of a retained image.

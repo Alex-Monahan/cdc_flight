@@ -58,19 +58,42 @@ def _bounded_service_destination_operation(function):
     """Bound service destination work before the commit/ack hand-off."""
     @functools.wraps(function)
     def wrapped(self, trigger: str) -> CommitResult:
-        if self.service_context is None or not self.group.units:
+        if not self.group.units:
+            return function(self, trigger)
+        if self.service_context is None and not self.prearm_commit_watchdog:
             return function(self, trigger)
         commit_id = self.group.spill_commit_id or self._next_commit_id
-        # If native destination work hangs before the existing inner watchdog is
-        # armed, leave the same durable diagnostic behind.  No timeout callback
-        # performs destination or telemetry I/O.
+        # Every commit watchdog needs its durable record before this function can
+        # open the destination transaction.  The throwaway resnapshot applier has
+        # no service_context, but it still calls the inner commit watchdog while
+        # sharing the service's fenced destination handle.
         self._arm_commit_timeout_alert(commit_id)
-        with self_heal.destination_operation_watchdog(self.cfg.commit_timeout) as stop:
-            self._destination_operation_deadline_stop = stop
-            try:
-                return function(self, trigger)
-            finally:
-                self._destination_operation_deadline_stop = None
+        try:
+            if self.service_context is None:
+                result = function(self, trigger)
+            else:
+                # If native destination work hangs before the existing inner
+                # watchdog is armed, leave the same durable diagnostic behind. No
+                # timeout callback performs destination or telemetry I/O.
+                with self_heal.destination_operation_watchdog(
+                    self.cfg.commit_timeout
+                ) as stop:
+                    self._destination_operation_deadline_stop = stop
+                    try:
+                        result = function(self, trigger)
+                    finally:
+                        self._destination_operation_deadline_stop = None
+        except BaseException:
+            # A normal exception is a known non-commit only until the protocol marks
+            # the COMMIT call as entered. After that point the server may already
+            # have committed, including when the client reports an error.
+            self._retire_commit_timeout_alert_if_known(commit_id)
+            raise
+        if result is not CommitResult.COMMITTED:
+            # BLOCKED (and any future non-commit outcome) has no durable destination
+            # boundary, so an outer arm must not become a false historical alert.
+            self._retire_commit_timeout_alert_if_known(commit_id)
+        return result
 
     return wrapped
 
@@ -285,6 +308,10 @@ def commit_group(self, trigger: str) -> CommitResult:
                     # COMMIT; the commit/ack window itself contains no lease or
                     # observability I/O.
                     self.service_context.assert_writable()
+                # From this statement onward a client-side exception is ambiguous:
+                # DuckDB/MotherDuck may have accepted the COMMIT even if the call
+                # does not return. Keep the durable pre-arm for that outcome.
+                self._mark_commit_timeout_ambiguous(commit_id)
                 self.con.execute("COMMIT")
                 self.group.txn_open = False
                 # The supervisor uses this exact post-COMMIT instant to measure
@@ -385,11 +412,13 @@ def commit_group(self, trigger: str) -> CommitResult:
         COMMIT_ACK.leave()
         self._request_resnapshot_for(ambiguous)
         self._rollback_quietly()
+        self._retire_commit_timeout_alert_if_known(commit_id)
         raise
     except AdmissionError as error:
         refused = as_schema_refusal(error, refusal_origin="typed_planner")
         self._contextualize_schema_refusal(refused)
         self._rollback_quietly()
+        self._retire_commit_timeout_alert_if_known(commit_id)
         self._record_schema_refusal(refused)
         raise
     except (DestinationExecutionFailure, TableWriteFailure) as failure:
@@ -400,6 +429,7 @@ def commit_group(self, trigger: str) -> CommitResult:
         # only the failed relation excluded. Commit/resume state is written only by
         # the successful retry.
         self._rollback_quietly()
+        self._retire_commit_timeout_alert_if_known(commit_id)
         qualified = self._contain_destination_failure(
             failure.refused,
             failure.original,
@@ -421,6 +451,7 @@ def commit_group(self, trigger: str) -> CommitResult:
             self._excluded_destination_tables.clear()
     except BaseException:
         self._rollback_quietly()
+        self._retire_commit_timeout_alert_if_known(commit_id)
         raise
     # The sidecar is test-only evidence and is written after COMMIT_ACK as well as
     # after the destination COMMIT. It can therefore never become an alternate
