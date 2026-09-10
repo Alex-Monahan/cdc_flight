@@ -813,9 +813,13 @@ def _service_environment(
             {
                 "CDC_FAULT_INJECT": "destination_hang:1",
                 "CDC_FAULT_HANG_PHASE": "pre_commit",
-                "CDC_FAULT_HANG_SECONDS": "12",
-                "CDC_SERVICE_COMMIT_TIMEOUT": "3",
-                "CDC_COMMIT_TIMEOUT": "3",
+                # The initial snapshot is a real destination commit too, so its
+                # bound must exceed the observed MotherDuck startup latency.  The
+                # injected 40s live-data hang is still terminated by this 20s
+                # commit watchdog after the arm is opened.
+                "CDC_FAULT_HANG_SECONDS": "40",
+                "CDC_SERVICE_COMMIT_TIMEOUT": "20",
+                "CDC_COMMIT_TIMEOUT": "20",
                 # MotherDuck admission and the initial snapshot are allowed to
                 # finish before the test arms the live data fault.  The
                 # destination-operation watchdog remains 3s once the fault is
