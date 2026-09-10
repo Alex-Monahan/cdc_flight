@@ -183,6 +183,7 @@ class Applier:
         binary_handling_mode: str = "base64", hstore_handling_mode: str = "map",
         control_schema: str | None = None,
         service_context=None,
+        prearm_commit_watchdog: bool = False,
         source_cluster_id: str | None = None,
         source_timeline: int | None = None,
         strict_event_identity: bool = False,
@@ -210,6 +211,10 @@ class Applier:
         # Service mode supplies the parent/epoch fence; batch callers leave this
         # unset and retain the finite adapter's exact callback surface.
         self.service_context = service_context
+        # A throwaway re-snapshot applier also shares the service's fenced
+        # destination handle but deliberately does not inherit the live service
+        # context. Its wrapper must therefore opt into the same pre-arm ordering.
+        self.prearm_commit_watchdog = bool(prearm_commit_watchdog)
         self.source_cluster_id = source_cluster_id
         self.source_timeline = source_timeline
         self.strict_event_identity = bool(strict_event_identity)

@@ -60,6 +60,8 @@ def _bounded_service_destination_operation(function):
     def wrapped(self, trigger: str) -> CommitResult:
         if not self.group.units:
             return function(self, trigger)
+        if self.service_context is None and not self.prearm_commit_watchdog:
+            return function(self, trigger)
         commit_id = self.group.spill_commit_id or self._next_commit_id
         # Every commit watchdog needs its durable record before this function can
         # open the destination transaction.  The throwaway resnapshot applier has

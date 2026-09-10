@@ -134,6 +134,7 @@ def test_commit_alert_arm_waits_for_a_fenced_observability_writer(tmp_path, capl
 
         class WrapperSubject:
             service_context = None
+            prearm_commit_watchdog = True
             group = type("Group", (), {"units": [object()], "spill_commit_id": None})()
             _next_commit_id = 9
 
