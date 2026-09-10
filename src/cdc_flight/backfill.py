@@ -1152,6 +1152,50 @@ class BackfillSignalEffect:
     dispatched: bool
 
 
+@dataclass(frozen=True)
+class SourceHealthAdmissionResult:
+    """Value-free evidence from one destination-owned health admission."""
+
+    observation_id: str
+    owner: str
+    sampled_at: str | None
+    confirmed_flush_lsn: int | None
+    current_wal_lsn: int | None
+    pending_source_tables: tuple[str, ...] = ()
+    rejected_unknown_age: tuple[str, ...] = ()
+    selected: tuple[str, ...] = ()
+    coalesced_tables: tuple[str, ...] = ()
+    reasons: tuple[tuple[str, str], ...] = ()
+    admitted: bool = False
+    coalesced: bool = False
+    signal_id: str | None = None
+    run_ids: tuple[str, ...] = ()
+    published_signal_ids: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "observation_id": self.observation_id,
+            "owner": self.owner,
+            "sampled_at": self.sampled_at,
+            "confirmed_flush_lsn": self.confirmed_flush_lsn,
+            "current_wal_lsn": self.current_wal_lsn,
+            "pending_source_tables": list(self.pending_source_tables),
+            "rejected_unknown_age": list(self.rejected_unknown_age),
+            "selected": list(self.selected),
+            "coalesced_tables": list(self.coalesced_tables),
+            "reasons": {table: reason for table, reason in self.reasons},
+            "admitted": self.admitted,
+            "coalesced": self.coalesced,
+            "signal_id": self.signal_id,
+            "run_ids": list(self.run_ids),
+            "published_signal_ids": list(self.published_signal_ids),
+            "source_effect_route": "reconcile_signal_effects",
+            "source_signal_inserted_directly": False,
+            "destination_owner": "RefreshScheduler",
+            "slot_acknowledgement": "not reachable from admission",
+        }
+
+
 class BackfillSignalIntentRepository:
     """Durable intent for the source-side INSERT that follows destination admission."""
 
@@ -1503,6 +1547,11 @@ class BackfillCoordinator:
         )
         self.owner_id = f"{OWNER}:{uuid.uuid4().hex}"
         self._pending: list[IncrementalNotification] = []
+        #: The bounded sampler queue normally prevents duplicate delivery. Keep
+        #: the last consumed identity as a second, process-local idempotency guard
+        #: so a caller retrying the exact immutable observation cannot create a
+        #: second run after the first transaction has already committed.
+        self._last_source_health_observation_id: str | None = None
 
     def active(self, schema: str, table: str) -> BackfillRun | None:
         return self.repository.active(schema, table)
@@ -1520,6 +1569,147 @@ class BackfillCoordinator:
 
     def active_runs(self) -> list[BackfillRun]:
         return self.repository.active_all(include_blocked=True)
+
+    def pending_source_data_facts(
+        self, confirmed_flush_lsn: int | None
+    ) -> dict[str, int]:
+        """Read the oldest durable source-data timestamp still behind the slot.
+
+        A fact is pending only when its source boundary is strictly greater than
+        the *sampled* confirmed slot position.  With no confirmed position the
+        pending set is unknown and therefore empty: age admission must refuse it.
+        This query intentionally does not read ``debezium_offsets`` or any
+        last-applied timestamp as a substitute for pending source data.
+        """
+        if confirmed_flush_lsn is None:
+            return {}
+        rows = _read_relation(
+            self.con,
+            f"SELECT source_schema, source_table, min(source_ts_ms) "
+            f"FROM {control_table(self.control_schema, 'source_data_facts')} "
+            "WHERE pipeline = ? AND source_lsn > ? AND source_ts_ms IS NOT NULL "
+            "GROUP BY source_schema, source_table ORDER BY source_schema, source_table",
+            [self.pipeline, int(confirmed_flush_lsn)],
+        ).fetchall()
+        return {
+            f"{schema}.{table}": int(source_ts_ms)
+            for schema, table, source_ts_ms in rows
+            if source_ts_ms is not None
+        }
+
+    def source_health_admission_states(
+        self, slot_name: str, tables: Iterable[str]
+    ) -> dict[str, tuple[int, str, str, int | None]]:
+        """Read durable health admission boundaries for one sampled slot.
+
+        The sampler's sequence is process-local and can restart.  This durable
+        table is the cross-sample coalescing authority: a table admitted at a
+        sampled confirmed position is not admitted again until durable delivered
+        source data moves. The returned tuple is
+        ``(confirmed_flush_lsn, signal_id, observation_id, source_data_lsn)``.
+        """
+        selected = tuple(dict.fromkeys(str(table) for table in tables))
+        if not selected:
+            return {}
+        qualified = [table.split(".", 1) for table in selected]
+        predicates = " OR ".join(
+            "(source_schema = ? AND source_table = ?)" for _ in qualified
+        )
+        values: list[Any] = [self.pipeline, str(slot_name)]
+        values.extend(value for pair in qualified for value in pair)
+        rows = _read_relation(
+            self.con,
+            f"SELECT source_schema, source_table, confirmed_flush_lsn, signal_id, "
+            f"observation_id, source_data_lsn FROM "
+            f"{control_table(self.control_schema, 'source_health_admissions')} "
+            f"WHERE pipeline = ? AND slot_name = ? AND ({predicates})",
+            values,
+        ).fetchall()
+        return {
+            f"{schema}.{table}": (
+                int(confirmed),
+                str(signal_id),
+                str(observation_id),
+                None if source_data_lsn is None else int(source_data_lsn),
+            )
+            for schema, table, confirmed, signal_id, observation_id, source_data_lsn in rows
+        }
+
+    def source_data_high_water(self, tables: Iterable[str]) -> dict[str, int]:
+        """Return the highest durable delivered-data LSN for each table."""
+        selected = tuple(dict.fromkeys(str(table) for table in tables))
+        if not selected:
+            return {}
+        qualified = [table.split(".", 1) for table in selected]
+        predicates = " OR ".join(
+            "(source_schema = ? AND source_table = ?)" for _ in qualified
+        )
+        values: list[Any] = [self.pipeline]
+        values.extend(value for pair in qualified for value in pair)
+        rows = _read_relation(
+            self.con,
+            f"SELECT source_schema, source_table, max(source_lsn) FROM "
+            f"{control_table(self.control_schema, 'source_data_facts')} "
+            f"WHERE pipeline = ? AND ({predicates}) "
+            "GROUP BY source_schema, source_table",
+            values,
+        ).fetchall()
+        return {
+            f"{schema}.{table}": int(source_lsn)
+            for schema, table, source_lsn in rows
+            if source_lsn is not None
+        }
+
+    def record_source_health_admissions(
+        self,
+        observation,
+        reasons: Mapping[str, str],
+        signal_id: str,
+        *,
+        admitted_at: datetime | None = None,
+    ) -> None:
+        """Record source-health boundaries inside the caller's MD transaction."""
+        from .source_health import SourceHealthObservation
+
+        if not isinstance(observation, SourceHealthObservation):
+            raise TypeError("source-health admission state requires an immutable observation")
+        if observation.confirmed_flush_lsn is None:
+            raise BackfillInvariantError(
+                "a source-health admission needs a confirmed slot position"
+            )
+        if not signal_id or not reasons:
+            raise ValueError("source-health admission state needs a signal and tables")
+        now = admitted_at or datetime.now(UTC)
+        high_water = self.source_data_high_water(reasons)
+        table = control_table(self.control_schema, "source_health_admissions")
+        self.con.executemany(
+            f"INSERT INTO {table} "
+            "(pipeline, slot_name, source_schema, source_table, confirmed_flush_lsn, "
+            "current_wal_lsn, observation_id, signal_id, trigger_reason, "
+            "source_data_lsn, admitted_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (pipeline, slot_name, source_schema, source_table) DO UPDATE SET "
+            "confirmed_flush_lsn = excluded.confirmed_flush_lsn, "
+            "current_wal_lsn = excluded.current_wal_lsn, "
+            "observation_id = excluded.observation_id, signal_id = excluded.signal_id, "
+            "trigger_reason = excluded.trigger_reason, "
+            "source_data_lsn = excluded.source_data_lsn, admitted_at = excluded.admitted_at",
+            [
+                [
+                    self.pipeline,
+                    observation.slot_name,
+                    *qualified.split(".", 1),
+                    int(observation.confirmed_flush_lsn),
+                    observation.current_wal_lsn,
+                    observation.identity,
+                    signal_id,
+                    reason,
+                    high_water.get(qualified),
+                    now,
+                ]
+                for qualified, reason in reasons.items()
+            ],
+        )
 
     def mark_signal_published(self, signal_id: str) -> None:
         """Acknowledge a source INSERT after its PostgreSQL transaction commits."""
@@ -1667,6 +1857,7 @@ class BackfillCoordinator:
         *,
         mode: str = "incremental",
         reason: str = "scheduled",
+        reason_by_table: Mapping[str, str] | None = None,
         request_id: str | None = None,
         signal_id: str | None = None,
         in_transaction: bool = False,
@@ -1683,6 +1874,12 @@ class BackfillCoordinator:
             raise ValueError("backfill tables must be schema-qualified")
         if mode != "incremental":
             raise ValueError("one stock signal set must use incremental mode")
+        reasons = {
+            table: str((reason_by_table or {}).get(table, reason))
+            for table in selected
+        }
+        if any(value not in TRIGGER_REASONS for value in reasons.values()):
+            raise ValueError("unknown backfill trigger reason")
         if not selected:
             # Stock has no meaningful empty execute-snapshot request.  Returning a
             # typed no-op keeps the arbitrary-set API total without creating a
@@ -1765,7 +1962,7 @@ class BackfillCoordinator:
                     schema,
                     table,
                     mode=mode,
-                    reason=reason,
+                    reason=reasons[qualified],
                     request_id=request_id,
                     target_table=naming.destination_table(self.topic_prefix, schema, table),
                 )
@@ -2197,6 +2394,188 @@ class RefreshScheduler:
             return policy
 
         return self.coordinator.repository.transaction(update)
+
+    def admit_source_health_observation(
+        self,
+        observation,
+        *,
+        owner: str = "service-destination-owner",
+        now_ms: int | None = None,
+    ) -> SourceHealthAdmissionResult:
+        """Admit fall-behind work from one queued SourceHealth observation.
+
+        This method is the destination owner for the sampler hand-off.  It reads
+        only durable policies and durable source-data facts, evaluates the
+        already-shipped byte/age predicate, and commits runs plus the source
+        signal intent before asking the inherited reconciliation chokepoint to
+        publish a source row.  It has no source connection and no Debezium
+        acknowledgement handle.
+        """
+        from .source_health import SourceHealthObservation
+
+        if not isinstance(observation, SourceHealthObservation):
+            raise TypeError("source-health admission requires an immutable observation")
+        if not owner:
+            raise ValueError("source-health admission owner must not be empty")
+        observation_id = observation.identity
+        sampled_at = (
+            observation.observed_at.isoformat()
+            if observation.observed_at is not None
+            else None
+        )
+        common = {
+            "observation_id": observation_id,
+            "owner": owner,
+            "sampled_at": sampled_at,
+            "confirmed_flush_lsn": observation.confirmed_flush_lsn,
+            "current_wal_lsn": observation.current_wal_lsn,
+        }
+        if self.coordinator._last_source_health_observation_id == observation_id:
+            return SourceHealthAdmissionResult(
+                **common,
+                coalesced=True,
+            )
+
+        clock_ms = (
+            int(now_ms)
+            if now_ms is not None
+            else int(datetime.now(UTC).timestamp() * 1000)
+        )
+        def evaluate() -> dict[str, Any]:
+            """Evaluate and persist one observation in the destination transaction."""
+            pending = self.coordinator.pending_source_data_facts(
+                observation.confirmed_flush_lsn
+            )
+            reasons: dict[str, str] = {}
+            rejected_unknown_age: list[str] = []
+            for policy in self.coordinator.policies.all():
+                if not policy.enabled or policy.mode != "incremental":
+                    continue
+                if (
+                    policy.size_threshold_bytes is None
+                    and policy.time_threshold_ms is None
+                ):
+                    continue
+                table = policy.qualified_table
+                oldest = pending.get(table)
+                reason = fall_behind_reason(
+                    current_wal_lsn=observation.current_wal_lsn,
+                    confirmed_flush_lsn=observation.confirmed_flush_lsn,
+                    oldest_pending_source_ts_ms=oldest,
+                    now_ms=clock_ms,
+                    size_threshold_bytes=policy.size_threshold_bytes,
+                    time_threshold_ms=policy.time_threshold_ms,
+                )
+                if reason is not None:
+                    reasons[table] = reason
+                elif policy.time_threshold_ms is not None and oldest is None:
+                    # Do not turn a missing source timestamp into an age signal.
+                    # The byte predicate may still admit the same table, in which
+                    # case this is not an age refusal and the durable reason is bytes.
+                    rejected_unknown_age.append(table)
+
+            selected = tuple(sorted(reasons))
+            result_kwargs = {
+                **common,
+                "pending_source_tables": tuple(sorted(pending)),
+                "rejected_unknown_age": tuple(sorted(rejected_unknown_age)),
+                "selected": selected,
+                "reasons": tuple(sorted(reasons.items())),
+            }
+            if not selected:
+                return {
+                    **result_kwargs,
+                    "admitted": False,
+                    "coalesced": False,
+                    "coalesced_tables": (),
+                    "signal_id": None,
+                    "run_ids": (),
+                }
+
+            states = self.coordinator.source_health_admission_states(
+                observation.slot_name, selected
+            )
+            source_data_high_water = self.coordinator.source_data_high_water(selected)
+            coalesced_tables = tuple(
+                table
+                for table in selected
+                if table in states
+                and (
+                    source_data_high_water.get(table) is None
+                    or (
+                        states[table][3] is not None
+                        and source_data_high_water[table] <= states[table][3]
+                    )
+                )
+            )
+            new_selected = tuple(
+                table for table in selected if table not in coalesced_tables
+            )
+            if not new_selected:
+                signal_ids = tuple(sorted({states[table][1] for table in coalesced_tables}))
+                signal_id = signal_ids[0] if len(signal_ids) == 1 else None
+                run_ids = (
+                    tuple(run.run_id for run in self.coordinator.repository.by_signal(signal_id))
+                    if signal_id is not None
+                    else ()
+                )
+                return {
+                    **result_kwargs,
+                    "admitted": False,
+                    "coalesced": True,
+                    "coalesced_tables": coalesced_tables,
+                    "signal_id": signal_id,
+                    "run_ids": run_ids,
+                }
+
+            active_before = {
+                run.qualified_table
+                for run in self.coordinator.active_runs()
+                if run.qualified_table in new_selected
+            }
+            request_id = f"source-health-{observation_id}"
+            new_reasons = {table: reasons[table] for table in new_selected}
+            signal, runs = self.coordinator.request_tables(
+                new_selected,
+                mode="incremental",
+                reason="both",
+                reason_by_table=new_reasons,
+                request_id=request_id,
+                in_transaction=True,
+            )
+            # The durable boundary and the run/intent are committed together. A
+            # later SourceHealth sample can therefore coalesce even after a
+            # process restart, without trusting the sampler's sequence number.
+            self.coordinator.record_source_health_admissions(
+                observation,
+                new_reasons,
+                signal.signal_id,
+            )
+            return {
+                **result_kwargs,
+                "admitted": True,
+                "coalesced": bool(coalesced_tables or active_before),
+                "coalesced_tables": coalesced_tables,
+                "signal_id": signal.signal_id,
+                "run_ids": tuple(run.run_id for run in runs),
+            }
+
+        # The transaction helper commits durable runs, per-table trigger reasons,
+        # the durable source-health boundary, and the source signal intent
+        # together. No source write is possible in this closure.
+        result_data = self.coordinator.repository.transaction(evaluate)
+        self.coordinator._last_source_health_observation_id = observation_id
+        published: tuple[str, ...] = ()
+        signal_id = result_data["signal_id"]
+        if self.signal_writer is not None and signal_id is not None:
+            # This is intentionally the only post-commit request here. It reaches
+            # ``publish_pending`` -> ``reconcile_signal_effects`` ->
+            # ``_publish_signal_intent``; there is no second writer path.
+            published = self.publish_pending(signal_ids=(signal_id,))
+        return SourceHealthAdmissionResult(
+            **result_data,
+            published_signal_ids=tuple(published),
+        )
 
     def request_tables(
         self,
@@ -2947,6 +3326,7 @@ __all__ = [
     "RefreshPollResult",
     "RefreshScheduler",
     "ResumableBackfillLab",
+    "SourceHealthAdmissionResult",
     "StockSignalWriter",
     "TableOutcome",
     "TableRoute",

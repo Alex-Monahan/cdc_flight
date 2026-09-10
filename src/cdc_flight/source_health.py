@@ -259,6 +259,21 @@ class SlotSample:
     publication_has_configured_tables: bool | None = None
 
     @property
+    def current_wal_lsn(self) -> int | None:
+        """Return the sampled WAL high-water mark when the slot relation has one.
+
+        The sampler already obtains the exact byte difference from the same
+        PostgreSQL statement.  Reconstructing the integer position from that
+        difference keeps the established fast-query tuple compatible with the
+        existing source-health fakes while still handing the destination owner a
+        source-position observation.  A missing confirmed position or lag is
+        deliberately unknown; it is never guessed from an applied watermark.
+        """
+        if self.confirmed_pos is None or self.lag_bytes is None:
+            return None
+        return int(self.confirmed_pos) + int(self.lag_bytes)
+
+    @property
     def streaming(self) -> bool:
         """True when a walsender is attached to our slot right now."""
         return self.exists and self.active
@@ -295,6 +310,158 @@ class SlotSample:
     @property
     def unknown(self) -> bool:
         return self.error is not None
+
+
+@dataclass(frozen=True)
+class SourceHealthObservation:
+    """Immutable source-position evidence emitted by one bounded sampler read.
+
+    This is the only value allowed across the SourceHealth callback boundary.
+    It contains copied scalar facts, not the mutable ``SourceHealth`` fold, a
+    database handle, a slot-acknowledgement callback, or a source writer.  The
+    destination owner may use it as an input to durable admission later.
+    """
+
+    slot_name: str
+    sequence: int
+    sampled_at: float
+    observed_at: datetime | None
+    slot_exists: bool
+    slot_active: bool
+    confirmed_flush_lsn: int | None
+    restart_lsn: int | None
+    current_wal_lsn: int | None
+    lag_bytes: int | None
+    error: str | None = None
+
+    @classmethod
+    def from_sample(
+        cls, slot_name: str, sequence: int, sample: SlotSample
+    ) -> SourceHealthObservation:
+        return cls(
+            slot_name=str(slot_name),
+            sequence=int(sequence),
+            sampled_at=float(sample.at),
+            observed_at=sample.observed_at,
+            slot_exists=bool(sample.exists),
+            slot_active=bool(sample.active),
+            confirmed_flush_lsn=(
+                None if sample.confirmed_pos is None else int(sample.confirmed_pos)
+            ),
+            restart_lsn=(
+                None if sample.restart_pos is None else int(sample.restart_pos)
+            ),
+            current_wal_lsn=(
+                None
+                if sample.current_wal_lsn is None
+                else int(sample.current_wal_lsn)
+            ),
+            lag_bytes=None if sample.lag_bytes is None else int(sample.lag_bytes),
+            error=sample.error,
+        )
+
+    @property
+    def identity(self) -> str:
+        """Stable process-local identity used to coalesce one observation."""
+        return f"{self.slot_name}:{self.sequence}"
+
+    def as_dict(self) -> dict[str, object]:
+        """Return value-free evidence suitable for a run summary."""
+        return {
+            "slot_name": self.slot_name,
+            "sequence": self.sequence,
+            "sampled_at": self.sampled_at,
+            "observed_at": (
+                self.observed_at.isoformat() if self.observed_at is not None else None
+            ),
+            "slot_exists": self.slot_exists,
+            "slot_active": self.slot_active,
+            "confirmed_flush_lsn": self.confirmed_flush_lsn,
+            "restart_lsn": self.restart_lsn,
+            "current_wal_lsn": self.current_wal_lsn,
+            "lag_bytes": self.lag_bytes,
+            "error": self.error,
+        }
+
+
+class SourceHealthObservationQueue:
+    """A non-blocking, one-entry hand-off from SourceHealth to its owner.
+
+    ``publish`` replaces an older observation rather than waiting for the
+    destination.  The sampler therefore cannot perform destination work or be
+    held hostage by a MotherDuck transaction.  ``consume`` is identity-checked,
+    so a retry or duplicate callback cannot remove a newer observation.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._pending: SourceHealthObservation | None = None
+        self._published = 0
+        self._coalesced = 0
+        self._consumed = 0
+        self._last_consumed_identity: str | None = None
+
+    def publish(self, observation: SourceHealthObservation) -> bool:
+        if not isinstance(observation, SourceHealthObservation):
+            raise TypeError("source-health callback accepts immutable observations only")
+        with self._lock:
+            if self._pending is not None:
+                if self._pending.identity == observation.identity:
+                    return False
+                self._coalesced += 1
+            self._pending = observation
+            self._published += 1
+            return True
+
+    def peek(self) -> SourceHealthObservation | None:
+        with self._lock:
+            return self._pending
+
+    def consume(self, observation: SourceHealthObservation) -> bool:
+        if not isinstance(observation, SourceHealthObservation):
+            raise TypeError("source-health queue consumes immutable observations only")
+        with self._lock:
+            if self._pending is None or self._pending.identity != observation.identity:
+                return False
+            self._pending = None
+            self._consumed += 1
+            return True
+
+    def acknowledge_evaluated(self, observation: SourceHealthObservation) -> bool:
+        """Count an observation evaluated by the owner without dropping a newer one.
+
+        The owner may hold the destination transaction long enough for the sampler
+        to replace the queue entry. In that case the older observation has already
+        left the bounded queue, while the newer one must remain available for the
+        next policy poll. This acknowledgement records the completed hand-off and
+        is monotone by sampler sequence; it never removes that newer observation.
+        """
+        if not isinstance(observation, SourceHealthObservation):
+            raise TypeError("source-health queue acknowledges immutable observations only")
+        with self._lock:
+            if self._last_consumed_identity == observation.identity:
+                return False
+            if self._pending is not None:
+                if self._pending.identity == observation.identity:
+                    self._pending = None
+                elif (
+                    self._pending.slot_name != observation.slot_name
+                    or self._pending.sequence < observation.sequence
+                ):
+                    return False
+            self._last_consumed_identity = observation.identity
+            self._consumed += 1
+            return True
+
+    def stats(self) -> dict[str, int | bool]:
+        with self._lock:
+            return {
+                "bounded_capacity": 1,
+                "pending": self._pending is not None,
+                "published": self._published,
+                "coalesced": self._coalesced,
+                "consumed": self._consumed,
+            }
 
 
 @dataclass
@@ -352,10 +519,10 @@ class SourceHealth:
     #: sampler blocked for ever, which is how "the source is dark" stopped being
     #: observable at all (Codex r2 MAJOR-4).
     query_timeout_ms: int = 4000
-    #: Optional in-process liveness projection. It is called by the sampler thread
-    #: itself so a slow destination run-log write cannot make a fresh source witness
-    #: look stale to the service watchdog.
-    observation_callback: Callable[[SourceHealth], None] | None = None
+    #: Optional bounded hand-off. The callback receives only a frozen scalar
+    #: observation; it must not be used for destination I/O, control writes,
+    #: source signalling, liveness refresh, or slot acknowledgement.
+    observation_callback: Callable[[SourceHealthObservation], None] | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _stop: threading.Event = field(default_factory=threading.Event, repr=False)
     _thread: threading.Thread | None = field(default=None, repr=False)
@@ -407,6 +574,7 @@ class SourceHealth:
     _heartbeat_attempts: int = field(default=0, repr=False)
     _heartbeat_writes: int = field(default=0, repr=False)
     _heartbeat_failures: int = field(default=0, repr=False)
+    _observation_sequence: int = field(default=0, repr=False)
 
     # -- lifecycle ---------------------------------------------------------- #
     def start(self) -> SourceHealth:
@@ -544,9 +712,13 @@ class SourceHealth:
                 if self._prev_lag is None or lag != self._prev_lag:
                     self._lag_stable_since = sample.at
                 self._prev_lag = lag
+            self._observation_sequence += 1
+            observation = SourceHealthObservation.from_sample(
+                self.slot_name, self._observation_sequence, sample
+            )
         callback = self.observation_callback
         if callback is not None:
-            callback(self)
+            callback(observation)
 
     # -- sampling ----------------------------------------------------------- #
     def sample_once(self) -> SlotSample:

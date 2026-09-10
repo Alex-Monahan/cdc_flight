@@ -456,6 +456,133 @@ def write_commit_log(con, **kwargs) -> None:
     )
 
 
+def collect_source_data_facts(
+    con,
+    units,
+    *,
+    commit_id: int,
+    ignored_source_tables: set[str] | frozenset[str] = frozenset(),
+    control_schema: str | None = None,
+) -> tuple[dict[str, Any], ...]:
+    """Collect value-free pending-source facts before spill rows are cleared.
+
+    The commit protocol calls this after the row plan has been admitted but before
+    it clears ``spill_events``.  It only records ordinary streaming data units;
+    snapshot and incremental READ units are not source-WAL backlog evidence.  The
+    returned facts are still just memory until :func:`write_source_data_facts`
+    runs inside the surrounding destination transaction.
+    """
+    facts: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def add(schema, table, source_lsn, source_ts_ms) -> None:
+        if not schema or not table or source_lsn is None:
+            return
+        qualified = f"{schema}.{table}"
+        if qualified in ignored_source_tables:
+            return
+        key = (str(schema), str(table))
+        current = facts.get(key)
+        lsn = int(source_lsn)
+        timestamp = None if source_ts_ms is None else int(source_ts_ms)
+        if current is None:
+            facts[key] = {
+                "commit_id": int(commit_id),
+                "source_schema": str(schema),
+                "source_table": str(table),
+                "source_lsn": lsn,
+                "source_ts_ms": timestamp,
+            }
+            return
+        current["source_lsn"] = max(int(current["source_lsn"]), lsn)
+        if timestamp is not None:
+            prior = current.get("source_ts_ms")
+            current["source_ts_ms"] = (
+                timestamp if prior is None else min(int(prior), timestamp)
+            )
+
+    for unit in units:
+        if getattr(unit, "fenced", False):
+            continue
+        # A snapshot's LSN is an image boundary, not unacknowledged streaming
+        # source data. Incremental READs likewise belong to the stock signal's
+        # destination run, not to SourceHealth's pending source-data age.
+        if getattr(unit, "kind", None) == "snapshot_chunk" or getattr(
+            unit, "incremental", False
+        ):
+            continue
+        unit_lsn = getattr(unit, "last_lsn", None)
+        for event in getattr(unit, "events", ()):
+            if not getattr(event, "is_delivery_data", False):
+                continue
+            snapshot = getattr(event, "snapshot", None)
+            if snapshot not in (None, "", "false", False):
+                continue
+            add(
+                getattr(event, "schema", None),
+                getattr(event, "table", None),
+                unit_lsn if unit_lsn not in (None, 0) else getattr(event, "lsn", None),
+                getattr(event, "source_ts_ms", None),
+            )
+
+        # A spilled prefix is no longer present in ``unit.events`` at this point,
+        # but its source identity and timestamp are still available in the same
+        # uncommitted destination transaction.  Read it once, then let the normal
+        # spill drain clear it as part of the same transaction.
+        unit_seq = getattr(unit, "spill_unit_seq", None)
+        if unit_seq is None:
+            continue
+        rows = con.execute(
+            f"SELECT source_schema, source_table, lsn, source_ts_ms "
+            f"FROM {_control_table(control_schema, 'spill_events')} "
+            "WHERE commit_id = ? AND unit_seq = ?",
+            [commit_id, unit_seq],
+        ).fetchall()
+        for schema, table, lsn, source_ts_ms in rows:
+            add(
+                schema,
+                table,
+                unit_lsn if unit_lsn not in (None, 0) else lsn,
+                source_ts_ms,
+            )
+
+    return tuple(
+        facts[key]
+        for key in sorted(facts)
+    )
+
+
+def write_source_data_facts(
+    con,
+    *,
+    pipeline: str,
+    facts: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    recorded_at: datetime,
+    control_schema: str | None = None,
+) -> None:
+    """Persist source-data facts in the caller's already-open transaction."""
+    if not facts:
+        return
+    table = _control_table(control_schema, "source_data_facts")
+    con.executemany(
+        f"INSERT INTO {table} "
+        "(pipeline, commit_id, source_schema, source_table, source_lsn, "
+        " source_ts_ms, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT (pipeline, commit_id, source_schema, source_table) DO NOTHING",
+        [
+            [
+                pipeline,
+                int(fact["commit_id"]),
+                fact["source_schema"],
+                fact["source_table"],
+                int(fact["source_lsn"]),
+                fact.get("source_ts_ms"),
+                recorded_at,
+            ]
+            for fact in facts
+        ],
+    )
+
+
 def write_table_event(
     con,
     *,

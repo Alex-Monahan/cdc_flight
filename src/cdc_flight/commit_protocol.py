@@ -194,6 +194,19 @@ def commit_group(self, trigger: str) -> CommitResult:
                 commit_id, catalog_plan, stats, schema_only=False
             )
             self.group.pending_alerts.extend(catalog_plan.alerts)
+        # These are durable, value-free facts about source data that this
+        # destination transaction actually applied.  SourceHealth later treats a
+        # fact as pending only while its sampled confirmed slot position is below
+        # this source boundary; it never substitutes the last-applied timestamp.
+        # Keep this write before commit_log/resume and the single COMMIT so the
+        # destination owner can never admit from a half-published fact.
+        destination.write_source_data_facts(
+            self.con,
+            pipeline=self.pipeline,
+            facts=stats.get("source_data_facts", ()),
+            recorded_at=destination.now(),
+            control_schema=self.control_schema,
+        )
         destination.write_commit_log(
             self.con,
             commit_id=commit_id,
@@ -278,6 +291,7 @@ def commit_group(self, trigger: str) -> CommitResult:
                 # the source-slot confirmation hand-off.  It is diagnostic only
                 # and is not read from the COMMIT_ACK critical section.
                 self.last_commit_monotonic = time.monotonic()
+                self.last_commit_source_lsn = new_point.last_lsn
                 if self.service_context is not None and has_data:
                     # A durable destination commit is real forward motion.  A
                     # lease heartbeat, bookkeeping-only group, or supervisor loop
@@ -341,6 +355,16 @@ def commit_group(self, trigger: str) -> CommitResult:
                 del self._pending_snapshot_notifications[: len(pending)]
             if pending_discards:
                 del self._pending_discarded_records[: len(pending_discards)]
+        self.last_ack_monotonic = time.monotonic()
+        self.last_ack_source_lsn = new_point.last_lsn
+        self.destination_commit_ack_trace.append(
+            {
+                "commit_id": commit_id,
+                "source_lsn": new_point.last_lsn,
+                "committed_at_monotonic": self.last_commit_monotonic,
+                "acknowledged_at_monotonic": self.last_ack_monotonic,
+            }
+        )
         # This DELETE is observability I/O, so it is intentionally after
         # COMMIT_ACK.leave() and outside the watchdog's guarded window.
         self._clear_commit_timeout_alert(commit_id)

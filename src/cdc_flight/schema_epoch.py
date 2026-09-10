@@ -196,6 +196,7 @@ def empty_apply_stats() -> dict:
         "first_lsn": None,
         "last_lsn": None,
         "max_source_ts": None,
+        "source_data_facts": (),
     }
 
 
@@ -216,6 +217,10 @@ def merge_apply_stats(total: dict | None, part: dict) -> dict:
         total["max_source_ts"] = max(
             total["max_source_ts"] or 0, part["max_source_ts"]
         )
+    total.setdefault("source_data_facts", ())
+    total["source_data_facts"] = tuple(
+        total["source_data_facts"]
+    ) + tuple(part.get("source_data_facts", ()))
     return total
 
 

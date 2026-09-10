@@ -27,7 +27,7 @@ from .machines import PHASE_SNAPSHOTTING, PHASE_STREAMING
 from .ownership import DestinationOwnership
 from .run_state import RunOutcome, RunPhaseWriter
 from .snapshot_completion import SnapshotCompletion
-from .source_health import SourceHealth
+from .source_health import SourceHealth, SourceHealthObservationQueue
 from .source_marker import SourceMarker
 from .source_routes import SourceRoutePolicy
 from .supervisor import run_engine_bounded
@@ -113,6 +113,10 @@ class LiveDiscoveryCoordinator:
         self.catalog_flush_exclude = set(catalog_flush_exclude or ())
         self.service_context = service_context
         self._next_refresh_poll_at = 0.0
+        # One bounded, latest-observation hand-off. SourceHealth publishes into
+        # this queue; the existing serialized destination owner drains it at the
+        # slower policy cadence below.
+        self.source_health_observation_queue = SourceHealthObservationQueue()
         self.offset_file = offset_file or self.replication.offset_file
         self.suppress_replayed_message_audit = bool(suppress_replayed_message_audit)
         signal_collection = self.props.get("signal.data.collection")
@@ -309,10 +313,17 @@ class LiveDiscoveryCoordinator:
                             int(self.run_cfg.jdbc_socket_timeout_seconds * 1000),
                         ),
                     ),
+                    observation_callback=(
+                        self.source_health_observation_queue.publish
+                        if self.service_context is not None
+                        else None
+                    ),
                     # SourceHealth samples are folded by the supervisor together
                     # with the live engine thread and Flight-owned callback/commit/
-                    # acknowledgement facts.  The sampler thread must not publish
-                    # ``connected_quiet`` on slot activity alone.
+                    # acknowledgement facts.  The sampler callback only queues an
+                    # immutable source-position observation; it must not publish
+                    # ``connected_quiet`` on slot activity alone or touch either
+                    # destination or source state.
                 ).start()
                 if self.phases.phase != PHASE_STREAMING:
                     self.phases.to(PHASE_STREAMING)
@@ -380,6 +391,9 @@ class LiveDiscoveryCoordinator:
                         f"close budget of {self.run_cfg.close_timeout:.1f}s",
                         dict(self.result),
                     )
+                self.summary_extra["source_health_observation_queue"] = (
+                    self.source_health_observation_queue.stats()
+                )
                 self.health = None
 
                 newly_discovered = (
@@ -515,6 +529,9 @@ class LiveDiscoveryCoordinator:
                     log.error(self.summary_extra["source_health_quiescence_error"])
                 else:
                     self.summary_extra.setdefault("source_health_quiesced", True)
+                self.summary_extra["source_health_observation_queue"] = (
+                    self.source_health_observation_queue.stats()
+                )
             if self.applier is not None:
                 self.applier.shutdown()
             watcher_quiesced = True
@@ -695,7 +712,9 @@ class LiveDiscoveryCoordinator:
                     refresh_now + SERVICE_REFRESH_POLL_SECONDS
                 )
                 scheduler = RefreshScheduler(handler.backfill)
-                if not scheduler.has_due_or_pending_intent():
+                health_observation = self.source_health_observation_queue.peek()
+                has_health_observation = health_observation is not None
+                if not scheduler.has_due_or_pending_intent() and not has_health_observation:
                     result["scheduled_refresh"] = {
                         "checked": False,
                         "reason": "no due policy or pending signal intent",
@@ -714,6 +733,18 @@ class LiveDiscoveryCoordinator:
                                 else None
                             ),
                         )
+                        health_admission = None
+                        if health_observation is not None:
+                            health_admission = scheduler.admit_source_health_observation(
+                                health_observation,
+                                owner="service-destination-owner",
+                            )
+                            # Consume only the observation that was evaluated. A
+                            # newer sampler result may already be waiting and is
+                            # retained for the next policy poll.
+                            self.source_health_observation_queue.acknowledge_evaluated(
+                                health_observation
+                            )
                         scheduled_poll = scheduler.poll_due(owner="service-destination-owner")
                         published_signal_ids = scheduler.publish_pending()
                     finally:
@@ -726,6 +757,12 @@ class LiveDiscoveryCoordinator:
                     self.summary_extra.setdefault("scheduled_refresh_polls", []).append(
                         scheduled_poll_summary
                     )
+                    if health_admission is not None:
+                        health_summary = health_admission.as_dict()
+                        self.summary_extra.setdefault(
+                            "source_health_admissions", []
+                        ).append(health_summary)
+                        result["source_health_admission"] = health_summary
                     result["scheduled_refresh_poll"] = scheduled_poll_summary
                     if scheduled_poll.full_requested:
                         context.request_drain()
