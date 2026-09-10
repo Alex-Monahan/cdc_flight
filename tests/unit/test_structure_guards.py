@@ -28,7 +28,8 @@ _BASELINE_SELECTED = {
     # one live two-sided retirement node.
     # The §3.4 post-ack queued-recovery proof and the empty service-recheck
     # regression proof each add one default-lane node.
-    "not motherduck and not slow": 2472,
+    # The commit-watchdog arming contention regression adds two more.
+    "not motherduck and not slow": 2474,
     "slow and not motherduck": 268,
     # The quiet-holder and stock-walsender retry proofs are MotherDuck-only real
     # process nodes; a local DuckDB file lock cannot exercise cloud takeover while

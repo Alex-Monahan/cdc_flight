@@ -95,6 +95,7 @@ from .marker_accounting import SourceMarkerReceiptCounter
 from .naming import control_table
 from .occurrence import _commit_reservation
 from .policy import AcknowledgementHandle, PolicyGate
+from .run_state import COMMIT_ACK
 from .snapshot import SnapshotCoordinator
 from .snapshot_completion import (
     SnapshotCompletion,
@@ -1398,33 +1399,66 @@ class Applier:
         place after a hard exit is the observable timeout; a successful group clears it
         only after the exclusion has closed.
         """
-        armed = self.alerts.raise_alert_once(
-            severity="critical",
-            code="commit_timeout",
-            message=(
-                f"commit group {commit_id} has an armed bounded commit watchdog; if "
-                "this alert remains, the commit or acknowledgement did not return "
-                "within the watchdog timeout. The commit is AMBIGUOUS and the "
-                "destination may already be durable, so the next run must reconcile "
-                "it before claiming success"
-            ),
-            condition_key="commit_timeout",
-            occurrence_key=OccurrenceKey.from_commit(
-                _commit_reservation(self.pipeline, commit_id),
-                pipeline=self.pipeline,
-            ),
-            context={
-                "commit_id": commit_id,
-                "armed_before_commit_ack_window": True,
-                "timeout_seconds": self.cfg.commit_timeout,
-                "runner_id": self.runner_id,
-            },
+        occurrence_key = OccurrenceKey.from_commit(
+            _commit_reservation(self.pipeline, commit_id),
+            pipeline=self.pipeline,
         )
-        if not armed:
-            log.critical(
-                "could not durably arm the commit watchdog alert for commit_id=%s",
-                commit_id,
+        message = (
+            f"commit group {commit_id} has an armed bounded commit watchdog; if "
+            "this alert remains, the commit or acknowledgement did not return "
+            "within the watchdog timeout. The commit is AMBIGUOUS and the "
+            "destination may already be durable, so the next run must reconcile "
+            "it before claiming success"
+        )
+
+        # AlertSink's independent cursor is itself epoch-fenced.  Its lease UPDATE
+        # must share the commit->ack exclusion with the run-state writer; otherwise
+        # the two independent cursors can conflict on the lease row before the alert
+        # INSERT is reached.  If a prior commit watchdog already armed this identity,
+        # the idempotent second call is success, not an arming failure.
+        while True:
+            with COMMIT_ACK.excluded() as inside_window:
+                if not inside_window:
+                    armed = self.alerts.raise_alert_once(
+                        severity="critical",
+                        code="commit_timeout",
+                        message=message,
+                        condition_key="commit_timeout",
+                        occurrence_key=occurrence_key,
+                        context={
+                            "commit_id": commit_id,
+                            "armed_before_commit_ack_window": True,
+                            "timeout_seconds": self.cfg.commit_timeout,
+                            "runner_id": self.runner_id,
+                        },
+                    )
+                    break
+            # ``excluded`` deliberately drops ordinary telemetry while the window is
+            # active. Arming cannot be dropped, so wait for that window to close and
+            # acquire the gate again before doing any destination I/O.
+            time.sleep(0.01)
+
+        if armed and self.alerts.independent:
+            return
+        if (
+            self.alerts.independent
+            and self.alerts._sink is not None
+            and destination.alert_identity_exists(
+                self.alerts._sink,
+                pipeline=self.pipeline,
+                code="commit_timeout",
+                condition_key="commit_timeout",
+                occurrence_key=occurrence_key,
+                control_schema=self.control_schema,
             )
+        ):
+            return
+        error = RuntimeError(
+            f"could not durably arm the commit watchdog alert for commit_id={commit_id}; "
+            "refusing to enter a watchdog without its durable timeout record"
+        )
+        log.critical("%s", error)
+        raise error
 
     def _clear_commit_timeout_alert(self, commit_id: int) -> None:
         """Clear the conservative watchdog alert after COMMIT_ACK has closed."""
