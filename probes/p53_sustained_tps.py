@@ -540,13 +540,13 @@ def _drop_motherduck_database(token: str, database: str) -> None:
 
 
 def _motherduck_database_exists(token: str, database: str) -> bool:
-    with duckdb.connect(f"md:?motherduck_token={token}") as con:
+    with duckdb.connect(f"md:?motherduck_token={token}", read_only=True) as con:
         return database in {str(row[0]) for row in con.execute("SHOW DATABASES").fetchall()}
 
 
 def _motherduck_count(token: str, database: str, dataset: str, prefix: str) -> int:
     try:
-        with duckdb.connect(f"md:{database}?motherduck_token={token}") as con:
+        with duckdb.connect(f"md:{database}?motherduck_token={token}", read_only=True) as con:
             table = f"{_duck_identifier(dataset)}.{_duck_identifier('cdcflight_app_customers')}"
             return int(
                 con.execute(
@@ -560,7 +560,7 @@ def _motherduck_count(token: str, database: str, dataset: str, prefix: str) -> i
 
 def _motherduck_total_count(token: str, database: str, dataset: str) -> int:
     try:
-        with duckdb.connect(f"md:{database}?motherduck_token={token}") as con:
+        with duckdb.connect(f"md:{database}?motherduck_token={token}", read_only=True) as con:
             table = f"{_duck_identifier(dataset)}.{_duck_identifier('cdcflight_app_customers')}"
             return int(con.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
     except Exception:
@@ -583,7 +583,7 @@ def _source_customer_rows(prefix: str) -> list[tuple[Any, ...]]:
 def _destination_customer_rows(
     token: str, database: str, dataset: str, prefix: str
 ) -> list[tuple[Any, ...]]:
-    with duckdb.connect(f"md:{database}?motherduck_token={token}") as con:
+    with duckdb.connect(f"md:{database}?motherduck_token={token}", read_only=True) as con:
         table = f"{_duck_identifier(dataset)}.{_duck_identifier('cdcflight_app_customers')}"
         return list(
             con.execute(
@@ -956,15 +956,11 @@ def _run_service_repetition(
                 destination_count = 0
                 deadline = time.monotonic() + (20.0 if stall else 300.0)
                 while time.monotonic() < deadline:
-                    destination_count = _motherduck_count(
-                        token, md_database, dataset, prefix
-                    )
                     slot_state = _slot_snapshot(slot)
                     confirmed = _lsn_value(slot_state.get("confirmed_flush_lsn"))
                     target = _lsn_value(upper_lsn)
                     if (
                         not stall
-                        and destination_count == expected_rows
                         and confirmed is not None
                         and target is not None
                         and confirmed >= target
@@ -975,6 +971,23 @@ def _run_service_repetition(
                     if process.poll() is not None:
                         break
                     time.sleep(1.0)
+                # A confirmed source position is the product's durable boundary:
+                # the applier only acknowledges after the one MotherDuck commit.
+                # Read the destination after that boundary, rather than polling a
+                # second MotherDuck connection while the service owns its commit
+                # connection; the latter can manufacture cloud write conflicts.
+                destination_count = _motherduck_count(
+                    token, md_database, dataset, prefix
+                )
+                if not stall and durable_at is not None and destination_count != expected_rows:
+                    destination_deadline = time.monotonic() + 60.0
+                    while time.monotonic() < destination_deadline:
+                        destination_count = _motherduck_count(
+                            token, md_database, dataset, prefix
+                        )
+                        if destination_count == expected_rows:
+                            break
+                        time.sleep(1.0)
                 source_window_end = source_finished_at
                 backlog = _backlog_verdict(monitor.source_window_samples(source_window_end))
             host_gate = sampler.verdict()
@@ -1039,10 +1052,15 @@ def _run_service_repetition(
                     "source_rows": len(source_rows),
                     "destination_rows": len(destination_rows),
                 }
+        elif stall:
+            result["oracle"] = {
+                "passed": False,
+                "reason": "destination-stall mutation intentionally prevents a durable exact oracle",
+            }
         else:
             result["oracle"] = {
                 "passed": False,
-                "reason": "destination-stall mutation intentionally prevented durable exact oracle",
+                "reason": "no durable source/destination boundary was observed",
             }
         result["keep_up"] = bool(
             not stall
