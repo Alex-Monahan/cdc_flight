@@ -58,13 +58,19 @@ def _bounded_service_destination_operation(function):
     """Bound service destination work before the commit/ack hand-off."""
     @functools.wraps(function)
     def wrapped(self, trigger: str) -> CommitResult:
-        if self.service_context is None or not self.group.units:
+        if not self.group.units:
             return function(self, trigger)
         commit_id = self.group.spill_commit_id or self._next_commit_id
+        # Every commit watchdog needs its durable record before this function can
+        # open the destination transaction.  The throwaway resnapshot applier has
+        # no service_context, but it still calls the inner commit watchdog while
+        # sharing the service's fenced destination handle.
+        self._arm_commit_timeout_alert(commit_id)
+        if self.service_context is None:
+            return function(self, trigger)
         # If native destination work hangs before the existing inner watchdog is
         # armed, leave the same durable diagnostic behind.  No timeout callback
         # performs destination or telemetry I/O.
-        self._arm_commit_timeout_alert(commit_id)
         with self_heal.destination_operation_watchdog(self.cfg.commit_timeout) as stop:
             self._destination_operation_deadline_stop = stop
             try:

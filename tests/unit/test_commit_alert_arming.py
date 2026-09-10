@@ -7,7 +7,7 @@ import time
 import duckdb
 import pytest
 
-from cdc_flight import destination
+from cdc_flight import commit_protocol, destination
 from cdc_flight.applier import Applier
 from cdc_flight.config import ServiceConfig
 from cdc_flight.destination_fence import EpochFencedConnection
@@ -126,6 +126,27 @@ def test_commit_alert_arm_waits_for_a_fenced_observability_writer(tmp_path, capl
             assert "could not durably arm" not in caplog.text
         finally:
             raw.execute("ROLLBACK")
+
+        # A throwaway/non-service applier takes the inner commit watchdog too, so
+        # the decorator must not skip the pre-arm merely because it has no service
+        # watchdog.  This is the ordering that protects its shared parent handle.
+        order: list[str] = []
+
+        class WrapperSubject:
+            service_context = None
+            group = type("Group", (), {"units": [object()], "spill_commit_id": None})()
+            _next_commit_id = 9
+
+            def _arm_commit_timeout_alert(self, commit_id):
+                order.append(f"arm:{commit_id}")
+
+        def commit_body(self, trigger):
+            order.append(f"body:{trigger}")
+            return "committed"
+
+        wrapped = commit_protocol._bounded_service_destination_operation(commit_body)
+        assert wrapped(WrapperSubject(), "resnapshot") == "committed"
+        assert order == ["arm:9", "body:resnapshot"]
     finally:
         release_holder.set()
         holder.join(2)
