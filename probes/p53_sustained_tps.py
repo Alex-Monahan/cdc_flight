@@ -540,13 +540,13 @@ def _drop_motherduck_database(token: str, database: str) -> None:
 
 
 def _motherduck_database_exists(token: str, database: str) -> bool:
-    with duckdb.connect(f"md:?motherduck_token={token}", read_only=True) as con:
+    with duckdb.connect(f"md:?motherduck_token={token}") as con:
         return database in {str(row[0]) for row in con.execute("SHOW DATABASES").fetchall()}
 
 
 def _motherduck_count(token: str, database: str, dataset: str, prefix: str) -> int:
     try:
-        with duckdb.connect(f"md:{database}?motherduck_token={token}", read_only=True) as con:
+        with duckdb.connect(f"md:{database}?motherduck_token={token}") as con:
             table = f"{_duck_identifier(dataset)}.{_duck_identifier('cdcflight_app_customers')}"
             return int(
                 con.execute(
@@ -560,7 +560,7 @@ def _motherduck_count(token: str, database: str, dataset: str, prefix: str) -> i
 
 def _motherduck_total_count(token: str, database: str, dataset: str) -> int:
     try:
-        with duckdb.connect(f"md:{database}?motherduck_token={token}", read_only=True) as con:
+        with duckdb.connect(f"md:{database}?motherduck_token={token}") as con:
             table = f"{_duck_identifier(dataset)}.{_duck_identifier('cdcflight_app_customers')}"
             return int(con.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
     except Exception:
@@ -583,7 +583,7 @@ def _source_customer_rows(prefix: str) -> list[tuple[Any, ...]]:
 def _destination_customer_rows(
     token: str, database: str, dataset: str, prefix: str
 ) -> list[tuple[Any, ...]]:
-    with duckdb.connect(f"md:{database}?motherduck_token={token}", read_only=True) as con:
+    with duckdb.connect(f"md:{database}?motherduck_token={token}") as con:
         table = f"{_duck_identifier(dataset)}.{_duck_identifier('cdcflight_app_customers')}"
         return list(
             con.execute(
