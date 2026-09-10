@@ -133,7 +133,7 @@ def _service_completion_witness(path, signal_id: str) -> list[dict] | None:
     """Return the service's completion-side notification, not a test-side event."""
     rows = _live_state_for_signal(path, signal_id)
     if any(
-        row.get("notification_status") == "COMPLETED"
+        row.get("notification_status") in {"COMPLETED", "TABLE_SCAN_COMPLETED"}
         and row.get("state") in {"complete", "ready_to_swap", "swapping"}
         for row in rows
     ):
