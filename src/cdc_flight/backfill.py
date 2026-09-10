@@ -2667,6 +2667,33 @@ class RefreshScheduler:
         ).fetchone()
         return bool(row[0])
 
+    def has_source_health_policy(self) -> bool:
+        """Return whether a durable policy can consume a health observation.
+
+        SourceHealth samples are useful to the fall-behind owner only when at
+        least one enabled incremental policy has a byte or age threshold. Keep
+        this as a read-only preflight so a service with ordinary queued work (or
+        no refresh policy at all) does not turn every sampler callback into an
+        extra destination operation.
+        """
+        row = _read_relation(
+            self.coordinator.con,
+            f"""
+            SELECT EXISTS (
+                SELECT 1 FROM {self.coordinator.policies.table}
+                WHERE pipeline = ?
+                  AND enabled
+                  AND mode = 'incremental'
+                  AND (
+                      size_threshold_bytes IS NOT NULL
+                      OR time_threshold_ms IS NOT NULL
+                  )
+            )
+            """,
+            [self.coordinator.pipeline],
+        ).fetchone()
+        return bool(row[0])
+
     def poll_due(
         self,
         *,

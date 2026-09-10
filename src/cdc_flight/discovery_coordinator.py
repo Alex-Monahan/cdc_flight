@@ -712,8 +712,14 @@ class LiveDiscoveryCoordinator:
                     refresh_now + SERVICE_REFRESH_POLL_SECONDS
                 )
                 scheduler = RefreshScheduler(handler.backfill)
-                health_observation = self.source_health_observation_queue.peek()
-                has_health_observation = health_observation is not None
+                health_queue = getattr(self, "source_health_observation_queue", None)
+                health_observation = (
+                    health_queue.peek() if health_queue is not None else None
+                )
+                has_health_observation = (
+                    health_observation is not None
+                    and scheduler.has_source_health_policy()
+                )
                 if not scheduler.has_due_or_pending_intent() and not has_health_observation:
                     result["scheduled_refresh"] = {
                         "checked": False,
@@ -742,9 +748,8 @@ class LiveDiscoveryCoordinator:
                             # Consume only the observation that was evaluated. A
                             # newer sampler result may already be waiting and is
                             # retained for the next policy poll.
-                            self.source_health_observation_queue.acknowledge_evaluated(
-                                health_observation
-                            )
+                            if health_queue is not None:
+                                health_queue.acknowledge_evaluated(health_observation)
                         scheduled_poll = scheduler.poll_due(owner="service-destination-owner")
                         published_signal_ids = scheduler.publish_pending()
                     finally:
