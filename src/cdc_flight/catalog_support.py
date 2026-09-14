@@ -8,7 +8,13 @@ prevents publication policy from being mixed into catalog reads.
 from __future__ import annotations
 
 from . import naming
-from .catalog_state import CHANGE_NEW, CHANGE_SCHEMA, CHANGE_UNPUBLISHED, DESTRUCTIVE
+from .catalog_state import (
+    CHANGE_NEW,
+    CHANGE_SCHEMA,
+    CHANGE_UNPUBLISHED,
+    DESTRUCTIVE,
+    PARTITION_CHANGE_KINDS,
+)
 from .errors import SchemaEvolutionRefused, SchemaShapeUnexplained
 from .machines import ADMISSION_ADMITTED, ADMISSION_EXTERNAL
 from .toast import ToastRoute, classify_relation
@@ -102,20 +108,81 @@ GROUP BY n.nspname
 """
 
 PARTITION_SQL = """
-SELECT child_n.nspname, child.relname
+SELECT parent_n.nspname                         AS parent_schema,
+       parent.relname                           AS parent_table,
+       parent.oid::bigint                       AS parent_oid,
+       parent.relfilenode::bigint               AS parent_relfilenode,
+       parent.reltype::bigint                   AS parent_relation_type_oid,
+       child_n.nspname                          AS child_schema,
+       child.relname                            AS child_table,
+       child.oid::bigint                        AS child_oid,
+       child.relfilenode::bigint                AS child_relfilenode,
+       child.reltype::bigint                    AS child_relation_type_oid,
+       pg_get_expr(child.relpartbound, child.oid) AS partition_bound,
+       CASE WHEN i.inhdetachpending
+            THEN 'detach_pending' ELSE 'attached' END AS attachment_state,
+       i.xmin::text                             AS attachment_epoch,
+       i.inhseqno::bigint                       AS attachment_sequence,
+       (
+           COALESCE(p.puballtables, false)
+           OR parent_pr.prrelid IS NOT NULL
+       )                                         AS parent_published,
+       (
+           COALESCE(p.puballtables, false)
+           OR child_pr.prrelid IS NOT NULL
+           OR parent_pr.prrelid IS NOT NULL
+       )                                         AS child_published,
+       COALESCE(p.puballtables, false)           AS publication_all_tables,
+       (parent_pr.prrelid IS NOT NULL)           AS parent_publication_member,
+       (child_pr.prrelid IS NOT NULL)            AS child_publication_member
 FROM pg_inherits i
 JOIN pg_class child ON child.oid = i.inhrelid
 JOIN pg_namespace child_n ON child_n.oid = child.relnamespace
 JOIN pg_class parent ON parent.oid = i.inhparent
 JOIN pg_namespace parent_n ON parent_n.oid = parent.relnamespace
 LEFT JOIN pg_publication p ON p.pubname = %s
-LEFT JOIN pg_publication_rel pr ON pr.prrelid = parent.oid AND pr.prpubid = p.oid
+LEFT JOIN pg_publication_rel parent_pr
+    ON parent_pr.prrelid = parent.oid AND parent_pr.prpubid = p.oid
+LEFT JOIN pg_publication_rel child_pr
+    ON child_pr.prrelid = child.oid AND child_pr.prpubid = p.oid
 WHERE parent.relkind IN ('r', 'p')
   AND (
       (%s::text[] IS NULL AND parent_n.nspname NOT IN ('pg_catalog', 'information_schema', '_cdc_flight'))
       OR parent_n.nspname = ANY(%s::text[])
   )
-  AND (COALESCE(p.puballtables, false) OR pr.prrelid IS NOT NULL)
+  AND (
+      COALESCE(p.puballtables, false)
+      OR parent_pr.prrelid IS NOT NULL
+  )
+"""
+
+# An empty ``PARTITION_SQL`` result is ambiguous: it can mean a parent currently
+# has no edges, or that a joined child/catalog row was not visible.  This count is
+# the source-side completeness proof for that projection.  It intentionally counts
+# the raw ``pg_inherits`` edge and the generation-complete join separately; a DROP
+# child that leaves an orphaned inheritance row therefore fails closed instead of
+# becoming a fabricated DROP fact.
+PARTITION_COVERAGE_SQL = """
+SELECT count(*)::bigint AS raw_edge_count,
+       count(child.oid)::bigint AS complete_edge_count,
+       count(*) FILTER (WHERE i.inhdetachpending)::bigint AS pending_edge_count
+FROM pg_inherits i
+JOIN pg_class parent ON parent.oid = i.inhparent
+JOIN pg_namespace parent_n ON parent_n.oid = parent.relnamespace
+LEFT JOIN pg_class child ON child.oid = i.inhrelid
+LEFT JOIN pg_publication p ON p.pubname = %s
+LEFT JOIN pg_publication_rel parent_pr
+    ON parent_pr.prrelid = parent.oid AND parent_pr.prpubid = p.oid
+WHERE parent.relkind IN ('r', 'p')
+  AND (
+      (%s::text[] IS NULL AND parent_n.nspname NOT IN
+          ('pg_catalog', 'information_schema', '_cdc_flight'))
+      OR parent_n.nspname = ANY(%s::text[])
+  )
+  AND (
+      COALESCE(p.puballtables, false)
+      OR parent_pr.prrelid IS NOT NULL
+  )
 """
 
 
@@ -275,6 +342,20 @@ def summary(watcher) -> dict:
         ]
         admission_errors = dict(watcher._admission_errors)
         schema_liveness = dict(watcher._schema_liveness)
+        partition_pending = [
+            change.context()
+            for change in pending
+            if change.kind in PARTITION_CHANGE_KINDS
+        ]
+        partition_edges = tuple(watcher._snapshot_partitions.values())
+        partition_observation = {
+            "state": watcher._partition_observation_state,
+            "reason": watcher._partition_observation_reason,
+            "detection_lsn": watcher._partition_last_detection_lsn,
+            "observation_epoch": watcher._partition_snapshot_epoch,
+            "edge_count": len(partition_edges),
+            "unconfirmed": len(watcher._partition_unconfirmed),
+        }
         toast_policies = [
             classify_relation(
                 relation.qualified,
@@ -310,6 +391,9 @@ def summary(watcher) -> dict:
         "catalog_admission_errors": admission_errors,
         "catalog_schema_refusals": sorted(watcher._schema_refusals),
         "catalog_schema_liveness": schema_liveness,
+        "catalog_partition_observation": partition_observation,
+        "catalog_partition_pending": partition_pending,
+        "catalog_partition_snapshot_dirty": watcher.partition_snapshot_dirty,
         "toast_efficient_tables": sum(policy.efficient for policy in toast_policies),
         "toast_fallback_tables": sum(policy.route is ToastRoute.FALLBACK for policy in toast_policies),
         "toast_residual_columns": sum(len(policy.residual_columns) for policy in toast_policies),

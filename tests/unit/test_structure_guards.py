@@ -32,14 +32,17 @@ _BASELINE_SELECTED = {
     # The rollback-lifetime probes add eight default-lane nodes: two outer known
     # rollback, two inner known rollback, one ambiguous post-COMMIT, two outer
     # hard-exit, and one inner hard-exit.
-    "not motherduck and not slow": 2482,
-    "slow and not motherduck": 268,
+    # §7.3 Round A adds ten default observation nodes, one slow real-catalog node,
+    # and one MotherDuck durability node. This is a correctness gate only; it does
+    # not change the 7.3 score.
+    "not motherduck and not slow": 2492,
+    "slow and not motherduck": 269,
     # The quiet-holder and stock-walsender retry proofs are MotherDuck-only real
     # process nodes; a local DuckDB file lock cannot exercise cloud takeover while
     # the old process retains its handle.
-    # The selected MotherDuck total is 65 including this guard after the permanent
+    # The selected MotherDuck total is 66 including this guard after the permanent
     # retained-recovery MotherDuck proof was added.
-    "motherduck": 65,
+    "motherduck": 66,
 }
 
 

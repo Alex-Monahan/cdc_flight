@@ -164,7 +164,11 @@ def flush_learned_relations(
     )
     blocked = {c.qualified for c in pending_fenced} | set(exclude or ())
     relations = catalog.dirty(exclude=blocked)
-    if not relations:
+    partition_edges = None
+    snapshot_for_flush = getattr(catalog, "partition_snapshot_for_flush", None)
+    if snapshot_for_flush is not None:
+        partition_edges = snapshot_for_flush()
+    if not relations and partition_edges is None:
         return []
     con.execute("BEGIN TRANSACTION")
     try:
@@ -185,6 +189,15 @@ def flush_learned_relations(
                 columns=relation.columns,
                 control_schema=control_schema,
             )
+        if partition_edges is not None:
+            from . import partition_topology
+
+            partition_topology.write_partition_snapshot(
+                con,
+                pipeline=pipeline,
+                edges=partition_edges,
+                control_schema=control_schema,
+            )
         con.execute("COMMIT")
     except BaseException:
         with contextlib.suppress(Exception):
@@ -192,5 +205,7 @@ def flush_learned_relations(
         raise
     names = [relation.qualified for relation in relations]
     catalog.clear_dirty(names)
+    if partition_edges is not None:
+        catalog.mark_partition_snapshot_persisted(partition_edges)
     log.info("persisted %s learned source relation(s): %s", len(names), ", ".join(names))
     return names

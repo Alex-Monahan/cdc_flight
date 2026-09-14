@@ -941,6 +941,9 @@ def run(
                 known=catalog_mod.read_known_relations(
                     con, dest.pipeline_name, control_schema=control_schema
                 ),
+                partition_edges=catalog_mod.read_known_partition_edges(
+                    con, dest.pipeline_name, control_schema=control_schema
+                ),
                 replicated=catalog_mod.seed_from_table_state(
                     con, dest.pipeline_name, control_schema=control_schema
                 ),

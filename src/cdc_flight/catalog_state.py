@@ -7,6 +7,7 @@ one small seam.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from dataclasses import dataclass, field
@@ -33,8 +34,16 @@ CHANGE_UNPUBLISHED = "unpublished"
 CHANGE_REPUBLISHED = "republished"
 CHANGE_NEW = "new"
 CHANGE_SCHEMA = "schema_changed"
+CHANGE_PARTITION_ATTACHED = "partition_attached"
+CHANGE_PARTITION_DETACHED = "partition_detached"
+CHANGE_PARTITION_DROPPED = "partition_dropped"
+PARTITION_CHANGE_KINDS = (
+    CHANGE_PARTITION_ATTACHED,
+    CHANGE_PARTITION_DETACHED,
+    CHANGE_PARTITION_DROPPED,
+)
 DESTRUCTIVE = (CHANGE_DROPPED, CHANGE_RECREATED)
-FENCED = (*DESTRUCTIVE, CHANGE_SCHEMA)
+FENCED = (*DESTRUCTIVE, CHANGE_SCHEMA, *PARTITION_CHANGE_KINDS)
 
 
 class _AdmissionStateUnset:
@@ -118,6 +127,162 @@ class SourceRelation:
         )
 
 
+@dataclass(frozen=True)
+class PartitionEdge:
+    """One server-observed parent/child partition edge generation.
+
+    Every identity and publication fact in this value comes from PostgreSQL's
+    catalog query.  In particular, ``bound`` is the result of
+    ``pg_get_expr(child.relpartbound, child.oid)``; callers must not render a
+    partition bound from Python values.
+    """
+
+    parent_schema: str
+    parent_table: str
+    parent_oid: int | None
+    parent_relfilenode: int | None
+    parent_relation_type_oid: int | None
+    child_schema: str
+    child_table: str
+    child_oid: int | None
+    child_relfilenode: int | None
+    child_relation_type_oid: int | None
+    bound: str | None
+    attachment_state: str | None
+    attachment_epoch: str | None
+    attachment_sequence: int | None
+    parent_published: bool
+    child_published: bool
+    publication_all_tables: bool
+    parent_publication_member: bool
+    child_publication_member: bool
+    observed_lsn: int = 0
+    observation_epoch: int = 0
+
+    @property
+    def parent_qualified(self) -> str:
+        return f"{self.parent_schema}.{self.parent_table}"
+
+    @property
+    def child_qualified(self) -> str:
+        return f"{self.child_schema}.{self.child_table}"
+
+    @property
+    def parent_generation(self) -> tuple:
+        return (
+            self.parent_oid,
+            self.parent_relfilenode,
+            self.parent_relation_type_oid,
+        )
+
+    @property
+    def child_generation(self) -> tuple:
+        return (
+            self.child_oid,
+            self.child_relfilenode,
+            self.child_relation_type_oid,
+        )
+
+    @property
+    def edge_key(self) -> tuple:
+        """The complete edge-generation key used by the diff and confirmation."""
+        return (
+            self.parent_qualified,
+            self.parent_generation,
+            self.child_qualified,
+            self.child_generation,
+            self.attachment_epoch,
+            self.attachment_sequence,
+        )
+
+    @property
+    def complete(self) -> bool:
+        """Whether this edge has enough source facts to enter the diff."""
+        identity_values = (
+            self.parent_oid,
+            self.parent_relfilenode,
+            self.parent_relation_type_oid,
+            self.child_oid,
+            self.child_relfilenode,
+            self.child_relation_type_oid,
+        )
+        return bool(
+            all(value is not None for value in identity_values)
+            and all(int(value) > 0 for value in (self.parent_oid, self.child_oid))
+            and isinstance(self.bound, str)
+            and self.attachment_state == "attached"
+            and isinstance(self.attachment_epoch, str)
+            and bool(self.attachment_epoch)
+            and self.attachment_sequence is not None
+        )
+
+    @property
+    def publication_facts(self) -> dict[str, bool]:
+        return {
+            "parent_published": self.parent_published,
+            "child_published": self.child_published,
+            "publication_all_tables": self.publication_all_tables,
+            "parent_publication_member": self.parent_publication_member,
+            "child_publication_member": self.child_publication_member,
+        }
+
+    def as_dict(self) -> dict:
+        """Return the complete fact for durable detail/audit consumers."""
+        return {
+            "parent_schema": self.parent_schema,
+            "parent_table": self.parent_table,
+            "parent_oid": self.parent_oid,
+            "parent_relfilenode": self.parent_relfilenode,
+            "parent_relation_type_oid": self.parent_relation_type_oid,
+            "child_schema": self.child_schema,
+            "child_table": self.child_table,
+            "child_oid": self.child_oid,
+            "child_relfilenode": self.child_relfilenode,
+            "child_relation_type_oid": self.child_relation_type_oid,
+            "bound": self.bound,
+            "attachment_state": self.attachment_state,
+            "attachment_epoch": self.attachment_epoch,
+            "attachment_sequence": self.attachment_sequence,
+            **self.publication_facts,
+            "observed_lsn": self.observed_lsn,
+            "observation_epoch": self.observation_epoch,
+        }
+
+
+@dataclass(frozen=True)
+class PartitionTopologyObservation:
+    """One complete-or-rejected source topology observation.
+
+    ``complete=False`` is deliberately a first-class value.  It is used for an
+    empty/malformed/incomplete partition projection and is never passed to the
+    lifecycle diff as evidence of a removal.
+    """
+
+    edges: tuple[PartitionEdge, ...] = ()
+    complete: bool = False
+    detection_lsn: int = 0
+    observation_epoch: int = 0
+    reason: str | None = None
+
+    @property
+    def usable(self) -> bool:
+        return bool(
+            self.complete
+            and int(self.detection_lsn) > 0
+            and all(edge.complete for edge in self.edges)
+        )
+
+    @property
+    def state(self) -> str:
+        if self.usable:
+            return "complete"
+        return "pending"
+
+
+# Short compatibility spelling for focused catalog tests and embedders.
+PartitionObservation = PartitionTopologyObservation
+
+
 @dataclass
 class CatalogChange:
     kind: str
@@ -138,6 +303,9 @@ class CatalogChange:
     old_relation: SourceRelation | None = None
     new_relation: SourceRelation | None = None
     column_changes: tuple[ColumnChange, ...] = ()
+    old_partition_edge: PartitionEdge | None = None
+    new_partition_edge: PartitionEdge | None = None
+    observation_epoch: int = 0
     deferrals: int = 0
     confirmations: int = 1
     state: str = CHANGE_OBSERVED
@@ -153,6 +321,19 @@ class CatalogChange:
     @property
     def fenced(self) -> bool:
         return CHANGE_MARKED in self.history
+
+    @property
+    def partition_event_id(self) -> str | None:
+        if self.kind not in PARTITION_CHANGE_KINDS:
+            return None
+        material = repr(
+            (
+                self.kind,
+                self.old_partition_edge.edge_key if self.old_partition_edge else None,
+                self.new_partition_edge.edge_key if self.new_partition_edge else None,
+            )
+        ).encode("utf-8")
+        return hashlib.sha256(material).hexdigest()[:32]
 
     def to(self, state: str) -> None:
         if state == self.state:
@@ -185,6 +366,17 @@ class CatalogChange:
             "fenced": self.fenced,
             "state": self.state,
             "confirmations": self.confirmations,
+            "partition_event_id": self.partition_event_id,
+            "old_partition_edge": (
+                self.old_partition_edge.as_dict()
+                if self.old_partition_edge is not None
+                else None
+            ),
+            "new_partition_edge": (
+                self.new_partition_edge.as_dict()
+                if self.new_partition_edge is not None
+                else None
+            ),
         }
 
 
