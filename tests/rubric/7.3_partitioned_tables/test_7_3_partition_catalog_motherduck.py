@@ -220,8 +220,9 @@ def test_motherduck_partition_fact_is_applied_or_explicitly_pending(
             md.execute("FORCE CHECKPOINT")
             facts = md.execute(
                 f"SELECT transition, parent_oid, parent_relfilenode, "
-                f"parent_relation_type_oid, child_oid, child_relfilenode, "
-                f"child_relation_type_oid, partition_bound, attachment_epoch, "
+                f"parent_relation_type_oid, child_table, child_oid, "
+                f"child_relfilenode, child_relation_type_oid, "
+                f"partition_bound, attachment_epoch, "
                 f"detection_lsn, durable_lsn, state FROM {control}.partition_events "
                 "WHERE pipeline = ? AND child_table = ? ORDER BY detection_lsn",
                 [pipeline, drop_child],
@@ -234,9 +235,9 @@ def test_motherduck_partition_fact_is_applied_or_explicitly_pending(
                 attached = facts[0]
                 assert attached == attach_fact
                 assert attached[1:4] == source_edge[2:5]
-                assert attached[4:7] == source_edge[7:10]
-                assert attached[7] == source_edge[10]
-                assert attached[8] == source_edge[12]
+                assert attached[5:8] == source_edge[7:10]
+                assert attached[8] == source_edge[10]
+                assert attached[9] == source_edge[12]
                 assert all(row[-1] == "applied" for row in facts)
                 assert all(row[-3] > 0 and row[-2] >= row[-3] for row in facts)
             else:
