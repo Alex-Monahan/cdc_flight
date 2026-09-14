@@ -234,6 +234,7 @@ ADMISSION_BOUNDARY_HANDLERS = frozenset(
         ("schema_registry.py", "ensure_typed"),
         ("schema_shadow.py", "convert_column_to_union"),
         ("service.py", "run"),
+        ("service.py", "run_history_mode"),
         ("spill_protocol.py", "_enrich_descriptors"),
         ("table_work.py", "_key_token"),
         ("table_writer.py", "write"),
