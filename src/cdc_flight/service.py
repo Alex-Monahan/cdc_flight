@@ -355,7 +355,9 @@ class SingleProcessFlight:
         try:
             try:
                 self._admit()
-            except ServiceStandDown as admission:
+            except AdmissionError as admission:
+                if not isinstance(admission, ServiceStandDown):
+                    raise
                 summary = {
                     "ok": True,
                     "status": "SUCCEEDED",
