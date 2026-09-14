@@ -78,12 +78,18 @@ from .source_routes import SourceRoutePolicy
 
 SourceRelation = catalog_state.SourceRelation
 CatalogChange = catalog_state.CatalogChange
+PartitionEdge = catalog_state.PartitionEdge
+PartitionTopologyObservation = catalog_state.PartitionTopologyObservation
 CHANGE_DROPPED = catalog_state.CHANGE_DROPPED
 CHANGE_RECREATED = catalog_state.CHANGE_RECREATED
 CHANGE_UNPUBLISHED = catalog_state.CHANGE_UNPUBLISHED
 CHANGE_REPUBLISHED = catalog_state.CHANGE_REPUBLISHED
 CHANGE_NEW = catalog_state.CHANGE_NEW
 CHANGE_SCHEMA = catalog_state.CHANGE_SCHEMA
+CHANGE_PARTITION_ATTACHED = catalog_state.CHANGE_PARTITION_ATTACHED
+CHANGE_PARTITION_DETACHED = catalog_state.CHANGE_PARTITION_DETACHED
+CHANGE_PARTITION_DROPPED = catalog_state.CHANGE_PARTITION_DROPPED
+PARTITION_CHANGE_KINDS = catalog_state.PARTITION_CHANGE_KINDS
 DESTRUCTIVE = catalog_state.DESTRUCTIVE
 FENCED = catalog_state.FENCED
 
@@ -166,6 +172,15 @@ def read_known_relations(
         raise
 
 
+def read_known_partition_edges(
+    con, pipeline: str, *, control_schema: str | None = None
+) -> dict[tuple, PartitionEdge] | None:
+    """Read the last committed positive edge snapshot for the watcher."""
+    from .partition_topology import read_partition_edges
+
+    return read_partition_edges(con, pipeline, control_schema=control_schema)
+
+
 def seed_from_table_state(
     con, pipeline: str, *, control_schema: str | None = None
 ) -> set[str]:
@@ -211,6 +226,7 @@ class CatalogWatcher(CatalogLifecycleMixin):
         marker_max_writes: int | None = 60,
         binary_handling_mode: str = "base64",
         hstore_handling_mode: str = "map",
+        partition_edges: dict[tuple, PartitionEdge] | None = None,
     ):
         if routes is not None:
             self.dsn = routes.read_dsn
@@ -348,7 +364,22 @@ class CatalogWatcher(CatalogLifecycleMixin):
         #: about. `supervisor.run_engine_bounded` fails the run on this one (A51 row 51).
         self.machine_error: str | None = None
         self.last_lsn: int = 0
-        self._snapshot_partitions: set[str] = set()
+        # The stable positive-edge snapshot is source topology state, not a set of
+        # child names.  The persisted copy is kept separately so a confirmed but
+        # still-unfenced transition cannot run ahead of the destination fact.
+        self._snapshot_partitions: dict[tuple, PartitionEdge] = dict(partition_edges or {})
+        self._partition_persisted_edges: dict[tuple, PartitionEdge] = dict(
+            partition_edges or {}
+        )
+        self._partition_baseline_initialized = partition_edges is not None
+        self._partition_persisted_baseline_initialized = partition_edges is not None
+        self._partition_unconfirmed: dict[tuple, CatalogChange] = {}
+        self._partition_snapshot_dirty = False
+        self._partition_snapshot_epoch = 0
+        self._partition_snapshot_lsn = 0
+        self._partition_last_detection_lsn = 0
+        self._partition_observation_state = "pending"
+        self._partition_observation_reason: str | None = None
         #: Monotone watcher epoch used by a destination plan to identify the
         #: observation set it was built from.  Settlement may still absorb an older
         #: committed plan, but it must not clear dirty state learned in a later epoch.

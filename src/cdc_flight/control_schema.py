@@ -316,6 +316,85 @@ CONTROL_DDL = [
             last_seen_at      TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (pipeline, source_schema, source_table)
         )""",
+    # §7.3 Round A. A positive edge is a generation-aware source observation, not a
+    # destination repair instruction. The snapshot is replaced only by the catalog
+    # apply owner after a complete observation; a missing/failed source projection
+    # therefore cannot erase the last durable topology proof.
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.partition_edges (
+            pipeline                    VARCHAR NOT NULL,
+            edge_key                    VARCHAR NOT NULL,
+            parent_schema               VARCHAR NOT NULL,
+            parent_table                VARCHAR NOT NULL,
+            parent_oid                  BIGINT,
+            parent_relfilenode          BIGINT,
+            parent_relation_type_oid   BIGINT,
+            child_schema                VARCHAR NOT NULL,
+            child_table                 VARCHAR NOT NULL,
+            child_oid                   BIGINT,
+            child_relfilenode           BIGINT,
+            child_relation_type_oid    BIGINT,
+            partition_bound             VARCHAR,
+            attachment_state            VARCHAR,
+            attachment_epoch            VARCHAR,
+            attachment_sequence        BIGINT,
+            parent_published            BOOLEAN NOT NULL,
+            child_published             BOOLEAN NOT NULL,
+            publication_all_tables      BOOLEAN NOT NULL,
+            parent_publication_member   BOOLEAN NOT NULL,
+            child_publication_member    BOOLEAN NOT NULL,
+            observed_lsn                BIGINT NOT NULL,
+            observation_epoch           BIGINT NOT NULL,
+            PRIMARY KEY (pipeline, edge_key)
+        )""",
+    # The positive-edge table has no row when a complete observation proves that
+    # the published topology is empty. Keep that fact separate from the edge rows
+    # so a restart can distinguish "never observed" from "observed, then empty".
+    # This marker is replaced in the same destination transaction as the snapshot.
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.partition_observation_state (
+            pipeline          VARCHAR NOT NULL PRIMARY KEY,
+            observed_lsn      BIGINT NOT NULL,
+            observation_epoch BIGINT NOT NULL,
+            state              VARCHAR NOT NULL,
+            updated_at         TIMESTAMPTZ NOT NULL
+        )""",
+    # One durable fact for each confirmed ATTACH/DETACH/DROP edge transition. The
+    # source detection LSN and the destination durable LSN are both retained so an
+    # operator can distinguish a pending fence from an applied fact. The full edge
+    # projection remains here even for DETACH/DROP: it is the server's explanation of
+    # which child generation was involved, including PostgreSQL's own bound output.
+    f"""CREATE TABLE IF NOT EXISTS {_DEFAULT_CONTROL_IDENTIFIER}.partition_events (
+            pipeline                    VARCHAR NOT NULL,
+            event_id                    VARCHAR NOT NULL,
+            transition                  VARCHAR NOT NULL,
+            edge_key                    VARCHAR NOT NULL,
+            parent_schema               VARCHAR NOT NULL,
+            parent_table                VARCHAR NOT NULL,
+            parent_oid                  BIGINT,
+            parent_relfilenode          BIGINT,
+            parent_relation_type_oid   BIGINT,
+            child_schema                VARCHAR NOT NULL,
+            child_table                 VARCHAR NOT NULL,
+            child_oid                   BIGINT,
+            child_relfilenode           BIGINT,
+            child_relation_type_oid    BIGINT,
+            partition_bound             VARCHAR,
+            attachment_state            VARCHAR,
+            attachment_epoch            VARCHAR,
+            attachment_sequence        BIGINT,
+            parent_published            BOOLEAN NOT NULL,
+            child_published             BOOLEAN NOT NULL,
+            publication_all_tables      BOOLEAN NOT NULL,
+            parent_publication_member   BOOLEAN NOT NULL,
+            child_publication_member    BOOLEAN NOT NULL,
+            observed_lsn                BIGINT NOT NULL,
+            observation_epoch           BIGINT NOT NULL,
+            detection_lsn               BIGINT NOT NULL,
+            durable_lsn                 BIGINT NOT NULL,
+            commit_id                   BIGINT NOT NULL,
+            state                       VARCHAR NOT NULL,
+            recorded_at                 TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (pipeline, event_id)
+        )""",
     # A late rename can be observed after a row with the new name has already been
     # applied.  NULL in that physical column is ambiguous: it may be an explicit
     # source NULL or an absent field in a partial Debezium image.  The row path records

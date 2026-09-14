@@ -26,6 +26,7 @@ from .catalog import (
     CHANGE_SCHEMA,
     DESTRUCTIVE,
     FENCED,
+    PARTITION_CHANGE_KINDS,
     CatalogChange,
 )
 from .config import DROP_IGNORE, DROP_REPLICATE
@@ -91,6 +92,15 @@ class CatalogPlan:
     #: source columns.  They travel with the schema action and are written in the
     #: same MotherDuck transaction as the destination DDL/backfill.
     policy_alerts: tuple[dict, ...] = ()
+    #: Confirmed partition transitions are observations only. They never become a
+    #: table lifecycle action or a destination row repair in Round A.
+    partition_events: tuple[CatalogChange, ...] = ()
+    #: A complete stable positive-edge snapshot to replace atomically with the fact.
+    #: ``None`` means this plan does not own a topology snapshot write; an empty
+    #: tuple is a proven empty topology and must clear the prior durable snapshot.
+    partition_edges: tuple | None = None
+    partition_epoch: int = 0
+    durable_lsn: int = 0
 
     @property
     def destructive(self) -> tuple[CatalogAction, ...]:
@@ -175,6 +185,13 @@ class CatalogCoordinator:
             return CatalogPlan()
 
         due = self.catalog.due(durable_lsn)
+        # Round A partition transitions are durable observations, never table
+        # lifecycle actions. Keep them out of the existing table-lifecycle planner
+        # so a child DROP cannot accidentally drop or resnapshot the parent target.
+        partition_due = [
+            change for change in due if change.kind in PARTITION_CHANGE_KINDS
+        ]
+        due = [change for change in due if change.kind not in PARTITION_CHANGE_KINDS]
         #: (change, blocking lifecycle) pairs; the lifecycle is part of the alert
         #: dedup identity, so a table blocked for a *different* reason later still
         #: gets its own single alert.
@@ -502,6 +519,10 @@ class CatalogCoordinator:
             refused=tuple(refused),
             alerts=alerts,
             policy_alerts=tuple(policy_alerts),
+            partition_events=tuple(partition_due),
+            partition_edges=self.catalog.partition_snapshot_for_plan(partition_due),
+            partition_epoch=self.catalog.epoch,
+            durable_lsn=int(durable_lsn),
         )
 
     # ------------------------------------------------------------------ #
@@ -610,7 +631,9 @@ class CatalogCoordinator:
                 for row in rows
             ]
 
-    def apply(self, con, plan: CatalogPlan, stats: dict) -> list[dict]:
+    def apply(
+        self, con, plan: CatalogPlan, stats: dict, *, commit_id: int | None = None
+    ) -> list[dict]:
         """Execute DDL and state writes after group DML, before MD COMMIT."""
         markers: list[dict] = []
         for action in plan.actions:
@@ -727,6 +750,29 @@ class CatalogCoordinator:
                 pipeline=self.pipeline,
                 control_schema=self.control_schema,
             )
+        if plan.partition_edges is not None:
+            from . import partition_topology
+
+            partition_topology.write_partition_snapshot(
+                con,
+                pipeline=self.pipeline,
+                edges=plan.partition_edges,
+                control_schema=self.control_schema,
+            )
+        if plan.partition_events:
+            from . import partition_topology
+
+            if commit_id is None:
+                raise ValueError("partition facts require the enclosing commit id")
+            for change in plan.partition_events:
+                partition_topology.write_partition_event(
+                    con,
+                    pipeline=self.pipeline,
+                    change=change,
+                    commit_id=commit_id,
+                    durable_lsn=plan.durable_lsn,
+                    control_schema=self.control_schema,
+                )
         self.destructive_refused += len(plan.refused)
         return markers
 
@@ -858,6 +904,7 @@ class CatalogCoordinator:
         if self.catalog is None:
             return
         changes = [action.change for action in plan.actions]
+        changes.extend(plan.partition_events)
         if changes:
             # A live watcher can supersede a due plan after the destination COMMIT.
             # The committed fact is still settled as applied; the newer change remains
@@ -878,6 +925,8 @@ class CatalogCoordinator:
                     self.catalog.forget(action.change.qualified)
         if plan.relations:
             self.catalog.clear_dirty_if_current(plan.relations, plan.catalog_epoch)
+        if plan.partition_edges is not None:
+            self.catalog.mark_partition_snapshot_persisted(plan.partition_edges)
         if source_tables:
             self.catalog.observe_replicated(source_tables)
 

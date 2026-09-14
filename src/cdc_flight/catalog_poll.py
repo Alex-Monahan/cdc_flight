@@ -11,7 +11,12 @@ from . import catalog_support as observation_mod
 from . import faults as faults_mod
 from .catalog_descriptors import CatalogDescriptorReader
 from .catalog_generation import identities_equal, identity_for
-from .catalog_state import FENCED, SourceRelation
+from .catalog_state import (
+    FENCED,
+    PartitionEdge,
+    PartitionTopologyObservation,
+    SourceRelation,
+)
 from .errors import AdmissionError, SchemaEvolutionRefused, as_schema_refusal
 from .machines import (
     CATALOG_SCHEMA_LIVENESS,
@@ -130,6 +135,124 @@ def _positive_lsn(value):
     except (TypeError, ValueError):
         return None
     return candidate if candidate > 0 else None
+
+
+def _partition_observation(
+    partition_rows,
+    coverage_rows,
+    *,
+    observed: dict[str, SourceRelation],
+    detection_lsn: int,
+    observation_epoch: int,
+) -> PartitionTopologyObservation:
+    """Parse the complete source topology projection without inventing facts."""
+    if len(coverage_rows) != 1:
+        return PartitionTopologyObservation(
+            complete=False,
+            detection_lsn=detection_lsn,
+            observation_epoch=observation_epoch,
+            reason="partition coverage proof was absent or malformed",
+        )
+    try:
+        raw_count, complete_count, pending_count = (
+            int(value) for value in coverage_rows[0][:3]
+        )
+    except (TypeError, ValueError, IndexError):
+        return PartitionTopologyObservation(
+            complete=False,
+            detection_lsn=detection_lsn,
+            observation_epoch=observation_epoch,
+            reason="partition coverage proof was not numeric",
+        )
+    if raw_count != complete_count or raw_count != len(partition_rows):
+        return PartitionTopologyObservation(
+            complete=False,
+            detection_lsn=detection_lsn,
+            observation_epoch=observation_epoch,
+            reason=(
+                "partition catalog returned an incomplete relation join "
+                f"(raw={raw_count}, complete={complete_count}, rows={len(partition_rows)})"
+            ),
+        )
+    if pending_count:
+        return PartitionTopologyObservation(
+            complete=False,
+            detection_lsn=detection_lsn,
+            observation_epoch=observation_epoch,
+            reason=(
+                f"{pending_count} partition inheritance edge(s) are in an "
+                "in-progress detach state"
+            ),
+        )
+
+    edges: list[PartitionEdge] = []
+    for row in partition_rows:
+        if len(row) < 19:
+            return PartitionTopologyObservation(
+                complete=False,
+                detection_lsn=detection_lsn,
+                observation_epoch=observation_epoch,
+                reason="partition catalog row omitted an identity or publication fact",
+            )
+        try:
+            edge = PartitionEdge(
+                parent_schema=str(row[0]),
+                parent_table=str(row[1]),
+                parent_oid=(int(row[2]) if row[2] is not None else None),
+                parent_relfilenode=(int(row[3]) if row[3] is not None else None),
+                parent_relation_type_oid=(int(row[4]) if row[4] is not None else None),
+                child_schema=str(row[5]),
+                child_table=str(row[6]),
+                child_oid=(int(row[7]) if row[7] is not None else None),
+                child_relfilenode=(int(row[8]) if row[8] is not None else None),
+                child_relation_type_oid=(int(row[9]) if row[9] is not None else None),
+                # Do not normalize, quote, or otherwise render this value. It is
+                # PostgreSQL's pg_get_expr output and is the only bound oracle.
+                bound=row[10],
+                attachment_state=(str(row[11]) if row[11] is not None else None),
+                attachment_epoch=(str(row[12]) if row[12] is not None else None),
+                attachment_sequence=(int(row[13]) if row[13] is not None else None),
+                parent_published=bool(row[14]),
+                child_published=bool(row[15]),
+                publication_all_tables=bool(row[16]),
+                parent_publication_member=bool(row[17]),
+                child_publication_member=bool(row[18]),
+                observed_lsn=detection_lsn,
+                observation_epoch=observation_epoch,
+            )
+        except (TypeError, ValueError, IndexError):
+            return PartitionTopologyObservation(
+                complete=False,
+                detection_lsn=detection_lsn,
+                observation_epoch=observation_epoch,
+                reason="partition catalog row contained an invalid identity fact",
+            )
+        if not edge.complete:
+            return PartitionTopologyObservation(
+                complete=False,
+                detection_lsn=detection_lsn,
+                observation_epoch=observation_epoch,
+                reason="partition catalog row was not a complete positive edge",
+            )
+        parent = observed.get(edge.parent_qualified)
+        child = observed.get(edge.child_qualified)
+        if parent is None or child is None:
+            return PartitionTopologyObservation(
+                complete=False,
+                detection_lsn=detection_lsn,
+                observation_epoch=observation_epoch,
+                reason=(
+                    "partition edge was not positively visible in the complete "
+                    "relation catalog"
+                ),
+            )
+        edges.append(edge)
+    return PartitionTopologyObservation(
+        edges=tuple(edges),
+        complete=True,
+        detection_lsn=detection_lsn,
+        observation_epoch=observation_epoch,
+    )
 
 
 def _closed_full_relation(relation, activation_lsn, invalidation_lsn):
@@ -478,6 +601,18 @@ def poll(watcher):
             str(schema): (SCHEMA_VISIBLE if int(count) > 0 else SCHEMA_EMPTY)
             for schema, count in liveness_rows
         }
+        # ``CATALOG_SQL`` and the liveness query are two projections of the same
+        # relation set. A short/permission-filtered result must not be allowed to
+        # turn a missing child into a lifecycle event.
+        try:
+            expected_relation_count = sum(int(count) for _schema, count in liveness_rows)
+        except (TypeError, ValueError):
+            raise RuntimeError("source catalog liveness proof was malformed") from None
+        if expected_relation_count != len(rows):
+            raise RuntimeError(
+                "source catalog relation projection was incomplete: "
+                f"liveness={expected_relation_count}, rows={len(rows)}"
+            )
         expected_schemas = set(watcher.schemas)
         if watcher.all_schemas:
             expected_schemas |= {name.partition(".")[0] for name in watcher.known}
@@ -489,6 +624,10 @@ def poll(watcher):
             watcher._schema_liveness = observed_liveness
         partition_rows = conn.execute(
             observation_mod.PARTITION_SQL,
+            (watcher.publication, schema_array, schema_array),
+        ).fetchall()
+        partition_coverage_rows = conn.execute(
+            observation_mod.PARTITION_COVERAGE_SQL,
             (watcher.publication, schema_array, schema_array),
         ).fetchall()
         lsn = int(conn.execute(observation_mod.LSN_SQL).fetchone()[0])
@@ -587,10 +726,13 @@ def poll(watcher):
             )
             log.error("catalog poll: %s", watcher.last_error)
             return []
-        with watcher._lock:
-            watcher._snapshot_partitions = {
-                f"{row[0]}.{row[1]}" for row in partition_rows
-            }
+        partition_observation = _partition_observation(
+            partition_rows,
+            partition_coverage_rows,
+            observed=observed,
+            detection_lsn=lsn,
+            observation_epoch=watcher.epoch + 1,
+        )
     # Keep source writes off the catalog read connection. A policy-aware watcher
     # gets a lazy source-write connection: ordinary catalog polling remains replica
     # read-only, while a real TOAST/publication/fence change opens one bounded
@@ -620,6 +762,7 @@ def poll(watcher):
             watcher, source_write_conn, observed, activation_lsn=lsn
         )
         added = watcher._compare(observed, lsn)
+        added.extend(watcher._compare_partitions(partition_observation, observed))
         watcher._ensure_published(source_write_conn, observed, added)
         with watcher._lock:
             watcher.successful_polls += 1

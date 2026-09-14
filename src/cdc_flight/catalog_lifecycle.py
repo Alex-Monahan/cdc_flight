@@ -11,13 +11,19 @@ from . import source_marker as marker_mod
 from .catalog_state import (
     CHANGE_DROPPED,
     CHANGE_NEW,
+    CHANGE_PARTITION_ATTACHED,
+    CHANGE_PARTITION_DETACHED,
+    CHANGE_PARTITION_DROPPED,
     CHANGE_RECREATED,
     CHANGE_REPUBLISHED,
     CHANGE_SCHEMA,
     CHANGE_UNPUBLISHED,
     DESTRUCTIVE,
     FENCED,
+    PARTITION_CHANGE_KINDS,
     CatalogChange,
+    PartitionEdge,
+    PartitionTopologyObservation,
     SourceRelation,
 )
 from .machines import (
@@ -413,6 +419,356 @@ class CatalogLifecycleMixin:
                 name,
             )
         return added
+
+    # -- partition topology ----------------------------------------------- #
+    @staticmethod
+    def _relation_generation(relation: SourceRelation | None) -> tuple | None:
+        if relation is None:
+            return None
+        identity = catalog_generation.identity_for(relation)
+        return identity.oid, identity.relfilenode, identity.reltype_oid
+
+    @classmethod
+    def _partition_change_shape(cls, change: CatalogChange) -> tuple:
+        return (
+            change.kind,
+            (
+                change.old_partition_edge.edge_key
+                if change.old_partition_edge is not None
+                else None
+            ),
+            (
+                change.new_partition_edge.edge_key
+                if change.new_partition_edge is not None
+                else None
+            ),
+        )
+
+    @staticmethod
+    def _edge_relation_matches(edge: PartitionEdge, relation: SourceRelation | None) -> bool:
+        if relation is None:
+            return False
+        return CatalogLifecycleMixin._relation_generation(relation) == edge.child_generation
+
+    @classmethod
+    def _partition_change_holds(
+        cls,
+        change: CatalogChange,
+        current: dict[tuple, PartitionEdge],
+        observed: dict[str, SourceRelation],
+    ) -> bool:
+        old = change.old_partition_edge
+        new = change.new_partition_edge
+        if change.kind == CHANGE_PARTITION_ATTACHED:
+            return new is not None and new.edge_key in current
+        if old is None or old.edge_key in current:
+            return False
+        child = observed.get(old.child_qualified)
+        if change.kind == CHANGE_PARTITION_DETACHED:
+            return cls._edge_relation_matches(old, child)
+        if change.kind == CHANGE_PARTITION_DROPPED:
+            return child is None
+        return False
+
+    def _partition_supersede(self, change: CatalogChange) -> None:
+        if change.state not in {CHANGE_APPLIED, CHANGE_SUPERSEDED}:
+            change.to(CHANGE_SUPERSEDED)
+            self.superseded += 1
+
+    def _confirm_partition(
+        self, shape: tuple, change: CatalogChange
+    ) -> CatalogChange | None:
+        """Confirm an edge transition without sharing the table-name queue key."""
+        seen = self._partition_unconfirmed.get(shape)
+        if seen is None:
+            change.to(CHANGE_UNCONFIRMED)
+            tracked = change
+        else:
+            tracked = seen
+            tracked.confirmations += 1
+            tracked.detected_lsn = change.detected_lsn
+            tracked.observation_epoch = getattr(change, "observation_epoch", 0)
+            tracked.to(CHANGE_UNCONFIRMED)
+        if tracked.confirmations < self.confirm_polls:
+            self._partition_unconfirmed[shape] = tracked
+            log.info(
+                "%s observed for partition edge %s (%s/%s confirming polls); "
+                "not queued yet",
+                tracked.kind,
+                tracked.qualified,
+                tracked.confirmations,
+                self.confirm_polls,
+            )
+            return None
+        self._partition_unconfirmed.pop(shape, None)
+        return tracked
+
+    def _new_partition_change(
+        self,
+        kind: str,
+        edge: PartitionEdge,
+        lsn: int,
+        *,
+        old_edge: PartitionEdge | None = None,
+        new_edge: PartitionEdge | None = None,
+        observation_epoch: int,
+    ) -> CatalogChange:
+        selected = new_edge or old_edge or edge
+        from .catalog_generation import RelationIdentity
+
+        old_identity = (
+            RelationIdentity(*old_edge.child_generation) if old_edge is not None else None
+        )
+        new_identity = (
+            RelationIdentity(*new_edge.child_generation) if new_edge is not None else None
+        )
+        change = CatalogChange(
+            kind=kind,
+            schema=selected.child_schema,
+            table=selected.child_table,
+            detected_lsn=lsn,
+            old_oid=(old_edge.child_oid if old_edge is not None else None),
+            new_oid=(new_edge.child_oid if new_edge is not None else None),
+            old_identity=old_identity,
+            new_identity=new_identity,
+            old_partition_edge=old_edge,
+            new_partition_edge=new_edge,
+        )
+        # The epoch is an observation fact alongside, not instead of, the source WAL
+        # fence. It lets settlement identify which snapshot was planned.
+        change.observation_epoch = observation_epoch
+        return change
+
+    def _partition_observation_rejected(self, observation, reason: str) -> list:
+        self._partition_observation_state = "pending"
+        self._partition_observation_reason = reason
+        if observation.detection_lsn:
+            self._partition_last_detection_lsn = int(observation.detection_lsn)
+        log.warning("partition topology observation held pending: %s", reason)
+        return []
+
+    def _compare_partitions(
+        self,
+        observation: PartitionTopologyObservation,
+        observed: dict[str, SourceRelation],
+    ) -> list[CatalogChange]:
+        """Diff two complete positive topology observations.
+
+        The stable snapshot is intentionally not advanced on the first half of a
+        transition.  That makes the confirmation streak compare the same complete
+        edge generation twice and leaves a pending fact re-detectable after a crash.
+        """
+        with self._lock:
+            if not observation.usable:
+                return self._partition_observation_rejected(
+                    observation,
+                    observation.reason
+                    or "partition catalog result was empty, incomplete, unfenced, "
+                    "or contained an in-progress edge",
+                )
+
+            current: dict[tuple, PartitionEdge] = {}
+            for edge in observation.edges:
+                if edge.edge_key in current:
+                    return self._partition_observation_rejected(
+                        observation, "partition catalog returned a duplicate edge key"
+                    )
+                parent = observed.get(edge.parent_qualified)
+                child = observed.get(edge.child_qualified)
+                if parent is None or child is None:
+                    return self._partition_observation_rejected(
+                        observation,
+                        "partition edge was not backed by a visible parent and child "
+                        "generation in the complete relation observation",
+                    )
+                if self._relation_generation(parent) != edge.parent_generation:
+                    return self._partition_observation_rejected(
+                        observation, "partition parent generation did not agree"
+                    )
+                if self._relation_generation(child) != edge.child_generation:
+                    return self._partition_observation_rejected(
+                        observation, "partition child generation did not agree"
+                    )
+                current[edge.edge_key] = edge
+
+            # A parent disappearing is not a child DROP fact. The relation catalog
+            # must remain positively complete before any edge removal is classified.
+            for old in self._snapshot_partitions.values():
+                if old.parent_qualified not in observed:
+                    return self._partition_observation_rejected(
+                        observation,
+                        "partition parent was absent from the relation set; no edge "
+                        "lifecycle event is provable",
+                    )
+                parent = observed.get(old.parent_qualified)
+                if self._relation_generation(parent) != old.parent_generation:
+                    return self._partition_observation_rejected(
+                        observation,
+                        "partition parent OID/generation reuse was observed; refusing "
+                        "to manufacture an edge event",
+                    )
+                child = observed.get(old.child_qualified)
+                if child is not None and self._relation_generation(child) != old.child_generation:
+                    return self._partition_observation_rejected(
+                        observation,
+                        "partition child OID/generation reuse was observed; refusing "
+                        "to manufacture an edge event",
+                    )
+
+            if not self._partition_baseline_initialized:
+                self._snapshot_partitions = current
+                self._partition_baseline_initialized = True
+                self._partition_snapshot_epoch = observation.observation_epoch
+                self._partition_snapshot_lsn = observation.detection_lsn
+                self._partition_snapshot_dirty = (
+                    self._snapshot_partitions != self._partition_persisted_edges
+                    or not self._partition_persisted_baseline_initialized
+                )
+                self._partition_observation_state = "complete"
+                self._partition_observation_reason = None
+                self._partition_last_detection_lsn = observation.detection_lsn
+                return []
+
+            stable = dict(self._snapshot_partitions)
+            candidates: list[tuple[tuple, CatalogChange]] = []
+            for key in sorted(current.keys() - stable.keys(), key=repr):
+                edge = current[key]
+                shape = (
+                    CHANGE_PARTITION_ATTACHED,
+                    None,
+                    edge.edge_key,
+                )
+                candidates.append(
+                    (
+                        shape,
+                        self._new_partition_change(
+                            CHANGE_PARTITION_ATTACHED,
+                            edge,
+                            observation.detection_lsn,
+                            new_edge=edge,
+                            observation_epoch=observation.observation_epoch,
+                        ),
+                    )
+                )
+            for key in sorted(stable.keys() - current.keys(), key=repr):
+                edge = stable[key]
+                child = observed.get(edge.child_qualified)
+                kind = (
+                    CHANGE_PARTITION_DETACHED
+                    if child is not None
+                    else CHANGE_PARTITION_DROPPED
+                )
+                shape = (kind, edge.edge_key, None)
+                candidates.append(
+                    (
+                        shape,
+                        self._new_partition_change(
+                            kind,
+                            edge,
+                            observation.detection_lsn,
+                            old_edge=edge,
+                            observation_epoch=observation.observation_epoch,
+                        ),
+                    )
+                )
+
+            candidate_shapes = {shape for shape, _change in candidates}
+            # A transition that no longer holds is superseded explicitly.  A live
+            # fact that still holds remains live while its source fence is pending.
+            for shape, change in list(self._partition_unconfirmed.items()):
+                if shape not in candidate_shapes:
+                    self._partition_supersede(change)
+                    self._partition_unconfirmed.pop(shape, None)
+                    self._changes = [
+                        item for item in self._changes if item.state in LIVE_CHANGE_STATES
+                    ]
+            for change in list(self._live()):
+                if (
+                    change.kind in PARTITION_CHANGE_KINDS
+                    and not self._partition_change_holds(change, current, observed)
+                ):
+                    self._partition_supersede(change)
+            self._changes = [
+                item for item in self._changes if item.state in LIVE_CHANGE_STATES
+            ]
+
+            ready: list[CatalogChange] = []
+            waiting = 0
+            for shape, change in candidates:
+                if any(
+                    item.kind in PARTITION_CHANGE_KINDS
+                    and self._partition_change_shape(item) == shape
+                    and self._partition_change_holds(item, current, observed)
+                    for item in self._live()
+                ):
+                    continue
+                waiting += 1
+                confirmed = self._confirm_partition(shape, change)
+                if confirmed is not None:
+                    ready.append(confirmed)
+
+            if waiting and len(ready) == waiting:
+                for change in ready:
+                    change.to(CHANGE_PENDING)
+                self._changes.extend(ready)
+                self._snapshot_partitions = current
+                self._partition_snapshot_epoch = observation.observation_epoch
+                self._partition_snapshot_lsn = observation.detection_lsn
+                self._partition_snapshot_dirty = (
+                    self._snapshot_partitions != self._partition_persisted_edges
+                    or not self._partition_persisted_baseline_initialized
+                )
+            self._partition_observation_state = "complete"
+            self._partition_observation_reason = None
+            self._partition_last_detection_lsn = observation.detection_lsn
+            return ready if waiting and len(ready) == waiting else []
+
+    @property
+    def partition_snapshot_dirty(self) -> bool:
+        with self._lock:
+            return bool(self._partition_snapshot_dirty)
+
+    def partition_snapshot_for_plan(
+        self, due: list[CatalogChange] | tuple[CatalogChange, ...] = ()
+    ) -> tuple[PartitionEdge, ...] | None:
+        """Return only a snapshot that is safe to write in this destination plan."""
+        with self._lock:
+            if not self._partition_snapshot_dirty:
+                return None
+            due_ids = {id(change) for change in due}
+            live_partition = [
+                change for change in self._live() if change.kind in PARTITION_CHANGE_KINDS
+            ]
+            if self._partition_unconfirmed:
+                return None
+            if live_partition and not all(id(change) in due_ids for change in live_partition):
+                return None
+            return tuple(
+                sorted(self._snapshot_partitions.values(), key=lambda edge: repr(edge.edge_key))
+            )
+
+    def mark_partition_snapshot_persisted(
+        self, edges: tuple[PartitionEdge, ...] | list[PartitionEdge]
+    ) -> None:
+        with self._lock:
+            self._partition_persisted_edges = {edge.edge_key: edge for edge in edges}
+            self._partition_persisted_baseline_initialized = True
+            self._partition_snapshot_dirty = (
+                self._partition_persisted_edges != self._snapshot_partitions
+            )
+
+    def partition_snapshot_for_flush(self) -> tuple[PartitionEdge, ...] | None:
+        """Return a stable snapshot for the post-watcher observation flush."""
+        with self._lock:
+            if not self._partition_snapshot_dirty or self._partition_unconfirmed:
+                return None
+            if any(
+                change.kind in PARTITION_CHANGE_KINDS for change in self._live()
+            ):
+                return None
+            return tuple(
+                sorted(self._snapshot_partitions.values(), key=lambda edge: repr(edge.edge_key))
+            )
 
     def _confirm(self, name: str, change: CatalogChange) -> CatalogChange | None:
         return catalog_change_queue.confirm(self, name, change)

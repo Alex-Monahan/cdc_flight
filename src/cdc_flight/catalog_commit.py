@@ -33,6 +33,8 @@ def plan_catalog_changes(applier, durable_lsn: int):
         and not plan.alerts
         and not plan.policy_alerts
         and not plan.refused
+        and not plan.partition_events
+        and plan.partition_edges is None
     ):
         return None
     applier.group.catalog_plan = plan
@@ -67,11 +69,23 @@ def apply_catalog_phase(
         refused=plan.refused if not schema_only else (),
         alerts=plan.alerts if not schema_only else [],
         policy_alerts=plan.policy_alerts if schema_only else (),
+        partition_events=plan.partition_events if not schema_only else (),
+        partition_edges=plan.partition_edges if not schema_only else None,
+        partition_epoch=plan.partition_epoch,
+        durable_lsn=plan.durable_lsn,
     )
-    if not phase.actions and not phase.relations and not phase.refused:
+    if (
+        not phase.actions
+        and not phase.relations
+        and not phase.refused
+        and not phase.partition_events
+        and phase.partition_edges is None
+    ):
         return
     applier.group.table_events.extend(
-        applier.catalog_coordinator.apply(applier.con, phase, stats)
+        applier.catalog_coordinator.apply(
+            applier.con, phase, stats, commit_id=commit_id
+        )
     )
     if applier.group.table_events:
         flush_table_events(applier, commit_id)
