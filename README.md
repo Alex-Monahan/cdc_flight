@@ -148,6 +148,20 @@ value fails closed with an explicit message because a finite scheduler cap can t
 healthy lease holder. The external scheduler may still start a new instance each minute;
 lease admission makes healthy successors stand down and expired-lease successors take over.
 
+To admit history for one identity-bearing table before it is materialized, run the
+bounded policy operation through the same service entrypoint:
+
+```bash
+max_runtime_sec=0 cdc-flight-service --destination duckdb \
+  set-history-mode --table app.customers --mode scd2
+```
+
+The command requires an exact qualified `schema.table`, validates the source catalog
+identity and primary key, and persists the selection in `_cdc_flight.table_state.history_mode`.
+It refuses to relabel an existing current-only destination and never creates a source
+signal or event-dispatch path. `none` is the durable default for every table not
+selected by this operation.
+
 ## Destination shape
 
 One destination table per source table, named `<topic_prefix>_<schema>_<table>`:

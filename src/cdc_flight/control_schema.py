@@ -851,6 +851,7 @@ def _migrate_policy_columns(con, control_schema: str | None = None) -> None:
         ).fetchall()
     }
     for name, type_name in (
+        ("history_mode", "VARCHAR NOT NULL DEFAULT 'none'"),
         ("delete_policy_epoch", "BIGINT DEFAULT 1"),
         ("delete_policy_digest", "VARCHAR"),
         ("pii_policy_epoch", "BIGINT DEFAULT 0"),

@@ -33,6 +33,7 @@ from . import (
     event_ledger,
     failure_containment,
     faults,
+    history_policy,
     logical_messages,
     naming,
     scd2,
@@ -93,7 +94,6 @@ class GroupPlan:
         source_cluster_id: str | None = None,
         source_timeline: int | None = None,
         strict_event_identity: bool = False,
-        history_modes: dict[str, str] | None = None,
         delete_policy=None,
         policy_gate=None,
         message_prefix_policy=None,
@@ -130,9 +130,6 @@ class GroupPlan:
         self.message_prefix_policy = message_prefix_policy or logical_messages.MessagePrefixPolicy()
         self.suppress_replayed_message_audit = bool(suppress_replayed_message_audit)
         self.policy_alerts: list[dict] = []
-        self.history_modes = {
-            str(name): str(mode).lower() for name, mode in (history_modes or {}).items()
-        }
         # The applier snapshots this durable admission set once per run.  A plan never
         # issues a control-plane query per schema epoch/table: all units in this commit
         # group therefore share one refusal decision and healthy co-published tables
@@ -354,9 +351,6 @@ class GroupPlan:
 
     def _history_mode_for(self, qualified: str) -> str:
         """Read the durable per-relation history policy once per group."""
-        history_modes = getattr(self, "history_modes", {})
-        if qualified in history_modes:
-            return history_modes[qualified]
         history_mode_cache = getattr(self, "_history_mode_cache", None)
         if history_mode_cache is None:
             history_mode_cache = {}
@@ -365,21 +359,19 @@ class GroupPlan:
             return history_mode_cache[qualified]
         mode = "none"
         pipeline = getattr(self, "pipeline", "")
-        if pipeline:
-            try:
-                schema, table = qualified.split(".", 1)
-                row = self.con.execute(
-                    f"SELECT history_mode FROM {destination._control_table(self._control_schema, 'table_state')} "
-                    "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
-                    [pipeline, schema, table],
-                ).fetchone()
-                if row and row[0] is not None:
-                    mode = str(row[0]).lower()
-            except Exception:
-                # A compatibility adapter may not create table_state.  It is safe
-                # to retain the existing current-row path in that case; explicitly
-                # requested SCD2 modes still arrive through ``history_modes``.
-                mode = "none"
+        if pipeline and self.con is not None:
+            schema, separator, table = str(qualified).partition(".")
+            if not separator or not schema or not table:
+                raise history_policy.HistoryPolicyRefused(
+                    f"event relation {qualified!r} is not a qualified source identity"
+                )
+            mode = history_policy.read_history_mode(
+                self.con,
+                pipeline=pipeline,
+                source_schema=schema,
+                source_table=table,
+                control_schema=self._control_schema,
+            )
         history_mode_cache[qualified] = mode
         return mode
 

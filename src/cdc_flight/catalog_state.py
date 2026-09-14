@@ -69,6 +69,10 @@ class SourceRelation:
     relation_type_oid: int | None = None
     publication_all_tables: bool = False
     is_partition: bool = False
+    #: The source primary-key identity used by the history-policy admission gate.
+    #: Ordinary catalog observations keep the compatibility default; the one-table
+    #: admission read fills this from PostgreSQL's pg_index/pg_attribute projection.
+    primary_key_columns: tuple[str, ...] = ()
     admission_state: str | _AdmissionStateUnset | None = _ADMISSION_STATE_UNSET
     full_activation_lsn: int | None = None
     full_invalidation_lsn: int | None = None
