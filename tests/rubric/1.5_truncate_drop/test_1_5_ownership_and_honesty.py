@@ -28,6 +28,7 @@ from support.applier_lab import Lab, end, keyed
 
 from cdc_flight import catalog as catalog_mod
 from cdc_flight import destination as dest_mod
+from cdc_flight import table_lifecycle
 from cdc_flight.catalog import CHANGE_DROPPED, CatalogChange, CatalogWatcher, SourceRelation
 from cdc_flight.config import RunConfig
 from cdc_flight.errors import EngineFailure
@@ -391,7 +392,7 @@ def test_a_watcher_that_really_stops_lets_the_verdict_stand():
     assert "undeclared transition" in str(excinfo.value)
 
 
-def test_what_the_watcher_learned_is_persisted_even_when_nothing_is_due():
+def test_what_the_watcher_learned_is_persisted_even_when_nothing_is_due(monkeypatch):
     """`source_relations` is what makes a drop detectable ACROSS a restart.
 
     It was written only as a side effect of a `CatalogPlan` that had at least one *due*
@@ -417,7 +418,17 @@ def test_what_the_watcher_learned_is_persisted_even_when_nothing_is_due():
 
     coordinator = CatalogCoordinator(
         catalog=w, pipeline="p", topic_prefix="cdcflight", drop_mode="replicate",
-        registry_of=lambda: None,
+        registry_of=lambda: None, lifecycle_con=object(),
+    )
+    monkeypatch.setattr(
+        table_lifecycle,
+        "owing_work",
+        lambda *_args, **_kwargs: pytest.fail("quiet plan read lifecycle owing work"),
+    )
+    monkeypatch.setattr(
+        dest_mod,
+        "blocked_schema_tables",
+        lambda *_args, **_kwargs: pytest.fail("quiet plan read blocked tables"),
     )
     plan = coordinator.plan(durable_lsn=0)
     assert plan.actions == (), "nothing was due, so nothing may be applied"

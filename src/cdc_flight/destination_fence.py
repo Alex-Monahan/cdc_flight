@@ -165,6 +165,12 @@ class _FencedOperations:
         self._epoch_fence_lease = lease
         self._epoch_fence_context = context
         self._epoch_fence_in_transaction = False
+        # One conditional lease refresh fences the whole open destination
+        # transaction.  The transaction owns the lease-row lock after that write,
+        # so repeating the same four-round-trip refresh before every DML statement
+        # adds no safety and starves the data path.  This is deliberately a single
+        # boolean, not a per-statement cache or an operation queue.
+        self._epoch_fence_transaction_fenced = False
 
     @property
     def _raw(self):
@@ -172,11 +178,14 @@ class _FencedOperations:
 
     def _assert_and_fence(self) -> None:
         self._epoch_fence_context.assert_writable()
+        if self._epoch_fence_transaction_fenced:
+            return
         run_destination_operation(
             self,
             "lease_refresh",
             lambda: self._epoch_fence_lease.fence(self._raw),
         )
+        self._epoch_fence_transaction_fenced = True
 
     def _raw_execute(self, sql, *args, **kwargs):
         return self._raw.execute(sql, *args, **kwargs)
@@ -199,6 +208,7 @@ class _FencedOperations:
 
         self._raw_execute("BEGIN TRANSACTION")
         self._epoch_fence_in_transaction = True
+        self._epoch_fence_transaction_fenced = False
         try:
             self._assert_and_fence()
             result = run_destination_operation(
@@ -209,12 +219,14 @@ class _FencedOperations:
             )
             self._raw_execute("COMMIT")
             self._epoch_fence_in_transaction = False
+            self._epoch_fence_transaction_fenced = False
             return result
         except BaseException:
             try:
                 self._raw_execute("ROLLBACK")
             finally:
                 self._epoch_fence_in_transaction = False
+                self._epoch_fence_transaction_fenced = False
             raise
 
     def execute(self, sql, *args, **kwargs):
@@ -222,14 +234,17 @@ class _FencedOperations:
         if control == "begin":
             result = self._raw_execute(sql, *args, **kwargs)
             self._epoch_fence_in_transaction = True
+            self._epoch_fence_transaction_fenced = False
             return result
         if control == "commit":
             result = self._raw_execute(sql, *args, **kwargs)
             self._epoch_fence_in_transaction = False
+            self._epoch_fence_transaction_fenced = False
             return result
         if control == "rollback":
             result = self._raw_execute(sql, *args, **kwargs)
             self._epoch_fence_in_transaction = False
+            self._epoch_fence_transaction_fenced = False
             return result
         if not is_destination_mutation(sql):
             return run_destination_operation(
@@ -276,11 +291,13 @@ class _FencedOperations:
     def commit(self):
         result = self._raw.commit()
         self._epoch_fence_in_transaction = False
+        self._epoch_fence_transaction_fenced = False
         return result
 
     def rollback(self):
         result = self._raw.rollback()
         self._epoch_fence_in_transaction = False
+        self._epoch_fence_transaction_fenced = False
         return result
 
     def __getattr__(self, name):

@@ -65,6 +65,7 @@ MAX_GENERATOR_TPS = 500.0
 DEFAULT_TARGET_TPS = 350.0
 SOURCE_BAND_LOWER = 300.0
 SOURCE_BAND_UPPER = 1000.0
+MIN_DELIVERED_ROWS_PER_SEC = 300.0
 DEFAULT_REPETITIONS = 5
 DEFAULT_SUSTAINED_WINDOW_SECONDS = 180.0
 DEFAULT_WORKERS = 8
@@ -1570,12 +1571,25 @@ def _run_service_repetition(
             >= sustained_window_seconds
         )
         result["source_window_sustained"] = source_window_sustained
+        delivered_rows_per_sec = (result.get("delivery") or {}).get(
+            "delivered_rows_per_sec"
+        )
+        throughput_passed = bool(
+            delivered_rows_per_sec is not None
+            and float(delivered_rows_per_sec) > MIN_DELIVERED_ROWS_PER_SEC
+        )
+        result["throughput_assertion"] = {
+            "required_delivered_rows_per_sec": MIN_DELIVERED_ROWS_PER_SEC,
+            "observed_delivered_rows_per_sec": delivered_rows_per_sec,
+            "passed": throughput_passed,
+        }
         result["keep_up"] = bool(
             not stall
             and result["host_gate"]["valid"]
             and result["source"]["actual_source_tps"] >= SOURCE_BAND_LOWER
             and result["source"]["actual_source_tps"] <= SOURCE_BAND_UPPER
             and source_window_sustained
+            and throughput_passed
             and result["published_backlog_sample_errors"] == []
             and result["published_backlog"].get("keep_up_backlog") is True
             and result["published_backlog_final_pending_records"] == 0

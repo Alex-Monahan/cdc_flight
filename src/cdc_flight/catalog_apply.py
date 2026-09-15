@@ -192,6 +192,26 @@ class CatalogCoordinator:
             change for change in due if change.kind in PARTITION_CHANGE_KINDS
         ]
         due = [change for change in due if change.kind not in PARTITION_CHANGE_KINDS]
+        if not due:
+            # A quiet catalog still carries dirty source relations into the current
+            # destination transaction so a newly learned identity is persisted.  It
+            # cannot, however, have a due change that needs lifecycle/refusal
+            # filtering.  Those durable reads were the hot path at sustained load:
+            # avoid asking the destination for owing work and blocked tables when
+            # there is no catalog action to filter.
+            remaining = {
+                change.qualified
+                for change in self.catalog.pending()
+                if change.kind in FENCED
+            }
+            return CatalogPlan(
+                relations=tuple(self.catalog.dirty(exclude=remaining)),
+                catalog_epoch=self.catalog.epoch,
+                partition_events=tuple(partition_due),
+                partition_edges=self.catalog.partition_snapshot_for_plan(partition_due),
+                partition_epoch=self.catalog.epoch,
+                durable_lsn=int(durable_lsn),
+            )
         #: (change, blocking lifecycle) pairs; the lifecycle is part of the alert
         #: dedup identity, so a table blocked for a *different* reason later still
         #: gets its own single alert.

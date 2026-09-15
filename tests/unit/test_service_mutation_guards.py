@@ -175,7 +175,9 @@ def test_old_epoch_cannot_fence_after_takeover_and_mutation_fails(tmp_path, monk
         con.close()
 
 
-def test_service_connection_and_independent_cursor_fence_every_mutation_path(tmp_path):
+def test_service_connection_and_independent_cursor_fence_every_mutation_path(
+    tmp_path, monkeypatch
+):
     """A resumed old generation cannot write data or control state through either handle."""
     con, old = _lease(tmp_path, owner="old")
     context = ServiceContext(
@@ -187,9 +189,25 @@ def test_service_connection_and_independent_cursor_fence_every_mutation_path(tmp
     try:
         context.bind(old, None)
         fenced = EpochFencedConnection(con, old, context)
+        fence_calls: list[object] = []
+        original_fence = old.fence
+        monkeypatch.setattr(
+            old,
+            "fence",
+            lambda actual: fence_calls.append(actual) or original_fence(actual),
+        )
         fenced.execute("CREATE SCHEMA service_fence_test")
         fenced.execute("CREATE TABLE service_fence_test.rows (value INTEGER)")
         fenced.execute("INSERT INTO service_fence_test.rows VALUES (1)")
+        fence_calls.clear()
+        fenced.execute("BEGIN TRANSACTION")
+        fenced.execute("INSERT INTO service_fence_test.rows VALUES (20)")
+        fenced.execute("INSERT INTO service_fence_test.rows VALUES (30)")
+        fenced.execute("ROLLBACK")
+        assert len(fence_calls) == 1, (
+            "one open destination transaction must have one lease fence, not one "
+            "four-round-trip refresh per DML statement"
+        )
         cursor = fenced.cursor()
         cursor.execute("INSERT INTO service_fence_test.rows VALUES (2)")
         cursor.close()

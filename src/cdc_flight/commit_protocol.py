@@ -178,12 +178,11 @@ def commit_group(self, trigger: str) -> CommitResult:
         matrix_crash("source_replay_mid_replay_before_first_md_commit")
     try:
         self._apply_backfill_notifications()
-        # The service path fences the exact lease epoch inside the destination
-        # transaction before any data/state DML.  The finite adapter retains its
-        # established renew call and therefore its existing batch behaviour.
-        if self.service_context is not None:
-            self.lease.fence(self.con)
-        else:
+        # The service destination handle fences the exact lease epoch on the first
+        # mutation inside this transaction and then retains that fence for the open
+        # transaction.  The finite adapter retains its established renew call and
+        # therefore its existing batch behaviour.
+        if self.service_context is None:
             self.lease.renew(self.con)
         new_point = offsets.point_for(
             group,
