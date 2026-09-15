@@ -188,13 +188,21 @@ def _drop_published_marker_table(table: str, publication: str = SOURCE_PUBLICATI
         SOURCE_DATABASE, application_name="p53-published-cleanup"
     ) as con:
         con.autocommit = True
-        con.execute(
-            pg_sql.SQL("ALTER PUBLICATION {} DROP TABLE IF EXISTS {}.{}").format(
-                pg_sql.Identifier(publication),
-                pg_sql.Identifier("app"),
-                pg_sql.Identifier(table),
+        member = con.execute(
+            "SELECT EXISTS (SELECT 1 FROM pg_publication_tables "
+            "WHERE pubname = %s AND schemaname = %s AND tablename = %s)",
+            (publication, "app", table),
+        ).fetchone()[0]
+        if member:
+            # ALTER PUBLICATION DROP TABLE has no IF EXISTS variant; check the
+            # live publication catalog first so cleanup remains idempotent.
+            con.execute(
+                pg_sql.SQL("ALTER PUBLICATION {} DROP TABLE {}.{}").format(
+                    pg_sql.Identifier(publication),
+                    pg_sql.Identifier("app"),
+                    pg_sql.Identifier(table),
+                )
             )
-        )
         con.execute(
             pg_sql.SQL("DROP TABLE IF EXISTS {}.{}").format(
                 pg_sql.Identifier("app"), pg_sql.Identifier(table)
