@@ -340,6 +340,7 @@ class CatalogWatcher(CatalogLifecycleMixin):
         self.toast_policy_cache_hits = 0
         self.toast_admission_checks = 0
         self.toast_source_revalidations = 0
+        self.toast_source_revalidation_skips = 0
         self.toast_admission_rejections = 0
         #: `name -> the CatalogChange object that is in state `unconfirmed``.
         #: It used to be `name -> ((kind, new_oid), count)` while the observation's own
@@ -674,6 +675,7 @@ class CatalogWatcher(CatalogLifecycleMixin):
         qualified: str,
         event_lsn: int | None = None,
         txn_id: str | None = None,
+        event: object | None = None,
     ) -> bool:
         """Validate one residual event inside its source-unit admission scope.
 
@@ -682,11 +684,17 @@ class CatalogWatcher(CatalogLifecycleMixin):
         locks the relation, and re-reads ``relreplident``.  The transaction stays
         open until :meth:`end_toast_admission` after the unit's last event has been
         admitted.  A concurrent ``REPLICA IDENTITY DEFAULT`` therefore cannot slip
-        between two event decisions.  Direct callers that omit ``txn_id`` retain a
-        short, one-event scope for probes and tests.
+        between two event decisions.  A complete, marker-free residual image does
+        not need a source value recovery or identity probe, so the planner may pass
+        the already-decoded event for that bounded fast path.  Direct callers that
+        omit ``txn_id`` and ``event`` retain the strict one-event scope for probes
+        and tests.
         """
         from .naming import quote
-        from .toast import ToastRoute
+        from .toast import (
+            ToastRoute,
+            residual_event_requires_source_revalidation,
+        )
 
         self.toast_admission_checks += 1
         policy = self.toast_policy_for(qualified, event_lsn=event_lsn)
@@ -696,6 +704,14 @@ class CatalogWatcher(CatalogLifecycleMixin):
             self.toast_admission_rejections += 1
             return False
         if policy.route is not ToastRoute.REPLICA_IDENTITY_FULL:
+            return True
+        if event is not None and not residual_event_requires_source_revalidation(
+            event,
+            tuple(policy.residual_columns),
+            binary_mode=self.binary_handling_mode,
+            hstore_mode=self.hstore_handling_mode,
+        ):
+            self.toast_source_revalidation_skips += 1
             return True
         with self._lock:
             relation = self.known.get(str(qualified))

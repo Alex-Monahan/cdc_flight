@@ -481,6 +481,7 @@ class GroupPlan:
                         event.qualified_table,
                         event_lsn=event.lsn,
                         txn_id=self._active_txn_id or event.txn_id,
+                        event=event,
                     )
                 else:
                     policy = self.toast_policy_provider(event.qualified_table, event_lsn=event.lsn)
@@ -489,7 +490,11 @@ class GroupPlan:
                 # Keep the narrow compatibility seam for embedders that supplied a
                 # legacy one-argument provider; the production CatalogWatcher uses
                 # the event-LSN close operation above.
-                if "event_lsn" not in str(exc) and "txn_id" not in str(exc):
+                if (
+                    "event_lsn" not in str(exc)
+                    and "txn_id" not in str(exc)
+                    and "event" not in str(exc)
+                ):
                     raise
                 provider = self.toast_admission_provider or self.toast_policy_provider
                 try:

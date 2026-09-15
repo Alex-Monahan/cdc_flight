@@ -447,6 +447,7 @@ def summary(watcher) -> dict:
         "toast_policy_cache_hits": watcher.toast_policy_cache_hits,
         "toast_admission_checks": watcher.toast_admission_checks,
         "toast_source_revalidations": watcher.toast_source_revalidations,
+        "toast_source_revalidation_skips": watcher.toast_source_revalidation_skips,
         "toast_admission_rejections": watcher.toast_admission_rejections,
     }
 

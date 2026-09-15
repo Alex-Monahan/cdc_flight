@@ -18,7 +18,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from .typed_types import FieldValue, SourceTypeDescriptor
+from . import naming
+from .typed_types import FieldState, FieldValue, SourceTypeDescriptor
 
 # Debezium's ``hex:`` parser turns this into one Java/Python U+0000 code point.
 UNAVAILABLE_VALUE_PLACEHOLDER = "hex:00"
@@ -206,6 +207,79 @@ def field_value(
     return FieldValue.of(value, descriptor)
 
 
+def residual_event_requires_source_revalidation(
+    event: object,
+    residual_columns: tuple[str, ...],
+    *,
+    binary_mode: str = "base64",
+    hstore_mode: str = "map",
+) -> bool:
+    """Return whether a residual event still needs a source identity probe.
+
+    A source identity check is necessary when a row image could contain an
+    unchanged-TOAST disposition: the destination must not fold a missing source
+    value against a relation whose FULL interval was not valid for that event.
+    It is unnecessary when *every* residual column is explicitly present in the
+    active image as a typed value/null and no field carries the decoded marker.
+    Such an image is self-contained and does not need a source read to recover a
+    value.  The check is deliberately conservative when a descriptor or image
+    field is unavailable.
+
+    This function only inspects already-decoded event state.  It never turns a
+    marker into text, reads the source, or retains event state after the call.
+    """
+    image_name = "before" if getattr(event, "op", None) == "d" else "after"
+    image = getattr(event, image_name, None)
+    if not isinstance(image, Mapping):
+        return True
+
+    typed = getattr(event, f"typed_{image_name}", None)
+    typed_fields = {
+        naming.normalize(str(name)): value
+        for name, value in getattr(typed, "fields", ())
+    }
+    descriptors = getattr(event, f"{image_name}_descriptors", None) or {}
+    raw_fields = {
+        naming.normalize(str(name)): (name, value)
+        for name, value in image.items()
+    }
+
+    for residual_name in residual_columns:
+        normalized = naming.normalize(str(residual_name))
+        typed_value = typed_fields.get(normalized)
+        if typed_value is not None:
+            if typed_value.state in {FieldState.UNCHANGED_TOAST, FieldState.ABSENT}:
+                return True
+            descriptor = typed_value.descriptor
+        else:
+            descriptor = None
+
+        raw = raw_fields.get(normalized)
+        if raw is None:
+            # A typed spill image can carry a complete value without a legacy raw
+            # mapping.  All other omissions remain on the locked path.
+            if typed_value is not None and typed_value.state in {
+                FieldState.VALUE,
+                FieldState.EXPLICIT_NULL,
+            }:
+                continue
+            return True
+
+        raw_name, raw_value = raw
+        descriptor = descriptor or descriptors.get(raw_name) or descriptors.get(normalized)
+        if descriptor is None:
+            return True
+        if is_structural_marker(
+            raw_value,
+            descriptor,
+            binary_mode=binary_mode,
+            hstore_mode=hstore_mode,
+        ):
+            return True
+
+    return not residual_columns
+
+
 def classify_column(
     name: str,
     descriptor: SourceTypeDescriptor | None,
@@ -334,4 +408,5 @@ __all__ = [
     "is_hstore",
     "is_structural_marker",
     "is_structural_type",
+    "residual_event_requires_source_revalidation",
 ]
