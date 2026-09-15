@@ -1,4 +1,4 @@
-"""Round 0 evidence harness for rubric 5.3.
+"""Sustained source-TPS evidence harness for rubric 5.3.
 
 This is an evidence probe, not a production path or a pytest test.  It has three
 deliberate properties that the older throughput probes did not have:
@@ -10,15 +10,19 @@ deliberate properties that the older throughput probes did not have:
   normal SingleProcessFlight -> ServiceContext -> run_engine_bounded -> Applier
   path; and
 * a repetition is not a keep-up result unless the source/destination oracle is
-  exact and the source slot backlog is non-growing during the source window.
+  exact and the **published-data-only** backlog is non-growing during a sustained
+  source window.
 
-The source marker table is not published.  Each generator transaction inserts
-one marker row and the application row in the same PostgreSQL transaction, so a
-PostgreSQL count of marker rows is an independent committed-transaction count.
-The marker's ``clock_timestamp()`` is PostgreSQL's clock, not the requested rate
-or a Python event counter.  PostgreSQL's ``pg_stat_database.xact_commit`` delta
-is retained as a second source-side counter.  Product destination delivery is
-reported separately as rows per durable wall-clock second.
+Each measured product transaction inserts the application row, one marker row in a
+unique table that is temporarily added to the existing publication, and one marker
+row in a deliberately unpublished measurement table.  The published marker gives
+the decoder an exact one-record-per-source-transaction witness.  The unpublished
+marker remains the independent source-TPS clock witness: its ``clock_timestamp()``
+is PostgreSQL's clock, not the requested rate or a Python event counter.  The
+unpublished marker's WAL is retained in the evidence but is never part of the
+keep-up backlog.  PostgreSQL ``pg_stat_database.xact_commit`` is used for the
+separate capability check.  Product destination delivery is reported separately
+as durable destination rows per source-start-to-durable-boundary wall second.
 """
 
 from __future__ import annotations
@@ -49,19 +53,20 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 SWARM_DIR = PROJECT_DIR.parent
 DEFAULT_EVIDENCE_DIR = SWARM_DIR / "codex_logs" / "p53_runs"
 SAMPLER = SWARM_DIR / "tools" / "contention_sampler.sh"
-BASE_SHA = "9b1823d54e21923c8642d41104bd2c3e9711f5ad"
-CANDIDATE_BRANCH = "feature/delivery-under-load"
+BASE_SHA = "ac73967181dc66f68a3ffe936eb985b788ab193f"
+CANDIDATE_BRANCH = "feature/5-3-band-three"
 SOURCE_PORT = 15432
 SOURCE_DATABASE = "cdc_source"
 SOURCE_ADMIN_DATABASE = "postgres"
+SOURCE_PUBLICATION = "cdc_flight_pub"
 MAX_GENERATOR_TPS = 500.0
 DEFAULT_TARGET_TPS = 350.0
 SOURCE_BAND_LOWER = 300.0
 SOURCE_BAND_UPPER = 1000.0
 DEFAULT_REPETITIONS = 5
-DEFAULT_TRANSACTIONS = 4000
+DEFAULT_SUSTAINED_WINDOW_SECONDS = 180.0
 DEFAULT_WORKERS = 8
-SAMPLE_INTERVAL_SECONDS = 0.5
+SAMPLE_INTERVAL_SECONDS = 2.0
 
 
 def _env(name: str, default: str) -> str:
@@ -150,6 +155,53 @@ def _create_marker_table(database: str, table: str) -> None:
         )
 
 
+def _create_published_marker_table(table: str, publication: str = SOURCE_PUBLICATION) -> None:
+    """Create a per-run source marker relation and make it part of the publication.
+
+    The table is included in ``CDC_TABLES`` by the service arm, so every generated
+    transaction has a published marker record that can be counted at the durable
+    destination.  It is removed from the publication before the table is dropped.
+    """
+    with _source_connect(SOURCE_DATABASE, application_name="p53-published-setup") as con:
+        con.autocommit = True
+        con.execute(
+            pg_sql.SQL(
+                "CREATE TABLE {}.{} ("
+                "transaction_no bigint PRIMARY KEY, "
+                "marker text NOT NULL, "
+                "observed_at timestamptz NOT NULL DEFAULT clock_timestamp()"
+                ")"
+            ).format(pg_sql.Identifier("app"), pg_sql.Identifier(table))
+        )
+        con.execute(
+            pg_sql.SQL("ALTER PUBLICATION {} ADD TABLE {}.{}").format(
+                pg_sql.Identifier(publication),
+                pg_sql.Identifier("app"),
+                pg_sql.Identifier(table),
+            )
+        )
+
+
+def _drop_published_marker_table(table: str, publication: str = SOURCE_PUBLICATION) -> None:
+    """Remove the per-run marker from the publication and then drop its table."""
+    with suppress(Exception), _source_connect(
+        SOURCE_DATABASE, application_name="p53-published-cleanup"
+    ) as con:
+        con.autocommit = True
+        con.execute(
+            pg_sql.SQL("ALTER PUBLICATION {} DROP TABLE IF EXISTS {}.{}").format(
+                pg_sql.Identifier(publication),
+                pg_sql.Identifier("app"),
+                pg_sql.Identifier(table),
+            )
+        )
+        con.execute(
+            pg_sql.SQL("DROP TABLE IF EXISTS {}.{}").format(
+                pg_sql.Identifier("app"), pg_sql.Identifier(table)
+            )
+        )
+
+
 def _drop_marker_table(database: str, table: str) -> None:
     with suppress(Exception), _source_connect(database, application_name="p53-cleanup") as con:
         con.autocommit = True
@@ -185,8 +237,10 @@ def _postgres_database_exists(database: str) -> bool:
         )
 
 
-def _source_relation_exists(schema: str, table: str) -> bool:
-    with _source_connect(SOURCE_DATABASE, application_name="p53-cleanup-check") as con:
+def _source_relation_exists(
+    schema: str, table: str, database: str = SOURCE_DATABASE
+) -> bool:
+    with _source_connect(database, application_name="p53-cleanup-check") as con:
         con.autocommit = True
         return bool(
             con.execute(
@@ -195,6 +249,41 @@ def _source_relation_exists(schema: str, table: str) -> bool:
                 (schema, table),
             ).fetchone()[0]
         )
+
+
+def _source_publication_contains_table(
+    publication: str, schema: str, table: str
+) -> bool:
+    with _source_connect(SOURCE_DATABASE, application_name="p53-publication-check") as con:
+        con.autocommit = True
+        return bool(
+            con.execute(
+                "SELECT EXISTS (SELECT 1 FROM pg_publication_tables "
+                "WHERE pubname = %s AND schemaname = %s AND tablename = %s)",
+                (publication, schema, table),
+            ).fetchone()[0]
+        )
+
+
+def _published_marker_facts(table: str) -> dict[str, Any]:
+    with _source_connect(SOURCE_DATABASE, application_name="p53-published-facts") as con:
+        con.autocommit = True
+        row = con.execute(
+            pg_sql.SQL(
+                "SELECT count(*), min(observed_at), max(observed_at) "
+                "FROM {}.{}"
+            ).format(pg_sql.Identifier("app"), pg_sql.Identifier(table))
+        ).fetchone()
+    count = int(row[0])
+    first = row[1]
+    last = row[2]
+    span = (last - first).total_seconds() if first is not None and last is not None else 0.0
+    return {
+        "committed_published_marker_rows": count,
+        "first_published_marker_observed_at": first,
+        "last_published_marker_observed_at": last,
+        "published_marker_clock_span_sec": round(max(0.0, span), 6),
+    }
 
 
 def _marker_facts(database: str, table: str) -> dict[str, Any]:
@@ -335,6 +424,31 @@ def _pace_limit(advertised_target_tps: float) -> tuple[float, str | None]:
     return advertised_target_tps, None
 
 
+def _transactions_for_sustained_window(
+    advertised_target_tps: float,
+    duration_seconds: float,
+    requested_transactions: int | None,
+) -> int:
+    """Choose enough commits to cover the required PostgreSQL-clock window.
+
+    An explicit transaction count is retained for mutation probes and for a caller
+    that wants a deliberately failing short run.  The normal score path leaves it
+    unset, so the source window is derived from the requested pacing limit rather
+    than from an arbitrary old burst size.
+    """
+    if not math.isfinite(duration_seconds) or duration_seconds < 0:
+        raise ValueError("duration_seconds must be finite and non-negative")
+    if requested_transactions is not None:
+        if requested_transactions < 1:
+            raise ValueError("requested_transactions must be positive")
+        return requested_transactions
+    effective_target_tps, _reason = _pace_limit(advertised_target_tps)
+    # The first scheduled commit is one pacing interval after release; the extra
+    # second leaves the PostgreSQL clock span at least the requested window even
+    # when commits land on their due times.
+    return max(1, math.ceil(effective_target_tps * (duration_seconds + 1.0)))
+
+
 def _insert_one_customer(con, prefix: str, row_no: int) -> None:
     name = f"{prefix}-{row_no}"
     con.execute(
@@ -362,6 +476,7 @@ def _generate_transactions(
     workers: int,
     *,
     include_customers: bool,
+    published_marker_table: str | None = None,
     on_start: Callable[[float], None] | None = None,
 ) -> dict[str, Any]:
     if transactions <= 0 or rows_per_transaction <= 0 or workers <= 0:
@@ -377,6 +492,11 @@ def _generate_transactions(
     marker_insert = pg_sql.SQL("INSERT INTO {}.{} (transaction_no, marker) VALUES (%s, %s)").format(
         pg_sql.Identifier("p53_measurement"), pg_sql.Identifier(marker_table)
     )
+    published_marker_insert = None
+    if published_marker_table is not None:
+        published_marker_insert = pg_sql.SQL(
+            "INSERT INTO {}.{} (transaction_no, marker) VALUES (%s, %s)"
+        ).format(pg_sql.Identifier("app"), pg_sql.Identifier(published_marker_table))
 
     def write_worker(worker: int) -> None:
         try:
@@ -396,8 +516,12 @@ def _generate_transactions(
                             if rows_per_transaction == 1:
                                 _insert_one_customer(con, prefix, first)
                             else:
-                                _insert_customer_batch(con, prefix, first, first + rows_per_transaction - 1)
+                                _insert_customer_batch(
+                                    con, prefix, first, first + rows_per_transaction - 1
+                                )
                         con.execute(marker_insert, (transaction_no, prefix))
+                        if published_marker_insert is not None:
+                            con.execute(published_marker_insert, (transaction_no, prefix))
                         con.commit()
                     except BaseException:
                         con.rollback()
@@ -452,6 +576,7 @@ def _run_source_capability(
     advertised_target_tps: float = DEFAULT_TARGET_TPS,
     transactions: int = 4000,
     label: str = "capability",
+    minimum_sustained_window_seconds: float = DEFAULT_SUSTAINED_WINDOW_SECONDS,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "kind": "source_capability",
@@ -501,9 +626,18 @@ def _run_source_capability(
     except BaseException as exc:
         result["scratch_database_cleanup_check_error"] = f"{type(exc).__name__}: {exc}"
     result["actual_source_tps"] = facts["source_tps_from_postgres_clock"]
+    result["minimum_sustained_window_seconds"] = minimum_sustained_window_seconds
+    result["source_clock_window_pass"] = (
+        facts["postgres_clock_span_sec"] >= minimum_sustained_window_seconds
+    )
+    result["xact_commit_cross_check_pass"] = (
+        result["postgres_xact_commit_delta"] >= transactions
+    )
     result["source_capability_pass"] = (
         result["host_gate"]["valid"]
         and result["committed_transactions"] == transactions
+        and result["xact_commit_cross_check_pass"]
+        and result["source_clock_window_pass"]
         and SOURCE_BAND_LOWER <= result["actual_source_tps"] <= SOURCE_BAND_UPPER
     )
     return result
@@ -544,6 +678,12 @@ def _motherduck_database_exists(token: str, database: str) -> bool:
         return database in {str(row[0]) for row in con.execute("SHOW DATABASES").fetchall()}
 
 
+def _destination_table_name(source_table: str) -> str:
+    from cdc_flight.naming import destination_table
+
+    return destination_table("cdcflight", "app", source_table)
+
+
 def _motherduck_count(token: str, database: str, dataset: str, prefix: str) -> int:
     try:
         with duckdb.connect(f"md:{database}?motherduck_token={token}") as con:
@@ -556,6 +696,100 @@ def _motherduck_count(token: str, database: str, dataset: str, prefix: str) -> i
             )
     except Exception:
         return 0
+
+
+def _motherduck_table_count(
+    token: str,
+    database: str,
+    dataset: str,
+    table: str,
+    column: str,
+    value: str,
+) -> int:
+    """Count a published marker with missing-table and network failures distinct.
+
+    A marker destination table legitimately does not exist during the first few
+    observations of initial admission; that means zero durable marker rows.  Any
+    other MotherDuck failure invalidates the backlog observation instead of being
+    silently converted into zero.
+    """
+    try:
+        with duckdb.connect(f"md:{database}?motherduck_token={token}") as con:
+            table_ref = (
+                f"{_duck_identifier(dataset)}.{_duck_identifier(table)}"
+            )
+            return int(
+                con.execute(
+                    f"SELECT count(*) FROM {table_ref} "
+                    f"WHERE {_duck_identifier(column)} = ?",
+                    [value],
+                ).fetchone()[0]
+            )
+    except duckdb.CatalogException as exc:
+        if "does not exist" in str(exc).lower() or "not found" in str(exc).lower():
+            return 0
+        raise
+
+
+def _source_published_marker_sample(
+    table: str,
+    unpublished_table: str,
+    prefix: str,
+) -> dict[str, int]:
+    """Return committed source counts for both marker classes in one snapshot."""
+    with _source_connect(SOURCE_DATABASE, application_name="p53-published-backlog") as con:
+        con.autocommit = True
+        row = con.execute(
+            pg_sql.SQL(
+                "SELECT "
+                "(SELECT count(*) FROM {}.{} WHERE marker = %s) AS published_count, "
+                "(SELECT count(*) FROM {}.{} WHERE marker = %s) AS unpublished_count"
+            ).format(
+                pg_sql.Identifier("app"),
+                pg_sql.Identifier(table),
+                pg_sql.Identifier("p53_measurement"),
+                pg_sql.Identifier(unpublished_table),
+            ),
+            (prefix, prefix),
+        ).fetchone()
+    return {
+        "source_published_marker_rows": int(row[0]),
+        "source_unpublished_marker_rows": int(row[1]),
+    }
+
+
+def _published_backlog_sample(
+    token: str,
+    database: str,
+    dataset: str,
+    published_marker_table: str,
+    published_destination_table: str,
+    unpublished_marker_table: str,
+    prefix: str,
+) -> dict[str, Any]:
+    source = _source_published_marker_sample(
+        published_marker_table, unpublished_marker_table, prefix
+    )
+    destination_rows = _motherduck_table_count(
+        token,
+        database,
+        dataset,
+        published_destination_table,
+        "marker",
+        prefix,
+    )
+    pending = source["source_published_marker_rows"] - destination_rows
+    return {
+        **source,
+        "destination_published_marker_rows": destination_rows,
+        "pending_published_records": pending,
+        "overdelivered_published_records": max(0, -pending),
+        "measure": (
+            "source committed rows in the published marker table minus durable "
+            "destination rows in its published marker table"
+        ),
+        "unpublished_marker_in_backlog": False,
+    }
 
 
 def _motherduck_total_count(token: str, database: str, dataset: str) -> int:
@@ -656,11 +890,18 @@ def _insert_source_warmup(prefix: str) -> None:
 
 
 class SlotMonitor:
-    def __init__(self, slot: str, interval: float = SAMPLE_INTERVAL_SECONDS):
+    def __init__(
+        self,
+        slot: str,
+        interval: float = SAMPLE_INTERVAL_SECONDS,
+        published_sample: Callable[[], dict[str, Any]] | None = None,
+    ):
         self.slot = slot
         self.interval = interval
+        self.published_sample = published_sample
         self.samples: list[dict[str, Any]] = []
         self.errors: list[str] = []
+        self._lock = threading.Lock()
         self.stop = threading.Event()
         self.start = threading.Event()
         self.source_started_at: float | None = None
@@ -678,28 +919,54 @@ class SlotMonitor:
         self.stop.set()
         self.thread.join(timeout=10)
 
-    def _run(self) -> None:
-        self.start.wait(timeout=120)
-        while not self.stop.is_set():
-            observed_at = time.monotonic()
+    def capture_now(self, observed_at: float | None = None) -> None:
+        """Capture the endpoint after the generator, labeled at its source edge."""
+        observed_at = time.monotonic() if observed_at is None else observed_at
+        try:
+            sample = _slot_snapshot(self.slot)
+        except BaseException as exc:
+            with self._lock:
+                self.errors.append(f"slot sample: {type(exc).__name__}: {exc}")
+            return
+        sample["observed_monotonic"] = observed_at
+        if self.source_started_at is not None:
+            sample["source_window_sec"] = round(observed_at - self.source_started_at, 6)
+        if self.published_sample is not None:
             try:
-                sample = _slot_snapshot(self.slot)
-                sample["observed_monotonic"] = observed_at
-                if self.source_started_at is not None:
-                    sample["source_window_sec"] = round(observed_at - self.source_started_at, 6)
-                self.samples.append(sample)
+                sample["published_backlog"] = self.published_sample()
             except BaseException as exc:
-                self.errors.append(f"{type(exc).__name__}: {exc}")
+                sample["published_backlog_error"] = f"{type(exc).__name__}: {exc}"
+                with self._lock:
+                    self.errors.append(
+                        f"published backlog sample: {type(exc).__name__}: {exc}"
+                    )
+        with self._lock:
+            self.samples.append(sample)
+
+    def _run(self) -> None:
+        if not self.start.wait(timeout=120):
+            return
+        while not self.stop.is_set():
+            self.capture_now()
             self.stop.wait(self.interval)
 
     def source_window_samples(self, end: float) -> list[dict[str, Any]]:
         start = self.source_started_at
         if start is None:
             return []
+        with self._lock:
+            samples = list(self.samples)
         return [
             sample
-            for sample in self.samples
+            for sample in samples
             if start <= float(sample["observed_monotonic"]) <= end
+        ]
+
+    def published_window_samples(self, end: float) -> list[dict[str, Any]]:
+        return [
+            sample
+            for sample in self.source_window_samples(end)
+            if isinstance(sample.get("published_backlog"), dict)
         ]
 
 
@@ -748,6 +1015,90 @@ def _backlog_verdict(samples: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _published_backlog_verdict(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    """Evaluate the backlog that the publication can actually deliver.
+
+    The source and destination counts are both marker rows from the same
+    published relation.  This deliberately does not use a slot byte delta: WAL
+    from the separate unpublished clock marker (and any other unpublished WAL)
+    cannot become destination rows and therefore is not application backlog.
+    """
+    observations: list[tuple[float, int, int, int, int]] = []
+    for sample in samples:
+        backlog = sample.get("published_backlog")
+        if not isinstance(backlog, dict):
+            continue
+        try:
+            observations.append(
+                (
+                    float(sample["source_window_sec"]),
+                    int(backlog["pending_published_records"]),
+                    int(backlog["source_published_marker_rows"]),
+                    int(backlog["destination_published_marker_rows"]),
+                    int(backlog["overdelivered_published_records"]),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    if len(observations) < 3:
+        return {
+            "valid_observations": len(observations),
+            "keep_up_backlog": False,
+            "reason": "fewer than three published-data backlog observations",
+            "definition": (
+                "published backlog is source committed marker rows minus durable "
+                "destination marker rows; keep-up requires >=3 observations, "
+                "non-negative bounded backlog, final <= initial, and OLS slope <= 0"
+            ),
+        }
+    pending_values = [item[1] for item in observations]
+    source_values = [item[2] for item in observations]
+    overdelivered_values = [item[4] for item in observations]
+    mean_x = statistics.fmean(item[0] for item in observations)
+    mean_y = statistics.fmean(item[1] for item in observations)
+    denominator = sum((x - mean_x) ** 2 for x, *_rest in observations)
+    slope = (
+        sum((x - mean_x) * (pending - mean_y) for x, pending, *_rest in observations)
+        / denominator
+        if denominator
+        else 0.0
+    )
+    first = pending_values[0]
+    last = pending_values[-1]
+    non_negative = all(value >= 0 for value in pending_values)
+    source_non_decreasing = all(
+        source_values[index] >= source_values[index - 1]
+        for index in range(1, len(source_values))
+    )
+    return {
+        "valid_observations": len(observations),
+        "pending_start_records": first,
+        "pending_end_records": last,
+        "pending_min_records": min(pending_values),
+        "pending_max_records": max(pending_values),
+        "pending_linear_slope_records_per_sec": round(slope, 6),
+        "source_published_marker_rows_start": observations[0][2],
+        "source_published_marker_rows_end": observations[-1][2],
+        "destination_published_marker_rows_start": observations[0][3],
+        "destination_published_marker_rows_end": observations[-1][3],
+        "overdelivered_observations": sum(value > 0 for value in overdelivered_values),
+        "source_count_non_decreasing": source_non_decreasing,
+        "positive_trend": slope > 0,
+        "definition": (
+            "published backlog is source committed marker rows minus durable "
+            "destination marker rows; keep-up requires >=3 observations, "
+            "non-negative bounded backlog, final <= initial, and OLS slope <= 0"
+        ),
+        "keep_up_backlog": (
+            non_negative
+            and source_non_decreasing
+            and not any(value > 0 for value in overdelivered_values)
+            and last <= first
+            and slope <= 0
+        ),
+    }
+
+
 def _stop_service(process: subprocess.Popen[str], timeout: float = 90.0) -> dict[str, Any]:
     if process.poll() is None:
         process.send_signal(signal.SIGTERM)
@@ -776,6 +1127,8 @@ def _service_environment(
     dataset: str,
     pipeline: str,
     slot: str,
+    published_marker_table: str,
+    publication: str = SOURCE_PUBLICATION,
     stall: bool = False,
 ) -> dict[str, str]:
     token = _motherduck_token()
@@ -795,10 +1148,11 @@ def _service_environment(
         "CDC_SLOT_NAME": slot,
         "CDC_PIPELINE_NAME": pipeline,
         "CDC_SERVICE_ID": pipeline,
+        "CDC_PUBLICATION": publication,
         "CDC_DESTINATION": "motherduck",
         "CDC_MD_DATABASE": database,
         "CDC_DATASET": dataset,
-        "CDC_TABLES": "customers",
+        "CDC_TABLES": f"customers,{published_marker_table}",
         "CDC_AUTO_DISCOVERY": "0",
         "CDC_SNAPSHOT_MODE": "initial",
         "MAX_RUNTIME_SEC": "0",
@@ -863,8 +1217,12 @@ def _run_service_repetition(
     target_tps: float,
     transactions: int,
     rows_per_transaction: int = 1,
+    sustained_window_seconds: float = DEFAULT_SUSTAINED_WINDOW_SECONDS,
     stall: bool = False,
+    positive_backlog_mutation: bool = False,
 ) -> dict[str, Any]:
+    if not math.isfinite(sustained_window_seconds) or sustained_window_seconds < 0:
+        raise ValueError("sustained_window_seconds must be finite and non-negative")
     token = _motherduck_token()
     if not token:
         raise RuntimeError("motherduck_token/MOTHERDUCK_TOKEN is required")
@@ -878,6 +1236,9 @@ def _run_service_repetition(
     prefix = f"p53-{arm}-{repetition}-{uuid.uuid4().hex[:8]}"
     warmup_prefix = f"p53-warm-{arm}-{repetition}-{uuid.uuid4().hex[:8]}"
     marker_table = f"run_{uuid.uuid4().hex[:12]}"
+    published_marker_table = f"pub_{uuid.uuid4().hex[:12]}"
+    publication = _env("CDC_PUBLICATION", SOURCE_PUBLICATION)
+    published_destination_table = _destination_table_name(published_marker_table)
     result: dict[str, Any] = {
         "kind": "service_repetition",
         "arm": arm,
@@ -891,11 +1252,17 @@ def _run_service_repetition(
         "slot": slot,
         "source_prefix": prefix,
         "warmup_prefix": warmup_prefix,
+        "unpublished_marker_table": f"p53_measurement.{marker_table}",
+        "published_marker_table": f"app.{published_marker_table}",
+        "published_destination_table": published_destination_table,
+        "publication": publication,
         "transactions": transactions,
         "rows_per_transaction": rows_per_transaction,
         "target_tps_advertised": target_tps,
         "harness_cap_tps": MAX_GENERATOR_TPS,
         "stall_mutation": stall,
+        "positive_backlog_mutation": positive_backlog_mutation,
+        "minimum_sustained_window_seconds": sustained_window_seconds,
         "product_owner_path": (
             "SingleProcessFlight -> lease/ServiceContext -> pipeline.run -> "
             "run_engine_bounded -> Applier -> commit_protocol.commit_group"
@@ -909,12 +1276,15 @@ def _run_service_repetition(
         _create_motherduck_database(token, md_database)
         _prepare_motherduck_destination(token, md_database, dataset)
         _create_marker_table(SOURCE_DATABASE, marker_table)
+        _create_published_marker_table(published_marker_table, publication)
         environment = _service_environment(
             run_dir,
             database=md_database,
             dataset=dataset,
             pipeline=pipeline,
             slot=slot,
+            published_marker_table=published_marker_table,
+            publication=publication,
             stall=stall,
         )
         process, log_handle = _start_service(environment, run_dir / "service.log")
@@ -938,11 +1308,22 @@ def _run_service_repetition(
         def on_start(at: float) -> None:
             source_started_box["at"] = at
 
+        def sample_published_backlog() -> dict[str, Any]:
+            return _published_backlog_sample(
+                token,
+                md_database,
+                dataset,
+                published_marker_table,
+                published_destination_table,
+                marker_table,
+                prefix,
+            )
+
         csv_path = evidence_dir / run_id / "host.csv"
         with HostSampler(csv_path) as sampler:
             # The sampler starts before the measured generator.  It continues
             # through destination durability, final oracle, and service stop.
-            with SlotMonitor(slot) as monitor:
+            with SlotMonitor(slot, published_sample=sample_published_backlog) as monitor:
                 generated = _generate_transactions(
                     SOURCE_DATABASE,
                     marker_table,
@@ -952,12 +1333,18 @@ def _run_service_repetition(
                     target_tps,
                     DEFAULT_WORKERS,
                     include_customers=True,
+                    published_marker_table=published_marker_table,
                     on_start=lambda at: (on_start(at), monitor.source_started(at)),
                 )
                 source_finished_at = time.monotonic()
+                # Label this endpoint at the last generator commit even though
+                # the query itself is performed immediately afterward.
+                monitor.capture_now(observed_at=source_finished_at)
                 source_facts = _marker_facts(SOURCE_DATABASE, marker_table)
+                published_source_facts = _published_marker_facts(published_marker_table)
                 upper_lsn = _source_lsn()
                 result["source"] = {**generated, **source_facts}
+                result["source"]["published_marker"] = published_source_facts
                 result["source"]["source_upper_lsn"] = upper_lsn
                 result["source"]["source_lower_lsn"] = lower_lsn
                 result["source"]["actual_source_tps"] = source_facts[
@@ -966,6 +1353,7 @@ def _run_service_repetition(
                 expected_rows = transactions * rows_per_transaction
                 durable_at: float | None = None
                 destination_count = 0
+                published_destination_count = 0
                 deadline = time.monotonic() + (20.0 if stall else 300.0)
                 while time.monotonic() < deadline:
                     slot_state = _slot_snapshot(slot)
@@ -991,17 +1379,77 @@ def _run_service_repetition(
                 destination_count = _motherduck_count(
                     token, md_database, dataset, prefix
                 )
-                if not stall and durable_at is not None and destination_count != expected_rows:
+                published_destination_count = _motherduck_table_count(
+                    token,
+                    md_database,
+                    dataset,
+                    published_destination_table,
+                    "marker",
+                    prefix,
+                )
+                if (
+                    not stall
+                    and durable_at is not None
+                    and (
+                        destination_count != expected_rows
+                        or published_destination_count != expected_rows
+                    )
+                ):
                     destination_deadline = time.monotonic() + 60.0
                     while time.monotonic() < destination_deadline:
                         destination_count = _motherduck_count(
                             token, md_database, dataset, prefix
                         )
-                        if destination_count == expected_rows:
+                        published_destination_count = _motherduck_table_count(
+                            token,
+                            md_database,
+                            dataset,
+                            published_destination_table,
+                            "marker",
+                            prefix,
+                        )
+                        if (
+                            destination_count == expected_rows
+                            and published_destination_count == expected_rows
+                        ):
                             break
                         time.sleep(1.0)
                 source_window_end = source_finished_at
-                backlog = _backlog_verdict(monitor.source_window_samples(source_window_end))
+                source_window_samples = monitor.source_window_samples(source_window_end)
+                published_window_samples = monitor.published_window_samples(source_window_end)
+                backlog = _backlog_verdict(source_window_samples)
+                published_backlog = _published_backlog_verdict(published_window_samples)
+                published_backlog_final_pending = (
+                    published_source_facts["committed_published_marker_rows"]
+                    - published_destination_count
+                )
+                if positive_backlog_mutation:
+                    original_published_backlog = published_backlog
+                    mutated_samples: list[dict[str, Any]] = []
+                    for index, sample in enumerate(published_window_samples):
+                        mutated = dict(sample)
+                        observed_backlog = dict(sample["published_backlog"])
+                        source_rows = max(
+                            int(observed_backlog["source_published_marker_rows"]),
+                            index + 1,
+                        )
+                        pending = index + 1
+                        observed_backlog.update(
+                            {
+                                "source_published_marker_rows": source_rows,
+                                "destination_published_marker_rows": source_rows - pending,
+                                "pending_published_records": pending,
+                                "overdelivered_published_records": 0,
+                            }
+                        )
+                        mutated["published_backlog"] = observed_backlog
+                        mutated_samples.append(mutated)
+                    published_backlog = _published_backlog_verdict(mutated_samples)
+                    published_backlog["mutation_applied"] = True
+                    published_backlog["observed_before_mutation"] = original_published_backlog
+                result["published_backlog_samples"] = published_window_samples
+                result["published_backlog"] = published_backlog
+                result["slot_backlog_samples"] = source_window_samples
             host_gate = sampler.verdict()
         result["host_gate"] = host_gate
         result["slot_backlog"] = backlog
@@ -1009,6 +1457,9 @@ def _run_service_repetition(
             source_finished_at - source_started_box["at"], 6
         )
         result["destination_rows_observed_before_stop"] = destination_count
+        result["published_destination_rows_observed_before_stop"] = published_destination_count
+        result["published_backlog_final_pending_records"] = published_backlog_final_pending
+        result["published_backlog_sample_errors"] = list(monitor.errors)
         if durable_at is not None:
             result["delivery"] = {
                 "durable_boundary_sec_after_source_start": round(
@@ -1039,10 +1490,21 @@ def _run_service_repetition(
                     destination_rows,
                     label=f"{arm} repetition {repetition} source/destination",
                 )
+                published_marker_exact = bool(
+                    published_source_facts["committed_published_marker_rows"]
+                    == expected_rows
+                    and published_destination_count == expected_rows
+                    and published_backlog_final_pending == 0
+                )
                 result["oracle"] = {
-                    "passed": True,
+                    "passed": published_marker_exact,
                     "source_rows": len(source_rows),
                     "destination_rows": len(destination_rows),
+                    "published_marker_source_rows": published_source_facts[
+                        "committed_published_marker_rows"
+                    ],
+                    "published_marker_destination_rows": published_destination_count,
+                    "published_marker_count_exact": published_marker_exact,
                     "identity_value_multiplicity": "exact",
                     "columns": [
                         "id",
@@ -1057,12 +1519,20 @@ def _run_service_repetition(
                         "updated_at",
                     ],
                 }
+                if not published_marker_exact:
+                    result["oracle"]["error"] = (
+                        "published marker count or final published backlog was not exact"
+                    )
             except BaseException as exc:
                 result["oracle"] = {
                     "passed": False,
                     "error": f"{type(exc).__name__}: {exc}",
                     "source_rows": len(source_rows),
                     "destination_rows": len(destination_rows),
+                    "published_marker_source_rows": published_source_facts[
+                        "committed_published_marker_rows"
+                    ],
+                    "published_marker_destination_rows": published_destination_count,
                 }
         elif stall:
             result["oracle"] = {
@@ -1074,12 +1544,22 @@ def _run_service_repetition(
                 "passed": False,
                 "reason": "no durable source/destination boundary was observed",
             }
+        source_window_sustained = bool(
+            result["source"].get("postgres_clock_span_sec", 0)
+            >= sustained_window_seconds
+            and result["source"].get("source_window_sec_client", 0)
+            >= sustained_window_seconds
+        )
+        result["source_window_sustained"] = source_window_sustained
         result["keep_up"] = bool(
             not stall
             and result["host_gate"]["valid"]
             and result["source"]["actual_source_tps"] >= SOURCE_BAND_LOWER
             and result["source"]["actual_source_tps"] <= SOURCE_BAND_UPPER
-            and backlog.get("keep_up_backlog") is True
+            and source_window_sustained
+            and result["published_backlog_sample_errors"] == []
+            and result["published_backlog"].get("keep_up_backlog") is True
+            and result["published_backlog_final_pending_records"] == 0
             and result["oracle"].get("passed") is True
         )
         result["valid_for_score"] = bool(result["keep_up"])
@@ -1107,6 +1587,7 @@ def _run_service_repetition(
         _drop_source_slot(slot)
         _source_cleanup(prefix)
         _source_cleanup(warmup_prefix)
+        _drop_published_marker_table(published_marker_table, publication)
         _drop_marker_table(SOURCE_DATABASE, marker_table)
         _drop_motherduck_database(token, md_database)
         cleanup: dict[str, Any] = {}
@@ -1127,6 +1608,19 @@ def _run_service_repetition(
             )
         except BaseException as exc:
             cleanup["marker_cleanup_check_error"] = f"{type(exc).__name__}: {exc}"
+        try:
+            cleanup["published_marker_table_exists_after_cleanup"] = _source_relation_exists(
+                "app", published_marker_table
+            )
+            cleanup["published_marker_publication_member_after_cleanup"] = (
+                _source_publication_contains_table(
+                    publication, "app", published_marker_table
+                )
+            )
+        except BaseException as exc:
+            cleanup["published_marker_cleanup_check_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
         try:
             cleanup["motherduck_database_exists_after_cleanup"] = _motherduck_database_exists(
                 token, md_database
@@ -1173,6 +1667,25 @@ def _run_service_repetition(
                 "keep-up decision also requires an exact destination/oracle boundary"
             ),
         }
+    if positive_backlog_mutation:
+        mutated_backlog = result.get("published_backlog") or {}
+        result["mutation_verdict"] = {
+            "passed": bool(
+                mutated_backlog.get("positive_trend") is True
+                and mutated_backlog.get("keep_up_backlog") is False
+                and not result.get("keep_up", False)
+            ),
+            "positive_trend_observed": mutated_backlog.get("positive_trend"),
+            "fitted_slope_records_per_sec": mutated_backlog.get(
+                "pending_linear_slope_records_per_sec"
+            ),
+            "keep_up_check_rejected": not result.get("keep_up", False),
+            "reason": (
+                "the recorded published-only backlog samples were given a positive "
+                "trend; the keep-up predicate rejected the mutated evidence"
+            ),
+        }
+    _write_json(run_dir / "result.json", result)
     if generator_error is not None and not result.get("stall_mutation"):
         # The caller records the failed product repetition and decides whether
         # the run is a product failure or an environmental discard.
@@ -1182,12 +1695,29 @@ def _run_service_repetition(
 
 def _aggregate(repetitions: list[dict[str, Any]]) -> dict[str, Any]:
     valid = [item for item in repetitions if item.get("valid_for_score")]
-    rates = [float(item["delivery"]["delivered_rows_per_sec"]) for item in valid]
-    source_rates = [float(item["source"]["actual_source_tps"]) for item in valid]
+    host_valid = [
+        item
+        for item in repetitions
+        if (item.get("host_gate") or {}).get("valid")
+        and item.get("source", {}).get("actual_source_tps") is not None
+    ]
+    rates = [
+        float(item["delivery"]["delivered_rows_per_sec"])
+        for item in valid
+        if item.get("delivery", {}).get("delivered_rows_per_sec") is not None
+    ]
+    source_rates = [float(item["source"]["actual_source_tps"]) for item in host_valid]
+    score_source_rates = [
+        float(item["source"]["actual_source_tps"])
+        for item in valid
+        if item.get("source", {}).get("actual_source_tps") is not None
+    ]
     durations = [
         float(item["delivery"]["durable_boundary_sec_after_source_start"])
         for item in valid
+        if item.get("delivery", {}).get("durable_boundary_sec_after_source_start") is not None
     ]
+
     def stats(values: list[float]) -> dict[str, Any]:
         if not values:
             return {"median": None, "min": None, "max": None, "p95_small_sample_max": None}
@@ -1197,14 +1727,38 @@ def _aggregate(repetitions: list[dict[str, Any]]) -> dict[str, Any]:
             "max": round(max(values), 3),
             "p95_small_sample_max": round(max(values), 3),
         }
+
+    discarded = []
+    for item in repetitions:
+        host_gate = item.get("host_gate") or {}
+        if not item.get("valid_for_score"):
+            discarded.append(
+                {
+                    "repetition": item.get("repetition"),
+                    "host_gate_valid": host_gate.get("valid"),
+                    "host_invalid_samples": host_gate.get("invalid_samples", []),
+                    "keep_up": item.get("keep_up", False),
+                    "oracle_passed": (item.get("oracle") or {}).get("passed"),
+                    "source_window_sustained": item.get("source_window_sustained"),
+                    "published_backlog": item.get("published_backlog"),
+                    "error": item.get("error") or item.get("keep_up_rejection_reason"),
+                }
+            )
     return {
         "repetitions_total": len(repetitions),
         "valid_repetitions": len(valid),
         "discarded_or_failed_repetitions": len(repetitions) - len(valid),
+        "host_valid_repetitions": len(host_valid),
+        "discarded_host_repetitions": sum(
+            not bool((item.get("host_gate") or {}).get("valid"))
+            for item in repetitions
+        ),
         "delivered_rows_per_sec": stats(rates),
         "source_tps": stats(source_rates),
+        "source_tps_score_valid": stats(score_source_rates),
         "durable_boundary_sec": stats(durations),
         "host_gate_verdicts": [item.get("host_gate") for item in repetitions],
+        "discarded_repetitions": discarded,
         "full_spread_repetition_ids": [
             {
                 "repetition": item.get("repetition"),
@@ -1213,6 +1767,28 @@ def _aggregate(repetitions: list[dict[str, Any]]) -> dict[str, Any]:
                 "delivered_rows_per_sec": item.get("delivery", {}).get("delivered_rows_per_sec"),
                 "backlog_start_bytes": item.get("slot_backlog", {}).get("lag_start_bytes"),
                 "backlog_end_bytes": item.get("slot_backlog", {}).get("lag_end_bytes"),
+                "published_backlog_start_records": item.get("published_backlog", {}).get(
+                    "pending_start_records"
+                ),
+                "published_backlog_end_records": item.get("published_backlog", {}).get(
+                    "pending_end_records"
+                ),
+                "published_backlog_slope_records_per_sec": item.get(
+                    "published_backlog", {}
+                ).get("pending_linear_slope_records_per_sec"),
+                "published_backlog_observations": item.get("published_backlog", {}).get(
+                    "valid_observations"
+                ),
+                "published_backlog_final_pending_records": item.get(
+                    "published_backlog_final_pending_records"
+                ),
+                "source_window_sec_client": item.get("source", {}).get(
+                    "source_window_sec_client"
+                ),
+                "postgres_clock_span_sec": item.get("source", {}).get(
+                    "postgres_clock_span_sec"
+                ),
+                "source_window_sustained": item.get("source_window_sustained"),
                 "oracle_passed": item.get("oracle", {}).get("passed"),
                 "host_csv": item.get("host_gate", {}).get("csv"),
             }
@@ -1221,7 +1797,15 @@ def _aggregate(repetitions: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _run_arm(evidence_dir: Path, arm: str, *, repetitions: int, target_tps: float, transactions: int) -> dict[str, Any]:
+def _run_arm(
+    evidence_dir: Path,
+    arm: str,
+    *,
+    repetitions: int,
+    target_tps: float,
+    transactions: int,
+    sustained_window_seconds: float,
+) -> dict[str, Any]:
     results = []
     for repetition in range(1, repetitions + 1):
         results.append(
@@ -1231,6 +1815,7 @@ def _run_arm(evidence_dir: Path, arm: str, *, repetitions: int, target_tps: floa
                 repetition=repetition,
                 target_tps=target_tps,
                 transactions=transactions,
+                sustained_window_seconds=sustained_window_seconds,
             )
         )
     return {"arm": arm, "repetitions": results, "aggregate": _aggregate(results)}
@@ -1249,6 +1834,7 @@ def _run_mutations(evidence_dir: Path, target_tps: float) -> dict[str, Any]:
         advertised_target_tps=2000.0,
         transactions=2500,
         label="mutation_advertised_2000_actual_cap_500",
+        minimum_sustained_window_seconds=0.0,
     )
     advertised["harness_decision"] = {
         "accepted_claimed_band": False,
@@ -1270,6 +1856,7 @@ def _run_mutations(evidence_dir: Path, target_tps: float) -> dict[str, Any]:
         repetition=1,
         target_tps=target_tps,
         transactions=1200,
+        sustained_window_seconds=0.0,
         stall=True,
     )
     stalled["harness_decision"] = {
@@ -1279,39 +1866,93 @@ def _run_mutations(evidence_dir: Path, target_tps: float) -> dict[str, Any]:
             "a source-only rate is not a keep-up result"
         ),
     }
-    return {"advertised_vs_actual": advertised, "destination_stall": stalled}
+    positive = _run_service_repetition(
+        evidence_dir,
+        arm="mutation_positive_backlog_trend",
+        repetition=1,
+        target_tps=target_tps,
+        transactions=1200,
+        sustained_window_seconds=0.0,
+        positive_backlog_mutation=True,
+    )
+    positive["harness_decision"] = {
+        "accepted_keep_up": False,
+        "positive_trend_rejected": (positive.get("published_backlog") or {}).get(
+            "positive_trend"
+        )
+        is True
+        and (positive.get("published_backlog") or {}).get("keep_up_backlog") is False,
+        "reason": (
+            "a positive fitted trend in the published-only pending-record series "
+            "must make keep-up false, even if the unmutated run reached the oracle"
+        ),
+    }
+    return {
+        "advertised_vs_actual": advertised,
+        "destination_stall": stalled,
+        "positive_backlog_trend": positive,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--evidence-dir", type=Path, default=Path(os.environ.get("P53_EVIDENCE_DIR", DEFAULT_EVIDENCE_DIR)))
+    parser.add_argument(
+        "--evidence-dir",
+        type=Path,
+        default=Path(os.environ.get("P53_EVIDENCE_DIR", DEFAULT_EVIDENCE_DIR)),
+    )
     parser.add_argument("--target-tps", type=float, default=DEFAULT_TARGET_TPS)
     parser.add_argument("--repetitions", type=int, default=DEFAULT_REPETITIONS)
-    parser.add_argument("--transactions", type=int, default=DEFAULT_TRANSACTIONS)
+    parser.add_argument("--duration-seconds", type=float, default=DEFAULT_SUSTAINED_WINDOW_SECONDS)
+    parser.add_argument("--transactions", type=int, default=None)
     parser.add_argument("--capability-only", action="store_true")
     parser.add_argument("--mutations-only", action="store_true")
     args = parser.parse_args(argv)
     if int(_env("CDC_TEST_PGPORT", str(SOURCE_PORT))) != SOURCE_PORT:
         raise SystemExit("p53 harness is intentionally fixed to CDC_TEST_PGPORT=15432")
-    if args.repetitions < 1 or args.transactions < 1:
-        raise SystemExit("repetitions and transactions must be positive")
+    if args.repetitions < 1:
+        raise SystemExit("repetitions must be positive")
+    if (
+        not math.isfinite(args.duration_seconds)
+        or args.duration_seconds < DEFAULT_SUSTAINED_WINDOW_SECONDS
+    ):
+        raise SystemExit(
+            f"duration-seconds must be at least {DEFAULT_SUSTAINED_WINDOW_SECONDS:.0f}"
+        )
+    if args.transactions is not None and args.transactions < 1:
+        raise SystemExit("transactions must be positive when supplied")
+    measurement_transactions = _transactions_for_sustained_window(
+        args.target_tps,
+        args.duration_seconds,
+        args.transactions,
+    )
     args.evidence_dir.mkdir(parents=True, exist_ok=True)
     report: dict[str, Any] = {
         "harness": "p53_sustained_tps",
         "base_sha": BASE_SHA,
         "branch_at_start": _git("branch", "--show-current"),
         "source_port": SOURCE_PORT,
+        "target_tps_advertised": args.target_tps,
+        "sustained_window_seconds": args.duration_seconds,
+        "transactions_for_measurement": measurement_transactions,
         "source_measurement": (
             "one PostgreSQL marker row per generator transaction, PostgreSQL clock "
             "span, and pg_stat_database.xact_commit delta"
         ),
         "keep_up_definition": (
-            "at least three source-window slot-lag samples, final lag <= initial lag, "
-            "non-positive fitted lag trend, exact identity/value/multiplicity oracle, "
-            "and durable destination/slot boundary"
+            "published-only pending records = source committed rows in the published "
+            "marker table minus durable destination marker rows; over >=180 seconds "
+            "it must be bounded and have non-positive OLS slope, then the final "
+            "published marker count and exact identity/value/multiplicity oracle must "
+            "hold at the durable boundary"
         ),
     }
-    capability = _run_source_capability(args.evidence_dir, advertised_target_tps=args.target_tps, transactions=args.transactions)
+    capability = _run_source_capability(
+        args.evidence_dir,
+        advertised_target_tps=args.target_tps,
+        transactions=measurement_transactions,
+        minimum_sustained_window_seconds=args.duration_seconds,
+    )
     report["source_capability"] = capability
     _write_json(args.evidence_dir / "source_capability.json", capability)
     if args.capability_only:
@@ -1332,19 +1973,25 @@ def main(argv: list[str] | None = None) -> int:
             "candidate",
             repetitions=args.repetitions,
             target_tps=args.target_tps,
-            transactions=args.transactions,
+            transactions=measurement_transactions,
+            sustained_window_seconds=args.duration_seconds,
         )
         _git("checkout", BASE_SHA)
         try:
+            if _git("rev-parse", "HEAD") != BASE_SHA:
+                raise RuntimeError("control arm did not start at the required base SHA")
             report["control"] = _run_arm(
                 args.evidence_dir,
                 "control",
                 repetitions=args.repetitions,
                 target_tps=args.target_tps,
-                transactions=args.transactions,
+                transactions=measurement_transactions,
+                sustained_window_seconds=args.duration_seconds,
             )
         finally:
             _git("switch", CANDIDATE_BRANCH)
+        if _git("rev-parse", "HEAD") != _git("rev-parse", CANDIDATE_BRANCH):
+            raise RuntimeError("candidate branch was not restored after control arm")
         report["mutations"] = _run_mutations(args.evidence_dir, args.target_tps)
     report["branch_at_end"] = _git("branch", "--show-current")
     report["sha_at_end"] = _git("rev-parse", "HEAD")
