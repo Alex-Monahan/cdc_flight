@@ -129,6 +129,34 @@ def connect(watcher, *, autocommit: bool = True, dsn: str | None = None):
     )
 
 
+def resolve_relation(watcher, source_schema: str, source_table: str) -> SourceRelation | None:
+    """Read one exact relation identity for the policy-admission operation."""
+    with connect(watcher) as conn:
+        rows = conn.execute(
+            observation_mod.POLICY_RELATION_SQL,
+            (watcher.publication, source_schema, source_table),
+        ).fetchall()
+    if not rows:
+        return None
+    if len(rows) != 1:
+        raise RuntimeError(
+            f"source identity {source_schema}.{source_table} was ambiguous in the catalog"
+        )
+    row = rows[0]
+    return SourceRelation(
+        schema=str(row[0]),
+        table=str(row[1]),
+        oid=int(row[2]),
+        relfilenode=(int(row[3]) if row[3] is not None else None),
+        relation_type_oid=(int(row[4]) if row[4] is not None else None),
+        replica_identity=str(row[5]),
+        published=bool(row[6]),
+        publication_all_tables=bool(row[7]),
+        is_partition=bool(row[8]),
+        primary_key_columns=tuple(str(value) for value in (row[9] or ())),
+    )
+
+
 def _positive_lsn(value):
     try:
         candidate = int(value)

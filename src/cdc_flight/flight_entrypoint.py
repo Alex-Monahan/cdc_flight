@@ -35,12 +35,12 @@ def _require_unbounded_flight() -> float:
     )
 
 
-def main() -> int:
-    """Validate the Flight contract, then run one scheduled service instance."""
+def main(argv: list[str] | None = None) -> int:
+    """Validate the Flight contract, then run one scheduled service operation."""
     _require_unbounded_flight()
     from .service import main as service_main
 
-    return int(service_main())
+    return int(service_main(argv))
 
 
 if __name__ == "__main__":

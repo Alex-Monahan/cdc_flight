@@ -851,6 +851,10 @@ def _migrate_policy_columns(con, control_schema: str | None = None) -> None:
         ).fetchall()
     }
     for name, type_name in (
+        # DuckDB/MotherDuck cannot add a constrained column with ALTER TABLE.
+        # Fresh schemas get the stricter definition above; legacy schemas are
+        # backfilled immediately below before any policy read can observe them.
+        ("history_mode", "VARCHAR"),
         ("delete_policy_epoch", "BIGINT DEFAULT 1"),
         ("delete_policy_digest", "VARCHAR"),
         ("pii_policy_epoch", "BIGINT DEFAULT 0"),
@@ -859,6 +863,7 @@ def _migrate_policy_columns(con, control_schema: str | None = None) -> None:
     ):
         if name not in existing:
             con.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {quote(name)} {type_name}")
+    con.execute(f"UPDATE {table} SET history_mode = 'none' WHERE history_mode IS NULL")
 
 
 def _migrate_event_ledger(con, control_schema: str | None = None) -> None:

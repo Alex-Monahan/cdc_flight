@@ -515,6 +515,10 @@ class CatalogWatcher(CatalogLifecycleMixin):
     def poll(self) -> list[CatalogChange]:
         return catalog_poll.poll(self)
 
+    def resolve_relation(self, source_schema: str, source_table: str) -> SourceRelation | None:
+        """Resolve one exact source identity without polling or source-side writes."""
+        return catalog_poll.resolve_relation(self, source_schema, source_table)
+
     def _ensure_published(self, conn, observed, changes: list[CatalogChange]) -> None:
         admission_mod.ensure_published(self, conn, observed, changes)
 

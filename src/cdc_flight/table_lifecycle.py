@@ -191,6 +191,7 @@ def transition(
     epoch=_KEEP,
     snapshot_lsn=_KEEP,
     last_commit_id=_KEEP,
+    history_mode=_KEEP,
     replace: bool = False,
     alerts=None,
     control_schema: str | None = None,
@@ -199,8 +200,8 @@ def transition(
 
     `replace=True` is DELETE+INSERT, which is what a caller wants when the row's
     *identity* is being re-established (a new shadow, a relation that came back under a
-    different target name); everything else is an UPDATE that leaves the per-table
-    configuration columns alone.
+    different target name). Existing per-table configuration is copied into the
+    replacement row; everything else is an UPDATE that leaves those columns alone.
     """
     frm = read(
         con, pipeline=pipeline, source_schema=source_schema, source_table=source_table,
@@ -212,7 +213,26 @@ def transition(
         reason=reason, alerts=alerts,
     )
     if frm == ABSENT or replace:
+        policy = (
+            "cdc", "hard",
+            "none" if history_mode is _KEEP else history_mode,
+            "pk", None, 1, None, 0, None, None,
+        )
         if frm != ABSENT:
+            policy_row = con.execute(
+                f"SELECT refresh_mode, delete_mode, history_mode, key_strategy, "
+                f"key_columns, delete_policy_epoch, delete_policy_digest, "
+                f"pii_policy_epoch, pii_policy_digest, pii_salt_id "
+                f"FROM {_control_table(control_schema, 'table_state')} "
+                "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
+                [pipeline, source_schema, source_table],
+            ).fetchone()
+            if policy_row is None:
+                raise RuntimeError(
+                    f"lifecycle row for {source_schema}.{source_table} disappeared "
+                    "while it was being replaced"
+                )
+            policy = tuple(policy_row)
             con.execute(
                 f"DELETE FROM {_control_table(control_schema, 'table_state')} "
                 "WHERE pipeline = ? AND source_schema = ? AND source_table = ?",
@@ -221,12 +241,16 @@ def transition(
         con.execute(
             f"INSERT INTO {_control_table(control_schema, 'table_state')} "
             "(pipeline, source_schema, source_table, target_table, snapshot_state, "
-            " snapshot_epoch, snapshot_lsn, last_commit_id) VALUES (?,?,?,?,?,?,?,?)",
+            " snapshot_epoch, snapshot_lsn, last_commit_id, refresh_mode, delete_mode, "
+            " history_mode, key_strategy, key_columns, delete_policy_epoch, "
+            " delete_policy_digest, pii_policy_epoch, pii_policy_digest, pii_salt_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [
                 pipeline, source_schema, source_table, target_table or source_table, to,
                 0 if epoch is _KEEP else epoch,
                 None if snapshot_lsn is _KEEP else snapshot_lsn,
                 None if last_commit_id is _KEEP else last_commit_id,
+                *policy,
             ],
         )
         _log(frm, to, f"{source_schema}.{source_table}", reason)

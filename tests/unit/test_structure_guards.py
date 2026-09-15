@@ -35,14 +35,16 @@ _BASELINE_SELECTED = {
     # §7.3 Round A adds ten default observation nodes, one slow real-catalog node,
     # and one MotherDuck durability node. This is a correctness gate only; it does
     # not change the 7.3 score.
-    "not motherduck and not slow": 2492,
-    "slow and not motherduck": 269,
+    # §8.2 Round 1 adds eleven default policy nodes, one slow public-operation node,
+    # and one MotherDuck policy-durability node. This is a correctness gate only;
+    # it does not change the 8.2 score.
+    "not motherduck and not slow": 2503,
+    "slow and not motherduck": 270,
     # The quiet-holder and stock-walsender retry proofs are MotherDuck-only real
     # process nodes; a local DuckDB file lock cannot exercise cloud takeover while
     # the old process retains its handle.
-    # The selected MotherDuck total is 66 including this guard after the permanent
-    # retained-recovery MotherDuck proof was added.
-    "motherduck": 66,
+    # The selected MotherDuck total is 67 excluding this guard after the §8.2 node.
+    "motherduck": 67,
 }
 
 

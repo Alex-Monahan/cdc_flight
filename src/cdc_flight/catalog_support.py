@@ -78,6 +78,52 @@ GROUP BY n.nspname, c.relname, c.oid, c.relfilenode, c.reltype, c.relreplident,
 
 # A catalog read may run on a hot standby.  `pg_current_wal_lsn()` is primary-only;
 # the receive position is the corresponding upper bound for the read-side WAL fence.
+# A policy operation observes one exact source relation without starting the polling
+# thread or issuing publication/TOAST writes. Generation and primary-key facts are
+# read from PostgreSQL catalogs; the source owner remains CatalogWatcher.
+POLICY_RELATION_SQL = """
+SELECT n.nspname                                  AS source_schema,
+       c.relname                                  AS source_table,
+       c.oid::bigint                              AS relation_oid,
+       c.relfilenode::bigint                      AS relation_filenode,
+       c.reltype::bigint                          AS relation_type_oid,
+       c.relreplident                             AS replica_identity,
+       (
+           COALESCE(p.puballtables, false)
+           OR pr.prrelid IS NOT NULL
+           OR EXISTS (
+               SELECT 1
+               FROM pg_inherits parent_i
+               JOIN pg_publication_rel parent_pr
+                 ON parent_pr.prrelid = parent_i.inhparent
+                AND parent_pr.prpubid = p.oid
+               WHERE parent_i.inhrelid = c.oid
+           )
+       )                                           AS published,
+       COALESCE(p.puballtables, false)             AS publication_all_tables,
+       EXISTS (
+           SELECT 1 FROM pg_inherits partition_i WHERE partition_i.inhrelid = c.oid
+       )                                           AS is_partition,
+       COALESCE((
+           SELECT array_agg(attribute.attname ORDER BY key_column.ordinality)
+           FROM pg_index index_row
+           CROSS JOIN LATERAL unnest(index_row.indkey)
+               WITH ORDINALITY AS key_column(attnum, ordinality)
+           JOIN pg_attribute attribute
+             ON attribute.attrelid = index_row.indrelid
+            AND attribute.attnum = key_column.attnum
+           WHERE index_row.indrelid = c.oid
+             AND index_row.indisprimary
+       ), ARRAY[]::text[])                          AS primary_key_columns
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_publication p ON p.pubname = %s
+LEFT JOIN pg_publication_rel pr ON pr.prrelid = c.oid AND pr.prpubid = p.oid
+WHERE c.relkind IN ('r', 'p')
+  AND n.nspname = %s
+  AND c.relname = %s
+"""
+
 LSN_SQL = """
 SELECT ((CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn()
               ELSE pg_current_wal_lsn() END) - '0/0'::pg_lsn)::bigint
