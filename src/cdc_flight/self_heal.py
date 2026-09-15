@@ -276,7 +276,7 @@ def destination_operation_watchdog(
                     # preceding completed operation. A quiet gap itself is never
                     # timed.
                     observed_active_started = active_started
-                    if paused_deadline is None:
+                    if paused_deadline is None or paused_deadline <= now:
                         paused_deadline = active_started + timeout
                     deadline = paused_deadline
                 elif progress_changed:
