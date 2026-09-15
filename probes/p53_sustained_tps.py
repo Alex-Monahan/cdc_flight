@@ -13,16 +13,18 @@ deliberate properties that the older throughput probes did not have:
   exact and the **published-data-only** backlog is non-growing during a sustained
   source window.
 
-Each measured product transaction inserts the application row, one marker row in a
-unique table that is temporarily added to the existing publication, and one marker
-row in a deliberately unpublished measurement table.  The published marker gives
-the decoder an exact one-record-per-source-transaction witness.  The unpublished
-marker remains the independent source-TPS clock witness: its ``clock_timestamp()``
-is PostgreSQL's clock, not the requested rate or a Python event counter.  The
-unpublished marker's WAL is retained in the evidence but is never part of the
-keep-up backlog.  PostgreSQL ``pg_stat_database.xact_commit`` is used for the
-separate capability check.  Product destination delivery is reported separately
-as durable destination rows per source-start-to-durable-boundary wall second.
+Each measured product transaction inserts one application row in the existing
+published ``app.customers`` relation and one marker row in a deliberately
+unpublished measurement table.  Because the workload has exactly one published
+customer row per transaction, the source customer-row count minus durable
+destination customer-row count is a direct published-data backlog witness.  The
+unpublished marker remains the independent source-TPS clock witness: its
+``clock_timestamp()`` is PostgreSQL's clock, not the requested rate or a Python
+event counter.  The unpublished marker's WAL is retained in the evidence but is
+never part of the keep-up backlog.  PostgreSQL ``pg_stat_database.xact_commit`` is
+used for the separate capability check.  Product destination delivery is reported
+separately as durable destination rows per source-start-to-durable-boundary wall
+second.
 """
 
 from __future__ import annotations
@@ -273,24 +275,22 @@ def _source_publication_contains_table(
         )
 
 
-def _published_marker_facts(table: str) -> dict[str, Any]:
+def _published_data_facts(prefix: str) -> dict[str, Any]:
+    """Count the generated rows in the already-published application table."""
     with _source_connect(SOURCE_DATABASE, application_name="p53-published-facts") as con:
         con.autocommit = True
-        row = con.execute(
-            pg_sql.SQL(
-                "SELECT count(*), min(observed_at), max(observed_at) "
-                "FROM {}.{}"
-            ).format(pg_sql.Identifier("app"), pg_sql.Identifier(table))
-        ).fetchone()
-    count = int(row[0])
-    first = row[1]
-    last = row[2]
-    span = (last - first).total_seconds() if first is not None and last is not None else 0.0
+        count = int(
+            con.execute(
+                "SELECT count(*) FROM app.customers WHERE name LIKE %s",
+                (f"{prefix}-%",),
+            ).fetchone()[0]
+        )
     return {
-        "committed_published_marker_rows": count,
-        "first_published_marker_observed_at": first,
-        "last_published_marker_observed_at": last,
-        "published_marker_clock_span_sec": round(max(0.0, span), 6),
+        "committed_published_data_rows": count,
+        "published_source_relation": "app.customers",
+        "published_data_measurement": (
+            "source committed app.customers rows for this run"
+        ),
     }
 
 
@@ -739,29 +739,51 @@ def _motherduck_table_count(
         raise
 
 
-def _source_published_marker_sample(
+def _motherduck_like_count(
+    token: str,
+    database: str,
+    dataset: str,
     table: str,
+    column: str,
+    pattern: str,
+) -> int:
+    """Count published destination rows without hiding non-catalog failures."""
+    try:
+        with duckdb.connect(f"md:{database}?motherduck_token={token}") as con:
+            table_ref = f"{_duck_identifier(dataset)}.{_duck_identifier(table)}"
+            return int(
+                con.execute(
+                    f"SELECT count(*) FROM {table_ref} "
+                    f"WHERE {_duck_identifier(column)} LIKE ?",
+                    [pattern],
+                ).fetchone()[0]
+            )
+    except duckdb.CatalogException as exc:
+        if "does not exist" in str(exc).lower() or "not found" in str(exc).lower():
+            return 0
+        raise
+
+
+def _source_published_data_sample(
     unpublished_table: str,
     prefix: str,
 ) -> dict[str, int]:
-    """Return committed source counts for both marker classes in one snapshot."""
+    """Return published application rows and the separate unpublished marker count."""
     with _source_connect(SOURCE_DATABASE, application_name="p53-published-backlog") as con:
         con.autocommit = True
         row = con.execute(
             pg_sql.SQL(
                 "SELECT "
-                "(SELECT count(*) FROM {}.{} WHERE marker = %s) AS published_count, "
+                "(SELECT count(*) FROM app.customers WHERE name LIKE %s) AS published_count, "
                 "(SELECT count(*) FROM {}.{} WHERE marker = %s) AS unpublished_count"
             ).format(
-                pg_sql.Identifier("app"),
-                pg_sql.Identifier(table),
                 pg_sql.Identifier("p53_measurement"),
                 pg_sql.Identifier(unpublished_table),
             ),
-            (prefix, prefix),
+            (f"{prefix}-%", prefix),
         ).fetchone()
     return {
-        "source_published_marker_rows": int(row[0]),
+        "source_published_data_rows": int(row[0]),
         "source_unpublished_marker_rows": int(row[1]),
     }
 
@@ -770,31 +792,27 @@ def _published_backlog_sample(
     token: str,
     database: str,
     dataset: str,
-    published_marker_table: str,
-    published_destination_table: str,
     unpublished_marker_table: str,
     prefix: str,
 ) -> dict[str, Any]:
-    source = _source_published_marker_sample(
-        published_marker_table, unpublished_marker_table, prefix
-    )
-    destination_rows = _motherduck_table_count(
+    source = _source_published_data_sample(unpublished_marker_table, prefix)
+    destination_rows = _motherduck_like_count(
         token,
         database,
         dataset,
-        published_destination_table,
-        "marker",
-        prefix,
+        _destination_table_name("customers"),
+        "name",
+        f"{prefix}-%",
     )
-    pending = source["source_published_marker_rows"] - destination_rows
+    pending = source["source_published_data_rows"] - destination_rows
     return {
         **source,
-        "destination_published_marker_rows": destination_rows,
+        "destination_published_data_rows": destination_rows,
         "pending_published_records": pending,
         "overdelivered_published_records": max(0, -pending),
         "measure": (
-            "source committed rows in the published marker table minus durable "
-            "destination rows in its published marker table"
+            "source committed app.customers rows minus durable destination "
+            "app.customers rows, both filtered to this run's marker prefix"
         ),
         "unpublished_marker_in_backlog": False,
     }
@@ -1026,8 +1044,8 @@ def _backlog_verdict(samples: list[dict[str, Any]]) -> dict[str, Any]:
 def _published_backlog_verdict(samples: list[dict[str, Any]]) -> dict[str, Any]:
     """Evaluate the backlog that the publication can actually deliver.
 
-    The source and destination counts are both marker rows from the same
-    published relation.  This deliberately does not use a slot byte delta: WAL
+    The source and destination counts are both rows from the already-published
+    ``app.customers`` relation.  This deliberately does not use a slot byte delta: WAL
     from the separate unpublished clock marker (and any other unpublished WAL)
     cannot become destination rows and therefore is not application backlog.
     """
@@ -1041,8 +1059,8 @@ def _published_backlog_verdict(samples: list[dict[str, Any]]) -> dict[str, Any]:
                 (
                     float(sample["source_window_sec"]),
                     int(backlog["pending_published_records"]),
-                    int(backlog["source_published_marker_rows"]),
-                    int(backlog["destination_published_marker_rows"]),
+                    int(backlog["source_published_data_rows"]),
+                    int(backlog["destination_published_data_rows"]),
                     int(backlog["overdelivered_published_records"]),
                 )
             )
@@ -1054,8 +1072,8 @@ def _published_backlog_verdict(samples: list[dict[str, Any]]) -> dict[str, Any]:
             "keep_up_backlog": False,
             "reason": "fewer than three published-data backlog observations",
             "definition": (
-                "published backlog is source committed marker rows minus durable "
-                "destination marker rows; keep-up requires >=3 observations, "
+                "published backlog is source committed app.customers rows minus "
+                "durable destination app.customers rows; keep-up requires >=3 observations, "
                 "non-negative bounded backlog, final <= initial, and OLS slope <= 0"
             ),
         }
@@ -1085,16 +1103,16 @@ def _published_backlog_verdict(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "pending_min_records": min(pending_values),
         "pending_max_records": max(pending_values),
         "pending_linear_slope_records_per_sec": round(slope, 6),
-        "source_published_marker_rows_start": observations[0][2],
-        "source_published_marker_rows_end": observations[-1][2],
-        "destination_published_marker_rows_start": observations[0][3],
-        "destination_published_marker_rows_end": observations[-1][3],
+        "source_published_data_rows_start": observations[0][2],
+        "source_published_data_rows_end": observations[-1][2],
+        "destination_published_data_rows_start": observations[0][3],
+        "destination_published_data_rows_end": observations[-1][3],
         "overdelivered_observations": sum(value > 0 for value in overdelivered_values),
         "source_count_non_decreasing": source_non_decreasing,
         "positive_trend": slope > 0,
         "definition": (
-            "published backlog is source committed marker rows minus durable "
-            "destination marker rows; keep-up requires >=3 observations, "
+            "published backlog is source committed app.customers rows minus "
+            "durable destination app.customers rows; keep-up requires >=3 observations, "
             "non-negative bounded backlog, final <= initial, and OLS slope <= 0"
         ),
         "keep_up_backlog": (
@@ -1135,7 +1153,6 @@ def _service_environment(
     dataset: str,
     pipeline: str,
     slot: str,
-    published_marker_table: str,
     publication: str = SOURCE_PUBLICATION,
     stall: bool = False,
 ) -> dict[str, str]:
@@ -1160,7 +1177,7 @@ def _service_environment(
         "CDC_DESTINATION": "motherduck",
         "CDC_MD_DATABASE": database,
         "CDC_DATASET": dataset,
-        "CDC_TABLES": f"customers,{published_marker_table}",
+        "CDC_TABLES": "customers",
         "CDC_AUTO_DISCOVERY": "0",
         "CDC_SNAPSHOT_MODE": "initial",
         "MAX_RUNTIME_SEC": "0",
@@ -1244,9 +1261,7 @@ def _run_service_repetition(
     prefix = f"p53-{arm}-{repetition}-{uuid.uuid4().hex[:8]}"
     warmup_prefix = f"p53-warm-{arm}-{repetition}-{uuid.uuid4().hex[:8]}"
     marker_table = f"run_{uuid.uuid4().hex[:12]}"
-    published_marker_table = f"pub_{uuid.uuid4().hex[:12]}"
     publication = _env("CDC_PUBLICATION", SOURCE_PUBLICATION)
-    published_destination_table = _destination_table_name(published_marker_table)
     result: dict[str, Any] = {
         "kind": "service_repetition",
         "arm": arm,
@@ -1261,8 +1276,8 @@ def _run_service_repetition(
         "source_prefix": prefix,
         "warmup_prefix": warmup_prefix,
         "unpublished_marker_table": f"p53_measurement.{marker_table}",
-        "published_marker_table": f"app.{published_marker_table}",
-        "published_destination_table": published_destination_table,
+        "published_source_relation": "app.customers",
+        "published_destination_relation": _destination_table_name("customers"),
         "publication": publication,
         "transactions": transactions,
         "rows_per_transaction": rows_per_transaction,
@@ -1284,14 +1299,12 @@ def _run_service_repetition(
         _create_motherduck_database(token, md_database)
         _prepare_motherduck_destination(token, md_database, dataset)
         _create_marker_table(SOURCE_DATABASE, marker_table)
-        _create_published_marker_table(published_marker_table, publication)
         environment = _service_environment(
             run_dir,
             database=md_database,
             dataset=dataset,
             pipeline=pipeline,
             slot=slot,
-            published_marker_table=published_marker_table,
             publication=publication,
             stall=stall,
         )
@@ -1321,8 +1334,6 @@ def _run_service_repetition(
                 token,
                 md_database,
                 dataset,
-                published_marker_table,
-                published_destination_table,
                 marker_table,
                 prefix,
             )
@@ -1341,7 +1352,6 @@ def _run_service_repetition(
                     target_tps,
                     DEFAULT_WORKERS,
                     include_customers=True,
-                    published_marker_table=published_marker_table,
                     on_start=lambda at: (on_start(at), monitor.source_started(at)),
                 )
                 source_finished_at = time.monotonic()
@@ -1349,10 +1359,10 @@ def _run_service_repetition(
                 # the query itself is performed immediately afterward.
                 monitor.capture_now(observed_at=source_finished_at)
                 source_facts = _marker_facts(SOURCE_DATABASE, marker_table)
-                published_source_facts = _published_marker_facts(published_marker_table)
+                published_source_facts = _published_data_facts(prefix)
                 upper_lsn = _source_lsn()
                 result["source"] = {**generated, **source_facts}
-                result["source"]["published_marker"] = published_source_facts
+                result["source"]["published_data"] = published_source_facts
                 result["source"]["source_upper_lsn"] = upper_lsn
                 result["source"]["source_lower_lsn"] = lower_lsn
                 result["source"]["actual_source_tps"] = source_facts[
@@ -1387,13 +1397,13 @@ def _run_service_repetition(
                 destination_count = _motherduck_count(
                     token, md_database, dataset, prefix
                 )
-                published_destination_count = _motherduck_table_count(
+                published_destination_count = _motherduck_like_count(
                     token,
                     md_database,
                     dataset,
-                    published_destination_table,
-                    "marker",
-                    prefix,
+                    _destination_table_name("customers"),
+                    "name",
+                    f"{prefix}-%",
                 )
                 if (
                     not stall
@@ -1408,13 +1418,13 @@ def _run_service_repetition(
                         destination_count = _motherduck_count(
                             token, md_database, dataset, prefix
                         )
-                        published_destination_count = _motherduck_table_count(
+                        published_destination_count = _motherduck_like_count(
                             token,
                             md_database,
                             dataset,
-                            published_destination_table,
-                            "marker",
-                            prefix,
+                            _destination_table_name("customers"),
+                            "name",
+                            f"{prefix}-%",
                         )
                         if (
                             destination_count == expected_rows
@@ -1428,7 +1438,7 @@ def _run_service_repetition(
                 backlog = _backlog_verdict(source_window_samples)
                 published_backlog = _published_backlog_verdict(published_window_samples)
                 published_backlog_final_pending = (
-                    published_source_facts["committed_published_marker_rows"]
+                    published_source_facts["committed_published_data_rows"]
                     - published_destination_count
                 )
                 if positive_backlog_mutation:
@@ -1438,14 +1448,14 @@ def _run_service_repetition(
                         mutated = dict(sample)
                         observed_backlog = dict(sample["published_backlog"])
                         source_rows = max(
-                            int(observed_backlog["source_published_marker_rows"]),
+                            int(observed_backlog["source_published_data_rows"]),
                             index + 1,
                         )
                         pending = index + 1
                         observed_backlog.update(
                             {
-                                "source_published_marker_rows": source_rows,
-                                "destination_published_marker_rows": source_rows - pending,
+                                "source_published_data_rows": source_rows,
+                                "destination_published_data_rows": source_rows - pending,
                                 "pending_published_records": pending,
                                 "overdelivered_published_records": 0,
                             }
@@ -1498,21 +1508,22 @@ def _run_service_repetition(
                     destination_rows,
                     label=f"{arm} repetition {repetition} source/destination",
                 )
-                published_marker_exact = bool(
-                    published_source_facts["committed_published_marker_rows"]
+                published_data_exact = bool(
+                    published_source_facts["committed_published_data_rows"]
                     == expected_rows
                     and published_destination_count == expected_rows
                     and published_backlog_final_pending == 0
                 )
                 result["oracle"] = {
-                    "passed": published_marker_exact,
+                    "passed": published_data_exact,
                     "source_rows": len(source_rows),
                     "destination_rows": len(destination_rows),
-                    "published_marker_source_rows": published_source_facts[
-                        "committed_published_marker_rows"
+                    "published_data_source_rows": published_source_facts[
+                        "committed_published_data_rows"
                     ],
-                    "published_marker_destination_rows": published_destination_count,
-                    "published_marker_count_exact": published_marker_exact,
+                    "published_data_source_rows_exact": published_data_exact,
+                    "published_data_destination_rows": published_destination_count,
+                    "published_data_count_exact": published_data_exact,
                     "identity_value_multiplicity": "exact",
                     "columns": [
                         "id",
@@ -1527,9 +1538,9 @@ def _run_service_repetition(
                         "updated_at",
                     ],
                 }
-                if not published_marker_exact:
+                if not published_data_exact:
                     result["oracle"]["error"] = (
-                        "published marker count or final published backlog was not exact"
+                        "published data count or final published backlog was not exact"
                     )
             except BaseException as exc:
                 result["oracle"] = {
@@ -1537,10 +1548,10 @@ def _run_service_repetition(
                     "error": f"{type(exc).__name__}: {exc}",
                     "source_rows": len(source_rows),
                     "destination_rows": len(destination_rows),
-                    "published_marker_source_rows": published_source_facts[
-                        "committed_published_marker_rows"
+                    "published_data_source_rows": published_source_facts[
+                        "committed_published_data_rows"
                     ],
-                    "published_marker_destination_rows": published_destination_count,
+                    "published_data_destination_rows": published_destination_count,
                 }
         elif stall:
             result["oracle"] = {
@@ -1595,7 +1606,6 @@ def _run_service_repetition(
         _drop_source_slot(slot)
         _source_cleanup(prefix)
         _source_cleanup(warmup_prefix)
-        _drop_published_marker_table(published_marker_table, publication)
         _drop_marker_table(SOURCE_DATABASE, marker_table)
         _drop_motherduck_database(token, md_database)
         cleanup: dict[str, Any] = {}
@@ -1616,19 +1626,6 @@ def _run_service_repetition(
             )
         except BaseException as exc:
             cleanup["marker_cleanup_check_error"] = f"{type(exc).__name__}: {exc}"
-        try:
-            cleanup["published_marker_table_exists_after_cleanup"] = _source_relation_exists(
-                "app", published_marker_table
-            )
-            cleanup["published_marker_publication_member_after_cleanup"] = (
-                _source_publication_contains_table(
-                    publication, "app", published_marker_table
-                )
-            )
-        except BaseException as exc:
-            cleanup["published_marker_cleanup_check_error"] = (
-                f"{type(exc).__name__}: {exc}"
-            )
         try:
             cleanup["motherduck_database_exists_after_cleanup"] = _motherduck_database_exists(
                 token, md_database
