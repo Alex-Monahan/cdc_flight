@@ -104,7 +104,7 @@ def destination_operation_progress(handle):
     return None
 
 
-def run_destination_operation(handle, name: str, operation, *, progressed: bool = False):
+def run_destination_operation(handle, name: str, operation, *, progressed: bool = True):
     """Run one named destination call through the optional memory-only witness."""
     progress = destination_operation_progress(handle)
     if progress is None:
@@ -114,12 +114,16 @@ def run_destination_operation(handle, name: str, operation, *, progressed: bool 
 
 
 def _destination_operation_kind(statement: object) -> tuple[str, bool]:
-    """Classify a statement without retaining SQL text or source values."""
+    """Classify a statement without retaining SQL text or source values.
+
+    The category is diagnostic; every completed destination call advances the
+    bounded pre-COMMIT operation.
+    """
     lowered = str(statement).lower()
     if "alerts" in lowered:
-        return "alert_write", False
+        return "alert_write", True
     if "lease" in lowered:
-        return "lease_refresh", False
+        return "lease_refresh", True
     if any(
         marker in lowered
         for marker in (
@@ -134,7 +138,7 @@ def _destination_operation_kind(statement: object) -> tuple[str, bool]:
             "resume",
         )
     ):
-        return "ledger_claims_batch", False
+        return "ledger_claims_batch", True
     if any(
         marker in lowered
         for marker in (
@@ -147,10 +151,10 @@ def _destination_operation_kind(statement: object) -> tuple[str, bool]:
             "schema",
         )
     ):
-        return "catalog_work", False
+        return "catalog_work", True
     if any(marker in lowered for marker in ("create ", "insert ", "update ", "delete ")):
         return "group_write", True
-    return "motherduck_round_trip", False
+    return "motherduck_round_trip", True
 
 
 class _FencedOperations:
@@ -182,7 +186,7 @@ class _FencedOperations:
         operation: Callable[[], object],
         *,
         operation_name: str = "motherduck_round_trip",
-        progressed: bool = False,
+        progressed: bool = True,
     ):
         if self._epoch_fence_in_transaction:
             self._assert_and_fence()

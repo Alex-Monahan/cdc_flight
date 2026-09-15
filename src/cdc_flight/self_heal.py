@@ -31,10 +31,9 @@ class DestinationOperationProgress:
     there is deliberately no free-standing ``touch`` method that a polling thread
     could use to make a blocked operation appear healthy.
 
-    ``progressed`` is reserved for source-data writes.  Lease, catalog, ledger, and
-    alert operations are still named for diagnosis but do not refresh the delivery
-    deadline.  The state is bounded to one active stack and two counters; it is not
-    an event buffer and never performs I/O.
+    Every successful destination operation is a progress edge.  The state is bounded
+    to one active stack and two counters; it is not an event buffer and never
+    performs I/O.
     """
 
     def __init__(self, *, on_start=None, on_finish=None):
@@ -47,7 +46,7 @@ class DestinationOperationProgress:
         self._on_finish = on_finish
 
     @contextlib.contextmanager
-    def operation(self, name: str, *, progressed: bool = False):
+    def operation(self, name: str, *, progressed: bool = True):
         """Track one named operation and publish progress only after success."""
         if not isinstance(name, str) or not name:
             raise ValueError("destination operation name must be non-empty")
@@ -82,7 +81,7 @@ class DestinationOperationProgress:
 
     @property
     def progress_sequence(self) -> int:
-        """Return the count of successful source-data completion edges."""
+        """Return the count of successful destination completion edges."""
         with self._lock:
             return self._progress_sequence
 
