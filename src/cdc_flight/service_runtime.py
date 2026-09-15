@@ -553,6 +553,11 @@ class ServiceContext:
         return True
 
     def heartbeat_summary(self) -> dict[str, object]:
+        # Snapshot the independent fixed-size table before taking the service
+        # context lock.  ``destination_operation_summary`` takes that same
+        # non-reentrant lock; calling it from inside this block would make a
+        # profiled service deadlock while writing its terminal summary.
+        destination_operations = self.destination_operation_summary()
         with self._lock:
             progress_values = (
                 self._last_engine_callback,
@@ -601,7 +606,7 @@ class ServiceContext:
                 ),
                 "stalled": self.stalled,
                 "lease_lost": self.lease_lost,
-                "destination_operations": self.destination_operation_summary(),
+                "destination_operations": destination_operations,
             }
 
     def close(self) -> None:
