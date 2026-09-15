@@ -21,6 +21,7 @@ import time
 from . import faults
 from .config import ServiceConfig
 from .errors import LeaseLost
+from .self_heal import DESTINATION_OPERATION_CATEGORIES
 from .witness_contract import RenewalWitnessEvidence, renewal_witness_allows
 
 log = logging.getLogger("cdc_flight.service_runtime")
@@ -91,6 +92,13 @@ class ServiceContext:
         #: completion witness here for the duration of one live commit group.  It
         #: is deliberately not a destination handle and cannot perform I/O.
         self._destination_operation_progress = None
+        # Fixed-size, memory-only operation evidence.  The destination progress
+        # witness reports starts/completions here so the final service summary can
+        # identify a sustained-load bottleneck without writing from the hot path.
+        self._destination_operation_totals = {
+            category: {"starts": 0, "completed": 0, "elapsed_sec": 0.0}
+            for category in DESTINATION_OPERATION_CATEGORIES
+        }
         self._stall_message: str | None = None
         self._lease_failure: BaseException | None = None
         self._watchdog: threading.Thread | None = None
@@ -137,6 +145,54 @@ class ServiceContext:
         """Return the current memory-only destination progress witness."""
         with self._lock:
             return self._destination_operation_progress
+
+    @staticmethod
+    def _operation_category(name: str) -> str:
+        return (
+            name
+            if name in DESTINATION_OPERATION_CATEGORIES
+            else "other"
+        )
+
+    def record_destination_operation_start(self, name: str) -> None:
+        """Record one operation start in the bounded in-memory profile."""
+        category = self._operation_category(name)
+        with self._lock:
+            self._destination_operation_totals[category]["starts"] += 1
+
+    def record_destination_operation_finish(
+        self, name: str, elapsed: float, succeeded: bool, progressed: bool
+    ) -> None:
+        """Record one returned operation without performing destination I/O."""
+        del succeeded, progressed
+        category = self._operation_category(name)
+        with self._lock:
+            values = self._destination_operation_totals[category]
+            values["completed"] += 1
+            values["elapsed_sec"] += max(0.0, float(elapsed))
+
+    def destination_operation_summary(self) -> dict[str, object]:
+        """Return the fixed-size operation table and its memory bound."""
+        with self._lock:
+            categories = {
+                category: {
+                    "starts": int(values["starts"]),
+                    "completed": int(values["completed"]),
+                    "elapsed_sec": round(float(values["elapsed_sec"]), 6),
+                }
+                for category, values in self._destination_operation_totals.items()
+            }
+        return {
+            "categories": categories,
+            "category_count_bound": len(DESTINATION_OPERATION_CATEGORIES),
+            "observed_category_count": sum(
+                values["starts"] > 0 for values in categories.values()
+            ),
+            "total_completed_elapsed_sec": round(
+                sum(float(values["elapsed_sec"]) for values in categories.values()),
+                6,
+            ),
+        }
 
     @property
     def lease_release_attempted(self) -> bool:
@@ -545,6 +601,7 @@ class ServiceContext:
                 ),
                 "stalled": self.stalled,
                 "lease_lost": self.lease_lost,
+                "destination_operations": self.destination_operation_summary(),
             }
 
     def close(self) -> None:

@@ -21,6 +21,22 @@ from .errors import AmbiguousDelete, DestinationIdentityCollision
 
 log = logging.getLogger("cdc_flight.self_heal")
 
+# This is deliberately a closed vocabulary.  Operation names are diagnostic
+# evidence, not an event stream: an unexpected name is folded into ``other`` so
+# a long-lived Flight cannot grow a dictionary from untrusted or newly added
+# call sites.
+DESTINATION_OPERATION_CATEGORIES = (
+    "alert_write",
+    "catalog_work",
+    "group_write",
+    "ledger_claims_batch",
+    "lease_refresh",
+    "motherduck_commit",
+    "motherduck_round_trip",
+    "other",
+)
+_DESTINATION_OPERATION_CATEGORY_SET = frozenset(DESTINATION_OPERATION_CATEGORIES)
+
 
 class DestinationOperationProgress:
     """Memory-only completion evidence for one pre-COMMIT destination operation.
@@ -32,8 +48,8 @@ class DestinationOperationProgress:
     could use to make a blocked operation appear healthy.
 
     Every successful destination operation is a progress edge.  The state is bounded
-    to one active stack and two counters; it is not an event buffer and never
-    performs I/O.
+    to one active stack and one fixed operation table; it is not an event buffer and
+    never performs I/O.  Unknown operation names are aggregated into ``other``.
     """
 
     def __init__(self, *, on_start=None, on_finish=None):
@@ -42,6 +58,10 @@ class DestinationOperationProgress:
         self._next_token = 0
         self._progress_sequence = 0
         self._last_progress = time.monotonic()
+        self._operation_totals = {
+            category: {"starts": 0, "completed": 0, "elapsed_sec": 0.0}
+            for category in DESTINATION_OPERATION_CATEGORIES
+        }
         self._on_start = on_start
         self._on_finish = on_finish
 
@@ -55,10 +75,16 @@ class DestinationOperationProgress:
             self._next_token += 1
             token = self._next_token
             self._active.append((token, name, started))
-        if self._on_start is not None:
-            self._on_start(name)
+            category = (
+                name
+                if name in _DESTINATION_OPERATION_CATEGORY_SET
+                else "other"
+            )
+            self._operation_totals[category]["starts"] += 1
         succeeded = False
         try:
+            if self._on_start is not None:
+                self._on_start(name)
             yield
             succeeded = True
         finally:
@@ -76,6 +102,8 @@ class DestinationOperationProgress:
                 if succeeded and progressed:
                     self._progress_sequence += 1
                     self._last_progress = finished
+                self._operation_totals[category]["completed"] += 1
+                self._operation_totals[category]["elapsed_sec"] += elapsed
             if self._on_finish is not None:
                 self._on_finish(name, elapsed, succeeded, bool(succeeded and progressed))
 
@@ -109,6 +137,18 @@ class DestinationOperationProgress:
                 ),
                 "progress_sequence": self._progress_sequence,
                 "progress_age_sec": round(now - self._last_progress, 3),
+            }
+
+    def operation_table(self) -> dict[str, dict[str, int | float]]:
+        """Return fixed-size operation evidence for the current group."""
+        with self._lock:
+            return {
+                category: {
+                    "starts": int(values["starts"]),
+                    "completed": int(values["completed"]),
+                    "elapsed_sec": round(float(values["elapsed_sec"]), 6),
+                }
+                for category, values in self._operation_totals.items()
             }
 
 

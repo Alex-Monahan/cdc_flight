@@ -74,7 +74,10 @@ def _bounded_service_destination_operation(function):
             # captures its pipe without a reader while the process remains live,
             # so per-operation diagnostic I/O can fill that pipe and deadlock the
             # terminal summary after a graceful stop.
-            progress = self_heal.DestinationOperationProgress()
+            progress = self_heal.DestinationOperationProgress(
+                on_start=self.service_context.record_destination_operation_start,
+                on_finish=self.service_context.record_destination_operation_finish,
+            )
             bind_progress = getattr(
                 self.service_context, "bind_destination_operation_progress", None
             )
@@ -333,7 +336,16 @@ def commit_group(self, trigger: str) -> CommitResult:
                 # DuckDB/MotherDuck may have accepted the COMMIT even if the call
                 # does not return. Keep the durable pre-arm for that outcome.
                 self._mark_commit_timeout_ambiguous(commit_id)
-                self.con.execute("COMMIT")
+                commit_progress = (
+                    self.service_context.destination_operation_progress
+                    if self.service_context is not None
+                    else None
+                )
+                if commit_progress is None:
+                    self.con.execute("COMMIT")
+                else:
+                    with commit_progress.operation("motherduck_commit"):
+                        self.con.execute("COMMIT")
                 self.group.txn_open = False
                 # The supervisor uses this exact post-COMMIT instant to measure
                 # the source-slot confirmation hand-off.  It is diagnostic only
