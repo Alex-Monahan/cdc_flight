@@ -1106,6 +1106,10 @@ class EventLedgerBatch:
         self.control_schema = control_schema
         self._known: dict[tuple[str, str], object] = {}
         self._loaded_targets: set[str] = set()
+        #: Streaming identities carry the source transaction id. Loading only
+        #: that transaction keeps replay checks exact without turning a
+        #: long-lived pipeline into an unbounded event-ledger cache.
+        self._loaded_transactions: set[tuple[str, str]] = set()
         self._pending: list[list[Any]] = []
 
     def _row_from_values(self, target_table: str, event_id: str, row) -> dict[str, Any]:
@@ -1131,6 +1135,64 @@ class EventLedgerBatch:
                 target_table, event_id, row[1:]
             )
         self._loaded_targets.add(target_table)
+
+    def _load_transaction(self, target_table: str, txn_id: str) -> None:
+        """Read committed claims for one source transaction into the plan cache."""
+        cache_key = (target_table, str(txn_id))
+        if cache_key in self._loaded_transactions:
+            return
+        rows = self.con.execute(
+            f"SELECT event_id, {self._READ_COLUMNS} FROM "
+            f"{_control_table(self.control_schema, 'event_ledger')} "
+            "WHERE pipeline = ? AND target_table = ? AND txn_id = ?",
+            [self.pipeline, target_table, txn_id],
+        ).fetchall()
+        for row in rows:
+            event_id = str(row[0])
+            self._known[(target_table, event_id)] = self._row_from_values(
+                target_table, event_id, row[1:]
+            )
+        self._loaded_transactions.add(cache_key)
+
+    def prefetch_transactions(self, pairs: list[tuple[str, str]]) -> None:
+        """Load bounded streaming replay claims before folding the group.
+
+        The caller supplies only the current whole-unit commit group. Claims stay
+        in this plan's open destination transaction, and exact identity checks
+        still happen in :meth:`claim`; the batch only replaces one indexed lookup
+        per source transaction with a bounded ``IN`` lookup. The cache therefore
+        cannot become a process-lifetime event-ledger index.
+        """
+        grouped: dict[str, set[str]] = {}
+        for target_table, txn_id in pairs:
+            if txn_id is None:
+                continue
+            grouped.setdefault(str(target_table), set()).add(str(txn_id))
+        batch_size = 1024
+        for target_table, txn_ids in grouped.items():
+            pending = sorted(
+                txn_id
+                for txn_id in txn_ids
+                if (target_table, txn_id) not in self._loaded_transactions
+            )
+            for start in range(0, len(pending), batch_size):
+                batch = pending[start : start + batch_size]
+                placeholders = ", ".join("?" for _ in batch)
+                rows = self.con.execute(
+                    f"SELECT event_id, {self._READ_COLUMNS} FROM "
+                    f"{_control_table(self.control_schema, 'event_ledger')} "
+                    "WHERE pipeline = ? AND target_table = ? "
+                    f"AND txn_id IN ({placeholders})",
+                    [self.pipeline, target_table, *batch],
+                ).fetchall()
+                for row in rows:
+                    event_id = str(row[0])
+                    self._known[(target_table, event_id)] = self._row_from_values(
+                        target_table, event_id, row[1:]
+                    )
+                self._loaded_transactions.update(
+                    (target_table, txn_id) for txn_id in batch
+                )
 
     @staticmethod
     def _pending_row(
@@ -1171,6 +1233,8 @@ class EventLedgerBatch:
         key = (target_table, identity.event_id)
         if snapshot:
             self._load_target(target_table)
+        elif identity.txn_id is not None:
+            self._load_transaction(target_table, str(identity.txn_id))
         observed = self._known.get(key)
         if observed is not None:
             if isinstance(observed, dict):
@@ -1190,7 +1254,7 @@ class EventLedgerBatch:
                 raise
             return True
 
-        if not snapshot:
+        if not snapshot and identity.txn_id is None:
             existing = read_event_ledger(
                 self.con,
                 pipeline=self.pipeline,

@@ -84,6 +84,79 @@ def unwrap_destination_handle(handle):
     return current
 
 
+def destination_operation_progress(handle):
+    """Find the service's memory-only destination progress witness on an alias."""
+    current = handle
+    seen: set[int] = set()
+    for _ in range(8):
+        if id(current) in seen:
+            break
+        seen.add(id(current))
+        context = getattr(current, "_epoch_fence_context", None)
+        if context is not None:
+            return getattr(context, "destination_operation_progress", None)
+        next_handle = getattr(current, "_epoch_fence_raw", None)
+        if next_handle is None:
+            next_handle = getattr(current, "_con", None)
+        if next_handle is None or next_handle is current:
+            break
+        current = next_handle
+    return None
+
+
+def run_destination_operation(handle, name: str, operation, *, progressed: bool = True):
+    """Run one named destination call through the optional memory-only witness."""
+    progress = destination_operation_progress(handle)
+    if progress is None:
+        return operation()
+    with progress.operation(name, progressed=progressed):
+        return operation()
+
+
+def _destination_operation_kind(statement: object) -> tuple[str, bool]:
+    """Classify a statement without retaining SQL text or source values.
+
+    The category is diagnostic; every completed destination call advances the
+    bounded pre-COMMIT operation.
+    """
+    lowered = str(statement).lower()
+    if "alerts" in lowered:
+        return "alert_write", True
+    if "lease" in lowered:
+        return "lease_refresh", True
+    if any(
+        marker in lowered
+        for marker in (
+            "event_ledger",
+            "delete_ledger",
+            "keyless_events",
+            "commit_log",
+            "debezium_offsets",
+            "source_data_facts",
+            "table_events",
+            "claims",
+            "resume",
+        )
+    ):
+        return "ledger_claims_batch", True
+    if any(
+        marker in lowered
+        for marker in (
+            "source_relations",
+            "table_state",
+            "table_lifecycle",
+            "column_presence",
+            "policy_alert",
+            "catalog",
+            "schema",
+        )
+    ):
+        return "catalog_work", True
+    if any(marker in lowered for marker in ("create ", "insert ", "update ", "delete ")):
+        return "group_write", True
+    return "motherduck_round_trip", True
+
+
 class _FencedOperations:
     """Common transaction/fence implementation for connections and cursors."""
 
@@ -99,21 +172,41 @@ class _FencedOperations:
 
     def _assert_and_fence(self) -> None:
         self._epoch_fence_context.assert_writable()
-        self._epoch_fence_lease.fence(self._raw)
+        run_destination_operation(
+            self,
+            "lease_refresh",
+            lambda: self._epoch_fence_lease.fence(self._raw),
+        )
 
     def _raw_execute(self, sql, *args, **kwargs):
         return self._raw.execute(sql, *args, **kwargs)
 
-    def _run_mutation(self, operation: Callable[[], object]):
+    def _run_mutation(
+        self,
+        operation: Callable[[], object],
+        *,
+        operation_name: str = "motherduck_round_trip",
+        progressed: bool = True,
+    ):
         if self._epoch_fence_in_transaction:
             self._assert_and_fence()
-            return operation()
+            return run_destination_operation(
+                self,
+                operation_name,
+                operation,
+                progressed=progressed,
+            )
 
         self._raw_execute("BEGIN TRANSACTION")
         self._epoch_fence_in_transaction = True
         try:
             self._assert_and_fence()
-            result = operation()
+            result = run_destination_operation(
+                self,
+                operation_name,
+                operation,
+                progressed=progressed,
+            )
             self._raw_execute("COMMIT")
             self._epoch_fence_in_transaction = False
             return result
@@ -139,21 +232,46 @@ class _FencedOperations:
             self._epoch_fence_in_transaction = False
             return result
         if not is_destination_mutation(sql):
-            return self._raw_execute(sql, *args, **kwargs)
-        return self._run_mutation(lambda: self._raw_execute(sql, *args, **kwargs))
+            return run_destination_operation(
+                self,
+                "motherduck_round_trip",
+                lambda: self._raw_execute(sql, *args, **kwargs),
+            )
+        name, progressed = _destination_operation_kind(sql)
+        return self._run_mutation(
+            lambda: self._raw_execute(sql, *args, **kwargs),
+            operation_name=name,
+            progressed=progressed,
+        )
 
     def executemany(self, sql, parameters, *args, **kwargs):
+        name, progressed = _destination_operation_kind(sql)
         return self._run_mutation(
-            lambda: self._raw.executemany(sql, parameters, *args, **kwargs)
+            lambda: self._raw.executemany(sql, parameters, *args, **kwargs),
+            operation_name=name,
+            progressed=progressed,
         )
 
     def append(self, *args, **kwargs):
-        return self._run_mutation(lambda: self._raw.append(*args, **kwargs))
+        return self._run_mutation(
+            lambda: self._raw.append(*args, **kwargs),
+            operation_name="group_write",
+            progressed=True,
+        )
 
     def sql(self, sql, *args, **kwargs):
         if not is_destination_mutation(sql):
-            return self._raw.sql(sql, *args, **kwargs)
-        return self._run_mutation(lambda: self._raw.sql(sql, *args, **kwargs))
+            return run_destination_operation(
+                self,
+                "motherduck_round_trip",
+                lambda: self._raw.sql(sql, *args, **kwargs),
+            )
+        name, progressed = _destination_operation_kind(sql)
+        return self._run_mutation(
+            lambda: self._raw.sql(sql, *args, **kwargs),
+            operation_name=name,
+            progressed=progressed,
+        )
 
     def commit(self):
         result = self._raw.commit()
@@ -201,6 +319,8 @@ class EpochFencedConnection(_FencedOperations):
 __all__ = [
     "EpochFencedConnection",
     "EpochFencedCursor",
+    "destination_operation_progress",
     "is_destination_mutation",
+    "run_destination_operation",
     "unwrap_destination_handle",
 ]

@@ -67,8 +67,21 @@ def _bounded_service_destination_operation(function):
         # open the destination transaction.  The throwaway resnapshot applier has
         # no service_context, but it still calls the inner commit watchdog while
         # sharing the service's fenced destination handle.
-        self._arm_commit_timeout_alert(commit_id)
+        progress = None
+        if self.service_context is not None:
+            # This witness is deliberately memory-only.  In particular, do not
+            # log every operation from a service child: the quiet-holder proof
+            # captures its pipe without a reader while the process remains live,
+            # so per-operation diagnostic I/O can fill that pipe and deadlock the
+            # terminal summary after a graceful stop.
+            progress = self_heal.DestinationOperationProgress()
+            bind_progress = getattr(
+                self.service_context, "bind_destination_operation_progress", None
+            )
+            if bind_progress is not None:
+                bind_progress(progress)
         try:
+            self._arm_commit_timeout_alert(commit_id)
             if self.service_context is None:
                 result = function(self, trigger)
             else:
@@ -76,7 +89,8 @@ def _bounded_service_destination_operation(function):
                 # watchdog is armed, leave the same durable diagnostic behind. No
                 # timeout callback performs destination or telemetry I/O.
                 with self_heal.destination_operation_watchdog(
-                    self.cfg.commit_timeout
+                    self.cfg.commit_timeout,
+                    progress=progress,
                 ) as stop:
                     self._destination_operation_deadline_stop = stop
                     try:
@@ -89,6 +103,13 @@ def _bounded_service_destination_operation(function):
             # have committed, including when the client reports an error.
             self._retire_commit_timeout_alert_if_known(commit_id)
             raise
+        finally:
+            if progress is not None:
+                clear_progress = getattr(
+                    self.service_context, "clear_destination_operation_progress", None
+                )
+                if clear_progress is not None:
+                    clear_progress(progress)
         if result is not CommitResult.COMMITTED:
             # BLOCKED (and any future non-commit outcome) has no durable destination
             # boundary, so an outer arm must not become a false historical alert.
