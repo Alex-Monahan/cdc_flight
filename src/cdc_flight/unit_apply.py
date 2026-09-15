@@ -99,6 +99,23 @@ def apply_units(
         message_prefix_policy=applier.message_prefix_policy,
         suppress_replayed_message_audit=applier.suppress_replayed_message_audit,
     )
+    if plan._event_ledger is not None:
+        stream_pairs = [
+            (
+                applier.snapshots.target_table(event.schema, event.table),
+                str(event.txn_id),
+            )
+            for unit in group
+            if unit.kind != "snapshot_chunk"
+            for event in unit.events
+            if (
+                event.txn_id is not None
+                and event.schema
+                and event.table
+                and not event.incremental
+            )
+        ]
+        plan._event_ledger.prefetch_transactions(stream_pairs)
     try:
         for unit in group:
             if unit.fenced:
