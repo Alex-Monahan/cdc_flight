@@ -43,6 +43,25 @@ def test_slow_but_progressing_destination_work_resets_the_deadline():
     assert result.stdout.strip() == "completed"
 
 
+def test_quiet_destination_watchdog_is_unarmed_without_an_operation():
+    result = _run_child(
+        """
+        import time
+        from cdc_flight.self_heal import (
+            DestinationOperationProgress,
+            destination_operation_watchdog,
+        )
+
+        progress = DestinationOperationProgress()
+        with destination_operation_watchdog(0.10, progress=progress):
+            time.sleep(0.30)
+        print("completed")
+        """
+    )
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    assert result.stdout.strip() == "completed"
+
+
 def test_a_hung_destination_operation_still_exits_75():
     result = _run_child(
         """

@@ -91,6 +91,12 @@ class DestinationOperationProgress:
         with self._lock:
             return self._last_progress
 
+    @property
+    def active_operation_started_at(self) -> float | None:
+        """Return the current operation's start time, or ``None`` while quiet."""
+        with self._lock:
+            return self._active[-1][2] if self._active else None
+
     def snapshot(self) -> dict[str, object]:
         """Return bounded diagnostic state without touching a destination."""
         with self._lock:
@@ -241,17 +247,33 @@ def destination_operation_watchdog(
 
     stopped = threading.Event()
     observed_progress = progress.progress_sequence if progress is not None else None
+    observed_active_started = None
+    deadline = time.monotonic() + timeout if progress is None else None
 
     def _watch() -> None:  # pragma: no cover - exercised by a real service child
-        deadline = time.monotonic() + timeout
-        nonlocal observed_progress
+        nonlocal deadline, observed_progress, observed_active_started
         while not stopped.wait(min(0.05, max(timeout / 10.0, 0.01))):
+            now = time.monotonic()
             if progress is not None:
                 current_progress = progress.progress_sequence
-                if current_progress != observed_progress:
-                    observed_progress = current_progress
-                    deadline = time.monotonic() + timeout
-            if time.monotonic() >= deadline:
+                active_started = progress.active_operation_started_at
+                if active_started is None:
+                    # A completed destination call leaves a quiet gap. There is
+                    # no native operation to be hung in that gap, so the guard is
+                    # deliberately unarmed until the next operation enters.
+                    deadline = None
+                    observed_active_started = None
+                elif active_started != observed_active_started:
+                    # Start a fresh per-operation budget from the operation's
+                    # actual entry edge, rather than from watchdog construction.
+                    observed_active_started = active_started
+                    deadline = active_started + timeout
+                elif current_progress != observed_progress:
+                    # A successful nested/completed operation is real progress;
+                    # reset the active-operation budget without polling heartbeats.
+                    deadline = now + timeout
+                observed_progress = current_progress
+            if deadline is not None and now >= deadline:
                 # This callback can run on a thread that is unrelated to the
                 # destination operation, and it may race COMMIT_ACK in a future
                 # refactor.  It therefore remains strictly I/O-free.

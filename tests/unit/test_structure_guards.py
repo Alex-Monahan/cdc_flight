@@ -38,10 +38,11 @@ _BASELINE_SELECTED = {
     # §8.2 Round 1 adds eleven default policy nodes, one slow public-operation node,
     # and one MotherDuck policy-durability node. This is a correctness gate only;
     # it does not change the 8.2 score.
-    # This stability round adds two destination-watchdog mutation nodes and one
-    # service-operation-progress node to the default lane. Rebaseline by exactly
-    # those three nodes: 2503 + 3 = 2506 (excluding this guard module).
-    "not motherduck and not slow": 2506,
+    # This stability round adds two destination-watchdog mutation nodes, one
+    # service-operation-progress node, and one quiet/no-operation watchdog node
+    # to the default lane. Rebaseline by exactly those four nodes:
+    # 2503 + 4 = 2507 (excluding this guard module).
+    "not motherduck and not slow": 2507,
     "slow and not motherduck": 270,
     # The quiet-holder and stock-walsender retry proofs are MotherDuck-only real
     # process nodes; a local DuckDB file lock cannot exercise cloud takeover while
