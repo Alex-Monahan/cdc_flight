@@ -249,14 +249,21 @@ def destination_operation_watchdog(
     observed_progress = progress.progress_sequence if progress is not None else None
     observed_active_started = None
     deadline = time.monotonic() + timeout if progress is None else None
+    paused_deadline = None
 
     def _watch() -> None:  # pragma: no cover - exercised by a real service child
-        nonlocal deadline, observed_progress, observed_active_started
+        nonlocal deadline, observed_progress, observed_active_started, paused_deadline
         while not stopped.wait(min(0.05, max(timeout / 10.0, 0.01))):
             now = time.monotonic()
             if progress is not None:
                 current_progress = progress.progress_sequence
                 active_started = progress.active_operation_started_at
+                progress_changed = current_progress != observed_progress
+                if progress_changed:
+                    # A successful completion resets the active-operation budget.
+                    # Carry that reset across a quiet gap without running a timer
+                    # while no destination operation is active.
+                    paused_deadline = now + timeout
                 if active_started is None:
                     # A completed destination call leaves a quiet gap. There is
                     # no native operation to be hung in that gap, so the guard is
@@ -265,10 +272,14 @@ def destination_operation_watchdog(
                     observed_active_started = None
                 elif active_started != observed_active_started:
                     # Start a fresh per-operation budget from the operation's
-                    # actual entry edge, rather than from watchdog construction.
+                    # actual entry edge, or resume the reset deadline from the
+                    # preceding completed operation. A quiet gap itself is never
+                    # timed.
                     observed_active_started = active_started
-                    deadline = active_started + timeout
-                elif current_progress != observed_progress:
+                    if paused_deadline is None:
+                        paused_deadline = active_started + timeout
+                    deadline = paused_deadline
+                elif progress_changed:
                     # A successful nested/completed operation is real progress;
                     # reset the active-operation budget without polling heartbeats.
                     deadline = now + timeout
