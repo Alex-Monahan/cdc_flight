@@ -1945,11 +1945,12 @@ def main(argv: list[str] | None = None) -> int:
             "span, and pg_stat_database.xact_commit delta"
         ),
         "keep_up_definition": (
-            "published-only pending records = source committed rows in the published "
-            "marker table minus durable destination marker rows; over >=180 seconds "
-            "it must be bounded and have non-positive OLS slope, then the final "
-            "published marker count and exact identity/value/multiplicity oracle must "
-            "hold at the durable boundary"
+            "published-only pending records = source committed app.customers rows "
+            "minus durable destination app.customers rows, both filtered to this run's "
+            "prefix; over >=180 seconds it must be bounded and have non-positive OLS "
+            "slope, then the final published-data count and exact "
+            "identity/value/multiplicity oracle must hold at the durable boundary; the "
+            "unpublished marker is excluded and is only the PostgreSQL-clock witness"
         ),
     }
     capability = _run_source_capability(
