@@ -71,6 +71,14 @@ class DestinationOperationProgress:
         if not isinstance(name, str) or not name:
             raise ValueError("destination operation name must be non-empty")
         started = time.monotonic()
+        # Keep the service-level aggregate outside this witness' lock.  The
+        # service watchdog reads the two witnesses in the opposite order
+        # (service context, then this progress object); invoking the callback
+        # while holding this lock would create a lock-order inversion during
+        # shutdown and could prevent the terminal service summary from being
+        # written.
+        if self._on_start is not None:
+            self._on_start(name)
         with self._lock:
             self._next_token += 1
             token = self._next_token
@@ -83,8 +91,6 @@ class DestinationOperationProgress:
             self._operation_totals[category]["starts"] += 1
         succeeded = False
         try:
-            if self._on_start is not None:
-                self._on_start(name)
             yield
             succeeded = True
         finally:
