@@ -23,6 +23,7 @@ from cdc_flight.destination_lease import Lease
 from cdc_flight.errors import LeaseLost, ServiceStandDown
 from cdc_flight.occurrence import OccurrenceKey, RunState
 from cdc_flight.run_state import COMMIT_ACK
+from cdc_flight.self_heal import DestinationOperationProgress
 from cdc_flight.service_runtime import ServiceContext
 
 
@@ -396,6 +397,48 @@ def test_completed_active_operation_does_not_trip_the_idle_stall_clock():
         time.sleep(0.05)
         assert exited == []
         assert not context.stalled
+    finally:
+        context.close()
+
+
+def test_completed_destination_operations_extend_the_active_operation_guard():
+    policy = ServiceConfig(
+        lease_ttl_seconds=2.0,
+        lease_renew_seconds=0.1,
+        heartbeat_bound_seconds=0.5,
+        stall_timeout_seconds=0.05,
+        stall_exit_grace_seconds=0.02,
+        watchdog_poll_seconds=0.01,
+        commit_timeout_seconds=0.1,
+        close_timeout_seconds=0.2,
+        invariant_check_seconds=0.1,
+    )
+    exited: list[int] = []
+    context = ServiceContext(
+        service_id="service-operation-progress",
+        lease_id="lease-operation-progress",
+        worker_generation="service-operation-progress:generation",
+        policy=policy,
+        exit_fn=exited.append,
+    )
+    progress = DestinationOperationProgress()
+    context.bind_destination_operation_progress(progress)
+    try:
+        context.operation_started()
+        context.start_watchdog()
+        for _ in range(8):
+            with progress.operation("motherduck_round_trip"):
+                time.sleep(0.045)
+        assert exited == []
+        assert not context.stalled
+
+        # Completion edges stop resetting here. The same active-operation guard
+        # must still trip a genuinely stalled callback.
+        deadline = time.monotonic() + 1
+        while not exited and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert exited == [1]
+        assert context.stalled
     finally:
         context.close()
 

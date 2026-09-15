@@ -85,6 +85,12 @@ class DestinationOperationProgress:
         with self._lock:
             return self._progress_sequence
 
+    @property
+    def last_progress(self) -> float:
+        """Return the monotonic time of the last successful completion edge."""
+        with self._lock:
+            return self._last_progress
+
     def snapshot(self) -> dict[str, object]:
         """Return bounded diagnostic state without touching a destination."""
         with self._lock:

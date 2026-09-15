@@ -304,14 +304,16 @@ class ServiceContext:
 
     def _watchdog_loop(self) -> None:
         while not self._closed.wait(self.policy.watchdog_poll_seconds):
+            now = time.monotonic()
             with self._lock:
-                stalled_for = time.monotonic() - self._last_progress
+                stalled_for = now - self._last_progress
                 already_stalled = self._stall_event.is_set()
                 source_dark = self._source_health_status == "dark"
                 source_quiet_ready = self._source_quiet_ready
                 teardown_started = self._teardown_started
                 operation_started_at = self._operation_started_at
                 operation_active = self._operation_active
+                destination_progress = self._destination_operation_progress
             # Source-dark is already a fail-closed drain decision made by the
             # supervisor.  Do not let the independent local-stall hard-exit race
             # that diagnosis and erase the durable alert/summary before the
@@ -330,7 +332,12 @@ class ServiceContext:
                 # successor was writing the real row when its own 20 s clock
                 # fenced it.  A separate operation budget still bounds a wedged
                 # callback before the destination lease expires.
-                operation_for = time.monotonic() - float(operation_started_at)
+                progress_at = getattr(destination_progress, "last_progress", None)
+                operation_for = now - float(
+                    progress_at
+                    if progress_at is not None
+                    else operation_started_at
+                )
                 if operation_for < self.policy.operation_timeout_seconds:
                     continue
                 if not already_stalled:
