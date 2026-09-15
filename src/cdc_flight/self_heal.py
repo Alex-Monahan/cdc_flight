@@ -14,11 +14,91 @@ import contextlib
 import logging
 import os
 import threading
+import time
 
 from . import naming
 from .errors import AmbiguousDelete, DestinationIdentityCollision
 
 log = logging.getLogger("cdc_flight.self_heal")
+
+
+class DestinationOperationProgress:
+    """Memory-only completion evidence for one pre-COMMIT destination operation.
+
+    A watchdog must distinguish a sequence of completed destination operations from
+    one native call that never returns.  The caller owns the operation context, so
+    the only progress edge accepted here is the context manager's successful exit;
+    there is deliberately no free-standing ``touch`` method that a polling thread
+    could use to make a blocked operation appear healthy.
+
+    ``progressed`` is reserved for source-data writes.  Lease, catalog, ledger, and
+    alert operations are still named for diagnosis but do not refresh the delivery
+    deadline.  The state is bounded to one active stack and two counters; it is not
+    an event buffer and never performs I/O.
+    """
+
+    def __init__(self, *, on_start=None, on_finish=None):
+        self._lock = threading.Lock()
+        self._active: list[tuple[int, str, float]] = []
+        self._next_token = 0
+        self._progress_sequence = 0
+        self._last_progress = time.monotonic()
+        self._on_start = on_start
+        self._on_finish = on_finish
+
+    @contextlib.contextmanager
+    def operation(self, name: str, *, progressed: bool = False):
+        """Track one named operation and publish progress only after success."""
+        if not isinstance(name, str) or not name:
+            raise ValueError("destination operation name must be non-empty")
+        started = time.monotonic()
+        with self._lock:
+            self._next_token += 1
+            token = self._next_token
+            self._active.append((token, name, started))
+        if self._on_start is not None:
+            self._on_start(name)
+        succeeded = False
+        try:
+            yield
+            succeeded = True
+        finally:
+            finished = time.monotonic()
+            elapsed = max(0.0, finished - started)
+            with self._lock:
+                # The operation stack is private and strictly nested.  Refusing to
+                # silently repair a mismatched close keeps a future instrumentation
+                # mutation from manufacturing a progress edge.
+                if not self._active or self._active[-1][0] != token:
+                    raise RuntimeError(
+                        f"destination operation stack mismatch while closing {name!r}"
+                    )
+                self._active.pop()
+                if succeeded and progressed:
+                    self._progress_sequence += 1
+                    self._last_progress = finished
+            if self._on_finish is not None:
+                self._on_finish(name, elapsed, succeeded, bool(succeeded and progressed))
+
+    @property
+    def progress_sequence(self) -> int:
+        """Return the count of successful source-data completion edges."""
+        with self._lock:
+            return self._progress_sequence
+
+    def snapshot(self) -> dict[str, object]:
+        """Return bounded diagnostic state without touching a destination."""
+        with self._lock:
+            active = self._active[-1] if self._active else None
+            now = time.monotonic()
+            return {
+                "active_operation": active[1] if active else None,
+                "active_operation_age_sec": (
+                    round(now - active[2], 3) if active else None
+                ),
+                "progress_sequence": self._progress_sequence,
+                "progress_age_sec": round(now - self._last_progress, 3),
+            }
 
 
 def request_resnapshot_for(
@@ -139,7 +219,9 @@ def commit_watchdog(timeout: float, commit_id: int, stage=None, on_timeout=None)
 
 
 @contextlib.contextmanager
-def destination_operation_watchdog(timeout: float):
+def destination_operation_watchdog(
+    timeout: float, progress: DestinationOperationProgress | None = None
+):
     """Bound pre-COMMIT destination work without adding work to COMMIT_ACK.
 
     The Flight is a hard process boundary, so terminating the whole instance is the
@@ -152,19 +234,33 @@ def destination_operation_watchdog(timeout: float):
         yield lambda: None
         return
 
-    def _fire() -> None:  # pragma: no cover - exercised by a real service child
-        os._exit(75)
+    stopped = threading.Event()
+    observed_progress = progress.progress_sequence if progress is not None else None
 
-    timer = threading.Timer(timeout, _fire)
-    timer.daemon = True
+    def _watch() -> None:  # pragma: no cover - exercised by a real service child
+        deadline = time.monotonic() + timeout
+        nonlocal observed_progress
+        while not stopped.wait(min(0.05, max(timeout / 10.0, 0.01))):
+            if progress is not None:
+                current_progress = progress.progress_sequence
+                if current_progress != observed_progress:
+                    observed_progress = current_progress
+                    deadline = time.monotonic() + timeout
+            if time.monotonic() >= deadline:
+                # This callback can run on a thread that is unrelated to the
+                # destination operation, and it may race COMMIT_ACK in a future
+                # refactor.  It therefore remains strictly I/O-free.
+                os._exit(75)
+
+    timer = threading.Thread(
+        target=_watch,
+        name="cdc-flight-destination-operation-watchdog",
+        daemon=True,
+    )
     timer.start()
-    stopped = False
 
     def stop() -> None:
-        nonlocal stopped
-        if not stopped:
-            stopped = True
-            timer.cancel()
+        stopped.set()
 
     try:
         yield stop

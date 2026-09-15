@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 
 from . import destination as _d
-from .destination_fence import unwrap_destination_handle
+from .destination_fence import run_destination_operation, unwrap_destination_handle
 from .errors import LeaseLost, ServiceStandDown
 from .occurrence import LeaseState, _lease_receipt_from_durable
 from .retirement import RetirementResult, retire_handle
@@ -503,12 +503,16 @@ class Lease:
         if require_live:
             params.append(current)
         def refresh():
-            return raw_con.execute(
-                f"UPDATE {_control_table(self.control_schema, 'lease')} SET renewed_at=?, "
-                "expires_at=? WHERE pipeline=? AND owner_id=? AND lease_id=? "
-                f"AND fencing_epoch=?{identity_predicate}AND state <> 'released'"
-                f"{live_predicate}",
-                params,
+            return run_destination_operation(
+                con,
+                "lease_refresh",
+                lambda: raw_con.execute(
+                    f"UPDATE {_control_table(self.control_schema, 'lease')} SET renewed_at=?, "
+                    "expires_at=? WHERE pipeline=? AND owner_id=? AND lease_id=? "
+                    f"AND fencing_epoch=?{identity_predicate}AND state <> 'released'"
+                    f"{live_predicate}",
+                    params,
+                ),
             )
 
         if retry_conflicts:

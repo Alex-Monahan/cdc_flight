@@ -87,6 +87,10 @@ class ServiceContext:
         #: admitted unit is work in flight, not evidence that the Flight is dead.
         self._operation_started_at: float | None = None
         self._operation_active = False
+        #: The pre-COMMIT destination watchdog installs a bounded, memory-only
+        #: completion witness here for the duration of one live commit group.  It
+        #: is deliberately not a destination handle and cannot perform I/O.
+        self._destination_operation_progress = None
         self._stall_message: str | None = None
         self._lease_failure: BaseException | None = None
         self._watchdog: threading.Thread | None = None
@@ -116,6 +120,23 @@ class ServiceContext:
         self.connection = connection
         self.lease_key = lease.lease_key
         self.fencing_epoch = lease.epoch
+
+    def bind_destination_operation_progress(self, progress) -> None:
+        """Attach the current pre-COMMIT progress witness to destination aliases."""
+        with self._lock:
+            self._destination_operation_progress = progress
+
+    def clear_destination_operation_progress(self, progress) -> None:
+        """Detach a completed witness without disturbing service liveness clocks."""
+        with self._lock:
+            if self._destination_operation_progress is progress:
+                self._destination_operation_progress = None
+
+    @property
+    def destination_operation_progress(self):
+        """Return the current memory-only destination progress witness."""
+        with self._lock:
+            return self._destination_operation_progress
 
     @property
     def lease_release_attempted(self) -> bool:

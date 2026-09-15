@@ -49,8 +49,8 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 SWARM_DIR = PROJECT_DIR.parent
 DEFAULT_EVIDENCE_DIR = SWARM_DIR / "codex_logs" / "p53_runs"
 SAMPLER = SWARM_DIR / "tools" / "contention_sampler.sh"
-BASE_SHA = "af6187c999bc12c340570df03201bd6166874c9e"
-CANDIDATE_BRANCH = "feature/5-3-sustained-tps"
+BASE_SHA = "9b1823d54e21923c8642d41104bd2c3e9711f5ad"
+CANDIDATE_BRANCH = "feature/delivery-under-load"
 SOURCE_PORT = 15432
 SOURCE_DATABASE = "cdc_source"
 SOURCE_ADMIN_DATABASE = "postgres"
@@ -1355,4 +1355,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

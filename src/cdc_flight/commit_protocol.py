@@ -7,6 +7,7 @@ from BEGIN through the guarded COMMIT/ack boundary and post-commit bookkeeping.
 from __future__ import annotations
 
 import functools
+import logging
 import time
 
 from . import commit_metadata, destination, offsets, self_heal, table_writer
@@ -24,6 +25,7 @@ from .policy import AcknowledgementHandle
 from .run_state import COMMIT_ACK
 
 OWNER = "commit-durability"
+log = logging.getLogger("cdc_flight.commit_protocol")
 
 
 def _ack_token(record):
@@ -67,8 +69,28 @@ def _bounded_service_destination_operation(function):
         # open the destination transaction.  The throwaway resnapshot applier has
         # no service_context, but it still calls the inner commit watchdog while
         # sharing the service's fenced destination handle.
-        self._arm_commit_timeout_alert(commit_id)
+        progress = None
+        if self.service_context is not None:
+            progress = self_heal.DestinationOperationProgress(
+                on_start=lambda name: log.info(
+                    "destination pre-commit operation started: %s", name
+                ),
+                on_finish=lambda name, elapsed, succeeded, progressed: log.info(
+                    "destination pre-commit operation finished: %s elapsed=%.3fs "
+                    "succeeded=%s progressed=%s",
+                    name,
+                    elapsed,
+                    succeeded,
+                    progressed,
+                ),
+            )
+            bind_progress = getattr(
+                self.service_context, "bind_destination_operation_progress", None
+            )
+            if bind_progress is not None:
+                bind_progress(progress)
         try:
+            self._arm_commit_timeout_alert(commit_id)
             if self.service_context is None:
                 result = function(self, trigger)
             else:
@@ -76,7 +98,8 @@ def _bounded_service_destination_operation(function):
                 # watchdog is armed, leave the same durable diagnostic behind. No
                 # timeout callback performs destination or telemetry I/O.
                 with self_heal.destination_operation_watchdog(
-                    self.cfg.commit_timeout
+                    self.cfg.commit_timeout,
+                    progress=progress,
                 ) as stop:
                     self._destination_operation_deadline_stop = stop
                     try:
@@ -89,6 +112,13 @@ def _bounded_service_destination_operation(function):
             # have committed, including when the client reports an error.
             self._retire_commit_timeout_alert_if_known(commit_id)
             raise
+        finally:
+            if progress is not None:
+                clear_progress = getattr(
+                    self.service_context, "clear_destination_operation_progress", None
+                )
+                if clear_progress is not None:
+                    clear_progress(progress)
         if result is not CommitResult.COMMITTED:
             # BLOCKED (and any future non-commit outcome) has no durable destination
             # boundary, so an outer arm must not become a false historical alert.
