@@ -148,9 +148,14 @@ def _destination_operation_kind(statement: object) -> tuple[str, bool]:
             "column_presence",
             "policy_alert",
             "catalog",
-            "schema",
         )
     ):
+        return "catalog_work", True
+    # Physical table/schema DDL is catalog work.  Do not use a bare ``schema``
+    # substring here: every published row carries the ordinary Debezium metadata
+    # column ``dbz_schema``, which would misclassify the hot data INSERT as catalog
+    # work and make the profile lie about the dominant cost.
+    if _first_keyword(statement) in {"create", "alter", "drop"}:
         return "catalog_work", True
     if any(marker in lowered for marker in ("create ", "insert ", "update ", "delete ")):
         return "group_write", True
